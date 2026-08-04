@@ -208,7 +208,6 @@ Task state describes semantic task lifecycle and is authoritative only when supp
 
 Initial values:
 
-- `unlinked`
 - `queued`
 - `running`
 - `blocked`
@@ -218,7 +217,18 @@ Initial values:
 
 Live activity alone may update execution state, but it must not mark a Task Run completed or calculate a percentage.
 
-### 8.3 Minimum normalized event fields
+### 8.3 Relationship state
+
+Relationship state is independent from execution and task lifecycle.
+
+Initial values:
+
+- `unlinked`: no explicit Controller or dependency relationship is known;
+- `linked`: at least one explicit semantic relationship identifies the Task Run.
+
+A dependency edge is stored separately from this summary state and remains the authority for the DAG.
+
+### 8.4 Minimum normalized event fields
 
 Each normalized observation contains:
 
@@ -342,9 +352,9 @@ Required behavior:
 
 ## 12. Herdr plugin packaging
 
-The repository contains a `herdr-plugin.toml` manifest.
+The implementation will include a `herdr-plugin.toml` manifest.
 
-Proposed stable identifiers:
+Initial stable identifiers:
 
 ```toml
 id = "mageyuki.herdr-top"
@@ -377,7 +387,7 @@ The release process publishes tagged GitHub releases for macOS and Linux. The pl
 | CLI and emit subcommand | `clap` |
 | Structured logs | `tracing`, `tracing-subscriber` |
 | Error types | `thiserror` |
-| Internal IDs | `ulid` or `uuid` |
+| Internal IDs | `ulid` |
 
 Rust is selected for single-binary distribution, predictable long-running resource use, terminal control, strong event and state types, and compatibility with the Herdr/Rust ecosystem.
 
