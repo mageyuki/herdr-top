@@ -20,14 +20,15 @@ Repository: [mageyuki/herdr-top](https://github.com/mageyuki/herdr-top)
 | Superpowers | Not required and not used as a required data source |
 | Primary view | Fixed-screen, htop-style live TUI |
 | Hierarchy | Herdr physical topology plus Task Run and native sub-agent nesting |
-| Physical pane identity | Herdr `terminal_id` is stable identity; public `pane_id` is the current address |
-| Cross-pane relationship | Independent and `unlinked` unless an explicit Controller event exists |
+| Physical pane identity | Herdr `terminal_id` is stable within one server run; public `pane_id` is the current address; no physical identity survives a cold restart |
+| Cross-pane relationship | Independent and `unlinked` unless an explicit Controller relationship event links it |
 | Dependency representation | A DAG separate from the execution tree |
 | Data acquisition | Herdr snapshot/events, including reported native sessions, plus non-invasive Claude/Codex local metadata observation |
 | Provider fallback | Two-second rescan when file watching is unavailable; no terminal-output scraping |
-| Task Run identity | Explicit `task_run_id`, then native session ID with Herdr-reported identity preferred, then provisional `terminal_id + start time` |
+| Task Run identity | Explicit `task_run_id`, then native session reference with Herdr-reported identity preferred, then provisional `terminal_id + start time + collector sequence` |
 | Controller protocol | Versioned JSON over a session-scoped Unix domain socket through `herdr-top emit` |
 | Persistence | Session-scoped SQLite as the source of truth |
+| State root | `${XDG_STATE_HOME:-$HOME/.local/state}/herdr-top/sessions/<session-key>`, keyed by the resolved session name; the collector socket lives in a runtime directory to respect socket-path length limits |
 | Retention | Finished Task Runs 30 days; events 7 days and at most 100,000 per session |
 | Process model | One collector, reducer, SQLite writer, event socket, and TUI process per Herdr session |
 | Second launch | Focus the existing Herdr Top pane instead of starting another collector |
@@ -95,7 +96,7 @@ Herdr named session
 | Project | Not a separate formal Herdr entity. The UI uses the workspace for project-like grouping. |
 | Tab | A layout within a workspace. |
 | Pane | A real terminal and the physical execution location of an agent or command. |
-| `terminal_id` | Stable physical terminal identity used to follow a pane across moves. |
+| `terminal_id` | Physical terminal identity, stable within a single Herdr server run. It follows a pane across moves, including cross-workspace moves, but Herdr does not persist it across a cold server restart. |
 | Public `pane_id` | The pane's current Herdr address. It may change when a terminal moves between workspaces. |
 | Native agent session | Claude Code or Codex's resumable session identity, distinct from a Herdr named session. |
 
@@ -105,7 +106,7 @@ References: [Herdr concepts](https://herdr.dev/docs/concepts/), [Herdr integrati
 
 | Unit | Meaning |
 | --- | --- |
-| Task Run | Herdr Top's semantic unit for one observed task execution. A pane may host multiple Task Runs over time. |
+| Task Run | Herdr Top's semantic unit for one observed task. A Task Run may span multiple executions over time or concurrently, and a pane may host multiple Task Runs over time. |
 | Agent Node | A Claude Code or Codex execution participating in a Task Run. |
 | Native Sub-agent | A provider-native child session nested below its parent Task Run or Agent Node. |
 | Execution Edge | An explicit parent-child relationship, such as a Controller dispatch. |
@@ -119,11 +120,12 @@ A pane is an execution location, not a task identity.
 Identity is resolved in this order:
 
 1. Explicit Controller `task_run_id`.
-2. Provider plus native Claude Code or Codex session ID, preferring Herdr's official-integration `agent_session` when available and using provider-local metadata as fallback.
-3. Provisional `terminal_id + observed start time`.
+2. Provider plus native session reference — an ID, or a path pending resolution per section 5.4 — preferring Herdr's official-integration `agent_session` when available and using provider-local metadata as fallback.
+3. Provisional `terminal_id + observed start time + collector sequence`.
 
 Rules:
 
+- Provisional identity is scoped to one collector run because `terminal_id` does not survive a cold server restart and physical executions are never continued across an observation gap.
 - A different native session in the same pane creates a new Task Run.
 - Resuming the same native session reactivates the existing Task Run.
 - Moving the same terminal or native session does not create a new Task Run.
@@ -131,6 +133,26 @@ Rules:
 - Multiple prompts inside one native session are not automatically split.
 - Finer semantic boundaries require explicit Controller events.
 - Pane closure or process exit changes execution state, not semantic task completion.
+
+### 5.4 Identity binding and merge rules
+
+A Task Run is keyed by exactly one of, in priority order: K1 explicit Controller `task_run_id`; K2 provider plus native session reference; K3 provisional `terminal_id + observed start time + collector sequence`. Observed start time is the collector's wall-clock timestamp, at millisecond precision, of the first observation of the execution, and the collector sequence disambiguates same-millisecond observations; both are opaque key components, never ordering keys. K3 keys are scoped to one collector run and therefore never survive a server restart or a collector restart.
+
+Native session references arrive as an ID or as a path. A Herdr `agent_session` of kind `id`, or provider-local metadata, yields the session ID directly. A reference of kind `path` is resolved to the session ID by the provider adapter when the file is readable; until then it is an opaque path-keyed reference and is never assumed equal to any ID. When a path resolves to an ID that no run owns, the run is re-keyed to that ID; when another run already owns the ID, the path-keyed run merges into it.
+
+Merges happen only on explicit evidence, never by inference:
+
+- K3 merges into K2 when the native session ID for that execution appears.
+- K3 or K2 merges into K1 when a Controller event carries a native session ID or terminal identity that matches the run.
+- Two K3 runs that resolve to the same native session merge into one run.
+
+Every merge is preflighted by simulating the contracted graph: a merge that would create a self-edge, a dependency cycle, a dispatch cycle, or two differing dispatch parents is deferred and surfaced as a conflict in diagnostics rather than applied. When only one of the runs has a dispatch parent the merge carries it over, and identical parents deduplicate to one edge. On an applied merge the surviving Task Run keeps the highest-priority key; executions, Agent Nodes, events, and edges are repointed; the superseded key is retained as an alias, and events addressed to an alias resolve to the survivor before deduplication or placeholder creation.
+
+A native session identity binds durably to at most one K1 run. Terminal identity is a point-in-time selector, not a durable reservation: a Controller binding by terminal identity matches the run whose execution is currently live on that terminal, and when none is live, the Controller run stays `unbound` with a diagnostic. A second K1 run claiming an already-bound native session is rejected as `conflict` and stays `unbound`. A Controller Task Run that carries no binding identity stays a separate semantic run and is surfaced as `unbound` in diagnostics and source coverage; it binds later only through an explicit event that carries binding identity.
+
+A Task Run may span multiple executions, sequentially or concurrently — for example the same native session resumed in two panes. Task Run to execution is one-to-many; each execution keeps its own execution state and its own hosting pane while the task state stays single.
+
+Provider-sourced events always attribute to the native-session-keyed Task Run or its merge target. Controller-declared sub-runs inside one native session are semantic children connected by execution edges; provider events are never attributed to them by inference.
 
 ## 6. Execution tree and task dependency DAG
 
@@ -145,14 +167,17 @@ Session
 ├── Workspace: api
 │   ├── Tab: implementation
 │   │   ├── Pane w1:p1
-│   │   │   └── Task Run: controller
-│   │   │       ├── Claude sub-agent: investigate
-│   │   │       └── Codex sub-agent: implement
-│   │   └── Pane w1:p2
-│   │       └── Task Run: tests [unlinked]
+│   │   │   └── Task Run: controller (Claude)
+│   │   │       └── Claude native sub-agent: investigate
+│   │   ├── Pane w1:p2
+│   │   │   └── Task Run: implement (Codex)  [dispatched by: controller]
+│   │   └── Pane w1:p3
+│   │       └── Task Run: tests  [unlinked]
 │   └── Tab: review
 └── Workspace: docs
 ```
+
+Native sub-agent nesting appears only beneath a Task Run of the same provider, because provider metadata is the only source of native parent-child edges and no provider's metadata can establish a cross-provider edge. A Controller `dispatch` links Task Runs across panes with an execution edge; the execution tree remains the physical tree and renders that edge as a `[dispatched by: …]` annotation on the child rather than re-parenting it. Each execution has one physical parent — the pane hosting it; the tree shows a Task Run under the pane of its most recent live execution, and a run with concurrent executions appears under each hosting pane with a shared-run marker. A Task Run has at most one semantic dispatch parent, so the execution view stays a tree because semantic parentage is annotation, not position. Grouping by dispatch parent belongs to the dependency view.
 
 ### 6.2 Task dependency DAG
 
@@ -167,7 +192,7 @@ Nesting must not be used to represent every dependency. A Task Run can depend on
 
 ### 6.3 Unlinked rule
 
-A task observed in another pane is displayed as an independent Task Run with `unlinked` relationship status unless an explicit event links it.
+A task observed in another pane is displayed as an independent Task Run with `unlinked` relationship status unless an explicit event links it or the identity rules in section 5.4 establish it as another execution of an existing Task Run.
 
 Herdr Top must not infer a Controller relationship from:
 
@@ -194,9 +219,9 @@ Herdr is authoritative for:
 - active and focused pane metadata;
 - plugin paths and invocation context.
 
-The collector connects through `HERDR_SOCKET_PATH`, fetches an initial snapshot, and subscribes to events. Reconnect always triggers a fresh snapshot before subscription resumes.
+The collector connects through `HERDR_SOCKET_PATH` and converges in a fixed order: subscribe to events first, buffer pushed events, fetch `session.snapshot` as the authoritative base, apply it, then replay the buffered events in receipt order, dispatching each by kind — creation events upsert their entity and closure events remove it. Anomaly classification happens at the buffer's drain boundary: an update for an entity absent from the snapshot, from the buffered creations, and from any later buffered closure marks the collector `RECONCILING` and triggers a resnapshot with a fresh buffer generation, bounded to three attempts before the collector stays `RECONCILING` and reports non-convergence rather than silently entering `LIVE`. Events arriving during replay append to the current generation's buffer, and the collector enters `LIVE` only after the buffer drains cleanly. Version fields are compared only where a pushed event actually carries one; most Herdr events carry none, so replay relies on idempotent upserts keyed by entity identity, not on version arithmetic. Herdr's event stream carries no global sequence number or replay cursor, so continuity can never be proven by the server. The collector therefore records an observation gap for any interval without an active subscription — initial startup, reconnects, and socket replacement included — and reconnect always repeats the subscribe-buffer-snapshot sequence. Gap reconciliation is uniform: every observation gap — startup, reconnect, socket replacement — retires every pre-gap execution and applies the attachment and closure rule of section 10.1 step 8 before buffered replay, while a resnapshot under an active subscription is not an observation gap and reconciles in place. Herdr's `seq` field on token-metadata reports orders that metadata only; it is not an event-stream cursor.
 
-A valid Herdr-reported `agent_session` is the preferred source for the top-level native session identity. Its absence does not prevent physical monitoring; the Claude or Codex adapter can resolve the identity from provider-local metadata. Conflicting identities are not merged by inference and are surfaced through diagnostics and source coverage.
+A valid Herdr-reported `agent_session` is the preferred source for the top-level native session identity. Its absence does not prevent physical monitoring; the Claude or Codex adapter can resolve the identity from provider-local metadata. Conflicting identities are not merged by inference; they follow the binding and merge rules in section 5.4 and are surfaced through diagnostics and source coverage.
 
 References: [Herdr CLI reference](https://herdr.dev/docs/cli-reference/), [Herdr Socket API](https://herdr.dev/docs/socket-api/).
 
@@ -232,7 +257,7 @@ A Controller or custom orchestrator can publish:
 
 `dispatch` records an execution parent-child relationship. `depends_on` records a dependency DAG edge. Neither implies the other.
 
-The collector owns a session-scoped Unix domain socket at `collector.sock` with current-user-only permissions. `herdr-top emit` sends one versioned JSON event and waits for `accepted`, `duplicate`, or `rejected`.
+The collector owns the session-scoped Controller-socket responsibility at its resolved runtime-directory path (section 10) with current-user-only permissions. `herdr-top emit` sends one versioned JSON event and waits for `accepted`, `duplicate`, or `rejected`.
 
 The minimum envelope contains:
 
@@ -244,6 +269,18 @@ The minimum envelope contains:
 - optional label, progress, reason, provider, native session ID, and terminal identity.
 
 The collector deduplicates by `event_id` and rejects dependency cycles. If the collector is unavailable, `emit` warns but exits successfully by default so monitoring cannot stop orchestration. `--strict` returns non-zero for callers that require enforcement.
+
+Envelope direction fields are explicit: `task_run_id` names the subject of the event; `depends_on_id` names the prerequisite the subject depends on; `parent_task_run_id` names the dispatch parent.
+
+Every event passes one pipeline in order: alias resolution, then `event_id` deduplication, then validation against current reducer state with any placeholders staged, then — on rejection — the staged placeholders are discarded, or — on acceptance — ingest-sequence assignment, application, enqueue to the single SQLite writer, and acknowledgement. Alias resolution first means an event naming a merged-away key applies to the surviving run before deduplication and before any placeholder is created. Rejected events leave no trace beyond diagnostics: their `event_id` does not enter the deduplication set, so a corrected retry may reuse it.
+
+Events referencing an unknown Task Run are forward references and are the normal case for a Controller announcing work before it starts. The unknown-endpoint rules cover every event: `dispatch` creates placeholders for an unknown subject and an unknown `parent_task_run_id`; `depends_on` creates placeholders for an unknown subject and an unknown `depends_on_id`; `task_started` on an unknown run creates it directly in `running`; `blocked` and `progress` on unknown runs create runs in `blocked` and `queued` respectively; `complete`, `failed`, and `cancelled` on unknown runs create them directly in that terminal state, flagged in diagnostics. Placeholders carry no execution. Relationship state follows the creating event: runs created by the relationship events `dispatch` and `depends_on` are `linked` because the creating edge is an explicit semantic relationship in the sense of section 8.3; runs created by task-state forward references start `unlinked` until an explicit edge links them — Controller ownership and relationship state are independent axes. Cycle rejection evaluates the dependency DAG including placeholders.
+
+The reducer assigns every accepted event a global monotonic ingest sequence at validation time, and transitions apply in ingest order. Envelope timestamps are display metadata, never ordering keys. Because the responder replies only after reducer validation, rejection reasons that depend on reducer state are decidable at ack time. `accepted` therefore means validated, deduplicated, sequenced, and enqueued to the single SQLite writer; durability follows within the writer's flush interval of at most one second, and a crash inside that window can drop an acknowledged event — the bound is stated so Controllers can reason about it. `duplicate` is reserved for a repeated `event_id`; a semantically identical event under a new `event_id` — including one that re-states an existing resolved edge — is an `accepted` no-op everywhere. `rejected` carries one reason: `invalid`, `cycle`, `conflict`, `stale_event`, or `unsupported_version`. A `schema_version` greater than 1 is rejected as `unsupported_version`.
+
+Controller task-state events are `task_started`, `blocked`, `progress`, `complete`, `failed`, and `cancelled`; `dispatch` and `depends_on` are relationship events and do not make a run Controller-owned. Task-state transitions are fixed. `task_started`: from `queued`, `blocked`, or `ended_unknown` to `running`; in `running` it is an `accepted` no-op; on another terminal state it is rejected as `stale_event`. `blocked`: from `queued`, `running`, or `ended_unknown` to `blocked`; in `blocked` it is an `accepted` no-op. `progress`: accepted in `queued`, `running`, or `blocked` without changing state; on `ended_unknown` it reactivates the run to `running`. `blocked` and `progress` on `completed`, `failed`, or `cancelled` are `accepted` no-ops that increment a diagnostic counter. `complete`, `failed`, `cancelled`: from any non-terminal state to the corresponding terminal state; any of the three refines `ended_unknown` because the Controller outcome is authoritative; the same terminal type on the same terminal state is an `accepted` no-op, and a different terminal type on `completed`, `failed`, or `cancelled` is rejected as `conflict`. `depends_on`: accepted until the subject is terminal, except that re-stating an existing resolved edge is an `accepted` no-op in any state; a cycle is rejected as `cycle`. `dispatch`: rejects self-parenting and any edge whose parent chain reaches the subject as `cycle`; otherwise accepted at any time; re-stating the same parent is an `accepted` no-op, and naming a different parent for a run that already has one is rejected as `conflict`.
+
+Relationship-only placeholder runs — runs with no execution and no task-state event — never close automatically: edges never propagate terminality, and closing announced work without evidence would be inference. They stay `queued` until a task-state event or an execution bound under the section 5.4 rules arrives. A maximal weakly connected component of such runs across execution and dependency edges is a dangling announcement when it has no non-terminal outside neighbor, surfaced through a diagnostic counter. A run in `ended_unknown` that gains a new execution — the same native session resuming — reactivates to `running`.
 
 Controller events are optional for read-only live monitoring but required for a complete cross-pane execution relationship or task DAG.
 
@@ -260,7 +297,7 @@ Execution state, task state, relationship state, and observation quality are sep
 - `stale`
 - `ended`
 
-`stale` is temporary. An execution that disappears without an authoritative close remains stale for 30 seconds. If a fresh snapshot still cannot find it, execution becomes `ended`. Explicit pane close or process exit moves directly to `ended`. Reappearance of the same native session during the grace period restores its live state.
+`stale` is temporary and applies only during uninterrupted live observation. An execution that disappears without an authoritative close remains stale for 30 seconds. If a fresh snapshot still cannot find it, execution becomes `ended`. Explicit pane close or process exit moves directly to `ended`. Reappearance of the same native session during the grace period restores its live state. The grace never applies across an observation gap — see section 10.1 step 8.
 
 ### 8.2 Task state
 
@@ -270,8 +307,11 @@ Execution state, task state, relationship state, and observation quality are sep
 - `completed`
 - `failed`
 - `cancelled`
+- `ended_unknown`
 
 Activity, stale timeout, pane closure, and process exit do not mark a Task Run completed or infer a percentage. A Controller Task Run still marked `running` or `blocked` remains visible even with no live execution.
+
+`ended_unknown` is the terminal state for closure with unknown outcome. It is entered automatically only by a Task Run that has never received a Controller task-state event, when its last execution reaches `ended`. It never claims success or failure — execution end still never implies semantic completion. A Task Run that has received any Controller task-state event never enters `ended_unknown` automatically; a Controller run still marked `running` or `blocked` remains visible with no live execution, as above. A later Controller terminal event refines `ended_unknown` into the reported outcome, any other Controller task-state event reactivates it, and a resumed execution reactivates the run, as defined in section 7.3.
 
 ### 8.3 Relationship state
 
@@ -322,7 +362,7 @@ flowchart LR
 
 | Component | Responsibility |
 | --- | --- |
-| Herdr collector | Snapshot, event subscription, reconnect, and resnapshot. |
+| Herdr collector | Event subscription, snapshot, buffered replay, reconnect, and bounded resnapshot. |
 | Claude adapter | Watch or scan and normalize Claude session and sub-agent information. |
 | Codex adapter | Watch or scan and normalize Codex session and sub-agent information. |
 | Controller-event input | Validate and acknowledge semantic events over local IPC. |
@@ -339,12 +379,12 @@ Collectors send normalized events through bounded in-process channels. The reduc
 
 One owner process per Herdr named session owns the collector, reducer, writer, event socket, and TUI.
 
-An OS advisory lock is scoped to a stable key derived from the Herdr session or socket namespace, never from launch cwd.
+An OS advisory lock is scoped to the session key derived by the resolver in section 10, never from the socket path or launch cwd.
 
 Startup:
 
 1. Resolve the session key and attempt the advisory lock.
-2. If acquired, remove only the stale Herdr Top socket, open the database, reconcile, and become owner.
+2. If acquired, validate or initialize the runtime sentinel per section 10 — initialize it on first launch, remove the socket only when the sentinel names this session and no live endpoint answers, treat a mismatched sentinel as a collision error, and surface a socket without a sentinel as an unsafe orphan without removing it — then open the database, reconcile, and become owner, entering the degraded Controller-input mode of section 10 when the socket path is unusable.
 3. If held, validate and focus the recorded owner pane, then exit without opening SQLite as writer.
 4. If focus fails while the lock remains held, report owner information and do not start a second collector.
 
@@ -357,12 +397,14 @@ The OS releases the lock when the owner exits or crashes. A live but hung owner 
 SQLite is the source of truth for recoverable Herdr Top state.
 
 ```text
-$HERDR_PLUGIN_STATE_DIR/sessions/<session-key>/collector.lock
-$HERDR_PLUGIN_STATE_DIR/sessions/<session-key>/collector.sock
-$HERDR_PLUGIN_STATE_DIR/sessions/<session-key>/herdr-top.sqlite3
+${XDG_STATE_HOME:-$HOME/.local/state}/herdr-top/sessions/<session-key>/collector.lock
+${XDG_STATE_HOME:-$HOME/.local/state}/herdr-top/sessions/<session-key>/herdr-top.sqlite3
+${XDG_STATE_HOME:-$HOME/.local/state}/herdr-top/sessions/<session-key>/session-name.txt
+<runtime-dir>/herdr-top/<hash16>.sock
+<runtime-dir>/herdr-top/<hash16>.name
 ```
 
-The path-safe `session-key` comes from the Herdr session or socket namespace. Different directories in the same default session share it; different named sessions do not.
+The path-safe `session-key` is derived from the Herdr named session name and from nothing else — never from the socket path, which can change across restarts and handoffs, and never from the launch cwd. Every launch context resolves the name through the same rule, in order: an explicit `--session <name>` flag; otherwise a non-empty `HERDR_SESSION` environment value; otherwise, inside a managed pane (`HERDR_ENV=1`), the reserved name `default`, matching the CLI convention that `default` names the unnamed session. Empty environment values count as unset, and the presence rule for `HERDR_SESSION` is observed behavior aligned with that CLI convention rather than a documented pane invariant, so `doctor` cross-checks the resolved key against the session socket layout as a consistency check — never as key derivation. `--socket <path>` overrides only the connection target and must be paired with `--session` in every context, because a snapshot does not reveal the session name. `emit` without a resolvable session name warns and exits 0 by default, or non-zero under `--strict`; an owner or TUI launch that cannot resolve a session name fails non-zero before touching any lock or state path, and `doctor` reports an unresolved session as a structured diagnostic. The session-key encoding rejects an empty name and names consisting only of dots, then forms `<sanitized>-<hash16>`: the name's UTF-8 bytes with ASCII letters lower-cased (no Unicode folding), every byte outside `[a-z0-9._-]` and any leading `.` replaced by `_`, truncated to 48 bytes, followed by the first 16 hex digits of the SHA-256 of the exact original name — so hostile names cannot traverse paths and accidental collisions, including case-only differences on case-insensitive filesystems, are avoided. The state directory records the exact original name in `session-name.txt`; a mismatch at startup refuses to open the directory, converting even a deliberate hash collision into a detected error. The Controller socket cannot live under the state root because home-directory paths overflow the platform socket-path length limit (108 bytes on Linux, 104 on macOS); it lives at `<runtime-dir>/herdr-top/<hash16>.sock`, where `<runtime-dir>` is `$XDG_RUNTIME_DIR` when set and otherwise `${TMPDIR:-/tmp}/herdr-top-<uid>`, `<hash16>` is the same 16 hex digits, and every component preflights the full socket path against the platform limit and fails with a clear error instead of binding a truncated path. Both runtime directory levels are created or opened without following symlinks; a pre-existing entry must be a real directory owned by the effective UID with mode exactly 0700, and anything else aborts without chmod or bind; the socket and its sentinel are created relative to the validated directory handle. Next to the socket lives a runtime sentinel `<hash16>.name` containing the exact session name. The sentinel is published atomically before the socket is bound: the name is written and synced to a private 0600 temp file with a fresh unique name per publication attempt — never a fixed path, so an abandoned temp from a crash neither blocks future publication nor races another publisher — then installed at `<hash16>.name` with no-replace semantics, so the final path never exposes empty or partial contents; when the final sentinel already exists the temp file is discarded and the existing contents are validated — a different name is a collision error, the same name proceeds. A socket with no sentinel beside it is an unsafe orphan: it is surfaced as a diagnostic and never unlinked automatically. On orderly shutdown an owner that successfully bound the Controller socket, while still holding the state lock, closes and unlinks only that bound socket; an unbound owner unlinks nothing; the sentinel is retained in both cases. Before any unlink or bind, a sentinel naming a different session is a collision error, never staleness; a socket is stale only when this session's state lock is held, the sentinel names this session, and no live endpoint answers. When the socket path is unusable — an unsafe orphan, a collision, a live endpoint answering under this session's lock, or a bind failure — the owner still starts with the Controller-event input unavailable: a named diagnostic condition that leaves section 8.4 observation quality unchanged, appears in the header's source coverage, and carries a persistent diagnostic with `doctor` guidance. Neither the Controller socket nor the final sentinel is unlinked because of these conditions; private publication temps are discarded as specified above, and `emit` retains the best-effort failure policy of section 7.3. `emit` itself connects only after validating that the runtime sentinel names its resolved session; on a mismatch it delivers nothing, warns, and exits 0, or non-zero under `--strict`. A live endpoint that answers without being owned by the process holding this session's state lock — whether no process holds the lock or another process currently holds it — is reachable only through an implementation bug; possible `emit` delivery to it is an accepted residual risk surfaced by `doctor`, not a protocol concern. Owning the event socket, wherever this document states it — the section 2 process-model row, section 7.3, and section 9.3 — means owning the responsibility for it; a degraded, unbound Controller input is reported, never silently assumed away. `HERDR_PLUGIN_STATE_DIR` is available only to plugin-invoked processes and is path discovery only, so Herdr Top writes a single-line breadcrumb file `state-root.txt` there (mode 0600, rewritten at each plugin-context launch) pointing at the canonical state root for `doctor`; it is never the rendezvous path. Launches from different directories in the same named session share state; different named sessions do not.
 
 Initial tables:
 
@@ -377,15 +419,15 @@ SQLite runs in WAL mode through bundled `rusqlite`.
 
 After every successful owner launch:
 
-1. Remove only the stale IPC socket inside the acquired session directory.
+1. Validate the runtime sentinel per section 10 and remove Herdr Top's own IPC socket only when that check proves it stale; a socket without a sentinel is never removed automatically.
 2. Back up the database before schema migration.
 3. Open and migrate the database.
 4. Load persisted Task Runs, Agent Nodes, edges, and recent events.
 5. Connect to the current Herdr named session.
-6. Fetch a fresh workspace, tab, pane, terminal, and agent snapshot.
-7. Reconcile physical nodes by `terminal_id` and semantic nodes by the identity rules.
-8. Mark non-authoritatively missing executions `stale` and apply the 30-second grace.
-9. Subscribe to Herdr and provider changes and enter the TUI.
+6. Subscribe to Herdr events and buffer pushed events.
+7. Fetch a fresh workspace, tab, pane, terminal, and agent snapshot.
+8. Reconcile: physical executions never survive an observation gap. Every persisted execution is retired as `ended`, and fresh executions are constructed from the snapshot. Corroborated identity preserves the Task Run, not the execution record: a fresh execution attaches to an existing Task Run only when both sides carry equal, non-empty native session identities — the live side preferring Herdr's reported `agent_session` and falling back to the provider adapter's resolved identity. A disagreement between those two sources is not corroboration and is surfaced as a diagnostic, a kind-`path` reference that has not resolved to an ID never corroborates, and provisional runs from before the gap gain no new execution because they carry no identity to match. Retirement and attachment are evaluated together: automatic closure per section 8.2 applies only to runs left with no live execution after reconciliation. Semantic nodes reconcile only by the identity rules in sections 5.3 and 5.4.
+9. Replay the buffered events idempotently, subscribe to provider changes, and enter the TUI.
 
 A second invocation does not reconcile because it does not acquire the lock.
 
@@ -393,8 +435,8 @@ A second invocation does not reconcile because it does not acquire the lock.
 
 - Detach and reattach: owner keeps running.
 - Cold Herdr restart: arbitrary monitor processes end; Herdr Top is not auto-started.
-- Next manual launch: load SQLite, fetch a fresh snapshot, and reconcile.
-- Live Herdr handoff or socket replacement: enter `RECONCILING`, reconnect, resnapshot, resubscribe, and show an event-gap warning when continuity is unprovable.
+- Next manual launch: load SQLite, subscribe, fetch a fresh snapshot, and reconcile.
+- Live Herdr handoff or socket replacement: enter `RECONCILING`, reconnect with the subscribe-buffer-snapshot sequence, record a collector-attested event gap for the disconnected interval, and apply section 10.1 step 8's retirement and attachment rule before replay; server-side continuity is never assumed.
 - Provider source loss: retain Herdr topology in `DEGRADED / Herdr-only` mode.
 
 Herdr restores its own topology and supported agent sessions. Herdr Top restores only its semantic model.
@@ -408,7 +450,7 @@ Herdr restores its own topology and supported agent sessions. Herdr Top restores
 - Parents or dependencies referenced by active Task Runs are not pruned.
 - Cleanup runs at startup and periodically after ingestion.
 
-The default TUI shows all non-terminal Task Runs plus runs that became `completed`, `failed`, `cancelled`, or unlinked `ended / outcome unknown` during the last hour. Older retained runs remain filterable.
+The default TUI shows all non-terminal Task Runs plus runs that entered a terminal state — `completed`, `failed`, `cancelled`, or `ended_unknown` — during the last hour. Older retained runs remain filterable.
 
 Prompts, responses, terminal scrollback, and raw provider payloads are not retained.
 
@@ -436,7 +478,7 @@ Required behavior:
 - manual scroll disables follow; `f` or End resumes it;
 - expand/collapse and filtering that retains matching ancestors;
 - execution-tree and dependency-DAG toggle;
-- distinct `unlinked`, `blocked`, `stale`, `ended`, and terminal task states;
+- distinct `unlinked`, `blocked`, `stale`, `ended`, `ended_unknown`, and other terminal task states;
 - selection moves to a surviving ancestor or neighbor when its node closes, with the reason shown;
 - `?` opens key help and setup guidance;
 - minimum-size screen and safe truncation for narrow panes and wide Unicode;
@@ -489,7 +531,7 @@ For update, press `q` while agents continue, then run:
 herdr plugin install mageyuki/herdr-top --yes
 ```
 
-Reinstallation replaces the managed checkout. Databases and settings remain in plugin state/config directories. Automatic update is deferred.
+Reinstallation replaces the managed checkout. Databases live under the Herdr Top state root defined in section 10 and settings in the plugin config directory, so both survive reinstalls. Automatic update is deferred.
 
 ### 12.2 Release artifacts and Marketplace
 
@@ -516,7 +558,7 @@ Herdr logs remain available through:
 herdr plugin log list --plugin mageyuki.herdr-top
 ```
 
-`doctor` checks Herdr socket, session key, lock, database schema, provider discovery, Herdr official-integration versions, plugin/CLI compatibility, native-session coverage, and log locations without printing prompts or responses. For Herdr 0.8.0 native session restore, it expects Claude Code integration version 6 or newer and Codex integration version 5 or newer. Missing or older integrations do not block Herdr-only monitoring, but diagnostics explain the unavailable `agent_session` and restore coverage.
+`doctor` checks Herdr socket, session key and its resolver source (flag, environment, or `default`), breadcrumb validity, the state-root `session-name.txt` record, the runtime sentinel, current Controller-socket availability and its reason, socket-path length, lock, database schema, provider discovery, Herdr official-integration versions, plugin/CLI compatibility, native-session coverage, and log locations without printing prompts or responses. For Herdr 0.8.0 native session restore, it expects Claude Code integration version 6 or newer and Codex integration version 5 or newer. Missing or older integrations do not block Herdr-only monitoring, but diagnostics explain the unavailable `agent_session` and restore coverage.
 
 ## 13. Technology stack
 
@@ -544,13 +586,13 @@ Provider adapters must not force unstable Claude Code or Codex JSON into an over
 - Parsers tolerate optional and unknown fields.
 - Malformed provider events are logged and skipped without terminating the TUI.
 - Provider loss yields `DEGRADED` with Herdr-only monitoring.
-- Herdr socket loss yields `DISCONNECTED`, bounded reconnect, then resnapshot/resubscribe through `RECONCILING`.
-- Unprovable reconnect continuity is shown as an event gap.
-- Controller socket access is limited to the current user.
+- Herdr socket loss yields `DISCONNECTED`, bounded reconnect, then the subscribe-buffer-snapshot sequence through `RECONCILING`.
+- Reconnect continuity is never provable; every disconnected interval is recorded and shown as a collector-attested event gap.
+- The state root, runtime socket directory, database, backups, and the runtime sentinel `<hash16>.name` are restricted to the current user: directories 0700, files 0600.
 - Duplicate Controller events are acknowledged; cyclic dependencies are rejected.
 - Best-effort `emit` failure warns but cannot terminate orchestration; `--strict` is opt-in.
 - Migration backs up the database first. Failure stops startup and never resets the database automatically.
-- Provisional nodes remain until a snapshot resolves them.
+- Provisional nodes remain until the identity rules resolve, merge, or close them.
 - Missing semantic links remain `unlinked`.
 - The header shows hostname so identical remote session names are distinguishable.
 - Panic handling restores the terminal where the platform permits.
@@ -562,11 +604,14 @@ Provider adapters must not force unstable Claude Code or Codex JSON into an over
 - sanitized Claude and Codex fixtures, including recursive depth-two and depth-three sub-agents, unknown parents, unknown-field tolerance, and redaction;
 - Task Run identity priority and provisional merge;
 - Herdr `agent_session` preference, provider-local fallback, and conflicting-identity handling;
-- reducer transitions, stale grace, and ended-without-outcome;
+- reducer transitions, live-observation stale grace versus observation-gap retirement, and `ended_unknown` closure;
 - execution-edge versus dependency-edge separation;
 - cycle rejection and event deduplication;
 - tree ordering, selection, and retention calculations;
-- execution, task, relationship, and observation-quality separation.
+- execution, task, relationship, and observation-quality separation;
+- identity binding: path-to-ID promotion, single-K1 binding conflicts, merge preflight on contracted graphs including self-edges and cycles, and direct-dispatch cycle rejection;
+- relationship-only placeholders staying `queued` and dangling-announcement diagnostics;
+- `ended_unknown` refinement, reactivation by task-state events, and reactivation by resumed executions.
 
 ### Integration tests
 
@@ -576,9 +621,11 @@ Provider adapters must not force unstable Claude Code or Codex JSON into an over
 - same-session resume and different-session pane reuse;
 - provider file watch and two-second fallback scan;
 - Controller acknowledgements, best-effort failure, and `--strict`;
-- reconnect, resnapshot, resubscribe, and event-gap indication;
+- reconnect with the subscribe-buffer-snapshot sequence and collector-attested event-gap indication;
 - second-launch focus and released-lock recovery;
-- `q` proving agent processes remain untouched.
+- `q` proving agent processes remain untouched;
+- session-key resolver fallback order, `--socket` pairing enforcement, hostile session names, maximum-length socket paths, socket-collision detection via the runtime sentinel, hostile runtime-directory states (symlink, wrong owner, wrong mode), and runtime-sentinel lifecycle (first launch, crash before sentinel publication restarting successfully with an abandoned temp present, crash between publication and bind, unsafe orphans, concurrent colliding-name creation, degraded Controller-input startup on unusable socket paths, `emit` refusing delivery on sentinel mismatch, and orderly shutdown and relaunch in both bound and degraded-unbound states);
+- Task Run continuity with corroborated identity: physical executions replaced across the three observation-gap kinds — startup, reconnect, and socket replacement — and live resnapshot-in-place reconciling without replacement under the live-observation stale rule.
 
 ### TUI tests
 
@@ -643,25 +690,25 @@ Herdr Top's differentiating combination is:
 
 1. A regular managed pane or tab connects to its Herdr named session.
 2. Live workspaces, tabs, panes, Claude/Codex executions, and available recursively nested native sub-agents are shown.
-3. `terminal_id` preserves identity across pane moves.
-4. Cross-pane runs remain `unlinked` without explicit Controller events.
+3. `terminal_id` preserves identity across pane moves while the server runs; after a cold restart, reconciliation relies on Task Run identity rules alone and never on stale physical identifiers.
+4. Cross-pane runs remain `unlinked` without an explicit Controller relationship event; execution and dependency edges are the only linking evidence.
 5. `dispatch` and `depends_on` create distinct persisted execution and dependency edges.
 6. Duplicate events are idempotent and cycles are rejected.
 7. Watched changes normally reach the screen within one second; fallback scan is about two seconds.
 8. Provider failure leaves `DEGRADED / Herdr-only` visibility.
-9. Non-authoritative disappearance is `stale` for 30 seconds before `ended`.
+9. Non-authoritative disappearance during live observation is `stale` for 30 seconds before `ended`; across an observation gap executions retire immediately.
 10. Execution end never implies semantic completion.
 11. All non-terminal runs remain visible regardless of age.
-12. Terminal and unlinked ended runs remain default-visible for one hour and filterable for 30 days.
+12. Runs in a terminal state, including `ended_unknown`, remain default-visible for one hour and filterable for 30 days.
 13. Events are bounded to seven days and 100,000 per named session.
 14. The fixed TUI supports scroll, stable selection, activity, follow, help, and narrow panes.
 15. Header always shows host, session, workspace count, quality, lag, and coverage.
 16. `q` stops only Herdr Top; agents continue.
 17. Detach/reattach keeps the collector running.
 18. Cold restart stops the collector; next manual launch restores from SQLite and reconciles.
-19. Live handoff reconnects, resnapshots, and resubscribes, showing gaps when needed.
+19. Live handoff reconnects with the subscribe-buffer-snapshot sequence, and the disconnected interval is recorded and shown as a collector-attested event gap.
 20. Second launch focuses the owner and creates no second writer.
-21. Different cwd launches in one default session share state; named sessions remain isolated.
+21. Launches from different directories in the same named session — including the unnamed `default` session — share state through the session-key rule; different named sessions remain isolated.
 22. Completion and progress are never inferred from tokens, context, or activity.
 23. Core monitoring works without Superpowers and without standalone CLI.
 24. First launch explains optional CLI setup without modifying `PATH`.
