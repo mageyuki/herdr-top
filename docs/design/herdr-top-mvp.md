@@ -22,8 +22,10 @@ Repository: [mageyuki/herdr-top](https://github.com/mageyuki/herdr-top)
 | Hierarchy | Herdr physical topology plus Task Run and native sub-agent nesting |
 | Cross-pane relationship | Independent and `unlinked` unless an explicit dependency event exists |
 | Dependency representation | A DAG separate from the execution tree |
-| Persistence | SQLite as the source of truth |
-| Restart behavior | Restore persisted Task Runs and edges, then reconcile with the live Herdr snapshot |
+| Persistence | Session-scoped SQLite as the source of truth |
+| Process model | One collector, SQLite writer, and TUI process per Herdr session |
+| Second launch | Focus the existing Herdr Top pane instead of starting another collector |
+| Restart behavior | After the owner process exits, the next launch acquires the session lock, restores persisted state, and reconciles with the live Herdr snapshot |
 | Implementation language | Rust |
 | Initial platforms | macOS and Linux |
 | License | MIT |
@@ -53,6 +55,7 @@ The MVP does not:
 - Support providers other than Claude Code and Codex.
 - Support Windows in the initial release.
 - Require OpenTelemetry, LangSmith, Langfuse, or another hosted observability service.
+- Run multiple simultaneous TUI clients or perform automatic collector leader election.
 
 ## 5. Management units and terminology
 
@@ -280,15 +283,35 @@ Collectors send normalized events through in-process channels. The reducer seria
 
 The TUI renders in-memory state. It must not query SQLite on every frame.
 
+### 9.3 Session singleton
+
+The MVP runs exactly one Herdr Top owner process per Herdr session. That process owns the collector, reducer, SQLite writer, local Controller-event socket, and TUI.
+
+The owner is selected with an OS advisory file lock scoped to a stable Herdr session key. The key is derived from the Herdr session/socket namespace, never from the launch working directory.
+
+Startup behavior:
+
+1. Resolve the current Herdr session key.
+2. Attempt to acquire the session's advisory lock.
+3. If the lock is acquired, remove any stale Herdr Top IPC socket, open the session database, and start as owner.
+4. If the lock is already held, validate the recorded owner pane, ask Herdr to focus that pane, and exit successfully without opening SQLite as a writer.
+5. If focusing fails while the lock remains held, report the existing owner information and exit without starting a second collector.
+
+The operating system releases the advisory lock when the owner process exits or crashes. A later invocation can then acquire the lock and recover. A process that is alive but hung continues to own the lock; automatic lease expiry, forced takeover, fencing tokens, and leader election are outside the MVP. The operator must close or terminate the hung pane before restarting Herdr Top.
+
 ## 10. Persistence and restart behavior
 
 SQLite is the source of truth for recoverable Herdr Top state. JSONL may be offered later for debugging or export, but it is not the primary database.
 
-Recommended database location:
+Session-scoped runtime and database locations:
 
 ```text
-$HERDR_PLUGIN_STATE_DIR/herdr-top.sqlite3
+$HERDR_PLUGIN_STATE_DIR/sessions/<session-key>/collector.lock
+$HERDR_PLUGIN_STATE_DIR/sessions/<session-key>/collector.sock
+$HERDR_PLUGIN_STATE_DIR/sessions/<session-key>/herdr-top.sqlite3
 ```
+
+`<session-key>` is a stable, path-safe identifier derived from the Herdr session/socket namespace. Different launch directories within the same default Herdr session resolve to the same key. Different named sessions resolve to different keys.
 
 Initial logical tables:
 
@@ -307,15 +330,18 @@ SQLite runs in WAL mode. Database access uses `rusqlite` with bundled SQLite to 
 
 ### 10.1 Startup reconciliation
 
-On launch or restored plugin-pane start:
+After acquiring the session lock on launch or restored plugin-pane start:
 
-1. Open and migrate the database.
-2. Load the persisted current-session Task Runs, Agent Nodes, edges, and recent events.
-3. Connect to the Herdr socket for the current named session.
-4. Fetch a fresh workspace, tab, pane, and agent snapshot.
-5. Reconcile live physical nodes with persisted semantic nodes.
-6. Mark persisted executions missing from the live snapshot as stale or ended rather than silently deleting them.
-7. Subscribe to live events and enter the fixed-screen TUI.
+1. Remove only the stale IPC socket inside the acquired session directory.
+2. Open and migrate the session database.
+3. Load the persisted current-session Task Runs, Agent Nodes, edges, and recent events.
+4. Connect to the Herdr socket for the current named session.
+5. Fetch a fresh workspace, tab, pane, and agent snapshot.
+6. Reconcile live physical nodes with persisted semantic nodes.
+7. Mark persisted executions missing from the live snapshot as stale or ended rather than silently deleting them.
+8. Subscribe to live events and enter the fixed-screen TUI.
+
+If the lock is already held, this reconciliation path does not run. The second invocation focuses the existing owner pane and exits.
 
 Herdr remains responsible for restoring workspaces, tabs, panes, layouts, processes, and supported native agent sessions. Herdr Top restores only its semantic model and reconciles it with Herdr's current state.
 
@@ -476,6 +502,9 @@ The MVP is acceptable when all of the following are true:
 8. Task completion and progress are never inferred from token or context usage.
 9. The core workflow works with Superpowers absent.
 10. No observed prompt or response content is transmitted externally.
+11. A second launch in the same Herdr session focuses the existing Herdr Top pane and does not create another collector or SQLite writer.
+12. After the owner exits or crashes, the next launch acquires the released lock and restores the session state.
+13. Launches from different working directories in the same default Herdr session use the same singleton and database, while different named sessions remain isolated.
 
 ## 18. Deferred capabilities
 
@@ -490,7 +519,9 @@ The following are intentionally deferred beyond the MVP:
 - task-control actions such as cancel, retry, or redispatch;
 - automatic orchestration;
 - plugin marketplace publication automation;
-- public stabilization of the Controller-event protocol.
+- public stabilization of the Controller-event protocol;
+- multiple simultaneous Herdr Top TUI clients;
+- automatic collector restart, leader election, lease expiry, and follower promotion.
 
 ## 19. Documentation policy
 
@@ -514,7 +545,7 @@ The next development session should:
 3. Scaffold the Rust binary and module boundaries.
 4. Add `herdr-plugin.toml` with a minimal pane entrypoint.
 5. Implement the normalized domain model and in-memory reducer first.
-6. Implement SQLite migrations and restart recovery.
+6. Implement the session-key derivation, advisory lock, session-scoped paths, SQLite migrations, and restart recovery.
 7. Add a mocked Herdr collector and render the first fixed-screen tree.
 8. Connect the real Herdr socket.
 9. Add Claude Code and Codex adapters with sanitized fixtures.
