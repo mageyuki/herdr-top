@@ -14,34 +14,46 @@ Repository: [mageyuki/herdr-top](https://github.com/mageyuki/herdr-top)
 | --- | --- |
 | Product name | Herdr Top |
 | Repository and binary | `herdr-top` |
-| Runtime | A managed pane inside the target Herdr session |
-| Required platform | Herdr |
+| Runtime | A regular Herdr-managed pane or tab inside the target named session |
+| Required platform | Herdr 0.8.0 or newer |
 | Agent providers | Claude Code and Codex |
 | Superpowers | Not required and not used as a required data source |
 | Primary view | Fixed-screen, htop-style live TUI |
 | Hierarchy | Herdr physical topology plus Task Run and native sub-agent nesting |
-| Cross-pane relationship | Independent and `unlinked` unless an explicit dependency event exists |
+| Physical pane identity | Herdr `terminal_id` is stable identity; public `pane_id` is the current address |
+| Cross-pane relationship | Independent and `unlinked` unless an explicit Controller event exists |
 | Dependency representation | A DAG separate from the execution tree |
+| Data acquisition | Herdr snapshot/events plus non-invasive Claude/Codex local metadata observation |
+| Provider fallback | Two-second rescan when file watching is unavailable; no terminal-output scraping |
+| Task Run identity | Explicit `task_run_id`, then native session ID, then provisional `terminal_id + start time` |
+| Controller protocol | Versioned JSON over a session-scoped Unix domain socket through `herdr-top emit` |
 | Persistence | Session-scoped SQLite as the source of truth |
-| Process model | One collector, SQLite writer, and TUI process per Herdr session |
+| Retention | Finished Task Runs 30 days; events 7 days and at most 100,000 per session |
+| Process model | One collector, reducer, SQLite writer, event socket, and TUI process per Herdr session |
 | Second launch | Focus the existing Herdr Top pane instead of starting another collector |
-| Restart behavior | After the owner process exits, the next launch acquires the session lock, restores persisted state, and reconciles with the live Herdr snapshot |
+| Quit | `q` stops Herdr Top only; Claude/Codex agents keep running |
+| Restart behavior | Detach keeps the collector alive; cold server restart requires the next manual Herdr Top launch to restore and reconcile |
 | Implementation language | Rust |
-| Initial platforms | macOS and Linux |
+| Initial platforms | macOS arm64/x86_64 and Linux arm64/x86_64 |
+| Distribution | Herdr managed GitHub plugin plus optional standalone CLI for Controller integration |
 | License | MIT |
 
 ## 3. Goals
 
 The MVP must:
 
-- Run as a Herdr plugin pane within the Herdr session being observed.
+- Run as a regular Herdr plugin pane or tab within the Herdr session being observed.
 - Show current Claude Code and Codex activity across the same Herdr session.
 - Make workspace, tab, pane, Task Run, and native sub-agent relationships understandable.
-- Show cross-pane task dependencies only when they are explicitly recorded.
-- Preserve the current execution model across a Herdr server restart and session restore.
+- Show cross-pane task relationships and dependencies only when explicitly recorded.
+- Keep execution topology and task dependencies as separate views.
+- Reflect watched Herdr or provider changes within one second under normal conditions and within about two seconds when using the scan fallback.
+- Show observation scope, freshness, source coverage, and degraded states in the fixed header.
+- Restore persisted semantic state on the next Herdr Top launch after a cold Herdr server restart.
 - Keep the display stable while information updates continuously.
 - Work without Superpowers.
 - Remain local-first and avoid sending session contents to an external service.
+- Continue providing Herdr-only visibility when Claude or Codex metadata cannot be read.
 
 ## 4. Non-goals
 
@@ -49,13 +61,18 @@ The MVP does not:
 
 - Replace Herdr as a multiplexer, session manager, worktree manager, or process owner.
 - Orchestrate agents by itself.
-- Infer semantic parent-child relationships from shared working directories, neighboring panes, timestamps, or similar heuristics.
+- Infer semantic relationships from shared directories, neighboring panes, timestamps, prompts, or similar heuristics.
+- Split one native agent session into multiple Task Runs by inspecting prompts or idle gaps.
 - Treat token usage, context-window usage, or visible activity as task completion percentage.
+- Scrape terminal output as a provider integration.
+- Automatically restart the collector after a cold Herdr server restart.
+- Run the long-lived monitor in a Herdr popup.
 - Provide an unlimited long-term analytics or audit-history product.
 - Support providers other than Claude Code and Codex.
 - Support Windows in the initial release.
-- Require OpenTelemetry, LangSmith, Langfuse, or another hosted observability service.
+- Require a hosted observability service.
 - Run multiple simultaneous TUI clients or perform automatic collector leader election.
+- Install a standalone CLI into `PATH` without explicit user action.
 
 ## 5. Management units and terminology
 
@@ -75,10 +92,12 @@ Herdr named session
 | --- | --- |
 | Herdr named session | Runtime and socket namespace for a persistent Herdr server. Herdr Top observes one session at a time. |
 | Workspace | Top-level Herdr project container. A repository or investigation usually maps to a workspace. |
-| Project | Not a separate formal Herdr entity. When the UI needs a project-like grouping, it uses the workspace. |
+| Project | Not a separate formal Herdr entity. The UI uses the workspace for project-like grouping. |
 | Tab | A layout within a workspace. |
 | Pane | A real terminal and the physical execution location of an agent or command. |
-| Native agent session | Claude Code or Codex's own resumable session identity. It is distinct from a Herdr named session. |
+| `terminal_id` | Stable physical terminal identity used to follow a pane across moves. |
+| Public `pane_id` | The pane's current Herdr address. It may change when a terminal moves between workspaces. |
+| Native agent session | Claude Code or Codex's resumable session identity, distinct from a Herdr named session. |
 
 References: [Herdr concepts](https://herdr.dev/docs/concepts/), [Herdr integrations](https://herdr.dev/docs/integrations/).
 
@@ -88,11 +107,30 @@ References: [Herdr concepts](https://herdr.dev/docs/concepts/), [Herdr integrati
 | --- | --- |
 | Task Run | Herdr Top's semantic unit for one observed task execution. A pane may host multiple Task Runs over time. |
 | Agent Node | A Claude Code or Codex execution participating in a Task Run. |
-| Native Sub-agent | A provider-native child session that can be nested below its parent Task Run or Agent Node. |
+| Native Sub-agent | A provider-native child session nested below its parent Task Run or Agent Node. |
+| Execution Edge | An explicit parent-child relationship, such as a Controller dispatch. |
 | Dependency Edge | An explicit directed relationship between Task Runs, such as `depends_on`. |
 | Observation Event | A normalized event produced by a Herdr, Claude, Codex, or Controller adapter. |
 
-A pane is an execution location, not a task identity. Moving or reusing a pane must not silently merge distinct Task Runs.
+A pane is an execution location, not a task identity.
+
+### 5.3 Task Run identity and lifecycle
+
+Identity is resolved in this order:
+
+1. Explicit Controller `task_run_id`.
+2. Provider plus native Claude Code or Codex session ID.
+3. Provisional `terminal_id + observed start time`.
+
+Rules:
+
+- A different native session in the same pane creates a new Task Run.
+- Resuming the same native session reactivates the existing Task Run.
+- Moving the same terminal or native session does not create a new Task Run.
+- A provisional Task Run merges into the resolved identity when the native session ID appears.
+- Multiple prompts inside one native session are not automatically split.
+- Finer semantic boundaries require explicit Controller events.
+- Pane closure or process exit changes execution state, not semantic task completion.
 
 ## 6. Execution tree and task dependency DAG
 
@@ -145,36 +183,36 @@ This rule favors an incomplete but truthful graph over a visually complete but i
 
 ### 7.1 Herdr
 
-Herdr is the authority for:
+Herdr is authoritative for:
 
 - named-session connection;
 - workspace, tab, and pane topology;
+- `terminal_id` and current public `pane_id`;
 - pane lifecycle and movement;
-- detected agent kind;
-- Herdr-reported agent execution state;
+- detected agent kind and Herdr-reported execution state;
 - active and focused pane metadata;
 - plugin paths and invocation context.
 
-The collector connects through `HERDR_SOCKET_PATH` and uses Herdr snapshot and event APIs. Herdr injects session and plugin environment variables into managed plugin panes.
+The collector connects through `HERDR_SOCKET_PATH`, fetches an initial snapshot, and subscribes to events. Reconnect always triggers a fresh snapshot before subscription resumes.
 
 References: [Herdr CLI reference](https://herdr.dev/docs/cli-reference/), [Herdr Socket API](https://herdr.dev/docs/socket-api/).
 
 ### 7.2 Claude Code and Codex adapters
 
-Provider adapters read locally available native session identity and event metadata needed to show:
+Provider adapters use a non-invasive hybrid strategy:
 
-- provider;
-- native session identifier;
-- model when available;
-- native sub-agent nesting when available;
-- recent tool or activity summary;
-- lifecycle signals not already authoritative in Herdr.
+1. Watch or tail locally available native session metadata.
+2. Normalize provider, native session ID, model when available, native sub-agent nesting, lifecycle signals, and redacted activity summaries.
+3. Fall back to a two-second rescan when file notification is unavailable or unreliable.
+4. Never scrape terminal output.
 
-Provider session formats are treated as unstable external formats. Adapters must accept optional and unknown fields and retain raw values only when needed for debugging.
+The common baseline is provider identity, native session identity, execution state, recent normalized activity, and native sub-agent nesting when exposed. Missing fields remain unavailable rather than fabricated.
+
+Provider formats are unstable external formats. Adapters accept optional and unknown fields, isolate parsing failures, and expose source coverage. If an adapter cannot read its source, the TUI remains usable in `DEGRADED / Herdr-only` mode.
 
 ### 7.3 Explicit Controller events
 
-A Controller or custom orchestrator can publish semantic events such as:
+A Controller or custom orchestrator can publish:
 
 - `dispatch`;
 - `task_started`;
@@ -185,31 +223,39 @@ A Controller or custom orchestrator can publish semantic events such as:
 - `failed`;
 - `cancelled`.
 
-These events are optional for basic live observation but required for a complete cross-pane Controller tree or task DAG.
+`dispatch` records an execution parent-child relationship. `depends_on` records a dependency DAG edge. Neither implies the other.
 
-The MVP uses a local IPC input owned by the running collector. A thin `herdr-top emit` command may publish events, but it must not write SQLite directly. If the collector is unavailable, emission fails explicitly; the tool must not fall back to inferred relationships.
+The collector owns a session-scoped Unix domain socket at `collector.sock` with current-user-only permissions. `herdr-top emit` sends one versioned JSON event and waits for `accepted`, `duplicate`, or `rejected`.
+
+The minimum envelope contains:
+
+- `schema_version = 1`;
+- unique `event_id` and emission timestamp;
+- source or Controller name and event type;
+- Task Run ID;
+- parent Task Run ID or dependency endpoints when applicable;
+- optional label, progress, reason, provider, native session ID, and terminal identity.
+
+The collector deduplicates by `event_id` and rejects dependency cycles. If the collector is unavailable, `emit` warns but exits successfully by default so monitoring cannot stop orchestration. `--strict` returns non-zero for callers that require enforcement.
+
+Controller events are optional for read-only live monitoring but required for a complete cross-pane execution relationship or task DAG.
 
 ## 8. State model
 
-Execution state and task state are stored separately.
+Execution state, task state, relationship state, and observation quality are separate.
 
 ### 8.1 Execution state
-
-Execution state describes what the agent process appears to be doing now.
-
-Initial normalized values:
 
 - `unknown`
 - `idle`
 - `working`
 - `blocked`
-- `done`
+- `stale`
+- `ended`
+
+`stale` is temporary. An execution that disappears without an authoritative close remains stale for 30 seconds. If a fresh snapshot still cannot find it, execution becomes `ended`. Explicit pane close or process exit moves directly to `ended`. Reappearance of the same native session during the grace period restores its live state.
 
 ### 8.2 Task state
-
-Task state describes semantic task lifecycle and is authoritative only when supported by explicit events.
-
-Initial values:
 
 - `queued`
 - `running`
@@ -218,43 +264,43 @@ Initial values:
 - `failed`
 - `cancelled`
 
-Live activity alone may update execution state, but it must not mark a Task Run completed or calculate a percentage.
+Activity, stale timeout, pane closure, and process exit do not mark a Task Run completed or infer a percentage. A Controller Task Run still marked `running` or `blocked` remains visible even with no live execution.
 
 ### 8.3 Relationship state
-
-Relationship state is independent from execution and task lifecycle.
-
-Initial values:
 
 - `unlinked`: no explicit Controller or dependency relationship is known;
 - `linked`: at least one explicit semantic relationship identifies the Task Run.
 
-A dependency edge is stored separately from this summary state and remains the authority for the DAG.
+Execution parent-child edges and dependency edges are stored separately.
 
-### 8.4 Minimum normalized event fields
+### 8.4 Observation quality
+
+- `LIVE`: subscribed and within the freshness target;
+- `RECONCILING`: restoring, reconnecting, or resnapshotting;
+- `DISCONNECTED`: Herdr socket unavailable;
+- `DEGRADED`: physical state available but a provider source or performance target is unavailable.
+
+### 8.5 Minimum normalized event fields
 
 Each normalized observation contains:
 
-- event ID;
-- timestamp;
-- source and source event type;
+- event ID, timestamp, source, and source event type;
 - Herdr session namespace;
-- workspace, tab, and pane identifiers when applicable;
-- provider and native session identifier when applicable;
-- Task Run identifier when known;
-- parent Agent Node identifier when known;
+- workspace, tab, public pane ID, and terminal ID when applicable;
+- provider and native session ID when applicable;
+- Task Run and Agent Node IDs when known;
 - normalized execution or task-state change;
-- optional dependency source and target;
-- minimal provider-specific metadata.
+- optional execution-parent or dependency endpoints;
+- source coverage and minimal provider metadata.
 
 ## 9. Architecture
 
 ```mermaid
 flowchart LR
     H["Herdr snapshot and events"] --> C["Collectors and adapters"]
-    CL["Claude Code metadata"] --> C
-    CX["Codex metadata"] --> C
-    CT["Controller events"] --> C
+    CL["Claude Code watch or scan"] --> C
+    CX["Codex watch or scan"] --> C
+    CT["Controller emit socket"] --> C
     C --> N["Normalized ObservationEvent"]
     N --> R["State reducer"]
     R --> M["In-memory live state"]
@@ -269,41 +315,39 @@ flowchart LR
 
 | Component | Responsibility |
 | --- | --- |
-| Herdr collector | Obtain the initial topology and subscribe to lifecycle and agent-state changes. |
-| Claude adapter | Normalize Claude Code session and native sub-agent information. |
-| Codex adapter | Normalize Codex session and native sub-agent information. |
-| Controller-event input | Accept explicit task and dependency events over local IPC. |
-| State reducer | Apply ordered events to the in-memory execution and dependency models. |
-| SQLite writer | Be the only process component that mutates the database. |
-| TUI | Render current state and handle navigation without owning persistence logic. |
+| Herdr collector | Snapshot, event subscription, reconnect, and resnapshot. |
+| Claude adapter | Watch or scan and normalize Claude session and sub-agent information. |
+| Codex adapter | Watch or scan and normalize Codex session and sub-agent information. |
+| Controller-event input | Validate and acknowledge semantic events over local IPC. |
+| State reducer | Apply ordered events to execution and dependency models. |
+| SQLite writer | Be the only component that mutates the database. |
+| TUI | Render in-memory state and handle navigation. |
+| Diagnostics | Report Herdr, lock, database, provider, version, and coverage health. |
 
-### 9.2 Concurrency rule
+### 9.2 Concurrency and rendering
 
-Collectors send normalized events through in-process channels. The reducer serializes state transitions and sends persistence operations to one SQLite writer.
-
-The TUI renders in-memory state. It must not query SQLite on every frame.
+Collectors send normalized events through bounded in-process channels. The reducer serializes transitions and sends persistence operations to one SQLite writer. The TUI renders in-memory state, not SQLite per frame. Rendering is event-driven and capped at 10 frames per second.
 
 ### 9.3 Session singleton
 
-The MVP runs exactly one Herdr Top owner process per Herdr session. That process owns the collector, reducer, SQLite writer, local Controller-event socket, and TUI.
+One owner process per Herdr named session owns the collector, reducer, writer, event socket, and TUI.
 
-The owner is selected with an OS advisory file lock scoped to a stable Herdr session key. The key is derived from the Herdr session/socket namespace, never from the launch working directory.
+An OS advisory lock is scoped to a stable key derived from the Herdr session or socket namespace, never from launch cwd.
 
-Startup behavior:
+Startup:
 
-1. Resolve the current Herdr session key.
-2. Attempt to acquire the session's advisory lock.
-3. If the lock is acquired, remove any stale Herdr Top IPC socket, open the session database, and start as owner.
-4. If the lock is already held, validate the recorded owner pane, ask Herdr to focus that pane, and exit successfully without opening SQLite as a writer.
-5. If focusing fails while the lock remains held, report the existing owner information and exit without starting a second collector.
+1. Resolve the session key and attempt the advisory lock.
+2. If acquired, remove only the stale Herdr Top socket, open the database, reconcile, and become owner.
+3. If held, validate and focus the recorded owner pane, then exit without opening SQLite as writer.
+4. If focus fails while the lock remains held, report owner information and do not start a second collector.
 
-The operating system releases the advisory lock when the owner process exits or crashes. A later invocation can then acquire the lock and recover. A process that is alive but hung continues to own the lock; automatic lease expiry, forced takeover, fencing tokens, and leader election are outside the MVP. The operator must close or terminate the hung pane before restarting Herdr Top.
+The OS releases the lock when the owner exits or crashes. A live but hung owner keeps it; the operator closes that pane before relaunching. Leases, fencing, leader election, and multiple clients are outside the MVP.
+
+`q` stops Herdr Top's TUI, collector, socket, and writer only. It never stops Claude Code, Codex, or another pane. Direct CLI launch returns to its shell. Closing the owner pane has the same monitor-only effect. Herdr detach and reattach leave the process running.
 
 ## 10. Persistence and restart behavior
 
-SQLite is the source of truth for recoverable Herdr Top state. JSONL may be offered later for debugging or export, but it is not the primary database.
-
-Session-scoped runtime and database locations:
+SQLite is the source of truth for recoverable Herdr Top state.
 
 ```text
 $HERDR_PLUGIN_STATE_DIR/sessions/<session-key>/collector.lock
@@ -311,95 +355,161 @@ $HERDR_PLUGIN_STATE_DIR/sessions/<session-key>/collector.sock
 $HERDR_PLUGIN_STATE_DIR/sessions/<session-key>/herdr-top.sqlite3
 ```
 
-`<session-key>` is a stable, path-safe identifier derived from the Herdr session/socket namespace. Different launch directories within the same default Herdr session resolve to the same key. Different named sessions resolve to different keys.
+The path-safe `session-key` comes from the Herdr session or socket namespace. Different directories in the same default session share it; different named sessions do not.
 
-Initial logical tables:
+Initial tables:
 
-- `herdr_sessions`
-- `workspaces`
-- `tabs`
-- `panes`
-- `native_agent_sessions`
-- `task_runs`
-- `agent_nodes`
-- `dependency_edges`
-- `events`
-- `schema_migrations`
+- `herdr_sessions`, `workspaces`, `tabs`, and `panes`;
+- `native_agent_sessions`, `task_runs`, and `agent_nodes`;
+- `execution_edges` and `dependency_edges`;
+- `events` and `schema_migrations`.
 
-SQLite runs in WAL mode. Database access uses `rusqlite` with bundled SQLite to reduce dependence on the host's installed SQLite version.
+SQLite runs in WAL mode through bundled `rusqlite`.
 
 ### 10.1 Startup reconciliation
 
-After acquiring the session lock on launch or restored plugin-pane start:
+After every successful owner launch:
 
 1. Remove only the stale IPC socket inside the acquired session directory.
-2. Open and migrate the session database.
-3. Load the persisted current-session Task Runs, Agent Nodes, edges, and recent events.
-4. Connect to the Herdr socket for the current named session.
-5. Fetch a fresh workspace, tab, pane, and agent snapshot.
-6. Reconcile live physical nodes with persisted semantic nodes.
-7. Mark persisted executions missing from the live snapshot as stale or ended rather than silently deleting them.
-8. Subscribe to live events and enter the fixed-screen TUI.
+2. Back up the database before schema migration.
+3. Open and migrate the database.
+4. Load persisted Task Runs, Agent Nodes, edges, and recent events.
+5. Connect to the current Herdr named session.
+6. Fetch a fresh workspace, tab, pane, terminal, and agent snapshot.
+7. Reconcile physical nodes by `terminal_id` and semantic nodes by the identity rules.
+8. Mark non-authoritatively missing executions `stale` and apply the 30-second grace.
+9. Subscribe to Herdr and provider changes and enter the TUI.
 
-If the lock is already held, this reconciliation path does not run. The second invocation focuses the existing owner pane and exits.
+A second invocation does not reconcile because it does not acquire the lock.
 
-Herdr remains responsible for restoring workspaces, tabs, panes, layouts, processes, and supported native agent sessions. Herdr Top restores only its semantic model and reconciles it with Herdr's current state.
+### 10.2 Runtime lifecycle
 
-### 10.2 Scope and retention
+- Detach and reattach: owner keeps running.
+- Cold Herdr restart: arbitrary monitor processes end; Herdr Top is not auto-started.
+- Next manual launch: load SQLite, fetch a fresh snapshot, and reconcile.
+- Live Herdr handoff or socket replacement: enter `RECONCILING`, reconnect, resnapshot, resubscribe, and show an event-gap warning when continuity is unprovable.
+- Provider source loss: retain Herdr topology in `DEGRADED / Herdr-only` mode.
 
-The UI defaults to the currently connected Herdr named session. The MVP retains enough event data to restore that session's latest state but does not provide an unlimited history browser.
+Herdr restores its own topology and supported agent sessions. Herdr Top restores only its semantic model.
+
+### 10.3 Retention and default visibility
+
+- Active and non-terminal Task Runs are never time-hidden or auto-pruned.
+- A `running` or `blocked` Task Run without live execution remains visible.
+- Finished Task Runs and unreferenced edges are retained for 30 days.
+- Events are retained for 7 days and at most 100,000 per named session.
+- Parents or dependencies referenced by active Task Runs are not pruned.
+- Cleanup runs at startup and periodically after ingestion.
+
+The default TUI shows all non-terminal Task Runs plus runs that became `completed`, `failed`, `cancelled`, or unlinked `ended / outcome unknown` during the last hour. Older retained runs remain filterable.
+
+Prompts, responses, terminal scrollback, and raw provider payloads are not retained.
 
 ## 11. TUI behavior
 
-The interface uses an alternate-screen, htop-style layout. Terminal rows do not continuously append.
+The alternate-screen interface is fixed rather than append-only.
 
 ```text
-┌ Herdr Top ─ session / connection / event lag ───────────────┐
-│ filters and summary counters                                │
-├ Execution tree or dependency view ──────────────────────────┤
-│ stable, selectable, internally scrollable viewport          │
-│                                                             │
-├ Activity for selected item ─────────────────────────────────┤
-│ recent normalized events                                    │
-├ q quit  tab view  / filter  f follow  enter details ────────┤
+┌ Herdr Top ─ host / session / workspaces / LIVE / lag / sources ┐
+│ filters and summary counters                                   │
+├ Execution tree or dependency view ─────────────────────────────┤
+│ stable, selectable, internally scrollable viewport             │
+├ Activity for selected item ────────────────────────────────────┤
+│ recent normalized events                                       │
+├ q stop monitor  tab view  / filter  f follow  ? help ──────────┤
 ```
 
 Required behavior:
 
 - fixed header and footer;
-- internal scrolling for the main tree;
-- a lower activity panel for the selected item;
-- stable ordering and selection while updates arrive;
-- follow mode that can be enabled or disabled;
-- tree nodes that can be expanded and collapsed;
-- clear visual distinction between `unlinked`, `blocked`, stale, and completed items;
-- a toggle between execution-tree and dependency views;
-- resize-safe rendering for narrow panes.
+- header shows host, named session, workspace count, quality, event lag, and source coverage;
+- `LIVE`, `RECONCILING`, `DISCONNECTED`, and `DEGRADED` indicators;
+- internal scrolling and lower selected-item activity;
+- stable ordering and selection during updates;
+- manual scroll disables follow; `f` or End resumes it;
+- expand/collapse and filtering that retains matching ancestors;
+- execution-tree and dependency-DAG toggle;
+- distinct `unlinked`, `blocked`, `stale`, `ended`, and terminal task states;
+- selection moves to a surviving ancestor or neighbor when its node closes, with the reason shown;
+- `?` opens key help and setup guidance;
+- minimum-size screen and safe truncation for narrow panes and wide Unicode;
+- footer distinguishes `q` from Herdr detach.
+
+Direct `herdr-top` uses the current pane and returns to its shell on `q`. The plugin entrypoint opens or focuses a dedicated regular tab or pane. It does not use a popup because popups have no Herdr pane identity.
+
+On first TUI launch only, if a compatible standalone CLI is not discoverable in `PATH`, show a dismissible Controller-integration notice. Basic monitoring remains fully functional. `?` keeps the standalone CLI and `emit` setup instructions available.
 
 ## 12. Herdr plugin packaging
 
-The implementation will include a `herdr-plugin.toml` manifest.
-
-Initial stable identifiers:
+The repository includes `herdr-plugin.toml`.
 
 ```toml
 id = "mageyuki.herdr-top"
 name = "Herdr Top"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+platforms = ["linux", "macos"]
 
 [[panes]]
 id = "top"
 title = "Herdr Top"
+placement = "tab"
+command = ["bin/herdr-top"]
 ```
 
-The long-running TUI is a plugin pane command. It must not use a one-shot startup hook as the monitoring loop.
+The long-running TUI is a pane command, not a startup hook.
 
-Development installation:
+### 12.1 Installation and update
+
+General installation:
 
 ```sh
+herdr plugin install mageyuki/herdr-top
+```
+
+Development:
+
+```sh
+cargo build --release
 herdr plugin link /absolute/path/to/herdr-top
 ```
 
-The release process publishes tagged GitHub releases for macOS and Linux. The plugin manifest selects the matching binary or build command according to the supported Herdr plugin contract.
+`plugin link` does not run build commands.
+
+For update, press `q` while agents continue, then run:
+
+```sh
+herdr plugin install mageyuki/herdr-top --yes
+```
+
+Reinstallation replaces the managed checkout. Databases and settings remain in plugin state/config directories. Automatic update is deferred.
+
+### 12.2 Release artifacts and Marketplace
+
+Tagged releases provide checksum-verified binaries for macOS arm64/x86_64 and Linux arm64/x86_64. The plugin build command selects and verifies the matching artifact without requiring Rust.
+
+After the first usable release, add the `herdr-plugin` GitHub topic for Marketplace discovery.
+
+Herdr 0.8.0 has no supported post-install caveat field and does not show successful build output. The plugin does not write to `/dev/tty` or silently mutate `PATH`. Optional CLI setup is explained by the first-launch notice and `?`.
+
+### 12.3 Optional standalone CLI and diagnostics
+
+The managed plugin is sufficient for live monitoring. Controller-event users explicitly install the same release's standalone binary into `PATH`.
+
+```sh
+herdr-top --version
+herdr-top emit ...
+herdr-top doctor
+herdr-top doctor --json
+```
+
+Herdr logs remain available through:
+
+```sh
+herdr plugin log list --plugin mageyuki.herdr-top
+```
+
+`doctor` checks Herdr socket, session key, lock, database schema, provider discovery, plugin/CLI compatibility, coverage, and log locations without printing prompts or responses.
 
 ## 13. Technology stack
 
@@ -421,49 +531,81 @@ Provider adapters must not force unstable Claude Code or Codex JSON into an over
 
 ## 14. Privacy, safety, and failure handling
 
-- All observation and storage remain local by default.
-- Store normalized metadata rather than full prompts, responses, or terminal scrollback.
-- Raw provider payload persistence is disabled by default.
+- Observation, IPC, and storage remain local by default.
+- Store normalized metadata, not prompts, responses, or terminal scrollback.
+- Raw provider payload persistence is disabled.
+- Parsers tolerate optional and unknown fields.
 - Malformed provider events are logged and skipped without terminating the TUI.
-- A lost Herdr socket changes the UI to disconnected state and triggers bounded reconnect attempts.
-- SQLite migration failure stops startup with a clear error and preserves the existing database.
-- A cyclic dependency event is rejected because Task Run dependencies must remain a DAG.
-- Unknown panes or native sessions may appear as provisional nodes until a later snapshot resolves them.
-- Missing semantic links remain `unlinked`; the UI never fabricates a Controller edge.
+- Provider loss yields `DEGRADED` with Herdr-only monitoring.
+- Herdr socket loss yields `DISCONNECTED`, bounded reconnect, then resnapshot/resubscribe through `RECONCILING`.
+- Unprovable reconnect continuity is shown as an event gap.
+- Controller socket access is limited to the current user.
+- Duplicate Controller events are acknowledged; cyclic dependencies are rejected.
+- Best-effort `emit` failure warns but cannot terminate orchestration; `--strict` is opt-in.
+- Migration backs up the database first. Failure stops startup and never resets the database automatically.
+- Provisional nodes remain until a snapshot resolves them.
+- Missing semantic links remain `unlinked`.
+- The header shows hostname so identical remote session names are distinguishable.
+- Panic handling restores the terminal where the platform permits.
 
 ## 15. Test strategy
 
 ### Unit tests
 
-- Claude Code and Codex event parsing from sanitized fixtures;
-- normalization and unknown-field tolerance;
-- state-reducer transitions;
-- dependency-cycle rejection;
-- stable tree ordering and selection;
-- status separation between execution and task state.
+- sanitized Claude and Codex fixtures, unknown-field tolerance, and redaction;
+- Task Run identity priority and provisional merge;
+- reducer transitions, stale grace, and ended-without-outcome;
+- execution-edge versus dependency-edge separation;
+- cycle rejection and event deduplication;
+- tree ordering, selection, and retention calculations;
+- execution, task, relationship, and observation-quality separation.
 
 ### Integration tests
 
-- temporary SQLite database migrations and recovery;
-- one-writer event ordering;
-- startup reconciliation against a mocked Herdr snapshot;
-- pane create, close, move, and agent-session replacement;
-- Controller event input and dependency persistence;
-- disconnection and reconnection.
+- SQLite migration backup, recovery, and cleanup;
+- one-writer ordering and startup reconciliation;
+- pane create, close, move, and replacement by `terminal_id`;
+- same-session resume and different-session pane reuse;
+- provider file watch and two-second fallback scan;
+- Controller acknowledgements, best-effort failure, and `--strict`;
+- reconnect, resnapshot, resubscribe, and event-gap indication;
+- second-launch focus and released-lock recovery;
+- `q` proving agent processes remain untouched.
 
 ### TUI tests
 
-- fixed-layout rendering at representative terminal sizes;
-- tree scrolling and collapse state;
-- follow-mode behavior;
-- narrow-terminal fallback;
-- snapshots for execution and dependency views.
+- fixed layout and header scope/freshness/coverage;
+- all four observation-quality states;
+- scroll, collapse, follow, filtered ancestors, and selection recovery;
+- all non-terminal plus one-hour terminal default visibility;
+- first-launch CLI notice and `?` help;
+- narrow-terminal and wide-Unicode rendering.
 
-### Plugin smoke tests
+### Performance tests
 
-- manifest validation;
-- pane launch inside Herdr;
-- injected environment-variable discovery;
+Target load:
+
+- 50 live panes;
+- 200 live or default-visible Task Runs;
+- 1,000 dependency edges;
+- 20 events per second sustained;
+- 100 events per second short burst without loss;
+- normal screen update within one second;
+- fallback visibility within about two seconds;
+- input response within 100 milliseconds;
+- startup within three seconds with 100,000 retained events;
+- idle CPU target below 2 percent and memory target below 100 MB on the reference machine.
+
+Above the target, enter `DEGRADED` and report lag. Older activity rendering may be omitted, but Task Runs and edges are not dropped.
+
+### Plugin and release smoke tests
+
+- manifest validation on Herdr 0.8.0;
+- managed artifact download and checksum verification;
+- local link after explicit build;
+- regular pane/tab launch and second-launch focus;
+- environment discovery and update while agents continue;
+- standalone CLI protocol compatibility;
 - clean terminal restoration after normal exit and panic.
 
 ## 16. Existing-tool comparison
@@ -490,38 +632,53 @@ Herdr Top's differentiating combination is:
 
 ## 17. MVP acceptance criteria
 
-The MVP is acceptable when all of the following are true:
-
-1. Running Herdr Top in a managed pane connects to that pane's Herdr named session.
-2. It displays live workspaces, tabs, panes, and detected Claude Code or Codex executions from that session.
-3. Native sub-agent nesting is displayed when provider metadata supplies it.
-4. Cross-pane Task Runs appear independently as `unlinked` without explicit Controller events.
-5. Explicit dependency events create persisted DAG edges and survive TUI restart.
-6. A Herdr server restart followed by session restoration reloads the persisted semantic state and reconciles it with the new live snapshot.
-7. The TUI uses a fixed screen with internal scrolling, stable selection, a lower activity panel, and follow toggle.
-8. Task completion and progress are never inferred from token or context usage.
-9. The core workflow works with Superpowers absent.
-10. No observed prompt or response content is transmitted externally.
-11. A second launch in the same Herdr session focuses the existing Herdr Top pane and does not create another collector or SQLite writer.
-12. After the owner exits or crashes, the next launch acquires the released lock and restores the session state.
-13. Launches from different working directories in the same default Herdr session use the same singleton and database, while different named sessions remain isolated.
+1. A regular managed pane or tab connects to its Herdr named session.
+2. Live workspaces, tabs, panes, Claude/Codex executions, and available native sub-agents are shown.
+3. `terminal_id` preserves identity across pane moves.
+4. Cross-pane runs remain `unlinked` without explicit Controller events.
+5. `dispatch` and `depends_on` create distinct persisted execution and dependency edges.
+6. Duplicate events are idempotent and cycles are rejected.
+7. Watched changes normally reach the screen within one second; fallback scan is about two seconds.
+8. Provider failure leaves `DEGRADED / Herdr-only` visibility.
+9. Non-authoritative disappearance is `stale` for 30 seconds before `ended`.
+10. Execution end never implies semantic completion.
+11. All non-terminal runs remain visible regardless of age.
+12. Terminal and unlinked ended runs remain default-visible for one hour and filterable for 30 days.
+13. Events are bounded to seven days and 100,000 per named session.
+14. The fixed TUI supports scroll, stable selection, activity, follow, help, and narrow panes.
+15. Header always shows host, session, workspace count, quality, lag, and coverage.
+16. `q` stops only Herdr Top; agents continue.
+17. Detach/reattach keeps the collector running.
+18. Cold restart stops the collector; next manual launch restores from SQLite and reconciles.
+19. Live handoff reconnects, resnapshots, and resubscribes, showing gaps when needed.
+20. Second launch focuses the owner and creates no second writer.
+21. Different cwd launches in one default session share state; named sessions remain isolated.
+22. Completion and progress are never inferred from tokens, context, or activity.
+23. Core monitoring works without Superpowers and without standalone CLI.
+24. First launch explains optional CLI setup without modifying `PATH`.
+25. `emit` is best-effort by default and supports `--strict`.
+26. No prompt, response, or scrollback is persisted or transmitted.
+27. macOS/Linux artifacts install through Herdr without Rust.
+28. `doctor` reports health without exposing content.
+29. Target load meets the budget or visibly degrades without losing Task Runs or edges.
 
 ## 18. Deferred capabilities
 
-The following are intentionally deferred beyond the MVP:
-
 - Windows support;
-- a web dashboard;
-- remote aggregation across multiple machines or Herdr named sessions;
+- web dashboard;
+- remote aggregation across hosts or named sessions;
 - hosted telemetry export;
-- additional agent providers;
-- historical analytics and configurable retention;
-- task-control actions such as cancel, retry, or redispatch;
+- additional providers;
+- long-term analytics and configurable retention;
+- manual history purge and export;
+- task controls such as cancel, retry, or redispatch;
 - automatic orchestration;
-- plugin marketplace publication automation;
-- public stabilization of the Controller-event protocol;
-- multiple simultaneous Herdr Top TUI clients;
-- automatic collector restart, leader election, lease expiry, and follower promotion.
+- automatic plugin update or Marketplace publication automation;
+- public stabilization of the Controller protocol;
+- multiple simultaneous TUI clients;
+- background collector independent from TUI;
+- automatic restart, leader election, lease expiry, and follower promotion;
+- enterprise-scale operation around 1,000 concurrent agents.
 
 ## 19. Documentation policy
 
@@ -540,21 +697,23 @@ ADRs should reference this design rather than duplicate it.
 
 The next development session should:
 
-1. Read this document and the current Herdr plugin and Socket API documentation.
-2. Produce an implementation plan divided into vertical slices.
+1. Read this design and current Herdr 0.8.0 plugin and Socket API documentation.
+2. Produce a vertical-slice implementation plan.
 3. Scaffold the Rust binary and module boundaries.
-4. Add `herdr-plugin.toml` with a minimal pane entrypoint.
-5. Implement the normalized domain model and in-memory reducer first.
-6. Implement the session-key derivation, advisory lock, session-scoped paths, SQLite migrations, and restart recovery.
-7. Add a mocked Herdr collector and render the first fixed-screen tree.
-8. Connect the real Herdr socket.
-9. Add Claude Code and Codex adapters with sanitized fixtures.
-10. Add Controller-event IPC and the dependency view after the live execution tree works.
+4. Add the manifest and a regular tab pane entrypoint.
+5. Implement normalized identities, states, execution edges, dependency edges, and reducer tests.
+6. Implement session-key derivation, advisory lock, SQLite migrations, backup, and retention.
+7. Add a mocked Herdr collector and first fixed-screen tree.
+8. Connect the real Herdr snapshot/event stream and `terminal_id` reconciliation.
+9. Add Claude and Codex watch/scan adapters with sanitized fixtures.
+10. Add the Controller socket, versioned protocol, `emit`, and dependency view.
+11. Add lifecycle, degraded-state, first-launch notice, doctor, and performance tests.
+12. Package release artifacts and validate managed install on macOS and Linux.
 
-The first vertical slice should prove:
+The first vertical slice proves:
 
 ```text
 Herdr snapshot -> normalized state -> fixed-screen tree -> SQLite restore
 ```
 
-before adding provider-specific parsing or a complete dependency DAG.
+before provider parsing or the complete dependency DAG.
