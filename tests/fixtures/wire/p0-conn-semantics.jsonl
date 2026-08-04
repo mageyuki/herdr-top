@@ -1,0 +1,14 @@
+{"t": "2026-08-04T18:46:39.817098+00:00", "conn": "T1", "dir": "note", "payload": "connected to /home/user/.config/herdr/sessions/herdr-top-probe/herdr.sock"}
+{"t": "2026-08-04T18:46:39.817147+00:00", "conn": "T1", "dir": "send", "payload": {"id": "T1-1", "method": "ping", "params": {}}}
+{"t": "2026-08-04T18:46:39.917424+00:00", "conn": "T1", "dir": "recv", "payload": {"id": "T1-1", "result": {"type": "pong", "version": "0.8.0", "protocol": 19, "capabilities": {"live_handoff": true, "detached_server_daemon": true}}}}
+{"t": "2026-08-04T18:46:39.917491+00:00", "conn": "T1", "dir": "send", "payload": {"id": "T1-2", "method": "ping", "params": {}}}
+{"t": "2026-08-04T18:46:39.917551+00:00", "conn": "T1", "dir": "note", "payload": "closed"}
+{"t": "2026-08-04T18:46:39.917595+00:00", "conn": "T2", "dir": "note", "payload": "connected to /home/user/.config/herdr/sessions/herdr-top-probe/herdr.sock"}
+{"t": "2026-08-04T18:46:39.917616+00:00", "conn": "T2", "dir": "send", "payload": {"id": "T2-1", "method": "ping", "params": {}}}
+{"t": "2026-08-04T18:46:39.917803+00:00", "conn": "T2", "dir": "recv", "payload": {"id": "T2-1", "result": {"type": "pong", "version": "0.8.0", "protocol": 19, "capabilities": {"live_handoff": true, "detached_server_daemon": true}}}}
+{"t": "2026-08-04T18:46:41.917902+00:00", "conn": "T2", "dir": "send", "payload": {"id": "T2-2", "method": "ping", "params": {}}}
+{"t": "2026-08-04T18:46:41.918012+00:00", "conn": "T2", "dir": "note", "payload": "closed"}
+{"t": "2026-08-04T18:46:41.918054+00:00", "conn": "T3", "dir": "note", "payload": "connected to /home/user/.config/herdr/sessions/herdr-top-probe/herdr.sock"}
+{"t": "2026-08-04T18:46:43.918142+00:00", "conn": "T3", "dir": "send", "payload": {"id": "T3-1", "method": "ping", "params": {}}}
+{"t": "2026-08-04T18:46:43.919864+00:00", "conn": "T3", "dir": "recv", "payload": {"id": "T3-1", "result": {"type": "pong", "version": "0.8.0", "protocol": 19, "capabilities": {"live_handoff": true, "detached_server_daemon": true}}}}
+{"t": "2026-08-04T18:46:43.919895+00:00", "conn": "T3", "dir": "note", "payload": "closed"}

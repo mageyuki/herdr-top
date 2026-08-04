@@ -1,0 +1,13 @@
+#![deny(unsafe_code)]
+
+//! Library components for the `herdr-top` session monitor.
+
+pub mod herdr;
+pub mod identity;
+pub mod lockfile;
+pub mod model;
+pub mod reducer;
+pub mod rendezvous;
+pub mod session_key;
+pub mod store;
+pub mod tui;

@@ -1,0 +1,13 @@
+{"type": "session_meta", "payload": {"session_id": "019f7504-83e2-75f0-870d-cc423f88a73b", "id": "019f76d1-1ac4-7083-b4b8-434c8dba857b", "parent_thread_id": "019f75fb-aa34-78a0-b97c-89a188fed43a", "timestamp": "2026-07-18T20:00:43.267Z", "cwd": "/home/user/proj", "originator": "codex-tui", "cli_version": "0.144.5", "thread_source": "subagent", "agent_nickname": "Mill", "agent_path": "/root/store_audit/pagination_store_review", "multi_agent_version": "v2"}}
+{"type": "event_msg", "redacted": true}
+{"type": "response_item", "redacted": true}
+{"type": "response_item", "redacted": true}
+{"type": "response_item", "redacted": true}
+{"type": "world_state", "redacted": true}
+{"type": "turn_context", "redacted": true}
+{"type": "inter_agent_communication_metadata", "payload": {"trigger_turn": true}}
+{"type": "event_msg", "redacted": true}
+{"type": "event_msg", "redacted": true}
+{"type": "inter_agent_communication_metadata", "payload": {"trigger_turn": false}}
+{"type": "turn_context", "redacted": true}
+{"type": "inter_agent_communication_metadata", "payload": {"trigger_turn": true}}
