@@ -15,7 +15,7 @@ Repository: [mageyuki/herdr-top](https://github.com/mageyuki/herdr-top)
 | Product name | Herdr Top |
 | Repository and binary | `herdr-top` |
 | Runtime | A regular Herdr-managed pane or tab inside the target named session |
-| Required platform | Herdr 0.8.0 or newer |
+| Required platform | Herdr 0.8.0 or newer; initial development and test baseline: Herdr 0.8.0, socket protocol 19 |
 | Agent providers | Claude Code and Codex |
 | Superpowers | Not required and not used as a required data source |
 | Primary view | Fixed-screen, htop-style live TUI |
@@ -480,12 +480,12 @@ Required behavior:
 - header shows host, named session, workspace count, quality, event lag — the age of the oldest received but not yet applied event, zero when the queue is empty — and source coverage, truncating below the standard width in the fixed order of criterion 15;
 - `LIVE`, `RECONCILING`, `DISCONNECTED`, and `DEGRADED` indicators;
 - internal scrolling and lower selected-item activity;
-- stable ordering and selection during updates;
+- stable ordering and selection during updates: every renderable entity receives a unique, persisted, immutable display ordinal on first entry into the model; siblings sort by that ordinal, never by an identity-key component; a state refresh never reorders rows, and after a merge the merged-in rows vanish while the survivor keeps its own ordinal and relative position;
 - manual scroll disables follow; `f` or End resumes it;
-- expand/collapse and filtering that retains matching ancestors;
-- execution-tree and dependency-DAG toggle;
+- expand/collapse and filtering that retains matching ancestors — in the dependency view, every prerequisite path to a matching run;
+- execution-tree and dependency-DAG toggle; the dependency view renders the conceptual DAG of section 6.2 as a stable topologically sorted list with prerequisite and dependent columns per run — prerequisites precede dependents, the display ordinal breaks topological ties, state refreshes preserve order, and only dependency-edge changes may reorder, minimally — so 1,000 edges stay scrollable and scannable;
 - distinct `unlinked`, `blocked`, `stale`, `ended`, `ended_unknown`, and other terminal task states;
-- selection moves to a surviving ancestor or neighbor when its node closes, with the reason shown;
+- selection moves to a surviving ancestor or neighbor when its node closes, and follows the surviving run through an identity merge, with the reason shown;
 - `?` opens key help and setup guidance;
 - minimum-size screen and safe truncation for narrow panes and wide Unicode;
 - footer distinguishes `q` from Herdr detach.
@@ -568,7 +568,7 @@ Herdr logs remain available through:
 herdr plugin log list --plugin mageyuki.herdr-top
 ```
 
-`doctor` checks Herdr socket, session key and its resolver source (flag, environment, or `default`), breadcrumb validity, the state-root `session-name.txt` record, the runtime sentinel, current Controller-socket availability and its reason, socket-path length, lock, database schema, provider discovery, Herdr official-integration versions, plugin/CLI compatibility, native-session coverage, and log locations without printing prompts or responses. For Herdr 0.8.0 native session restore, it expects Claude Code integration version 6 or newer and Codex integration version 5 or newer. Missing or older integrations do not block Herdr-only monitoring, but diagnostics explain the unavailable `agent_session` and restore coverage.
+`doctor` checks Herdr socket, session key and its resolver source (flag, environment, or `default`), breadcrumb validity, the state-root `session-name.txt` record, the runtime sentinel, current Controller-socket availability and its reason, socket-path length, lock, database schema, provider discovery, Herdr official-integration versions, plugin/CLI compatibility, native-session coverage, and log locations without printing prompts or responses. Every executable, integration, or protocol version `doctor` reports is queried from the relevant binary or server — and reported as unavailable when that source cannot answer — never inferred from an installation path; self-updating installs make path-derived versions lie. For Herdr 0.8.0 native session restore, it expects Claude Code integration version 6 or newer and Codex integration version 5 or newer. Missing or older integrations do not block Herdr-only monitoring, but diagnostics explain the unavailable `agent_session` and restore coverage.
 
 ## 13. Technology stack
 
@@ -584,6 +584,8 @@ herdr plugin log list --plugin mageyuki.herdr-top
 | Structured logs | `tracing`, `tracing-subscriber` |
 | Error types | `thiserror` |
 | Internal IDs | `ulid` |
+
+Initial development pins ratatui 0.30, crossterm 0.29, and rusqlite 0.40 with the `bundled` and `backup` features; the minimum supported Rust version follows ratatui 0.30's floor of 1.88. Exact versions live in `Cargo.lock`, and the design does not chase releases.
 
 Rust is selected for single-binary distribution, predictable long-running resource use, terminal control, strong event and state types, and compatibility with the Herdr/Rust ecosystem.
 
@@ -602,7 +604,7 @@ Provider adapters must not force unstable Claude Code or Codex JSON into an over
 - The state root, runtime socket directory, database, backups, and the runtime sentinel `<hash16>.name` are restricted to the current user: directories 0700, files 0600.
 - Duplicate Controller events are acknowledged; cyclic dependencies are rejected.
 - Best-effort `emit` failure warns but cannot terminate orchestration; `--strict` is opt-in.
-- Migration backs up the database first. Failure stops startup and never resets the database automatically.
+- Migration backs up the database first. Failure stops startup and never resets the database automatically. An older binary refuses to open a database whose schema version is newer than it understands, with a clear upgrade message.
 - Provisional nodes remain until the identity rules resolve, merge, or close them.
 - Missing semantic links remain `unlinked`.
 - The header shows hostname so identical remote session names are distinguishable.
@@ -618,7 +620,7 @@ Provider adapters must not force unstable Claude Code or Codex JSON into an over
 - reducer transitions, live-observation stale grace versus observation-gap retirement, and `ended_unknown` closure;
 - execution-edge versus dependency-edge separation;
 - cycle rejection and event deduplication;
-- tree ordering, selection, and retention calculations;
+- tree and dependency-list ordering, display-ordinal stability across refreshes and merges, selection, and retention calculations;
 - execution, task, relationship, and observation-quality separation;
 - identity binding: path-to-ID promotion, single-K1 binding conflicts, merge preflight on contracted graphs including self-edges and cycles, and direct-dispatch cycle rejection;
 - relationship-only placeholders staying `queued` and dangling-announcement diagnostics;
@@ -642,7 +644,7 @@ Provider adapters must not force unstable Claude Code or Codex JSON into an over
 
 - fixed layout and header scope/freshness/coverage;
 - all four observation-quality states;
-- scroll, collapse, follow, filtered ancestors, and selection recovery;
+- scroll, collapse, follow, filtered ancestors, dependency-list order stability, and selection recovery;
 - all non-terminal plus one-hour terminal default visibility;
 - first-launch CLI notice and `?` help;
 - narrow-terminal and wide-Unicode rendering.
@@ -685,6 +687,8 @@ Above the target, enter `DEGRADED` and report lag. Older activity rendering may 
 | `herdr-insight` | Herdr state history | Timeline rather than a Controller-aware execution model. |
 | Huba | Claude-native task dependencies and progress | Claude-only and not a Herdr-native sidecar. |
 | General observability platforms | Rich traces, metrics, and analytics | Require instrumentation or hosted infrastructure and do not expose Herdr topology natively. |
+
+The capability and gap entries above reflect each tool's public description at design time and were not verified against installed copies.
 
 Herdr Top's differentiating combination is:
 
