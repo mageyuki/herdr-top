@@ -23,9 +23,9 @@ Repository: [mageyuki/herdr-top](https://github.com/mageyuki/herdr-top)
 | Physical pane identity | Herdr `terminal_id` is stable identity; public `pane_id` is the current address |
 | Cross-pane relationship | Independent and `unlinked` unless an explicit Controller event exists |
 | Dependency representation | A DAG separate from the execution tree |
-| Data acquisition | Herdr snapshot/events plus non-invasive Claude/Codex local metadata observation |
+| Data acquisition | Herdr snapshot/events, including reported native sessions, plus non-invasive Claude/Codex local metadata observation |
 | Provider fallback | Two-second rescan when file watching is unavailable; no terminal-output scraping |
-| Task Run identity | Explicit `task_run_id`, then native session ID, then provisional `terminal_id + start time` |
+| Task Run identity | Explicit `task_run_id`, then native session ID with Herdr-reported identity preferred, then provisional `terminal_id + start time` |
 | Controller protocol | Versioned JSON over a session-scoped Unix domain socket through `herdr-top emit` |
 | Persistence | Session-scoped SQLite as the source of truth |
 | Retention | Finished Task Runs 30 days; events 7 days and at most 100,000 per session |
@@ -119,7 +119,7 @@ A pane is an execution location, not a task identity.
 Identity is resolved in this order:
 
 1. Explicit Controller `task_run_id`.
-2. Provider plus native Claude Code or Codex session ID.
+2. Provider plus native Claude Code or Codex session ID, preferring Herdr's official-integration `agent_session` when available and using provider-local metadata as fallback.
 3. Provisional `terminal_id + observed start time`.
 
 Rules:
@@ -190,10 +190,13 @@ Herdr is authoritative for:
 - `terminal_id` and current public `pane_id`;
 - pane lifecycle and movement;
 - detected agent kind and Herdr-reported execution state;
+- official-integration `agent_session` identity for the pane's top-level native agent when available;
 - active and focused pane metadata;
 - plugin paths and invocation context.
 
 The collector connects through `HERDR_SOCKET_PATH`, fetches an initial snapshot, and subscribes to events. Reconnect always triggers a fresh snapshot before subscription resumes.
+
+A valid Herdr-reported `agent_session` is the preferred source for the top-level native session identity. Its absence does not prevent physical monitoring; the Claude or Codex adapter can resolve the identity from provider-local metadata. Conflicting identities are not merged by inference and are surfaced through diagnostics and source coverage.
 
 References: [Herdr CLI reference](https://herdr.dev/docs/cli-reference/), [Herdr Socket API](https://herdr.dev/docs/socket-api/).
 
@@ -202,11 +205,15 @@ References: [Herdr CLI reference](https://herdr.dev/docs/cli-reference/), [Herdr
 Provider adapters use a non-invasive hybrid strategy:
 
 1. Watch or tail locally available native session metadata.
-2. Normalize provider, native session ID, model when available, native sub-agent nesting, lifecycle signals, and redacted activity summaries.
+2. Normalize provider, native session ID, model when available, recursive native sub-agent nesting, lifecycle signals, and redacted activity summaries.
 3. Fall back to a two-second rescan when file notification is unavailable or unreliable.
 4. Never scrape terminal output.
 
 The common baseline is provider identity, native session identity, execution state, recent normalized activity, and native sub-agent nesting when exposed. Missing fields remain unavailable rather than fabricated.
+
+Agent Nodes form a recursive tree rather than a fixed one-level list. A native parent-child edge is created only when provider metadata establishes it. If an agent is observable but its immediate parent is not, it remains directly under the Task Run without an inferred Agent Node parent.
+
+Claude Code hooks or OpenTelemetry may be added as optional higher-fidelity inputs. Core monitoring must not require Claude settings mutation, an OTLP exporter, or beta telemetry. Claude-local task or lifecycle events never create cross-pane Controller execution or dependency edges by themselves.
 
 Provider formats are unstable external formats. Adapters accept optional and unknown fields, isolate parsing failures, and expose source coverage. If an adapter cannot read its source, the TUI remains usable in `DEGRADED / Herdr-only` mode.
 
@@ -509,7 +516,7 @@ Herdr logs remain available through:
 herdr plugin log list --plugin mageyuki.herdr-top
 ```
 
-`doctor` checks Herdr socket, session key, lock, database schema, provider discovery, plugin/CLI compatibility, coverage, and log locations without printing prompts or responses.
+`doctor` checks Herdr socket, session key, lock, database schema, provider discovery, Herdr official-integration versions, plugin/CLI compatibility, native-session coverage, and log locations without printing prompts or responses. For Herdr 0.8.0 native session restore, it expects Claude Code integration version 6 or newer and Codex integration version 5 or newer. Missing or older integrations do not block Herdr-only monitoring, but diagnostics explain the unavailable `agent_session` and restore coverage.
 
 ## 13. Technology stack
 
@@ -552,8 +559,9 @@ Provider adapters must not force unstable Claude Code or Codex JSON into an over
 
 ### Unit tests
 
-- sanitized Claude and Codex fixtures, unknown-field tolerance, and redaction;
+- sanitized Claude and Codex fixtures, including recursive depth-two and depth-three sub-agents, unknown parents, unknown-field tolerance, and redaction;
 - Task Run identity priority and provisional merge;
+- Herdr `agent_session` preference, provider-local fallback, and conflicting-identity handling;
 - reducer transitions, stale grace, and ended-without-outcome;
 - execution-edge versus dependency-edge separation;
 - cycle rejection and event deduplication;
@@ -605,6 +613,7 @@ Above the target, enter `DEGRADED` and report lag. Older activity rendering may 
 - local link after explicit build;
 - regular pane/tab launch and second-launch focus;
 - environment discovery and update while agents continue;
+- Herdr official-integration version and native-session coverage diagnostics;
 - standalone CLI protocol compatibility;
 - clean terminal restoration after normal exit and panic.
 
@@ -633,7 +642,7 @@ Herdr Top's differentiating combination is:
 ## 17. MVP acceptance criteria
 
 1. A regular managed pane or tab connects to its Herdr named session.
-2. Live workspaces, tabs, panes, Claude/Codex executions, and available native sub-agents are shown.
+2. Live workspaces, tabs, panes, Claude/Codex executions, and available recursively nested native sub-agents are shown.
 3. `terminal_id` preserves identity across pane moves.
 4. Cross-pane runs remain `unlinked` without explicit Controller events.
 5. `dispatch` and `depends_on` create distinct persisted execution and dependency edges.
@@ -659,7 +668,7 @@ Herdr Top's differentiating combination is:
 25. `emit` is best-effort by default and supports `--strict`.
 26. No prompt, response, or scrollback is persisted or transmitted.
 27. macOS/Linux artifacts install through Herdr without Rust.
-28. `doctor` reports health without exposing content.
+28. `doctor` reports health, Herdr integration versions, and native-session coverage without exposing content.
 29. Target load meets the budget or visibly degrades without losing Task Runs or edges.
 
 ## 18. Deferred capabilities
@@ -668,6 +677,7 @@ Herdr Top's differentiating combination is:
 - web dashboard;
 - remote aggregation across hosts or named sessions;
 - hosted telemetry export;
+- optional Claude Code hook and OpenTelemetry provider inputs;
 - additional providers;
 - long-term analytics and configurable retention;
 - manual history purge and export;
@@ -704,8 +714,8 @@ The next development session should:
 5. Implement normalized identities, states, execution edges, dependency edges, and reducer tests.
 6. Implement session-key derivation, advisory lock, SQLite migrations, backup, and retention.
 7. Add a mocked Herdr collector and first fixed-screen tree.
-8. Connect the real Herdr snapshot/event stream and `terminal_id` reconciliation.
-9. Add Claude and Codex watch/scan adapters with sanitized fixtures.
+8. Connect the real Herdr snapshot/event stream and reconcile `terminal_id` plus preferred `agent_session` identity.
+9. Add Claude and Codex watch/scan adapters with sanitized recursive sub-agent fixtures.
 10. Add the Controller socket, versioned protocol, `emit`, and dependency view.
 11. Add lifecycle, degraded-state, first-launch notice, doctor, and performance tests.
 12. Package release artifacts and validate managed install on macOS and Linux.
