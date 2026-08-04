@@ -29,7 +29,7 @@ Repository: [mageyuki/herdr-top](https://github.com/mageyuki/herdr-top)
 | Controller protocol | Versioned JSON over a session-scoped Unix domain socket through `herdr-top emit` |
 | Persistence | Session-scoped SQLite as the source of truth |
 | State root | `${XDG_STATE_HOME:-$HOME/.local/state}/herdr-top/sessions/<session-key>`, keyed by the resolved session name; the collector socket lives in a runtime directory to respect socket-path length limits |
-| Retention | Finished Task Runs 30 days; events 7 days and at most 100,000 per session |
+| Retention | Finished Task Runs 30 days; activity events ring-bounded at 100,000 per session and 7 days; `event_id` dedup ledger 7 days |
 | Process model | One collector, reducer, SQLite writer, event socket, and TUI process per Herdr session |
 | Second launch | Focus the existing Herdr Top pane instead of starting another collector |
 | Quit | `q` stops Herdr Top only; Claude/Codex agents keep running |
@@ -48,7 +48,7 @@ The MVP must:
 - Make workspace, tab, pane, Task Run, and native sub-agent relationships understandable.
 - Show cross-pane task relationships and dependencies only when explicitly recorded.
 - Keep execution topology and task dependencies as separate views.
-- Reflect watched Herdr or provider changes within one second under normal conditions and within about two seconds when using the scan fallback.
+- Reflect watched Herdr or provider changes within one second at the 95th percentile under target load; fallback scanning adds at most one two-second polling interval.
 - Show observation scope, freshness, source coverage, and degraded states in the fixed header.
 - Restore persisted semantic state on the next Herdr Top launch after a cold Herdr server restart.
 - Keep the display stable while information updates continuously.
@@ -229,18 +229,22 @@ References: [Herdr CLI reference](https://herdr.dev/docs/cli-reference/), [Herdr
 
 Provider adapters use a non-invasive hybrid strategy:
 
-1. Watch or tail locally available native session metadata.
-2. Normalize provider, native session ID, model when available, recursive native sub-agent nesting, lifecycle signals, and redacted activity summaries.
-3. Fall back to a two-second rescan when file notification is unavailable or unreliable.
+1. Watch locally available native session metadata with filesystem notification and tail files incrementally: a per-file byte offset advances on append and only appended bytes are read, while an inode change or size regression signals rotation or truncation, resets the offset state, and reopens the file. Discovery performs one bounded bootstrap read per file — the first complete structural record, such as Codex's `session_meta`, parsed for allowlisted identity and topology fields only, with Claude topology derived from path structure alone — and historical activity is never replayed: ongoing tailing starts at the current end of file for files that predate the collector run, while files created or rotated during observation are read from byte zero. Incomplete trailing records buffer until their terminating newline.
+2. Normalize provider, native session ID, model when available, recursive native sub-agent nesting, lifecycle signals, and allowlisted activity summaries.
+3. Fall back to a two-second rescan when file notification is unavailable or unreliable; the rescan stats directories and files for mtime and size changes and tails only what changed — it never re-reads whole files, keeping the idle CPU budget of section 15 honest against hundreds of megabytes of local metadata.
 4. Never scrape terminal output.
 
 The common baseline is provider identity, native session identity, execution state, recent normalized activity, and native sub-agent nesting when exposed. Missing fields remain unavailable rather than fabricated.
 
-Agent Nodes form a recursive tree rather than a fixed one-level list. A native parent-child edge is created only when provider metadata establishes it. If an agent is observable but its immediate parent is not, it remains directly under the Task Run without an inferred Agent Node parent.
+Provider activity content is built from an explicit field allowlist and nothing else: provider, native session and agent identifiers, model ID, lifecycle and event kind, tool name without arguments, item and byte counts, and timestamps. The normalized identity, topology, relationship, and coverage fields of section 8.5 — workspace, tab, and pane IDs, `terminal_id`, Task Run and Agent Node IDs, edge endpoints, and source coverage — are always included, as are the identity references of section 5.4, including path-kind `agent_session` values, and the owner record of section 9.3. Operational paths — the session file an agent maps to, discovery diagnostics, log locations, and the section 10 breadcrumb — are persisted locally under the section 14 permissions and shown only in detail and `doctor` views, home-abbreviated and control-character-escaped. No value extracted from prompt text, response text, or tool arguments and results is persisted or displayed anywhere — including paths, URLs, and environment values found inside them; the same string remains legal when it arrives from an independent operational source. Controller-supplied `label` and `reason` strings are operator-provided display text, capped at 256 bytes, control-character-escaped, and truncated UTF-8-safely. Fixtures with sentinel strings prove the exclusions in section 15 by scanning the database, WAL, backups, logs — including malformed-record diagnostics — and rendered output. Malformed-record diagnostics are not activity content; their own allowlist is provider, the independently discovered, home-abbreviated, escaped source path, byte offset, and parser error code.
+
+Agent Nodes form a recursive tree rather than a fixed one-level list, and deeper structures are tolerated wherever metadata establishes them — but observed reality is shallow: local evidence shows Codex nesting to depth two and Claude Code to depth one, and no depth field exists in either format. A native parent-child edge is created only when provider metadata establishes it. If an agent is observable but its immediate parent is not, it remains directly under the Task Run without an inferred Agent Node parent.
 
 Claude Code hooks or OpenTelemetry may be added as optional higher-fidelity inputs. Core monitoring must not require Claude settings mutation, an OTLP exporter, or beta telemetry. Claude-local task or lifecycle events never create cross-pane Controller execution or dependency edges by themselves.
 
 Provider formats are unstable external formats. Adapters accept optional and unknown fields, isolate parsing failures, and expose source coverage. If an adapter cannot read its source, the TUI remains usable in `DEGRADED / Herdr-only` mode.
+
+The two discovery models are inverted and the adapters do not share a strategy. Claude Code stores each sub-agent in its own file under the parent session's `subagents/` directory, so topology is path-derived without content parsing; sub-agents are effectively always background, fan-out is high, spawn results can arrive long after the spawn or never, and named spawns vary the filename pattern. Codex stores every agent as an identically shaped rollout file whose first `session_meta` line carries `agent_path` and `parent_thread_id`; parents and children can sit in different date directories; `forked_from_id` marks forking rather than parenting and never creates an edge; and the parent's own rollout emits `sub_agent_activity` events — the preferred liveness signal, cheaper than opening every child file. Ephemeral side artifacts such as spawn output files are not data sources.
 
 ### 7.3 Explicit Controller events
 
@@ -257,7 +261,7 @@ A Controller or custom orchestrator can publish:
 
 `dispatch` records an execution parent-child relationship. `depends_on` records a dependency DAG edge. Neither implies the other.
 
-The collector owns the session-scoped Controller-socket responsibility at its resolved runtime-directory path (section 10) with current-user-only permissions. `herdr-top emit` sends one versioned JSON event and waits for `accepted`, `duplicate`, or `rejected`.
+The collector owns the session-scoped Controller-socket responsibility at its resolved runtime-directory path (section 10) with current-user-only permissions. `herdr-top emit` sends one versioned JSON event and waits for `accepted`, `duplicate`, `rejected`, or `retryable`.
 
 The minimum envelope contains:
 
@@ -268,15 +272,15 @@ The minimum envelope contains:
 - parent Task Run ID or dependency endpoints when applicable;
 - optional label, progress, reason, provider, native session ID, and terminal identity.
 
-The collector deduplicates by `event_id` and rejects dependency cycles. If the collector is unavailable, `emit` warns but exits successfully by default so monitoring cannot stop orchestration. `--strict` returns non-zero for callers that require enforcement.
+The collector deduplicates by `event_id` against a ledger retained independently of activity-event pruning, and rejects dependency cycles. The protocol has no supersede or removal events: a mistaken edge or premature terminal state persists until retention expires, or indefinitely while referenced by active state per section 10.3, and correction events are deferred (section 18). If the collector is unavailable or the connection times out, `emit` warns but exits successfully by default so monitoring cannot stop orchestration; after transmission `emit` receives exactly one wire response — `accepted`, `duplicate`, `rejected`, or `retryable` — or reports `unresolved` when the connection fails or times out before any response; retrying the same `event_id` is safe within the ledger window and is the recovery path, and nothing is silently dropped. `--strict` returns non-zero for callers that require enforcement.
 
 Envelope direction fields are explicit: `task_run_id` names the subject of the event; `depends_on_id` names the prerequisite the subject depends on; `parent_task_run_id` names the dispatch parent.
 
-Every event passes one pipeline in order: alias resolution, then `event_id` deduplication, then validation against current reducer state with any placeholders staged, then — on rejection — the staged placeholders are discarded, or — on acceptance — ingest-sequence assignment, application, enqueue to the single SQLite writer, and acknowledgement. Alias resolution first means an event naming a merged-away key applies to the surviving run before deduplication and before any placeholder is created. Rejected events leave no trace beyond diagnostics: their `event_id` does not enter the deduplication set, so a corrected retry may reuse it.
+Every event admitted past the saturation check passes one pipeline in order: alias resolution; then `event_id` ledger lookup, where a hit returns `duplicate`; then validation against current reducer state with any placeholders staged, where a failure discards the staged placeholders and returns `rejected`; then the serialized writer-health gate, which returns `retryable` with `persistence_unavailable` while persistence is unhealthy; and otherwise ingest-sequence assignment, ledger insertion, application, enqueue to the single SQLite writer, and `accepted`. Alias resolution first means an event naming a merged-away key applies to the surviving run before deduplication and before any placeholder is created. Rejected events leave no trace beyond diagnostics: their `event_id` does not enter the deduplication set, so a corrected retry may reuse it.
 
 Events referencing an unknown Task Run are forward references and are the normal case for a Controller announcing work before it starts. The unknown-endpoint rules cover every event: `dispatch` creates placeholders for an unknown subject and an unknown `parent_task_run_id`; `depends_on` creates placeholders for an unknown subject and an unknown `depends_on_id`; `task_started` on an unknown run creates it directly in `running`; `blocked` and `progress` on unknown runs create runs in `blocked` and `queued` respectively; `complete`, `failed`, and `cancelled` on unknown runs create them directly in that terminal state, flagged in diagnostics. Placeholders carry no execution. Relationship state follows the creating event: runs created by the relationship events `dispatch` and `depends_on` are `linked` because the creating edge is an explicit semantic relationship in the sense of section 8.3; runs created by task-state forward references start `unlinked` until an explicit edge links them — Controller ownership and relationship state are independent axes. Cycle rejection evaluates the dependency DAG including placeholders.
 
-The reducer assigns every accepted event a global monotonic ingest sequence at validation time, and transitions apply in ingest order. Envelope timestamps are display metadata, never ordering keys. Because the responder replies only after reducer validation, rejection reasons that depend on reducer state are decidable at ack time. `accepted` therefore means validated, deduplicated, sequenced, and enqueued to the single SQLite writer; durability follows within the writer's flush interval of at most one second, and a crash inside that window can drop an acknowledged event — the bound is stated so Controllers can reason about it. `duplicate` is reserved for a repeated `event_id`; a semantically identical event under a new `event_id` — including one that re-states an existing resolved edge — is an `accepted` no-op everywhere. `rejected` carries one reason: `invalid`, `cycle`, `conflict`, `stale_event`, or `unsupported_version`. A `schema_version` greater than 1 is rejected as `unsupported_version`.
+The reducer assigns every accepted event a global monotonic ingest sequence after successful validation and the writer-health gate, and transitions apply in ingest order. Envelope timestamps are display metadata, never ordering keys. Because a `rejected` response is issued only after reducer validation, rejection reasons that depend on reducer state are decidable at ack time. `accepted` means validated, deduplicated, sequenced, and enqueued to the single SQLite writer; durability follows within the writer's flush interval of at most one second, and a crash inside that window can drop an acknowledged event — the bound is stated so Controllers can reason about it. `duplicate` is reserved for a repeated `event_id`; a semantically identical event under a new `event_id` — including one that re-states an existing resolved edge — is an `accepted` no-op everywhere. `rejected` carries one reason: `invalid`, `cycle`, `conflict`, `stale_event`, or `unsupported_version`. A `schema_version` greater than 1 is rejected as `unsupported_version`. `retryable` carries reason `busy` or `persistence_unavailable` and is returned before ledger insertion and before reducer application, so retrying the same `event_id` is safe and is the expected recovery. Response precedence is fixed: admission saturation answers `retryable` with `busy` before the pipeline; `duplicate` follows alias resolution and ledger lookup; `rejected` follows validation; `retryable` with `persistence_unavailable` is decided at a serialized writer-health gate after validation and before sequencing, insertion, application, and enqueue; otherwise the event is `accepted`. A rejection and both retryable paths leave no ledger or reducer change and discard staged placeholders.
 
 Controller task-state events are `task_started`, `blocked`, `progress`, `complete`, `failed`, and `cancelled`; `dispatch` and `depends_on` are relationship events and do not make a run Controller-owned. Task-state transitions are fixed. `task_started`: from `queued`, `blocked`, or `ended_unknown` to `running`; in `running` it is an `accepted` no-op; on another terminal state it is rejected as `stale_event`. `blocked`: from `queued`, `running`, or `ended_unknown` to `blocked`; in `blocked` it is an `accepted` no-op. `progress`: accepted in `queued`, `running`, or `blocked` without changing state; on `ended_unknown` it reactivates the run to `running`. `blocked` and `progress` on `completed`, `failed`, or `cancelled` are `accepted` no-ops that increment a diagnostic counter. `complete`, `failed`, `cancelled`: from any non-terminal state to the corresponding terminal state; any of the three refines `ended_unknown` because the Controller outcome is authoritative; the same terminal type on the same terminal state is an `accepted` no-op, and a different terminal type on `completed`, `failed`, or `cancelled` is rejected as `conflict`. `depends_on`: accepted until the subject is terminal, except that re-stating an existing resolved edge is an `accepted` no-op in any state; a cycle is rejected as `cycle`. `dispatch`: rejects self-parenting and any edge whose parent chain reaches the subject as `cycle`; otherwise accepted at any time; re-stating the same parent is an `accepted` no-op, and naming a different parent for a run that already has one is rejected as `conflict`.
 
@@ -298,6 +302,8 @@ Execution state, task state, relationship state, and observation quality are sep
 - `ended`
 
 `stale` is temporary and applies only during uninterrupted live observation. An execution that disappears without an authoritative close remains stale for 30 seconds. If a fresh snapshot still cannot find it, execution becomes `ended`. Explicit pane close or process exit moves directly to `ended`. Reappearance of the same native session during the grace period restores its live state. The grace never applies across an observation gap — see section 10.1 step 8.
+
+Herdr's five reported agent states map onto execution state as: `working` to `working`, `blocked` to `blocked`, `idle` to `idle`, `unknown` to `unknown`, and `done` to `idle` — Herdr documents `done` as the same underlying idle state after unseen background work finishes, so it never maps to `ended`. Herdr is authoritative for pane liveness and the execution state of the pane's top-level reported agent; provider metadata is the only lifecycle source for native child agents and otherwise adds identity, nesting, and activity detail, never overriding Herdr on pane liveness. Observation quality is evaluated per source, and the header shows the worst applicable state in severity order `DISCONNECTED`, then `RECONCILING`, then `DEGRADED`, then `LIVE`, with per-source detail in source coverage; the Controller input's availability appears in coverage only and never enters the worst-state aggregation, per section 10.
 
 ### 8.2 Task state
 
@@ -373,7 +379,7 @@ flowchart LR
 
 ### 9.2 Concurrency and rendering
 
-Collectors send normalized events through bounded in-process channels. The reducer serializes transitions and sends persistence operations to one SQLite writer. The TUI renders in-memory state, not SQLite per frame. Rendering is event-driven and capped at 10 frames per second.
+Collectors send normalized events through bounded in-process channels with per-source overflow policies, and no class is dropped silently. When the Herdr channel would overflow, the collector marks the current buffer generation overflowed and enters `RECONCILING`, then runs section 7.1's bounded in-place resnapshot with a fresh generation under the still-active subscription — an in-process overflow discontinuity, not an observation gap, so no execution is retired; section 10.1 step 8 applies only to the observation gaps section 7.1 enumerates. Overflow and drain-boundary anomalies share a single convergence episode and one three-attempt counter — an overflow during recovery consumes the current attempt and never resets it. Provider activity coalesces per entity, keeping the newest state and counting coalesced updates in diagnostics. Controller events are validated at the serialized reducer as section 7.3 defines, so their backpressure is connection queueing bounded by the acceptor; saturation surfaces to `emit` as the `retryable` response with reason `busy` under the best-effort policy. Each queue's capacity is a fixed constant recorded in diagnostics. The reducer serializes transitions and sends persistence operations to one SQLite writer. The TUI renders in-memory state, not SQLite per frame. Rendering is event-driven and capped at 10 frames per second.
 
 ### 9.3 Session singleton
 
@@ -385,10 +391,10 @@ Startup:
 
 1. Resolve the session key and attempt the advisory lock.
 2. If acquired, validate or initialize the runtime sentinel per section 10 — initialize it on first launch, remove the socket only when the sentinel names this session and no live endpoint answers, treat a mismatched sentinel as a collision error, and surface a socket without a sentinel as an unsafe orphan without removing it — then open the database, reconcile, and become owner, entering the degraded Controller-input mode of section 10 when the socket path is unusable.
-3. If held, validate and focus the recorded owner pane, then exit without opening SQLite as writer.
+3. If held, read the owner record — PID, start time, `terminal_id`, and last known public pane ID, which the owner maintains in SQLite and refreshes on pane moves — resolve the owner's `terminal_id` to its current pane through a live snapshot, focus that pane, and exit without opening SQLite as writer.
 4. If focus fails while the lock remains held, report owner information and do not start a second collector.
 
-The OS releases the lock when the owner exits or crashes. A live but hung owner keeps it; the operator closes that pane before relaunching. Leases, fencing, leader election, and multiple clients are outside the MVP.
+The acquiring owner replaces any stale owner record before subscribing. The OS releases the lock when the owner exits or crashes. A live but hung owner keeps it; the operator closes that pane before relaunching. Leases, fencing, leader election, and multiple clients are outside the MVP.
 
 `q` stops Herdr Top's TUI, collector, socket, and writer only. It never stops Claude Code, Codex, or another pane. Direct CLI launch returns to its shell. Closing the owner pane has the same monitor-only effect. Herdr detach and reattach leave the process running.
 
@@ -411,16 +417,16 @@ Initial tables:
 - `herdr_sessions`, `workspaces`, `tabs`, and `panes`;
 - `native_agent_sessions`, `task_runs`, and `agent_nodes`;
 - `execution_edges` and `dependency_edges`;
-- `events` and `schema_migrations`.
+- `events`, `event_ledger`, `owner`, and `schema_migrations`.
 
-SQLite runs in WAL mode through bundled `rusqlite`.
+SQLite runs through bundled `rusqlite` with WAL enabled explicitly, `synchronous=FULL` so a flushed batch survives OS crashes and power loss, foreign keys on, and a busy timeout. The single writer batches work in transactions flushed at least once per second — the durability bound the Controller ack in section 7.3 states — and checkpoints the WAL periodically and at shutdown. While persistence is unhealthy the responder stops returning `accepted` and answers `retryable` with reason `persistence_unavailable`. A full disk or runtime write failure surfaces as a persistence diagnostic and degrades to in-memory monitoring, never silently; migration or backup failure stops startup, as section 14 states.
 
 ### 10.1 Startup reconciliation
 
 After every successful owner launch:
 
 1. Validate the runtime sentinel per section 10 and remove Herdr Top's own IPC socket only when that check proves it stale; a socket without a sentinel is never removed automatically.
-2. Back up the database before schema migration.
+2. Back up the database before schema migration using the SQLite online backup API — never a file copy, which can tear a live WAL.
 3. Open and migrate the database.
 4. Load persisted Task Runs, Agent Nodes, edges, and recent events.
 5. Connect to the current Herdr named session.
@@ -446,7 +452,7 @@ Herdr restores its own topology and supported agent sessions. Herdr Top restores
 - Active and non-terminal Task Runs are never time-hidden or auto-pruned.
 - A `running` or `blocked` Task Run without live execution remains visible.
 - Finished Task Runs and unreferenced edges are retained for 30 days.
-- Events are retained for 7 days and at most 100,000 per named session.
+- Events form an activity ring bounded to 100,000 per named session and 7 days; under the target sustained load the count bound dominates at roughly 83 minutes, which is intentional — semantic state never depends on event retention. The `event_id` deduplication ledger is stored separately and keeps IDs for the full 7 days regardless of ring eviction.
 - Parents or dependencies referenced by active Task Runs are not pruned.
 - Cleanup runs at startup and periodically after ingestion.
 
@@ -471,7 +477,7 @@ The alternate-screen interface is fixed rather than append-only.
 Required behavior:
 
 - fixed header and footer;
-- header shows host, named session, workspace count, quality, event lag, and source coverage;
+- header shows host, named session, workspace count, quality, event lag — the age of the oldest received but not yet applied event, zero when the queue is empty — and source coverage, truncating below the standard width in the fixed order of criterion 15;
 - `LIVE`, `RECONCILING`, `DISCONNECTED`, and `DEGRADED` indicators;
 - internal scrolling and lower selected-item activity;
 - stable ordering and selection during updates;
@@ -499,6 +505,9 @@ version = "0.1.0"
 min_herdr_version = "0.8.0"
 platforms = ["linux", "macos"]
 
+[[build]]
+command = ["scripts/fetch-release.sh"]
+
 [[panes]]
 id = "top"
 title = "Herdr Top"
@@ -506,7 +515,7 @@ placement = "tab"
 command = ["bin/herdr-top"]
 ```
 
-The long-running TUI is a pane command, not a startup hook.
+The long-running TUI is a pane command, not a startup hook. The `[[build]]` command `scripts/fetch-release.sh` runs during `herdr plugin install`: it selects the release artifact for the current platform, verifies its checksum, and places the binary at `bin/herdr-top`, so installation needs no Rust toolchain.
 
 ### 12.1 Installation and update
 
@@ -520,6 +529,7 @@ Development:
 
 ```sh
 cargo build --release
+mkdir -p bin && cp target/release/herdr-top bin/herdr-top
 herdr plugin link /absolute/path/to/herdr-top
 ```
 
@@ -535,7 +545,7 @@ Reinstallation replaces the managed checkout. Databases live under the Herdr Top
 
 ### 12.2 Release artifacts and Marketplace
 
-Tagged releases provide checksum-verified binaries for macOS arm64/x86_64 and Linux arm64/x86_64. The plugin build command selects and verifies the matching artifact without requiring Rust.
+Tagged releases provide checksum-verified binaries for macOS arm64/x86_64 and Linux arm64/x86_64. The manifest `[[build]]` command selects and verifies the matching artifact without requiring Rust.
 
 After the first usable release, add the `herdr-plugin` GitHub topic for Marketplace discovery.
 
@@ -567,7 +577,8 @@ herdr plugin log list --plugin mageyuki.herdr-top
 | TUI | `ratatui` |
 | Terminal backend | `crossterm` |
 | Async socket, file, and event work | `tokio` |
-| SQLite | `rusqlite` with `bundled` |
+| Filesystem notification | `notify` |
+| SQLite | `rusqlite` with `bundled` and `backup` |
 | Serialization | `serde`, `serde_json` |
 | CLI and emit subcommand | `clap` |
 | Structured logs | `tracing`, `tracing-subscriber` |
@@ -581,10 +592,10 @@ Provider adapters must not force unstable Claude Code or Codex JSON into an over
 ## 14. Privacy, safety, and failure handling
 
 - Observation, IPC, and storage remain local by default.
-- Store normalized metadata, not prompts, responses, or terminal scrollback.
+- Store and display only fields on the section 7.2 allowlist — never prompts, responses, tool arguments or results, or terminal scrollback; operational paths appear only in detail and `doctor` views.
 - Raw provider payload persistence is disabled.
 - Parsers tolerate optional and unknown fields.
-- Malformed provider events are logged and skipped without terminating the TUI.
+- Malformed provider events are logged and skipped without terminating the TUI; their diagnostics carry only the provider, the escaped allowlisted source path, a byte offset, and a parser error code — never raw bytes or decoded values.
 - Provider loss yields `DEGRADED` with Herdr-only monitoring.
 - Herdr socket loss yields `DISCONNECTED`, bounded reconnect, then the subscribe-buffer-snapshot sequence through `RECONCILING`.
 - Reconnect continuity is never provable; every disconnected interval is recorded and shown as a collector-attested event gap.
@@ -601,7 +612,7 @@ Provider adapters must not force unstable Claude Code or Codex JSON into an over
 
 ### Unit tests
 
-- sanitized Claude and Codex fixtures, including recursive depth-two and depth-three sub-agents, unknown parents, unknown-field tolerance, and redaction;
+- sanitized real Claude and Codex fixtures — the evidenced Codex depth-two chain and Claude depth-one spawns — plus one synthetic Codex depth-three `agent_path` fixture marked format-plausible but unevidenced (Claude's observed layout cannot express deeper nesting, so no deeper Claude fixture is fabricated), unknown parents, unknown-field tolerance, and allowlist redaction proven with sentinel strings;
 - Task Run identity priority and provisional merge;
 - Herdr `agent_session` preference, provider-local fallback, and conflicting-identity handling;
 - reducer transitions, live-observation stale grace versus observation-gap retirement, and `ended_unknown` closure;
@@ -620,7 +631,7 @@ Provider adapters must not force unstable Claude Code or Codex JSON into an over
 - pane create, close, move, and replacement by `terminal_id`;
 - same-session resume and different-session pane reuse;
 - provider file watch and two-second fallback scan;
-- Controller acknowledgements, best-effort failure, and `--strict`;
+- Controller wire responses including both `retryable` reasons, response precedence, their no-ledger and no-reducer effects, best-effort failure, and `--strict`;
 - reconnect with the subscribe-buffer-snapshot sequence and collector-attested event-gap indication;
 - second-launch focus and released-lock recovery;
 - `q` proving agent processes remain untouched;
@@ -644,12 +655,12 @@ Target load:
 - 200 live or default-visible Task Runs;
 - 1,000 dependency edges;
 - 20 events per second sustained;
-- 100 events per second short burst without loss;
-- normal screen update within one second;
-- fallback visibility within about two seconds;
+- 100 events per second burst for ten seconds without loss;
+- screen update within one second at the 95th percentile;
+- fallback scanning adding at most one two-second polling interval;
 - input response within 100 milliseconds;
 - startup within three seconds with 100,000 retained events;
-- idle CPU target below 2 percent and memory target below 100 MB on the reference machine.
+- idle CPU target below 2 percent and memory target below 100 MB on the reference machine: a 4-core x86_64 Linux host with 16 GB RAM and a local SSD.
 
 Above the target, enter `DEGRADED` and report lag. Older activity rendering may be omitted, but Task Runs and edges are not dropped.
 
@@ -694,15 +705,15 @@ Herdr Top's differentiating combination is:
 4. Cross-pane runs remain `unlinked` without an explicit Controller relationship event; execution and dependency edges are the only linking evidence.
 5. `dispatch` and `depends_on` create distinct persisted execution and dependency edges.
 6. Duplicate events are idempotent and cycles are rejected.
-7. Watched changes normally reach the screen within one second; fallback scan is about two seconds.
+7. Watched changes reach the screen within one second at the 95th percentile under target load; the fallback scan adds at most its two-second interval.
 8. Provider failure leaves `DEGRADED / Herdr-only` visibility.
 9. Non-authoritative disappearance during live observation is `stale` for 30 seconds before `ended`; across an observation gap executions retire immediately.
 10. Execution end never implies semantic completion.
 11. All non-terminal runs remain visible regardless of age.
 12. Runs in a terminal state, including `ended_unknown`, remain default-visible for one hour and filterable for 30 days.
-13. Events are bounded to seven days and 100,000 per named session.
+13. Activity events are ring-bounded to 100,000 per named session and seven days; the `event_id` ledger is retained independently for seven days; no semantic state depends on event retention.
 14. The fixed TUI supports scroll, stable selection, activity, follow, help, and narrow panes.
-15. Header always shows host, session, workspace count, quality, lag, and coverage.
+15. At or above the standard width of 100 columns the header shows host, session, workspace count, quality, lag, and coverage; below it, down to the minimum supported width of 48 columns, fields truncate in the fixed order coverage, lag, workspace count, host — quality and session are never dropped.
 16. `q` stops only Herdr Top; agents continue.
 17. Detach/reattach keeps the collector running.
 18. Cold restart stops the collector; next manual launch restores from SQLite and reconciles.
@@ -716,7 +727,7 @@ Herdr Top's differentiating combination is:
 26. No prompt, response, or scrollback is persisted or transmitted.
 27. macOS/Linux artifacts install through Herdr without Rust.
 28. `doctor` reports health, Herdr integration versions, and native-session coverage without exposing content.
-29. Target load meets the budget or visibly degrades without losing Task Runs or edges.
+29. On the reference machine the target load meets every budget in section 15, and twice the target load sustained for 60 seconds degrades visibly without losing Task Runs or edges.
 
 ## 18. Deferred capabilities
 
@@ -732,6 +743,7 @@ Herdr Top's differentiating combination is:
 - automatic orchestration;
 - automatic plugin update or Marketplace publication automation;
 - public stabilization of the Controller protocol;
+- Controller correction events such as supersede and tombstone;
 - multiple simultaneous TUI clients;
 - background collector independent from TUI;
 - automatic restart, leader election, lease expiry, and follower promotion;
@@ -755,22 +767,23 @@ ADRs should reference this design rather than duplicate it.
 The next development session should:
 
 1. Read this design and current Herdr 0.8.0 plugin and Socket API documentation.
-2. Produce a vertical-slice implementation plan.
-3. Scaffold the Rust binary and module boundaries.
-4. Add the manifest and a regular tab pane entrypoint.
-5. Implement normalized identities, states, execution edges, dependency edges, and reducer tests.
-6. Implement session-key derivation, advisory lock, SQLite migrations, backup, and retention.
-7. Add a mocked Herdr collector and first fixed-screen tree.
-8. Connect the real Herdr snapshot/event stream and reconcile `terminal_id` plus preferred `agent_session` identity.
-9. Add Claude and Codex watch/scan adapters with sanitized recursive sub-agent fixtures.
-10. Add the Controller socket, versioned protocol, `emit`, and dependency view.
-11. Add lifecycle, degraded-state, first-launch notice, doctor, and performance tests.
-12. Package release artifacts and validate managed install on macOS and Linux.
+2. Verify the frozen contracts against a live Herdr with a throwaway probe: the subscribe-buffer-snapshot convergence, `terminal_id` behavior, and `agent_session` reporting; a mismatch between observed behavior and the frozen contracts stops the effort and reopens design review before planning.
+3. Collect and sanitize real provider fixtures — the evidenced Codex depth-two chain and Claude depth-one spawns — marking synthetic deeper fixtures as unevidenced.
+4. Produce a vertical-slice implementation plan.
+5. Scaffold the Rust binary and module boundaries.
+6. Implement the session-key resolver, runtime sentinel, advisory lock, SQLite migrations, online backup, and retention, with their tests.
+7. Implement normalized identities, states, execution edges, dependency edges, and reducer tests, including the section 5.4 merge rules and the section 7.3 transition table.
+8. Add a mocked Herdr collector and first fixed-screen tree.
+9. Connect the real Herdr snapshot/event stream with the convergence algorithm and gap reconciliation.
+10. Add Claude and Codex adapters with incremental tailing, the field allowlist, and the sanitized fixtures.
+11. Add the Controller socket, versioned protocol, `emit`, and dependency view.
+12. Add lifecycle, degraded-state, first-launch notice, doctor, and performance tests.
+13. Add the manifest with its `[[build]]` artifact fetch, package release artifacts, and validate managed install on macOS and Linux.
 
 The first vertical slice proves:
 
 ```text
-Herdr snapshot -> normalized state -> fixed-screen tree -> SQLite restore
+Herdr subscribe/snapshot -> normalized state -> fixed-screen tree -> SQLite restore
 ```
 
 before provider parsing or the complete dependency DAG.
