@@ -200,15 +200,80 @@ pub fn apply_binding_plan(
     model: &mut DomainModel,
     plan: BindingPlan,
 ) -> Result<PersistBatch, MergeConflict> {
+    apply_binding_plan_at(model, plan, unix_now_ms())
+}
+
+/// Applies a binding plan using the collector-captured receipt time for persistence.
+pub fn apply_binding_plan_at(
+    model: &mut DomainModel,
+    plan: BindingPlan,
+    receipt_time_ms: i64,
+) -> Result<PersistBatch, MergeConflict> {
     match plan {
         BindingPlan::NoChange => Ok(Vec::new()),
         BindingPlan::Conflict(conflict) => Err(conflict),
-        BindingPlan::Bind { run, key } => apply_bind(model, run, key),
+        BindingPlan::Bind { run, key } => apply_bind(model, run, key, receipt_time_ms),
         BindingPlan::Merge { survivor, absorbed } => {
             let contracted = preflight_merge(model, survivor, absorbed)?;
             merge_in_memory(model, survivor, absorbed, contracted);
             Ok(vec![PersistOp::MergeTaskRuns { survivor, absorbed }])
         }
+    }
+}
+
+/// Preflights one candidate dispatch edge against the current live graph.
+pub fn preflight_execution_edge(
+    model: &DomainModel,
+    candidate: &ExecutionEdge,
+) -> Result<(), MergeConflict> {
+    let mut parent_by_child = HashMap::new();
+    let mut pairs = Vec::new();
+    for edge in model.execution_edges().chain(std::iter::once(candidate)) {
+        if edge.parent_run_id == edge.child_run_id {
+            return Err(MergeConflict::DispatchSelfEdge {
+                run: edge.parent_run_id,
+            });
+        }
+        if let Some(existing_parent) = parent_by_child.get(&edge.child_run_id) {
+            if *existing_parent != edge.parent_run_id {
+                let (first_parent, second_parent) =
+                    sorted_pair(*existing_parent, edge.parent_run_id);
+                return Err(MergeConflict::DifferingDispatchParents {
+                    child: edge.child_run_id,
+                    first_parent,
+                    second_parent,
+                });
+            }
+        } else {
+            parent_by_child.insert(edge.child_run_id, edge.parent_run_id);
+        }
+        pairs.push((edge.parent_run_id, edge.child_run_id));
+    }
+    if graph_has_cycle(&pairs) {
+        Err(MergeConflict::DispatchCycle)
+    } else {
+        Ok(())
+    }
+}
+
+/// Preflights one candidate dependency edge against the current live graph.
+pub fn preflight_dependency_edge(
+    model: &DomainModel,
+    candidate: &DependencyEdge,
+) -> Result<(), MergeConflict> {
+    let mut pairs = Vec::new();
+    for edge in model.dependency_edges().chain(std::iter::once(candidate)) {
+        if edge.prerequisite_run_id == edge.dependent_run_id {
+            return Err(MergeConflict::DependencySelfEdge {
+                run: edge.prerequisite_run_id,
+            });
+        }
+        pairs.push((edge.prerequisite_run_id, edge.dependent_run_id));
+    }
+    if graph_has_cycle(&pairs) {
+        Err(MergeConflict::DependencyCycle)
+    } else {
+        Ok(())
     }
 }
 
@@ -361,6 +426,7 @@ fn apply_bind(
     model: &mut DomainModel,
     run: RunId,
     key: RunKey,
+    receipt_time_ms: i64,
 ) -> Result<PersistBatch, MergeConflict> {
     let (provider, sid) = match &key {
         RunKey::Native { provider, sid } => (*provider, sid.clone()),
@@ -408,15 +474,14 @@ fn apply_bind(
             promoted
         }
     };
-    let now_ms = unix_now_ms();
     let persisted = PersistTaskRun {
         task_run: persisted_task_run,
         native_session: Some(NativeSessionBinding {
             provider,
             native_session_id: sid,
         }),
-        created_at_ms: now_ms,
-        updated_at_ms: now_ms,
+        created_at_ms: receipt_time_ms,
+        updated_at_ms: receipt_time_ms,
         finished_at_ms: None,
     };
     Ok(match promoted_from {
@@ -963,6 +1028,62 @@ mod tests {
             BindingPlan::Conflict(MergeConflict::DifferingDispatchParents { child, .. })
                 if child == survivor
         ));
+    }
+
+    #[test]
+    fn live_graph_preflight_detects_self_and_multihop_cycle() {
+        let mut model = DomainModel::default();
+        let first = insert_run(&mut model, provisional("first", 1), 1);
+        let second = insert_run(&mut model, provisional("second", 2), 2);
+        let third = insert_run(&mut model, provisional("third", 3), 3);
+        assert!(matches!(
+            preflight_execution_edge(
+                &model,
+                &ExecutionEdge {
+                    parent_run_id: first,
+                    child_run_id: first,
+                }
+            ),
+            Err(MergeConflict::DispatchSelfEdge { run }) if run == first
+        ));
+
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: first,
+            child_run_id: second,
+        });
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: second,
+            child_run_id: third,
+        });
+        assert_eq!(
+            preflight_execution_edge(
+                &model,
+                &ExecutionEdge {
+                    parent_run_id: third,
+                    child_run_id: first,
+                }
+            ),
+            Err(MergeConflict::DispatchCycle)
+        );
+
+        model.insert_dependency_edge(DependencyEdge {
+            prerequisite_run_id: first,
+            dependent_run_id: second,
+        });
+        model.insert_dependency_edge(DependencyEdge {
+            prerequisite_run_id: second,
+            dependent_run_id: third,
+        });
+        assert_eq!(
+            preflight_dependency_edge(
+                &model,
+                &DependencyEdge {
+                    prerequisite_run_id: third,
+                    dependent_run_id: first,
+                }
+            ),
+            Err(MergeConflict::DependencyCycle)
+        );
     }
 
     #[test]

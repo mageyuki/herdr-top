@@ -1,4 +1,4 @@
-//! SQLite schema v1, read-only preflight, online backup, and migration support.
+//! SQLite schema v2, read-only preflight, online backup, and migration support.
 
 use std::fs::{self, OpenOptions, Permissions};
 use std::io;
@@ -12,7 +12,7 @@ use rusqlite::{Connection, MAIN_DB, OpenFlags};
 use super::StoreError;
 use crate::lockfile::StateRoot;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 1;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 2;
 pub(super) const DATABASE_FILE: &str = "herdr-top.sqlite3";
 const FILE_MODE: u32 = 0o600;
 
@@ -136,7 +136,7 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), St
     let transaction = connection.transaction()?;
     transaction.execute_batch(SCHEMA_V1)?;
 
-    let version = transaction
+    let mut version = transaction
         .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
             row.get::<_, Option<i64>>(0)
         })?
@@ -148,15 +148,35 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), St
         });
     }
 
-    transaction.execute(
-        "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (?1, ?2)",
-        (CURRENT_SCHEMA_VERSION, now_ms),
-    )?;
+    if version == 0 {
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (1, ?1)",
+            [now_ms],
+        )?;
+        version = 1;
+    }
+    if version < 2 {
+        transaction.execute_batch(SCHEMA_V2)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (2, ?1)",
+            [now_ms],
+        )?;
+    }
     transaction.commit()?;
     Ok(())
 }
 
-const SCHEMA_V1: &str = r#"
+const SCHEMA_V2: &str = r#"
+ALTER TABLE events ADD COLUMN ingest_seq INTEGER NULL;
+
+CREATE TABLE meta (
+    key   TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
+INSERT INTO meta(key, value) VALUES ('ingest_seq_high_water', 0);
+"#;
+
+pub(super) const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version       INTEGER PRIMARY KEY,
     applied_at_ms INTEGER NOT NULL

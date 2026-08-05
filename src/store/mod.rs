@@ -18,7 +18,10 @@ pub mod schema;
 pub mod writer;
 
 pub use schema::{SchemaVerdict, database_path, preflight_schema};
-pub use writer::{WriterClient, WriterError, WriterLifecycle, spawn_writer};
+pub use writer::{
+    EnqueuePermit, EventLedgerCache, PendingEnqueue, WriterClient, WriterError, WriterLifecycle,
+    spawn_writer,
+};
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const EVENT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
@@ -237,13 +240,18 @@ pub enum PersistOp {
     },
     /// Record a collector-attested observation gap and its ledger identifier.
     RecordCollectorGap(CollectorGap),
+    /// Advance the non-pruned Controller ingest-sequence high-water mark.
+    AdvanceIngestSequence {
+        /// The newly allocated sequence in SQLite's signed integer domain.
+        ingest_seq: i64,
+    },
 }
 
 /// A reducer persistence batch committed in exactly one SQLite transaction.
 pub type PersistBatch = Vec<PersistOp>;
 
 /// Counts of rows removed during one retention pass.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CleanupStats {
     /// Activity-ring rows evicted by age or per-session count.
     pub events_evicted: u64,
@@ -263,6 +271,15 @@ pub struct CleanupStats {
     pub native_sessions_pruned: u64,
     /// Display-ordinal allocations belonging to pruned runs.
     pub display_ordinals_pruned: u64,
+    /// Exact durable ledger rows deleted by this transaction.
+    pub deleted_ledger_entries: Vec<LedgerEntry>,
+}
+
+/// One durable event-ledger row used to seed and conditionally evict the dedup cache.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LedgerEntry {
+    pub event_id: String,
+    pub seen_at_ms: i64,
 }
 
 /// The durable domain model reconstructed at owner startup.
@@ -272,6 +289,10 @@ pub struct RestoredState {
     pub model: crate::model::DomainModel,
     /// The next globally available display ordinal.
     pub next_ordinal: i64,
+    /// Next Controller ingest sequence, or `None` when `i64::MAX` was allocated.
+    pub next_ingest_seq: Option<i64>,
+    /// Durable deduplication rows retained at startup.
+    pub event_ledger: Vec<LedgerEntry>,
 }
 
 /// A single SQLite connection used either by the writer thread or a reader.
@@ -354,6 +375,21 @@ fn configure_writer(connection: &Connection) -> Result<(), StoreError> {
 }
 
 impl Store {
+    pub(crate) fn load_event_ledger(&self) -> Result<Vec<LedgerEntry>, StoreError> {
+        let mut entries = Vec::new();
+        let mut statement = self
+            .connection
+            .prepare("SELECT event_id, seen_at_ms FROM event_ledger ORDER BY event_id")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            entries.push(LedgerEntry {
+                event_id: row.get(0)?,
+                seen_at_ms: row.get(1)?,
+            });
+        }
+        Ok(entries)
+    }
+
     /// Restores persisted topology, task runs, executions, nodes, and edges.
     pub fn load_restored_state(&self) -> Result<RestoredState, StoreError> {
         let mut model = crate::model::DomainModel::default();
@@ -382,9 +418,27 @@ impl Store {
             None => DISPLAY_ORDINAL_BASE,
         };
 
+        let ingest_high_water: i64 = self.connection.query_row(
+            "SELECT value FROM meta WHERE key = 'ingest_seq_high_water'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !(0..=i64::MAX).contains(&ingest_high_water) {
+            return Err(StoreError::invalid(
+                "meta.ingest_seq_high_water",
+                ingest_high_water.to_string(),
+                "ingest sequence high-water mark cannot be negative",
+            ));
+        }
+        let next_ingest_seq = ingest_high_water.checked_add(1);
+
+        let event_ledger = self.load_event_ledger()?;
+
         Ok(RestoredState {
             model,
             next_ordinal,
+            next_ingest_seq,
+            event_ledger,
         })
     }
 
@@ -494,6 +548,19 @@ impl Store {
              )",
             [EVENT_RING_LIMIT],
         )?);
+        {
+            let mut statement = transaction.prepare(
+                "SELECT event_id, seen_at_ms FROM event_ledger \
+                 WHERE seen_at_ms < ?1 ORDER BY event_id",
+            )?;
+            let mut rows = statement.query([event_cutoff])?;
+            while let Some(row) = rows.next()? {
+                stats.deleted_ledger_entries.push(LedgerEntry {
+                    event_id: row.get(0)?,
+                    seen_at_ms: row.get(1)?,
+                });
+            }
+        }
         stats.ledger_pruned = changed(transaction.execute(
             "DELETE FROM event_ledger WHERE seen_at_ms < ?1",
             [event_cutoff],
@@ -954,6 +1021,25 @@ fn apply_operation(transaction: &Transaction<'_>, operation: PersistOp) -> Resul
             record_event(transaction, &event, seen_at_ms)?;
         }
         PersistOp::RecordCollectorGap(gap) => record_gap(transaction, &gap)?,
+        PersistOp::AdvanceIngestSequence { ingest_seq } => {
+            let changed = transaction.execute(
+                "UPDATE meta SET value = ?1 \
+                 WHERE key = 'ingest_seq_high_water' AND value < ?1",
+                [ingest_seq],
+            )?;
+            if changed != 1 {
+                let current: i64 = transaction.query_row(
+                    "SELECT value FROM meta WHERE key = 'ingest_seq_high_water'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                return Err(StoreError::invalid(
+                    "ingest_seq",
+                    ingest_seq.to_string(),
+                    format!("sequence must advance durable high-water mark {current}"),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1492,15 +1578,23 @@ fn record_event(
         .and_then(|value| value.byte_count)
         .map(|value| signed_count("event.byte_count", value))
         .transpose()?;
+    let ingest_seq = metadata
+        .ingest_seq
+        .map(|value| {
+            i64::try_from(value).map_err(|_| StoreError::IntegerOutOfRange {
+                field: "event.ingest_seq",
+            })
+        })
+        .transpose()?;
     transaction.execute(
         "INSERT INTO events(\
              event_id, seen_at_ms, event_timestamp_ms, herdr_session, source, normalized_kind, \
              source_event_type, workspace_id, tab_id, pane_id, terminal_id, provider, \
              native_session_id, task_run_id, agent_node_id, task_state, model_id, \
-             provider_event_kind, tool_name, item_count, byte_count, gap_kind\
+             provider_event_kind, tool_name, item_count, byte_count, gap_kind, ingest_seq\
          ) VALUES (\
              ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-             ?16, ?17, ?18, ?19, ?20, ?21, NULL\
+             ?16, ?17, ?18, ?19, ?20, ?21, NULL, ?22\
          )",
         params![
             metadata.event_id,
@@ -1523,7 +1617,8 @@ fn record_event(
             provider_metadata.and_then(|value| value.event_kind.as_deref()),
             provider_metadata.and_then(|value| value.tool_name.as_deref()),
             item_count,
-            byte_count
+            byte_count,
+            ingest_seq
         ],
     )?;
     Ok(())
@@ -1570,6 +1665,7 @@ fn insert_ledger(
 
 fn event_metadata(event: &NormalizedEvent) -> (&EventMetadata, &'static str) {
     match event {
+        NormalizedEvent::ControllerEvent { metadata, .. } => (metadata, "controller_event"),
         NormalizedEvent::TopologyUpsert { metadata, .. } => (metadata, "topology_upsert"),
         NormalizedEvent::TopologyClosure { metadata, .. } => (metadata, "topology_closure"),
         NormalizedEvent::AgentStatusChanged { metadata, .. } => (metadata, "agent_status_changed"),
@@ -1804,7 +1900,7 @@ mod tests {
 
         assert!(database_path(&root).is_file());
         assert!(backup_files(directory.path()).is_empty());
-        assert_eq!(schema_version(&store.connection), 1);
+        assert_eq!(schema_version(&store.connection), 2);
     }
 
     #[test]
@@ -1821,7 +1917,7 @@ mod tests {
                     "CREATE TABLE schema_migrations(\
                          version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL\
                      );\
-                     INSERT INTO schema_migrations(version, applied_at_ms) VALUES (2, 0);",
+                     INSERT INTO schema_migrations(version, applied_at_ms) VALUES (3, 0);",
                 )
                 .unwrap();
         }
@@ -1830,15 +1926,15 @@ mod tests {
         assert!(matches!(
             preflight_schema(&root),
             Err(StoreError::NewerSchema {
-                found: 2,
-                supported: 1
+                found: 3,
+                supported: 2
             })
         ));
         assert!(matches!(
             open_writer(&root),
             Err(StoreError::NewerSchema {
-                found: 2,
-                supported: 1
+                found: 3,
+                supported: 2
             })
         ));
 
@@ -1867,7 +1963,7 @@ mod tests {
         let backups = backup_files(directory.path());
 
         assert_eq!(backups.len(), 1);
-        assert_eq!(schema_version(&store.connection), 1);
+        assert_eq!(schema_version(&store.connection), 2);
         let backup = Connection::open_with_flags(
             &backups[0],
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -1895,6 +1991,89 @@ mod tests {
             .unwrap();
         assert!(has_legacy);
         assert!(!has_migration_table);
+    }
+
+    #[test]
+    fn schema_v1_to_v2_migration() {
+        let (_directory, root) = test_root();
+        let database = database_path(&root);
+        {
+            let connection = Connection::open(&database).unwrap();
+            connection.execute_batch(schema::SCHEMA_V1).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (1, 1)",
+                    [],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(preflight_schema(&root).unwrap(), SchemaVerdict::Migratable);
+        let store = open_writer(&root).unwrap();
+        assert_eq!(schema_version(&store.connection), 2);
+        let has_ingest_seq: bool = store
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('events') WHERE name = 'ingest_seq')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let high_water: i64 = store
+            .connection
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'ingest_seq_high_water'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_ingest_seq);
+        assert_eq!(high_water, 0);
+        assert_eq!(
+            store.load_restored_state().unwrap().next_ingest_seq,
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn ingest_seq_seeds_from_restore() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        store
+            .apply_batch(vec![PersistOp::AdvanceIngestSequence { ingest_seq: 41 }])
+            .unwrap();
+
+        assert_eq!(
+            store.load_restored_state().unwrap().next_ingest_seq,
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn ingest_seq_high_water_survives_event_retention() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let now = unix_now_ms().unwrap();
+        let mut event = old_topology_event(now - 8 * DAY_MS);
+        let NormalizedEvent::TopologyClosure { metadata, .. } = &mut event else {
+            panic!("fixture must be a topology closure");
+        };
+        metadata.ingest_seq = Some(77);
+        store
+            .apply_batch(vec![
+                PersistOp::AdvanceIngestSequence { ingest_seq: 77 },
+                PersistOp::RecordEvent {
+                    event: Box::new(event),
+                    seen_at_ms: now - 8 * DAY_MS,
+                },
+            ])
+            .unwrap();
+
+        let cleanup = store.cleanup_retention(now).unwrap();
+        let restored = store.load_restored_state().unwrap();
+        assert_eq!(cleanup.ledger_pruned, 1);
+        assert_eq!(restored.next_ingest_seq, Some(78));
+        assert!(restored.event_ledger.is_empty());
     }
 
     #[test]
@@ -2890,6 +3069,7 @@ mod tests {
             metadata: EventMetadata {
                 event_id: "old-event".to_owned(),
                 timestamp_ms,
+                receipt_time_ms: timestamp_ms,
                 source: "herdr".to_owned(),
                 source_event_type: "workspace.closed".to_owned(),
                 herdr_session: "session-a".to_owned(),
@@ -2906,6 +3086,10 @@ mod tests {
                 dependency: None,
                 source_coverage: Vec::new(),
                 provider_metadata: None,
+                label: None,
+                reason: None,
+                progress: None,
+                ingest_seq: None,
             },
             entity: TopologyEntityId::Workspace {
                 workspace_id: "old-workspace".to_owned(),
@@ -2918,6 +3102,7 @@ mod tests {
             metadata: EventMetadata {
                 event_id: event_id.to_owned(),
                 timestamp_ms,
+                receipt_time_ms: timestamp_ms,
                 source: "test".to_owned(),
                 source_event_type: "execution.end".to_owned(),
                 herdr_session: "session-a".to_owned(),
@@ -2934,6 +3119,10 @@ mod tests {
                 dependency: None,
                 source_coverage: Vec::new(),
                 provider_metadata: None,
+                label: None,
+                reason: None,
+                progress: None,
+                ingest_seq: None,
             },
             execution_id: "execution-1".to_owned(),
         }

@@ -71,6 +71,10 @@ pub struct DependencyEdge {
 #[derive(Clone, Debug, Default)]
 pub struct ControllerDiagnostics {
     binding_conflicts: u64,
+    terminal_blocked_progress_noops: u64,
+    terminal_forward_reference_creations: u64,
+    dangling_announcement_components: u64,
+    ingest_sequence_exhaustions: u64,
     acceptor: ControllerDiagnosticsHandle,
 }
 
@@ -79,6 +83,30 @@ impl ControllerDiagnostics {
     #[must_use]
     pub const fn binding_conflicts(&self) -> u64 {
         self.binding_conflicts
+    }
+
+    /// Blocked/progress observations accepted as no-ops on terminal runs.
+    #[must_use]
+    pub const fn terminal_blocked_progress_noops(&self) -> u64 {
+        self.terminal_blocked_progress_noops
+    }
+
+    /// Terminal Controller observations that created an unknown run.
+    #[must_use]
+    pub const fn terminal_forward_reference_creations(&self) -> u64 {
+        self.terminal_forward_reference_creations
+    }
+
+    /// Dangling relationship-only components observed by the reducer.
+    #[must_use]
+    pub const fn dangling_announcement_components(&self) -> u64 {
+        self.dangling_announcement_components
+    }
+
+    /// Admissions rejected because the durable ingest-sequence domain is exhausted.
+    #[must_use]
+    pub const fn ingest_sequence_exhaustions(&self) -> u64 {
+        self.ingest_sequence_exhaustions
     }
 
     /// Controller socket admissions rejected because the acceptor was saturated.
@@ -95,6 +123,26 @@ impl ControllerDiagnostics {
 
     pub(crate) fn record_binding_conflict(&mut self) {
         self.binding_conflicts = self.binding_conflicts.saturating_add(1);
+    }
+
+    pub(crate) fn record_terminal_blocked_progress_noops(&mut self, count: u64) {
+        self.terminal_blocked_progress_noops =
+            self.terminal_blocked_progress_noops.saturating_add(count);
+    }
+
+    pub(crate) fn record_terminal_forward_reference_creations(&mut self, count: u64) {
+        self.terminal_forward_reference_creations = self
+            .terminal_forward_reference_creations
+            .saturating_add(count);
+    }
+
+    pub(crate) fn record_dangling_announcement_components(&mut self, count: u64) {
+        self.dangling_announcement_components =
+            self.dangling_announcement_components.saturating_add(count);
+    }
+
+    pub(crate) fn record_ingest_sequence_exhaustion(&mut self) {
+        self.ingest_sequence_exhaustions = self.ingest_sequence_exhaustions.saturating_add(1);
     }
 }
 
@@ -332,7 +380,10 @@ pub struct MinimalProviderMetadata {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EventMetadata {
     pub event_id: String,
+    /// Source-emitted time. This is display metadata, never an ordering or retention key.
     pub timestamp_ms: i64,
+    /// Collector-local receipt time used for persistence and retention.
+    pub receipt_time_ms: i64,
     pub source: String,
     pub source_event_type: String,
     pub herdr_session: String,
@@ -349,6 +400,75 @@ pub struct EventMetadata {
     pub dependency: Option<DependencyEdge>,
     pub source_coverage: Vec<SourceCoverage>,
     pub provider_metadata: Option<MinimalProviderMetadata>,
+    pub label: Option<String>,
+    pub reason: Option<String>,
+    /// Validated Controller progress in basis points (`0..=10_000`).
+    pub progress: Option<u16>,
+    /// Reducer-assigned global Controller ingest sequence.
+    pub ingest_seq: Option<u64>,
+}
+
+/// One validated Controller event before its raw keys are resolved to internal run IDs.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ControllerEvent {
+    pub schema_version: u64,
+    pub task_run_id: String,
+    pub metadata: EventMetadata,
+    pub event: ControllerEventKind,
+}
+
+/// The eight Controller event types with their required endpoint carried by the variant.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "event_type")]
+pub enum ControllerEventKind {
+    Dispatch { parent_task_run_id: String },
+    TaskStarted,
+    DependsOn { depends_on_id: String },
+    Blocked,
+    Progress,
+    Complete,
+    Failed,
+    Cancelled,
+}
+
+/// Returned when a wire progress number is not finite or outside `0.0..=1.0`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProgressOutOfRange;
+
+/// Quantizes a wire progress number to basis points, rounding half away from zero.
+pub fn quantize_progress(value: f64) -> Result<u16, ProgressOutOfRange> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(ProgressOutOfRange);
+    }
+    let rounded = (value * 10_000.0).round();
+    if !(0.0..=10_000.0).contains(&rounded) {
+        return Err(ProgressOutOfRange);
+    }
+    Ok(rounded as u16)
+}
+
+/// Escapes control characters and truncates Controller display text to 256 UTF-8 bytes.
+#[must_use]
+pub fn sanitize_controller_text(value: &str) -> String {
+    const MAX_BYTES: usize = 256;
+
+    let mut sanitized = String::new();
+    for character in value.chars() {
+        if character.is_control() {
+            for escaped in character.escape_default() {
+                if sanitized.len().saturating_add(escaped.len_utf8()) > MAX_BYTES {
+                    return sanitized;
+                }
+                sanitized.push(escaped);
+            }
+        } else {
+            if sanitized.len().saturating_add(character.len_utf8()) > MAX_BYTES {
+                break;
+            }
+            sanitized.push(character);
+        }
+    }
+    sanitized
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -367,6 +487,10 @@ pub enum TopologyEntityId {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum NormalizedEvent {
+    ControllerEvent {
+        metadata: EventMetadata,
+        event: ControllerEventKind,
+    },
     TopologyUpsert {
         metadata: EventMetadata,
         entity: TopologyEntity,
@@ -576,6 +700,67 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<TopologySnapshot>(&encoded).unwrap(),
             snapshot
+        );
+    }
+
+    #[test]
+    fn progress_quantization_boundaries() {
+        assert_eq!(quantize_progress(0.0), Ok(0));
+        assert_eq!(quantize_progress(1.0), Ok(10_000));
+        assert_eq!(quantize_progress(0.00005), Ok(1));
+        assert_eq!(quantize_progress(0.99995), Ok(10_000));
+        assert_eq!(quantize_progress(-0.000_001), Err(ProgressOutOfRange));
+        assert_eq!(quantize_progress(1.000_001), Err(ProgressOutOfRange));
+    }
+
+    #[test]
+    fn controller_text_escape_and_utf8_truncation_are_safe() {
+        let value = format!("line\n{}tail", "雪".repeat(100));
+        let sanitized = sanitize_controller_text(&value);
+
+        assert!(sanitized.starts_with("line\\n"));
+        assert!(sanitized.len() <= 256);
+        assert!(std::str::from_utf8(sanitized.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn controller_event_variant_roundtrips() {
+        let metadata = EventMetadata {
+            event_id: "controller-event".to_owned(),
+            timestamp_ms: 11,
+            receipt_time_ms: 22,
+            source: "orchestrator".to_owned(),
+            source_event_type: "depends_on".to_owned(),
+            herdr_session: "session".to_owned(),
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+            terminal_id: None,
+            provider: None,
+            native_session_id: None,
+            task_run_id: Some(RunId::new()),
+            agent_node_id: None,
+            task_state: None,
+            execution_parent: None,
+            dependency: None,
+            source_coverage: Vec::new(),
+            provider_metadata: None,
+            label: Some("label".to_owned()),
+            reason: None,
+            progress: Some(5_000),
+            ingest_seq: Some(7),
+        };
+        let event = NormalizedEvent::ControllerEvent {
+            metadata,
+            event: ControllerEventKind::DependsOn {
+                depends_on_id: "raw prerequisite".to_owned(),
+            },
+        };
+        let encoded = serde_json::to_string(&event).unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<NormalizedEvent>(&encoded).unwrap(),
+            event
         );
     }
 }

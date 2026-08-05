@@ -147,6 +147,9 @@ async fn run_collector(
 ) -> Result<(), CollectorError> {
     let mut first_subscription = true;
     let mut previous_socket = None;
+    let mut retention_cleanup = tokio::time::interval(STALE_SWEEP_INTERVAL);
+    retention_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    retention_cleanup.tick().await;
 
     loop {
         if cancellation.is_cancelled() {
@@ -157,6 +160,10 @@ async fn run_collector(
         let subscriptions = subscriptions();
         let stream = match tokio::select! {
             () = cancellation.cancelled() => return Ok(()),
+            _ = retention_cleanup.tick() => {
+                let _ = writer.cleanup(unix_now_ms()).await?;
+                continue;
+            }
             result = wire::subscribe(&sock, &subscriptions) => result,
         } {
             Ok(stream) => stream,
@@ -459,6 +466,7 @@ async fn monitor_live(
             if !persist.is_empty() {
                 writer.apply(persist).await?;
             }
+            let _ = writer.cleanup(unix_now_ms()).await?;
             continue;
         };
         let anomalous =
@@ -513,6 +521,7 @@ async fn monitor_reconciling(
             if !persist.is_empty() {
                 writer.apply(persist).await?;
             }
+            let _ = writer.cleanup(unix_now_ms()).await?;
             continue;
         };
         apply_received_event(
@@ -1466,9 +1475,11 @@ fn pane_metadata(session: &str, kind: &str, pane: &PaneInfo) -> EventMetadata {
 }
 
 fn metadata(session: &str, kind: &str) -> EventMetadata {
+    let receipt_time_ms = unix_now_ms();
     EventMetadata {
         event_id: format!("herdr-event-{}", ulid::Ulid::new()),
-        timestamp_ms: unix_now_ms(),
+        timestamp_ms: receipt_time_ms,
+        receipt_time_ms,
         source: "herdr".to_owned(),
         source_event_type: kind.to_owned(),
         herdr_session: session.to_owned(),
@@ -1485,6 +1496,10 @@ fn metadata(session: &str, kind: &str) -> EventMetadata {
         dependency: None,
         source_coverage: Vec::new(),
         provider_metadata: None,
+        label: None,
+        reason: None,
+        progress: None,
+        ingest_seq: None,
     }
 }
 

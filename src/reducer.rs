@@ -6,14 +6,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::watch;
 
-use crate::identity::{BindingEvidence, MergeConflict, apply_binding_plan, plan_binding};
+use crate::identity::{
+    BindingEvidence, MergeConflict, apply_binding_plan_at, plan_binding, preflight_dependency_edge,
+    preflight_execution_edge,
+};
 use crate::model::{
-    AgentNode, AgentSessionReferenceKind, ControllerDiagnosticsHandle, DisplayOrdinal, DomainModel,
-    EventMetadata, ExecState, Execution, NormalizedEvent, Pane, Provider, ReconcileBatch, RunId,
-    RunKey, SharedModel, TaskRun, TaskState, TopologyEntity, TopologyEntityId,
+    AgentNode, AgentSessionReferenceKind, ControllerDiagnosticsHandle, ControllerEvent,
+    ControllerEventKind, DependencyEdge, DisplayOrdinal, DomainModel, EventMetadata, ExecState,
+    Execution, ExecutionEdge, NormalizedEvent, Pane, Provider, ReconcileBatch, RunId, RunKey,
+    SharedModel, TaskRun, TaskState, TopologyEntity, TopologyEntityId, sanitize_controller_text,
 };
 use crate::store::{
-    NativeSessionBinding, PersistBatch, PersistExecution, PersistOp, PersistTaskRun, RestoredState,
+    EnqueuePermit, NativeSessionBinding, PendingEnqueue, PersistBatch, PersistExecution, PersistOp,
+    PersistTaskRun, RestoredState,
 };
 
 const STALE_GRACE_MS: i64 = 30_000;
@@ -38,10 +43,44 @@ pub enum ApplyOutcome {
     DroppedBindingConflict(MergeConflict),
 }
 
+/// Stable Controller rejection taxonomy used by the later transport surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RejectReason {
+    Invalid,
+    Cycle,
+    Conflict,
+    StaleEvent,
+    UnsupportedVersion,
+}
+
+/// Reducer-owned diagnostic increments captured during scratch validation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ControllerDiagnosticDeltas {
+    pub terminal_blocked_progress_noops: u64,
+    pub terminal_forward_reference_creations: u64,
+    pub dangling_announcement_components: u64,
+}
+
+/// Fully materialized result of successful Controller validation.
+pub struct MaterializedDelta {
+    pub post_model: DomainModel,
+    pub post_next_ordinal: i64,
+    pub diagnostic_deltas: ControllerDiagnosticDeltas,
+    pub batch: PersistBatch,
+}
+
+/// Retryable failure before any staged domain mutation is committed.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum CommitStagedError {
+    #[error("Controller ingest sequence is exhausted")]
+    IngestSequenceExhausted,
+}
+
 /// Serialized owner of domain transitions and display-ordinal allocation.
 pub struct Reducer {
     model: DomainModel,
     next_ordinal: i64,
+    next_ingest_seq: Option<i64>,
     publisher: watch::Sender<Arc<DomainModel>>,
     #[cfg(test)]
     publish_count: std::cell::Cell<u64>,
@@ -56,6 +95,7 @@ impl Reducer {
             Self {
                 model: restored.model,
                 next_ordinal: restored.next_ordinal,
+                next_ingest_seq: restored.next_ingest_seq,
                 publisher,
                 #[cfg(test)]
                 publish_count: std::cell::Cell::new(0),
@@ -112,6 +152,216 @@ impl Reducer {
         self.publish();
     }
 
+    /// Resolves a raw Controller key through canonical and durable alias bindings.
+    #[must_use]
+    pub fn resolve_controller_run(&self, raw: &str) -> Option<RunId> {
+        self.model
+            .task_run_by_key(&RunKey::Controller(raw.to_owned()))
+            .map(|run| run.run_id)
+    }
+
+    /// Executes the complete Controller mutation sequence on one throwaway clone.
+    pub fn validate_controller_event(
+        &self,
+        event: &ControllerEvent,
+    ) -> Result<MaterializedDelta, RejectReason> {
+        if event.schema_version > 1 {
+            return Err(RejectReason::UnsupportedVersion);
+        }
+        if event.schema_version != 1
+            || event.metadata.event_id.is_empty()
+            || event.metadata.source.is_empty()
+            || event.task_run_id.is_empty()
+            || event.metadata.native_session_id.is_some() && event.metadata.provider.is_none()
+        {
+            return Err(RejectReason::Invalid);
+        }
+
+        let subject_was_unknown = self.resolve_controller_run(&event.task_run_id).is_none();
+        let subject = self
+            .resolve_controller_run(&event.task_run_id)
+            .unwrap_or_default();
+        let mut metadata = event.metadata.clone();
+        metadata.label = metadata.label.as_deref().map(sanitize_controller_text);
+        metadata.reason = metadata.reason.as_deref().map(sanitize_controller_text);
+        metadata.task_run_id = Some(subject);
+        metadata.source_event_type = controller_kind_name(&event.event).to_owned();
+        metadata.task_state = controller_target_state(&event.event);
+        metadata.execution_parent = None;
+        metadata.dependency = None;
+        metadata.ingest_seq = None;
+
+        match &event.event {
+            ControllerEventKind::Dispatch { parent_task_run_id } => {
+                if parent_task_run_id.is_empty() {
+                    return Err(RejectReason::Invalid);
+                }
+                let parent = if parent_task_run_id == &event.task_run_id {
+                    subject
+                } else {
+                    self.resolve_controller_run(parent_task_run_id)
+                        .unwrap_or_default()
+                };
+                metadata.execution_parent = Some(ExecutionEdge {
+                    parent_run_id: parent,
+                    child_run_id: subject,
+                });
+            }
+            ControllerEventKind::DependsOn { depends_on_id } => {
+                if depends_on_id.is_empty() {
+                    return Err(RejectReason::Invalid);
+                }
+                let prerequisite = if depends_on_id == &event.task_run_id {
+                    subject
+                } else {
+                    self.resolve_controller_run(depends_on_id)
+                        .unwrap_or_default()
+                };
+                metadata.dependency = Some(DependencyEdge {
+                    prerequisite_run_id: prerequisite,
+                    dependent_run_id: subject,
+                });
+            }
+            ControllerEventKind::TaskStarted
+            | ControllerEventKind::Blocked
+            | ControllerEventKind::Progress
+            | ControllerEventKind::Complete
+            | ControllerEventKind::Failed
+            | ControllerEventKind::Cancelled => {}
+        }
+
+        let (mut scratch, _scratch_shared) = Self::new(RestoredState {
+            model: self.model.clone(),
+            next_ordinal: self.next_ordinal,
+            next_ingest_seq: self.next_ingest_seq,
+            event_ledger: Vec::new(),
+        });
+        let normalized = NormalizedEvent::ControllerEvent {
+            metadata: metadata.clone(),
+            event: event.event.clone(),
+        };
+        let mut persist = Vec::new();
+        let initial_state = metadata.task_state.map_or(TaskState::Queued, |state| {
+            initial_controller_state(&metadata.source_event_type, state)
+        });
+        scratch
+            .ensure_metadata_run(
+                subject,
+                &metadata,
+                true,
+                Some(&event.task_run_id),
+                initial_state,
+                &mut persist,
+            )
+            .map_err(|_| RejectReason::Conflict)?;
+        match (
+            &event.event,
+            &metadata.execution_parent,
+            &metadata.dependency,
+        ) {
+            (ControllerEventKind::Dispatch { parent_task_run_id }, Some(edge), None) => {
+                scratch
+                    .ensure_controller_placeholder(
+                        edge.parent_run_id,
+                        Some(parent_task_run_id),
+                        metadata.receipt_time_ms,
+                        &mut persist,
+                    )
+                    .map_err(|_| RejectReason::Conflict)?;
+            }
+            (ControllerEventKind::DependsOn { depends_on_id }, None, Some(edge)) => {
+                scratch
+                    .ensure_controller_placeholder(
+                        edge.prerequisite_run_id,
+                        Some(depends_on_id),
+                        metadata.receipt_time_ms,
+                        &mut persist,
+                    )
+                    .map_err(|_| RejectReason::Conflict)?;
+            }
+            (ControllerEventKind::Dispatch { .. }, _, _)
+            | (ControllerEventKind::DependsOn { .. }, _, _) => {
+                return Err(RejectReason::Invalid);
+            }
+            _ => {}
+        }
+
+        let diagnostic_deltas = validate_controller_transition(
+            &scratch.model,
+            &event.event,
+            subject,
+            subject_was_unknown,
+            metadata.execution_parent.as_ref(),
+            metadata.dependency.as_ref(),
+        )?;
+        scratch.apply_controller_metadata(&metadata, &mut persist);
+        scratch.apply_event_body(&normalized, &metadata, &mut persist);
+        scratch
+            .apply_identity_metadata(&normalized, &metadata, &mut persist)
+            .map_err(|error| match error {
+                ReducerError::BindingConflict(conflict) => reject_merge_conflict(&conflict),
+                ReducerError::OrdinalExhausted => RejectReason::Conflict,
+            })?;
+        scratch.persist_event_execution(&normalized, metadata.receipt_time_ms, &mut persist);
+        persist.push(PersistOp::RecordEvent {
+            event: Box::new(normalized),
+            seen_at_ms: metadata.receipt_time_ms,
+        });
+
+        Ok(MaterializedDelta {
+            post_model: scratch.model,
+            post_next_ordinal: scratch.next_ordinal,
+            diagnostic_deltas,
+            batch: persist,
+        })
+    }
+
+    /// Allocates/stamps one sequence, swaps the staged state, publishes once, and consumes a permit.
+    pub fn commit_staged(
+        &mut self,
+        mut delta: MaterializedDelta,
+        permit: EnqueuePermit,
+    ) -> Result<PendingEnqueue, CommitStagedError> {
+        let Some(ingest_seq) = self.next_ingest_seq.filter(|value| *value > 0) else {
+            self.model
+                .controller_diagnostics_mut()
+                .record_ingest_sequence_exhaustion();
+            self.publish();
+            return Err(CommitStagedError::IngestSequenceExhausted);
+        };
+        let Ok(ingest_seq_u64) = u64::try_from(ingest_seq) else {
+            self.model
+                .controller_diagnostics_mut()
+                .record_ingest_sequence_exhaustion();
+            self.publish();
+            return Err(CommitStagedError::IngestSequenceExhausted);
+        };
+        for operation in &mut delta.batch {
+            if let PersistOp::RecordEvent { event, .. } = operation {
+                event_metadata_mut(event).ingest_seq = Some(ingest_seq_u64);
+            }
+        }
+        let mut batch = vec![PersistOp::AdvanceIngestSequence { ingest_seq }];
+        batch.extend(delta.batch);
+
+        self.model = delta.post_model;
+        self.next_ordinal = delta.post_next_ordinal;
+        self.next_ingest_seq = ingest_seq.checked_add(1);
+        self.apply_controller_diagnostic_deltas(delta.diagnostic_deltas);
+        self.publish();
+        Ok(permit.enqueue(batch))
+    }
+
+    fn apply_controller_diagnostic_deltas(&mut self, deltas: ControllerDiagnosticDeltas) {
+        let diagnostics = self.model.controller_diagnostics_mut();
+        diagnostics.record_terminal_blocked_progress_noops(deltas.terminal_blocked_progress_noops);
+        diagnostics.record_terminal_forward_reference_creations(
+            deltas.terminal_forward_reference_creations,
+        );
+        diagnostics
+            .record_dangling_announcement_components(deltas.dangling_announcement_components);
+    }
+
     fn apply_inner(&mut self, event: NormalizedEvent) -> Result<PersistBatch, ReducerError> {
         let metadata = event_metadata(&event).clone();
         let mut persist = Vec::new();
@@ -120,10 +370,10 @@ impl Reducer {
         self.apply_controller_metadata(&metadata, &mut persist);
         self.apply_event_body(&event, &metadata, &mut persist);
         self.apply_identity_metadata(&event, &metadata, &mut persist)?;
-        self.persist_event_execution(&event, metadata.timestamp_ms, &mut persist);
+        self.persist_event_execution(&event, metadata.receipt_time_ms, &mut persist);
         persist.push(PersistOp::RecordEvent {
             event: Box::new(event),
-            seen_at_ms: metadata.timestamp_ms,
+            seen_at_ms: metadata.receipt_time_ms,
         });
 
         Ok(persist)
@@ -272,24 +522,37 @@ impl Reducer {
                 run_id,
                 metadata,
                 controller_reference,
+                None,
                 initial_state,
                 persist,
             )?;
         }
 
         if let Some(edge) = &metadata.execution_parent {
-            self.ensure_controller_placeholder(edge.parent_run_id, metadata.timestamp_ms, persist)?;
-            self.ensure_controller_placeholder(edge.child_run_id, metadata.timestamp_ms, persist)?;
+            self.ensure_controller_placeholder(
+                edge.parent_run_id,
+                None,
+                metadata.receipt_time_ms,
+                persist,
+            )?;
+            self.ensure_controller_placeholder(
+                edge.child_run_id,
+                None,
+                metadata.receipt_time_ms,
+                persist,
+            )?;
         }
         if let Some(edge) = &metadata.dependency {
             self.ensure_controller_placeholder(
                 edge.prerequisite_run_id,
-                metadata.timestamp_ms,
+                None,
+                metadata.receipt_time_ms,
                 persist,
             )?;
             self.ensure_controller_placeholder(
                 edge.dependent_run_id,
-                metadata.timestamp_ms,
+                None,
+                metadata.receipt_time_ms,
                 persist,
             )?;
         }
@@ -316,7 +579,7 @@ impl Reducer {
             });
         let key = match native_key {
             Some(key) if self.model.task_run_by_key(&key).is_none() => key,
-            _ => provisional_key(&execution.terminal_id, metadata.timestamp_ms, ordinal),
+            _ => provisional_key(&execution.terminal_id, metadata.receipt_time_ms, ordinal),
         };
         let task_run = TaskRun {
             run_id: execution.task_run_id,
@@ -326,7 +589,7 @@ impl Reducer {
             has_controller_task_state_event: false,
         };
         self.model.insert_task_run(task_run.clone());
-        persist.push(self.persist_task_run(task_run, metadata.timestamp_ms));
+        persist.push(self.persist_task_run(task_run, metadata.receipt_time_ms));
         Ok(())
     }
 
@@ -335,6 +598,7 @@ impl Reducer {
         run_id: RunId,
         metadata: &EventMetadata,
         controller_reference: bool,
+        controller_key: Option<&str>,
         initial_state: TaskState,
         persist: &mut PersistBatch,
     ) -> Result<(), ReducerError> {
@@ -351,7 +615,7 @@ impl Reducer {
                 sid: sid.to_owned(),
             });
         let key = if controller_reference {
-            RunKey::Controller(run_id.to_string())
+            RunKey::Controller(controller_key.map_or_else(|| run_id.to_string(), ToOwned::to_owned))
         } else {
             match native_key {
                 Some(key) if self.model.task_run_by_key(&key).is_none() => key,
@@ -360,7 +624,7 @@ impl Reducer {
                         .terminal_id
                         .as_deref()
                         .map_or("unknown-terminal", |terminal_id| terminal_id),
-                    metadata.timestamp_ms,
+                    metadata.receipt_time_ms,
                     ordinal,
                 ),
             }
@@ -373,13 +637,14 @@ impl Reducer {
             has_controller_task_state_event: metadata.task_state.is_some(),
         };
         self.model.insert_task_run(task_run.clone());
-        persist.push(self.persist_task_run(task_run, metadata.timestamp_ms));
+        persist.push(self.persist_task_run(task_run, metadata.receipt_time_ms));
         Ok(())
     }
 
     fn ensure_controller_placeholder(
         &mut self,
         run_id: RunId,
+        controller_key: Option<&str>,
         timestamp_ms: i64,
         persist: &mut PersistBatch,
     ) -> Result<(), ReducerError> {
@@ -389,7 +654,9 @@ impl Reducer {
         let ordinal = self.allocate_ordinal()?;
         let task_run = TaskRun {
             run_id,
-            key: RunKey::Controller(run_id.to_string()),
+            key: RunKey::Controller(
+                controller_key.map_or_else(|| run_id.to_string(), ToOwned::to_owned),
+            ),
             display_ordinal: ordinal,
             state: TaskState::Queued,
             has_controller_task_state_event: false,
@@ -407,7 +674,7 @@ impl Reducer {
             task_run.state =
                 controller_task_transition(task_run.state, &metadata.source_event_type, target);
             self.model.insert_task_run(task_run.clone());
-            persist.push(self.persist_task_run(task_run, metadata.timestamp_ms));
+            persist.push(self.persist_task_run(task_run, metadata.receipt_time_ms));
         }
 
         if let Some(edge) = &metadata.execution_parent
@@ -415,7 +682,7 @@ impl Reducer {
         {
             persist.push(PersistOp::UpsertExecutionEdge {
                 edge: edge.clone(),
-                created_at_ms: metadata.timestamp_ms,
+                created_at_ms: metadata.receipt_time_ms,
             });
         }
         if let Some(edge) = &metadata.dependency
@@ -423,7 +690,7 @@ impl Reducer {
         {
             persist.push(PersistOp::UpsertDependencyEdge {
                 edge: edge.clone(),
-                created_at_ms: metadata.timestamp_ms,
+                created_at_ms: metadata.receipt_time_ms,
             });
         }
     }
@@ -435,6 +702,7 @@ impl Reducer {
         persist: &mut PersistBatch,
     ) {
         match event {
+            NormalizedEvent::ControllerEvent { .. } => {}
             NormalizedEvent::TopologyUpsert { entity, .. } => match entity {
                 TopologyEntity::Workspace(workspace) => {
                     self.model.insert_workspace(workspace.clone());
@@ -450,7 +718,7 @@ impl Reducer {
                 }
             },
             NormalizedEvent::TopologyClosure { entity, .. } => {
-                self.apply_topology_closure(entity, metadata.timestamp_ms, persist);
+                self.apply_topology_closure(entity, metadata.receipt_time_ms, persist);
             }
             NormalizedEvent::AgentStatusChanged {
                 execution_id,
@@ -463,7 +731,7 @@ impl Reducer {
                 self.model.insert_execution(execution.clone());
             }
             NormalizedEvent::ExecutionEnd { execution_id, .. } => {
-                self.end_execution(execution_id, metadata.timestamp_ms, persist);
+                self.end_execution(execution_id, metadata.receipt_time_ms, persist);
             }
         }
     }
@@ -549,7 +817,7 @@ impl Reducer {
         let ended = execution.state.is_terminal();
         self.model.insert_execution(execution);
         if ended {
-            self.close_run_without_live_execution(run_id, metadata.timestamp_ms, persist);
+            self.close_run_without_live_execution(run_id, metadata.receipt_time_ms, persist);
         }
     }
 
@@ -571,6 +839,7 @@ impl Reducer {
         persist: &mut PersistBatch,
     ) -> Result<(), ReducerError> {
         let event_run = match event {
+            NormalizedEvent::ControllerEvent { .. } => None,
             NormalizedEvent::ExecutionBegin { execution, .. } => Some(execution.task_run_id),
             NormalizedEvent::AgentStatusChanged { execution_id, .. }
             | NormalizedEvent::ExecutionEnd { execution_id, .. } => self
@@ -607,7 +876,7 @@ impl Reducer {
                     sid: sid.to_owned(),
                 }
             };
-            self.apply_binding(evidence, persist)?;
+            self.apply_binding(evidence, metadata.receipt_time_ms, persist)?;
         }
 
         if matches!(
@@ -621,6 +890,7 @@ impl Reducer {
                     controller_run: run_id,
                     terminal_id: terminal_id.to_owned(),
                 },
+                metadata.receipt_time_ms,
                 persist,
             )?;
         }
@@ -629,7 +899,11 @@ impl Reducer {
             && let Some(current) = self.model.execution(&execution.execution_id)
             && !current.state.is_terminal()
         {
-            self.activate_for_live_execution(current.task_run_id, metadata.timestamp_ms, persist);
+            self.activate_for_live_execution(
+                current.task_run_id,
+                metadata.receipt_time_ms,
+                persist,
+            );
         }
         Ok(())
     }
@@ -637,10 +911,15 @@ impl Reducer {
     fn apply_binding(
         &mut self,
         evidence: BindingEvidence,
+        receipt_time_ms: i64,
         persist: &mut PersistBatch,
     ) -> Result<(), ReducerError> {
         let plan = plan_binding(&self.model, &evidence);
-        persist.extend(apply_binding_plan(&mut self.model, plan)?);
+        persist.extend(apply_binding_plan_at(
+            &mut self.model,
+            plan,
+            receipt_time_ms,
+        )?);
         Ok(())
     }
 
@@ -651,6 +930,7 @@ impl Reducer {
         persist: &mut PersistBatch,
     ) {
         let execution_id = match event {
+            NormalizedEvent::ControllerEvent { .. } => None,
             NormalizedEvent::AgentStatusChanged { execution_id, .. } => Some(execution_id.as_str()),
             NormalizedEvent::ExecutionEnd { .. } => None,
             NormalizedEvent::ExecutionBegin { execution, .. } => {
@@ -879,9 +1159,125 @@ impl Reducer {
     }
 }
 
+fn validate_controller_transition(
+    model: &DomainModel,
+    event: &ControllerEventKind,
+    subject: RunId,
+    subject_was_unknown: bool,
+    execution_edge: Option<&ExecutionEdge>,
+    dependency_edge: Option<&DependencyEdge>,
+) -> Result<ControllerDiagnosticDeltas, RejectReason> {
+    let mut deltas = ControllerDiagnosticDeltas::default();
+    let state = model
+        .task_run(&subject)
+        .map(|run| run.state)
+        .ok_or(RejectReason::Invalid)?;
+    match event {
+        ControllerEventKind::Dispatch { .. } => {
+            let edge = execution_edge.ok_or(RejectReason::Invalid)?;
+            preflight_execution_edge(model, edge)
+                .map_err(|conflict| reject_merge_conflict(&conflict))?;
+            if subject_was_unknown {
+                deltas.dangling_announcement_components = 1;
+            }
+        }
+        ControllerEventKind::DependsOn { .. } => {
+            let edge = dependency_edge.ok_or(RejectReason::Invalid)?;
+            let restatement = model.dependency_edges().any(|existing| existing == edge);
+            if state.is_terminal() && !restatement {
+                return Err(RejectReason::StaleEvent);
+            }
+            preflight_dependency_edge(model, edge)
+                .map_err(|conflict| reject_merge_conflict(&conflict))?;
+            if subject_was_unknown {
+                deltas.dangling_announcement_components = 1;
+            }
+        }
+        ControllerEventKind::TaskStarted => {
+            if matches!(
+                state,
+                TaskState::Completed | TaskState::Failed | TaskState::Cancelled
+            ) {
+                return Err(RejectReason::StaleEvent);
+            }
+        }
+        ControllerEventKind::Blocked | ControllerEventKind::Progress => {
+            if matches!(
+                state,
+                TaskState::Completed | TaskState::Failed | TaskState::Cancelled
+            ) {
+                deltas.terminal_blocked_progress_noops = 1;
+            }
+        }
+        ControllerEventKind::Complete
+        | ControllerEventKind::Failed
+        | ControllerEventKind::Cancelled => {
+            let target = controller_target_state(event).ok_or(RejectReason::Invalid)?;
+            if matches!(
+                state,
+                TaskState::Completed | TaskState::Failed | TaskState::Cancelled
+            ) && state != target
+            {
+                return Err(RejectReason::Conflict);
+            }
+            if subject_was_unknown {
+                deltas.terminal_forward_reference_creations = 1;
+            }
+        }
+    }
+    Ok(deltas)
+}
+
+fn reject_merge_conflict(conflict: &MergeConflict) -> RejectReason {
+    match conflict {
+        MergeConflict::DispatchSelfEdge { .. }
+        | MergeConflict::DependencySelfEdge { .. }
+        | MergeConflict::DispatchCycle
+        | MergeConflict::DependencyCycle => RejectReason::Cycle,
+        _ => RejectReason::Conflict,
+    }
+}
+
+fn controller_kind_name(event: &ControllerEventKind) -> &'static str {
+    match event {
+        ControllerEventKind::Dispatch { .. } => "dispatch",
+        ControllerEventKind::TaskStarted => "task_started",
+        ControllerEventKind::DependsOn { .. } => "depends_on",
+        ControllerEventKind::Blocked => "blocked",
+        ControllerEventKind::Progress => "progress",
+        ControllerEventKind::Complete => "complete",
+        ControllerEventKind::Failed => "failed",
+        ControllerEventKind::Cancelled => "cancelled",
+    }
+}
+
+fn controller_target_state(event: &ControllerEventKind) -> Option<TaskState> {
+    match event {
+        ControllerEventKind::Dispatch { .. } | ControllerEventKind::DependsOn { .. } => None,
+        ControllerEventKind::TaskStarted => Some(TaskState::Running),
+        ControllerEventKind::Blocked => Some(TaskState::Blocked),
+        ControllerEventKind::Progress => Some(TaskState::Queued),
+        ControllerEventKind::Complete => Some(TaskState::Completed),
+        ControllerEventKind::Failed => Some(TaskState::Failed),
+        ControllerEventKind::Cancelled => Some(TaskState::Cancelled),
+    }
+}
+
 fn event_metadata(event: &NormalizedEvent) -> &EventMetadata {
     match event {
-        NormalizedEvent::TopologyUpsert { metadata, .. }
+        NormalizedEvent::ControllerEvent { metadata, .. }
+        | NormalizedEvent::TopologyUpsert { metadata, .. }
+        | NormalizedEvent::TopologyClosure { metadata, .. }
+        | NormalizedEvent::AgentStatusChanged { metadata, .. }
+        | NormalizedEvent::ExecutionBegin { metadata, .. }
+        | NormalizedEvent::ExecutionEnd { metadata, .. } => metadata,
+    }
+}
+
+fn event_metadata_mut(event: &mut NormalizedEvent) -> &mut EventMetadata {
+    match event {
+        NormalizedEvent::ControllerEvent { metadata, .. }
+        | NormalizedEvent::TopologyUpsert { metadata, .. }
         | NormalizedEvent::TopologyClosure { metadata, .. }
         | NormalizedEvent::AgentStatusChanged { metadata, .. }
         | NormalizedEvent::ExecutionBegin { metadata, .. }
@@ -891,13 +1287,13 @@ fn event_metadata(event: &NormalizedEvent) -> &EventMetadata {
 
 fn initial_controller_state(source_event_type: &str, supplied: TaskState) -> TaskState {
     match controller_event_kind(source_event_type) {
-        ControllerEventKind::Started => TaskState::Running,
-        ControllerEventKind::Blocked => TaskState::Blocked,
-        ControllerEventKind::Progress => TaskState::Queued,
-        ControllerEventKind::Complete => TaskState::Completed,
-        ControllerEventKind::Failed => TaskState::Failed,
-        ControllerEventKind::Cancelled => TaskState::Cancelled,
-        ControllerEventKind::Other => supplied,
+        LegacyControllerEventKind::Started => TaskState::Running,
+        LegacyControllerEventKind::Blocked => TaskState::Blocked,
+        LegacyControllerEventKind::Progress => TaskState::Queued,
+        LegacyControllerEventKind::Complete => TaskState::Completed,
+        LegacyControllerEventKind::Failed => TaskState::Failed,
+        LegacyControllerEventKind::Cancelled => TaskState::Cancelled,
+        LegacyControllerEventKind::Other => supplied,
     }
 }
 
@@ -907,25 +1303,25 @@ fn controller_task_transition(
     supplied: TaskState,
 ) -> TaskState {
     match controller_event_kind(source_event_type) {
-        ControllerEventKind::Started => match current {
+        LegacyControllerEventKind::Started => match current {
             TaskState::Queued | TaskState::Blocked | TaskState::EndedUnknown => TaskState::Running,
             _ => current,
         },
-        ControllerEventKind::Blocked => match current {
+        LegacyControllerEventKind::Blocked => match current {
             TaskState::Queued | TaskState::Running | TaskState::EndedUnknown => TaskState::Blocked,
             _ => current,
         },
-        ControllerEventKind::Progress => {
+        LegacyControllerEventKind::Progress => {
             if current == TaskState::EndedUnknown {
                 TaskState::Running
             } else {
                 current
             }
         }
-        ControllerEventKind::Complete => terminal_transition(current, TaskState::Completed),
-        ControllerEventKind::Failed => terminal_transition(current, TaskState::Failed),
-        ControllerEventKind::Cancelled => terminal_transition(current, TaskState::Cancelled),
-        ControllerEventKind::Other => match supplied {
+        LegacyControllerEventKind::Complete => terminal_transition(current, TaskState::Completed),
+        LegacyControllerEventKind::Failed => terminal_transition(current, TaskState::Failed),
+        LegacyControllerEventKind::Cancelled => terminal_transition(current, TaskState::Cancelled),
+        LegacyControllerEventKind::Other => match supplied {
             TaskState::Completed | TaskState::Failed | TaskState::Cancelled => {
                 terminal_transition(current, supplied)
             }
@@ -963,7 +1359,7 @@ fn terminal_transition(current: TaskState, target: TaskState) -> TaskState {
 }
 
 #[derive(Clone, Copy)]
-enum ControllerEventKind {
+enum LegacyControllerEventKind {
     Started,
     Blocked,
     Progress,
@@ -973,15 +1369,15 @@ enum ControllerEventKind {
     Other,
 }
 
-fn controller_event_kind(source_event_type: &str) -> ControllerEventKind {
+fn controller_event_kind(source_event_type: &str) -> LegacyControllerEventKind {
     match source_event_type {
-        "task_started" => ControllerEventKind::Started,
-        "blocked" => ControllerEventKind::Blocked,
-        "progress" => ControllerEventKind::Progress,
-        "complete" => ControllerEventKind::Complete,
-        "failed" => ControllerEventKind::Failed,
-        "cancelled" => ControllerEventKind::Cancelled,
-        _ => ControllerEventKind::Other,
+        "task_started" => LegacyControllerEventKind::Started,
+        "blocked" => LegacyControllerEventKind::Blocked,
+        "progress" => LegacyControllerEventKind::Progress,
+        "complete" => LegacyControllerEventKind::Complete,
+        "failed" => LegacyControllerEventKind::Failed,
+        "cancelled" => LegacyControllerEventKind::Cancelled,
+        _ => LegacyControllerEventKind::Other,
     }
 }
 
@@ -1001,7 +1397,7 @@ fn next_execution_state(
         ExecState::Stale { .. } => match current {
             ExecState::Ended => ExecState::Ended,
             ExecState::Stale { since_ms }
-                if metadata.timestamp_ms.saturating_sub(*since_ms) >= STALE_GRACE_MS =>
+                if metadata.receipt_time_ms.saturating_sub(*since_ms) >= STALE_GRACE_MS =>
             {
                 ExecState::Ended
             }
@@ -1009,7 +1405,7 @@ fn next_execution_state(
                 since_ms: *since_ms,
             },
             _ => ExecState::Stale {
-                since_ms: metadata.timestamp_ms,
+                since_ms: metadata.receipt_time_ms,
             },
         },
         ExecState::Ended => ExecState::Ended,
@@ -1100,20 +1496,25 @@ fn unix_now_ms() -> i64 {
 mod tests {
     use std::sync::Arc;
 
+    use crate::lockfile::StateRoot;
     use crate::model::{
-        AgentNode, AgentSessionReference, AgentSessionReferenceKind, DependencyEdge,
-        DisplayOrdinal, DomainModel, EventMetadata, ExecState, Execution, ExecutionEdge, GapKind,
-        NormalizedEvent, PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SnapshotAgent,
-        TaskRun, TaskState, TopologyEntity, TopologySnapshot, Workspace,
+        AgentNode, AgentSessionReference, AgentSessionReferenceKind, ControllerEvent,
+        ControllerEventKind, DependencyEdge, DisplayOrdinal, DomainModel, EventMetadata, ExecState,
+        Execution, ExecutionEdge, GapKind, NormalizedEvent, PaneSnapshot, Provider, ReconcileBatch,
+        RunId, RunKey, SnapshotAgent, TaskRun, TaskState, TopologyEntity, TopologySnapshot,
+        Workspace,
     };
-    use crate::store::{PersistOp, RestoredState};
+    use crate::store::{
+        PersistOp, RestoredState, database_path, open_reader, open_writer, spawn_writer,
+    };
 
-    use super::{ApplyOutcome, Reducer, ReducerError};
+    use super::{ApplyOutcome, CommitStagedError, Reducer, ReducerError, RejectReason};
 
     fn metadata(event_id: &str, timestamp_ms: i64) -> EventMetadata {
         EventMetadata {
             event_id: event_id.to_owned(),
             timestamp_ms,
+            receipt_time_ms: timestamp_ms,
             source: "herdr".to_owned(),
             source_event_type: "agent_status_changed".to_owned(),
             herdr_session: "session".to_owned(),
@@ -1130,7 +1531,39 @@ mod tests {
             dependency: None,
             source_coverage: Vec::new(),
             provider_metadata: None,
+            label: None,
+            reason: None,
+            progress: None,
+            ingest_seq: None,
         }
+    }
+
+    fn controller_event(
+        event_id: &str,
+        raw_run_id: &str,
+        event: ControllerEventKind,
+    ) -> ControllerEvent {
+        let mut metadata = metadata(event_id, 10);
+        metadata.source = "controller".to_owned();
+        metadata.receipt_time_ms = 20;
+        ControllerEvent {
+            schema_version: 1,
+            task_run_id: raw_run_id.to_owned(),
+            metadata,
+            event,
+        }
+    }
+
+    fn controller_model(raw_run_id: &str, state: TaskState) -> (DomainModel, RunId) {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            run_id,
+            RunKey::Controller(raw_run_id.to_owned()),
+            1,
+            state,
+        ));
+        (model, run_id)
     }
 
     fn run(run_id: RunId, key: RunKey, ordinal: i64, state: TaskState) -> TaskRun {
@@ -1157,6 +1590,8 @@ mod tests {
         RestoredState {
             model,
             next_ordinal,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
         }
     }
 
@@ -1714,5 +2149,567 @@ mod tests {
         let result = reducer.apply_observation(vec![topology_event(value, "ws-err")]);
         assert_eq!(result, Err(ReducerError::OrdinalExhausted));
         assert_eq!(reducer.publish_count.get(), before_err);
+    }
+
+    #[test]
+    fn staged_validate_is_pure_no_mutation() {
+        let (reducer, mut shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let initial = Arc::clone(&shared.borrow_and_update());
+
+        let delta = reducer
+            .validate_controller_event(&controller_event(
+                "pure",
+                "raw run",
+                ControllerEventKind::TaskStarted,
+            ))
+            .unwrap();
+
+        assert!(
+            delta
+                .post_model
+                .task_run_by_key(&RunKey::Controller("raw run".to_owned()))
+                .is_some()
+        );
+        assert!(reducer.resolve_controller_run("raw run").is_none());
+        assert!(!shared.has_changed().unwrap());
+        assert!(Arc::ptr_eq(&initial, &shared.borrow()));
+    }
+
+    #[tokio::test]
+    async fn commit_assigns_monotonic_ingest_seq() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        for (event_id, raw) in [("sequence-1", "raw-1"), ("sequence-2", "raw-2")] {
+            let mut event = controller_event(event_id, raw, ControllerEventKind::TaskStarted);
+            event.metadata.receipt_time_ms = super::unix_now_ms();
+            let delta = reducer.validate_controller_event(&event).unwrap();
+            let permit = writer.reserve_enqueue().expect("writer must have capacity");
+            reducer
+                .commit_staged(delta, permit)
+                .expect("sequence must be available")
+                .wait()
+                .await
+                .unwrap();
+        }
+        lifecycle.shutdown().await.unwrap();
+
+        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+        assert_eq!(restored.next_ingest_seq, Some(3));
+        let connection = rusqlite::Connection::open(database_path(&root)).unwrap();
+        let mut statement = connection
+            .prepare("SELECT ingest_seq FROM events ORDER BY ingest_seq")
+            .unwrap();
+        let sequences: Vec<i64> = statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(sequences, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn ledger_reservation_returns_duplicate_before_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        store
+            .apply_batch(vec![PersistOp::RecordEvent {
+                event: Box::new(topology_event(metadata("duplicate", 20), "workspace")),
+                seen_at_ms: 20,
+            }])
+            .unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (reducer, mut shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let initial = Arc::clone(&shared.borrow_and_update());
+
+        assert!(writer.is_duplicate("duplicate"));
+        assert!(reducer.resolve_controller_run("must-not-stage").is_none());
+        assert!(!shared.has_changed().unwrap());
+        assert!(Arc::ptr_eq(&initial, &shared.borrow()));
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_event_id_is_reusable() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let event_id = "reusable";
+
+        assert!(matches!(
+            reducer.validate_controller_event(&controller_event(
+                event_id,
+                "same",
+                ControllerEventKind::Dispatch {
+                    parent_task_run_id: "same".to_owned(),
+                },
+            )),
+            Err(RejectReason::Cycle)
+        ));
+        assert!(!writer.is_duplicate(event_id));
+        assert!(
+            reducer
+                .validate_controller_event(&controller_event(
+                    event_id,
+                    "same",
+                    ControllerEventKind::TaskStarted,
+                ))
+                .is_ok()
+        );
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_health_gate_returns_retryable_no_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        assert!(
+            writer
+                .apply(vec![PersistOp::UpsertTab(crate::model::Tab {
+                    tab_id: "orphan-tab".to_owned(),
+                    workspace_id: "missing-workspace".to_owned(),
+                })])
+                .await
+                .is_err()
+        );
+        let (reducer, mut shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let initial = Arc::clone(&shared.borrow_and_update());
+        let _delta = reducer
+            .validate_controller_event(&controller_event(
+                "unhealthy",
+                "raw",
+                ControllerEventKind::TaskStarted,
+            ))
+            .unwrap();
+
+        assert!(writer.reserve_enqueue().is_none());
+        assert!(!shared.has_changed().unwrap());
+        assert!(Arc::ptr_eq(&initial, &shared.borrow()));
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn receipt_time_distinct_from_envelope_time() {
+        let (reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let delta = reducer
+            .validate_controller_event(&controller_event(
+                "receipt",
+                "child",
+                ControllerEventKind::Dispatch {
+                    parent_task_run_id: "parent".to_owned(),
+                },
+            ))
+            .unwrap();
+
+        assert!(delta.batch.iter().all(|operation| match operation {
+            PersistOp::UpsertTaskRun(value) =>
+                value.created_at_ms == 20 && value.updated_at_ms == 20,
+            PersistOp::UpsertExecutionEdge { created_at_ms, .. } => *created_at_ms == 20,
+            PersistOp::RecordEvent { seen_at_ms, event } => {
+                *seen_at_ms == 20 && super::event_metadata(event).timestamp_ms == 10
+            }
+            _ => true,
+        }));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_counters_increment() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        for (event_id, kind) in [
+            ("terminal-forward", ControllerEventKind::Complete),
+            ("terminal-noop", ControllerEventKind::Blocked),
+            (
+                "dangling",
+                ControllerEventKind::Dispatch {
+                    parent_task_run_id: "dangling-parent".to_owned(),
+                },
+            ),
+        ] {
+            let raw = if event_id == "dangling" {
+                "dangling-child"
+            } else {
+                "raw"
+            };
+            let delta = reducer
+                .validate_controller_event(&controller_event(event_id, raw, kind))
+                .unwrap();
+            let permit = writer.reserve_enqueue().unwrap();
+            reducer
+                .commit_staged(delta, permit)
+                .unwrap()
+                .wait()
+                .await
+                .unwrap();
+        }
+
+        let snapshot = shared.borrow();
+        assert_eq!(
+            snapshot
+                .controller_diagnostics()
+                .terminal_forward_reference_creations(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .controller_diagnostics()
+                .terminal_blocked_progress_noops(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .controller_diagnostics()
+                .dangling_announcement_components(),
+            1
+        );
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn commit_is_infallible_after_permit() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let delta = reducer
+            .validate_controller_event(&controller_event(
+                "commit",
+                "raw",
+                ControllerEventKind::TaskStarted,
+            ))
+            .unwrap();
+        let permit = writer.reserve_enqueue().unwrap();
+
+        reducer
+            .commit_staged(delta, permit)
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        assert!(
+            shared
+                .borrow()
+                .task_run_by_key(&RunKey::Controller("raw".to_owned()))
+                .is_some()
+        );
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sequence_exhaustion_before_mutation_answers_retryable() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: None,
+            event_ledger: Vec::new(),
+        });
+        let delta = reducer
+            .validate_controller_event(&controller_event(
+                "exhausted",
+                "raw",
+                ControllerEventKind::TaskStarted,
+            ))
+            .unwrap();
+        let permit = writer.reserve_enqueue().unwrap();
+
+        assert!(matches!(
+            reducer.commit_staged(delta, permit),
+            Err(CommitStagedError::IngestSequenceExhausted)
+        ));
+        assert!(
+            shared
+                .borrow()
+                .task_run_by_key(&RunKey::Controller("raw".to_owned()))
+                .is_none()
+        );
+        assert_eq!(
+            shared
+                .borrow()
+                .controller_diagnostics()
+                .ingest_sequence_exhaustions(),
+            1
+        );
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_ulid_controller_key_resolves_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let raw = "not a ULID / task #1";
+        let delta = reducer
+            .validate_controller_event(&controller_event(
+                "raw-key",
+                raw,
+                ControllerEventKind::TaskStarted,
+            ))
+            .unwrap();
+        let permit = writer.reserve_enqueue().unwrap();
+        reducer
+            .commit_staged(delta, permit)
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        let original = shared
+            .borrow()
+            .task_run_by_key(&RunKey::Controller(raw.to_owned()))
+            .unwrap()
+            .run_id;
+        lifecycle.shutdown().await.unwrap();
+
+        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+        assert_eq!(
+            restored
+                .model
+                .task_run_by_key(&RunKey::Controller(raw.to_owned()))
+                .unwrap()
+                .run_id,
+            original
+        );
+    }
+
+    #[test]
+    fn receipt_time_covers_native_binding_persistence() {
+        let (reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let mut event = controller_event(
+            "native-receipt",
+            "controller raw",
+            ControllerEventKind::TaskStarted,
+        );
+        event.metadata.provider = Some(Provider::Codex);
+        event.metadata.native_session_id = Some("native-session".to_owned());
+        let delta = reducer.validate_controller_event(&event).unwrap();
+
+        assert!(
+            delta
+                .batch
+                .iter()
+                .filter_map(|operation| match operation {
+                    PersistOp::UpsertTaskRun(value) if value.native_session.is_some() =>
+                        Some(value),
+                    _ => None,
+                })
+                .all(|value| value.created_at_ms == 20 && value.updated_at_ms == 20)
+        );
+        assert!(delta.batch.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertTaskRun(value) if value.native_session.is_some()
+        )));
+    }
+
+    #[test]
+    fn edge_then_binding_composite_self_cycle_rejected_in_validation() {
+        let native_run = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            native_run,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "native".to_owned(),
+            },
+            1,
+            TaskState::Running,
+        ));
+        model.insert_task_run_alias(RunKey::Controller("parent".to_owned()), native_run);
+        model.insert_execution(execution(native_run, "live", ExecState::Working));
+        let (reducer, _shared) = Reducer::new(restored(model, 2));
+        let mut event = controller_event(
+            "composite",
+            "child",
+            ControllerEventKind::Dispatch {
+                parent_task_run_id: "parent".to_owned(),
+            },
+        );
+        event.metadata.terminal_id = Some("terminal-1".to_owned());
+
+        assert!(matches!(
+            reducer.validate_controller_event(&event),
+            Err(RejectReason::Cycle)
+        ));
+        assert!(reducer.resolve_controller_run("child").is_none());
+    }
+
+    #[test]
+    fn dual_binding_native_then_terminal_ordering() {
+        let native = RunId::new();
+        let terminal = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            native,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "sid".to_owned(),
+            },
+            1,
+            TaskState::Running,
+        ));
+        model.insert_task_run(run(
+            terminal,
+            RunKey::Provisional {
+                terminal_id: "terminal-1".to_owned(),
+                start_ms: 1,
+                seq: 2,
+            },
+            2,
+            TaskState::Running,
+        ));
+        model.insert_execution(execution(terminal, "terminal-live", ExecState::Working));
+        let (reducer, _shared) = Reducer::new(restored(model, 3));
+        let mut event = controller_event("dual", "controller", ControllerEventKind::TaskStarted);
+        event.metadata.provider = Some(Provider::Codex);
+        event.metadata.native_session_id = Some("sid".to_owned());
+        event.metadata.terminal_id = Some("terminal-1".to_owned());
+
+        let delta = reducer.validate_controller_event(&event).unwrap();
+        let merges: Vec<_> = delta
+            .batch
+            .iter()
+            .filter_map(|operation| match operation {
+                PersistOp::MergeTaskRuns { absorbed, .. } => Some(*absorbed),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(merges, vec![native, terminal]);
+    }
+
+    #[test]
+    fn transition_matrix_task_started() {
+        let (running, _) = controller_model("run", TaskState::Running);
+        let (reducer, _) = Reducer::new(restored(running, 2));
+        assert!(
+            reducer
+                .validate_controller_event(&controller_event(
+                    "started-noop",
+                    "run",
+                    ControllerEventKind::TaskStarted
+                ))
+                .is_ok()
+        );
+
+        let (completed, _) = controller_model("run", TaskState::Completed);
+        let (reducer, _) = Reducer::new(restored(completed, 2));
+        assert!(matches!(
+            reducer.validate_controller_event(&controller_event(
+                "started-stale",
+                "run",
+                ControllerEventKind::TaskStarted
+            )),
+            Err(RejectReason::StaleEvent)
+        ));
+    }
+
+    #[test]
+    fn transition_matrix_blocked() {
+        let (blocked, _) = controller_model("run", TaskState::Blocked);
+        let (reducer, _) = Reducer::new(restored(blocked, 2));
+        assert!(
+            reducer
+                .validate_controller_event(&controller_event(
+                    "blocked-noop",
+                    "run",
+                    ControllerEventKind::Blocked
+                ))
+                .is_ok()
+        );
+
+        let (terminal, _) = controller_model("run", TaskState::Completed);
+        let (reducer, _) = Reducer::new(restored(terminal, 2));
+        let delta = reducer
+            .validate_controller_event(&controller_event(
+                "blocked-terminal",
+                "run",
+                ControllerEventKind::Blocked,
+            ))
+            .unwrap();
+        assert_eq!(delta.diagnostic_deltas.terminal_blocked_progress_noops, 1);
+    }
+
+    #[test]
+    fn transition_matrix_progress() {
+        let (queued, run_id) = controller_model("run", TaskState::Queued);
+        let (reducer, _) = Reducer::new(restored(queued, 2));
+        let delta = reducer
+            .validate_controller_event(&controller_event(
+                "progress-noop",
+                "run",
+                ControllerEventKind::Progress,
+            ))
+            .unwrap();
+        assert_eq!(
+            delta.post_model.task_run(&run_id).unwrap().state,
+            TaskState::Queued
+        );
+
+        let (terminal, _) = controller_model("run", TaskState::Failed);
+        let (reducer, _) = Reducer::new(restored(terminal, 2));
+        let delta = reducer
+            .validate_controller_event(&controller_event(
+                "progress-terminal",
+                "run",
+                ControllerEventKind::Progress,
+            ))
+            .unwrap();
+        assert_eq!(delta.diagnostic_deltas.terminal_blocked_progress_noops, 1);
+    }
+
+    #[test]
+    fn transition_matrix_terminal() {
+        let (completed, _) = controller_model("run", TaskState::Completed);
+        let (reducer, _) = Reducer::new(restored(completed, 2));
+        assert!(
+            reducer
+                .validate_controller_event(&controller_event(
+                    "same-terminal",
+                    "run",
+                    ControllerEventKind::Complete
+                ))
+                .is_ok()
+        );
+
+        let (completed, _) = controller_model("run", TaskState::Completed);
+        let (reducer, _) = Reducer::new(restored(completed, 2));
+        assert!(matches!(
+            reducer.validate_controller_event(&controller_event(
+                "different-terminal",
+                "run",
+                ControllerEventKind::Failed
+            )),
+            Err(RejectReason::Conflict)
+        ));
+
+        let (ended, run_id) = controller_model("run", TaskState::EndedUnknown);
+        let (reducer, _) = Reducer::new(restored(ended, 2));
+        let delta = reducer
+            .validate_controller_event(&controller_event(
+                "refine-terminal",
+                "run",
+                ControllerEventKind::Cancelled,
+            ))
+            .unwrap();
+        assert_eq!(
+            delta.post_model.task_run(&run_id).unwrap().state,
+            TaskState::Cancelled
+        );
     }
 }

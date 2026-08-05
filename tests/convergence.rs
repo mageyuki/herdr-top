@@ -874,6 +874,8 @@ fn binding_conflict_returns_typed_dropped_result() {
     let (mut reducer, mut shared) = Reducer::new(RestoredState {
         model,
         next_ordinal: 2,
+        next_ingest_seq: Some(1),
+        event_ledger: Vec::new(),
     });
     let _ = shared.borrow_and_update();
     let mut event_metadata = identity_metadata("binding-conflict", "task_started");
@@ -1024,6 +1026,8 @@ async fn different_sid_replacement_publishes_once() {
     let (mut reducer, mut shared) = Reducer::new(RestoredState {
         model,
         next_ordinal: 2,
+        next_ingest_seq: Some(1),
+        event_ledger: Vec::new(),
     });
     let _ = shared.borrow_and_update();
     let mut begin_metadata = identity_metadata("replacement-begin", "pane_updated");
@@ -1606,6 +1610,8 @@ async fn gap_replacement_prunes_absent_topology_on_restore() {
         RestoredState {
             model: old_model,
             next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
         },
         writer,
     )
@@ -1661,6 +1667,8 @@ async fn converge_error_cancels_and_joins_reader() {
         RestoredState {
             model: DomainModel::default(),
             next_ordinal: i64::MAX,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
         },
         writer,
     )
@@ -1813,6 +1821,8 @@ fn empty_restored() -> RestoredState {
     RestoredState {
         model: DomainModel::default(),
         next_ordinal: 1,
+        next_ingest_seq: Some(1),
+        event_ledger: Vec::new(),
     }
 }
 
@@ -1824,6 +1834,7 @@ fn identity_metadata(event_id: &str, event_type: &str) -> EventMetadata {
     EventMetadata {
         event_id: event_id.to_owned(),
         timestamp_ms: 1,
+        receipt_time_ms: 1,
         source: "herdr".to_owned(),
         source_event_type: event_type.to_owned(),
         herdr_session: test_session(),
@@ -1840,6 +1851,10 @@ fn identity_metadata(event_id: &str, event_type: &str) -> EventMetadata {
         dependency: None,
         source_coverage: Vec::new(),
         provider_metadata: None,
+        label: None,
+        reason: None,
+        progress: None,
+        ingest_seq: None,
     }
 }
 
@@ -1887,6 +1902,8 @@ fn persisted_native_restored(sid: &str) -> (RestoredState, Vec<PersistOp>, RunId
         RestoredState {
             model,
             next_ordinal: 2,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
         },
         seed,
         run_id,

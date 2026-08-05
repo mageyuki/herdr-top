@@ -418,7 +418,7 @@ Initial tables:
 - `native_agent_sessions`, `task_runs`, `executions`, and `agent_nodes`;
 - `execution_edges` and `dependency_edges`;
 - `display_ordinals`;
-- `events`, `event_ledger`, `owner`, and `schema_migrations`.
+- `events`, `event_ledger`, `meta`, `owner`, and `schema_migrations`.
 
 SQLite runs through bundled `rusqlite` with WAL enabled explicitly, `synchronous=FULL` so a flushed batch survives OS crashes and power loss, foreign keys on, and a busy timeout. The single writer batches work in transactions flushed at least once per second — the durability bound the Controller ack in section 7.3 states — and checkpoints the WAL periodically and at shutdown. While persistence is unhealthy the responder stops returning `accepted` and answers `retryable` with reason `persistence_unavailable`. A full disk or runtime write failure surfaces as a persistence diagnostic and degrades to in-memory monitoring, never silently; migration or backup failure stops startup, as section 14 states.
 
@@ -455,7 +455,7 @@ Herdr restores its own topology and supported agent sessions. Herdr Top restores
 - Finished Task Runs and unreferenced edges are retained for 30 days.
 - Events form an activity ring bounded to 100,000 per named session and 7 days; under the target sustained load the count bound dominates at roughly 83 minutes, which is intentional — semantic state never depends on event retention. The `event_id` deduplication ledger is stored separately and keeps IDs for the full 7 days regardless of ring eviction.
 - Parents or dependencies referenced by active Task Runs are not pruned.
-- Cleanup runs at startup and periodically after ingestion.
+- Cleanup runs at startup, after ingestion, and on a collector-driven periodic tick.
 
 The default TUI shows all non-terminal Task Runs plus runs that entered a terminal state — `completed`, `failed`, `cancelled`, or `ended_unknown` — during the last hour. Older retained runs remain filterable.
 
