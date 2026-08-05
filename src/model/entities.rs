@@ -226,6 +226,21 @@ impl DomainModel {
     pub(crate) fn dependency_edges_mut(&mut self) -> &mut HashSet<DependencyEdge> {
         &mut self.dependency_edges
     }
+
+    /// Removes one workspace from the current physical topology.
+    pub fn remove_workspace(&mut self, workspace_id: &str) -> Option<Workspace> {
+        self.workspaces.remove(workspace_id)
+    }
+
+    /// Removes one tab from the current physical topology.
+    pub fn remove_tab(&mut self, tab_id: &str) -> Option<Tab> {
+        self.tabs.remove(tab_id)
+    }
+
+    /// Removes one pane from the current physical topology.
+    pub fn remove_pane(&mut self, pane_id: &str) -> Option<Pane> {
+        self.panes.remove(pane_id)
+    }
 }
 
 pub type SharedModel = tokio::sync::watch::Receiver<Arc<DomainModel>>;
