@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::watch;
 
-use crate::identity::{BindingEvidence, BindingPlan, apply_binding_plan, plan_binding};
+use crate::identity::{BindingEvidence, MergeConflict, apply_binding_plan, plan_binding};
 use crate::model::{
     AgentNode, AgentSessionReferenceKind, DisplayOrdinal, DomainModel, EventMetadata, ExecState,
     Execution, NormalizedEvent, Pane, Provider, ReconcileBatch, RunId, RunKey, SharedModel,
@@ -24,6 +24,9 @@ pub enum ReducerError {
     /// No immutable display ordinal remains for a newly observed Task Run.
     #[error("display ordinal allocator is exhausted")]
     OrdinalExhausted,
+    /// Identity evidence conflicted with the current binding graph.
+    #[error("identity binding conflict: {0}")]
+    BindingConflict(#[from] MergeConflict),
 }
 
 /// Serialized owner of domain transitions and display-ordinal allocation.
@@ -50,16 +53,32 @@ impl Reducer {
 
     /// Applies one normalized event and publishes exactly one resulting snapshot.
     pub fn apply(&mut self, event: NormalizedEvent) -> Result<PersistBatch, ReducerError> {
+        self.apply_observation(vec![event])
+    }
+
+    /// Applies one source observation and publishes exactly one resulting snapshot.
+    pub fn apply_observation(
+        &mut self,
+        events: Vec<NormalizedEvent>,
+    ) -> Result<PersistBatch, ReducerError> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
         let original_model = self.model.clone();
         let original_next_ordinal = self.next_ordinal;
-        match self.apply_inner(event) {
-            Ok(persist) => Ok(persist),
-            Err(error) => {
-                self.model = original_model;
-                self.next_ordinal = original_next_ordinal;
-                Err(error)
+        let mut persist = Vec::new();
+        for event in events {
+            match self.apply_inner(event) {
+                Ok(event_persist) => persist.extend(event_persist),
+                Err(error) => {
+                    self.model = original_model;
+                    self.next_ordinal = original_next_ordinal;
+                    return Err(error);
+                }
             }
         }
+        self.publish();
+        Ok(persist)
     }
 
     fn apply_inner(&mut self, event: NormalizedEvent) -> Result<PersistBatch, ReducerError> {
@@ -69,14 +88,13 @@ impl Reducer {
         self.ensure_event_runs(&event, &metadata, &mut persist)?;
         self.apply_controller_metadata(&metadata, &mut persist);
         self.apply_event_body(&event, &metadata, &mut persist);
-        self.apply_identity_metadata(&event, &metadata, &mut persist);
+        self.apply_identity_metadata(&event, &metadata, &mut persist)?;
         self.persist_event_execution(&event, metadata.timestamp_ms, &mut persist);
         persist.push(PersistOp::RecordEvent {
             event: Box::new(event),
             seen_at_ms: metadata.timestamp_ms,
         });
 
-        self.publish();
         Ok(persist)
     }
 
@@ -520,7 +538,7 @@ impl Reducer {
         event: &NormalizedEvent,
         metadata: &EventMetadata,
         persist: &mut PersistBatch,
-    ) {
+    ) -> Result<(), ReducerError> {
         let event_run = match event {
             NormalizedEvent::ExecutionBegin { execution, .. } => Some(execution.task_run_id),
             NormalizedEvent::AgentStatusChanged { execution_id, .. }
@@ -534,10 +552,10 @@ impl Reducer {
         };
         let run_id = metadata.task_run_id.or(event_run);
         let Some(run_id) = run_id else {
-            return;
+            return Ok(());
         };
         let Some(task_run) = self.model.task_run(&run_id) else {
-            return;
+            return Ok(());
         };
 
         if let Some((provider, sid)) = metadata
@@ -558,7 +576,7 @@ impl Reducer {
                     sid: sid.to_owned(),
                 }
             };
-            self.apply_binding(evidence, persist);
+            self.apply_binding(evidence, persist)?;
         }
 
         if matches!(
@@ -573,7 +591,7 @@ impl Reducer {
                     terminal_id: terminal_id.to_owned(),
                 },
                 persist,
-            );
+            )?;
         }
 
         if let NormalizedEvent::ExecutionBegin { execution, .. } = event
@@ -582,16 +600,17 @@ impl Reducer {
         {
             self.activate_for_live_execution(current.task_run_id, metadata.timestamp_ms, persist);
         }
+        Ok(())
     }
 
-    fn apply_binding(&mut self, evidence: BindingEvidence, persist: &mut PersistBatch) {
+    fn apply_binding(
+        &mut self,
+        evidence: BindingEvidence,
+        persist: &mut PersistBatch,
+    ) -> Result<(), ReducerError> {
         let plan = plan_binding(&self.model, &evidence);
-        if matches!(plan, BindingPlan::Conflict(_)) {
-            return;
-        }
-        if let Ok(operations) = apply_binding_plan(&mut self.model, plan) {
-            persist.extend(operations);
-        }
+        persist.extend(apply_binding_plan(&mut self.model, plan)?);
+        Ok(())
     }
 
     fn persist_event_execution(

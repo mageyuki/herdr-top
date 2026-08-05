@@ -144,6 +144,28 @@ pub fn open_runtime_dir() -> Result<ValidatedRuntimeDir, RvError> {
     open_runtime_dir_at_for_uid(&base, uid)
 }
 
+/// Reads the kernel hostname through the platform libc boundary.
+#[must_use]
+pub fn gethostname() -> Option<String> {
+    let mut buffer = [0_u8; 256];
+    // SAFETY: `buffer` is writable for exactly `buffer.len()` bytes and remains alive for the
+    // call. The return code is checked before reading, and the initialized zero-filled buffer
+    // bounds the search even on platforms that truncate without a trailing NUL.
+    let result =
+        unsafe { libc::gethostname(buffer.as_mut_ptr().cast::<libc::c_char>(), buffer.len()) };
+    if result != 0 {
+        return None;
+    }
+    let length = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(buffer.len());
+    if length == 0 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&buffer[..length]).into_owned())
+}
+
 /// Creates or opens and validates `base` and its `herdr-top` child.
 ///
 /// Neither level follows a symlink, and no pre-existing entry is chmodded.

@@ -705,3 +705,166 @@ pub mod hardening_mock {
         io::Error::new(io::ErrorKind::InvalidData, error.to_string())
     }
 }
+
+// Live-push mock appended for convergence tests that must observe state after LIVE.
+#[allow(dead_code)]
+pub mod live_mock {
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{UnixListener, UnixStream};
+    use tokio::sync::{mpsc, oneshot};
+    use tokio::task::JoinHandle;
+
+    #[derive(Clone, Debug, Default)]
+    pub struct LiveConfig {
+        snapshots: Vec<Value>,
+    }
+
+    impl LiveConfig {
+        pub fn snapshots(mut self, snapshots: Vec<Value>) -> Self {
+            self.snapshots = snapshots;
+            self
+        }
+    }
+
+    pub struct LiveHerdr {
+        _temp_dir: TempDir,
+        socket_path: PathBuf,
+        snapshot_requests: Arc<AtomicUsize>,
+        active_subscription: Arc<Mutex<Option<mpsc::UnboundedSender<SubscriptionCommand>>>>,
+        accept_task: JoinHandle<()>,
+    }
+
+    impl LiveHerdr {
+        pub async fn start(config: LiveConfig) -> io::Result<Self> {
+            let temp_dir = tempfile::tempdir()?;
+            let socket_path = temp_dir.path().join("herdr.sock");
+            let listener = UnixListener::bind(&socket_path)?;
+            let snapshot_requests = Arc::new(AtomicUsize::new(0));
+            let active_subscription = Arc::new(Mutex::new(None));
+            let task_snapshots = Arc::clone(&snapshot_requests);
+            let task_subscription = Arc::clone(&active_subscription);
+            let config = Arc::new(config);
+            let accept_task = tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let config = Arc::clone(&config);
+                    let snapshots = Arc::clone(&task_snapshots);
+                    let subscription = Arc::clone(&task_subscription);
+                    tokio::spawn(async move {
+                        let _ = handle_connection(stream, &config, &snapshots, &subscription).await;
+                    });
+                }
+            });
+            Ok(Self {
+                _temp_dir: temp_dir,
+                socket_path,
+                snapshot_requests,
+                active_subscription,
+                accept_task,
+            })
+        }
+
+        pub fn socket_path(&self) -> &Path {
+            &self.socket_path
+        }
+
+        pub fn snapshot_requests(&self) -> usize {
+            self.snapshot_requests.load(Ordering::SeqCst)
+        }
+
+        pub async fn push(&self, frame: Value) -> io::Result<()> {
+            let sender = self
+                .active_subscription
+                .lock()
+                .map_err(|_| io::Error::other("live subscription mutex was poisoned"))?
+                .clone()
+                .ok_or_else(|| io::Error::other("live subscription is not connected"))?;
+            let (acknowledgement, response) = oneshot::channel();
+            sender
+                .send(SubscriptionCommand::Push(frame, acknowledgement))
+                .map_err(|_| io::Error::other("live subscription is closed"))?;
+            response
+                .await
+                .map_err(|_| io::Error::other("live push was not acknowledged"))
+        }
+    }
+
+    impl Drop for LiveHerdr {
+        fn drop(&mut self) {
+            self.accept_task.abort();
+        }
+    }
+
+    enum SubscriptionCommand {
+        Push(Value, oneshot::Sender<()>),
+    }
+
+    async fn handle_connection(
+        stream: UnixStream,
+        config: &LiveConfig,
+        snapshot_requests: &AtomicUsize,
+        active_subscription: &Mutex<Option<mpsc::UnboundedSender<SubscriptionCommand>>>,
+    ) -> io::Result<()> {
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        if reader.read_line(&mut line).await? == 0 {
+            return Ok(());
+        }
+        let request: Value = serde_json::from_str(&line).map_err(invalid_data)?;
+        let id = request["id"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("missing request id"))?;
+        match request["method"].as_str() {
+            Some("events.subscribe") => {
+                let (sender, mut commands) = mpsc::unbounded_channel();
+                *active_subscription
+                    .lock()
+                    .map_err(|_| io::Error::other("live subscription mutex was poisoned"))? =
+                    Some(sender);
+                write_frame(
+                    reader.get_mut(),
+                    &json!({"id": id, "result": {"type": "subscription_started"}}),
+                )
+                .await?;
+                while let Some(SubscriptionCommand::Push(frame, acknowledgement)) =
+                    commands.recv().await
+                {
+                    write_frame(reader.get_mut(), &frame).await?;
+                    let _ = acknowledgement.send(());
+                }
+                Ok(())
+            }
+            Some("session.snapshot") => {
+                let index = snapshot_requests.fetch_add(1, Ordering::SeqCst);
+                let snapshot = config
+                    .snapshots
+                    .get(index)
+                    .or_else(|| config.snapshots.last())
+                    .ok_or_else(|| io::Error::other("live mock has no snapshot"))?;
+                write_frame(
+                    reader.get_mut(),
+                    &json!({"id": id, "result": {"type": "session_snapshot", "snapshot": snapshot}}),
+                )
+                .await
+            }
+            _ => Ok(()),
+        }
+    }
+
+    async fn write_frame(stream: &mut UnixStream, frame: &Value) -> io::Result<()> {
+        let mut bytes = serde_json::to_vec(frame).map_err(invalid_data)?;
+        bytes.push(b'\n');
+        stream.write_all(&bytes).await?;
+        stream.flush().await
+    }
+
+    fn invalid_data(error: impl std::fmt::Display) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+    }
+}

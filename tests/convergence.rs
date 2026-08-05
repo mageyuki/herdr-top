@@ -4,14 +4,15 @@ mod common;
 use std::time::Duration;
 
 use common::hardening_mock::{HardeningConfig, HardeningHerdr, SnapshotReply};
+use common::live_mock::{LiveConfig, LiveHerdr};
 use common::mock::{MockConfig, MockHerdr, fixture_payloads};
 use common::scripted_mock::{ScriptedConfig, ScriptedHerdr};
 use herdr_top::herdr::collector::{self, CollectorHandle, ObservationQuality};
 use herdr_top::lockfile::{StateRoot, state_root_in};
 use herdr_top::model::{
-    AgentSessionReference, AgentSessionReferenceKind, DisplayOrdinal, DomainModel, ExecState,
-    Execution, GapKind, Pane, PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SnapshotAgent,
-    Tab, TaskRun, TaskState, TopologySnapshot, Workspace,
+    AgentSessionReference, AgentSessionReferenceKind, DisplayOrdinal, DomainModel, EventMetadata,
+    ExecState, Execution, GapKind, NormalizedEvent, Pane, PaneSnapshot, Provider, ReconcileBatch,
+    RunId, RunKey, SnapshotAgent, Tab, TaskRun, TaskState, TopologySnapshot, Workspace,
 };
 use herdr_top::reducer::Reducer;
 use herdr_top::session_key;
@@ -783,6 +784,293 @@ async fn different_sid_same_terminal_starts_new_run() {
 }
 
 #[tokio::test]
+async fn provider_transition_starts_new_run() {
+    let initial = agent_snapshot("old-codex-sid", AgentSessionReferenceKind::Id, "working");
+    let mut replacement = agent_pane_value(
+        "w1:p1",
+        "term_6583d08d791e41",
+        "w1",
+        "w1:t1",
+        "new-claude-sid",
+    );
+    replacement["agent"] = json!("claude");
+    replacement["agent_session"]["source"] = json!("herdr:claude");
+    replacement["agent_session"]["agent"] = json!("claude");
+    let update = push(
+        "pane_updated",
+        json!({"type": "pane_updated", "pane": replacement}),
+    );
+    let mock = MockHerdr::start(
+        MockConfig::default()
+            .respond("session.snapshot", snapshot_result(initial))
+            .subscription_pushes(vec![update]),
+    )
+    .await
+    .expect("mock server should bind");
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+
+    let model = handle.model.borrow();
+    let old_run = model
+        .task_run_by_key(&RunKey::Native {
+            provider: Provider::Codex,
+            sid: "old-codex-sid".to_owned(),
+        })
+        .expect("the original Codex run should remain addressable")
+        .run_id;
+    let new_run = model
+        .task_run_by_key(&RunKey::Native {
+            provider: Provider::Claude,
+            sid: "new-claude-sid".to_owned(),
+        })
+        .expect("the Claude observation should create a new run")
+        .run_id;
+    assert_ne!(old_run, new_run);
+    assert!(
+        model
+            .executions()
+            .filter(|execution| execution.task_run_id == old_run)
+            .all(|execution| execution.state.is_terminal())
+    );
+    assert_eq!(
+        model
+            .executions()
+            .filter(|execution| execution.task_run_id == new_run && !execution.state.is_terminal())
+            .count(),
+        1
+    );
+    drop(model);
+    shutdown(handle, lifecycle).await;
+}
+
+#[test]
+fn binding_conflict_surfaces_diagnostic() {
+    let run_id = RunId::new();
+    let execution_id = "binding-conflict-execution".to_owned();
+    let mut model = DomainModel::default();
+    model.insert_task_run(TaskRun {
+        run_id,
+        key: RunKey::Native {
+            provider: Provider::Codex,
+            sid: "bound-codex-sid".to_owned(),
+        },
+        display_ordinal: DisplayOrdinal::new(1),
+        state: TaskState::Running,
+        has_controller_task_state_event: false,
+    });
+    model.insert_execution(Execution {
+        execution_id: execution_id.clone(),
+        pane_id: "w1:p1".to_owned(),
+        terminal_id: "terminal-1".to_owned(),
+        task_run_id: run_id,
+        state: ExecState::Working,
+    });
+    let (mut reducer, mut shared) = Reducer::new(RestoredState {
+        model,
+        next_ordinal: 2,
+    });
+    let _ = shared.borrow_and_update();
+    let mut event_metadata = identity_metadata("binding-conflict", "pane_updated");
+    event_metadata.provider = Some(Provider::Claude);
+    event_metadata.native_session_id = Some("different-claude-sid".to_owned());
+
+    let diagnostic = reducer
+        .apply(NormalizedEvent::ExecutionBegin {
+            metadata: event_metadata,
+            execution: Execution {
+                execution_id: execution_id.clone(),
+                pane_id: "w1:p1".to_owned(),
+                terminal_id: "terminal-1".to_owned(),
+                task_run_id: run_id,
+                state: ExecState::Blocked,
+            },
+        })
+        .expect_err("conflicting native identity must surface from the reducer");
+
+    assert!(diagnostic.to_string().contains("binding evidence"));
+    assert_eq!(
+        shared
+            .borrow()
+            .execution(&execution_id)
+            .expect("the original execution should remain")
+            .state,
+        ExecState::Working
+    );
+    assert!(!shared.has_changed().unwrap());
+}
+
+#[tokio::test]
+async fn different_sid_replacement_publishes_once() {
+    let old_run_id = RunId::new();
+    let new_run_id = RunId::new();
+    let mut model = DomainModel::default();
+    model.insert_task_run(TaskRun {
+        run_id: old_run_id,
+        key: RunKey::Native {
+            provider: Provider::Codex,
+            sid: "publication-old-sid".to_owned(),
+        },
+        display_ordinal: DisplayOrdinal::new(1),
+        state: TaskState::Running,
+        has_controller_task_state_event: false,
+    });
+    model.insert_execution(Execution {
+        execution_id: "publication-old-execution".to_owned(),
+        pane_id: "w1:p1".to_owned(),
+        terminal_id: "terminal-1".to_owned(),
+        task_run_id: old_run_id,
+        state: ExecState::Working,
+    });
+    let (mut reducer, mut shared) = Reducer::new(RestoredState {
+        model,
+        next_ordinal: 2,
+    });
+    let _ = shared.borrow_and_update();
+    let mut begin_metadata = identity_metadata("replacement-begin", "pane_updated");
+    begin_metadata.provider = Some(Provider::Codex);
+    begin_metadata.native_session_id = Some("publication-new-sid".to_owned());
+
+    reducer
+        .apply_observation(vec![
+            NormalizedEvent::ExecutionEnd {
+                metadata: identity_metadata("replacement-end", "pane_updated"),
+                execution_id: "publication-old-execution".to_owned(),
+            },
+            NormalizedEvent::ExecutionBegin {
+                metadata: begin_metadata,
+                execution: Execution {
+                    execution_id: "publication-new-execution".to_owned(),
+                    pane_id: "w1:p1".to_owned(),
+                    terminal_id: "terminal-1".to_owned(),
+                    task_run_id: new_run_id,
+                    state: ExecState::Working,
+                },
+            },
+        ])
+        .expect("replacement observation should apply atomically");
+
+    shared
+        .changed()
+        .await
+        .expect("replacement should publish one complete observation");
+    let published = shared.borrow_and_update();
+    assert_eq!(
+        published
+            .execution("publication-old-execution")
+            .expect("old execution should remain as history")
+            .state,
+        ExecState::Ended
+    );
+    assert_eq!(
+        published
+            .execution("publication-new-execution")
+            .expect("new execution should be visible in the same publication")
+            .state,
+        ExecState::Working
+    );
+    drop(published);
+    assert!(!shared.has_changed().unwrap());
+}
+
+#[tokio::test]
+async fn sid_only_push_promotes_without_agent() {
+    let initial = agent_snapshot("", AgentSessionReferenceKind::Id, "blocked");
+    let mut sid_only = agent_pane_value(
+        "w1:p1",
+        "term_6583d08d791e41",
+        "w1",
+        "w1:t1",
+        "promoted-without-agent",
+    );
+    sid_only
+        .as_object_mut()
+        .expect("pane fixture should be an object")
+        .remove("agent");
+    let update = push(
+        "pane_updated",
+        json!({"type": "pane_updated", "pane": sid_only}),
+    );
+    let mock = MockHerdr::start(
+        MockConfig::default()
+            .respond("session.snapshot", snapshot_result(initial))
+            .subscription_pushes(vec![update]),
+    )
+    .await
+    .expect("mock server should bind");
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+
+    let model = handle.model.borrow();
+    let promoted = model
+        .task_run_by_key(&RunKey::Native {
+            provider: Provider::Codex,
+            sid: "promoted-without-agent".to_owned(),
+        })
+        .expect("SID-only push should promote the existing provisional run");
+    let execution = model
+        .executions()
+        .find(|execution| execution.task_run_id == promoted.run_id)
+        .expect("promotion should preserve the existing execution");
+    assert_eq!(execution.state, ExecState::Blocked);
+    drop(model);
+    shutdown(handle, lifecycle).await;
+}
+
+#[tokio::test]
+async fn latched_session_without_agent_yields_no_live_execution() {
+    let sid = "latched-without-agent";
+    let mut snapshot = agent_snapshot(sid, AgentSessionReferenceKind::Id, "idle");
+    snapshot["panes"][0]
+        .as_object_mut()
+        .expect("pane fixture should be an object")
+        .remove("agent");
+    let mock = MockHerdr::start(
+        MockConfig::default().respond("session.snapshot", snapshot_result(snapshot)),
+    )
+    .await
+    .expect("mock server should bind");
+    let (restored, seed, run_id) = persisted_native_restored(sid);
+    let (_directory, _root, lifecycle, writer) = test_writer_seeded(seed);
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        restored,
+        writer,
+    )
+    .await
+    .expect("collector should start");
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+
+    let model = handle.model.borrow();
+    assert!(model.pane("w1:p1").is_some());
+    assert!(
+        model
+            .executions()
+            .filter(|execution| execution.task_run_id == run_id)
+            .all(|execution| execution.state.is_terminal()),
+        "latched identity without a reported agent must not attach a live execution"
+    );
+    drop(model);
+    shutdown(handle, lifecycle).await;
+}
+
+#[tokio::test]
 async fn resnapshot_discovers_new_agent_pane() {
     let initial = p1_snapshot();
     let mut discovered = initial.clone();
@@ -940,6 +1228,85 @@ async fn stale_same_sid_reappearance_preserves_execution() {
     assert_eq!(model.executions().next().unwrap().state, ExecState::Working);
     assert!(model.pane("w1:p1").is_some());
     drop(model);
+    shutdown(handle, lifecycle).await;
+}
+
+#[tokio::test]
+async fn push_reappearance_cancels_pending_retirement() {
+    let sid = "live-reappearance";
+    let present = agent_snapshot(sid, AgentSessionReferenceKind::Id, "working");
+    let missing = snapshot_without_panes(&present);
+    let mock = LiveHerdr::start(LiveConfig::default().snapshots(vec![present, missing]))
+        .await
+        .expect("live mock should bind");
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+
+    mock.push(resnapshot_anomaly())
+        .await
+        .expect("anomaly should trigger an in-place snapshot");
+    wait_until(|| mock.snapshot_requests() == 2).await;
+    wait_until(|| {
+        handle
+            .model
+            .borrow()
+            .executions()
+            .any(|execution| matches!(execution.state, ExecState::Stale { .. }))
+    })
+    .await;
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+
+    mock.push(push(
+        "pane_updated",
+        json!({
+            "type": "pane_updated",
+            "pane": agent_pane_value(
+                "w1:p1",
+                "term_6583d08d791e41",
+                "w1",
+                "w1:t1",
+                sid,
+            ),
+        }),
+    ))
+    .await
+    .expect("live pane reappearance should be delivered");
+    wait_until(|| {
+        handle
+            .model
+            .borrow()
+            .executions()
+            .any(|execution| execution.state == ExecState::Working)
+    })
+    .await;
+    mock.push(push(
+        "pane_exited",
+        json!({"type": "pane_exited", "pane_id": "w1:p1"}),
+    ))
+    .await
+    .expect("later execution exit should be delivered");
+    wait_until(|| {
+        handle
+            .model
+            .borrow()
+            .executions()
+            .all(|execution| execution.state.is_terminal())
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(5_250)).await;
+    assert!(
+        handle.model.borrow().pane("w1:p1").is_some(),
+        "the retired pre-reappearance closure must not close the re-observed pane"
+    );
     shutdown(handle, lifecycle).await;
 }
 
@@ -1240,6 +1607,29 @@ fn empty_restored() -> RestoredState {
 
 fn test_session() -> String {
     "convergence-test".to_owned()
+}
+
+fn identity_metadata(event_id: &str, event_type: &str) -> EventMetadata {
+    EventMetadata {
+        event_id: event_id.to_owned(),
+        timestamp_ms: 1,
+        source: "herdr".to_owned(),
+        source_event_type: event_type.to_owned(),
+        herdr_session: test_session(),
+        workspace_id: Some("w1".to_owned()),
+        tab_id: Some("w1:t1".to_owned()),
+        pane_id: Some("w1:p1".to_owned()),
+        terminal_id: Some("terminal-1".to_owned()),
+        provider: None,
+        native_session_id: None,
+        task_run_id: None,
+        agent_node_id: None,
+        task_state: None,
+        execution_parent: None,
+        dependency: None,
+        source_coverage: Vec::new(),
+        provider_metadata: None,
+    }
 }
 
 fn persisted_native_restored(sid: &str) -> (RestoredState, Vec<PersistOp>, RunId) {
