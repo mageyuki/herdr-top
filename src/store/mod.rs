@@ -177,8 +177,32 @@ pub enum PersistOp {
     UpsertTab(Tab),
     /// Upsert a physical pane.
     UpsertPane(Pane),
+    /// Delete a physical workspace and its database-cascaded descendants.
+    DeleteWorkspace {
+        /// The workspace identity to remove.
+        workspace_id: String,
+    },
+    /// Delete a physical tab and its database-cascaded panes.
+    DeleteTab {
+        /// The tab identity to remove.
+        tab_id: String,
+    },
+    /// Delete a physical pane.
+    DeletePane {
+        /// The pane identity to remove.
+        pane_id: String,
+    },
     /// Upsert semantic task-run state.
     UpsertTaskRun(PersistTaskRun),
+    /// Atomically re-key a canonical run while retaining its old key as a durable alias row.
+    PromoteTaskRunKey {
+        /// The promoted canonical task run and its native binding.
+        promoted: PersistTaskRun,
+        /// The superseded key retained as an alias.
+        old_key: RunKey,
+        /// The internal row identity used only for the durable alias.
+        alias_run_id: RunId,
+    },
     /// Merge an absorbed canonical task run into a surviving canonical task run.
     MergeTaskRuns {
         /// The live canonical run that remains addressable.
@@ -643,7 +667,8 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT run_id, key_kind, key_controller_id, key_provider, key_native_sid, \
                     key_native_path, key_terminal_id, key_start_ms, key_seq, \
-                    display_ordinal, task_state, has_controller_task_state_event, merged_into \
+                    display_ordinal, task_state, has_controller_task_state_event, merged_into, \
+                    native_provider, native_session_id \
              FROM task_runs",
         )?;
         let mut rows = statement.query([])?;
@@ -673,6 +698,20 @@ impl Store {
                     has_controller_task_state_event: row.get::<_, i64>(11)? != 0,
                 },
                 merged_into: merged_into_text.as_deref().map(parse_run_id).transpose()?,
+                native_binding: match (
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                ) {
+                    (Some(provider), Some(sid)) => Some((parse_provider(&provider)?, sid)),
+                    (None, None) => None,
+                    _ => {
+                        return Err(StoreError::invalid(
+                            "native_session_binding",
+                            run_id_text,
+                            "provider and native session ID nullability disagree",
+                        ));
+                    }
+                },
             });
         }
 
@@ -684,6 +723,15 @@ impl Store {
                 model.insert_historical_task_run(stored.task_run.clone());
             } else {
                 model.insert_task_run(stored.task_run.clone());
+            }
+            if let Some((provider, sid)) = &stored.native_binding {
+                model.insert_task_run_alias(
+                    RunKey::Native {
+                        provider: *provider,
+                        sid: sid.clone(),
+                    },
+                    stored.task_run.run_id,
+                );
             }
         }
 
@@ -797,6 +845,7 @@ impl Store {
 struct StoredTaskRun {
     task_run: TaskRun,
     merged_into: Option<RunId>,
+    native_binding: Option<(Provider, String)>,
 }
 
 fn resolve_alias_root(alias: RunId, aliases: &HashMap<RunId, RunId>) -> Result<RunId, StoreError> {
@@ -847,7 +896,24 @@ fn apply_operation(transaction: &Transaction<'_>, operation: PersistOp) -> Resul
                 ],
             )?;
         }
+        PersistOp::DeleteWorkspace { workspace_id } => {
+            transaction.execute(
+                "DELETE FROM workspaces WHERE workspace_id = ?1",
+                [&workspace_id],
+            )?;
+        }
+        PersistOp::DeleteTab { tab_id } => {
+            transaction.execute("DELETE FROM tabs WHERE tab_id = ?1", [&tab_id])?;
+        }
+        PersistOp::DeletePane { pane_id } => {
+            transaction.execute("DELETE FROM panes WHERE pane_id = ?1", [&pane_id])?;
+        }
         PersistOp::UpsertTaskRun(task_run) => upsert_task_run(transaction, &task_run)?,
+        PersistOp::PromoteTaskRunKey {
+            promoted,
+            old_key,
+            alias_run_id,
+        } => promote_task_run_key(transaction, &promoted, &old_key, alias_run_id)?,
         PersistOp::MergeTaskRuns { survivor, absorbed } => {
             merge_task_runs(transaction, survivor, absorbed)?;
         }
@@ -889,6 +955,89 @@ fn apply_operation(transaction: &Transaction<'_>, operation: PersistOp) -> Resul
         }
         PersistOp::RecordCollectorGap(gap) => record_gap(transaction, &gap)?,
     }
+    Ok(())
+}
+
+fn promote_task_run_key(
+    transaction: &Transaction<'_>,
+    promoted: &PersistTaskRun,
+    old_key: &RunKey,
+    alias_run_id: RunId,
+) -> Result<(), StoreError> {
+    let canonical_run_id = promoted.task_run.run_id.to_string();
+    let stored_key = transaction.query_row(
+        "SELECT key_kind, key_controller_id, key_provider, key_native_sid, \
+                key_native_path, key_terminal_id, key_start_ms, key_seq \
+         FROM task_runs WHERE run_id = ?1 AND merged_into IS NULL",
+        [&canonical_run_id],
+        |row| {
+            let kind: String = row.get(0)?;
+            Ok((
+                kind,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        },
+    )?;
+    let decoded = decode_run_key(
+        &stored_key.0,
+        stored_key.1,
+        stored_key.2,
+        stored_key.3,
+        stored_key.4,
+        stored_key.5,
+        stored_key.6,
+        stored_key.7,
+    )?;
+    if &decoded != old_key {
+        return Err(StoreError::invalid(
+            "task_run_key",
+            format!("{decoded:?}"),
+            format!("expected promotion source key {old_key:?}"),
+        ));
+    }
+
+    upsert_task_run(transaction, promoted)?;
+
+    let alias_ordinal: i64 = transaction.query_row(
+        "SELECT COALESCE(MIN(display_ordinal), 0) - 1 FROM task_runs",
+        [],
+        |row| row.get(0),
+    )?;
+    let encoded = EncodedRunKey::from(old_key);
+    transaction.execute(
+        "INSERT INTO task_runs(\
+             run_id, key_kind, key_controller_id, key_provider, key_native_sid, \
+             key_native_path, key_terminal_id, key_start_ms, key_seq, display_ordinal, \
+             task_state, has_controller_task_state_event, native_provider, native_session_id, \
+             merged_into, created_at_ms, updated_at_ms, finished_at_ms\
+         ) VALUES (\
+             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, NULL, ?13, ?14, ?15, ?16\
+         )",
+        params![
+            alias_run_id.to_string(),
+            encoded.kind,
+            encoded.controller_id,
+            encoded.provider,
+            encoded.native_sid,
+            encoded.native_path,
+            encoded.terminal_id,
+            encoded.start_ms,
+            encoded.seq,
+            alias_ordinal,
+            task_state_text(promoted.task_run.state),
+            i64::from(promoted.task_run.has_controller_task_state_event),
+            canonical_run_id,
+            promoted.created_at_ms,
+            promoted.updated_at_ms,
+            promoted.finished_at_ms,
+        ],
+    )?;
     Ok(())
 }
 

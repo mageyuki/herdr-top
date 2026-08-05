@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::execute;
@@ -17,6 +17,9 @@ use crate::herdr::collector::ObservationQuality;
 use crate::model::{DomainModel, RunId, RunKey, SharedModel};
 
 use super::view::{self, TreeRow};
+
+const FRAME_INTERVAL: Duration = Duration::from_millis(100);
+const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Header values not yet published by the vertical-slice collector.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -222,6 +225,27 @@ impl App {
         self.recover_selection(&old_rows, &new_rows);
     }
 
+    fn refresh_if_changed(&mut self) -> io::Result<bool> {
+        let model_changed = self.model_receiver.has_changed().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "model watch closed; collector is no longer publishing state",
+            )
+        })?;
+        let quality_changed = self.quality_receiver.has_changed().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "quality watch closed; collector is no longer publishing diagnostics",
+            )
+        })?;
+        if model_changed || quality_changed {
+            self.refresh();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Applies one keyboard event without touching the collector, writer, or monitored agents.
     pub fn handle_key(&mut self, key: KeyEvent) -> LoopControl {
         if key.kind == KeyEventKind::Release {
@@ -261,14 +285,25 @@ impl App {
         let _terminal_session = TerminalSession::enter()?;
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend)?;
+        let started = Instant::now();
+        let mut limiter = FrameLimiter::default();
+        let mut dirty = true;
         loop {
-            self.refresh();
-            terminal.draw(|frame| self.render(frame))?;
-            if event::poll(Duration::from_millis(50))?
-                && let Event::Key(key) = event::read()?
-                && self.handle_key(key) == LoopControl::Exit
-            {
-                return Ok(());
+            dirty |= self.refresh_if_changed()?;
+            let now = started.elapsed();
+            if limiter.ready(dirty, now) {
+                terminal.draw(|frame| self.render(frame))?;
+                limiter.record(now);
+                dirty = false;
+            }
+
+            let poll_for = limiter.poll_duration(dirty, started.elapsed());
+            if event::poll(poll_for)? {
+                match event::read()? {
+                    Event::Key(key) if self.handle_key(key) == LoopControl::Exit => return Ok(()),
+                    Event::Key(_) | Event::Resize(_, _) => dirty = true,
+                    _ => {}
+                }
             }
         }
     }
@@ -372,6 +407,35 @@ impl App {
             .unwrap_or_else(|| "no surviving row".to_owned());
         self.set_selection(replacement);
         self.state.selection_reason = Some(format!("Selection moved: closed; now {label}"));
+    }
+}
+
+#[derive(Debug, Default)]
+struct FrameLimiter {
+    last_draw: Option<Duration>,
+}
+
+impl FrameLimiter {
+    fn ready(&self, dirty: bool, now: Duration) -> bool {
+        dirty
+            && self
+                .last_draw
+                .is_none_or(|last| now.saturating_sub(last) >= FRAME_INTERVAL)
+    }
+
+    fn record(&mut self, now: Duration) {
+        self.last_draw = Some(now);
+    }
+
+    fn poll_duration(&self, dirty: bool, now: Duration) -> Duration {
+        if !dirty {
+            return WATCH_POLL_INTERVAL;
+        }
+        self.last_draw.map_or(Duration::ZERO, |last| {
+            FRAME_INTERVAL
+                .saturating_sub(now.saturating_sub(last))
+                .min(WATCH_POLL_INTERVAL)
+        })
     }
 }
 
@@ -634,5 +698,37 @@ mod tests {
         assert!(model_sender.send(Arc::new(DomainModel::default())).is_ok());
         assert!(quality_sender.send(ObservationQuality::Degraded).is_ok());
         assert_eq!(app.model().task_runs().count(), expected_run_count);
+    }
+
+    #[test]
+    fn tui_exits_on_closed_watch() {
+        let (model_sender, model_receiver) = watch::channel(Arc::new(DomainModel::default()));
+        let (_quality_sender, quality_receiver) = watch::channel(ObservationQuality::Live);
+        let mut app = App::new(model_receiver, quality_receiver, HeaderInputs::default());
+        drop(model_sender);
+
+        let error = app
+            .refresh_if_changed()
+            .expect_err("closed model watch must terminate the TUI loop");
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(error.to_string().contains("model watch closed"));
+    }
+
+    #[test]
+    fn tui_redraw_is_dirty_driven_and_capped_at_ten_fps() {
+        let mut limiter = FrameLimiter::default();
+        assert!(limiter.ready(true, Duration::ZERO));
+        limiter.record(Duration::ZERO);
+        assert!(!limiter.ready(false, Duration::from_secs(1)));
+        assert!(!limiter.ready(true, Duration::from_millis(99)));
+        assert!(limiter.ready(true, Duration::from_millis(100)));
+        limiter.record(Duration::from_millis(100));
+        assert!(!limiter.ready(true, Duration::from_millis(199)));
+        assert!(limiter.ready(true, Duration::from_millis(200)));
+        assert_eq!(
+            limiter.poll_duration(false, Duration::from_millis(200)),
+            WATCH_POLL_INTERVAL
+        );
     }
 }

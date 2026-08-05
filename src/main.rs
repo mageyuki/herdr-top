@@ -58,6 +58,8 @@ enum MainError {
     Collector(#[from] CollectorError),
     #[error(transparent)]
     Tui(#[from] io::Error),
+    #[error("TUI blocking task failed: {0}")]
+    TuiTask(String),
     #[error("HERDR_SOCKET_PATH is unset or empty; pass --socket with --session")]
     MissingSocket,
     #[error("collector startup failed: {startup}; writer shutdown also failed: {shutdown}")]
@@ -110,7 +112,8 @@ async fn run_monitor(cli: &Cli) -> Result<(), MainError> {
     let store = store::open_writer(&root)?;
     let restored = store.load_restored_state()?;
     let (lifecycle, writer) = store::spawn_writer(store)?;
-    let collector = match collector::spawn(socket, restored, writer).await {
+    let session_name = resolved.session_key().name().to_owned();
+    let collector = match collector::spawn(socket, session_name.clone(), restored, writer).await {
         Ok(collector) => collector,
         Err(startup) => {
             return match lifecycle.shutdown().await {
@@ -127,13 +130,16 @@ async fn run_monitor(cli: &Cli) -> Result<(), MainError> {
         collector.model.clone(),
         collector.quality.clone(),
         HeaderInputs {
-            host: env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_owned()),
-            session: resolved.session_key().name().to_owned(),
+            host: hostname::resolve(),
+            session: session_name,
             event_lag: Duration::ZERO,
             source_coverage: format!("herdr; controller={controller_status:?}"),
         },
     );
-    let tui_result = app.run();
+    let tui_result = tokio::task::spawn_blocking(move || app.run())
+        .await
+        .map_err(|error| MainError::TuiTask(error.to_string()))
+        .and_then(|result| result.map_err(MainError::Tui));
     let collector_result = collector.stop().await;
     let writer_result = lifecycle.shutdown().await;
     rendezvous::shutdown_controller_socket(&runtime, resolved.session_key(), &owner_lock);
@@ -142,6 +148,37 @@ async fn run_monitor(cli: &Cli) -> Result<(), MainError> {
     collector_result?;
     writer_result?;
     Ok(())
+}
+
+#[allow(unsafe_code)]
+mod hostname {
+    use std::env;
+
+    pub fn resolve() -> String {
+        gethostname()
+            .or_else(|| env::var("HOSTNAME").ok().filter(|value| !value.is_empty()))
+            .unwrap_or_else(|| "unknown".to_owned())
+    }
+
+    fn gethostname() -> Option<String> {
+        let mut buffer = [0_u8; 256];
+        // SAFETY: `buffer` is writable for exactly `buffer.len()` bytes and remains alive for the
+        // call. The return code is checked before reading, and the initialized zero-filled buffer
+        // bounds the search even on platforms that truncate without a trailing NUL.
+        let result =
+            unsafe { libc::gethostname(buffer.as_mut_ptr().cast::<libc::c_char>(), buffer.len()) };
+        if result != 0 {
+            return None;
+        }
+        let length = buffer
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(buffer.len());
+        if length == 0 {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&buffer[..length]).into_owned())
+    }
 }
 
 async fn run_held_branch(cli: &Cli, root: &StateRoot) -> Result<(), MainError> {

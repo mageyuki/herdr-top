@@ -19,7 +19,7 @@ use crate::model::{
     NormalizedEvent, Pane, PaneSnapshot, Provider, ReconcileBatch, RunId, SharedModel,
     SnapshotAgent, Tab, TopologyEntity, TopologyEntityId, TopologySnapshot, Workspace,
 };
-use crate::reducer::Reducer;
+use crate::reducer::{Reducer, ReducerError};
 use crate::store::writer::{WriterClient, WriterError};
 use crate::store::{CollectorGap, PersistBatch, PersistOp, RestoredState};
 
@@ -30,6 +30,8 @@ const EVENT_QUEUE_CAPACITY: usize = 64;
 const RESNAPSHOT_ATTEMPTS: usize = 3;
 const RECONNECT_DELAY: Duration = Duration::from_millis(50);
 const DRAIN_QUIET_PERIOD: Duration = Duration::from_millis(5);
+const STALE_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Current quality of the Herdr physical-state observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,9 +58,15 @@ pub enum CollectorError {
     /// A snapshot pane did not carry the tab identity required by the domain model.
     #[error("snapshot pane {pane_id:?} has no tab_id")]
     MissingTabId { pane_id: String },
+    /// A reducer rejected the transition before publication.
+    #[error(transparent)]
+    Reducer(#[from] ReducerError),
     /// The collector task panicked or was cancelled externally.
     #[error("collector task failed: {0}")]
     Task(String),
+    /// The collector ignored cancellation until it had to be aborted and joined.
+    #[error("collector did not stop within {seconds} seconds and was aborted")]
+    StopTimeout { seconds: u64 },
 }
 
 /// Handle to the collector's coherent model and observation-quality streams.
@@ -75,15 +83,24 @@ impl CollectorHandle {
     /// Cancels the collector and waits for its subscription task to exit.
     pub async fn stop(self) -> Result<(), CollectorError> {
         self.cancellation.cancel();
-        self.task
-            .await
-            .map_err(|error| CollectorError::Task(error.to_string()))?
+        let mut task = self.task;
+        match tokio::time::timeout(STOP_TIMEOUT, &mut task).await {
+            Ok(result) => result.map_err(|error| CollectorError::Task(error.to_string()))?,
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                Err(CollectorError::StopTimeout {
+                    seconds: STOP_TIMEOUT.as_secs(),
+                })
+            }
+        }
     }
 }
 
 /// Commits the new owner record, then launches subscribe-first convergence.
 pub async fn spawn(
     sock: PathBuf,
+    session: String,
     restored: RestoredState,
     writer: WriterClient,
 ) -> Result<CollectorHandle, CollectorError> {
@@ -98,6 +115,7 @@ pub async fn spawn(
     let task = tokio::spawn(async move {
         run_collector(
             sock,
+            session,
             writer,
             reducer,
             task_model,
@@ -116,8 +134,10 @@ pub async fn spawn(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_collector(
     sock: PathBuf,
+    session: String,
     writer: WriterClient,
     mut reducer: Reducer,
     shared: SharedModel,
@@ -125,10 +145,6 @@ async fn run_collector(
     cancellation: CancellationToken,
     mut owner: OwnerTracker,
 ) -> Result<(), CollectorError> {
-    let session = env::var("HERDR_SESSION")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "default".to_owned());
     let mut first_subscription = true;
     let mut previous_socket = None;
 
@@ -138,7 +154,11 @@ async fn run_collector(
         }
 
         let socket_identity = socket_identity(&sock);
-        let stream = match wire::subscribe(&sock, &subscriptions()).await {
+        let subscriptions = subscriptions();
+        let stream = match tokio::select! {
+            () = cancellation.cancelled() => return Ok(()),
+            result = wire::subscribe(&sock, &subscriptions) => result,
+        } {
             Ok(stream) => stream,
             Err(_) => {
                 quality.send_replace(ObservationQuality::Disconnected);
@@ -155,8 +175,6 @@ async fn run_collector(
         } else {
             GapKind::Reconnect
         };
-        first_subscription = false;
-        previous_socket = socket_identity;
         quality.send_replace(ObservationQuality::Reconciling);
 
         let reader_cancellation = cancellation.child_token();
@@ -174,11 +192,25 @@ async fn run_collector(
             events,
             Arc::clone(&overflowed),
         )
-        .await?;
+        .await;
 
         reader_cancellation.cancel();
-        let _ = reader.await;
-        match outcome {
+        let reader_result = reader
+            .await
+            .map_err(|error| CollectorError::Task(error.to_string()))?;
+        let outcome = outcome?;
+        if outcome.gap_committed {
+            first_subscription = false;
+            previous_socket = socket_identity;
+        }
+        if let Err(error) = reader_result {
+            quality.send_replace(ObservationQuality::Disconnected);
+            if matches!(outcome.outcome, SubscriptionOutcome::Cancelled) {
+                return Ok(());
+            }
+            let _ = error;
+        }
+        match outcome.outcome {
             SubscriptionOutcome::Cancelled => return Ok(()),
             SubscriptionOutcome::Ended => {
                 quality.send_replace(ObservationQuality::Disconnected);
@@ -200,24 +232,26 @@ async fn converge(
     gap_kind: GapKind,
     mut events: mpsc::Receiver<ReceivedEvent>,
     overflowed: Arc<AtomicBool>,
-) -> Result<SubscriptionOutcome, CollectorError> {
+) -> Result<ConvergeOutcome, CollectorError> {
     let mut first_generation = true;
     let mut resnapshot_attempts = 0;
+    let mut pending_closures = PendingTopologyClosures::default();
 
     loop {
         overflowed.store(false, Ordering::Release);
         let snapshot = tokio::select! {
-            () = cancellation.cancelled() => return Ok(SubscriptionOutcome::Cancelled),
+            () = cancellation.cancelled() => return Ok(ConvergeOutcome::new(SubscriptionOutcome::Cancelled, !first_generation)),
             result = wire::request(sock, "session.snapshot", json!({})) => {
                 match result.and_then(|value| value.into_snapshot()) {
                     Ok(snapshot) => snapshot,
-                    Err(_) => return Ok(SubscriptionOutcome::Ended),
+                    Err(_) => return Ok(ConvergeOutcome::new(SubscriptionOutcome::Ended, !first_generation)),
                 }
             }
         };
         let topology = topology_from_snapshot(&snapshot)?;
         let mut batch = if first_generation {
-            let mut batch = reducer.reconcile_gap(ReconcileBatch { topology, gap_kind });
+            pending_closures = PendingTopologyClosures::default();
+            let mut batch = reducer.reconcile_gap(ReconcileBatch { topology, gap_kind })?;
             batch.push(PersistOp::RecordCollectorGap(CollectorGap {
                 event_id: format!("collector-gap-{}", ulid::Ulid::new()),
                 herdr_session: session.to_owned(),
@@ -227,7 +261,7 @@ async fn converge(
             first_generation = false;
             batch
         } else {
-            apply_snapshot_in_place(reducer, shared, topology, session)
+            apply_snapshot_in_place(reducer, shared, topology, session, &mut pending_closures)?
         };
         writer.apply(std::mem::take(&mut batch)).await?;
         owner.refresh_from_snapshot(&snapshot, writer).await?;
@@ -245,8 +279,18 @@ async fn converge(
         )
         .await?;
         match replay {
-            ReplayOutcome::Cancelled => return Ok(SubscriptionOutcome::Cancelled),
-            ReplayOutcome::Ended => return Ok(SubscriptionOutcome::Ended),
+            ReplayOutcome::Cancelled => {
+                return Ok(ConvergeOutcome::new(
+                    SubscriptionOutcome::Cancelled,
+                    !first_generation,
+                ));
+            }
+            ReplayOutcome::Ended => {
+                return Ok(ConvergeOutcome::new(
+                    SubscriptionOutcome::Ended,
+                    !first_generation,
+                ));
+            }
             ReplayOutcome::Clean => {
                 quality.send_replace(ObservationQuality::Live);
                 match monitor_live(
@@ -258,6 +302,7 @@ async fn converge(
                     &mut events,
                     &overflowed,
                     cancellation,
+                    &mut pending_closures,
                 )
                 .await?
                 {
@@ -265,15 +310,25 @@ async fn converge(
                         quality.send_replace(ObservationQuality::Reconciling);
                         resnapshot_attempts = 0;
                     }
-                    ReplayOutcome::Ended => return Ok(SubscriptionOutcome::Ended),
-                    ReplayOutcome::Cancelled => return Ok(SubscriptionOutcome::Cancelled),
+                    ReplayOutcome::Ended => {
+                        return Ok(ConvergeOutcome::new(
+                            SubscriptionOutcome::Ended,
+                            !first_generation,
+                        ));
+                    }
+                    ReplayOutcome::Cancelled => {
+                        return Ok(ConvergeOutcome::new(
+                            SubscriptionOutcome::Cancelled,
+                            !first_generation,
+                        ));
+                    }
                     ReplayOutcome::Clean => {}
                 }
             }
             ReplayOutcome::Dirty => {
                 quality.send_replace(ObservationQuality::Reconciling);
                 if resnapshot_attempts == RESNAPSHOT_ATTEMPTS {
-                    return monitor_reconciling(
+                    let outcome = monitor_reconciling(
                         reducer,
                         shared,
                         writer,
@@ -281,8 +336,10 @@ async fn converge(
                         session,
                         events,
                         cancellation,
+                        &mut pending_closures,
                     )
-                    .await;
+                    .await?;
+                    return Ok(ConvergeOutcome::new(outcome, !first_generation));
                 }
                 resnapshot_attempts += 1;
             }
@@ -366,14 +423,32 @@ async fn monitor_live(
     events: &mut mpsc::Receiver<ReceivedEvent>,
     overflowed: &AtomicBool,
     cancellation: &CancellationToken,
+    pending_closures: &mut PendingTopologyClosures,
 ) -> Result<ReplayOutcome, CollectorError> {
+    let mut stale_sweep = tokio::time::interval(STALE_SWEEP_INTERVAL);
+    stale_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    stale_sweep.tick().await;
     loop {
         let received = tokio::select! {
             () = cancellation.cancelled() => return Ok(ReplayOutcome::Cancelled),
             received = events.recv() => match received {
-                Some(received) => received,
+                Some(received) => Some(received),
                 None => return Ok(ReplayOutcome::Ended),
             },
+            _ = stale_sweep.tick() => None,
+        };
+        let Some(received) = received else {
+            let mut persist = reducer.sweep_stale(unix_now_ms());
+            persist.extend(apply_pending_topology_closures(
+                reducer,
+                shared,
+                session,
+                pending_closures,
+            )?);
+            if !persist.is_empty() {
+                writer.apply(persist).await?;
+            }
+            continue;
         };
         let anomalous =
             updated_entity(&received).is_some_and(|entity| !entity_exists(shared, &entity));
@@ -393,14 +468,32 @@ async fn monitor_reconciling(
     session: &str,
     mut events: mpsc::Receiver<ReceivedEvent>,
     cancellation: &CancellationToken,
+    pending_closures: &mut PendingTopologyClosures,
 ) -> Result<SubscriptionOutcome, CollectorError> {
+    let mut stale_sweep = tokio::time::interval(STALE_SWEEP_INTERVAL);
+    stale_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    stale_sweep.tick().await;
     loop {
         let received = tokio::select! {
             () = cancellation.cancelled() => return Ok(SubscriptionOutcome::Cancelled),
             received = events.recv() => match received {
-                Some(received) => received,
+                Some(received) => Some(received),
                 None => return Ok(SubscriptionOutcome::Ended),
             },
+            _ = stale_sweep.tick() => None,
+        };
+        let Some(received) = received else {
+            let mut persist = reducer.sweep_stale(unix_now_ms());
+            persist.extend(apply_pending_topology_closures(
+                reducer,
+                shared,
+                session,
+                pending_closures,
+            )?);
+            if !persist.is_empty() {
+                writer.apply(persist).await?;
+            }
+            continue;
         };
         apply_received_event(reducer, shared, writer, owner, session, received).await?;
     }
@@ -474,6 +567,27 @@ enum SubscriptionOutcome {
     Cancelled,
 }
 
+struct ConvergeOutcome {
+    outcome: SubscriptionOutcome,
+    gap_committed: bool,
+}
+
+#[derive(Default)]
+struct PendingTopologyClosures {
+    workspaces: HashSet<String>,
+    tabs: HashSet<String>,
+    panes: HashSet<String>,
+}
+
+impl ConvergeOutcome {
+    const fn new(outcome: SubscriptionOutcome, gap_committed: bool) -> Self {
+        Self {
+            outcome,
+            gap_committed,
+        }
+    }
+}
+
 enum DrainError {
     Closed,
 }
@@ -505,7 +619,7 @@ async fn apply_received_event(
     let normalized = normalize_event(shared, session, &received)?;
     let mut persist = Vec::new();
     for event in normalized {
-        persist.extend(reducer.apply(event));
+        persist.extend(reducer.apply(event)?);
     }
     if !persist.is_empty() {
         writer.apply(persist).await?;
@@ -717,13 +831,76 @@ fn append_pane_upsert(
         event_kind,
         TopologyEntity::Pane(pane_entity(&pane)?),
     ));
-    let has_live_execution = shared.borrow().executions().any(|execution| {
-        execution.terminal_id == pane.terminal_id && !execution.state.is_terminal()
+    if pane.agent.is_none() {
+        return Ok(());
+    }
+    let current: Vec<_> = shared
+        .borrow()
+        .executions()
+        .filter(|execution| {
+            execution.terminal_id == pane.terminal_id && !execution.state.is_terminal()
+        })
+        .cloned()
+        .collect();
+    let provider = pane_provider(&pane);
+    let incoming_sid = pane.agent_session.as_ref().and_then(|reference| {
+        (reference.kind == AgentSessionKind::Id && !reference.value.is_empty())
+            .then_some(reference.value.as_str())
     });
-    if pane.agent.is_some() && !has_live_execution {
+    let mut reused = false;
+    for execution in current {
+        let has_native = run_has_native_binding(shared, execution.task_run_id, provider);
+        let same_native = provider.zip(incoming_sid).is_some_and(|(provider, sid)| {
+            run_owns_native(shared, execution.task_run_id, provider, sid)
+        });
+        let should_reuse = incoming_sid.is_none() || same_native || !has_native;
+        if should_reuse && !reused {
+            let mut updated = execution;
+            updated.pane_id.clone_from(&pane.pane_id);
+            updated.state = status_from_str(pane.agent_status.as_deref());
+            events.push(NormalizedEvent::ExecutionBegin {
+                metadata: pane_metadata(session, event_kind, &pane),
+                execution: updated,
+            });
+            reused = true;
+        } else {
+            events.push(NormalizedEvent::ExecutionEnd {
+                metadata: metadata(session, event_kind),
+                execution_id: execution.execution_id,
+            });
+        }
+    }
+    if !reused {
         events.push(execution_begin(session, event_kind, &pane));
     }
     Ok(())
+}
+
+fn run_has_native_binding(shared: &SharedModel, run_id: RunId, provider: Option<Provider>) -> bool {
+    let model = shared.borrow();
+    model.task_run_bindings().any(|(key, owner)| {
+        *owner == run_id
+            && matches!(key, crate::model::RunKey::Native { provider: bound, .. } if Some(*bound) == provider)
+    }) || model.agent_nodes().any(|node| {
+        node.task_run_id == run_id
+            && Some(node.provider) == provider
+            && node.native_session_id.as_ref().is_some_and(|sid| !sid.is_empty())
+    })
+}
+
+fn run_owns_native(shared: &SharedModel, run_id: RunId, provider: Provider, sid: &str) -> bool {
+    let model = shared.borrow();
+    model
+        .task_run_by_key(&crate::model::RunKey::Native {
+            provider,
+            sid: sid.to_owned(),
+        })
+        .is_some_and(|run| run.run_id == run_id)
+        || model.agent_nodes().any(|node| {
+            node.task_run_id == run_id
+                && node.provider == provider
+                && node.native_session_id.as_deref() == Some(sid)
+        })
 }
 
 fn append_execution_ends(
@@ -748,7 +925,8 @@ fn apply_snapshot_in_place(
     shared: &SharedModel,
     topology: TopologySnapshot,
     session: &str,
-) -> PersistBatch {
+    pending_closures: &mut PendingTopologyClosures,
+) -> Result<PersistBatch, ReducerError> {
     let mut persist = Vec::new();
     let snapshot_workspace_ids: HashSet<_> = topology
         .workspaces
@@ -767,14 +945,14 @@ fn apply_snapshot_in_place(
             session,
             "snapshot_workspace",
             TopologyEntity::Workspace(workspace.clone()),
-        )));
+        ))?);
     }
     for tab in &topology.tabs {
         persist.extend(reducer.apply(topology_upsert(
             session,
             "snapshot_tab",
             TopologyEntity::Tab(tab.clone()),
-        )));
+        ))?);
     }
     for pane in &topology.panes {
         persist.extend(reducer.apply(topology_upsert(
@@ -786,7 +964,19 @@ fn apply_snapshot_in_place(
                 tab_id: pane.tab_id.clone(),
                 terminal_id: pane.terminal_id.clone(),
             }),
-        )));
+        ))?);
+        let provider = pane.agent.as_ref().and_then(|agent| {
+            snapshot_provider_name(
+                &agent.agent_name,
+                pane.agent_session
+                    .as_ref()
+                    .map(|session| session.agent.as_str()),
+            )
+        });
+        let incoming_sid = pane.agent_session.as_ref().and_then(|reference| {
+            (reference.kind == AgentSessionReferenceKind::Id && !reference.value.is_empty())
+                .then_some(reference.value.as_str())
+        });
         let current: Vec<_> = shared
             .borrow()
             .executions()
@@ -795,16 +985,53 @@ fn apply_snapshot_in_place(
             })
             .cloned()
             .collect();
-        for mut execution in current {
-            execution.pane_id.clone_from(&pane.pane_id);
-            if let Some(agent) = &pane.agent {
-                execution.state = agent.state.clone();
+        let mut reused = false;
+        if let Some(agent) = &pane.agent {
+            for mut execution in current {
+                let has_native = run_has_native_binding(shared, execution.task_run_id, provider);
+                let same_native = provider.zip(incoming_sid).is_some_and(|(provider, sid)| {
+                    run_owns_native(shared, execution.task_run_id, provider, sid)
+                });
+                let should_reuse = incoming_sid.is_none() || same_native || !has_native;
+                if should_reuse && !reused {
+                    execution.pane_id.clone_from(&pane.pane_id);
+                    execution.state = agent.state.clone();
+                    persist.extend(reducer.apply(NormalizedEvent::ExecutionBegin {
+                        metadata: snapshot_pane_metadata(session, "snapshot_execution", pane),
+                        execution,
+                    })?);
+                    reused = true;
+                } else {
+                    persist.extend(reducer.apply(NormalizedEvent::ExecutionEnd {
+                        metadata: metadata(session, "snapshot_different_session"),
+                        execution_id: execution.execution_id,
+                    })?);
+                }
             }
-            persist.extend(reducer.apply(NormalizedEvent::ExecutionBegin {
-                metadata: metadata(session, "snapshot_execution"),
-                execution,
-            }));
+            if !reused {
+                persist.extend(reducer.apply(snapshot_execution_begin(session, pane, agent))?);
+            }
         }
+    }
+
+    let stale_ids: Vec<_> = shared
+        .borrow()
+        .executions()
+        .filter(|execution| {
+            !execution.state.is_terminal()
+                && !topology
+                    .panes
+                    .iter()
+                    .any(|pane| pane.terminal_id == execution.terminal_id && pane.agent.is_some())
+        })
+        .map(|execution| execution.execution_id.clone())
+        .collect();
+    for execution_id in stale_ids {
+        persist.extend(reducer.apply(NormalizedEvent::AgentStatusChanged {
+            metadata: metadata(session, "snapshot_execution_missing"),
+            execution_id,
+            state: ExecState::Stale { since_ms: 0 },
+        })?);
     }
 
     let old_panes: Vec<_> = shared
@@ -825,28 +1052,162 @@ fn apply_snapshot_in_place(
         .filter(|workspace| !snapshot_workspace_ids.contains(&workspace.workspace_id))
         .map(|workspace| workspace.workspace_id.clone())
         .collect();
+    pending_closures.panes = old_panes.iter().cloned().collect();
+    pending_closures.tabs = old_tabs.iter().cloned().collect();
+    pending_closures.workspaces = old_workspaces.iter().cloned().collect();
     for pane_id in old_panes {
-        persist.extend(reducer.apply(topology_closure(
-            session,
-            "snapshot_pane_missing",
-            TopologyEntityId::Pane { pane_id },
-        )));
+        let in_grace = shared.borrow().executions().any(|execution| {
+            execution.pane_id == pane_id && matches!(execution.state, ExecState::Stale { .. })
+        });
+        if !in_grace {
+            persist.extend(reducer.apply(topology_closure(
+                session,
+                "snapshot_pane_missing",
+                TopologyEntityId::Pane {
+                    pane_id: pane_id.clone(),
+                },
+            ))?);
+            pending_closures.panes.remove(&pane_id);
+        }
     }
     for tab_id in old_tabs {
-        persist.extend(reducer.apply(topology_closure(
-            session,
-            "snapshot_tab_missing",
-            TopologyEntityId::Tab { tab_id },
-        )));
+        if !shared.borrow().panes().any(|pane| pane.tab_id == tab_id) {
+            persist.extend(reducer.apply(topology_closure(
+                session,
+                "snapshot_tab_missing",
+                TopologyEntityId::Tab {
+                    tab_id: tab_id.clone(),
+                },
+            ))?);
+            pending_closures.tabs.remove(&tab_id);
+        }
     }
     for workspace_id in old_workspaces {
-        persist.extend(reducer.apply(topology_closure(
-            session,
-            "snapshot_workspace_missing",
-            TopologyEntityId::Workspace { workspace_id },
-        )));
+        if !shared
+            .borrow()
+            .tabs()
+            .any(|tab| tab.workspace_id == workspace_id)
+        {
+            persist.extend(reducer.apply(topology_closure(
+                session,
+                "snapshot_workspace_missing",
+                TopologyEntityId::Workspace {
+                    workspace_id: workspace_id.clone(),
+                },
+            ))?);
+            pending_closures.workspaces.remove(&workspace_id);
+        }
     }
-    persist
+    Ok(persist)
+}
+
+fn apply_pending_topology_closures(
+    reducer: &mut Reducer,
+    shared: &SharedModel,
+    session: &str,
+    pending: &mut PendingTopologyClosures,
+) -> Result<PersistBatch, ReducerError> {
+    let mut persist = Vec::new();
+    let pane_ids: Vec<_> = pending.panes.iter().cloned().collect();
+    for pane_id in pane_ids {
+        let has_live_execution = shared
+            .borrow()
+            .executions()
+            .any(|execution| execution.pane_id == pane_id && !execution.state.is_terminal());
+        if !has_live_execution {
+            if shared.borrow().pane(&pane_id).is_some() {
+                persist.extend(reducer.apply(topology_closure(
+                    session,
+                    "stale_grace_expired_pane",
+                    TopologyEntityId::Pane {
+                        pane_id: pane_id.clone(),
+                    },
+                ))?);
+            }
+            pending.panes.remove(&pane_id);
+        }
+    }
+
+    let tab_ids: Vec<_> = pending.tabs.iter().cloned().collect();
+    for tab_id in tab_ids {
+        if !shared.borrow().panes().any(|pane| pane.tab_id == tab_id) {
+            if shared.borrow().tab(&tab_id).is_some() {
+                persist.extend(reducer.apply(topology_closure(
+                    session,
+                    "stale_grace_expired_tab",
+                    TopologyEntityId::Tab {
+                        tab_id: tab_id.clone(),
+                    },
+                ))?);
+            }
+            pending.tabs.remove(&tab_id);
+        }
+    }
+
+    let workspace_ids: Vec<_> = pending.workspaces.iter().cloned().collect();
+    for workspace_id in workspace_ids {
+        if !shared
+            .borrow()
+            .tabs()
+            .any(|tab| tab.workspace_id == workspace_id)
+        {
+            if shared.borrow().workspace(&workspace_id).is_some() {
+                persist.extend(reducer.apply(topology_closure(
+                    session,
+                    "stale_grace_expired_workspace",
+                    TopologyEntityId::Workspace {
+                        workspace_id: workspace_id.clone(),
+                    },
+                ))?);
+            }
+            pending.workspaces.remove(&workspace_id);
+        }
+    }
+    Ok(persist)
+}
+
+fn snapshot_provider_name(agent_name: &str, session_agent: Option<&str>) -> Option<Provider> {
+    session_agent
+        .and_then(provider_from_name)
+        .or_else(|| provider_from_name(agent_name))
+}
+
+fn snapshot_pane_metadata(session: &str, kind: &str, pane: &PaneSnapshot) -> EventMetadata {
+    let mut value = metadata(session, kind);
+    value.workspace_id = Some(pane.workspace_id.clone());
+    value.tab_id = Some(pane.tab_id.clone());
+    value.pane_id = Some(pane.pane_id.clone());
+    value.terminal_id = Some(pane.terminal_id.clone());
+    value.provider = pane.agent.as_ref().and_then(|agent| {
+        snapshot_provider_name(
+            &agent.agent_name,
+            pane.agent_session
+                .as_ref()
+                .map(|session| session.agent.as_str()),
+        )
+    });
+    value.native_session_id = pane.agent_session.as_ref().and_then(|reference| {
+        (reference.kind == AgentSessionReferenceKind::Id && !reference.value.is_empty())
+            .then(|| reference.value.clone())
+    });
+    value
+}
+
+fn snapshot_execution_begin(
+    session: &str,
+    pane: &PaneSnapshot,
+    agent: &SnapshotAgent,
+) -> NormalizedEvent {
+    NormalizedEvent::ExecutionBegin {
+        metadata: snapshot_pane_metadata(session, "snapshot_execution_discovered", pane),
+        execution: Execution {
+            execution_id: format!("herdr-execution-{}", ulid::Ulid::new()),
+            pane_id: pane.pane_id.clone(),
+            terminal_id: pane.terminal_id.clone(),
+            task_run_id: RunId::new(),
+            state: agent.state.clone(),
+        },
+    }
 }
 
 fn topology_from_snapshot(snapshot: &Snapshot) -> Result<TopologySnapshot, CollectorError> {
@@ -880,10 +1241,14 @@ fn topology_from_snapshot(snapshot: &Snapshot) -> Result<TopologySnapshot, Colle
                 workspace_id: pane.workspace_id.clone(),
                 tab_id,
                 terminal_id: pane.terminal_id.clone(),
-                agent: pane.agent.as_ref().map(|agent| SnapshotAgent {
-                    agent_name: agent.clone(),
-                    state: status_from_str(pane.agent_status.as_deref()),
-                }),
+                agent: pane
+                    .agent
+                    .as_ref()
+                    .or_else(|| pane.agent_session.as_ref().map(|session| &session.agent))
+                    .map(|agent| SnapshotAgent {
+                        agent_name: agent.clone(),
+                        state: status_from_str(pane.agent_status.as_deref()),
+                    }),
                 agent_session: pane.agent_session.as_ref().map(agent_session_reference),
             })
         })

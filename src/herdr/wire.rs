@@ -2,6 +2,7 @@
 
 use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -9,6 +10,8 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 use super::types::{ErrorBody, Snapshot, Subscription};
 
@@ -23,6 +26,11 @@ pub enum WireError {
     Server { code: String, message: String },
     #[error("unexpected herdr response: {0}")]
     UnexpectedResponse(String),
+    #[error("herdr wire {operation} timed out after {seconds} seconds")]
+    Timeout {
+        operation: &'static str,
+        seconds: u64,
+    },
 }
 
 /// A successful result object returned by herdr.
@@ -115,35 +123,52 @@ impl EventStream {
 
 /// Sends one request over a fresh Unix-socket connection.
 pub async fn request(sock: &Path, method: &str, params: Value) -> Result<WireResult, WireError> {
-    let mut stream = UnixStream::connect(sock).await?;
+    let mut stream = timeout("connect", UnixStream::connect(sock)).await??;
     let id = ulid::Ulid::new().to_string();
-    write_request(&mut stream, &id, method, params).await?;
-
-    let mut reader = BufReader::new(stream);
-    read_response(&mut reader, &id).await
+    timeout("request", async move {
+        write_request(&mut stream, &id, method, params).await?;
+        let mut reader = BufReader::new(stream);
+        read_response(&mut reader, &id).await
+    })
+    .await?
 }
 
 /// Opens an event-only connection and validates its subscription acknowledgement.
 pub async fn subscribe(sock: &Path, subs: &[Subscription]) -> Result<EventStream, WireError> {
-    let mut stream = UnixStream::connect(sock).await?;
+    let mut stream = timeout("connect", UnixStream::connect(sock)).await??;
     let id = ulid::Ulid::new().to_string();
-    write_request(
-        &mut stream,
-        &id,
-        "events.subscribe",
-        json!({"subscriptions": subs}),
-    )
-    .await?;
+    timeout("subscription acknowledgement", async move {
+        write_request(
+            &mut stream,
+            &id,
+            "events.subscribe",
+            json!({"subscriptions": subs}),
+        )
+        .await?;
 
-    let mut reader = BufReader::new(stream);
-    let acknowledgement = read_response(&mut reader, &id).await?;
-    if acknowledgement.result_type() != "subscription_started" {
-        return Err(WireError::UnexpectedResponse(format!(
-            "expected subscription_started, received {}",
-            acknowledgement.result_type()
-        )));
-    }
-    Ok(EventStream { reader })
+        let mut reader = BufReader::new(stream);
+        let acknowledgement = read_response(&mut reader, &id).await?;
+        if acknowledgement.result_type() != "subscription_started" {
+            return Err(WireError::UnexpectedResponse(format!(
+                "expected subscription_started, received {}",
+                acknowledgement.result_type()
+            )));
+        }
+        Ok(EventStream { reader })
+    })
+    .await?
+}
+
+async fn timeout<T>(
+    operation: &'static str,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, WireError> {
+    tokio::time::timeout(IO_TIMEOUT, future)
+        .await
+        .map_err(|_| WireError::Timeout {
+            operation,
+            seconds: IO_TIMEOUT.as_secs(),
+        })
 }
 
 #[derive(Deserialize)]

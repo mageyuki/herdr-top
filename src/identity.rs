@@ -445,6 +445,7 @@ fn apply_bind(
         return Err(MergeConflict::NativeSessionRebind { run });
     }
 
+    let mut promoted_from = None;
     let persisted_task_run = match &task_run.key {
         RunKey::Controller(_) => {
             model.insert_task_run_alias(key, run);
@@ -462,12 +463,13 @@ fn apply_bind(
             let mut promoted = task_run;
             promoted.key = key.clone();
             model.insert_task_run(promoted.clone());
-            model.insert_task_run_alias(old_key, run);
+            model.insert_task_run_alias(old_key.clone(), run);
+            promoted_from = Some(old_key);
             promoted
         }
     };
     let now_ms = unix_now_ms();
-    Ok(vec![PersistOp::UpsertTaskRun(PersistTaskRun {
+    let persisted = PersistTaskRun {
         task_run: persisted_task_run,
         native_session: Some(NativeSessionBinding {
             provider,
@@ -476,7 +478,15 @@ fn apply_bind(
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
         finished_at_ms: None,
-    })])
+    };
+    Ok(match promoted_from {
+        Some(old_key @ RunKey::NativePath { .. }) => vec![PersistOp::PromoteTaskRunKey {
+            promoted: persisted,
+            old_key,
+            alias_run_id: RunId::new(),
+        }],
+        Some(_) | None => vec![PersistOp::UpsertTaskRun(persisted)],
+    })
 }
 
 fn unix_now_ms() -> i64 {
@@ -948,7 +958,10 @@ mod tests {
         );
         let batch = apply_binding_plan(&mut model, plan).unwrap();
 
-        assert!(matches!(batch.as_slice(), [PersistOp::UpsertTaskRun(_)]));
+        assert!(matches!(
+            batch.as_slice(),
+            [PersistOp::PromoteTaskRunKey { .. }]
+        ));
         assert_eq!(model.task_run(&run).unwrap().key, promoted);
         assert_eq!(model.task_run_by_key(&old_key).unwrap().run_id, run);
     }
@@ -1244,5 +1257,83 @@ mod tests {
 
         assert_eq!(result, Err(conflict));
         assert_eq!(model_fingerprint(&model), before);
+    }
+
+    #[test]
+    fn native_binding_round_trips_restore_without_unique_collision() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let run_id = RunId::new();
+        store
+            .apply_batch(vec![persisted_run(
+                run_id,
+                "controller-native",
+                1,
+                "round-trip-sid",
+            )])
+            .unwrap();
+
+        let restored = store.load_restored_state().unwrap();
+        let native_key = native(Provider::Codex, "round-trip-sid");
+        assert_eq!(
+            restored
+                .model
+                .task_run_by_key(&native_key)
+                .expect("native binding must be restored as an alias")
+                .run_id,
+            run_id
+        );
+        assert_eq!(
+            plan_binding(
+                &restored.model,
+                &BindingEvidence::NativeSession {
+                    run: run_id,
+                    provider: Provider::Codex,
+                    sid: "round-trip-sid".to_owned(),
+                },
+            ),
+            BindingPlan::NoChange
+        );
+    }
+
+    #[test]
+    fn native_path_promotion_alias_round_trips_restore() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let old_key = path(Provider::Claude, "/sessions/round-trip.jsonl");
+        let mut model = DomainModel::default();
+        let run_id = insert_run(&mut model, old_key.clone(), 1);
+        store
+            .apply_batch(vec![PersistOp::UpsertTaskRun(PersistTaskRun {
+                task_run: model.task_run(&run_id).unwrap().clone(),
+                native_session: None,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+                finished_at_ms: None,
+            })])
+            .unwrap();
+        let evidence = BindingEvidence::NativePathResolved {
+            run: run_id,
+            provider: Provider::Claude,
+            path: "/sessions/round-trip.jsonl".to_owned(),
+            sid: "resolved-round-trip".to_owned(),
+        };
+        let plan = plan_binding(&model, &evidence);
+        let operations = apply_binding_plan(&mut model, plan).unwrap();
+        store.apply_batch(operations).unwrap();
+
+        let restored = store.load_restored_state().unwrap();
+        let native_key = native(Provider::Claude, "resolved-round-trip");
+        assert_eq!(restored.model.task_run(&run_id).unwrap().key, native_key);
+        assert_eq!(
+            restored.model.task_run_by_key(&old_key).unwrap().run_id,
+            run_id
+        );
+        assert_eq!(
+            restored.model.task_run_by_key(&native_key).unwrap().run_id,
+            run_id
+        );
     }
 }

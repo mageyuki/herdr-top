@@ -211,10 +211,14 @@ async fn restore_across_cold_restart() {
         .load_restored_state()
         .expect("empty first state should load");
     let (lifecycle_a, writer_a) = spawn_writer(store_a).expect("first writer should spawn");
-    let mut collector_a =
-        collector::spawn(mock_a.socket_path().to_path_buf(), restored_a, writer_a)
-            .await
-            .expect("collector A should start");
+    let mut collector_a = collector::spawn(
+        mock_a.socket_path().to_path_buf(),
+        SESSION_NAME.to_owned(),
+        restored_a,
+        writer_a,
+    )
+    .await
+    .expect("collector A should start");
     wait_live(&mut collector_a).await;
 
     let before = collector_a.model.borrow();
@@ -291,10 +295,14 @@ async fn restore_across_cold_restart() {
         "every Task Run must be restored before reconciliation"
     );
     let (lifecycle_b, writer_b) = spawn_writer(store_b).expect("second writer should spawn");
-    let mut collector_b =
-        collector::spawn(mock_b.socket_path().to_path_buf(), restored_b, writer_b)
-            .await
-            .expect("collector B should start");
+    let mut collector_b = collector::spawn(
+        mock_b.socket_path().to_path_buf(),
+        SESSION_NAME.to_owned(),
+        restored_b,
+        writer_b,
+    )
+    .await
+    .expect("collector B should start");
     wait_live(&mut collector_b).await;
 
     let after = collector_b.model.borrow();

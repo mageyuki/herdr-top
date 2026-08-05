@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use thiserror::Error;
 use tokio::sync::watch;
 
 use crate::identity::{BindingEvidence, BindingPlan, apply_binding_plan, plan_binding};
@@ -16,6 +17,14 @@ use crate::store::{
 };
 
 const STALE_GRACE_MS: i64 = 30_000;
+
+/// Errors that reject a reducer transition before any model or persistence mutation escapes.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum ReducerError {
+    /// No immutable display ordinal remains for a newly observed Task Run.
+    #[error("display ordinal allocator is exhausted")]
+    OrdinalExhausted,
+}
 
 /// Serialized owner of domain transitions and display-ordinal allocation.
 pub struct Reducer {
@@ -40,11 +49,24 @@ impl Reducer {
     }
 
     /// Applies one normalized event and publishes exactly one resulting snapshot.
-    pub fn apply(&mut self, event: NormalizedEvent) -> PersistBatch {
+    pub fn apply(&mut self, event: NormalizedEvent) -> Result<PersistBatch, ReducerError> {
+        let original_model = self.model.clone();
+        let original_next_ordinal = self.next_ordinal;
+        match self.apply_inner(event) {
+            Ok(persist) => Ok(persist),
+            Err(error) => {
+                self.model = original_model;
+                self.next_ordinal = original_next_ordinal;
+                Err(error)
+            }
+        }
+    }
+
+    fn apply_inner(&mut self, event: NormalizedEvent) -> Result<PersistBatch, ReducerError> {
         let metadata = event_metadata(&event).clone();
         let mut persist = Vec::new();
 
-        self.ensure_event_runs(&event, &metadata, &mut persist);
+        self.ensure_event_runs(&event, &metadata, &mut persist)?;
         self.apply_controller_metadata(&metadata, &mut persist);
         self.apply_event_body(&event, &metadata, &mut persist);
         self.apply_identity_metadata(&event, &metadata, &mut persist);
@@ -55,11 +77,24 @@ impl Reducer {
         });
 
         self.publish();
-        persist
+        Ok(persist)
     }
 
     /// Replaces physical topology across an observation gap in one coherent batch.
-    pub fn reconcile_gap(&mut self, batch: ReconcileBatch) -> PersistBatch {
+    pub fn reconcile_gap(&mut self, batch: ReconcileBatch) -> Result<PersistBatch, ReducerError> {
+        let original_model = self.model.clone();
+        let original_next_ordinal = self.next_ordinal;
+        match self.reconcile_gap_inner(batch) {
+            Ok(persist) => Ok(persist),
+            Err(error) => {
+                self.model = original_model;
+                self.next_ordinal = original_next_ordinal;
+                Err(error)
+            }
+        }
+    }
+
+    fn reconcile_gap_inner(&mut self, batch: ReconcileBatch) -> Result<PersistBatch, ReducerError> {
         let ReconcileBatch {
             topology,
             gap_kind: _,
@@ -114,7 +149,7 @@ impl Reducer {
                     &pane.terminal_id,
                     now_ms,
                     &mut persist,
-                ),
+                )?,
             };
             let token = RunId::new().to_string();
             let execution_id = format!("gap-execution-{token}");
@@ -132,8 +167,22 @@ impl Reducer {
             }
 
             if let Some(provider) = provider {
+                let existing_node_id = native_sid
+                    .as_deref()
+                    .filter(|sid| !sid.is_empty())
+                    .and_then(|sid| {
+                        self.model
+                            .agent_nodes()
+                            .filter(|node| {
+                                node.task_run_id == run_id
+                                    && node.provider == provider
+                                    && node.native_session_id.as_deref() == Some(sid)
+                            })
+                            .map(|node| node.agent_node_id.clone())
+                            .min()
+                    });
                 let agent_node = AgentNode {
-                    agent_node_id: format!("gap-agent-{token}"),
+                    agent_node_id: existing_node_id.unwrap_or_else(|| format!("gap-agent-{token}")),
                     provider,
                     native_session_id: native_sid.clone(),
                     task_run_id: run_id,
@@ -148,7 +197,7 @@ impl Reducer {
         }
 
         self.publish();
-        persist
+        Ok(persist)
     }
 
     fn ensure_event_runs(
@@ -156,9 +205,9 @@ impl Reducer {
         event: &NormalizedEvent,
         metadata: &EventMetadata,
         persist: &mut PersistBatch,
-    ) {
+    ) -> Result<(), ReducerError> {
         if let NormalizedEvent::ExecutionBegin { execution, .. } = event {
-            self.ensure_execution_run(execution, metadata, persist);
+            self.ensure_execution_run(execution, metadata, persist)?;
         }
 
         if let Some(run_id) = metadata.task_run_id {
@@ -176,25 +225,26 @@ impl Reducer {
                 controller_reference,
                 initial_state,
                 persist,
-            );
+            )?;
         }
 
         if let Some(edge) = &metadata.execution_parent {
-            self.ensure_controller_placeholder(edge.parent_run_id, metadata.timestamp_ms, persist);
-            self.ensure_controller_placeholder(edge.child_run_id, metadata.timestamp_ms, persist);
+            self.ensure_controller_placeholder(edge.parent_run_id, metadata.timestamp_ms, persist)?;
+            self.ensure_controller_placeholder(edge.child_run_id, metadata.timestamp_ms, persist)?;
         }
         if let Some(edge) = &metadata.dependency {
             self.ensure_controller_placeholder(
                 edge.prerequisite_run_id,
                 metadata.timestamp_ms,
                 persist,
-            );
+            )?;
             self.ensure_controller_placeholder(
                 edge.dependent_run_id,
                 metadata.timestamp_ms,
                 persist,
-            );
+            )?;
         }
+        Ok(())
     }
 
     fn ensure_execution_run(
@@ -202,11 +252,11 @@ impl Reducer {
         execution: &Execution,
         metadata: &EventMetadata,
         persist: &mut PersistBatch,
-    ) {
+    ) -> Result<(), ReducerError> {
         if self.model.task_run(&execution.task_run_id).is_some() {
-            return;
+            return Ok(());
         }
-        let ordinal = self.allocate_ordinal();
+        let ordinal = self.allocate_ordinal()?;
         let native_key = metadata
             .provider
             .zip(metadata.native_session_id.as_deref())
@@ -228,6 +278,7 @@ impl Reducer {
         };
         self.model.insert_task_run(task_run.clone());
         persist.push(self.persist_task_run(task_run, metadata.timestamp_ms));
+        Ok(())
     }
 
     fn ensure_metadata_run(
@@ -237,11 +288,11 @@ impl Reducer {
         controller_reference: bool,
         initial_state: TaskState,
         persist: &mut PersistBatch,
-    ) {
+    ) -> Result<(), ReducerError> {
         if self.model.task_run(&run_id).is_some() {
-            return;
+            return Ok(());
         }
-        let ordinal = self.allocate_ordinal();
+        let ordinal = self.allocate_ordinal()?;
         let native_key = metadata
             .provider
             .zip(metadata.native_session_id.as_deref())
@@ -274,6 +325,7 @@ impl Reducer {
         };
         self.model.insert_task_run(task_run.clone());
         persist.push(self.persist_task_run(task_run, metadata.timestamp_ms));
+        Ok(())
     }
 
     fn ensure_controller_placeholder(
@@ -281,19 +333,21 @@ impl Reducer {
         run_id: RunId,
         timestamp_ms: i64,
         persist: &mut PersistBatch,
-    ) {
+    ) -> Result<(), ReducerError> {
         if self.model.task_run(&run_id).is_some() {
-            return;
+            return Ok(());
         }
+        let ordinal = self.allocate_ordinal()?;
         let task_run = TaskRun {
             run_id,
             key: RunKey::Controller(run_id.to_string()),
-            display_ordinal: self.allocate_ordinal(),
+            display_ordinal: ordinal,
             state: TaskState::Queued,
             has_controller_task_state_event: false,
         };
         self.model.insert_task_run(task_run.clone());
         persist.push(self.persist_task_run(task_run, timestamp_ms));
+        Ok(())
     }
 
     fn apply_controller_metadata(&mut self, metadata: &EventMetadata, persist: &mut PersistBatch) {
@@ -373,23 +427,61 @@ impl Reducer {
     ) {
         match entity {
             TopologyEntityId::Workspace { workspace_id } => {
-                self.model.remove_workspace(workspace_id);
+                let tab_ids: Vec<_> = self
+                    .model
+                    .tabs()
+                    .filter(|tab| tab.workspace_id == *workspace_id)
+                    .map(|tab| tab.tab_id.clone())
+                    .collect();
+                for tab_id in tab_ids {
+                    self.close_tab(&tab_id, timestamp_ms, persist);
+                }
+                if self.model.remove_workspace(workspace_id).is_some() {
+                    persist.push(PersistOp::DeleteWorkspace {
+                        workspace_id: workspace_id.clone(),
+                    });
+                }
             }
             TopologyEntityId::Tab { tab_id } => {
-                self.model.remove_tab(tab_id);
+                self.close_tab(tab_id, timestamp_ms, persist);
             }
             TopologyEntityId::Pane { pane_id } => {
-                let execution_ids: Vec<_> = self
-                    .model
-                    .executions()
-                    .filter(|execution| execution.pane_id == *pane_id)
-                    .map(|execution| execution.execution_id.clone())
-                    .collect();
-                for execution_id in execution_ids {
-                    self.end_execution(&execution_id, timestamp_ms, persist);
-                }
-                self.model.remove_pane(pane_id);
+                self.close_pane(pane_id, timestamp_ms, persist);
             }
+        }
+    }
+
+    fn close_tab(&mut self, tab_id: &str, timestamp_ms: i64, persist: &mut PersistBatch) {
+        let pane_ids: Vec<_> = self
+            .model
+            .panes()
+            .filter(|pane| pane.tab_id == tab_id)
+            .map(|pane| pane.pane_id.clone())
+            .collect();
+        for pane_id in pane_ids {
+            self.close_pane(&pane_id, timestamp_ms, persist);
+        }
+        if self.model.remove_tab(tab_id).is_some() {
+            persist.push(PersistOp::DeleteTab {
+                tab_id: tab_id.to_owned(),
+            });
+        }
+    }
+
+    fn close_pane(&mut self, pane_id: &str, timestamp_ms: i64, persist: &mut PersistBatch) {
+        let execution_ids: Vec<_> = self
+            .model
+            .executions()
+            .filter(|execution| execution.pane_id == pane_id && !execution.state.is_terminal())
+            .map(|execution| execution.execution_id.clone())
+            .collect();
+        for execution_id in execution_ids {
+            self.end_execution(&execution_id, timestamp_ms, persist);
+        }
+        if self.model.remove_pane(pane_id).is_some() {
+            persist.push(PersistOp::DeletePane {
+                pane_id: pane_id.to_owned(),
+            });
         }
     }
 
@@ -592,14 +684,18 @@ impl Reducer {
             .panes()
             .map(|pane| pane.pane_id.clone())
             .collect();
-        for workspace_id in workspace_ids {
-            self.model.remove_workspace(&workspace_id);
+        for pane_id in pane_ids {
+            self.close_pane(&pane_id, unix_now_ms(), persist);
         }
         for tab_id in tab_ids {
-            self.model.remove_tab(&tab_id);
+            if self.model.remove_tab(&tab_id).is_some() {
+                persist.push(PersistOp::DeleteTab { tab_id });
+            }
         }
-        for pane_id in pane_ids {
-            self.model.remove_pane(&pane_id);
+        for workspace_id in workspace_ids {
+            if self.model.remove_workspace(&workspace_id).is_some() {
+                persist.push(PersistOp::DeleteWorkspace { workspace_id });
+            }
         }
 
         for workspace in &topology.workspaces {
@@ -630,9 +726,9 @@ impl Reducer {
         terminal_id: &str,
         timestamp_ms: i64,
         persist: &mut PersistBatch,
-    ) -> RunId {
+    ) -> Result<RunId, ReducerError> {
         let run_id = RunId::new();
-        let ordinal = self.allocate_ordinal();
+        let ordinal = self.allocate_ordinal()?;
         let key = match (provider, native_sid, native_path) {
             (Some(provider), Some(sid), _) => RunKey::Native {
                 provider,
@@ -653,7 +749,7 @@ impl Reducer {
         };
         self.model.insert_task_run(task_run.clone());
         persist.push(self.persist_task_run(task_run, timestamp_ms));
-        run_id
+        Ok(run_id)
     }
 
     fn run_for_native_session(&self, provider: Provider, sid: &str) -> Option<RunId> {
@@ -692,10 +788,38 @@ impl Reducer {
         })
     }
 
-    fn allocate_ordinal(&mut self) -> DisplayOrdinal {
+    fn allocate_ordinal(&mut self) -> Result<DisplayOrdinal, ReducerError> {
         let ordinal = DisplayOrdinal::new(self.next_ordinal);
-        self.next_ordinal = self.next_ordinal.saturating_add(1);
-        ordinal
+        self.next_ordinal = self
+            .next_ordinal
+            .checked_add(1)
+            .ok_or(ReducerError::OrdinalExhausted)?;
+        Ok(ordinal)
+    }
+
+    /// Ends executions whose live-observation stale grace has expired.
+    pub fn sweep_stale(&mut self, now_ms: i64) -> PersistBatch {
+        let execution_ids: Vec<_> = self
+            .model
+            .executions()
+            .filter_map(|execution| match execution.state {
+                ExecState::Stale { since_ms }
+                    if now_ms.saturating_sub(since_ms) >= STALE_GRACE_MS =>
+                {
+                    Some(execution.execution_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        if execution_ids.is_empty() {
+            return Vec::new();
+        }
+        let mut persist = Vec::new();
+        for execution_id in execution_ids {
+            self.end_execution(&execution_id, now_ms, &mut persist);
+        }
+        self.publish();
+        persist
     }
 
     fn publish(&self) {
@@ -925,14 +1049,14 @@ mod tests {
     use std::sync::Arc;
 
     use crate::model::{
-        AgentSessionReference, AgentSessionReferenceKind, DependencyEdge, DisplayOrdinal,
-        DomainModel, EventMetadata, ExecState, Execution, ExecutionEdge, GapKind, NormalizedEvent,
-        PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SnapshotAgent, TaskRun, TaskState,
-        TopologyEntity, TopologySnapshot, Workspace,
+        AgentNode, AgentSessionReference, AgentSessionReferenceKind, DependencyEdge,
+        DisplayOrdinal, DomainModel, EventMetadata, ExecState, Execution, ExecutionEdge, GapKind,
+        NormalizedEvent, PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SnapshotAgent,
+        TaskRun, TaskState, TopologyEntity, TopologySnapshot, Workspace,
     };
     use crate::store::{PersistOp, RestoredState};
 
-    use super::Reducer;
+    use super::{Reducer, ReducerError};
 
     fn metadata(event_id: &str, timestamp_ms: i64) -> EventMetadata {
         EventMetadata {
@@ -1049,11 +1173,13 @@ mod tests {
         let mut done = metadata("done", 1_000);
         done.source_event_type = "done".to_owned();
 
-        reducer.apply(NormalizedEvent::AgentStatusChanged {
-            metadata: done,
-            execution_id: "execution-1".to_owned(),
-            state: ExecState::Ended,
-        });
+        reducer
+            .apply(NormalizedEvent::AgentStatusChanged {
+                metadata: done,
+                execution_id: "execution-1".to_owned(),
+                state: ExecState::Ended,
+            })
+            .unwrap();
 
         assert_eq!(
             shared.borrow().execution("execution-1").unwrap().state,
@@ -1081,18 +1207,22 @@ mod tests {
         live_model.insert_execution(execution(live_run, "live-execution", ExecState::Working));
         let (mut live_reducer, live_shared) = Reducer::new(restored(live_model, 2));
 
-        live_reducer.apply(status_event(
-            "missing-1",
-            1_000,
-            "live-execution",
-            ExecState::Stale { since_ms: 0 },
-        ));
-        live_reducer.apply(status_event(
-            "missing-2",
-            30_999,
-            "live-execution",
-            ExecState::Stale { since_ms: 0 },
-        ));
+        live_reducer
+            .apply(status_event(
+                "missing-1",
+                1_000,
+                "live-execution",
+                ExecState::Stale { since_ms: 0 },
+            ))
+            .unwrap();
+        live_reducer
+            .apply(status_event(
+                "missing-2",
+                30_999,
+                "live-execution",
+                ExecState::Stale { since_ms: 0 },
+            ))
+            .unwrap();
         assert_eq!(
             live_shared
                 .borrow()
@@ -1102,12 +1232,14 @@ mod tests {
             ExecState::Stale { since_ms: 1_000 }
         );
 
-        live_reducer.apply(status_event(
-            "missing-3",
-            31_000,
-            "live-execution",
-            ExecState::Stale { since_ms: 0 },
-        ));
+        live_reducer
+            .apply(status_event(
+                "missing-3",
+                31_000,
+                "live-execution",
+                ExecState::Stale { since_ms: 0 },
+            ))
+            .unwrap();
         assert_eq!(
             live_shared
                 .borrow()
@@ -1131,10 +1263,12 @@ mod tests {
         gap_model.insert_execution(execution(gap_run, "gap-execution", ExecState::Working));
         let (mut gap_reducer, gap_shared) = Reducer::new(restored(gap_model, 3));
 
-        gap_reducer.reconcile_gap(ReconcileBatch {
-            topology: TopologySnapshot::default(),
-            gap_kind: GapKind::Reconnect,
-        });
+        gap_reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: TopologySnapshot::default(),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
 
         assert_eq!(
             gap_shared
@@ -1166,10 +1300,12 @@ mod tests {
         model.insert_execution(execution(run_id, "pre-gap", ExecState::Working));
         let (mut reducer, shared) = Reducer::new(restored(model, 8));
 
-        let batch = reducer.reconcile_gap(ReconcileBatch {
-            topology: native_snapshot("sid-1"),
-            gap_kind: GapKind::Reconnect,
-        });
+        let batch = reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: native_snapshot("sid-1"),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
 
         assert_eq!(
             shared.borrow().task_run(&run_id).unwrap().state,
@@ -1206,10 +1342,12 @@ mod tests {
         begin_metadata.provider = Some(Provider::Codex);
         begin_metadata.native_session_id = Some("sid-1".to_owned());
 
-        reducer.apply(NormalizedEvent::ExecutionBegin {
-            metadata: begin_metadata,
-            execution: execution(run_id, "resumed", ExecState::Working),
-        });
+        reducer
+            .apply(NormalizedEvent::ExecutionBegin {
+                metadata: begin_metadata,
+                execution: execution(run_id, "resumed", ExecState::Working),
+            })
+            .unwrap();
 
         assert_eq!(
             shared.borrow().task_run(&run_id).unwrap().state,
@@ -1247,10 +1385,12 @@ mod tests {
         begin_metadata.provider = Some(Provider::Codex);
         begin_metadata.native_session_id = Some("sid-1".to_owned());
 
-        let batch = reducer.apply(NormalizedEvent::ExecutionBegin {
-            metadata: begin_metadata,
-            execution: execution(absorbed, "execution-1", ExecState::Working),
-        });
+        let batch = reducer
+            .apply(NormalizedEvent::ExecutionBegin {
+                metadata: begin_metadata,
+                execution: execution(absorbed, "execution-1", ExecState::Working),
+            })
+            .unwrap();
 
         assert!(batch.iter().any(|operation| matches!(
             operation,
@@ -1288,8 +1428,12 @@ mod tests {
         second_metadata.event_id = "second".to_owned();
         second_metadata.task_run_id = Some(second);
 
-        reducer.apply(topology_event(first_metadata, "workspace-1"));
-        reducer.apply(topology_event(second_metadata, "workspace-1"));
+        reducer
+            .apply(topology_event(first_metadata, "workspace-1"))
+            .unwrap();
+        reducer
+            .apply(topology_event(second_metadata, "workspace-1"))
+            .unwrap();
 
         assert_eq!(
             shared.borrow().task_run(&first).unwrap().display_ordinal,
@@ -1318,7 +1462,9 @@ mod tests {
         refresh.task_run_id = Some(run_id);
         refresh.task_state = Some(TaskState::Running);
 
-        reducer.apply(topology_event(refresh, "workspace-1"));
+        reducer
+            .apply(topology_event(refresh, "workspace-1"))
+            .unwrap();
 
         assert_eq!(
             shared.borrow().task_run(&run_id).unwrap().display_ordinal,
@@ -1345,7 +1491,9 @@ mod tests {
         });
         let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
 
-        reducer.apply(topology_event(relationship, "workspace-1"));
+        reducer
+            .apply(topology_event(relationship, "workspace-1"))
+            .unwrap();
 
         assert!([parent, prerequisite, subject].iter().all(|run_id| {
             let snapshot = shared.borrow();
@@ -1361,17 +1509,132 @@ mod tests {
         let (mut reducer, mut shared) = Reducer::new(restored(DomainModel::default(), 1));
         let initial = Arc::clone(&shared.borrow());
 
-        reducer.apply(topology_event(metadata("one", 1_000), "workspace-1"));
+        reducer
+            .apply(topology_event(metadata("one", 1_000), "workspace-1"))
+            .unwrap();
         assert!(shared.has_changed().unwrap());
         let first = Arc::clone(&shared.borrow_and_update());
         assert!(!Arc::ptr_eq(&initial, &first));
         assert!(first.workspace("workspace-1").is_some());
 
-        reducer.apply(topology_event(metadata("two", 2_000), "workspace-2"));
+        reducer
+            .apply(topology_event(metadata("two", 2_000), "workspace-2"))
+            .unwrap();
         assert!(shared.has_changed().unwrap());
         let second = Arc::clone(&shared.borrow_and_update());
         assert!(!Arc::ptr_eq(&first, &second));
         assert!(second.workspace("workspace-1").is_some());
         assert!(second.workspace("workspace-2").is_some());
+    }
+
+    #[test]
+    fn stale_sweep_ends_after_grace() {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "stale-sweep".to_owned(),
+            },
+            1,
+            TaskState::Running,
+        ));
+        model.insert_execution(execution(
+            run_id,
+            "stale-execution",
+            ExecState::Stale { since_ms: 1_000 },
+        ));
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        assert!(reducer.sweep_stale(30_999).is_empty());
+        assert_eq!(
+            shared.borrow().execution("stale-execution").unwrap().state,
+            ExecState::Stale { since_ms: 1_000 }
+        );
+        let persist = reducer.sweep_stale(31_000);
+
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertExecution(value)
+                if value.execution.execution_id == "stale-execution"
+                    && value.execution.state == ExecState::Ended
+        )));
+        assert_eq!(
+            shared.borrow().execution("stale-execution").unwrap().state,
+            ExecState::Ended
+        );
+    }
+
+    #[test]
+    fn gap_reattach_reuses_agent_node() {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "reattach-sid".to_owned(),
+            },
+            1,
+            TaskState::Running,
+        ));
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "stable-top-level-node".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some("reattach-sid".to_owned()),
+            task_run_id: run_id,
+        });
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "sub-agent-node".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some("child-sid".to_owned()),
+            task_run_id: run_id,
+        });
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: native_snapshot("reattach-sid"),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+
+        assert!(
+            shared
+                .borrow()
+                .agent_node("stable-top-level-node")
+                .is_some()
+        );
+        assert!(shared.borrow().agent_node("sub-agent-node").is_some());
+        assert_eq!(
+            shared
+                .borrow()
+                .agent_nodes()
+                .filter(|node| {
+                    node.task_run_id == run_id
+                        && node.provider == Provider::Codex
+                        && node.native_session_id.as_deref() == Some("reattach-sid")
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn ordinal_exhaustion_returns_error_without_mutation() {
+        let (mut reducer, mut shared) = Reducer::new(restored(DomainModel::default(), i64::MAX));
+        let initial = Arc::clone(&shared.borrow_and_update());
+        let run_id = RunId::new();
+        let mut value = metadata("ordinal-exhaustion", 1_000);
+        value.task_run_id = Some(run_id);
+
+        let result = reducer.apply(topology_event(value, "must-not-exist"));
+
+        assert_eq!(result, Err(ReducerError::OrdinalExhausted));
+        assert!(!shared.has_changed().unwrap());
+        assert_eq!(shared.borrow().task_runs().count(), 0);
+        assert!(shared.borrow().workspace("must-not-exist").is_none());
+        assert!(Arc::ptr_eq(&initial, &shared.borrow()));
     }
 }

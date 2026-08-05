@@ -515,3 +515,193 @@ pub mod scripted_mock {
         io::Error::new(io::ErrorKind::InvalidData, error.to_string())
     }
 }
+
+// Hardening-only mock with ordered snapshot failures and subscription-lifecycle counters.
+// Appended separately so the earlier shared mocks remain byte-for-byte behavior compatible.
+#[allow(dead_code)]
+pub mod hardening_mock {
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{UnixListener, UnixStream};
+    use tokio::task::JoinHandle;
+
+    #[derive(Clone, Debug)]
+    pub enum SnapshotReply {
+        Snapshot(Value),
+        Error,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    pub struct HardeningConfig {
+        replies: Vec<SnapshotReply>,
+        hang_subscription_ack: bool,
+    }
+
+    impl HardeningConfig {
+        pub fn replies(mut self, replies: Vec<SnapshotReply>) -> Self {
+            self.replies = replies;
+            self
+        }
+
+        pub fn hang_subscription_ack(mut self) -> Self {
+            self.hang_subscription_ack = true;
+            self
+        }
+    }
+
+    pub struct HardeningHerdr {
+        _temp_dir: TempDir,
+        socket_path: PathBuf,
+        subscriptions: Arc<AtomicUsize>,
+        active_subscriptions: Arc<AtomicUsize>,
+        joined_subscriptions: Arc<AtomicUsize>,
+        snapshot_requests: Arc<AtomicUsize>,
+        accept_task: JoinHandle<()>,
+    }
+
+    impl HardeningHerdr {
+        pub async fn start(config: HardeningConfig) -> io::Result<Self> {
+            let temp_dir = tempfile::tempdir()?;
+            let socket_path = temp_dir.path().join("herdr.sock");
+            let listener = UnixListener::bind(&socket_path)?;
+            let subscriptions = Arc::new(AtomicUsize::new(0));
+            let active_subscriptions = Arc::new(AtomicUsize::new(0));
+            let joined_subscriptions = Arc::new(AtomicUsize::new(0));
+            let snapshot_requests = Arc::new(AtomicUsize::new(0));
+            let config = Arc::new(config);
+            let task_subscriptions = Arc::clone(&subscriptions);
+            let task_active = Arc::clone(&active_subscriptions);
+            let task_joined = Arc::clone(&joined_subscriptions);
+            let task_snapshots = Arc::clone(&snapshot_requests);
+            let accept_task = tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let config = Arc::clone(&config);
+                    let subscriptions = Arc::clone(&task_subscriptions);
+                    let active = Arc::clone(&task_active);
+                    let joined = Arc::clone(&task_joined);
+                    let snapshots = Arc::clone(&task_snapshots);
+                    tokio::spawn(async move {
+                        let _ = handle_connection(
+                            stream,
+                            &config,
+                            &subscriptions,
+                            &active,
+                            &joined,
+                            &snapshots,
+                        )
+                        .await;
+                    });
+                }
+            });
+            Ok(Self {
+                _temp_dir: temp_dir,
+                socket_path,
+                subscriptions,
+                active_subscriptions,
+                joined_subscriptions,
+                snapshot_requests,
+                accept_task,
+            })
+        }
+
+        pub fn socket_path(&self) -> &Path {
+            &self.socket_path
+        }
+
+        pub fn subscriptions(&self) -> usize {
+            self.subscriptions.load(Ordering::SeqCst)
+        }
+
+        pub fn active_subscriptions(&self) -> usize {
+            self.active_subscriptions.load(Ordering::SeqCst)
+        }
+
+        pub fn joined_subscriptions(&self) -> usize {
+            self.joined_subscriptions.load(Ordering::SeqCst)
+        }
+
+        pub fn snapshot_requests(&self) -> usize {
+            self.snapshot_requests.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for HardeningHerdr {
+        fn drop(&mut self) {
+            self.accept_task.abort();
+        }
+    }
+
+    async fn handle_connection(
+        stream: UnixStream,
+        config: &HardeningConfig,
+        subscriptions: &AtomicUsize,
+        active: &AtomicUsize,
+        joined: &AtomicUsize,
+        snapshots: &AtomicUsize,
+    ) -> io::Result<()> {
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        if reader.read_line(&mut line).await? == 0 {
+            return Ok(());
+        }
+        let request: Value = serde_json::from_str(&line).map_err(invalid_data)?;
+        let id = request["id"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("missing request id"))?;
+        match request["method"].as_str() {
+            Some("events.subscribe") => {
+                subscriptions.fetch_add(1, Ordering::SeqCst);
+                if !config.hang_subscription_ack {
+                    write_frame(
+                        reader.get_mut(),
+                        &json!({"id": id, "result": {"type": "subscription_started"}}),
+                    )
+                    .await?;
+                }
+                active.fetch_add(1, Ordering::SeqCst);
+                line.clear();
+                let result = reader.read_line(&mut line).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                joined.fetch_add(1, Ordering::SeqCst);
+                result.map(|_| ())
+            }
+            Some("session.snapshot") => {
+                let index = snapshots.fetch_add(1, Ordering::SeqCst);
+                match config.replies.get(index).or_else(|| config.replies.last()) {
+                    Some(SnapshotReply::Snapshot(snapshot)) => {
+                        write_frame(
+                            reader.get_mut(),
+                            &json!({"id": id, "result": {"type": "session_snapshot", "snapshot": snapshot}}),
+                        )
+                        .await
+                    }
+                    Some(SnapshotReply::Error) | None => {
+                        write_frame(
+                            reader.get_mut(),
+                            &json!({"id": id, "error": {"code": "SNAPSHOT_FAILED", "message": "fabricated first snapshot failure"}}),
+                        )
+                        .await
+                    }
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
+    async fn write_frame(stream: &mut UnixStream, frame: &Value) -> io::Result<()> {
+        let mut bytes = serde_json::to_vec(frame).map_err(invalid_data)?;
+        bytes.push(b'\n');
+        stream.write_all(&bytes).await?;
+        stream.flush().await
+    }
+
+    fn invalid_data(error: impl std::fmt::Display) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+    }
+}

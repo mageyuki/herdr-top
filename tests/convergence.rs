@@ -3,14 +3,15 @@ mod common;
 
 use std::time::Duration;
 
+use common::hardening_mock::{HardeningConfig, HardeningHerdr, SnapshotReply};
 use common::mock::{MockConfig, MockHerdr, fixture_payloads};
 use common::scripted_mock::{ScriptedConfig, ScriptedHerdr};
 use herdr_top::herdr::collector::{self, CollectorHandle, ObservationQuality};
 use herdr_top::lockfile::{StateRoot, state_root_in};
 use herdr_top::model::{
     AgentSessionReference, AgentSessionReferenceKind, DisplayOrdinal, DomainModel, ExecState,
-    Execution, GapKind, PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SnapshotAgent,
-    TaskRun, TaskState, TopologySnapshot,
+    Execution, GapKind, Pane, PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SnapshotAgent,
+    Tab, TaskRun, TaskState, TopologySnapshot, Workspace,
 };
 use herdr_top::reducer::Reducer;
 use herdr_top::session_key;
@@ -52,9 +53,14 @@ async fn subscribe_buffer_snapshot_replay_order() {
     .expect("mock server should bind");
     let (directory, root, lifecycle, writer) = test_writer();
 
-    let mut handle = collector::spawn(mock.socket_path().to_path_buf(), empty_restored(), writer)
-        .await
-        .expect("collector should start");
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
 
     assert!(handle.model.borrow().pane("w1:p2").is_some());
@@ -90,9 +96,14 @@ async fn anomaly_triggers_fresh_generation_resnapshot() {
     .expect("scripted mock should bind");
     let (_directory, _root, lifecycle, writer) = test_writer();
 
-    let mut handle = collector::spawn(mock.socket_path().to_path_buf(), empty_restored(), writer)
-        .await
-        .expect("collector should start");
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
 
     assert_eq!(mock.snapshot_requests(), 2);
@@ -122,9 +133,14 @@ async fn later_closure_exempts_anomaly() {
     .expect("scripted mock should bind");
     let (_directory, _root, lifecycle, writer) = test_writer();
 
-    let mut handle = collector::spawn(mock.socket_path().to_path_buf(), empty_restored(), writer)
-        .await
-        .expect("collector should start");
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
 
     assert_eq!(mock.snapshot_requests(), 1);
@@ -147,9 +163,14 @@ async fn three_attempts_then_stays_reconciling() {
     .expect("scripted mock should bind");
     let (_directory, _root, lifecycle, writer) = test_writer();
 
-    let handle = collector::spawn(mock.socket_path().to_path_buf(), empty_restored(), writer)
-        .await
-        .expect("collector should start");
+    let handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
     wait_until(|| mock.snapshot_requests() == 4).await;
     tokio::time::sleep(Duration::from_millis(25)).await;
 
@@ -189,9 +210,14 @@ async fn overflow_consumes_shared_counter_no_retirement() {
     let (restored, seed, run_id) = persisted_native_restored(sid);
     let (_directory, _root, lifecycle, writer) = test_writer_seeded(seed);
 
-    let handle = collector::spawn(mock.socket_path().to_path_buf(), restored, writer)
-        .await
-        .expect("collector should start");
+    let handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        restored,
+        writer,
+    )
+    .await
+    .expect("collector should start");
     wait_until(|| mock.snapshot_requests() == 4).await;
     tokio::time::sleep(Duration::from_millis(25)).await;
 
@@ -230,9 +256,14 @@ async fn gap_retires_pre_gap_executions_all_three_kinds() {
     .expect("scripted mock should bind");
     let (restored, seed, run_id) = persisted_native_restored(sid);
     let (_directory, root, lifecycle, writer) = test_writer_seeded(seed);
-    let mut handle = collector::spawn(mock.socket_path().to_path_buf(), restored, writer)
-        .await
-        .expect("collector should start");
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        restored,
+        writer,
+    )
+    .await
+    .expect("collector should start");
 
     wait_until(|| mock.snapshot_requests() >= 2).await;
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
@@ -263,10 +294,12 @@ async fn gap_retires_pre_gap_executions_all_three_kinds() {
 fn attach_requires_equal_nonempty_identity() {
     let (restored, _seed, run_id) = persisted_native_restored("same-sid");
     let (mut reducer, shared) = Reducer::new(restored);
-    reducer.reconcile_gap(ReconcileBatch {
-        topology: topology_with_session("same-sid", AgentSessionReferenceKind::Id, "working"),
-        gap_kind: GapKind::Startup,
-    });
+    reducer
+        .reconcile_gap(ReconcileBatch {
+            topology: topology_with_session("same-sid", AgentSessionReferenceKind::Id, "working"),
+            gap_kind: GapKind::Startup,
+        })
+        .unwrap();
     assert!(shared.borrow().executions().any(|execution| {
         execution.execution_id != "pre-gap-execution"
             && execution.task_run_id == run_id
@@ -275,10 +308,12 @@ fn attach_requires_equal_nonempty_identity() {
 
     let (restored, _seed, run_id) = persisted_native_restored("nonempty-sid");
     let (mut reducer, shared) = Reducer::new(restored);
-    reducer.reconcile_gap(ReconcileBatch {
-        topology: topology_with_session("", AgentSessionReferenceKind::Id, "working"),
-        gap_kind: GapKind::Startup,
-    });
+    reducer
+        .reconcile_gap(ReconcileBatch {
+            topology: topology_with_session("", AgentSessionReferenceKind::Id, "working"),
+            gap_kind: GapKind::Startup,
+        })
+        .unwrap();
     assert!(!shared.borrow().executions().any(|execution| {
         execution.execution_id != "pre-gap-execution"
             && execution.task_run_id == run_id
@@ -290,10 +325,16 @@ fn attach_requires_equal_nonempty_identity() {
 fn path_kind_never_corroborates() {
     let (restored, _seed, run_id) = persisted_native_restored("same-text");
     let (mut reducer, shared) = Reducer::new(restored);
-    reducer.reconcile_gap(ReconcileBatch {
-        topology: topology_with_session("same-text", AgentSessionReferenceKind::Path, "working"),
-        gap_kind: GapKind::Startup,
-    });
+    reducer
+        .reconcile_gap(ReconcileBatch {
+            topology: topology_with_session(
+                "same-text",
+                AgentSessionReferenceKind::Path,
+                "working",
+            ),
+            gap_kind: GapKind::Startup,
+        })
+        .unwrap();
 
     assert!(!shared.borrow().executions().any(|execution| {
         execution.execution_id != "pre-gap-execution"
@@ -316,9 +357,14 @@ async fn restored_synthesized_idle_attaches_truthfully() {
     let (restored, seed, run_id) = persisted_native_restored(sid);
     let (_directory, _root, lifecycle, writer) = test_writer_seeded(seed);
 
-    let mut handle = collector::spawn(mock.socket_path().to_path_buf(), restored, writer)
-        .await
-        .expect("collector should start");
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        restored,
+        writer,
+    )
+    .await
+    .expect("collector should start");
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
 
     assert!(handle.model.borrow().executions().any(|execution| {
@@ -349,9 +395,14 @@ async fn terminal_id_preserved_across_move_replay() {
     .expect("mock server should bind");
     let (_directory, _root, lifecycle, writer) = test_writer();
 
-    let mut handle = collector::spawn(mock.socket_path().to_path_buf(), empty_restored(), writer)
-        .await
-        .expect("collector should start");
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
 
     assert_eq!(
@@ -384,9 +435,14 @@ async fn live_only_after_clean_drain() {
     .expect("scripted mock should bind");
     let (_directory, _root, lifecycle, writer) = test_writer();
 
-    let mut handle = collector::spawn(mock.socket_path().to_path_buf(), empty_restored(), writer)
-        .await
-        .expect("collector should start");
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
     wait_until(|| mock.snapshot_requests() == 1).await;
     assert_eq!(*handle.quality.borrow(), ObservationQuality::Reconciling);
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
@@ -414,9 +470,14 @@ async fn owner_location_refreshed_on_move() {
     .expect("mock server should bind");
     let (_directory, root, lifecycle, writer) = test_writer();
 
-    let mut handle = collector::spawn(mock.socket_path().to_path_buf(), empty_restored(), writer)
-        .await
-        .expect("collector should start");
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
     shutdown(handle, lifecycle).await;
 
@@ -438,9 +499,14 @@ async fn owner_replace_committed_before_subscription() {
     .expect("mock server should bind");
     let (_directory, root, lifecycle, writer) = test_writer();
 
-    let handle = collector::spawn(mock.socket_path().to_path_buf(), empty_restored(), writer)
-        .await
-        .expect("collector should start");
+    let handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
     let reader = open_reader(&root).expect("reader should see committed owner");
     assert!(
         reader
@@ -463,7 +529,13 @@ async fn owner_replace_failure_is_startup_error() {
         .await
         .expect("writer should shut down cleanly");
 
-    let result = collector::spawn(mock.socket_path().to_path_buf(), empty_restored(), writer).await;
+    let result = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await;
 
     assert!(result.is_err());
     assert_eq!(mock.accepted_connections(), 0);
@@ -478,9 +550,14 @@ async fn snapshot_maps_to_topology() {
     .expect("mock server should bind");
     let (_directory, root, lifecycle, writer) = test_writer();
 
-    let mut handle = collector::spawn(mock.socket_path().to_path_buf(), empty_restored(), writer)
-        .await
-        .expect("collector should start");
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
     assert!(handle.model.borrow().workspace("w1").is_some());
     assert!(handle.model.borrow().tab("w1:t1").is_some());
@@ -584,12 +661,555 @@ async fn fifty_pane_mock_smoke() {
     .expect("mock server should bind");
     let (_directory, _root, lifecycle, writer) = test_writer();
 
-    let mut handle = collector::spawn(mock.socket_path().to_path_buf(), empty_restored(), writer)
-        .await
-        .expect("collector should start");
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
 
     assert_eq!(handle.model.borrow().panes().count(), 50);
+    shutdown(handle, lifecycle).await;
+}
+
+#[tokio::test]
+async fn pane_update_with_new_sid_promotes_provisional() {
+    let initial = agent_snapshot("", AgentSessionReferenceKind::Id, "working");
+    let update = push(
+        "pane_updated",
+        json!({"type": "pane_updated", "pane": agent_pane_value("w1:p1", "term_6583d08d791e41", "w1", "w1:t1", "promoted-sid")}),
+    );
+    let mock = MockHerdr::start(
+        MockConfig::default()
+            .respond("session.snapshot", snapshot_result(initial))
+            .subscription_pushes(vec![update]),
+    )
+    .await
+    .expect("mock server should bind");
+    let (_directory, _root, lifecycle, writer) = test_writer();
+
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+
+    let model = handle.model.borrow();
+    let promoted = model
+        .task_run_by_key(&RunKey::Native {
+            provider: Provider::Codex,
+            sid: "promoted-sid".to_owned(),
+        })
+        .expect("pane update identity must promote the provisional run");
+    assert_eq!(model.task_runs().count(), 1);
+    assert_eq!(
+        model
+            .executions()
+            .filter(|execution| {
+                execution.task_run_id == promoted.run_id && !execution.state.is_terminal()
+            })
+            .count(),
+        1
+    );
+    drop(model);
+    shutdown(handle, lifecycle).await;
+}
+
+#[tokio::test]
+async fn different_sid_same_terminal_starts_new_run() {
+    let initial = agent_snapshot("old-sid", AgentSessionReferenceKind::Id, "working");
+    let update = push(
+        "pane_updated",
+        json!({"type": "pane_updated", "pane": agent_pane_value("w1:p1", "term_6583d08d791e41", "w1", "w1:t1", "new-sid")}),
+    );
+    let mock = MockHerdr::start(
+        MockConfig::default()
+            .respond("session.snapshot", snapshot_result(initial))
+            .subscription_pushes(vec![update]),
+    )
+    .await
+    .expect("mock server should bind");
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+
+    let model = handle.model.borrow();
+    let old_run = model
+        .task_run_by_key(&RunKey::Native {
+            provider: Provider::Codex,
+            sid: "old-sid".to_owned(),
+        })
+        .unwrap()
+        .run_id;
+    let new_run = model
+        .task_run_by_key(&RunKey::Native {
+            provider: Provider::Codex,
+            sid: "new-sid".to_owned(),
+        })
+        .unwrap()
+        .run_id;
+    assert_ne!(old_run, new_run);
+    assert!(
+        model
+            .executions()
+            .filter(|execution| execution.task_run_id == old_run)
+            .all(|execution| execution.state.is_terminal())
+    );
+    assert_eq!(
+        model
+            .executions()
+            .filter(|execution| {
+                execution.terminal_id == "term_6583d08d791e41" && !execution.state.is_terminal()
+            })
+            .count(),
+        1
+    );
+    drop(model);
+    shutdown(handle, lifecycle).await;
+}
+
+#[tokio::test]
+async fn resnapshot_discovers_new_agent_pane() {
+    let initial = p1_snapshot();
+    let mut discovered = initial.clone();
+    discovered["panes"]
+        .as_array_mut()
+        .unwrap()
+        .push(agent_pane_value(
+            "w1:p2",
+            "new-terminal",
+            "w1",
+            "w1:t1",
+            "discovered-sid",
+        ));
+    discovered["workspaces"][0]["pane_count"] = json!(2);
+    discovered["tabs"][0]["pane_count"] = json!(2);
+    let mock = ScriptedHerdr::start(
+        ScriptedConfig::default()
+            .snapshots(vec![initial, discovered])
+            .generations(vec![vec![resnapshot_anomaly()], vec![]]),
+    )
+    .await
+    .expect("scripted mock should bind");
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+
+    let model = handle.model.borrow();
+    let run = model
+        .task_run_by_key(&RunKey::Native {
+            provider: Provider::Codex,
+            sid: "discovered-sid".to_owned(),
+        })
+        .expect("resnapshot must begin an execution for the new agent pane");
+    assert!(model.executions().any(|execution| {
+        execution.task_run_id == run.run_id
+            && execution.pane_id == "w1:p2"
+            && !execution.state.is_terminal()
+    }));
+    drop(model);
+    shutdown(handle, lifecycle).await;
+}
+
+#[tokio::test]
+async fn resnapshot_missing_pane_goes_stale_not_ended() {
+    let initial = agent_snapshot("stale-sid", AgentSessionReferenceKind::Id, "working");
+    let missing = snapshot_without_panes(&initial);
+    let mock = ScriptedHerdr::start(
+        ScriptedConfig::default()
+            .snapshots(vec![initial, missing])
+            .generations(vec![vec![resnapshot_anomaly()], vec![]]),
+    )
+    .await
+    .expect("scripted mock should bind");
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+
+    let model = handle.model.borrow();
+    assert!(
+        model.pane("w1:p1").is_some(),
+        "stale pane must remain renderable"
+    );
+    assert!(model.tab("w1:t1").is_some());
+    assert!(model.workspace("w1").is_some());
+    assert!(model.executions().any(|execution| {
+        execution.pane_id == "w1:p1" && matches!(execution.state, ExecState::Stale { .. })
+    }));
+    assert!(
+        !model.executions().any(|execution| {
+            execution.pane_id == "w1:p1" && execution.state == ExecState::Ended
+        })
+    );
+    drop(model);
+    shutdown(handle, lifecycle).await;
+}
+
+#[tokio::test]
+async fn explicit_pane_close_bypasses_stale_grace() {
+    let initial = agent_snapshot("close-sid", AgentSessionReferenceKind::Id, "working");
+    let close = push(
+        "pane_closed",
+        json!({"type": "pane_closed", "pane_id": "w1:p1"}),
+    );
+    let mock = MockHerdr::start(
+        MockConfig::default()
+            .respond("session.snapshot", snapshot_result(initial))
+            .subscription_pushes(vec![close]),
+    )
+    .await
+    .expect("mock server should bind");
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+
+    let model = handle.model.borrow();
+    assert!(model.pane("w1:p1").is_none());
+    assert!(
+        model
+            .executions()
+            .all(|execution| execution.state == ExecState::Ended)
+    );
+    drop(model);
+    shutdown(handle, lifecycle).await;
+}
+
+#[tokio::test]
+async fn stale_same_sid_reappearance_preserves_execution() {
+    let present = agent_snapshot("returning-sid", AgentSessionReferenceKind::Id, "working");
+    let missing = snapshot_without_panes(&present);
+    let mock = ScriptedHerdr::start(
+        ScriptedConfig::default()
+            .snapshots(vec![present.clone(), missing, present])
+            .generations(vec![
+                vec![resnapshot_anomaly()],
+                vec![resnapshot_anomaly()],
+                vec![],
+            ]),
+    )
+    .await
+    .expect("scripted mock should bind");
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+
+    let model = handle.model.borrow();
+    assert_eq!(model.executions().count(), 1);
+    assert_eq!(model.executions().next().unwrap().state, ExecState::Working);
+    assert!(model.pane("w1:p1").is_some());
+    drop(model);
+    shutdown(handle, lifecycle).await;
+}
+
+#[tokio::test]
+async fn topology_closure_cascades_and_persists() {
+    let initial = agent_snapshot("cascade-sid", AgentSessionReferenceKind::Id, "working");
+    let close = push(
+        "workspace_closed",
+        json!({"type": "workspace_closed", "workspace_id": "w1"}),
+    );
+    let mock = MockHerdr::start(
+        MockConfig::default()
+            .respond("session.snapshot", snapshot_result(initial))
+            .subscription_pushes(vec![close]),
+    )
+    .await
+    .expect("mock server should bind");
+    let (_directory, root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+
+    assert_eq!(handle.model.borrow().workspaces().count(), 0);
+    assert_eq!(handle.model.borrow().tabs().count(), 0);
+    assert_eq!(handle.model.borrow().panes().count(), 0);
+    assert!(
+        handle
+            .model
+            .borrow()
+            .executions()
+            .all(|execution| execution.state == ExecState::Ended)
+    );
+    shutdown(handle, lifecycle).await;
+    let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+    assert_eq!(restored.model.workspaces().count(), 0);
+    assert_eq!(restored.model.tabs().count(), 0);
+    assert_eq!(restored.model.panes().count(), 0);
+}
+
+#[tokio::test]
+async fn gap_replacement_prunes_absent_topology_on_restore() {
+    let mut old_model = DomainModel::default();
+    old_model.insert_workspace(Workspace {
+        workspace_id: "old-workspace".to_owned(),
+    });
+    old_model.insert_tab(Tab {
+        tab_id: "old-tab".to_owned(),
+        workspace_id: "old-workspace".to_owned(),
+    });
+    old_model.insert_pane(Pane {
+        pane_id: "old-pane".to_owned(),
+        workspace_id: "old-workspace".to_owned(),
+        tab_id: "old-tab".to_owned(),
+        terminal_id: "old-terminal".to_owned(),
+    });
+    let seed = vec![
+        PersistOp::UpsertWorkspace(Workspace {
+            workspace_id: "old-workspace".to_owned(),
+        }),
+        PersistOp::UpsertTab(Tab {
+            tab_id: "old-tab".to_owned(),
+            workspace_id: "old-workspace".to_owned(),
+        }),
+        PersistOp::UpsertPane(Pane {
+            pane_id: "old-pane".to_owned(),
+            workspace_id: "old-workspace".to_owned(),
+            tab_id: "old-tab".to_owned(),
+            terminal_id: "old-terminal".to_owned(),
+        }),
+    ];
+    let mock = MockHerdr::start(
+        MockConfig::default().respond("session.snapshot", snapshot_result(p1_snapshot())),
+    )
+    .await
+    .expect("mock server should bind");
+    let (_directory, root, lifecycle, writer) = test_writer_seeded(seed);
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        RestoredState {
+            model: old_model,
+            next_ordinal: 1,
+        },
+        writer,
+    )
+    .await
+    .expect("collector should start");
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    shutdown(handle, lifecycle).await;
+
+    let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+    assert!(restored.model.workspace("old-workspace").is_none());
+    assert!(restored.model.tab("old-tab").is_none());
+    assert!(restored.model.pane("old-pane").is_none());
+    assert!(restored.model.workspace("w1").is_some());
+}
+
+#[tokio::test]
+async fn subscribe_hang_cannot_block_stop() {
+    let mock = HardeningHerdr::start(HardeningConfig::default().hang_subscription_ack())
+        .await
+        .expect("hardening mock should bind");
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
+    wait_until(|| mock.subscriptions() == 1).await;
+
+    tokio::time::timeout(Duration::from_secs(1), handle.stop())
+        .await
+        .expect("stop must not wait for the hanging subscription acknowledgement")
+        .expect("cancellation should stop the collector cleanly");
+    wait_until(|| mock.active_subscriptions() == 0).await;
+    assert_eq!(mock.joined_subscriptions(), 1);
+    lifecycle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn converge_error_cancels_and_joins_reader() {
+    let snapshot = agent_snapshot("ordinal-failure", AgentSessionReferenceKind::Id, "working");
+    let mock = HardeningHerdr::start(
+        HardeningConfig::default().replies(vec![SnapshotReply::Snapshot(snapshot)]),
+    )
+    .await
+    .expect("hardening mock should bind");
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: i64::MAX,
+        },
+        writer,
+    )
+    .await
+    .expect("collector should start");
+    wait_until(|| mock.snapshot_requests() == 1).await;
+    wait_until(|| mock.joined_subscriptions() == 1).await;
+
+    let error = handle
+        .stop()
+        .await
+        .expect_err("ordinal exhaustion must surface from convergence");
+    assert!(
+        error
+            .to_string()
+            .contains("display ordinal allocator is exhausted")
+    );
+    assert_eq!(mock.active_subscriptions(), 0);
+    lifecycle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn collector_uses_resolved_session_name() {
+    let mock = MockHerdr::start(
+        MockConfig::default().respond("session.snapshot", snapshot_result(p1_snapshot())),
+    )
+    .await
+    .expect("mock server should bind");
+    let (_directory, root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        "resolved-session-name".to_owned(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    shutdown(handle, lifecycle).await;
+
+    let connection = Connection::open(database_path(&root)).unwrap();
+    let names: Vec<String> = connection
+        .prepare("SELECT DISTINCT herdr_session FROM events")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(names, vec!["resolved-session-name"]);
+}
+
+#[tokio::test]
+async fn startup_gap_recorded_despite_first_snapshot_retry() {
+    let mock = HardeningHerdr::start(HardeningConfig::default().replies(vec![
+        SnapshotReply::Error,
+        SnapshotReply::Snapshot(p1_snapshot()),
+    ]))
+    .await
+    .expect("hardening mock should bind");
+    let (_directory, root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    assert_eq!(mock.snapshot_requests(), 2);
+    assert_eq!(mock.subscriptions(), 2);
+    shutdown(handle, lifecycle).await;
+
+    let connection = Connection::open(database_path(&root)).unwrap();
+    let startup: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE gap_kind = 'startup'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let reconnect: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE gap_kind = 'reconnect'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(startup, 1);
+    assert_eq!(reconnect, 0);
+}
+
+#[tokio::test]
+async fn snapshot_maps_agent_and_agent_session_identity() {
+    let snapshot = agent_snapshot("mapped-sid", AgentSessionReferenceKind::Id, "blocked");
+    let mock = MockHerdr::start(
+        MockConfig::default().respond("session.snapshot", snapshot_result(snapshot)),
+    )
+    .await
+    .expect("mock server should bind");
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+
+    let model = handle.model.borrow();
+    let run = model
+        .task_run_by_key(&RunKey::Native {
+            provider: Provider::Codex,
+            sid: "mapped-sid".to_owned(),
+        })
+        .unwrap();
+    assert!(model.agent_nodes().any(|node| {
+        node.task_run_id == run.run_id
+            && node.provider == Provider::Codex
+            && node.native_session_id.as_deref() == Some("mapped-sid")
+    }));
+    assert!(model.executions().any(|execution| {
+        execution.task_run_id == run.run_id && execution.state == ExecState::Blocked
+    }));
+    drop(model);
     shutdown(handle, lifecycle).await;
 }
 
@@ -616,6 +1236,10 @@ fn empty_restored() -> RestoredState {
         model: DomainModel::default(),
         next_ordinal: 1,
     }
+}
+
+fn test_session() -> String {
+    "convergence-test".to_owned()
 }
 
 fn persisted_native_restored(sid: &str) -> (RestoredState, Vec<PersistOp>, RunId) {
@@ -740,6 +1364,47 @@ fn pane_value(pane_id: &str, terminal_id: &str, workspace_id: &str, tab_id: &str
         "agent_status": "unknown",
         "revision": 1
     })
+}
+
+fn agent_pane_value(
+    pane_id: &str,
+    terminal_id: &str,
+    workspace_id: &str,
+    tab_id: &str,
+    sid: &str,
+) -> Value {
+    json!({
+        "pane_id": pane_id,
+        "terminal_id": terminal_id,
+        "workspace_id": workspace_id,
+        "tab_id": tab_id,
+        "focused": false,
+        "agent": "codex",
+        "agent_status": "working",
+        "agent_session": {
+            "source": "herdr:codex",
+            "agent": "codex",
+            "kind": "id",
+            "value": sid,
+        },
+        "revision": 2
+    })
+}
+
+fn snapshot_without_panes(snapshot: &Value) -> Value {
+    let mut missing = snapshot.clone();
+    missing["panes"] = json!([]);
+    missing["workspaces"][0]["pane_count"] = json!(0);
+    missing["tabs"][0]["pane_count"] = json!(0);
+    missing["focused_pane_id"] = Value::Null;
+    missing
+}
+
+fn resnapshot_anomaly() -> Value {
+    push(
+        "pane_focused",
+        json!({"type": "pane_focused", "pane_id": "ghost:p1", "workspace_id": "ghost"}),
+    )
 }
 
 fn push(event: &str, data: Value) -> Value {
