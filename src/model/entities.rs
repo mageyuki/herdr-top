@@ -1,2 +1,454 @@
 //! T4C entity structs, `DomainModel`, `SharedModel`, `NormalizedEvent`, `GapKind`,
 //! `ReconcileBatch`, and `TopologySnapshot`.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+
+use super::ids::{DisplayOrdinal, Provider, RunId, RunKey};
+use super::state::{ExecState, TaskState};
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Workspace {
+    pub workspace_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Tab {
+    pub tab_id: String,
+    pub workspace_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Pane {
+    pub pane_id: String,
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub terminal_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Execution {
+    pub execution_id: String,
+    pub pane_id: String,
+    pub terminal_id: String,
+    pub task_run_id: RunId,
+    pub state: ExecState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskRun {
+    pub run_id: RunId,
+    pub key: RunKey,
+    pub display_ordinal: DisplayOrdinal,
+    pub state: TaskState,
+    pub has_controller_task_state_event: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentNode {
+    pub agent_node_id: String,
+    pub provider: Provider,
+    pub native_session_id: Option<String>,
+    pub task_run_id: RunId,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct ExecutionEdge {
+    pub parent_run_id: RunId,
+    pub child_run_id: RunId,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct DependencyEdge {
+    pub prerequisite_run_id: RunId,
+    pub dependent_run_id: RunId,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DomainModel {
+    workspaces: HashMap<String, Workspace>,
+    tabs: HashMap<String, Tab>,
+    panes: HashMap<String, Pane>,
+    task_runs: HashMap<RunId, TaskRun>,
+    run_ids_by_key: HashMap<RunKey, RunId>,
+    executions: HashMap<String, Execution>,
+    agent_nodes: HashMap<String, AgentNode>,
+    execution_edges: HashSet<ExecutionEdge>,
+    dependency_edges: HashSet<DependencyEdge>,
+}
+
+impl DomainModel {
+    pub fn insert_workspace(&mut self, workspace: Workspace) -> Option<Workspace> {
+        self.workspaces
+            .insert(workspace.workspace_id.clone(), workspace)
+    }
+
+    #[must_use]
+    pub fn workspace(&self, workspace_id: &str) -> Option<&Workspace> {
+        self.workspaces.get(workspace_id)
+    }
+
+    pub fn workspaces(&self) -> impl Iterator<Item = &Workspace> {
+        self.workspaces.values()
+    }
+
+    pub fn insert_tab(&mut self, tab: Tab) -> Option<Tab> {
+        self.tabs.insert(tab.tab_id.clone(), tab)
+    }
+
+    #[must_use]
+    pub fn tab(&self, tab_id: &str) -> Option<&Tab> {
+        self.tabs.get(tab_id)
+    }
+
+    pub fn tabs(&self) -> impl Iterator<Item = &Tab> {
+        self.tabs.values()
+    }
+
+    pub fn insert_pane(&mut self, pane: Pane) -> Option<Pane> {
+        self.panes.insert(pane.pane_id.clone(), pane)
+    }
+
+    #[must_use]
+    pub fn pane(&self, pane_id: &str) -> Option<&Pane> {
+        self.panes.get(pane_id)
+    }
+
+    pub fn panes(&self) -> impl Iterator<Item = &Pane> {
+        self.panes.values()
+    }
+
+    pub fn insert_task_run(&mut self, task_run: TaskRun) -> Option<TaskRun> {
+        let run_id = task_run.run_id;
+        let key = task_run.key.clone();
+        let replaced = self.task_runs.insert(run_id, task_run);
+        if let Some(previous) = &replaced
+            && self.run_ids_by_key.get(&previous.key) == Some(&run_id)
+        {
+            self.run_ids_by_key.remove(&previous.key);
+        }
+        self.run_ids_by_key.insert(key, run_id);
+        replaced
+    }
+
+    #[must_use]
+    pub fn task_run(&self, run_id: &RunId) -> Option<&TaskRun> {
+        self.task_runs.get(run_id)
+    }
+
+    #[must_use]
+    pub fn task_run_by_key(&self, key: &RunKey) -> Option<&TaskRun> {
+        self.run_ids_by_key
+            .get(key)
+            .and_then(|run_id| self.task_runs.get(run_id))
+    }
+
+    pub fn task_runs(&self) -> impl Iterator<Item = &TaskRun> {
+        self.task_runs.values()
+    }
+
+    pub fn insert_execution(&mut self, execution: Execution) -> Option<Execution> {
+        self.executions
+            .insert(execution.execution_id.clone(), execution)
+    }
+
+    #[must_use]
+    pub fn execution(&self, execution_id: &str) -> Option<&Execution> {
+        self.executions.get(execution_id)
+    }
+
+    pub fn executions(&self) -> impl Iterator<Item = &Execution> {
+        self.executions.values()
+    }
+
+    pub fn insert_agent_node(&mut self, agent_node: AgentNode) -> Option<AgentNode> {
+        self.agent_nodes
+            .insert(agent_node.agent_node_id.clone(), agent_node)
+    }
+
+    #[must_use]
+    pub fn agent_node(&self, agent_node_id: &str) -> Option<&AgentNode> {
+        self.agent_nodes.get(agent_node_id)
+    }
+
+    pub fn agent_nodes(&self) -> impl Iterator<Item = &AgentNode> {
+        self.agent_nodes.values()
+    }
+
+    pub fn insert_execution_edge(&mut self, edge: ExecutionEdge) -> bool {
+        self.execution_edges.insert(edge)
+    }
+
+    pub fn execution_edges(&self) -> impl Iterator<Item = &ExecutionEdge> {
+        self.execution_edges.iter()
+    }
+
+    pub fn insert_dependency_edge(&mut self, edge: DependencyEdge) -> bool {
+        self.dependency_edges.insert(edge)
+    }
+
+    pub fn dependency_edges(&self) -> impl Iterator<Item = &DependencyEdge> {
+        self.dependency_edges.iter()
+    }
+}
+
+pub type SharedModel = tokio::sync::watch::Receiver<Arc<DomainModel>>;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SourceCoverage {
+    pub source: String,
+    pub available: bool,
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MinimalProviderMetadata {
+    pub agent_id: Option<String>,
+    pub parent_agent_id: Option<String>,
+    pub model_id: Option<String>,
+    pub event_kind: Option<String>,
+    pub tool_name: Option<String>,
+    pub item_count: Option<u64>,
+    pub byte_count: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EventMetadata {
+    pub event_id: String,
+    pub timestamp_ms: i64,
+    pub source: String,
+    pub source_event_type: String,
+    pub herdr_session: String,
+    pub workspace_id: Option<String>,
+    pub tab_id: Option<String>,
+    pub pane_id: Option<String>,
+    pub terminal_id: Option<String>,
+    pub provider: Option<Provider>,
+    pub native_session_id: Option<String>,
+    pub task_run_id: Option<RunId>,
+    pub agent_node_id: Option<String>,
+    pub task_state: Option<TaskState>,
+    pub execution_parent: Option<ExecutionEdge>,
+    pub dependency: Option<DependencyEdge>,
+    pub source_coverage: Vec<SourceCoverage>,
+    pub provider_metadata: Option<MinimalProviderMetadata>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum TopologyEntity {
+    Workspace(Workspace),
+    Tab(Tab),
+    Pane(Pane),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum TopologyEntityId {
+    Workspace { workspace_id: String },
+    Tab { tab_id: String },
+    Pane { pane_id: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum NormalizedEvent {
+    TopologyUpsert {
+        metadata: EventMetadata,
+        entity: TopologyEntity,
+    },
+    TopologyClosure {
+        metadata: EventMetadata,
+        entity: TopologyEntityId,
+    },
+    AgentStatusChanged {
+        metadata: EventMetadata,
+        execution_id: String,
+        state: ExecState,
+    },
+    ExecutionBegin {
+        metadata: EventMetadata,
+        execution: Execution,
+    },
+    ExecutionEnd {
+        metadata: EventMetadata,
+        execution_id: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum GapKind {
+    Startup,
+    Reconnect,
+    SocketReplacement,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReconcileBatch {
+    pub topology: TopologySnapshot,
+    pub gap_kind: GapKind,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TopologySnapshot {
+    pub workspaces: Vec<Workspace>,
+    pub tabs: Vec<Tab>,
+    pub panes: Vec<PaneSnapshot>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PaneSnapshot {
+    pub pane_id: String,
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub terminal_id: String,
+    pub agent: Option<SnapshotAgent>,
+    pub agent_session: Option<AgentSessionReference>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SnapshotAgent {
+    pub agent_name: String,
+    pub state: ExecState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentSessionReference {
+    pub source: String,
+    pub agent: String,
+    pub kind: AgentSessionReferenceKind,
+    pub value: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum AgentSessionReferenceKind {
+    Id,
+    Path,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ids::{DisplayOrdinal, Provider, RunId, RunKey};
+    use crate::model::state::{ExecState, TaskState};
+
+    #[test]
+    fn domain_model_construction() {
+        let mut model = DomainModel::default();
+        let run_id = RunId::new();
+        let dependency_id = RunId::new();
+        let run_key = RunKey::Provisional {
+            terminal_id: "terminal-1".to_owned(),
+            start_ms: 100,
+            seq: 1,
+        };
+
+        model.insert_workspace(Workspace {
+            workspace_id: "workspace-1".to_owned(),
+        });
+        model.insert_tab(Tab {
+            tab_id: "tab-1".to_owned(),
+            workspace_id: "workspace-1".to_owned(),
+        });
+        model.insert_pane(Pane {
+            pane_id: "pane-1".to_owned(),
+            workspace_id: "workspace-1".to_owned(),
+            tab_id: "tab-1".to_owned(),
+            terminal_id: "terminal-1".to_owned(),
+        });
+        model.insert_task_run(TaskRun {
+            run_id,
+            key: run_key.clone(),
+            display_ordinal: DisplayOrdinal::new(3),
+            state: TaskState::Running,
+            has_controller_task_state_event: false,
+        });
+        model.insert_task_run(TaskRun {
+            run_id: dependency_id,
+            key: RunKey::Controller("controller-run".to_owned()),
+            display_ordinal: DisplayOrdinal::new(4),
+            state: TaskState::Queued,
+            has_controller_task_state_event: true,
+        });
+        model.insert_execution(Execution {
+            execution_id: "execution-1".to_owned(),
+            pane_id: "pane-1".to_owned(),
+            terminal_id: "terminal-1".to_owned(),
+            task_run_id: run_id,
+            state: ExecState::Working,
+        });
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "agent-1".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some("session-1".to_owned()),
+            task_run_id: run_id,
+        });
+        let execution_edge = ExecutionEdge {
+            parent_run_id: dependency_id,
+            child_run_id: run_id,
+        };
+        let dependency_edge = DependencyEdge {
+            prerequisite_run_id: dependency_id,
+            dependent_run_id: run_id,
+        };
+        model.insert_execution_edge(execution_edge.clone());
+        model.insert_dependency_edge(dependency_edge.clone());
+
+        assert_eq!(
+            model.workspace("workspace-1").unwrap().workspace_id,
+            "workspace-1"
+        );
+        assert_eq!(model.tab("tab-1").unwrap().workspace_id, "workspace-1");
+        assert_eq!(model.pane("pane-1").unwrap().terminal_id, "terminal-1");
+        assert_eq!(model.task_run(&run_id).unwrap().key, run_key);
+        assert_eq!(model.task_run_by_key(&run_key).unwrap().run_id, run_id);
+        assert_eq!(model.execution("execution-1").unwrap().task_run_id, run_id);
+        assert_eq!(model.agent_node("agent-1").unwrap().task_run_id, run_id);
+        assert!(model.execution_edges().any(|edge| edge == &execution_edge));
+        assert!(
+            model
+                .dependency_edges()
+                .any(|edge| edge == &dependency_edge)
+        );
+        assert_eq!(model.workspaces().count(), 1);
+        assert_eq!(model.tabs().count(), 1);
+        assert_eq!(model.panes().count(), 1);
+        assert_eq!(model.task_runs().count(), 2);
+        assert_eq!(model.executions().count(), 1);
+        assert_eq!(model.agent_nodes().count(), 1);
+    }
+
+    #[test]
+    fn topology_snapshot_serde_roundtrip() {
+        let snapshot = TopologySnapshot {
+            workspaces: vec![Workspace {
+                workspace_id: "workspace-1".to_owned(),
+            }],
+            tabs: vec![Tab {
+                tab_id: "tab-1".to_owned(),
+                workspace_id: "workspace-1".to_owned(),
+            }],
+            panes: vec![PaneSnapshot {
+                pane_id: "pane-1".to_owned(),
+                workspace_id: "workspace-1".to_owned(),
+                tab_id: "tab-1".to_owned(),
+                terminal_id: "terminal-1".to_owned(),
+                agent: Some(SnapshotAgent {
+                    agent_name: "codex".to_owned(),
+                    state: ExecState::Working,
+                }),
+                agent_session: Some(AgentSessionReference {
+                    source: "herdr".to_owned(),
+                    agent: "codex".to_owned(),
+                    kind: AgentSessionReferenceKind::Id,
+                    value: "session-1".to_owned(),
+                }),
+            }],
+        };
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<TopologySnapshot>(&encoded).unwrap(),
+            snapshot
+        );
+    }
+}
