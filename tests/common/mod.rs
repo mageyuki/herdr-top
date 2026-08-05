@@ -209,3 +209,309 @@ pub mod mock {
         io::Error::new(io::ErrorKind::InvalidData, error.to_string())
     }
 }
+
+// This is intentionally a separate, append-only helper: the T8 mock above keeps
+// its one-response-per-method behavior unchanged for the existing wire tests.
+#[allow(dead_code)]
+pub mod scripted_mock {
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{UnixListener, UnixStream};
+    use tokio::sync::{mpsc, oneshot};
+    use tokio::task::JoinHandle;
+
+    #[derive(Clone, Debug, Default)]
+    pub struct ScriptedConfig {
+        snapshots: Vec<Value>,
+        generations: Vec<Vec<Value>>,
+        close_after_snapshots: Vec<usize>,
+        snapshot_delay: Duration,
+    }
+
+    impl ScriptedConfig {
+        pub fn snapshots(mut self, snapshots: Vec<Value>) -> Self {
+            self.snapshots = snapshots;
+            self
+        }
+
+        pub fn generations(mut self, generations: Vec<Vec<Value>>) -> Self {
+            self.generations = generations;
+            self
+        }
+
+        pub fn close_after_snapshots(mut self, indexes: Vec<usize>) -> Self {
+            self.close_after_snapshots = indexes;
+            self
+        }
+
+        pub fn snapshot_delay(mut self, delay: Duration) -> Self {
+            self.snapshot_delay = delay;
+            self
+        }
+    }
+
+    pub struct ScriptedHerdr {
+        _temp_dir: TempDir,
+        socket_path: PathBuf,
+        accepted_connections: Arc<AtomicUsize>,
+        subscription_connections: Arc<AtomicUsize>,
+        snapshot_requests: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<Value>>>,
+        config: Arc<ScriptedConfig>,
+        active_subscription: Arc<Mutex<Option<mpsc::UnboundedSender<SubscriptionCommand>>>>,
+        accept_task: JoinHandle<()>,
+    }
+
+    impl ScriptedHerdr {
+        pub async fn start(config: ScriptedConfig) -> io::Result<Self> {
+            let temp_dir = tempfile::tempdir()?;
+            let socket_path = temp_dir.path().join("herdr.sock");
+            let listener = UnixListener::bind(&socket_path)?;
+            let accepted_connections = Arc::new(AtomicUsize::new(0));
+            let subscription_connections = Arc::new(AtomicUsize::new(0));
+            let snapshot_requests = Arc::new(AtomicUsize::new(0));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let active_subscription = Arc::new(Mutex::new(None));
+            let config = Arc::new(config);
+            let accept_task = spawn_accept_task(
+                listener,
+                Arc::clone(&config),
+                Arc::clone(&accepted_connections),
+                Arc::clone(&subscription_connections),
+                Arc::clone(&snapshot_requests),
+                Arc::clone(&requests),
+                Arc::clone(&active_subscription),
+            );
+
+            Ok(Self {
+                _temp_dir: temp_dir,
+                socket_path,
+                accepted_connections,
+                subscription_connections,
+                snapshot_requests,
+                requests,
+                config,
+                active_subscription,
+                accept_task,
+            })
+        }
+
+        pub fn socket_path(&self) -> &Path {
+            &self.socket_path
+        }
+
+        pub fn accepted_connections(&self) -> usize {
+            self.accepted_connections.load(Ordering::SeqCst)
+        }
+
+        pub fn subscription_connections(&self) -> usize {
+            self.subscription_connections.load(Ordering::SeqCst)
+        }
+
+        pub fn snapshot_requests(&self) -> usize {
+            self.snapshot_requests.load(Ordering::SeqCst)
+        }
+
+        pub fn requests(&self) -> Vec<Value> {
+            self.requests
+                .lock()
+                .expect("scripted mock request log should not be poisoned")
+                .clone()
+        }
+
+        pub async fn replace_socket(&mut self) -> io::Result<()> {
+            let active = self
+                .active_subscription
+                .lock()
+                .map_err(|_| io::Error::other("active subscription mutex was poisoned"))?
+                .clone();
+            if let Some(active) = active {
+                let _ = active.send(SubscriptionCommand::Close);
+            }
+            self.accept_task.abort();
+            match std::fs::remove_file(&self.socket_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let listener = UnixListener::bind(&self.socket_path)?;
+            self.accept_task = spawn_accept_task(
+                listener,
+                Arc::clone(&self.config),
+                Arc::clone(&self.accepted_connections),
+                Arc::clone(&self.subscription_connections),
+                Arc::clone(&self.snapshot_requests),
+                Arc::clone(&self.requests),
+                Arc::clone(&self.active_subscription),
+            );
+            Ok(())
+        }
+    }
+
+    impl Drop for ScriptedHerdr {
+        fn drop(&mut self) {
+            self.accept_task.abort();
+        }
+    }
+
+    enum SubscriptionCommand {
+        Push(Vec<Value>, oneshot::Sender<()>),
+        Close,
+    }
+
+    fn spawn_accept_task(
+        listener: UnixListener,
+        config: Arc<ScriptedConfig>,
+        accepted_connections: Arc<AtomicUsize>,
+        subscription_connections: Arc<AtomicUsize>,
+        snapshot_requests: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<Value>>>,
+        active_subscription: Arc<Mutex<Option<mpsc::UnboundedSender<SubscriptionCommand>>>>,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                accepted_connections.fetch_add(1, Ordering::SeqCst);
+                let config = Arc::clone(&config);
+                let subscriptions = Arc::clone(&subscription_connections);
+                let snapshots = Arc::clone(&snapshot_requests);
+                let requests = Arc::clone(&requests);
+                let active = Arc::clone(&active_subscription);
+                tokio::spawn(async move {
+                    let _ = handle_connection(
+                        stream,
+                        &config,
+                        &subscriptions,
+                        &snapshots,
+                        &requests,
+                        &active,
+                    )
+                    .await;
+                });
+            }
+        })
+    }
+
+    async fn handle_connection(
+        stream: UnixStream,
+        config: &ScriptedConfig,
+        subscription_connections: &AtomicUsize,
+        snapshot_requests: &AtomicUsize,
+        requests: &Mutex<Vec<Value>>,
+        active_subscription: &Mutex<Option<mpsc::UnboundedSender<SubscriptionCommand>>>,
+    ) -> io::Result<()> {
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        if reader.read_line(&mut line).await? == 0 {
+            return Ok(());
+        }
+        let request: Value = serde_json::from_str(&line).map_err(invalid_data)?;
+        requests
+            .lock()
+            .map_err(|_| io::Error::other("scripted request log was poisoned"))?
+            .push(request.clone());
+        let id = required_string(&request, "id")?.to_owned();
+        let method = required_string(&request, "method")?;
+
+        if method == "events.subscribe" {
+            subscription_connections.fetch_add(1, Ordering::SeqCst);
+            let (sender, mut commands) = mpsc::unbounded_channel();
+            *active_subscription
+                .lock()
+                .map_err(|_| io::Error::other("active subscription mutex was poisoned"))? =
+                Some(sender);
+            write_frame(
+                reader.get_mut(),
+                &json!({"id": id, "result": {"type": "subscription_started"}}),
+            )
+            .await?;
+            while let Some(command) = commands.recv().await {
+                match command {
+                    SubscriptionCommand::Push(frames, acknowledgement) => {
+                        for frame in frames {
+                            write_frame(reader.get_mut(), &frame).await?;
+                        }
+                        let _ = acknowledgement.send(());
+                    }
+                    SubscriptionCommand::Close => return Ok(()),
+                }
+            }
+            return Ok(());
+        }
+
+        if method == "session.snapshot" {
+            let index = snapshot_requests.fetch_add(1, Ordering::SeqCst);
+            let sender = active_subscription
+                .lock()
+                .map_err(|_| io::Error::other("active subscription mutex was poisoned"))?
+                .clone();
+            if let Some(sender) = sender {
+                let frames = config.generations.get(index).cloned().unwrap_or_default();
+                let (acknowledgement, response) = oneshot::channel();
+                if sender
+                    .send(SubscriptionCommand::Push(frames, acknowledgement))
+                    .is_ok()
+                {
+                    let _ = response.await;
+                }
+            }
+            if !config.snapshot_delay.is_zero() {
+                tokio::time::sleep(config.snapshot_delay).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
+            let snapshot = config
+                .snapshots
+                .get(index)
+                .or_else(|| config.snapshots.last())
+                .ok_or_else(|| io::Error::other("scripted mock has no snapshot"))?;
+            write_frame(
+                reader.get_mut(),
+                &json!({"id": id, "result": {"type": "session_snapshot", "snapshot": snapshot}}),
+            )
+            .await?;
+            if config.close_after_snapshots.contains(&index) {
+                let sender = active_subscription
+                    .lock()
+                    .map_err(|_| io::Error::other("active subscription mutex was poisoned"))?
+                    .clone();
+                if let Some(sender) = sender {
+                    let _ = sender.send(SubscriptionCommand::Close);
+                }
+            }
+            return Ok(());
+        }
+
+        write_frame(
+            reader.get_mut(),
+            &json!({"id": id, "error": {"code": "METHOD_NOT_FOUND", "message": "no scripted response"}}),
+        )
+        .await
+    }
+
+    async fn write_frame(stream: &mut UnixStream, frame: &Value) -> io::Result<()> {
+        let mut bytes = serde_json::to_vec(frame).map_err(invalid_data)?;
+        bytes.push(b'\n');
+        stream.write_all(&bytes).await?;
+        stream.flush().await
+    }
+
+    fn required_string<'a>(value: &'a Value, key: &str) -> io::Result<&'a str> {
+        value.get(key).and_then(Value::as_str).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("request is missing string field {key}"),
+            )
+        })
+    }
+
+    fn invalid_data(error: impl std::fmt::Display) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+    }
+}

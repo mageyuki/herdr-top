@@ -18,6 +18,7 @@ pub mod schema;
 pub mod writer;
 
 pub use schema::{SchemaVerdict, database_path, preflight_schema};
+pub use writer::{WriterClient, WriterError, WriterLifecycle, spawn_writer};
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const EVENT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
