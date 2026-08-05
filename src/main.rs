@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use herdr_top::herdr::collector::{self, CollectorError};
+use herdr_top::herdr::controller::{self, ControllerEnvelope, EmitOutcome};
 use herdr_top::herdr::wire;
 use herdr_top::lockfile::{self, LockError, OwnerRecord, StateRoot};
 use herdr_top::rendezvous::{self, RvError};
@@ -35,11 +36,44 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Emit {
-        #[arg(long)]
-        strict: bool,
-    },
+    Emit(Box<EmitArgs>),
     Doctor,
+}
+
+#[derive(Debug, Args)]
+struct EmitArgs {
+    /// Return failure unless the event is accepted or already present.
+    #[arg(long)]
+    strict: bool,
+    /// Controller wire schema version.
+    #[arg(long, default_value_t = 1)]
+    schema_version: u64,
+    #[arg(long)]
+    event_id: String,
+    #[arg(long)]
+    emitted_at_ms: i64,
+    #[arg(long)]
+    source: String,
+    #[arg(long)]
+    event_type: String,
+    #[arg(long)]
+    task_run_id: String,
+    #[arg(long)]
+    parent_task_run_id: Option<String>,
+    #[arg(long)]
+    depends_on_id: Option<String>,
+    #[arg(long)]
+    label: Option<String>,
+    #[arg(long)]
+    reason: Option<String>,
+    #[arg(long)]
+    progress: Option<f64>,
+    #[arg(long)]
+    provider: Option<String>,
+    #[arg(long)]
+    native_session_id: Option<String>,
+    #[arg(long)]
+    terminal_id: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -67,6 +101,8 @@ enum MainError {
         startup: Box<CollectorError>,
         shutdown: Box<WriterError>,
     },
+    #[error("failed to clone the bound Controller listener: {0}")]
+    ControllerListener(#[source] io::Error),
 }
 
 #[tokio::main]
@@ -74,13 +110,7 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match &cli.command {
         None => run_monitor(&cli).await,
-        Some(Command::Emit { strict }) => {
-            println!("NotImplementedInVerticalSlice: Controller event input");
-            if *strict {
-                return ExitCode::FAILURE;
-            }
-            Ok(())
-        }
+        Some(Command::Emit(args)) => return run_emit(&cli, args).await,
         Some(Command::Doctor) => run_doctor(&cli),
     };
 
@@ -90,6 +120,62 @@ async fn main() -> ExitCode {
             eprintln!("herdr-top: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+async fn run_emit(cli: &Cli, args: &EmitArgs) -> ExitCode {
+    let resolved = match resolve_session(cli) {
+        Ok(resolved) => resolved,
+        Err(error) => return emit_unavailable(args.strict, error.to_string()),
+    };
+    let runtime = match rendezvous::open_runtime_dir_for_client() {
+        Ok(runtime) => runtime,
+        Err(error) => return emit_unavailable(args.strict, error.to_string()),
+    };
+    let endpoint = match rendezvous::resolve_controller_socket(&runtime, resolved.session_key()) {
+        Ok(rendezvous::ControllerEndpointStatus::Available(endpoint)) => endpoint,
+        Ok(rendezvous::ControllerEndpointStatus::Unavailable(reason)) => {
+            return emit_unavailable(args.strict, format!("{reason:?}"));
+        }
+        Err(error) => return emit_unavailable(args.strict, error.to_string()),
+    };
+    let envelope = ControllerEnvelope {
+        schema_version: args.schema_version,
+        event_id: args.event_id.clone(),
+        emitted_at_ms: args.emitted_at_ms,
+        source: args.source.clone(),
+        event_type: args.event_type.clone(),
+        task_run_id: args.task_run_id.clone(),
+        parent_task_run_id: args.parent_task_run_id.clone(),
+        depends_on_id: args.depends_on_id.clone(),
+        label: args.label.clone(),
+        reason: args.reason.clone(),
+        progress: args.progress,
+        provider: args.provider.clone(),
+        native_session_id: args.native_session_id.clone(),
+        terminal_id: args.terminal_id.clone(),
+    };
+    let outcome = controller::emit_to_endpoint(&endpoint, &envelope).await;
+    match &outcome {
+        EmitOutcome::Response(response) => match serde_json::to_string(response) {
+            Ok(response) => println!("{response}"),
+            Err(error) => eprintln!("herdr-top emit: unresolved: {error}"),
+        },
+        EmitOutcome::Unresolved(reason) => eprintln!("herdr-top emit: unresolved: {reason}"),
+    }
+    if args.strict && !outcome.is_success() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn emit_unavailable(strict: bool, reason: String) -> ExitCode {
+    eprintln!("herdr-top emit: unavailable: {reason}");
+    if strict {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
@@ -107,13 +193,24 @@ async fn run_monitor(cli: &Cli) -> Result<(), MainError> {
     let controller_status =
         rendezvous::prepare_controller_socket(&runtime, resolved.session_key(), &owner_lock)?;
     eprintln!("controller_socket: {controller_status:?}");
+    let controller_listener = controller_status
+        .try_clone_listener()
+        .map_err(MainError::ControllerListener)?;
 
     let _schema = store::preflight_schema(&root)?;
     let store = store::open_writer(&root)?;
     let restored = store.load_restored_state()?;
     let (lifecycle, writer) = store::spawn_writer(store)?;
     let session_name = resolved.session_key().name().to_owned();
-    let collector = match collector::spawn(socket, session_name.clone(), restored, writer).await {
+    let collector = match collector::spawn_with_controller(
+        socket,
+        session_name.clone(),
+        restored,
+        writer,
+        controller_listener,
+    )
+    .await
+    {
         Ok(collector) => collector,
         Err(startup) => {
             return match lifecycle.shutdown().await {
@@ -142,7 +239,7 @@ async fn run_monitor(cli: &Cli) -> Result<(), MainError> {
         .and_then(|result| result.map_err(MainError::Tui));
     let collector_result = collector.stop().await;
     let writer_result = lifecycle.shutdown().await;
-    rendezvous::shutdown_controller_socket(&runtime, resolved.session_key(), &owner_lock);
+    rendezvous::shutdown_controller_socket(controller_status, &owner_lock)?;
 
     tui_result?;
     collector_result?;
@@ -255,6 +352,6 @@ fn run_doctor(cli: &Cli) -> Result<(), MainError> {
     let root = lockfile::state_root(resolved.session_key())?;
     println!("resolver_source: {}", resolved.source());
     println!("state_root: {}", root.0.display());
-    println!("controller_socket: NotImplementedInVerticalSlice");
+    println!("controller_socket: implemented");
     Ok(())
 }

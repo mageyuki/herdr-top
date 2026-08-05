@@ -2,6 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::future::pending;
+use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +25,9 @@ use crate::reducer::{ApplyOutcome, Reducer, ReducerError};
 use crate::store::writer::{WriterClient, WriterError};
 use crate::store::{CollectorGap, PersistBatch, PersistOp, RestoredState};
 
+use super::controller::{
+    self, ControllerRequest, ControllerRequestReceiver, ControllerServerError,
+};
 use super::types::{AgentSessionKind, PaneInfo, Snapshot, Subscription, TabInfo, WorkspaceInfo};
 use super::wire::{self, EventStream, WireError};
 
@@ -67,6 +72,12 @@ pub enum CollectorError {
     /// The collector ignored cancellation until it had to be aborted and joined.
     #[error("collector did not stop within {seconds} seconds and was aborted")]
     StopTimeout { seconds: u64 },
+    /// The Controller socket acceptor could not be started or stopped cleanly.
+    #[error(transparent)]
+    Controller(#[from] ControllerServerError),
+    /// The Controller acceptor task panicked or was cancelled externally.
+    #[error("Controller acceptor task failed: {0}")]
+    ControllerTask(String),
 }
 
 /// Handle to the collector's coherent model and observation-quality streams.
@@ -77,6 +88,7 @@ pub struct CollectorHandle {
     pub model: SharedModel,
     cancellation: CancellationToken,
     task: JoinHandle<Result<(), CollectorError>>,
+    controller_acceptor: Option<JoinHandle<Result<(), ControllerServerError>>>,
 }
 
 impl CollectorHandle {
@@ -84,16 +96,31 @@ impl CollectorHandle {
     pub async fn stop(self) -> Result<(), CollectorError> {
         self.cancellation.cancel();
         let mut task = self.task;
-        match tokio::time::timeout(STOP_TIMEOUT, &mut task).await {
+        let collector_result = match tokio::time::timeout(STOP_TIMEOUT, &mut task).await {
             Ok(result) => result.map_err(|error| CollectorError::Task(error.to_string()))?,
             Err(_) => {
                 task.abort();
                 let _ = task.await;
-                Err(CollectorError::StopTimeout {
+                return Err(CollectorError::StopTimeout {
                     seconds: STOP_TIMEOUT.as_secs(),
-                })
+                });
+            }
+        };
+        if let Some(mut acceptor) = self.controller_acceptor {
+            match tokio::time::timeout(STOP_TIMEOUT, &mut acceptor).await {
+                Ok(result) => {
+                    result.map_err(|error| CollectorError::ControllerTask(error.to_string()))??
+                }
+                Err(_) => {
+                    acceptor.abort();
+                    let _ = acceptor.await;
+                    return Err(CollectorError::StopTimeout {
+                        seconds: STOP_TIMEOUT.as_secs(),
+                    });
+                }
             }
         }
+        collector_result
     }
 }
 
@@ -104,12 +131,39 @@ pub async fn spawn(
     restored: RestoredState,
     writer: WriterClient,
 ) -> Result<CollectorHandle, CollectorError> {
+    spawn_with_controller(sock, session, restored, writer, None).await
+}
+
+/// Commits the owner record and launches convergence plus an optional Controller acceptor.
+pub async fn spawn_with_controller(
+    sock: PathBuf,
+    session: String,
+    restored: RestoredState,
+    writer: WriterClient,
+    controller_listener: Option<StdUnixListener>,
+) -> Result<CollectorHandle, CollectorError> {
     let owner = OwnerTracker::from_environment();
     writer.replace_owner(owner.record()).await?;
 
     let (reducer, model) = Reducer::new(restored);
     let (quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
     let cancellation = CancellationToken::new();
+    let (controller_sender, controller_requests) =
+        controller_listener.as_ref().map_or((None, None), |_| {
+            let (sender, receiver) = controller::request_channel(
+                controller::CONTROLLER_REQUEST_QUEUE_CAPACITY,
+                reducer.controller_diagnostics_handle(),
+            );
+            (Some(sender), Some(receiver))
+        });
+    let controller_acceptor = match (controller_listener, controller_sender) {
+        (Some(listener), Some(sender)) => Some(controller::spawn_acceptor(
+            listener,
+            sender,
+            cancellation.clone(),
+        )?),
+        _ => None,
+    };
     let task_cancellation = cancellation.clone();
     let task_model = model.clone();
     let task = tokio::spawn(async move {
@@ -122,6 +176,7 @@ pub async fn spawn(
             quality_sender,
             task_cancellation,
             owner,
+            controller_requests,
         )
         .await
     });
@@ -131,6 +186,7 @@ pub async fn spawn(
         model,
         cancellation,
         task,
+        controller_acceptor,
     })
 }
 
@@ -144,6 +200,7 @@ async fn run_collector(
     quality: watch::Sender<ObservationQuality>,
     cancellation: CancellationToken,
     mut owner: OwnerTracker,
+    mut controller_requests: Option<ControllerRequestReceiver>,
 ) -> Result<(), CollectorError> {
     let mut first_subscription = true;
     let mut previous_socket = None;
@@ -164,12 +221,25 @@ async fn run_collector(
                 let _ = writer.cleanup(unix_now_ms()).await?;
                 continue;
             }
+            request = receive_controller(&mut controller_requests) => {
+                service_controller(request, &mut controller_requests, &session, &mut reducer, &writer).await;
+                continue;
+            }
             result = wire::subscribe(&sock, &subscriptions) => result,
         } {
             Ok(stream) => stream,
             Err(_) => {
                 quality.send_replace(ObservationQuality::Disconnected);
-                if wait_or_cancel(&cancellation, RECONNECT_DELAY).await {
+                if wait_or_service_controller(
+                    &cancellation,
+                    RECONNECT_DELAY,
+                    &mut controller_requests,
+                    &session,
+                    &mut reducer,
+                    &writer,
+                )
+                .await
+                {
                     return Ok(());
                 }
                 continue;
@@ -198,6 +268,7 @@ async fn run_collector(
             gap_kind,
             events,
             Arc::clone(&overflowed),
+            &mut controller_requests,
         )
         .await;
 
@@ -239,6 +310,7 @@ async fn converge(
     gap_kind: GapKind,
     mut events: mpsc::Receiver<ReceivedEvent>,
     overflowed: Arc<AtomicBool>,
+    controller_requests: &mut Option<ControllerRequestReceiver>,
 ) -> Result<ConvergeOutcome, CollectorError> {
     let mut first_generation = true;
     let mut resnapshot_attempts = 0;
@@ -248,6 +320,10 @@ async fn converge(
         overflowed.store(false, Ordering::Release);
         let snapshot = tokio::select! {
             () = cancellation.cancelled() => return Ok(ConvergeOutcome::new(SubscriptionOutcome::Cancelled, !first_generation)),
+            request = receive_controller(controller_requests) => {
+                service_controller(request, controller_requests, session, reducer, writer).await;
+                continue;
+            }
             result = wire::request(sock, "session.snapshot", json!({})) => {
                 match result.and_then(|value| value.into_snapshot()) {
                     Ok(snapshot) => snapshot,
@@ -284,6 +360,7 @@ async fn converge(
             &overflowed,
             cancellation,
             &mut pending_closures,
+            controller_requests,
         )
         .await?;
         match replay {
@@ -311,6 +388,7 @@ async fn converge(
                     &overflowed,
                     cancellation,
                     &mut pending_closures,
+                    controller_requests,
                 )
                 .await?
                 {
@@ -345,6 +423,7 @@ async fn converge(
                         events,
                         cancellation,
                         &mut pending_closures,
+                        controller_requests,
                     )
                     .await?;
                     return Ok(ConvergeOutcome::new(outcome, !first_generation));
@@ -367,6 +446,7 @@ async fn replay_generation(
     overflowed: &AtomicBool,
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
+    controller_requests: &mut Option<ControllerRequestReceiver>,
 ) -> Result<ReplayOutcome, CollectorError> {
     let snapshot_entities = snapshot_entity_keys(snapshot);
     let mut buffered = Vec::new();
@@ -406,6 +486,10 @@ async fn replay_generation(
 
         let next_received = tokio::select! {
             () = cancellation.cancelled() => return Ok(ReplayOutcome::Cancelled),
+            request = receive_controller(controller_requests) => {
+                service_controller(request, controller_requests, session, reducer, writer).await;
+                continue;
+            }
             result = tokio::time::timeout(DRAIN_QUIET_PERIOD, events.recv()) => result,
         };
         match next_received {
@@ -442,6 +526,7 @@ async fn monitor_live(
     overflowed: &AtomicBool,
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
+    controller_requests: &mut Option<ControllerRequestReceiver>,
 ) -> Result<ReplayOutcome, CollectorError> {
     let mut stale_sweep = tokio::time::interval(STALE_SWEEP_INTERVAL);
     stale_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -449,6 +534,10 @@ async fn monitor_live(
     loop {
         let received = tokio::select! {
             () = cancellation.cancelled() => return Ok(ReplayOutcome::Cancelled),
+            request = receive_controller(controller_requests) => {
+                service_controller(request, controller_requests, session, reducer, writer).await;
+                continue;
+            }
             received = events.recv() => match received {
                 Some(received) => Some(received),
                 None => return Ok(ReplayOutcome::Ended),
@@ -497,6 +586,7 @@ async fn monitor_reconciling(
     mut events: mpsc::Receiver<ReceivedEvent>,
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
+    controller_requests: &mut Option<ControllerRequestReceiver>,
 ) -> Result<SubscriptionOutcome, CollectorError> {
     let mut stale_sweep = tokio::time::interval(STALE_SWEEP_INTERVAL);
     stale_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -504,6 +594,10 @@ async fn monitor_reconciling(
     loop {
         let received = tokio::select! {
             () = cancellation.cancelled() => return Ok(SubscriptionOutcome::Cancelled),
+            request = receive_controller(controller_requests) => {
+                service_controller(request, controller_requests, session, reducer, writer).await;
+                continue;
+            }
             received = events.recv() => match received {
                 Some(received) => Some(received),
                 None => return Ok(SubscriptionOutcome::Ended),
@@ -1824,10 +1918,46 @@ fn socket_identity(_path: &Path) -> Option<(u64, u64)> {
     None
 }
 
-async fn wait_or_cancel(cancellation: &CancellationToken, duration: Duration) -> bool {
-    tokio::select! {
-        () = cancellation.cancelled() => true,
-        () = tokio::time::sleep(duration) => false,
+async fn receive_controller(
+    receiver: &mut Option<ControllerRequestReceiver>,
+) -> Option<ControllerRequest> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => pending().await,
+    }
+}
+
+async fn service_controller(
+    request: Option<ControllerRequest>,
+    receiver: &mut Option<ControllerRequestReceiver>,
+    session: &str,
+    reducer: &mut Reducer,
+    writer: &WriterClient,
+) {
+    match request {
+        Some(request) => controller::service_request(request, session, reducer, writer).await,
+        None => *receiver = None,
+    }
+}
+
+async fn wait_or_service_controller(
+    cancellation: &CancellationToken,
+    duration: Duration,
+    receiver: &mut Option<ControllerRequestReceiver>,
+    session: &str,
+    reducer: &mut Reducer,
+    writer: &WriterClient,
+) -> bool {
+    let delay = tokio::time::sleep(duration);
+    tokio::pin!(delay);
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => return true,
+            () = &mut delay => return false,
+            request = receive_controller(receiver) => {
+                service_controller(request, receiver, session, reducer, writer).await;
+            }
+        }
     }
 }
 

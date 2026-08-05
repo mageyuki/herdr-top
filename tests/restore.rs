@@ -188,11 +188,11 @@ async fn restore_across_cold_restart() {
         .expect("first launch should own the session");
     let runtime =
         open_runtime_dir_at(runtime_directory.path()).expect("runtime directory should validate");
-    assert_eq!(
+    assert!(matches!(
         prepare_controller_socket(&runtime, &key, &first_lock)
             .expect("controller pre-bind should succeed"),
-        ControllerSocketStatus::NotImplementedInVerticalSlice
-    );
+        ControllerSocketStatus::Bound(_)
+    ));
     assert_eq!(
         preflight_schema(&root).expect("first schema preflight should work"),
         SchemaVerdict::Absent
@@ -266,11 +266,11 @@ async fn restore_across_cold_restart() {
     let second_lock = try_acquire(&root)
         .expect("second lock attempt should work")
         .expect("cold restart should reacquire the session");
-    assert_eq!(
+    assert!(matches!(
         prepare_controller_socket(&runtime, &key, &second_lock)
             .expect("second controller pre-bind should succeed"),
-        ControllerSocketStatus::NotImplementedInVerticalSlice
-    );
+        ControllerSocketStatus::Bound(_)
+    ));
     assert_eq!(
         preflight_schema(&root).expect("second schema preflight should work"),
         SchemaVerdict::Current
