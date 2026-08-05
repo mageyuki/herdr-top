@@ -20,17 +20,6 @@ pub enum BindingEvidence {
         /// The provider-native session ID.
         sid: String,
     },
-    /// A previously opaque provider session path resolved to a native ID.
-    NativePathResolved {
-        /// The path-keyed run whose reference resolved.
-        run: RunId,
-        /// The provider that owns the path and session namespaces.
-        provider: Provider,
-        /// The exact opaque path that was resolved.
-        path: String,
-        /// The resolved provider-native session ID.
-        sid: String,
-    },
     /// A Controller event explicitly tied its run to a native session.
     ControllerNativeSession {
         /// The Controller-keyed run being bound.
@@ -191,12 +180,6 @@ pub fn plan_binding(model: &DomainModel, ev: &BindingEvidence) -> BindingPlan {
         BindingEvidence::NativeSession { run, provider, sid } => {
             plan_native_session(model, *run, *provider, sid)
         }
-        BindingEvidence::NativePathResolved {
-            run,
-            provider,
-            path,
-            sid,
-        } => plan_path_resolution(model, *run, *provider, path, sid),
         BindingEvidence::ControllerNativeSession {
             controller_run,
             provider,
@@ -273,49 +256,6 @@ fn plan_native_session(
             })
         }
         None => BindingPlan::Conflict(MergeConflict::EvidenceMismatch { run }),
-    }
-}
-
-fn plan_path_resolution(
-    model: &DomainModel,
-    run: RunId,
-    provider: Provider,
-    path: &str,
-    sid: &str,
-) -> BindingPlan {
-    let Some(observed) = model.task_run(&run) else {
-        return BindingPlan::Conflict(MergeConflict::MissingRun { run });
-    };
-    let path_key = RunKey::NativePath {
-        provider,
-        path: path.to_owned(),
-    };
-    if model.task_run_by_key(&path_key).map(|owner| owner.run_id) != Some(run) {
-        return BindingPlan::Conflict(MergeConflict::EvidenceMismatch { run });
-    }
-    let native_key = RunKey::Native {
-        provider,
-        sid: sid.to_owned(),
-    };
-    match model.task_run_by_key(&native_key) {
-        Some(owner) if owner.run_id == run => BindingPlan::NoChange,
-        Some(owner) if matches!(owner.key, RunKey::Controller(_)) => {
-            BindingPlan::Conflict(MergeConflict::ExplicitControllerEvidenceRequired {
-                controller: owner.run_id,
-                observed: run,
-            })
-        }
-        Some(owner) => planned_merge(model, owner.run_id, run),
-        None if matches!(observed.key, RunKey::Controller(_)) => {
-            BindingPlan::Conflict(MergeConflict::ExplicitControllerEvidenceRequired {
-                controller: run,
-                observed: run,
-            })
-        }
-        None => BindingPlan::Bind {
-            run,
-            key: native_key,
-        },
     }
 }
 
@@ -753,13 +693,6 @@ mod tests {
         }
     }
 
-    fn path(provider: Provider, value: &str) -> RunKey {
-        RunKey::NativePath {
-            provider,
-            path: value.to_owned(),
-        }
-    }
-
     fn insert_run(model: &mut DomainModel, key: RunKey, ordinal: i64) -> RunId {
         let run_id = RunId::new();
         model.insert_task_run(TaskRun {
@@ -778,6 +711,30 @@ mod tests {
             provider: Provider::Codex,
             sid: sid.to_owned(),
         }
+    }
+
+    #[test]
+    fn native_path_resolved_removed_compiles() {
+        fn assert_exhaustive(evidence: BindingEvidence) {
+            match evidence {
+                BindingEvidence::NativeSession { .. }
+                | BindingEvidence::ControllerNativeSession { .. }
+                | BindingEvidence::ControllerTerminal { .. } => {}
+            }
+        }
+
+        assert_exhaustive(BindingEvidence::NativeSession {
+            run: RunId::new(),
+            provider: Provider::Codex,
+            sid: "native-sid".to_owned(),
+        });
+        assert!(matches!(
+            RunKey::NativePath {
+                provider: Provider::Claude,
+                path: "/sessions/pending.jsonl".to_owned(),
+            },
+            RunKey::NativePath { .. }
+        ));
     }
 
     fn merge_fixture() -> (DomainModel, RunId, RunId) {
@@ -933,66 +890,6 @@ mod tests {
         );
         apply_binding_plan(&mut model, second_plan).unwrap();
         assert_eq!(model.task_runs().count(), 1);
-    }
-
-    #[test]
-    fn path_promotion_rekeys_unowned() {
-        let mut model = DomainModel::default();
-        let old_key = path(Provider::Claude, "/sessions/pending.jsonl");
-        let run = insert_run(&mut model, old_key.clone(), 1);
-        let promoted = native(Provider::Claude, "resolved-sid");
-        let evidence = BindingEvidence::NativePathResolved {
-            run,
-            provider: Provider::Claude,
-            path: "/sessions/pending.jsonl".to_owned(),
-            sid: "resolved-sid".to_owned(),
-        };
-
-        let plan = plan_binding(&model, &evidence);
-        assert_eq!(
-            plan,
-            BindingPlan::Bind {
-                run,
-                key: promoted.clone(),
-            }
-        );
-        let batch = apply_binding_plan(&mut model, plan).unwrap();
-
-        assert!(matches!(
-            batch.as_slice(),
-            [PersistOp::PromoteTaskRunKey { .. }]
-        ));
-        assert_eq!(model.task_run(&run).unwrap().key, promoted);
-        assert_eq!(model.task_run_by_key(&old_key).unwrap().run_id, run);
-    }
-
-    #[test]
-    fn path_promotion_merges_into_owner() {
-        let mut model = DomainModel::default();
-        let owner = insert_run(&mut model, native(Provider::Claude, "resolved-sid"), 1);
-        let path_run = insert_run(
-            &mut model,
-            path(Provider::Claude, "/sessions/pending.jsonl"),
-            2,
-        );
-
-        let plan = plan_binding(
-            &model,
-            &BindingEvidence::NativePathResolved {
-                run: path_run,
-                provider: Provider::Claude,
-                path: "/sessions/pending.jsonl".to_owned(),
-                sid: "resolved-sid".to_owned(),
-            },
-        );
-
-        assert_eq!(
-            plan,
-            BindingPlan::Merge {
-                survivor: owner,
-                absorbed: path_run,
-            }
-        );
     }
 
     #[test]
@@ -1294,46 +1191,6 @@ mod tests {
                 },
             ),
             BindingPlan::NoChange
-        );
-    }
-
-    #[test]
-    fn native_path_promotion_alias_round_trips_restore() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = StateRoot(directory.path().to_path_buf());
-        let mut store = open_writer(&root).unwrap();
-        let old_key = path(Provider::Claude, "/sessions/round-trip.jsonl");
-        let mut model = DomainModel::default();
-        let run_id = insert_run(&mut model, old_key.clone(), 1);
-        store
-            .apply_batch(vec![PersistOp::UpsertTaskRun(PersistTaskRun {
-                task_run: model.task_run(&run_id).unwrap().clone(),
-                native_session: None,
-                created_at_ms: 1_000,
-                updated_at_ms: 1_000,
-                finished_at_ms: None,
-            })])
-            .unwrap();
-        let evidence = BindingEvidence::NativePathResolved {
-            run: run_id,
-            provider: Provider::Claude,
-            path: "/sessions/round-trip.jsonl".to_owned(),
-            sid: "resolved-round-trip".to_owned(),
-        };
-        let plan = plan_binding(&model, &evidence);
-        let operations = apply_binding_plan(&mut model, plan).unwrap();
-        store.apply_batch(operations).unwrap();
-
-        let restored = store.load_restored_state().unwrap();
-        let native_key = native(Provider::Claude, "resolved-round-trip");
-        assert_eq!(restored.model.task_run(&run_id).unwrap().key, native_key);
-        assert_eq!(
-            restored.model.task_run_by_key(&old_key).unwrap().run_id,
-            run_id
-        );
-        assert_eq!(
-            restored.model.task_run_by_key(&native_key).unwrap().run_id,
-            run_id
         );
     }
 }

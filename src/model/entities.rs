@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,60 @@ pub struct DependencyEdge {
     pub dependent_run_id: RunId,
 }
 
+/// Counters maintained by the serialized reducer for Controller-input diagnostics.
+#[derive(Clone, Debug, Default)]
+pub struct ControllerDiagnostics {
+    binding_conflicts: u64,
+    acceptor: ControllerDiagnosticsHandle,
+}
+
+impl ControllerDiagnostics {
+    /// Identity-binding observations dropped after transactional preflight.
+    #[must_use]
+    pub const fn binding_conflicts(&self) -> u64 {
+        self.binding_conflicts
+    }
+
+    /// Controller socket admissions rejected because the acceptor was saturated.
+    #[must_use]
+    pub fn socket_saturations(&self) -> u64 {
+        self.acceptor.socket_saturations()
+    }
+
+    /// Returns the atomic counter handle shared with the socket acceptor.
+    #[must_use]
+    pub fn acceptor_handle(&self) -> ControllerDiagnosticsHandle {
+        self.acceptor.clone()
+    }
+
+    pub(crate) fn record_binding_conflict(&mut self) {
+        self.binding_conflicts = self.binding_conflicts.saturating_add(1);
+    }
+}
+
+/// Acceptor-shareable atomic portion of the Controller diagnostic counters.
+#[derive(Clone, Debug, Default)]
+pub struct ControllerDiagnosticsHandle {
+    socket_saturations: Arc<AtomicU64>,
+}
+
+impl ControllerDiagnosticsHandle {
+    /// Records one admission rejected because the Controller socket was saturated.
+    pub fn record_socket_saturation(&self) {
+        let _ =
+            self.socket_saturations
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    Some(value.saturating_add(1))
+                });
+    }
+
+    /// Returns the current saturation count.
+    #[must_use]
+    pub fn socket_saturations(&self) -> u64 {
+        self.socket_saturations.load(Ordering::Relaxed)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DomainModel {
     workspaces: HashMap<String, Workspace>,
@@ -77,9 +132,20 @@ pub struct DomainModel {
     agent_nodes: HashMap<String, AgentNode>,
     execution_edges: HashSet<ExecutionEdge>,
     dependency_edges: HashSet<DependencyEdge>,
+    controller_diagnostics: ControllerDiagnostics,
 }
 
 impl DomainModel {
+    /// Returns the reducer-owned Controller diagnostic counters.
+    #[must_use]
+    pub const fn controller_diagnostics(&self) -> &ControllerDiagnostics {
+        &self.controller_diagnostics
+    }
+
+    pub(crate) const fn controller_diagnostics_mut(&mut self) -> &mut ControllerDiagnostics {
+        &mut self.controller_diagnostics
+    }
+
     pub fn insert_workspace(&mut self, workspace: Workspace) -> Option<Workspace> {
         self.workspaces
             .insert(workspace.workspace_id.clone(), workspace)
@@ -464,6 +530,18 @@ mod tests {
         assert_eq!(model.task_runs().count(), 2);
         assert_eq!(model.executions().count(), 1);
         assert_eq!(model.agent_nodes().count(), 1);
+    }
+
+    #[test]
+    fn controller_diagnostics_saturation_handle_is_shared() {
+        let model = DomainModel::default();
+        let cloned = model.clone();
+        let acceptor = model.controller_diagnostics().acceptor_handle();
+
+        acceptor.record_socket_saturation();
+
+        assert_eq!(model.controller_diagnostics().socket_saturations(), 1);
+        assert_eq!(cloned.controller_diagnostics().socket_saturations(), 1);
     }
 
     #[test]

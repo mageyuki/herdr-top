@@ -8,13 +8,14 @@ use common::live_mock::{LiveConfig, LiveHerdr};
 use common::mock::{MockConfig, MockHerdr, fixture_payloads};
 use common::scripted_mock::{ScriptedConfig, ScriptedHerdr};
 use herdr_top::herdr::collector::{self, CollectorHandle, ObservationQuality};
+use herdr_top::identity::MergeConflict;
 use herdr_top::lockfile::{StateRoot, state_root_in};
 use herdr_top::model::{
     AgentSessionReference, AgentSessionReferenceKind, DisplayOrdinal, DomainModel, EventMetadata,
     ExecState, Execution, GapKind, NormalizedEvent, Pane, PaneSnapshot, Provider, ReconcileBatch,
     RunId, RunKey, SnapshotAgent, Tab, TaskRun, TaskState, TopologySnapshot, Workspace,
 };
-use herdr_top::reducer::Reducer;
+use herdr_top::reducer::{ApplyOutcome, Reducer};
 use herdr_top::session_key;
 use herdr_top::store::writer::{WriterClient, WriterLifecycle, spawn_writer};
 use herdr_top::store::{
@@ -852,59 +853,150 @@ async fn provider_transition_starts_new_run() {
 }
 
 #[test]
-fn binding_conflict_surfaces_diagnostic() {
-    let run_id = RunId::new();
-    let execution_id = "binding-conflict-execution".to_owned();
+fn binding_conflict_returns_typed_dropped_result() {
+    let owner_run_id = RunId::new();
+    let claimant_run_id = RunId::new();
     let mut model = DomainModel::default();
     model.insert_task_run(TaskRun {
-        run_id,
-        key: RunKey::Native {
+        run_id: owner_run_id,
+        key: RunKey::Controller("owner-controller-run".to_owned()),
+        display_ordinal: DisplayOrdinal::new(1),
+        state: TaskState::Running,
+        has_controller_task_state_event: true,
+    });
+    model.insert_task_run_alias(
+        RunKey::Native {
             provider: Provider::Codex,
             sid: "bound-codex-sid".to_owned(),
         },
-        display_ordinal: DisplayOrdinal::new(1),
-        state: TaskState::Running,
-        has_controller_task_state_event: false,
-    });
-    model.insert_execution(Execution {
-        execution_id: execution_id.clone(),
-        pane_id: "w1:p1".to_owned(),
-        terminal_id: "terminal-1".to_owned(),
-        task_run_id: run_id,
-        state: ExecState::Working,
-    });
+        owner_run_id,
+    );
     let (mut reducer, mut shared) = Reducer::new(RestoredState {
         model,
         next_ordinal: 2,
     });
     let _ = shared.borrow_and_update();
-    let mut event_metadata = identity_metadata("binding-conflict", "pane_updated");
-    event_metadata.provider = Some(Provider::Claude);
-    event_metadata.native_session_id = Some("different-claude-sid".to_owned());
+    let mut event_metadata = identity_metadata("binding-conflict", "task_started");
+    event_metadata.source = "controller".to_owned();
+    event_metadata.task_run_id = Some(claimant_run_id);
+    event_metadata.task_state = Some(TaskState::Running);
+    event_metadata.provider = Some(Provider::Codex);
+    event_metadata.native_session_id = Some("bound-codex-sid".to_owned());
 
-    let diagnostic = reducer
-        .apply(NormalizedEvent::ExecutionBegin {
+    let outcome = reducer
+        .apply(NormalizedEvent::TopologyUpsert {
             metadata: event_metadata,
-            execution: Execution {
-                execution_id: execution_id.clone(),
-                pane_id: "w1:p1".to_owned(),
-                terminal_id: "terminal-1".to_owned(),
-                task_run_id: run_id,
-                state: ExecState::Blocked,
-            },
+            entity: herdr_top::model::TopologyEntity::Workspace(Workspace {
+                workspace_id: "must-roll-back".to_owned(),
+            }),
         })
-        .expect_err("conflicting native identity must surface from the reducer");
+        .expect("binding conflicts should be typed non-fatal outcomes");
 
-    assert!(diagnostic.to_string().contains("binding evidence"));
+    assert!(matches!(
+        outcome,
+        ApplyOutcome::DroppedBindingConflict(MergeConflict::NativeSessionAlreadyBound {
+            owner,
+            claimant,
+            ..
+        }) if owner == owner_run_id && claimant == claimant_run_id
+    ));
+    assert!(shared.borrow().task_run(&claimant_run_id).is_none());
+    assert!(shared.borrow().workspace("must-roll-back").is_none());
+    assert!(!shared.has_changed().unwrap());
+
+    let next_run_id = RunId::new();
+    let mut next_metadata = identity_metadata("after-binding-conflict", "task_started");
+    next_metadata.source = "controller".to_owned();
+    next_metadata.task_run_id = Some(next_run_id);
+    next_metadata.task_state = Some(TaskState::Running);
+    reducer
+        .apply(NormalizedEvent::TopologyUpsert {
+            metadata: next_metadata,
+            entity: herdr_top::model::TopologyEntity::Workspace(Workspace {
+                workspace_id: "after-rollback".to_owned(),
+            }),
+        })
+        .expect("a non-conflicting event should apply after the dropped conflict");
+
     assert_eq!(
         shared
             .borrow()
-            .execution(&execution_id)
-            .expect("the original execution should remain")
-            .state,
-        ExecState::Working
+            .task_run(&next_run_id)
+            .expect("the next run should be created")
+            .display_ordinal,
+        DisplayOrdinal::new(2)
     );
-    assert!(!shared.has_changed().unwrap());
+}
+
+#[tokio::test]
+async fn binding_conflict_is_non_fatal_diagnostic() {
+    let initial = agent_snapshot("bound-codex-sid", AgentSessionReferenceKind::Id, "working");
+    let mock = LiveHerdr::start(LiveConfig::default().snapshots(vec![initial]))
+        .await
+        .expect("live mock should bind");
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+
+    let (execution_id, run_id) = {
+        let model = handle.model.borrow();
+        let execution = model
+            .executions()
+            .next()
+            .expect("snapshot should create one execution");
+        (execution.execution_id.clone(), execution.task_run_id)
+    };
+    let mut moved = agent_pane_value(
+        "w1:p2",
+        "term_6583d08d791e41",
+        "w1",
+        "w1:t1",
+        "different-claude-sid",
+    );
+    moved["agent"] = json!("claude");
+    moved["agent_session"]["source"] = json!("herdr:claude");
+    moved["agent_session"]["agent"] = json!("claude");
+    mock.push(push(
+        "pane_moved",
+        json!({
+            "type": "pane_moved",
+            "previous_pane_id": "w1:p1",
+            "pane": moved,
+        }),
+    ))
+    .await
+    .expect("conflicting pane move should be delivered");
+
+    wait_until(|| {
+        handle
+            .model
+            .borrow()
+            .controller_diagnostics()
+            .binding_conflicts()
+            == 1
+    })
+    .await;
+    assert_eq!(*handle.quality.borrow(), ObservationQuality::Live);
+    let model = handle.model.borrow();
+    let execution = model
+        .execution(&execution_id)
+        .expect("the original execution should remain");
+    assert_eq!(execution.task_run_id, run_id);
+    assert_eq!(execution.pane_id, "w1:p1");
+    assert_eq!(execution.state, ExecState::Working);
+    assert!(model.pane("w1:p1").is_some());
+    assert!(model.pane("w1:p2").is_none());
+    assert_eq!(model.task_runs().count(), 1);
+    drop(model);
+
+    shutdown(handle, lifecycle).await;
 }
 
 #[tokio::test]

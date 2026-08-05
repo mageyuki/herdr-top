@@ -19,7 +19,7 @@ use crate::model::{
     NormalizedEvent, Pane, PaneSnapshot, Provider, ReconcileBatch, RunId, SharedModel,
     SnapshotAgent, Tab, TopologyEntity, TopologyEntityId, TopologySnapshot, Workspace,
 };
-use crate::reducer::{Reducer, ReducerError};
+use crate::reducer::{ApplyOutcome, Reducer, ReducerError};
 use crate::store::writer::{WriterClient, WriterError};
 use crate::store::{CollectorGap, PersistBatch, PersistOp, RestoredState};
 
@@ -668,12 +668,40 @@ async fn apply_received_event(
         owner.refresh_from_move(&received.data, writer).await?;
     }
     let normalized = normalize_event(shared, session, &received)?;
-    let persist = reducer.apply_observation(normalized)?;
+    let Some(persist) = apply_collector_observation(reducer, normalized)? else {
+        return Ok(());
+    };
     if !persist.is_empty() {
         writer.apply(persist).await?;
     }
     cancel_pending_topology_closures(&received, pending_closures);
     Ok(())
+}
+
+fn apply_collector_event(
+    reducer: &mut Reducer,
+    event: NormalizedEvent,
+) -> Result<Option<PersistBatch>, ReducerError> {
+    let outcome = reducer.apply(event)?;
+    Ok(collector_apply_outcome(reducer, outcome))
+}
+
+fn apply_collector_observation(
+    reducer: &mut Reducer,
+    events: Vec<NormalizedEvent>,
+) -> Result<Option<PersistBatch>, ReducerError> {
+    let outcome = reducer.apply_observation(events)?;
+    Ok(collector_apply_outcome(reducer, outcome))
+}
+
+fn collector_apply_outcome(reducer: &mut Reducer, outcome: ApplyOutcome) -> Option<PersistBatch> {
+    match outcome {
+        ApplyOutcome::Applied(persist) => Some(persist),
+        ApplyOutcome::DroppedBindingConflict(_conflict) => {
+            reducer.record_binding_conflict();
+            None
+        }
+    }
 }
 
 fn normalize_event(
@@ -1013,18 +1041,24 @@ fn apply_snapshot_in_place(
         .collect();
 
     for workspace in &topology.workspaces {
-        persist.extend(reducer.apply(topology_upsert(
-            session,
-            "snapshot_workspace",
-            TopologyEntity::Workspace(workspace.clone()),
-        ))?);
+        if let Some(batch) = apply_collector_event(
+            reducer,
+            topology_upsert(
+                session,
+                "snapshot_workspace",
+                TopologyEntity::Workspace(workspace.clone()),
+            ),
+        )? {
+            persist.extend(batch);
+        }
     }
     for tab in &topology.tabs {
-        persist.extend(reducer.apply(topology_upsert(
-            session,
-            "snapshot_tab",
-            TopologyEntity::Tab(tab.clone()),
-        ))?);
+        if let Some(batch) = apply_collector_event(
+            reducer,
+            topology_upsert(session, "snapshot_tab", TopologyEntity::Tab(tab.clone())),
+        )? {
+            persist.extend(batch);
+        }
     }
     for pane in &topology.panes {
         let mut observation = vec![topology_upsert(
@@ -1084,7 +1118,9 @@ fn apply_snapshot_in_place(
                 observation.push(snapshot_execution_begin(session, pane, agent));
             }
         }
-        persist.extend(reducer.apply_observation(observation)?);
+        if let Some(batch) = apply_collector_observation(reducer, observation)? {
+            persist.extend(batch);
+        }
     }
 
     let stale_ids: Vec<_> = shared
@@ -1100,11 +1136,16 @@ fn apply_snapshot_in_place(
         .map(|execution| execution.execution_id.clone())
         .collect();
     for execution_id in stale_ids {
-        persist.extend(reducer.apply(NormalizedEvent::AgentStatusChanged {
-            metadata: metadata(session, "snapshot_execution_missing"),
-            execution_id,
-            state: ExecState::Stale { since_ms: 0 },
-        })?);
+        if let Some(batch) = apply_collector_event(
+            reducer,
+            NormalizedEvent::AgentStatusChanged {
+                metadata: metadata(session, "snapshot_execution_missing"),
+                execution_id,
+                state: ExecState::Stale { since_ms: 0 },
+            },
+        )? {
+            persist.extend(batch);
+        }
     }
 
     let old_panes: Vec<_> = shared
@@ -1133,25 +1174,35 @@ fn apply_snapshot_in_place(
             execution.pane_id == pane_id && matches!(execution.state, ExecState::Stale { .. })
         });
         if !in_grace {
-            persist.extend(reducer.apply(topology_closure(
-                session,
-                "snapshot_pane_missing",
-                TopologyEntityId::Pane {
-                    pane_id: pane_id.clone(),
-                },
-            ))?);
+            if let Some(batch) = apply_collector_event(
+                reducer,
+                topology_closure(
+                    session,
+                    "snapshot_pane_missing",
+                    TopologyEntityId::Pane {
+                        pane_id: pane_id.clone(),
+                    },
+                ),
+            )? {
+                persist.extend(batch);
+            }
             pending_closures.panes.remove(&pane_id);
         }
     }
     for tab_id in old_tabs {
         if !shared.borrow().panes().any(|pane| pane.tab_id == tab_id) {
-            persist.extend(reducer.apply(topology_closure(
-                session,
-                "snapshot_tab_missing",
-                TopologyEntityId::Tab {
-                    tab_id: tab_id.clone(),
-                },
-            ))?);
+            if let Some(batch) = apply_collector_event(
+                reducer,
+                topology_closure(
+                    session,
+                    "snapshot_tab_missing",
+                    TopologyEntityId::Tab {
+                        tab_id: tab_id.clone(),
+                    },
+                ),
+            )? {
+                persist.extend(batch);
+            }
             pending_closures.tabs.remove(&tab_id);
         }
     }
@@ -1161,13 +1212,18 @@ fn apply_snapshot_in_place(
             .tabs()
             .any(|tab| tab.workspace_id == workspace_id)
         {
-            persist.extend(reducer.apply(topology_closure(
-                session,
-                "snapshot_workspace_missing",
-                TopologyEntityId::Workspace {
-                    workspace_id: workspace_id.clone(),
-                },
-            ))?);
+            if let Some(batch) = apply_collector_event(
+                reducer,
+                topology_closure(
+                    session,
+                    "snapshot_workspace_missing",
+                    TopologyEntityId::Workspace {
+                        workspace_id: workspace_id.clone(),
+                    },
+                ),
+            )? {
+                persist.extend(batch);
+            }
             pending_closures.workspaces.remove(&workspace_id);
         }
     }
@@ -1188,14 +1244,19 @@ fn apply_pending_topology_closures(
             .executions()
             .any(|execution| execution.pane_id == pane_id && !execution.state.is_terminal());
         if !has_live_execution {
-            if shared.borrow().pane(&pane_id).is_some() {
-                persist.extend(reducer.apply(topology_closure(
-                    session,
-                    "stale_grace_expired_pane",
-                    TopologyEntityId::Pane {
-                        pane_id: pane_id.clone(),
-                    },
-                ))?);
+            if shared.borrow().pane(&pane_id).is_some()
+                && let Some(batch) = apply_collector_event(
+                    reducer,
+                    topology_closure(
+                        session,
+                        "stale_grace_expired_pane",
+                        TopologyEntityId::Pane {
+                            pane_id: pane_id.clone(),
+                        },
+                    ),
+                )?
+            {
+                persist.extend(batch);
             }
             pending.panes.remove(&pane_id);
         }
@@ -1204,14 +1265,19 @@ fn apply_pending_topology_closures(
     let tab_ids: Vec<_> = pending.tabs.iter().cloned().collect();
     for tab_id in tab_ids {
         if !shared.borrow().panes().any(|pane| pane.tab_id == tab_id) {
-            if shared.borrow().tab(&tab_id).is_some() {
-                persist.extend(reducer.apply(topology_closure(
-                    session,
-                    "stale_grace_expired_tab",
-                    TopologyEntityId::Tab {
-                        tab_id: tab_id.clone(),
-                    },
-                ))?);
+            if shared.borrow().tab(&tab_id).is_some()
+                && let Some(batch) = apply_collector_event(
+                    reducer,
+                    topology_closure(
+                        session,
+                        "stale_grace_expired_tab",
+                        TopologyEntityId::Tab {
+                            tab_id: tab_id.clone(),
+                        },
+                    ),
+                )?
+            {
+                persist.extend(batch);
             }
             pending.tabs.remove(&tab_id);
         }
@@ -1224,14 +1290,19 @@ fn apply_pending_topology_closures(
             .tabs()
             .any(|tab| tab.workspace_id == workspace_id)
         {
-            if shared.borrow().workspace(&workspace_id).is_some() {
-                persist.extend(reducer.apply(topology_closure(
-                    session,
-                    "stale_grace_expired_workspace",
-                    TopologyEntityId::Workspace {
-                        workspace_id: workspace_id.clone(),
-                    },
-                ))?);
+            if shared.borrow().workspace(&workspace_id).is_some()
+                && let Some(batch) = apply_collector_event(
+                    reducer,
+                    topology_closure(
+                        session,
+                        "stale_grace_expired_workspace",
+                        TopologyEntityId::Workspace {
+                            workspace_id: workspace_id.clone(),
+                        },
+                    ),
+                )?
+            {
+                persist.extend(batch);
             }
             pending.workspaces.remove(&workspace_id);
         }

@@ -8,9 +8,9 @@ use tokio::sync::watch;
 
 use crate::identity::{BindingEvidence, MergeConflict, apply_binding_plan, plan_binding};
 use crate::model::{
-    AgentNode, AgentSessionReferenceKind, DisplayOrdinal, DomainModel, EventMetadata, ExecState,
-    Execution, NormalizedEvent, Pane, Provider, ReconcileBatch, RunId, RunKey, SharedModel,
-    TaskRun, TaskState, TopologyEntity, TopologyEntityId,
+    AgentNode, AgentSessionReferenceKind, ControllerDiagnosticsHandle, DisplayOrdinal, DomainModel,
+    EventMetadata, ExecState, Execution, NormalizedEvent, Pane, Provider, ReconcileBatch, RunId,
+    RunKey, SharedModel, TaskRun, TaskState, TopologyEntity, TopologyEntityId,
 };
 use crate::store::{
     NativeSessionBinding, PersistBatch, PersistExecution, PersistOp, PersistTaskRun, RestoredState,
@@ -27,6 +27,15 @@ pub enum ReducerError {
     /// Identity evidence conflicted with the current binding graph.
     #[error("identity binding conflict: {0}")]
     BindingConflict(#[from] MergeConflict),
+}
+
+/// Transactional result of applying one reducer observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ApplyOutcome {
+    /// The observation committed in memory and produced this durable batch.
+    Applied(PersistBatch),
+    /// Identity evidence conflicted and the complete observation was rolled back.
+    DroppedBindingConflict(MergeConflict),
 }
 
 /// Serialized owner of domain transitions and display-ordinal allocation.
@@ -56,7 +65,7 @@ impl Reducer {
     }
 
     /// Applies one normalized event and publishes exactly one resulting snapshot.
-    pub fn apply(&mut self, event: NormalizedEvent) -> Result<PersistBatch, ReducerError> {
+    pub fn apply(&mut self, event: NormalizedEvent) -> Result<ApplyOutcome, ReducerError> {
         self.apply_observation(vec![event])
     }
 
@@ -64,9 +73,9 @@ impl Reducer {
     pub fn apply_observation(
         &mut self,
         events: Vec<NormalizedEvent>,
-    ) -> Result<PersistBatch, ReducerError> {
+    ) -> Result<ApplyOutcome, ReducerError> {
         if events.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ApplyOutcome::Applied(Vec::new()));
         }
         let original_model = self.model.clone();
         let original_next_ordinal = self.next_ordinal;
@@ -74,6 +83,11 @@ impl Reducer {
         for event in events {
             match self.apply_inner(event) {
                 Ok(event_persist) => persist.extend(event_persist),
+                Err(ReducerError::BindingConflict(conflict)) => {
+                    self.model = original_model;
+                    self.next_ordinal = original_next_ordinal;
+                    return Ok(ApplyOutcome::DroppedBindingConflict(conflict));
+                }
                 Err(error) => {
                     self.model = original_model;
                     self.next_ordinal = original_next_ordinal;
@@ -82,7 +96,20 @@ impl Reducer {
             }
         }
         self.publish();
-        Ok(persist)
+        Ok(ApplyOutcome::Applied(persist))
+    }
+
+    /// Returns the atomic diagnostics handle intended for the socket acceptor.
+    #[must_use]
+    pub fn controller_diagnostics_handle(&self) -> ControllerDiagnosticsHandle {
+        self.model.controller_diagnostics().acceptor_handle()
+    }
+
+    pub(crate) fn record_binding_conflict(&mut self) {
+        self.model
+            .controller_diagnostics_mut()
+            .record_binding_conflict();
+        self.publish();
     }
 
     fn apply_inner(&mut self, event: NormalizedEvent) -> Result<PersistBatch, ReducerError> {
@@ -1081,7 +1108,7 @@ mod tests {
     };
     use crate::store::{PersistOp, RestoredState};
 
-    use super::{Reducer, ReducerError};
+    use super::{ApplyOutcome, Reducer, ReducerError};
 
     fn metadata(event_id: &str, timestamp_ms: i64) -> EventMetadata {
         EventMetadata {
@@ -1410,12 +1437,15 @@ mod tests {
         begin_metadata.provider = Some(Provider::Codex);
         begin_metadata.native_session_id = Some("sid-1".to_owned());
 
-        let batch = reducer
+        let outcome = reducer
             .apply(NormalizedEvent::ExecutionBegin {
                 metadata: begin_metadata,
                 execution: execution(absorbed, "execution-1", ExecState::Working),
             })
             .unwrap();
+        let ApplyOutcome::Applied(batch) = outcome else {
+            panic!("non-conflicting binding should apply");
+        };
 
         assert!(batch.iter().any(|operation| matches!(
             operation,
@@ -1647,7 +1677,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinal_exhaustion_returns_error_without_mutation() {
+    fn other_reducer_errors_stay_fatal() {
         let (mut reducer, mut shared) = Reducer::new(restored(DomainModel::default(), i64::MAX));
         let initial = Arc::clone(&shared.borrow_and_update());
         let run_id = RunId::new();
