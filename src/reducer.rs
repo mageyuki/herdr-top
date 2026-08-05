@@ -34,6 +34,8 @@ pub struct Reducer {
     model: DomainModel,
     next_ordinal: i64,
     publisher: watch::Sender<Arc<DomainModel>>,
+    #[cfg(test)]
+    publish_count: std::cell::Cell<u64>,
 }
 
 impl Reducer {
@@ -46,6 +48,8 @@ impl Reducer {
                 model: restored.model,
                 next_ordinal: restored.next_ordinal,
                 publisher,
+                #[cfg(test)]
+                publish_count: std::cell::Cell::new(0),
             },
             shared,
         )
@@ -842,6 +846,8 @@ impl Reducer {
     }
 
     fn publish(&self) {
+        #[cfg(test)]
+        self.publish_count.set(self.publish_count.get() + 1);
         self.publisher.send_replace(Arc::new(self.model.clone()));
     }
 }
@@ -1655,5 +1661,28 @@ mod tests {
         assert_eq!(shared.borrow().task_runs().count(), 0);
         assert!(shared.borrow().workspace("must-not-exist").is_none());
         assert!(Arc::ptr_eq(&initial, &shared.borrow()));
+    }
+
+    #[test]
+    fn apply_observation_publishes_exactly_once() {
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let first = topology_event(metadata("publish-once-a", 1_000), "ws-a");
+        let second = topology_event(metadata("publish-once-b", 1_001), "ws-b");
+
+        let before = reducer.publish_count.get();
+        reducer
+            .apply_observation(vec![first, second])
+            .expect("observation should apply");
+        assert_eq!(reducer.publish_count.get() - before, 1);
+        assert!(shared.borrow().workspace("ws-a").is_some());
+        assert!(shared.borrow().workspace("ws-b").is_some());
+
+        reducer.next_ordinal = i64::MAX;
+        let mut value = metadata("publish-once-err", 1_002);
+        value.task_run_id = Some(RunId::new());
+        let before_err = reducer.publish_count.get();
+        let result = reducer.apply_observation(vec![topology_event(value, "ws-err")]);
+        assert_eq!(result, Err(ReducerError::OrdinalExhausted));
+        assert_eq!(reducer.publish_count.get(), before_err);
     }
 }

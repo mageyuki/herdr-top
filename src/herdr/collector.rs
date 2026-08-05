@@ -896,6 +896,19 @@ fn append_pane_upsert(
     if pane.agent.is_none() {
         if incoming_sid.is_some() {
             for execution in current {
+                let has_native = run_has_native_binding(shared, execution.task_run_id);
+                let same_native = provider.zip(incoming_sid).is_some_and(|(provider, sid)| {
+                    run_owns_native(shared, execution.task_run_id, provider, sid)
+                });
+                if has_native && !same_native {
+                    // An agent-less pane carries no liveness that could justify a
+                    // replacement run, so conflicting latched evidence is dropped.
+                    tracing::warn!(
+                        terminal_id = pane.terminal_id.as_str(),
+                        "skipped conflicting agent-session evidence from an agent-less pane update"
+                    );
+                    continue;
+                }
                 events.push(NormalizedEvent::ExecutionBegin {
                     metadata: pane_metadata(session, event_kind, &pane),
                     execution,

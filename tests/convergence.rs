@@ -983,28 +983,9 @@ async fn different_sid_replacement_publishes_once() {
 #[tokio::test]
 async fn sid_only_push_promotes_without_agent() {
     let initial = agent_snapshot("", AgentSessionReferenceKind::Id, "blocked");
-    let mut sid_only = agent_pane_value(
-        "w1:p1",
-        "term_6583d08d791e41",
-        "w1",
-        "w1:t1",
-        "promoted-without-agent",
-    );
-    sid_only
-        .as_object_mut()
-        .expect("pane fixture should be an object")
-        .remove("agent");
-    let update = push(
-        "pane_updated",
-        json!({"type": "pane_updated", "pane": sid_only}),
-    );
-    let mock = MockHerdr::start(
-        MockConfig::default()
-            .respond("session.snapshot", snapshot_result(initial))
-            .subscription_pushes(vec![update]),
-    )
-    .await
-    .expect("mock server should bind");
+    let mock = LiveHerdr::start(LiveConfig::default().snapshots(vec![initial]))
+        .await
+        .expect("live mock should bind");
     let (_directory, _root, lifecycle, writer) = test_writer();
     let mut handle = collector::spawn(
         mock.socket_path().to_path_buf(),
@@ -1016,6 +997,49 @@ async fn sid_only_push_promotes_without_agent() {
     .expect("collector should start");
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
 
+    let (provisional_run_id, provisional_execution_id) = {
+        let model = handle.model.borrow();
+        let provisional = model
+            .task_runs()
+            .next()
+            .expect("snapshot should create the provisional run");
+        assert!(matches!(provisional.key, RunKey::Provisional { .. }));
+        let execution = model
+            .executions()
+            .next()
+            .expect("snapshot should create the execution");
+        (provisional.run_id, execution.execution_id.clone())
+    };
+
+    let mut sid_only = agent_pane_value(
+        "w1:p1",
+        "term_6583d08d791e41",
+        "w1",
+        "w1:t1",
+        "promoted-without-agent",
+    );
+    sid_only
+        .as_object_mut()
+        .expect("pane fixture should be an object")
+        .remove("agent");
+    mock.push(push(
+        "pane_updated",
+        json!({"type": "pane_updated", "pane": sid_only}),
+    ))
+    .await
+    .expect("SID-only push should deliver");
+    wait_until(|| {
+        handle
+            .model
+            .borrow()
+            .task_run_by_key(&RunKey::Native {
+                provider: Provider::Codex,
+                sid: "promoted-without-agent".to_owned(),
+            })
+            .is_some()
+    })
+    .await;
+
     let model = handle.model.borrow();
     let promoted = model
         .task_run_by_key(&RunKey::Native {
@@ -1023,11 +1047,106 @@ async fn sid_only_push_promotes_without_agent() {
             sid: "promoted-without-agent".to_owned(),
         })
         .expect("SID-only push should promote the existing provisional run");
-    let execution = model
-        .executions()
-        .find(|execution| execution.task_run_id == promoted.run_id)
-        .expect("promotion should preserve the existing execution");
-    assert_eq!(execution.state, ExecState::Blocked);
+    assert_eq!(
+        promoted.run_id, provisional_run_id,
+        "promotion must keep the provisional run, not end-and-recreate it"
+    );
+    assert_eq!(model.task_runs().count(), 1);
+    let executions: Vec<_> = model.executions().collect();
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0].execution_id, provisional_execution_id);
+    assert_eq!(executions[0].state, ExecState::Blocked);
+    drop(model);
+    shutdown(handle, lifecycle).await;
+}
+
+#[tokio::test]
+async fn conflicting_sid_only_push_is_skipped_not_fatal() {
+    let established = "established-binding";
+    let initial = agent_snapshot(established, AgentSessionReferenceKind::Id, "working");
+    let mock = LiveHerdr::start(LiveConfig::default().snapshots(vec![initial]))
+        .await
+        .expect("live mock should bind");
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    wait_until(|| {
+        handle
+            .model
+            .borrow()
+            .task_run_by_key(&RunKey::Native {
+                provider: Provider::Codex,
+                sid: established.to_owned(),
+            })
+            .is_some()
+    })
+    .await;
+
+    let mut stale = agent_pane_value(
+        "w1:p1",
+        "term_6583d08d791e41",
+        "w1",
+        "w1:t1",
+        "stale-latched-sid",
+    );
+    stale
+        .as_object_mut()
+        .expect("pane fixture should be an object")
+        .remove("agent");
+    mock.push(push(
+        "pane_updated",
+        json!({"type": "pane_updated", "pane": stale}),
+    ))
+    .await
+    .expect("conflicting SID-only push should deliver");
+
+    let mut follow_up =
+        agent_pane_value("w1:p1", "term_6583d08d791e41", "w1", "w1:t1", established);
+    follow_up
+        .as_object_mut()
+        .expect("pane fixture should be an object")
+        .insert("agent_status".to_owned(), json!("idle"));
+    mock.push(push(
+        "pane_updated",
+        json!({"type": "pane_updated", "pane": follow_up}),
+    ))
+    .await
+    .expect("follow-up push should deliver");
+    wait_until(|| {
+        handle
+            .model
+            .borrow()
+            .executions()
+            .any(|execution| execution.state == ExecState::Idle)
+    })
+    .await;
+
+    let model = handle.model.borrow();
+    assert!(
+        model
+            .task_run_by_key(&RunKey::Native {
+                provider: Provider::Codex,
+                sid: established.to_owned(),
+            })
+            .is_some(),
+        "the established binding must survive the conflicting SID-only push"
+    );
+    assert!(
+        model
+            .task_run_by_key(&RunKey::Native {
+                provider: Provider::Codex,
+                sid: "stale-latched-sid".to_owned(),
+            })
+            .is_none(),
+        "conflicting evidence must be skipped, never bound"
+    );
     drop(model);
     shutdown(handle, lifecycle).await;
 }
