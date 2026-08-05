@@ -202,6 +202,30 @@ impl DomainModel {
     pub fn insert_historical_task_run(&mut self, task_run: TaskRun) -> Option<TaskRun> {
         self.task_runs.insert(task_run.run_id, task_run)
     }
+
+    pub(crate) fn remove_task_run_record(&mut self, run_id: &RunId) -> Option<TaskRun> {
+        self.task_runs.remove(run_id)
+    }
+
+    pub(crate) fn task_run_bindings(&self) -> impl Iterator<Item = (&RunKey, &RunId)> {
+        self.run_ids_by_key.iter()
+    }
+
+    pub(crate) fn executions_mut(&mut self) -> impl Iterator<Item = &mut Execution> {
+        self.executions.values_mut()
+    }
+
+    pub(crate) fn agent_nodes_mut(&mut self) -> impl Iterator<Item = &mut AgentNode> {
+        self.agent_nodes.values_mut()
+    }
+
+    pub(crate) fn execution_edges_mut(&mut self) -> &mut HashSet<ExecutionEdge> {
+        &mut self.execution_edges
+    }
+
+    pub(crate) fn dependency_edges_mut(&mut self) -> &mut HashSet<DependencyEdge> {
+        &mut self.dependency_edges
+    }
 }
 
 pub type SharedModel = tokio::sync::watch::Receiver<Arc<DomainModel>>;
