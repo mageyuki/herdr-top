@@ -1,5 +1,6 @@
 //! SQLite-backed restoration, ownership, event ledger, and retention.
 
+use std::collections::{HashMap, HashSet};
 use std::num::TryFromIntError;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -177,6 +178,13 @@ pub enum PersistOp {
     UpsertPane(Pane),
     /// Upsert semantic task-run state.
     UpsertTaskRun(PersistTaskRun),
+    /// Merge an absorbed canonical task run into a surviving canonical task run.
+    MergeTaskRuns {
+        /// The live canonical run that remains addressable.
+        survivor: RunId,
+        /// The canonical run converted into a durable alias.
+        absorbed: RunId,
+    },
     /// Upsert one physical execution of a task run.
     UpsertExecution(PersistExecution),
     /// Upsert a provider-native agent node.
@@ -473,29 +481,38 @@ impl Store {
              DELETE FROM cleanup_doomed_runs;",
         )?;
         transaction.execute(
-            "INSERT INTO cleanup_doomed_runs(run_id) \
-             SELECT candidate.run_id \
-             FROM task_runs AS candidate \
-             WHERE candidate.task_state IN ('completed', 'failed', 'cancelled', 'ended_unknown') \
-               AND candidate.finished_at_ms < ?1 \
-               AND NOT EXISTS (\
-                   SELECT 1 \
-                   FROM execution_edges AS edge \
-                   JOIN task_runs AS active ON active.run_id = edge.child_run_id \
-                   WHERE edge.parent_run_id = candidate.run_id \
-                     AND active.task_state NOT IN (\
-                         'completed', 'failed', 'cancelled', 'ended_unknown'\
-                     )\
-               ) \
-               AND NOT EXISTS (\
-                   SELECT 1 \
-                   FROM dependency_edges AS edge \
-                   JOIN task_runs AS active ON active.run_id = edge.dependent_run_id \
-                   WHERE edge.prerequisite_run_id = candidate.run_id \
-                     AND active.task_state NOT IN (\
-                         'completed', 'failed', 'cancelled', 'ended_unknown'\
-                     )\
-               )",
+            "WITH RECURSIVE doomed(run_id) AS (\
+                 SELECT candidate.run_id \
+                 FROM task_runs AS candidate \
+                 WHERE candidate.merged_into IS NULL \
+                   AND candidate.task_state IN (\
+                       'completed', 'failed', 'cancelled', 'ended_unknown'\
+                   ) \
+                   AND candidate.finished_at_ms < ?1 \
+                   AND NOT EXISTS (\
+                       SELECT 1 \
+                       FROM execution_edges AS edge \
+                       JOIN task_runs AS active ON active.run_id = edge.child_run_id \
+                       WHERE edge.parent_run_id = candidate.run_id \
+                         AND active.task_state NOT IN (\
+                             'completed', 'failed', 'cancelled', 'ended_unknown'\
+                         )\
+                   ) \
+                   AND NOT EXISTS (\
+                       SELECT 1 \
+                       FROM dependency_edges AS edge \
+                       JOIN task_runs AS active ON active.run_id = edge.dependent_run_id \
+                       WHERE edge.prerequisite_run_id = candidate.run_id \
+                         AND active.task_state NOT IN (\
+                             'completed', 'failed', 'cancelled', 'ended_unknown'\
+                         )\
+                   ) \
+                 UNION \
+                 SELECT alias.run_id \
+                 FROM task_runs AS alias \
+                 JOIN doomed AS parent ON alias.merged_into = parent.run_id\
+             ) \
+             INSERT OR IGNORE INTO cleanup_doomed_runs(run_id) SELECT run_id FROM doomed",
             [run_cutoff],
         )?;
 
@@ -527,11 +544,22 @@ impl Store {
                AND entity_id IN (SELECT run_id FROM cleanup_doomed_runs)",
             [],
         )?);
-        stats.runs_pruned = changed(transaction.execute(
+        let doomed_run_count: i64 =
+            transaction.query_row("SELECT COUNT(*) FROM cleanup_doomed_runs", [], |row| {
+                row.get(0)
+            })?;
+        stats.runs_pruned = u64::try_from(doomed_run_count).map_err(|_| {
+            StoreError::invalid(
+                "cleanup_doomed_runs",
+                doomed_run_count.to_string(),
+                "row count cannot be negative",
+            )
+        })?;
+        transaction.execute(
             "DELETE FROM task_runs \
              WHERE run_id IN (SELECT run_id FROM cleanup_doomed_runs)",
             [],
-        )?);
+        )?;
         stats.native_sessions_pruned = changed(transaction.execute(
             "DELETE FROM native_agent_sessions AS native \
              WHERE NOT EXISTS (\
@@ -614,10 +642,11 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT run_id, key_kind, key_controller_id, key_provider, key_native_sid, \
                     key_native_path, key_terminal_id, key_start_ms, key_seq, \
-                    display_ordinal, task_state, has_controller_task_state_event \
+                    display_ordinal, task_state, has_controller_task_state_event, merged_into \
              FROM task_runs",
         )?;
         let mut rows = statement.query([])?;
+        let mut stored_runs = Vec::new();
         while let Some(row) = rows.next()? {
             let run_id_text: String = row.get(0)?;
             let run_id = parse_run_id(&run_id_text)?;
@@ -633,13 +662,56 @@ impl Store {
                 row.get(8)?,
             )?;
             let state_text: String = row.get(10)?;
-            model.insert_task_run(TaskRun {
-                run_id,
-                key,
-                display_ordinal: DisplayOrdinal::new(row.get(9)?),
-                state: parse_task_state(&state_text)?,
-                has_controller_task_state_event: row.get::<_, i64>(11)? != 0,
+            let merged_into_text: Option<String> = row.get(12)?;
+            stored_runs.push(StoredTaskRun {
+                task_run: TaskRun {
+                    run_id,
+                    key,
+                    display_ordinal: DisplayOrdinal::new(row.get(9)?),
+                    state: parse_task_state(&state_text)?,
+                    has_controller_task_state_event: row.get::<_, i64>(11)? != 0,
+                },
+                merged_into: merged_into_text.as_deref().map(parse_run_id).transpose()?,
             });
+        }
+
+        for stored in stored_runs
+            .iter()
+            .filter(|stored| stored.merged_into.is_none())
+        {
+            if matches!(stored.task_run.key, RunKey::Provisional { .. }) {
+                model.insert_historical_task_run(stored.task_run.clone());
+            } else {
+                model.insert_task_run(stored.task_run.clone());
+            }
+        }
+
+        let aliases: HashMap<RunId, RunId> = stored_runs
+            .iter()
+            .filter_map(|stored| {
+                stored
+                    .merged_into
+                    .map(|target| (stored.task_run.run_id, target))
+            })
+            .collect();
+        for stored in stored_runs
+            .iter()
+            .filter(|stored| stored.merged_into.is_some())
+        {
+            let canonical = resolve_alias_root(stored.task_run.run_id, &aliases)?;
+            if model.task_run(&canonical).is_none() {
+                return Err(StoreError::invalid(
+                    "merged_into",
+                    canonical.to_string(),
+                    format!(
+                        "alias task run {} does not resolve to a live canonical root",
+                        stored.task_run.run_id
+                    ),
+                ));
+            }
+            if !matches!(stored.task_run.key, RunKey::Provisional { .. }) {
+                model.insert_task_run_alias(stored.task_run.key.clone(), canonical);
+            }
         }
         Ok(())
     }
@@ -721,6 +793,27 @@ impl Store {
     }
 }
 
+struct StoredTaskRun {
+    task_run: TaskRun,
+    merged_into: Option<RunId>,
+}
+
+fn resolve_alias_root(alias: RunId, aliases: &HashMap<RunId, RunId>) -> Result<RunId, StoreError> {
+    let mut current = alias;
+    let mut visited = HashSet::new();
+    while let Some(target) = aliases.get(&current) {
+        if !visited.insert(current) {
+            return Err(StoreError::invalid(
+                "merged_into",
+                alias.to_string(),
+                "alias cycle detected while restoring task runs",
+            ));
+        }
+        current = *target;
+    }
+    Ok(current)
+}
+
 fn apply_operation(transaction: &Transaction<'_>, operation: PersistOp) -> Result<(), StoreError> {
     match operation {
         PersistOp::UpsertWorkspace(workspace) => {
@@ -754,6 +847,9 @@ fn apply_operation(transaction: &Transaction<'_>, operation: PersistOp) -> Resul
             )?;
         }
         PersistOp::UpsertTaskRun(task_run) => upsert_task_run(transaction, &task_run)?,
+        PersistOp::MergeTaskRuns { survivor, absorbed } => {
+            merge_task_runs(transaction, survivor, absorbed)?;
+        }
         PersistOp::UpsertExecution(execution) => upsert_execution(transaction, &execution)?,
         PersistOp::UpsertAgentNode(agent_node) => upsert_agent_node(transaction, &agent_node)?,
         PersistOp::UpsertExecutionEdge {
@@ -795,12 +891,271 @@ fn apply_operation(transaction: &Transaction<'_>, operation: PersistOp) -> Resul
     Ok(())
 }
 
+struct MergeParty {
+    binding: Option<(String, String)>,
+}
+
+fn merge_task_runs(
+    transaction: &Transaction<'_>,
+    survivor: RunId,
+    absorbed: RunId,
+) -> Result<(), StoreError> {
+    if survivor == absorbed {
+        return Err(StoreError::invalid(
+            "task_run_merge",
+            survivor.to_string(),
+            "survivor and absorbed task runs must be distinct",
+        ));
+    }
+
+    let survivor_text = survivor.to_string();
+    let absorbed_text = absorbed.to_string();
+    let survivor_party = read_canonical_merge_party(transaction, &survivor_text)?;
+    let absorbed_party = read_canonical_merge_party(transaction, &absorbed_text)?;
+
+    match (&survivor_party.binding, &absorbed_party.binding) {
+        (None, Some((provider, native_session_id))) => {
+            transaction.execute(
+                "UPDATE task_runs \
+                 SET native_provider = NULL, native_session_id = NULL \
+                 WHERE run_id = ?1",
+                [&absorbed_text],
+            )?;
+            transaction.execute(
+                "UPDATE task_runs \
+                 SET native_provider = ?2, native_session_id = ?3 \
+                 WHERE run_id = ?1",
+                (&survivor_text, provider, native_session_id),
+            )?;
+        }
+        (Some(survivor_binding), Some(absorbed_binding))
+            if survivor_binding == absorbed_binding =>
+        {
+            return Err(StoreError::invalid(
+                "native_session_binding",
+                format!("{}:{}", survivor_binding.0, survivor_binding.1),
+                "the survivor and absorbed rows share one binding despite its UNIQUE invariant",
+            ));
+        }
+        (Some(survivor_binding), Some(absorbed_binding)) => {
+            return Err(StoreError::invalid(
+                "native_session_binding",
+                format!(
+                    "{}:{} and {}:{}",
+                    survivor_binding.0, survivor_binding.1, absorbed_binding.0, absorbed_binding.1
+                ),
+                "cannot merge task runs with different native-session bindings",
+            ));
+        }
+        (Some(_), None) | (None, None) => {}
+    }
+
+    let execution_edges = substituted_execution_edges(transaction, &survivor_text, &absorbed_text)?;
+    let dependency_edges =
+        substituted_dependency_edges(transaction, &survivor_text, &absorbed_text)?;
+
+    transaction.execute(
+        "UPDATE executions SET task_run_id = ?1 WHERE task_run_id = ?2",
+        (&survivor_text, &absorbed_text),
+    )?;
+    transaction.execute(
+        "UPDATE agent_nodes SET task_run_id = ?1 WHERE task_run_id = ?2",
+        (&survivor_text, &absorbed_text),
+    )?;
+    transaction.execute(
+        "UPDATE events SET task_run_id = ?1 WHERE task_run_id = ?2",
+        (&survivor_text, &absorbed_text),
+    )?;
+    replace_execution_edges(transaction, execution_edges)?;
+    replace_dependency_edges(transaction, dependency_edges)?;
+
+    transaction.execute(
+        "UPDATE task_runs SET merged_into = ?1 WHERE merged_into = ?2",
+        (&survivor_text, &absorbed_text),
+    )?;
+    transaction.execute(
+        "UPDATE task_runs SET merged_into = ?1 WHERE run_id = ?2",
+        (&survivor_text, &absorbed_text),
+    )?;
+    Ok(())
+}
+
+fn read_canonical_merge_party(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+) -> Result<MergeParty, StoreError> {
+    let stored: Option<(Option<String>, Option<String>, Option<String>)> = transaction
+        .query_row(
+            "SELECT native_provider, native_session_id, merged_into \
+             FROM task_runs WHERE run_id = ?1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let (native_provider, native_session_id, merged_into) = stored.ok_or_else(|| {
+        StoreError::invalid("task_run_merge", run_id, "merge party does not exist")
+    })?;
+    if let Some(target) = merged_into {
+        return Err(StoreError::invalid(
+            "merged_into",
+            run_id,
+            format!("merge party is already an alias of {target}"),
+        ));
+    }
+    let binding = match (native_provider, native_session_id) {
+        (Some(provider), Some(native_session_id)) => Some((provider, native_session_id)),
+        (None, None) => None,
+        _ => {
+            return Err(StoreError::invalid(
+                "native_session_binding",
+                run_id,
+                "provider and native session ID nullability disagree",
+            ));
+        }
+    };
+    Ok(MergeParty { binding })
+}
+
+fn substituted_execution_edges(
+    transaction: &Transaction<'_>,
+    survivor: &str,
+    absorbed: &str,
+) -> Result<Vec<(String, String, i64)>, StoreError> {
+    let mut statement = transaction
+        .prepare("SELECT parent_run_id, child_run_id, created_at_ms FROM execution_edges")?;
+    let mut rows = statement.query([])?;
+    let mut substituted: HashMap<String, (String, i64)> = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let parent = substitute_run_id(row.get(0)?, survivor, absorbed);
+        let child = substitute_run_id(row.get(1)?, survivor, absorbed);
+        let created_at_ms: i64 = row.get(2)?;
+        if parent == child {
+            return Err(StoreError::invalid(
+                "execution_edge",
+                format!("{parent}->{child}"),
+                "task-run merge would create a dispatch self-edge",
+            ));
+        }
+        match substituted.entry(child.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((parent, created_at_ms));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let (existing_parent, oldest_created_at_ms) = entry.get_mut();
+                if existing_parent != &parent {
+                    return Err(StoreError::invalid(
+                        "execution_edge",
+                        child,
+                        format!(
+                            "task-run merge would give one child differing parents {existing_parent} and {parent}"
+                        ),
+                    ));
+                }
+                *oldest_created_at_ms = (*oldest_created_at_ms).min(created_at_ms);
+            }
+        }
+    }
+    let mut edges: Vec<_> = substituted
+        .into_iter()
+        .map(|(child, (parent, created_at_ms))| (parent, child, created_at_ms))
+        .collect();
+    edges.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    Ok(edges)
+}
+
+fn substituted_dependency_edges(
+    transaction: &Transaction<'_>,
+    survivor: &str,
+    absorbed: &str,
+) -> Result<Vec<(String, String, i64)>, StoreError> {
+    let mut statement = transaction.prepare(
+        "SELECT prerequisite_run_id, dependent_run_id, created_at_ms FROM dependency_edges",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut substituted: HashMap<(String, String), i64> = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let prerequisite = substitute_run_id(row.get(0)?, survivor, absorbed);
+        let dependent = substitute_run_id(row.get(1)?, survivor, absorbed);
+        let created_at_ms: i64 = row.get(2)?;
+        if prerequisite == dependent {
+            return Err(StoreError::invalid(
+                "dependency_edge",
+                format!("{prerequisite}->{dependent}"),
+                "task-run merge would create a dependency self-edge",
+            ));
+        }
+        substituted
+            .entry((prerequisite, dependent))
+            .and_modify(|oldest| *oldest = (*oldest).min(created_at_ms))
+            .or_insert(created_at_ms);
+    }
+    let mut edges: Vec<_> = substituted
+        .into_iter()
+        .map(|((prerequisite, dependent), created_at_ms)| (prerequisite, dependent, created_at_ms))
+        .collect();
+    edges.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    Ok(edges)
+}
+
+fn substitute_run_id(value: String, survivor: &str, absorbed: &str) -> String {
+    if value == absorbed {
+        survivor.to_owned()
+    } else {
+        value
+    }
+}
+
+fn replace_execution_edges(
+    transaction: &Transaction<'_>,
+    edges: Vec<(String, String, i64)>,
+) -> Result<(), StoreError> {
+    transaction.execute("DELETE FROM execution_edges", [])?;
+    let mut statement = transaction.prepare(
+        "INSERT INTO execution_edges(parent_run_id, child_run_id, created_at_ms) \
+         VALUES (?1, ?2, ?3)",
+    )?;
+    for (parent, child, created_at_ms) in edges {
+        statement.execute((parent, child, created_at_ms))?;
+    }
+    Ok(())
+}
+
+fn replace_dependency_edges(
+    transaction: &Transaction<'_>,
+    edges: Vec<(String, String, i64)>,
+) -> Result<(), StoreError> {
+    transaction.execute("DELETE FROM dependency_edges", [])?;
+    let mut statement = transaction.prepare(
+        "INSERT INTO dependency_edges(\
+             prerequisite_run_id, dependent_run_id, created_at_ms\
+         ) VALUES (?1, ?2, ?3)",
+    )?;
+    for (prerequisite, dependent, created_at_ms) in edges {
+        statement.execute((prerequisite, dependent, created_at_ms))?;
+    }
+    Ok(())
+}
+
 fn upsert_task_run(
     transaction: &Transaction<'_>,
     persisted: &PersistTaskRun,
 ) -> Result<(), StoreError> {
     let task_run = &persisted.task_run;
     let run_id = task_run.run_id.to_string();
+    let existing_merged_into: Option<Option<String>> = transaction
+        .query_row(
+            "SELECT merged_into FROM task_runs WHERE run_id = ?1",
+            [&run_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(Some(canonical)) = existing_merged_into {
+        return Err(StoreError::invalid(
+            "merged_into",
+            run_id,
+            format!("cannot upsert an alias of canonical task run {canonical}"),
+        ));
+    }
     let encoded_key = EncodedRunKey::from(&task_run.key);
     let task_state = task_state_text(task_run.state);
     let finished_at_ms = if task_run.state.is_terminal() {
@@ -1576,6 +1931,676 @@ mod tests {
     }
 
     #[test]
+    fn merge_op_moves_native_binding_atomically() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let now = unix_now_ms().unwrap();
+        let survivor = RunId::new();
+        let absorbed = RunId::new();
+        store
+            .apply_batch(vec![
+                run_op(survivor, 1, TaskState::Running, now, false),
+                run_op_with_key(
+                    absorbed,
+                    RunKey::Native {
+                        provider: Provider::Codex,
+                        sid: "native-1".to_owned(),
+                    },
+                    2,
+                    TaskState::Running,
+                    now,
+                    false,
+                    Some(NativeSessionBinding {
+                        provider: Provider::Codex,
+                        native_session_id: "native-1".to_owned(),
+                    }),
+                ),
+                PersistOp::MergeTaskRuns { survivor, absorbed },
+            ])
+            .unwrap();
+
+        assert_eq!(
+            binding(&store.connection, survivor),
+            codex_binding("native-1")
+        );
+        assert_eq!(binding(&store.connection, absorbed), (None, None));
+        assert_eq!(merged_into(&store.connection, absorbed), Some(survivor));
+
+        let bound_survivor = RunId::new();
+        let unbound_absorbed = RunId::new();
+        store
+            .apply_batch(vec![
+                run_op_with_key(
+                    bound_survivor,
+                    RunKey::Controller("bound-survivor".to_owned()),
+                    3,
+                    TaskState::Running,
+                    now,
+                    true,
+                    Some(NativeSessionBinding {
+                        provider: Provider::Codex,
+                        native_session_id: "native-2".to_owned(),
+                    }),
+                ),
+                run_op(unbound_absorbed, 4, TaskState::Running, now, false),
+                PersistOp::MergeTaskRuns {
+                    survivor: bound_survivor,
+                    absorbed: unbound_absorbed,
+                },
+            ])
+            .unwrap();
+        assert_eq!(
+            binding(&store.connection, bound_survivor),
+            codex_binding("native-2")
+        );
+        assert_eq!(binding(&store.connection, unbound_absorbed), (None, None));
+    }
+
+    #[test]
+    fn merge_op_repoints_all_references_and_dedups_edges() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let now = unix_now_ms().unwrap();
+        let survivor = RunId::new();
+        let absorbed = RunId::new();
+        let parent = RunId::new();
+        let dependent = RunId::new();
+        store
+            .apply_batch(vec![
+                PersistOp::UpsertWorkspace(Workspace {
+                    workspace_id: "workspace-1".to_owned(),
+                }),
+                PersistOp::UpsertTab(Tab {
+                    tab_id: "tab-1".to_owned(),
+                    workspace_id: "workspace-1".to_owned(),
+                }),
+                PersistOp::UpsertPane(Pane {
+                    pane_id: "pane-1".to_owned(),
+                    workspace_id: "workspace-1".to_owned(),
+                    tab_id: "tab-1".to_owned(),
+                    terminal_id: "terminal-1".to_owned(),
+                }),
+                run_op(survivor, 1, TaskState::Running, now, false),
+                run_op(absorbed, 2, TaskState::Running, now, false),
+                run_op(parent, 3, TaskState::Running, now, false),
+                run_op(dependent, 4, TaskState::Running, now, false),
+                PersistOp::UpsertExecution(PersistExecution {
+                    execution: Execution {
+                        execution_id: "execution-1".to_owned(),
+                        pane_id: "pane-1".to_owned(),
+                        terminal_id: "terminal-1".to_owned(),
+                        task_run_id: absorbed,
+                        state: ExecState::Working,
+                    },
+                    started_at_ms: now,
+                    updated_at_ms: now,
+                    ended_at_ms: None,
+                }),
+                PersistOp::UpsertAgentNode(AgentNode {
+                    agent_node_id: "agent-1".to_owned(),
+                    provider: Provider::Codex,
+                    native_session_id: Some("native-1".to_owned()),
+                    task_run_id: absorbed,
+                }),
+                PersistOp::RecordEvent {
+                    event: Box::new(run_event("event-1", absorbed, now)),
+                    seen_at_ms: now,
+                },
+                PersistOp::UpsertExecutionEdge {
+                    edge: ExecutionEdge {
+                        parent_run_id: parent,
+                        child_run_id: absorbed,
+                    },
+                    created_at_ms: now - 10,
+                },
+                PersistOp::UpsertExecutionEdge {
+                    edge: ExecutionEdge {
+                        parent_run_id: parent,
+                        child_run_id: survivor,
+                    },
+                    created_at_ms: now,
+                },
+                PersistOp::UpsertDependencyEdge {
+                    edge: DependencyEdge {
+                        prerequisite_run_id: absorbed,
+                        dependent_run_id: dependent,
+                    },
+                    created_at_ms: now - 10,
+                },
+                PersistOp::UpsertDependencyEdge {
+                    edge: DependencyEdge {
+                        prerequisite_run_id: survivor,
+                        dependent_run_id: dependent,
+                    },
+                    created_at_ms: now,
+                },
+                PersistOp::MergeTaskRuns { survivor, absorbed },
+            ])
+            .unwrap();
+
+        assert_eq!(
+            referenced_run(&store.connection, "executions", "execution-1"),
+            survivor
+        );
+        assert_eq!(
+            referenced_run(&store.connection, "agent_nodes", "agent-1"),
+            survivor
+        );
+        assert_eq!(
+            referenced_run(&store.connection, "events", "event-1"),
+            survivor
+        );
+        assert_eq!(count(&store.connection, "execution_edges"), 1);
+        assert_eq!(count(&store.connection, "dependency_edges"), 1);
+        assert_eq!(
+            execution_edge(&store.connection),
+            (parent, survivor, now - 10)
+        );
+        assert_eq!(
+            dependency_edge(&store.connection),
+            (survivor, dependent, now - 10)
+        );
+    }
+
+    #[test]
+    fn merged_rows_restore_as_aliases_not_runs() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let now = unix_now_ms().unwrap();
+        let survivor = RunId::new();
+        let absorbed = RunId::new();
+        let alias_key = RunKey::NativePath {
+            provider: Provider::Claude,
+            path: "/sessions/pending.jsonl".to_owned(),
+        };
+        store
+            .apply_batch(vec![
+                run_op(survivor, 1, TaskState::Running, now, true),
+                run_op_with_key(
+                    absorbed,
+                    alias_key.clone(),
+                    2,
+                    TaskState::Running,
+                    now,
+                    false,
+                    None,
+                ),
+                PersistOp::MergeTaskRuns { survivor, absorbed },
+            ])
+            .unwrap();
+
+        let restored = store.load_restored_state().unwrap();
+
+        assert_eq!(restored.next_ordinal, 3);
+        assert_eq!(restored.model.task_runs().count(), 1);
+        assert!(restored.model.task_run(&absorbed).is_none());
+        assert_eq!(
+            restored.model.task_run_by_key(&alias_key).unwrap().run_id,
+            survivor
+        );
+    }
+
+    #[test]
+    fn merge_op_sets_merged_into_and_preserves_alias_key() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let now = unix_now_ms().unwrap();
+        let survivor = RunId::new();
+        let absorbed = RunId::new();
+        let alias_key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "native-alias".to_owned(),
+        };
+        store
+            .apply_batch(vec![
+                run_op(survivor, 1, TaskState::Running, now, true),
+                run_op_with_key(absorbed, alias_key, 2, TaskState::Running, now, false, None),
+                PersistOp::MergeTaskRuns { survivor, absorbed },
+            ])
+            .unwrap();
+
+        let (kind, provider, native_sid, target): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = store
+            .connection
+            .query_row(
+                "SELECT key_kind, key_provider, key_native_sid, merged_into \
+                 FROM task_runs WHERE run_id = ?1",
+                [absorbed.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "native");
+        assert_eq!(provider.as_deref(), Some("codex"));
+        assert_eq!(native_sid.as_deref(), Some("native-alias"));
+        assert_eq!(target, Some(survivor.to_string()));
+    }
+
+    #[test]
+    fn k3_keys_never_resolve_after_restore() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let now = unix_now_ms().unwrap();
+        let survivor = RunId::new();
+        let historical = RunId::new();
+        let absorbed = RunId::new();
+        let provisional_key = RunKey::Provisional {
+            terminal_id: "terminal-1".to_owned(),
+            start_ms: now,
+            seq: 1,
+        };
+        store
+            .apply_batch(vec![
+                run_op(survivor, 1, TaskState::Running, now, true),
+                run_op_with_key(
+                    historical,
+                    provisional_key.clone(),
+                    2,
+                    TaskState::EndedUnknown,
+                    now,
+                    false,
+                    None,
+                ),
+                run_op_with_key(
+                    absorbed,
+                    provisional_key.clone(),
+                    3,
+                    TaskState::Running,
+                    now,
+                    false,
+                    None,
+                ),
+                PersistOp::MergeTaskRuns { survivor, absorbed },
+            ])
+            .unwrap();
+
+        let restored = store.load_restored_state().unwrap();
+
+        assert!(restored.model.task_run(&historical).is_some());
+        assert!(restored.model.task_run(&absorbed).is_none());
+        assert!(restored.model.task_run_by_key(&provisional_key).is_none());
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_index_list('task_runs') \
+                     WHERE name = 'task_runs_provisional_key_idx' AND \"unique\" = 0",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn alias_chains_stay_canonical_flat() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let now = unix_now_ms().unwrap();
+        let first_root = RunId::new();
+        let first_alias = RunId::new();
+        let final_root = RunId::new();
+        store
+            .apply_batch(vec![
+                run_op(first_root, 1, TaskState::Running, now, false),
+                run_op(first_alias, 2, TaskState::Running, now, false),
+                run_op(final_root, 3, TaskState::Running, now, false),
+                PersistOp::MergeTaskRuns {
+                    survivor: first_root,
+                    absorbed: first_alias,
+                },
+                PersistOp::MergeTaskRuns {
+                    survivor: final_root,
+                    absorbed: first_root,
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(
+            merged_into(&store.connection, first_alias),
+            Some(final_root)
+        );
+        assert_eq!(merged_into(&store.connection, first_root), Some(final_root));
+        assert_eq!(merged_into(&store.connection, final_root), None);
+
+        assert!(matches!(
+            store.apply_batch(vec![PersistOp::MergeTaskRuns {
+                survivor: final_root,
+                absorbed: first_alias,
+            }]),
+            Err(StoreError::InvalidData { .. })
+        ));
+        assert_eq!(
+            merged_into(&store.connection, first_alias),
+            Some(final_root)
+        );
+    }
+
+    #[test]
+    fn restore_defensively_resolves_alias_chains_and_rejects_cycles() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let now = unix_now_ms().unwrap();
+        let canonical = RunId::new();
+        let middle = RunId::new();
+        let leaf = RunId::new();
+        let leaf_key = RunKey::Controller(format!("controller-{leaf}"));
+        store
+            .apply_batch(vec![
+                run_op(canonical, 1, TaskState::Running, now, false),
+                run_op(middle, 2, TaskState::Running, now, false),
+                run_op(leaf, 3, TaskState::Running, now, false),
+                PersistOp::MergeTaskRuns {
+                    survivor: canonical,
+                    absorbed: middle,
+                },
+                PersistOp::MergeTaskRuns {
+                    survivor: canonical,
+                    absorbed: leaf,
+                },
+            ])
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE task_runs SET merged_into = ?1 WHERE run_id = ?2",
+                (middle.to_string(), leaf.to_string()),
+            )
+            .unwrap();
+
+        let restored = store.load_restored_state().unwrap();
+        assert_eq!(
+            restored.model.task_run_by_key(&leaf_key).unwrap().run_id,
+            canonical
+        );
+
+        store
+            .connection
+            .execute(
+                "UPDATE task_runs SET merged_into = ?1 WHERE run_id = ?2",
+                (leaf.to_string(), middle.to_string()),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.load_restored_state(),
+            Err(StoreError::InvalidData { .. })
+        ));
+    }
+
+    #[test]
+    fn binding_overlap_is_store_error() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let now = unix_now_ms().unwrap();
+        let survivor = RunId::new();
+        let absorbed = RunId::new();
+        store
+            .apply_batch(vec![
+                run_op_with_key(
+                    survivor,
+                    RunKey::Controller("survivor".to_owned()),
+                    1,
+                    TaskState::Running,
+                    now,
+                    true,
+                    Some(NativeSessionBinding {
+                        provider: Provider::Codex,
+                        native_session_id: "native-x".to_owned(),
+                    }),
+                ),
+                run_op_with_key(
+                    absorbed,
+                    RunKey::Controller("absorbed".to_owned()),
+                    2,
+                    TaskState::Running,
+                    now,
+                    true,
+                    Some(NativeSessionBinding {
+                        provider: Provider::Codex,
+                        native_session_id: "native-y".to_owned(),
+                    }),
+                ),
+            ])
+            .unwrap();
+
+        let error = store.apply_batch(vec![
+            PersistOp::UpsertWorkspace(Workspace {
+                workspace_id: "must-roll-back".to_owned(),
+            }),
+            PersistOp::MergeTaskRuns { survivor, absorbed },
+        ]);
+
+        assert!(matches!(error, Err(StoreError::InvalidData { .. })));
+        assert_eq!(
+            binding(&store.connection, survivor),
+            codex_binding("native-x")
+        );
+        assert_eq!(
+            binding(&store.connection, absorbed),
+            codex_binding("native-y")
+        );
+        assert_eq!(merged_into(&store.connection, absorbed), None);
+        assert_eq!(count(&store.connection, "workspaces"), 0);
+    }
+
+    #[test]
+    fn repoint_dedup_preserves_oldest_edge() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let now = unix_now_ms().unwrap();
+        let survivor = RunId::new();
+        let absorbed = RunId::new();
+        let parent = RunId::new();
+        let dependent = RunId::new();
+        store
+            .apply_batch(vec![
+                run_op(survivor, 1, TaskState::Running, now, false),
+                run_op(absorbed, 2, TaskState::Running, now, false),
+                run_op(parent, 3, TaskState::Running, now, false),
+                run_op(dependent, 4, TaskState::Running, now, false),
+                PersistOp::UpsertExecutionEdge {
+                    edge: ExecutionEdge {
+                        parent_run_id: parent,
+                        child_run_id: survivor,
+                    },
+                    created_at_ms: now,
+                },
+                PersistOp::UpsertExecutionEdge {
+                    edge: ExecutionEdge {
+                        parent_run_id: parent,
+                        child_run_id: absorbed,
+                    },
+                    created_at_ms: now - 20,
+                },
+                PersistOp::UpsertDependencyEdge {
+                    edge: DependencyEdge {
+                        prerequisite_run_id: survivor,
+                        dependent_run_id: dependent,
+                    },
+                    created_at_ms: now - 30,
+                },
+                PersistOp::UpsertDependencyEdge {
+                    edge: DependencyEdge {
+                        prerequisite_run_id: absorbed,
+                        dependent_run_id: dependent,
+                    },
+                    created_at_ms: now,
+                },
+                PersistOp::MergeTaskRuns { survivor, absorbed },
+            ])
+            .unwrap();
+
+        assert_eq!(execution_edge(&store.connection).2, now - 20);
+        assert_eq!(dependency_edge(&store.connection).2, now - 30);
+    }
+
+    #[test]
+    fn merge_op_rejects_invalid_substituted_edges() {
+        let now = unix_now_ms().unwrap();
+        {
+            let (_directory, root) = test_root();
+            let mut store = open_writer(&root).unwrap();
+            let survivor = RunId::new();
+            let absorbed = RunId::new();
+            store
+                .apply_batch(vec![
+                    run_op(survivor, 1, TaskState::Running, now, false),
+                    run_op(absorbed, 2, TaskState::Running, now, false),
+                    PersistOp::UpsertExecutionEdge {
+                        edge: ExecutionEdge {
+                            parent_run_id: absorbed,
+                            child_run_id: survivor,
+                        },
+                        created_at_ms: now,
+                    },
+                ])
+                .unwrap();
+
+            assert!(matches!(
+                store.apply_batch(vec![PersistOp::MergeTaskRuns { survivor, absorbed }]),
+                Err(StoreError::InvalidData { .. })
+            ));
+            assert_eq!(merged_into(&store.connection, absorbed), None);
+            assert_eq!(count(&store.connection, "execution_edges"), 1);
+        }
+
+        {
+            let (_directory, root) = test_root();
+            let mut store = open_writer(&root).unwrap();
+            let survivor = RunId::new();
+            let absorbed = RunId::new();
+            store
+                .apply_batch(vec![
+                    run_op(survivor, 1, TaskState::Running, now, false),
+                    run_op(absorbed, 2, TaskState::Running, now, false),
+                    PersistOp::UpsertDependencyEdge {
+                        edge: DependencyEdge {
+                            prerequisite_run_id: survivor,
+                            dependent_run_id: absorbed,
+                        },
+                        created_at_ms: now,
+                    },
+                ])
+                .unwrap();
+
+            assert!(matches!(
+                store.apply_batch(vec![PersistOp::MergeTaskRuns { survivor, absorbed }]),
+                Err(StoreError::InvalidData { .. })
+            ));
+            assert_eq!(merged_into(&store.connection, absorbed), None);
+            assert_eq!(count(&store.connection, "dependency_edges"), 1);
+        }
+
+        {
+            let (_directory, root) = test_root();
+            let mut store = open_writer(&root).unwrap();
+            let survivor = RunId::new();
+            let absorbed = RunId::new();
+            let first_parent = RunId::new();
+            let second_parent = RunId::new();
+            store
+                .apply_batch(vec![
+                    run_op(survivor, 1, TaskState::Running, now, false),
+                    run_op(absorbed, 2, TaskState::Running, now, false),
+                    run_op(first_parent, 3, TaskState::Running, now, false),
+                    run_op(second_parent, 4, TaskState::Running, now, false),
+                    PersistOp::UpsertExecutionEdge {
+                        edge: ExecutionEdge {
+                            parent_run_id: first_parent,
+                            child_run_id: survivor,
+                        },
+                        created_at_ms: now,
+                    },
+                    PersistOp::UpsertExecutionEdge {
+                        edge: ExecutionEdge {
+                            parent_run_id: second_parent,
+                            child_run_id: absorbed,
+                        },
+                        created_at_ms: now,
+                    },
+                ])
+                .unwrap();
+
+            assert!(matches!(
+                store.apply_batch(vec![PersistOp::MergeTaskRuns { survivor, absorbed }]),
+                Err(StoreError::InvalidData { .. })
+            ));
+            assert_eq!(merged_into(&store.connection, absorbed), None);
+            assert_eq!(count(&store.connection, "execution_edges"), 2);
+        }
+    }
+
+    #[test]
+    fn alias_pruned_only_with_canonical_root() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let now = unix_now_ms().unwrap();
+        let root_run = RunId::new();
+        let alias = RunId::new();
+        store
+            .apply_batch(vec![
+                run_op(root_run, 1, TaskState::Running, now, false),
+                run_op(alias, 2, TaskState::Completed, now - 31 * DAY_MS, false),
+                PersistOp::MergeTaskRuns {
+                    survivor: root_run,
+                    absorbed: alias,
+                },
+            ])
+            .unwrap();
+
+        store.cleanup_retention(now).unwrap();
+        assert_eq!(count(&store.connection, "task_runs"), 2);
+        assert_eq!(count(&store.connection, "display_ordinals"), 2);
+
+        store
+            .apply_batch(vec![run_op(
+                root_run,
+                1,
+                TaskState::Completed,
+                now - 31 * DAY_MS,
+                false,
+            )])
+            .unwrap();
+        let stats = store.cleanup_retention(now).unwrap();
+
+        assert_eq!(stats.runs_pruned, 2);
+        assert_eq!(count(&store.connection, "task_runs"), 0);
+        assert_eq!(count(&store.connection, "display_ordinals"), 0);
+    }
+
+    #[test]
+    fn upsert_rejected_on_merged_row() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let now = unix_now_ms().unwrap();
+        let survivor = RunId::new();
+        let absorbed = RunId::new();
+        store
+            .apply_batch(vec![
+                run_op(survivor, 1, TaskState::Running, now, false),
+                run_op(absorbed, 2, TaskState::Running, now, false),
+                PersistOp::MergeTaskRuns { survivor, absorbed },
+            ])
+            .unwrap();
+
+        let error = store.apply_batch(vec![run_op(
+            absorbed,
+            2,
+            TaskState::Completed,
+            now + 1,
+            false,
+        )]);
+
+        assert!(matches!(error, Err(StoreError::InvalidData { .. })));
+        assert_eq!(merged_into(&store.connection, absorbed), Some(survivor));
+        assert_eq!(task_state(&store.connection, absorbed), "running");
+    }
+
+    #[test]
     fn owner_replace_read_and_location_update() {
         let (_directory, root) = test_root();
         let mut store = open_writer(&root).unwrap();
@@ -1674,15 +2699,36 @@ mod tests {
         state_at_ms: i64,
         controller_flag: bool,
     ) -> PersistOp {
+        run_op_with_key(
+            run_id,
+            RunKey::Controller(format!("controller-{run_id}")),
+            ordinal,
+            state,
+            state_at_ms,
+            controller_flag,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_op_with_key(
+        run_id: RunId,
+        key: RunKey,
+        ordinal: i64,
+        state: TaskState,
+        state_at_ms: i64,
+        controller_flag: bool,
+        native_session: Option<NativeSessionBinding>,
+    ) -> PersistOp {
         PersistOp::UpsertTaskRun(PersistTaskRun {
             task_run: TaskRun {
                 run_id,
-                key: RunKey::Controller(format!("controller-{run_id}")),
+                key,
                 display_ordinal: DisplayOrdinal::new(ordinal),
                 state,
                 has_controller_task_state_event: controller_flag,
             },
-            native_session: None,
+            native_session,
             created_at_ms: state_at_ms,
             updated_at_ms: state_at_ms,
             finished_at_ms: state.is_terminal().then_some(state_at_ms),
@@ -1715,6 +2761,111 @@ mod tests {
                 workspace_id: "old-workspace".to_owned(),
             },
         }
+    }
+
+    fn run_event(event_id: &str, task_run_id: RunId, timestamp_ms: i64) -> NormalizedEvent {
+        NormalizedEvent::ExecutionEnd {
+            metadata: EventMetadata {
+                event_id: event_id.to_owned(),
+                timestamp_ms,
+                source: "test".to_owned(),
+                source_event_type: "execution.end".to_owned(),
+                herdr_session: "session-a".to_owned(),
+                workspace_id: None,
+                tab_id: None,
+                pane_id: None,
+                terminal_id: None,
+                provider: None,
+                native_session_id: None,
+                task_run_id: Some(task_run_id),
+                agent_node_id: None,
+                task_state: None,
+                execution_parent: None,
+                dependency: None,
+                source_coverage: Vec::new(),
+                provider_metadata: None,
+            },
+            execution_id: "execution-1".to_owned(),
+        }
+    }
+
+    fn binding(connection: &Connection, run_id: RunId) -> (Option<String>, Option<String>) {
+        connection
+            .query_row(
+                "SELECT native_provider, native_session_id FROM task_runs WHERE run_id = ?1",
+                [run_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn codex_binding(native_session_id: &str) -> (Option<String>, Option<String>) {
+        (Some("codex".to_owned()), Some(native_session_id.to_owned()))
+    }
+
+    fn merged_into(connection: &Connection, run_id: RunId) -> Option<RunId> {
+        let value: Option<String> = connection
+            .query_row(
+                "SELECT merged_into FROM task_runs WHERE run_id = ?1",
+                [run_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        value.map(|target| RunId::parse(&target).unwrap())
+    }
+
+    fn referenced_run(connection: &Connection, table: &str, entity_id: &str) -> RunId {
+        let query = match table {
+            "executions" => "SELECT task_run_id FROM executions WHERE execution_id = ?1",
+            "agent_nodes" => "SELECT task_run_id FROM agent_nodes WHERE agent_node_id = ?1",
+            "events" => "SELECT task_run_id FROM events WHERE event_id = ?1",
+            _ => panic!("unsupported reference table {table}"),
+        };
+        let value: String = connection
+            .query_row(query, [entity_id], |row| row.get(0))
+            .unwrap();
+        RunId::parse(&value).unwrap()
+    }
+
+    fn execution_edge(connection: &Connection) -> (RunId, RunId, i64) {
+        let (parent, child, created_at_ms): (String, String, i64) = connection
+            .query_row(
+                "SELECT parent_run_id, child_run_id, created_at_ms FROM execution_edges",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        (
+            RunId::parse(&parent).unwrap(),
+            RunId::parse(&child).unwrap(),
+            created_at_ms,
+        )
+    }
+
+    fn dependency_edge(connection: &Connection) -> (RunId, RunId, i64) {
+        let (prerequisite, dependent, created_at_ms): (String, String, i64) = connection
+            .query_row(
+                "SELECT prerequisite_run_id, dependent_run_id, created_at_ms \
+                 FROM dependency_edges",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        (
+            RunId::parse(&prerequisite).unwrap(),
+            RunId::parse(&dependent).unwrap(),
+            created_at_ms,
+        )
+    }
+
+    fn task_state(connection: &Connection, run_id: RunId) -> String {
+        connection
+            .query_row(
+                "SELECT task_state FROM task_runs WHERE run_id = ?1",
+                [run_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     fn backup_files(directory: &Path) -> Vec<PathBuf> {

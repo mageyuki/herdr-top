@@ -209,12 +209,15 @@ CREATE TABLE IF NOT EXISTS task_runs (
                                          CHECK (has_controller_task_state_event IN (0, 1)),
     native_provider                  TEXT,
     native_session_id                TEXT,
+    merged_into                     TEXT,
     created_at_ms                    INTEGER NOT NULL,
     updated_at_ms                    INTEGER NOT NULL,
     finished_at_ms                   INTEGER,
     CHECK ((native_provider IS NULL) = (native_session_id IS NULL)),
+    CHECK (merged_into IS NULL OR merged_into <> run_id),
     FOREIGN KEY (native_provider, native_session_id)
-        REFERENCES native_agent_sessions(provider, native_session_id)
+        REFERENCES native_agent_sessions(provider, native_session_id),
+    FOREIGN KEY (merged_into) REFERENCES task_runs(run_id) ON DELETE CASCADE
 );
 CREATE UNIQUE INDEX IF NOT EXISTS task_runs_controller_key_unique
     ON task_runs(key_controller_id) WHERE key_kind = 'controller';
@@ -222,12 +225,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS task_runs_native_key_unique
     ON task_runs(key_provider, key_native_sid) WHERE key_kind = 'native';
 CREATE UNIQUE INDEX IF NOT EXISTS task_runs_native_path_key_unique
     ON task_runs(key_provider, key_native_path) WHERE key_kind = 'native_path';
-CREATE UNIQUE INDEX IF NOT EXISTS task_runs_provisional_key_unique
+CREATE INDEX IF NOT EXISTS task_runs_provisional_key_idx
     ON task_runs(key_terminal_id, key_start_ms, key_seq) WHERE key_kind = 'provisional';
 CREATE UNIQUE INDEX IF NOT EXISTS task_runs_native_session_binding_unique
     ON task_runs(native_provider, native_session_id) WHERE native_session_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS task_runs_retention_idx
     ON task_runs(task_state, finished_at_ms);
+CREATE INDEX IF NOT EXISTS task_runs_merged_into_idx ON task_runs(merged_into);
 
 CREATE TABLE IF NOT EXISTS agent_nodes (
     agent_node_id     TEXT PRIMARY KEY,

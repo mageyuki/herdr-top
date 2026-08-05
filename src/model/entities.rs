@@ -192,6 +192,16 @@ impl DomainModel {
     pub fn dependency_edges(&self) -> impl Iterator<Item = &DependencyEdge> {
         self.dependency_edges.iter()
     }
+
+    /// Adds a superseded key that resolves directly to its canonical task run.
+    pub fn insert_task_run_alias(&mut self, key: RunKey, canonical_run_id: RunId) -> Option<RunId> {
+        self.run_ids_by_key.insert(key, canonical_run_id)
+    }
+
+    /// Restores a historical run without making its collector-scoped key addressable.
+    pub fn insert_historical_task_run(&mut self, task_run: TaskRun) -> Option<TaskRun> {
+        self.task_runs.insert(task_run.run_id, task_run)
+    }
 }
 
 pub type SharedModel = tokio::sync::watch::Receiver<Arc<DomainModel>>;
