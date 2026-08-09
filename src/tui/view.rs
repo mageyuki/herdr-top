@@ -13,7 +13,8 @@ use crate::model::{
     AgentNode, DisplayOrdinal, DomainModel, ExecState, Provider, RunId, RunKey, TaskRun, TaskState,
 };
 
-use super::app::{AppState, HeaderInputs, NodeKey};
+use super::app::{AppState, HeaderInputs, NodeKey, ViewMode};
+use super::dag;
 
 const MIN_WIDTH: u16 = 48;
 const MIN_HEIGHT: u16 = 10;
@@ -25,6 +26,8 @@ pub(crate) struct TreeRow {
     pub(crate) key: NodeKey,
     pub(crate) depth: usize,
     pub(crate) label: String,
+    pub(crate) prerequisites: Vec<String>,
+    pub(crate) dependents: Vec<String>,
 }
 
 /// Draws a complete fixed-screen frame from immutable model and UI snapshots.
@@ -59,8 +62,11 @@ pub(super) fn render(
     );
 
     render_header(frame, header_area, model, quality, header);
-    let rows = build_tree_rows_named(model, state, Some(&header.session));
-    render_tree(frame, tree_area, &rows, state);
+    let rows = build_rows_named(model, state, Some(&header.session));
+    match state.view_mode() {
+        ViewMode::ExecutionTree => render_tree(frame, tree_area, &rows, state),
+        ViewMode::DependencyDag => render_dag(frame, tree_area, &rows, state),
+    }
     render_activity(frame, activity_area, &rows, state);
     frame.render_widget(
         Paragraph::new(footer_line(usize::from(footer_area.width))),
@@ -91,22 +97,7 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, rows: &[TreeRow], state: &AppS
     if viewport_height == 0 {
         return;
     }
-    let selected_index = state
-        .selected()
-        .and_then(|selected| rows.iter().position(|row| &row.key == selected));
-    let start = if state.is_following() {
-        rows.len().saturating_sub(viewport_height)
-    } else {
-        selected_index
-            .map(|index| {
-                if index >= viewport_height {
-                    index.saturating_add(1).saturating_sub(viewport_height)
-                } else {
-                    0
-                }
-            })
-            .unwrap_or(0)
-    };
+    let start = viewport_start(rows, state, viewport_height);
     let width = usize::from(inner.width);
     let lines = rows
         .iter()
@@ -126,6 +117,98 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, rows: &[TreeRow], state: &AppS
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_dag(frame: &mut Frame<'_>, area: Rect, rows: &[TreeRow], state: &AppState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Dependency DAG ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let width = usize::from(inner.width);
+    let (run_width, prerequisite_width, dependent_width) = dag_column_widths(width);
+    let heading = format!(
+        "{} │ {} │ {}",
+        pad_to_width("Task Run", run_width),
+        pad_to_width("Prereqs", prerequisite_width),
+        pad_to_width("Dependents", dependent_width),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            truncate_to_width(&heading, width),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+
+    let viewport_height = usize::from(inner.height.saturating_sub(1));
+    if viewport_height == 0 {
+        return;
+    }
+    let start = viewport_start(rows, state, viewport_height);
+    let lines = rows
+        .iter()
+        .skip(start)
+        .take(viewport_height)
+        .map(|row| {
+            let selected = state.selected() == Some(&row.key);
+            let marker = if selected { "> " } else { "  " };
+            let run = pad_to_width(&format!("{marker}{}", row.label), run_width);
+            let prerequisites = pad_to_width(&row.prerequisites.join(", "), prerequisite_width);
+            let dependents = pad_to_width(&row.dependents.join(", "), dependent_width);
+            let text = truncate_to_width(&format!("{run} │ {prerequisites} │ {dependents}"), width);
+            let style = if selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(text, style))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(
+            inner.x,
+            inner.y.saturating_add(1),
+            inner.width,
+            inner.height.saturating_sub(1),
+        ),
+    );
+}
+
+fn viewport_start(rows: &[TreeRow], state: &AppState, viewport_height: usize) -> usize {
+    if state.is_following() {
+        return rows.len().saturating_sub(viewport_height);
+    }
+    state
+        .selected()
+        .and_then(|selected| rows.iter().position(|row| &row.key == selected))
+        .map(|index| {
+            if index >= viewport_height {
+                index.saturating_add(1).saturating_sub(viewport_height)
+            } else {
+                0
+            }
+        })
+        .unwrap_or(0)
+}
+
+fn dag_column_widths(width: usize) -> (usize, usize, usize) {
+    let content = width.saturating_sub(6);
+    let prerequisite = content / 4;
+    let dependent = content / 4;
+    let run = content.saturating_sub(prerequisite.saturating_add(dependent));
+    (run, prerequisite, dependent)
+}
+
+fn pad_to_width(value: &str, width: usize) -> String {
+    let value = truncate_to_width(value, width);
+    let padding = width.saturating_sub(Span::raw(value.as_str()).width());
+    format!("{value}{}", " ".repeat(padding))
 }
 
 fn render_activity(frame: &mut Frame<'_>, area: Rect, rows: &[TreeRow], state: &AppState) {
@@ -306,8 +389,20 @@ fn quality_style(quality: ObservationQuality) -> Style {
     Style::default().fg(color).add_modifier(Modifier::BOLD)
 }
 
+#[cfg(test)]
 pub(crate) fn build_tree_rows(model: &DomainModel, state: &AppState) -> Vec<TreeRow> {
     build_tree_rows_named(model, state, None)
+}
+
+pub(crate) fn build_rows(model: &DomainModel, state: &AppState) -> Vec<TreeRow> {
+    build_rows_named(model, state, None)
+}
+
+fn build_rows_named(model: &DomainModel, state: &AppState, session: Option<&str>) -> Vec<TreeRow> {
+    match state.view_mode() {
+        ViewMode::ExecutionTree => build_tree_rows_named(model, state, session),
+        ViewMode::DependencyDag => dag::build_rows(model, state.dag_order()),
+    }
 }
 
 fn build_tree_rows_named(
@@ -321,6 +416,8 @@ fn build_tree_rows_named(
         label: session
             .map(|name| format!("Session: {}", safe_text(name)))
             .unwrap_or_else(|| "Session".to_owned()),
+        prerequisites: Vec::new(),
+        dependents: Vec::new(),
     }];
     let (mut pane_runs, unattached) = place_runs(model, state);
 
@@ -339,6 +436,8 @@ fn build_tree_rows_named(
             key: NodeKey::Workspace(workspace.workspace_id.clone()),
             depth: 1,
             label: format!("Workspace: {}", safe_text(&workspace.workspace_id)),
+            prerequisites: Vec::new(),
+            dependents: Vec::new(),
         });
         let mut tabs = model
             .tabs()
@@ -358,6 +457,8 @@ fn build_tree_rows_named(
                 key: NodeKey::Tab(tab.tab_id.clone()),
                 depth: 2,
                 label: format!("Tab: {}", safe_text(&tab.tab_id)),
+                prerequisites: Vec::new(),
+                dependents: Vec::new(),
             });
             let mut panes = model
                 .panes()
@@ -379,6 +480,8 @@ fn build_tree_rows_named(
                     key: NodeKey::Pane(pane.pane_id.clone()),
                     depth: 3,
                     label: format!("Pane: {}", safe_text(&pane.pane_id)),
+                    prerequisites: Vec::new(),
+                    dependents: Vec::new(),
                 });
                 if let Some(runs) = pane_runs.remove(&pane.pane_id) {
                     append_run_rows(&mut rows, model, runs, Some(&pane.pane_id), 4);
@@ -392,6 +495,8 @@ fn build_tree_rows_named(
             key: NodeKey::UnattachedGroup,
             depth: 1,
             label: "Unattached Task Runs".to_owned(),
+            prerequisites: Vec::new(),
+            dependents: Vec::new(),
         });
         let runs = unattached
             .into_iter()
@@ -487,6 +592,8 @@ fn append_run_rows(
             },
             depth,
             label: task_run_label(model, run, shared),
+            prerequisites: Vec::new(),
+            dependents: Vec::new(),
         });
         let agents = model
             .agent_nodes()
@@ -552,6 +659,8 @@ fn append_agent_subtree(
         },
         depth,
         label: agent_node_label(agent),
+        prerequisites: Vec::new(),
+        dependents: Vec::new(),
     });
     if let Some(child_nodes) = children.get(agent.agent_node_id.as_str()) {
         for child in child_nodes {
@@ -592,7 +701,7 @@ fn agent_node_label(agent: &AgentNode) -> String {
     )
 }
 
-fn task_run_label(model: &DomainModel, run: &TaskRun, shared: bool) -> String {
+pub(crate) fn task_run_label(model: &DomainModel, run: &TaskRun, shared: bool) -> String {
     let mut label = format!(
         "Task Run: {} [{}]",
         run_name(run),
@@ -639,7 +748,7 @@ fn run_name(run: &TaskRun) -> String {
     }
 }
 
-fn short_run_name(run: &TaskRun) -> String {
+pub(crate) fn short_run_name(run: &TaskRun) -> String {
     match &run.key {
         RunKey::Controller(name) => safe_text(name),
         RunKey::Native { sid, .. } => safe_text(sid),
@@ -730,6 +839,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::{Buffer, CellWidth};
@@ -739,8 +849,8 @@ mod tests {
     use super::*;
     use crate::herdr::collector::ObservationQuality;
     use crate::model::{
-        AgentNode, DisplayOrdinal, DomainModel, ExecState, Execution, ExecutionEdge, Pane,
-        Provider, RunId, RunKey, Tab, TaskRun, TaskState, Workspace,
+        AgentNode, DependencyEdge, DisplayOrdinal, DomainModel, ExecState, Execution,
+        ExecutionEdge, Pane, Provider, RunId, RunKey, Tab, TaskRun, TaskState, Workspace,
     };
     use crate::tui::app::{App, AppState, HeaderInputs};
 
@@ -875,6 +985,7 @@ mod tests {
         assert!(screen.contains("q: stop Top only"));
         assert!(screen.contains("agents continue"));
         assert!(screen.contains("detach: Top runs"));
+        assert!(screen.contains("tab view"));
 
         let session_x = rows
             .iter()
@@ -1338,5 +1449,76 @@ mod tests {
                 .any(|label| label.contains("Unattached Task Runs"))
         );
         assert!(labels.iter().any(|label| label.contains("orphan")));
+    }
+
+    #[test]
+    fn dag_renders_direct_columns_unicode_safely_at_minimum_width_and_tracks_activity() {
+        let prerequisite = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let dependent = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let mut model = DomainModel::default();
+        for (run_id, label, ordinal) in [
+            (prerequisite, "前提🙂", 1),
+            (dependent, "依存先🙂with-a-long-tail", 2),
+        ] {
+            model.insert_task_run(TaskRun {
+                run_id,
+                key: RunKey::Controller(label.to_owned()),
+                display_ordinal: DisplayOrdinal::new(ordinal),
+                state: TaskState::Running,
+                has_controller_task_state_event: true,
+            });
+        }
+        model.insert_dependency_edge(DependencyEdge {
+            prerequisite_run_id: prerequisite,
+            dependent_run_id: dependent,
+        });
+        let mut app = app(model, ObservationQuality::Live, "dag-session");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let rows = render(&app, 48, 18);
+        let screen = rows.join("\n");
+
+        assert!(screen.contains("Dependency DAG"));
+        assert!(screen.contains("Task Run"));
+        assert!(screen.contains("Prereqs"));
+        assert!(screen.contains("Dependents"));
+        assert!(screen.contains("前提"));
+        assert!(screen.contains("Selected: Task Run: 依存先"));
+        for row in &rows {
+            assert!(
+                Line::raw(row.as_str()).width() <= 48,
+                "overflowing row: {row:?}"
+            );
+            assert!(!row.contains('\u{fffd}'));
+        }
+    }
+
+    #[test]
+    fn thousand_edge_dag_follow_window_shows_exact_tail() {
+        let mut model = DomainModel::default();
+        let ids = (0..=1_000).map(|_| RunId::new()).collect::<Vec<_>>();
+        for (index, run_id) in ids.iter().copied().enumerate() {
+            model.insert_task_run(TaskRun {
+                run_id,
+                key: RunKey::Controller(format!("run-{index:04}")),
+                display_ordinal: DisplayOrdinal::new(index as i64),
+                state: TaskState::Running,
+                has_controller_task_state_event: true,
+            });
+        }
+        for pair in ids.windows(2) {
+            model.insert_dependency_edge(DependencyEdge {
+                prerequisite_run_id: pair[0],
+                dependent_run_id: pair[1],
+            });
+        }
+        let mut app = app(model, ObservationQuality::Live, "large-dag");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let rows = render(&app, 100, 14);
+        let dag = rows[3..9].join("\n");
+
+        assert!(dag.contains("Task Run: run-0998"));
+        assert!(dag.contains("Task Run: run-0999"));
+        assert!(dag.contains("Task Run: run-1000"));
+        assert!(!dag.contains("Task Run: run-0997"));
     }
 }

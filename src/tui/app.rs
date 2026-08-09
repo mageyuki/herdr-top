@@ -16,6 +16,7 @@ use ratatui::{Frame, Terminal};
 use crate::herdr::collector::{ObservationQuality, SourceCoverageRegistry};
 use crate::model::{DomainModel, RunId, RunKey, SharedModel};
 
+use super::dag::DagOrder;
 use super::view::{self, TreeRow};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(100);
@@ -54,6 +55,22 @@ pub enum LoopControl {
     Continue,
     /// Exit only the monitor loop; no producer is stopped.
     Exit,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ViewMode {
+    #[default]
+    ExecutionTree,
+    DependencyDag,
+}
+
+impl ViewMode {
+    const fn toggled(self) -> Self {
+        match self {
+            Self::ExecutionTree => Self::DependencyDag,
+            Self::DependencyDag => Self::ExecutionTree,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -120,6 +137,8 @@ pub(crate) struct AppState {
     follow: bool,
     selection_reason: Option<String>,
     execution_order: StableOrder,
+    view_mode: ViewMode,
+    dag_order: DagOrder,
 }
 
 impl AppState {
@@ -128,6 +147,7 @@ impl AppState {
         // their in-session adoption order chooses a run's most recent known hosting pane.
         self.execution_order
             .adopt(model.executions().map(|item| item.execution_id.clone()));
+        self.dag_order.recompute(model);
     }
 
     pub(super) fn execution_order(&self, id: &str) -> u64 {
@@ -144,6 +164,14 @@ impl AppState {
 
     pub(super) fn selection_reason(&self) -> Option<&str> {
         self.selection_reason.as_deref()
+    }
+
+    pub(super) const fn view_mode(&self) -> ViewMode {
+        self.view_mode
+    }
+
+    pub(super) const fn dag_order(&self) -> &DagOrder {
+        &self.dag_order
     }
 }
 
@@ -179,7 +207,7 @@ impl App {
             },
         };
         app.state.adopt_model(app.model.as_ref());
-        let last = view::build_tree_rows(app.model.as_ref(), &app.state)
+        let last = view::build_rows(app.model.as_ref(), &app.state)
             .last()
             .map(|row| row.key.clone());
         app.set_selection(last);
@@ -188,13 +216,13 @@ impl App {
 
     /// Refreshes the cached coherent model and independently published quality.
     pub fn refresh(&mut self) {
-        let old_rows = view::build_tree_rows(self.model.as_ref(), &self.state);
+        let old_rows = view::build_rows(self.model.as_ref(), &self.state);
         let new_model = Arc::clone(&self.model_receiver.borrow_and_update());
         self.quality = *self.quality_receiver.borrow_and_update();
         self.header.source_coverage.borrow_and_update();
         self.state.adopt_model(new_model.as_ref());
         self.model = new_model;
-        let new_rows = view::build_tree_rows(self.model.as_ref(), &self.state);
+        let new_rows = view::build_rows(self.model.as_ref(), &self.state);
         self.recover_selection(&old_rows, &new_rows);
     }
 
@@ -237,6 +265,10 @@ impl App {
             }
             KeyCode::Char('f') | KeyCode::End => {
                 self.resume_follow();
+                LoopControl::Continue
+            }
+            KeyCode::Tab => {
+                self.toggle_view();
                 LoopControl::Continue
             }
             _ => LoopControl::Continue,
@@ -294,7 +326,7 @@ impl App {
         &self.state
     }
 
-    /// Returns whether the execution-tree viewport is pinned to its newest rows.
+    /// Returns whether the active viewport is pinned to its newest rows.
     #[must_use]
     pub const fn is_following(&self) -> bool {
         self.state.follow
@@ -309,7 +341,7 @@ impl App {
     fn move_selection(&mut self, down: bool) {
         self.state.follow = false;
         self.state.selection_reason = None;
-        let rows = view::build_tree_rows(self.model.as_ref(), &self.state);
+        let rows = view::build_rows(self.model.as_ref(), &self.state);
         if rows.is_empty() {
             self.set_selection(None);
             return;
@@ -331,10 +363,33 @@ impl App {
     fn resume_follow(&mut self) {
         self.state.follow = true;
         self.state.selection_reason = None;
-        let selected = view::build_tree_rows(self.model.as_ref(), &self.state)
+        let selected = view::build_rows(self.model.as_ref(), &self.state)
             .last()
             .map(|row| row.key.clone());
         self.set_selection(selected);
+    }
+
+    fn toggle_view(&mut self) {
+        let previous = self.state.selected.clone();
+        self.state.view_mode = self.state.view_mode.toggled();
+        self.state.selection_reason = None;
+        let rows = view::build_rows(self.model.as_ref(), &self.state);
+        let replacement = previous.as_ref().and_then(|selected| {
+            selected.run_id().and_then(|run_id| {
+                if self.state.view_mode == ViewMode::ExecutionTree {
+                    preferred_run_row(&rows, run_id, selected).map(|row| row.key.clone())
+                } else {
+                    rows.iter()
+                        .find(|row| row.key.run_id() == Some(run_id))
+                        .map(|row| row.key.clone())
+                }
+            })
+        });
+        if replacement.is_some() {
+            self.set_selection(replacement);
+        } else {
+            self.resume_follow();
+        }
     }
 
     fn set_selection(&mut self, selected: Option<NodeKey>) {
@@ -501,8 +556,8 @@ mod tests {
     use crate::herdr::collector::ObservationQuality;
     use crate::herdr::collector::{CoverageSource, SourceAvailability, SourceCoverageRegistry};
     use crate::model::{
-        DisplayOrdinal, DomainModel, ExecState, Execution, Pane, RunId, RunKey, Tab, TaskRun,
-        TaskState, Workspace,
+        DependencyEdge, DisplayOrdinal, DomainModel, ExecState, Execution, Pane, RunId, RunKey,
+        Tab, TaskRun, TaskState, Workspace,
     };
 
     fn run_id(value: &str) -> RunId {
@@ -574,6 +629,275 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    fn render_lines(app: &App, width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(width))
+            .map(|cells| cells.iter().map(|cell| cell.symbol()).collect())
+            .collect()
+    }
+
+    fn displayed_run_names(app: &App) -> Vec<String> {
+        view::build_rows(app.model(), app.state())
+            .into_iter()
+            .filter_map(|row| row.key.run_id())
+            .map(|run_id| match &app.model().task_run(&run_id).unwrap().key {
+                RunKey::Controller(name) => name.clone(),
+                _ => unreachable!("test creates controller runs"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tab_round_trip_preserves_selected_run_across_modes() {
+        let first = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let last = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let (mut app, _model_sender) = app_with_model(model_with_runs(&[
+            (first, "first", 1, TaskState::Running),
+            (last, "last", 2, TaskState::Running),
+        ]));
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.selected_run_id(), Some(first));
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.state().view_mode(), ViewMode::DependencyDag);
+        assert_eq!(app.selected_run_id(), Some(first));
+        assert_eq!(
+            app.state().selected(),
+            Some(&NodeKey::Run {
+                run_id: first,
+                pane_id: None,
+            })
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.state().view_mode(), ViewMode::ExecutionTree);
+        assert_eq!(app.selected_run_id(), Some(first));
+        assert!(matches!(
+            app.state().selected(),
+            Some(NodeKey::Run {
+                run_id,
+                pane_id: Some(_),
+            }) if *run_id == first
+        ));
+    }
+
+    #[test]
+    fn tree_to_dag_maps_a_shared_run_occurrence_to_one_run_row() {
+        let shared = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut model = model_with_runs(&[(shared, "shared", 1, TaskState::Running)]);
+        model.insert_pane(Pane {
+            pane_id: "pane-2".to_owned(),
+            workspace_id: "workspace".to_owned(),
+            tab_id: "tab".to_owned(),
+            terminal_id: "terminal-2".to_owned(),
+        });
+        model.insert_execution(Execution {
+            execution_id: "execution-shared-2".to_owned(),
+            pane_id: "pane-2".to_owned(),
+            terminal_id: "terminal-2".to_owned(),
+            task_run_id: shared,
+            state: ExecState::Working,
+        });
+        let (mut app, _sender) = app_with_model(model);
+        app.state.follow = false;
+        app.set_selection(Some(NodeKey::Run {
+            run_id: shared,
+            pane_id: Some("pane-2".to_owned()),
+        }));
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert_eq!(
+            app.state().selected(),
+            Some(&NodeKey::Run {
+                run_id: shared,
+                pane_id: None,
+            })
+        );
+        assert_eq!(
+            view::build_rows(app.model(), app.state())
+                .iter()
+                .filter(|row| row.key.run_id() == Some(shared))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn tab_from_non_run_selection_falls_back_to_follow() {
+        let run = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let (mut app, _model_sender) =
+            app_with_model(model_with_runs(&[(run, "run", 1, TaskState::Running)]));
+        app.state.follow = false;
+        app.set_selection(Some(NodeKey::Workspace("workspace".to_owned())));
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert_eq!(app.state().view_mode(), ViewMode::DependencyDag);
+        assert!(app.is_following());
+        assert_eq!(app.selected_run_id(), Some(run));
+    }
+
+    #[test]
+    fn dag_mode_refresh_consumes_one_coalesced_edge_batch() {
+        let a = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let v = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let x = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        let u = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAY");
+        let initial = model_with_runs(&[
+            (a, "A", 1, TaskState::Running),
+            (v, "V", 2, TaskState::Running),
+            (x, "X", 3, TaskState::Running),
+            (u, "U", 4, TaskState::Running),
+        ]);
+        let mut refreshed = initial.clone();
+        refreshed.insert_dependency_edge(DependencyEdge {
+            prerequisite_run_id: u,
+            dependent_run_id: v,
+        });
+        refreshed.insert_dependency_edge(DependencyEdge {
+            prerequisite_run_id: x,
+            dependent_run_id: a,
+        });
+        let (mut app, model_sender) = app_with_model(initial);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(displayed_run_names(&app), ["A", "V", "X", "U"]);
+
+        model_sender.send(Arc::new(refreshed)).unwrap();
+        app.refresh();
+
+        assert_eq!(displayed_run_names(&app), ["X", "A", "U", "V"]);
+    }
+
+    #[test]
+    fn dag_refresh_keeps_neighbor_and_merge_selection_reasons() {
+        let first = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let selected = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let next = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        let (mut closed, sender) = app_with_model(model_with_runs(&[
+            (first, "first", 1, TaskState::Running),
+            (selected, "selected", 2, TaskState::Running),
+            (next, "next", 3, TaskState::Running),
+        ]));
+        closed.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        closed.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        sender
+            .send(Arc::new(model_with_runs(&[
+                (first, "first", 1, TaskState::Running),
+                (next, "next", 3, TaskState::Running),
+            ])))
+            .unwrap();
+        closed.refresh();
+        assert_eq!(closed.selected_run_id(), Some(next));
+        assert!(
+            closed
+                .state()
+                .selection_reason()
+                .unwrap()
+                .contains("closed")
+        );
+
+        let survivor = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAY");
+        let absorbed_key = RunKey::Controller("absorbed".to_owned());
+        let (mut merged, sender) = app_with_model(model_with_runs(&[
+            (first, "first", 1, TaskState::Running),
+            (selected, "absorbed", 2, TaskState::Running),
+            (survivor, "survivor", 3, TaskState::Running),
+        ]));
+        merged.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        merged.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        let mut replacement = model_with_runs(&[
+            (first, "first", 1, TaskState::Running),
+            (survivor, "survivor", 3, TaskState::Running),
+        ]);
+        replacement.insert_task_run_alias(absorbed_key, survivor);
+        sender.send(Arc::new(replacement)).unwrap();
+        merged.refresh();
+        assert_eq!(merged.selected_run_id(), Some(survivor));
+        assert!(
+            merged
+                .state()
+                .selection_reason()
+                .unwrap()
+                .contains("merged into")
+        );
+    }
+
+    #[test]
+    fn dag_selection_movement_and_resume_follow_use_dag_rows() {
+        let first = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let middle = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let last = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        let (mut app, _model_sender) = app_with_model(model_with_runs(&[
+            (first, "first", 1, TaskState::Running),
+            (middle, "middle", 2, TaskState::Running),
+            (last, "last", 3, TaskState::Running),
+        ]));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.selected_run_id(), Some(last));
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.selected_run_id(), Some(middle));
+        assert!(!app.is_following());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert_eq!(app.selected_run_id(), Some(last));
+        assert!(app.is_following());
+    }
+
+    #[test]
+    fn toggled_viewport_pins_bottom_only_while_following() {
+        let ids = [
+            run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW"),
+            run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX"),
+            run_id("01ARZ3NDEKTSV4RRFFQ69G5FAY"),
+            run_id("01ARZ3NDEKTSV4RRFFQ69G5FAZ"),
+            run_id("01ARZ3NDEKTSV4RRFFQ69G5FB0"),
+            run_id("01ARZ3NDEKTSV4RRFFQ69G5FB1"),
+            run_id("01ARZ3NDEKTSV4RRFFQ69G5FB2"),
+        ];
+        let runs = ids
+            .iter()
+            .enumerate()
+            .map(|(index, run_id)| (*run_id, format!("run-{index}"), index as i64 + 1))
+            .collect::<Vec<_>>();
+        let input = runs
+            .iter()
+            .map(|(run_id, label, ordinal)| (*run_id, label.as_str(), *ordinal, TaskState::Running))
+            .collect::<Vec<_>>();
+
+        let (mut following, _sender) = app_with_model(model_with_runs(&input));
+        following.set_selection(Some(NodeKey::Run {
+            run_id: ids[0],
+            pane_id: Some("pane".to_owned()),
+        }));
+        assert!(following.is_following());
+        following.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let following_rows = render_lines(&following, 100, 14);
+        let following_view = following_rows[3..9].join("\n");
+        assert!(following_view.contains("Dependency DAG"));
+        assert!(!following_view.contains("> Task Run: run-0"));
+        assert!(following_view.contains("Task Run: run-7"));
+
+        let (mut manual, _sender) = app_with_model(model_with_runs(&input));
+        manual.state.follow = false;
+        manual.set_selection(Some(NodeKey::Run {
+            run_id: ids[0],
+            pane_id: Some("pane".to_owned()),
+        }));
+        manual.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let manual_rows = render_lines(&manual, 100, 14);
+        let manual_view = manual_rows[3..9].join("\n");
+        assert!(manual_view.contains("> Task Run: run-0"));
     }
 
     #[test]
