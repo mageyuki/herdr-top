@@ -20,6 +20,7 @@ use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
 use crate::model::{ExecState, MinimalProviderMetadata, Provider};
 
+pub mod claude;
 pub mod codex;
 pub mod tail;
 
