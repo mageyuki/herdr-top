@@ -38,6 +38,7 @@ The five real files in `tests/fixtures/provider/` were adapted from the research
 | `codex-depth2-grandchild.jsonl` | Depth-2 `session_meta`, where `agent_path` has three segments; this is the only locally evidenced depth-2 chain. |
 | `codex-depth3-synthetic.jsonl` | **Synthetic, format-plausible, unevidenced:** depth-3 `agent_path`, a deeper `started` activity for parent-prefix resolution, and a non-allowlisted prompt sentinel. |
 | `codex-fork-only-synthetic.jsonl` | **Synthetic, format-plausible, unevidenced:** `forked_from_id` without `parent_thread_id`, proving that a fork alone creates no parent edge. |
+| `codex-allowlist-overlay-synthetic.jsonl` | **Synthetic, format-plausible, unevidenced:** allowlisted root/child topology plus unique prompt, response, tool-argument, and malformed-raw sentinels for the non-vacuous artifact scanner. |
 | `claude-depth1-subagent.jsonl` | The `isSidechain`/`agentId`/parent `sessionId` structure and redacted message stubs. |
 | `claude-depth1-parent.jsonl` | Main-chain records with redacted messages; `toolUseResult` is absent (0 records), limited to the first 50 records. |
 

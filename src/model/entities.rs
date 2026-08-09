@@ -206,6 +206,168 @@ pub struct ControllerDiagnosticsHandle {
     accept_failures: Arc<AtomicU64>,
 }
 
+/// Provider-I/O counters exposed through coherent domain-model snapshots.
+#[derive(Clone, Debug, Default)]
+pub struct ProviderDiagnostics {
+    handle: ProviderDiagnosticsHandle,
+}
+
+impl ProviderDiagnostics {
+    #[must_use]
+    pub fn dropped_hints(&self) -> u64 {
+        self.handle.dropped_hints()
+    }
+
+    #[must_use]
+    pub fn coalesced_updates(&self) -> u64 {
+        self.handle.coalesced_updates()
+    }
+
+    #[must_use]
+    pub fn duplicate_events(&self) -> u64 {
+        self.handle.duplicate_events()
+    }
+
+    #[must_use]
+    pub fn egress_saturations(&self) -> u64 {
+        self.handle.egress_saturations()
+    }
+
+    #[must_use]
+    pub fn egress_closed(&self) -> u64 {
+        self.handle.egress_closed()
+    }
+
+    #[must_use]
+    pub fn malformed_records(&self) -> u64 {
+        self.handle.malformed_records()
+    }
+
+    #[must_use]
+    pub fn watch_cap_fallbacks(&self) -> u64 {
+        self.handle.watch_cap_fallbacks()
+    }
+
+    #[must_use]
+    pub fn provider_cycles(&self) -> u64 {
+        self.handle.provider_cycles()
+    }
+
+    #[must_use]
+    pub fn provider_io_errors(&self) -> u64 {
+        self.handle.provider_io_errors()
+    }
+
+    /// Returns the atomic handle shared with the provider I/O thread.
+    #[must_use]
+    pub fn handle(&self) -> ProviderDiagnosticsHandle {
+        self.handle.clone()
+    }
+}
+
+/// Provider-thread-shareable atomic diagnostic counters.
+#[derive(Clone, Debug, Default)]
+pub struct ProviderDiagnosticsHandle {
+    dropped_hints: Arc<AtomicU64>,
+    coalesced_updates: Arc<AtomicU64>,
+    duplicate_events: Arc<AtomicU64>,
+    egress_saturations: Arc<AtomicU64>,
+    egress_closed: Arc<AtomicU64>,
+    malformed_records: Arc<AtomicU64>,
+    watch_cap_fallbacks: Arc<AtomicU64>,
+    provider_cycles: Arc<AtomicU64>,
+    provider_io_errors: Arc<AtomicU64>,
+}
+
+impl ProviderDiagnosticsHandle {
+    fn increment(counter: &AtomicU64) {
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            Some(value.saturating_add(1))
+        });
+    }
+
+    pub fn record_dropped_hint(&self) {
+        Self::increment(&self.dropped_hints);
+    }
+
+    pub fn record_coalesced_update(&self) {
+        Self::increment(&self.coalesced_updates);
+    }
+
+    pub fn record_duplicate_event(&self) {
+        Self::increment(&self.duplicate_events);
+    }
+
+    pub fn record_egress_saturation(&self) {
+        Self::increment(&self.egress_saturations);
+    }
+
+    pub fn record_egress_closed(&self) {
+        Self::increment(&self.egress_closed);
+    }
+
+    pub fn record_malformed_record(&self) {
+        Self::increment(&self.malformed_records);
+    }
+
+    pub fn record_watch_cap_fallback(&self) {
+        Self::increment(&self.watch_cap_fallbacks);
+    }
+
+    pub fn record_provider_cycle(&self) {
+        Self::increment(&self.provider_cycles);
+    }
+
+    pub fn record_provider_io_error(&self) {
+        Self::increment(&self.provider_io_errors);
+    }
+
+    #[must_use]
+    pub fn dropped_hints(&self) -> u64 {
+        self.dropped_hints.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn coalesced_updates(&self) -> u64 {
+        self.coalesced_updates.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn duplicate_events(&self) -> u64 {
+        self.duplicate_events.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn egress_saturations(&self) -> u64 {
+        self.egress_saturations.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn egress_closed(&self) -> u64 {
+        self.egress_closed.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn malformed_records(&self) -> u64 {
+        self.malformed_records.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn watch_cap_fallbacks(&self) -> u64 {
+        self.watch_cap_fallbacks.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn provider_cycles(&self) -> u64 {
+        self.provider_cycles.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn provider_io_errors(&self) -> u64 {
+        self.provider_io_errors.load(Ordering::Relaxed)
+    }
+}
+
 impl ControllerDiagnosticsHandle {
     /// Records one failed Controller listener accept call.
     pub fn record_accept_failure(&self) {
@@ -250,6 +412,7 @@ pub struct DomainModel {
     execution_edges: HashSet<ExecutionEdge>,
     dependency_edges: HashSet<DependencyEdge>,
     controller_diagnostics: ControllerDiagnostics,
+    provider_diagnostics: ProviderDiagnostics,
 }
 
 impl DomainModel {
@@ -261,6 +424,12 @@ impl DomainModel {
 
     pub(crate) const fn controller_diagnostics_mut(&mut self) -> &mut ControllerDiagnostics {
         &mut self.controller_diagnostics
+    }
+
+    /// Returns the provider I/O diagnostic counters.
+    #[must_use]
+    pub const fn provider_diagnostics(&self) -> &ProviderDiagnostics {
+        &self.provider_diagnostics
     }
 
     pub fn insert_workspace(&mut self, workspace: Workspace) -> Option<Workspace> {

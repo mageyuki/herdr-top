@@ -9,7 +9,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -18,7 +18,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
-use crate::model::{ExecState, MinimalProviderMetadata, Provider};
+use crate::model::{ExecState, MinimalProviderMetadata, Provider, ProviderDiagnosticsHandle};
 
 pub mod claude;
 pub mod codex;
@@ -760,93 +760,78 @@ const fn provider_rank(provider: Provider) -> u8 {
     }
 }
 
-#[derive(Debug, Default)]
-struct DiagnosticCounters {
-    dropped_hints: AtomicU64,
-    coalesced_updates: AtomicU64,
-    duplicate_events: AtomicU64,
-    egress_saturations: AtomicU64,
-    egress_closed: AtomicU64,
-    malformed_records: AtomicU64,
-    watch_cap_fallbacks: AtomicU64,
-    provider_cycles: AtomicU64,
-    provider_io_errors: AtomicU64,
-}
-
 /// Shareable provider diagnostic counters.
 #[derive(Clone, Debug, Default)]
-pub struct ProviderDiagnostics(Arc<DiagnosticCounters>);
+pub struct ProviderDiagnostics(ProviderDiagnosticsHandle);
 
 impl ProviderDiagnostics {
-    fn increment(counter: &AtomicU64) {
-        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            Some(value.saturating_add(1))
-        });
+    pub(crate) const fn from_model_handle(handle: ProviderDiagnosticsHandle) -> Self {
+        Self(handle)
     }
 
     fn record_dropped_hint(&self) {
-        Self::increment(&self.0.dropped_hints);
+        self.0.record_dropped_hint();
     }
     fn record_coalesced(&self) {
-        Self::increment(&self.0.coalesced_updates);
+        self.0.record_coalesced_update();
     }
     fn record_duplicate(&self) {
-        Self::increment(&self.0.duplicate_events);
+        self.0.record_duplicate_event();
     }
     fn record_egress_saturation(&self) {
-        Self::increment(&self.0.egress_saturations);
+        self.0.record_egress_saturation();
     }
     fn record_egress_closed(&self) {
-        Self::increment(&self.0.egress_closed);
+        self.0.record_egress_closed();
     }
     fn record_malformed(&self) {
-        Self::increment(&self.0.malformed_records);
+        self.0.record_malformed_record();
     }
     fn record_watch_cap_fallback(&self) {
-        Self::increment(&self.0.watch_cap_fallbacks);
+        self.0.record_watch_cap_fallback();
     }
     fn record_cycle(&self) {
-        Self::increment(&self.0.provider_cycles);
+        self.0.record_provider_cycle();
     }
     fn record_io_error(&self) {
-        Self::increment(&self.0.provider_io_errors);
+        self.0.record_provider_io_error();
     }
 
     #[must_use]
     pub fn dropped_hints(&self) -> u64 {
-        self.0.dropped_hints.load(Ordering::Relaxed)
+        self.0.dropped_hints()
     }
     #[must_use]
     pub fn coalesced_updates(&self) -> u64 {
-        self.0.coalesced_updates.load(Ordering::Relaxed)
+        self.0.coalesced_updates()
     }
     #[must_use]
     pub fn duplicate_events(&self) -> u64 {
-        self.0.duplicate_events.load(Ordering::Relaxed)
+        self.0.duplicate_events()
     }
     #[must_use]
     pub fn egress_saturations(&self) -> u64 {
-        self.0.egress_saturations.load(Ordering::Relaxed)
+        self.0.egress_saturations()
     }
     #[must_use]
     pub fn egress_closed(&self) -> u64 {
-        self.0.egress_closed.load(Ordering::Relaxed)
+        self.0.egress_closed()
     }
     #[must_use]
     pub fn malformed_records(&self) -> u64 {
-        self.0.malformed_records.load(Ordering::Relaxed)
+        self.0.malformed_records()
     }
     #[must_use]
     pub fn watch_cap_fallbacks(&self) -> u64 {
-        self.0.watch_cap_fallbacks.load(Ordering::Relaxed)
+        self.0.watch_cap_fallbacks()
     }
     #[must_use]
     pub fn provider_cycles(&self) -> u64 {
-        self.0.provider_cycles.load(Ordering::Relaxed)
+        self.0.provider_cycles()
     }
     #[must_use]
     pub fn provider_io_errors(&self) -> u64 {
-        self.0.provider_io_errors.load(Ordering::Relaxed)
+        self.0.provider_io_errors()
     }
 }
 
@@ -1163,11 +1148,51 @@ pub fn spawn_provider_thread(
     egress: tokio_mpsc::Sender<ProviderEvent>,
     notify_factory: Option<Box<dyn NotifyFactory>>,
 ) -> Result<ProviderThreadHandle, ProviderSpawnError> {
+    spawn_provider_thread_configured(
+        worker,
+        egress,
+        notify_factory,
+        ProviderDiagnostics::default(),
+        RESCAN_INTERVAL,
+    )
+}
+
+/// Starts provider I/O with an explicit fallback interval for watcher verification.
+pub fn spawn_provider_thread_with_rescan_interval(
+    worker: impl ProviderWorker,
+    egress: tokio_mpsc::Sender<ProviderEvent>,
+    notify_factory: Option<Box<dyn NotifyFactory>>,
+    rescan_interval: Duration,
+) -> Result<ProviderThreadHandle, ProviderSpawnError> {
+    spawn_provider_thread_configured(
+        worker,
+        egress,
+        notify_factory,
+        ProviderDiagnostics::default(),
+        rescan_interval,
+    )
+}
+
+pub(crate) fn spawn_provider_thread_with_diagnostics(
+    worker: impl ProviderWorker,
+    egress: tokio_mpsc::Sender<ProviderEvent>,
+    notify_factory: Option<Box<dyn NotifyFactory>>,
+    diagnostics: ProviderDiagnostics,
+) -> Result<ProviderThreadHandle, ProviderSpawnError> {
+    spawn_provider_thread_configured(worker, egress, notify_factory, diagnostics, RESCAN_INTERVAL)
+}
+
+fn spawn_provider_thread_configured(
+    worker: impl ProviderWorker,
+    egress: tokio_mpsc::Sender<ProviderEvent>,
+    notify_factory: Option<Box<dyn NotifyFactory>>,
+    diagnostics: ProviderDiagnostics,
+    rescan_interval: Duration,
+) -> Result<ProviderThreadHandle, ProviderSpawnError> {
     let (control, receiver) = mpsc::sync_channel(CONTROL_CHANNEL_CAPACITY);
     let targets = Arc::new(Mutex::new(None));
     let force_rescan = Arc::new(AtomicBool::new(false));
     let stop_flag = Arc::new(AtomicBool::new(false));
-    let diagnostics = ProviderDiagnostics::default();
     let sink = NotifySink {
         control: control.clone(),
         force_rescan: Arc::clone(&force_rescan),
@@ -1200,6 +1225,7 @@ pub fn spawn_provider_thread(
                 thread_stop_flag,
                 thread_watcher,
                 thread_diagnostics,
+                rescan_interval,
             );
             let _ = exit_sender.send(());
         })
@@ -1227,6 +1253,7 @@ fn provider_thread_main(
     stop_flag: Arc<AtomicBool>,
     watcher: Arc<Mutex<Option<WatchRegistry>>>,
     diagnostics: ProviderDiagnostics,
+    rescan_interval: Duration,
 ) {
     let mut pending = PendingEvents::new(diagnostics.clone());
     run_provider_cycle(
@@ -1242,7 +1269,7 @@ fn provider_thread_main(
     );
 
     loop {
-        let control = receiver.recv_timeout(RESCAN_INTERVAL);
+        let control = receiver.recv_timeout(rescan_interval);
         if stop_flag.load(Ordering::Acquire) {
             break;
         }

@@ -216,9 +216,10 @@ fn header_line(
         });
     }
     if screen_width >= 100 {
+        let coverage = inputs.source_coverage.borrow().summary();
         fields.push(HeaderField {
             prefix: "sources:",
-            value: safe_text(&inputs.source_coverage),
+            value: safe_text(&coverage),
             shrinkable: true,
         });
     }
@@ -783,6 +784,14 @@ mod tests {
     fn app(model: DomainModel, quality: ObservationQuality, session: &str) -> App {
         let (_model_sender, model_receiver) = watch::channel(Arc::new(model));
         let (_quality_sender, quality_receiver) = watch::channel(quality);
+        let mut coverage = crate::herdr::collector::SourceCoverageRegistry::new(
+            crate::herdr::collector::SourceAvailability::NotApplicable,
+        );
+        coverage.set(
+            crate::herdr::collector::CoverageSource::Codex,
+            crate::herdr::collector::SourceAvailability::Available,
+        );
+        let (_coverage_sender, source_coverage) = watch::channel(coverage);
         App::new(
             model_receiver,
             quality_receiver,
@@ -790,7 +799,7 @@ mod tests {
                 host: "build-host".to_owned(),
                 session: session.to_owned(),
                 event_lag: Duration::from_millis(23),
-                source_coverage: "herdr+codex".to_owned(),
+                source_coverage,
             },
         )
     }
@@ -843,7 +852,7 @@ mod tests {
         assert!(header.contains("workspaces:1"));
         assert!(header.contains("LIVE"));
         assert!(header.contains("lag:23ms"));
-        assert!(header.contains("sources:herdr+codex"));
+        assert!(header.contains("sources:h"));
         assert!(screen.contains("q: stop Top only"));
         assert!(screen.contains("agents continue"));
         assert!(screen.contains("detach: Top runs"));

@@ -14,8 +14,8 @@ use crate::model::{
     AgentNode, AgentNodeObservation, AgentSessionReferenceKind, ControllerDiagnosticsHandle,
     ControllerEvent, ControllerEventKind, DependencyEdge, DisplayOrdinal, DomainModel,
     EventMetadata, ExecState, Execution, ExecutionEdge, MinimalProviderMetadata, NormalizedEvent,
-    Pane, Provider, ReconcileBatch, RunId, RunKey, SharedModel, TaskRun, TaskState, TopologyEntity,
-    TopologyEntityId, sanitize_controller_text,
+    Pane, Provider, ProviderDiagnosticsHandle, ReconcileBatch, RunId, RunKey, SharedModel, TaskRun,
+    TaskState, TopologyEntity, TopologyEntityId, sanitize_controller_text,
 };
 use crate::store::{
     EnqueuePermit, NativeSessionBinding, PendingEnqueue, PersistBatch, PersistExecution, PersistOp,
@@ -144,6 +144,12 @@ impl Reducer {
     #[must_use]
     pub fn controller_diagnostics_handle(&self) -> ControllerDiagnosticsHandle {
         self.model.controller_diagnostics().acceptor_handle()
+    }
+
+    /// Returns the atomic diagnostics handle intended for the provider I/O thread.
+    #[must_use]
+    pub fn provider_diagnostics_handle(&self) -> ProviderDiagnosticsHandle {
+        self.model.provider_diagnostics().handle()
     }
 
     pub(crate) fn record_binding_conflict(&mut self) {
@@ -1786,6 +1792,26 @@ mod tests {
             progress: None,
             ingest_seq: None,
         }
+    }
+
+    #[test]
+    fn provider_diagnostics_handle_lands_counters_in_shared_model() {
+        let (reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let diagnostics = reducer.provider_diagnostics_handle();
+
+        diagnostics.record_egress_saturation();
+        diagnostics.record_coalesced_update();
+        diagnostics.record_dropped_hint();
+        diagnostics.record_watch_cap_fallback();
+        diagnostics.record_malformed_record();
+
+        let model = shared.borrow();
+        let landed = model.provider_diagnostics();
+        assert_eq!(landed.egress_saturations(), 1);
+        assert_eq!(landed.coalesced_updates(), 1);
+        assert_eq!(landed.dropped_hints(), 1);
+        assert_eq!(landed.watch_cap_fallbacks(), 1);
+        assert_eq!(landed.malformed_records(), 1);
     }
 
     fn controller_event(

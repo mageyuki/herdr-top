@@ -13,7 +13,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::{Frame, Terminal};
 
-use crate::herdr::collector::ObservationQuality;
+use crate::herdr::collector::{ObservationQuality, SourceCoverageRegistry};
 use crate::model::{DomainModel, RunId, RunKey, SharedModel};
 
 use super::view::{self, TreeRow};
@@ -21,8 +21,8 @@ use super::view::{self, TreeRow};
 const FRAME_INTERVAL: Duration = Duration::from_millis(100);
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Header values not yet published by the vertical-slice collector.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Static header values plus the collector-published dynamic source coverage.
+#[derive(Clone, Debug)]
 pub struct HeaderInputs {
     /// Host that owns the monitored Herdr session.
     pub host: String,
@@ -31,16 +31,18 @@ pub struct HeaderInputs {
     /// Age of the oldest received event that has not yet been applied.
     pub event_lag: Duration,
     /// Honest summary of currently available sources.
-    pub source_coverage: String,
+    pub source_coverage: tokio::sync::watch::Receiver<SourceCoverageRegistry>,
 }
 
 impl Default for HeaderInputs {
     fn default() -> Self {
+        let (_coverage_sender, source_coverage) =
+            tokio::sync::watch::channel(SourceCoverageRegistry::default());
         Self {
             host: "unknown".to_owned(),
             session: "unknown".to_owned(),
             event_lag: Duration::ZERO,
-            source_coverage: "herdr".to_owned(),
+            source_coverage,
         }
     }
 }
@@ -213,6 +215,7 @@ impl App {
         let old_rows = view::build_tree_rows(self.model.as_ref(), &self.state);
         let new_model = Arc::clone(&self.model_receiver.borrow_and_update());
         self.quality = *self.quality_receiver.borrow_and_update();
+        self.header.source_coverage.borrow_and_update();
         self.state.adopt_model(new_model.as_ref());
         self.model = new_model;
         let new_rows = view::build_tree_rows(self.model.as_ref(), &self.state);
@@ -232,7 +235,8 @@ impl App {
                 "quality watch closed; collector is no longer publishing diagnostics",
             )
         })?;
-        if model_changed || quality_changed {
+        let coverage_changed = self.header.source_coverage.has_changed().unwrap_or(false);
+        if model_changed || quality_changed || coverage_changed {
             self.refresh();
             Ok(true)
         } else {
@@ -519,6 +523,7 @@ mod tests {
 
     use super::*;
     use crate::herdr::collector::ObservationQuality;
+    use crate::herdr::collector::{CoverageSource, SourceAvailability, SourceCoverageRegistry};
     use crate::model::{
         DisplayOrdinal, DomainModel, ExecState, Execution, Pane, RunId, RunKey, Tab, TaskRun,
         TaskState, Workspace,
@@ -572,14 +577,18 @@ mod tests {
                 host: "host".to_owned(),
                 session: "session".to_owned(),
                 event_lag: Duration::ZERO,
-                source_coverage: "herdr".to_owned(),
+                ..HeaderInputs::default()
             },
         );
         (app, model_sender)
     }
 
     fn render(app: &App) -> String {
-        let backend = TestBackend::new(100, 18);
+        render_at_width(app, 100)
+    }
+
+    fn render_at_width(app: &App, width: u16) -> String {
+        let backend = TestBackend::new(width, 18);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
         terminal
@@ -589,6 +598,36 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn source_coverage_refreshes_dynamically() {
+        let (model_sender, model_receiver) = watch::channel(Arc::new(DomainModel::default()));
+        let (_quality_sender, quality_receiver) = watch::channel(ObservationQuality::Live);
+        let (coverage_sender, coverage_receiver) =
+            watch::channel(SourceCoverageRegistry::new(SourceAvailability::Available));
+        let mut app = App::new(
+            model_receiver,
+            quality_receiver,
+            HeaderInputs {
+                source_coverage: coverage_receiver,
+                ..HeaderInputs::default()
+            },
+        );
+        assert!(render_at_width(&app, 220).contains("codex=n/a"));
+
+        let mut updated = coverage_sender.borrow().clone();
+        updated.set(
+            CoverageSource::Codex,
+            SourceAvailability::Unavailable {
+                detail: "read_failed".to_owned(),
+            },
+        );
+        coverage_sender.send(updated).unwrap();
+        assert!(app.refresh_if_changed().unwrap());
+
+        assert!(render_at_width(&app, 220).contains("codex=unavailable(read_failed)"));
+        drop(model_sender);
     }
 
     #[test]

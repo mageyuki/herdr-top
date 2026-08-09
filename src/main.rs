@@ -1,13 +1,15 @@
 #![deny(unsafe_code)]
 
 use std::env;
+use std::fs::{OpenOptions, Permissions};
 use std::io;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use herdr_top::herdr::collector::{self, CollectorError};
+use herdr_top::herdr::collector::{self, CollectorError, SourceAvailability};
 use herdr_top::herdr::controller::{self, ControllerEnvelope, EmitOutcome};
 use herdr_top::herdr::wire;
 use herdr_top::lockfile::{self, LockError, OwnerRecord, StateRoot};
@@ -20,6 +22,8 @@ use thiserror::Error;
 
 const OWNER_STARTING_RETRIES: usize = 5;
 const OWNER_STARTING_DELAY: Duration = Duration::from_millis(200);
+const LOG_FILE: &str = "herdr-top.log";
+const LOG_FILE_MODE: u32 = 0o600;
 
 #[derive(Debug, Parser)]
 #[command(name = "herdr-top")]
@@ -103,6 +107,14 @@ enum MainError {
     },
     #[error("failed to clone the bound Controller listener: {0}")]
     ControllerListener(#[source] io::Error),
+    #[error("failed to initialize tracing at {path:?}: {source}")]
+    TracingIo {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to install the tracing subscriber: {0}")]
+    TracingInit(String),
 }
 
 #[tokio::main]
@@ -182,6 +194,7 @@ fn emit_unavailable(strict: bool, reason: String) -> ExitCode {
 async fn run_monitor(cli: &Cli) -> Result<(), MainError> {
     let resolved = resolve_session(cli)?;
     let root = lockfile::state_root(resolved.session_key())?;
+    initialize_tracing(&root)?;
     let owner_lock = lockfile::try_acquire(&root)?;
 
     let Some(owner_lock) = owner_lock else {
@@ -196,18 +209,37 @@ async fn run_monitor(cli: &Cli) -> Result<(), MainError> {
     let controller_listener = controller_status
         .try_clone_listener()
         .map_err(MainError::ControllerListener)?;
+    let controller_coverage = match &controller_status {
+        rendezvous::ControllerSocketStatus::Bound(_) => SourceAvailability::Available,
+        rendezvous::ControllerSocketStatus::Unavailable(reason) => {
+            let detail = match reason {
+                rendezvous::ControllerInputUnavailable::UnsafeOrphan => "unsafe_orphan",
+                rendezvous::ControllerInputUnavailable::SentinelMalformed => "sentinel_malformed",
+                rendezvous::ControllerInputUnavailable::Collision { .. } => "collision",
+                rendezvous::ControllerInputUnavailable::LiveEndpointUnderLock => {
+                    "live_endpoint_under_lock"
+                }
+                rendezvous::ControllerInputUnavailable::BindFailure(_) => "bind_failure",
+                rendezvous::ControllerInputUnavailable::PathTooLong => "path_too_long",
+            };
+            SourceAvailability::Unavailable {
+                detail: detail.to_owned(),
+            }
+        }
+    };
 
     let _schema = store::preflight_schema(&root)?;
     let store = store::open_writer(&root)?;
     let restored = store.load_restored_state()?;
     let (lifecycle, writer) = store::spawn_writer(store)?;
     let session_name = resolved.session_key().name().to_owned();
-    let collector = match collector::spawn_with_controller(
+    let collector = match collector::spawn_with_controller_coverage(
         socket,
         session_name.clone(),
         restored,
         writer,
         controller_listener,
+        controller_coverage,
     )
     .await
     {
@@ -230,7 +262,7 @@ async fn run_monitor(cli: &Cli) -> Result<(), MainError> {
             host: resolve_hostname(),
             session: session_name,
             event_lag: Duration::ZERO,
-            source_coverage: format!("herdr; controller={controller_status:?}"),
+            source_coverage: collector.source_coverage.clone(),
         },
     );
     let tui_result = tokio::task::spawn_blocking(move || app.run())
@@ -251,6 +283,36 @@ fn resolve_hostname() -> String {
     rendezvous::gethostname()
         .or_else(|| env::var("HOSTNAME").ok().filter(|value| !value.is_empty()))
         .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn tracing_log_path(root: &StateRoot) -> PathBuf {
+    root.0.join(LOG_FILE)
+}
+
+fn build_tracing_subscriber(
+    root: &StateRoot,
+) -> io::Result<impl tracing::Subscriber + Send + Sync> {
+    let path = tracing_log_path(root);
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(LOG_FILE_MODE)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.set_permissions(Permissions::from_mode(LOG_FILE_MODE))?;
+    Ok(tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(file)
+        .finish())
+}
+
+fn initialize_tracing(root: &StateRoot) -> Result<(), MainError> {
+    let path = tracing_log_path(root);
+    let subscriber =
+        build_tracing_subscriber(root).map_err(|source| MainError::TracingIo { path, source })?;
+    tracing::subscriber::set_global_default(subscriber)
+        .map_err(|error| MainError::TracingInit(error.to_string()))
 }
 
 async fn run_held_branch(cli: &Cli, root: &StateRoot) -> Result<(), MainError> {
@@ -354,4 +416,38 @@ fn run_doctor(cli: &Cli) -> Result<(), MainError> {
     println!("state_root: {}", root.0.display());
     println!("controller_socket: implemented");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn tracing_file_is_private_warn_filtered_and_content_free_for_malformed_records() {
+        let directory = tempfile::tempdir().expect("temporary state root should exist");
+        let root = StateRoot(directory.path().to_path_buf());
+        let subscriber = build_tracing_subscriber(&root).expect("subscriber should build");
+        let raw_sentinel = "MALFORMED_RAW_SENTINEL_I2E_8D97";
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(secret = raw_sentinel, "filtered informational event");
+            tracing::warn!(
+                provider = "codex",
+                path = "synthetic.jsonl",
+                byte_offset = 41_u64,
+                error_code = "codex_json",
+                "malformed provider record"
+            );
+        });
+
+        let path = tracing_log_path(&root);
+        let metadata = std::fs::metadata(&path).expect("log metadata should read");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let contents = std::fs::read_to_string(path).expect("log should be UTF-8");
+        assert!(contents.contains("malformed provider record"));
+        assert!(contents.contains("codex_json"));
+        assert!(!contents.contains(raw_sentinel));
+    }
 }

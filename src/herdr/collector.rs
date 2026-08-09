@@ -29,7 +29,7 @@ use crate::provider::{
     MergeOutcome, PendingEvents, ProviderCycle, ProviderEvent, ProviderSourceState,
     ProviderSpawnError, ProviderTarget, ProviderTargetPublisher, ProviderThreadError,
     ProviderThreadHandle, ProviderWorker, RecommendedNotifyFactory, TailFile, TargetSet,
-    spawn_provider_thread,
+    spawn_provider_thread_with_diagnostics,
 };
 use crate::reducer::{ApplyOutcome, Reducer, ReducerError};
 use crate::store::writer::{WriterClient, WriterError};
@@ -59,6 +59,129 @@ pub enum ObservationQuality {
     Disconnected,
     /// Physical state is available but another source or target is unavailable.
     Degraded,
+}
+
+/// One of the four fixed observation and input sources shown in coverage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoverageSource {
+    Herdr,
+    Controller,
+    Claude,
+    Codex,
+}
+
+/// Tri-state availability retained independently for each fixed source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SourceAvailability {
+    Available,
+    Unavailable { detail: String },
+    NotApplicable,
+}
+
+/// Latest coverage for Herdr, Controller input, Claude, and Codex.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceCoverageRegistry {
+    herdr: SourceAvailability,
+    controller: SourceAvailability,
+    claude: SourceAvailability,
+    codex: SourceAvailability,
+}
+
+impl SourceCoverageRegistry {
+    /// Creates startup coverage; optional providers begin as not applicable.
+    #[must_use]
+    pub fn new(controller: SourceAvailability) -> Self {
+        Self {
+            herdr: SourceAvailability::Available,
+            controller,
+            claude: SourceAvailability::NotApplicable,
+            codex: SourceAvailability::NotApplicable,
+        }
+    }
+
+    /// Returns one source's latest tri-state.
+    #[must_use]
+    pub const fn state(&self, source: CoverageSource) -> &SourceAvailability {
+        match source {
+            CoverageSource::Herdr => &self.herdr,
+            CoverageSource::Controller => &self.controller,
+            CoverageSource::Claude => &self.claude,
+            CoverageSource::Codex => &self.codex,
+        }
+    }
+
+    /// Replaces one source's state.
+    pub fn set(&mut self, source: CoverageSource, state: SourceAvailability) {
+        *match source {
+            CoverageSource::Herdr => &mut self.herdr,
+            CoverageSource::Controller => &mut self.controller,
+            CoverageSource::Claude => &mut self.claude,
+            CoverageSource::Codex => &mut self.codex,
+        } = state;
+    }
+
+    /// Stable header summary without operational paths.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        [
+            ("herdr", &self.herdr),
+            ("controller", &self.controller),
+            ("claude", &self.claude),
+            ("codex", &self.codex),
+        ]
+        .into_iter()
+        .map(|(name, state)| match state {
+            SourceAvailability::Available => format!("{name}=available"),
+            SourceAvailability::Unavailable { detail } => {
+                format!("{name}=unavailable({detail})")
+            }
+            SourceAvailability::NotApplicable => format!("{name}=n/a"),
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+    }
+
+    fn provider_metadata(&self) -> Vec<SourceCoverage> {
+        [
+            ("herdr", &self.herdr),
+            ("controller", &self.controller),
+            ("claude", &self.claude),
+            ("codex", &self.codex),
+        ]
+        .into_iter()
+        .filter_map(|(source, state)| match state {
+            SourceAvailability::Available => Some(SourceCoverage {
+                source: source.to_owned(),
+                available: true,
+                detail: None,
+            }),
+            SourceAvailability::Unavailable { detail } => Some(SourceCoverage {
+                source: source.to_owned(),
+                available: false,
+                detail: Some(detail.clone()),
+            }),
+            SourceAvailability::NotApplicable => None,
+        })
+        .collect()
+    }
+
+    fn effective_quality(&self, herdr_quality: ObservationQuality) -> ObservationQuality {
+        if herdr_quality == ObservationQuality::Live
+            && [&self.claude, &self.codex]
+                .into_iter()
+                .any(|state| matches!(state, SourceAvailability::Unavailable { .. }))
+        {
+            ObservationQuality::Degraded
+        } else {
+            herdr_quality
+        }
+    }
+}
+
+impl Default for SourceCoverageRegistry {
+    fn default() -> Self {
+        Self::new(SourceAvailability::NotApplicable)
+    }
 }
 
 /// Errors surfaced by collector startup or orderly shutdown.
@@ -96,10 +219,12 @@ pub enum CollectorError {
     ProviderThread(#[from] ProviderThreadError),
 }
 
-/// Handle to the collector's coherent model and observation-quality streams.
+/// Handle to the collector's coherent model, quality, and source-coverage streams.
 pub struct CollectorHandle {
     /// Independently published Herdr observation quality.
     pub quality: watch::Receiver<ObservationQuality>,
+    /// Dynamic four-source coverage published independently of model snapshots.
+    pub source_coverage: watch::Receiver<SourceCoverageRegistry>,
     /// Coherent reducer-owned domain snapshots.
     pub model: SharedModel,
     cancellation: CancellationToken,
@@ -163,7 +288,15 @@ pub async fn spawn(
     restored: RestoredState,
     writer: WriterClient,
 ) -> Result<CollectorHandle, CollectorError> {
-    spawn_with_controller(sock, session, restored, writer, None).await
+    spawn_configured(
+        sock,
+        session,
+        restored,
+        writer,
+        None,
+        SourceAvailability::NotApplicable,
+    )
+    .await
 }
 
 /// Commits the owner record and launches convergence plus an optional Controller acceptor.
@@ -174,11 +307,59 @@ pub async fn spawn_with_controller(
     writer: WriterClient,
     controller_listener: Option<StdUnixListener>,
 ) -> Result<CollectorHandle, CollectorError> {
+    let controller_coverage = if controller_listener.is_some() {
+        SourceAvailability::Available
+    } else {
+        SourceAvailability::Unavailable {
+            detail: "not_bound".to_owned(),
+        }
+    };
+    spawn_configured(
+        sock,
+        session,
+        restored,
+        writer,
+        controller_listener,
+        controller_coverage,
+    )
+    .await
+}
+
+/// Launches convergence with the already-resolved Controller coverage detail.
+pub async fn spawn_with_controller_coverage(
+    sock: PathBuf,
+    session: String,
+    restored: RestoredState,
+    writer: WriterClient,
+    controller_listener: Option<StdUnixListener>,
+    controller_coverage: SourceAvailability,
+) -> Result<CollectorHandle, CollectorError> {
+    spawn_configured(
+        sock,
+        session,
+        restored,
+        writer,
+        controller_listener,
+        controller_coverage,
+    )
+    .await
+}
+
+async fn spawn_configured(
+    sock: PathBuf,
+    session: String,
+    restored: RestoredState,
+    writer: WriterClient,
+    controller_listener: Option<StdUnixListener>,
+    controller_coverage: SourceAvailability,
+) -> Result<CollectorHandle, CollectorError> {
     let owner = OwnerTracker::from_environment();
     writer.replace_owner(owner.record()).await?;
 
     let (reducer, model) = Reducer::new(restored);
     let (quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
+    let initial_coverage = SourceCoverageRegistry::new(controller_coverage.clone());
+    let (coverage_sender, source_coverage) = watch::channel(initial_coverage);
     let cancellation = CancellationToken::new();
     let (controller_sender, controller_requests) =
         controller_listener.as_ref().map_or((None, None), |_| {
@@ -197,10 +378,14 @@ pub async fn spawn_with_controller(
         _ => None,
     };
     let (provider_sender, provider_events) = mpsc::channel(EVENT_QUEUE_CAPACITY);
-    let provider_thread = match spawn_provider_thread(
+    let provider_diagnostics = crate::provider::ProviderDiagnostics::from_model_handle(
+        reducer.provider_diagnostics_handle(),
+    );
+    let provider_thread = match spawn_provider_thread_with_diagnostics(
         AdapterProviderWorker::default(),
         provider_sender,
         Some(Box::new(RecommendedNotifyFactory)),
+        provider_diagnostics,
     ) {
         Ok(handle) => handle,
         Err(error) => {
@@ -219,8 +404,13 @@ pub async fn spawn_with_controller(
     let provider_publisher = provider_thread.target_publisher();
     let restored_targets = derive_provider_targets(&model.borrow());
     provider_publisher.update_targets(restored_targets.clone());
-    let provider_integration =
-        ProviderIntegration::new(provider_events, provider_publisher, restored_targets);
+    let coverage = CoverageTracker::new(controller_coverage, coverage_sender, quality_sender);
+    let provider_integration = ProviderIntegration::new(
+        provider_events,
+        provider_publisher,
+        restored_targets,
+        coverage,
+    );
     let task_cancellation = cancellation.clone();
     let task_model = model.clone();
     let task = tokio::spawn(async move {
@@ -230,7 +420,6 @@ pub async fn spawn_with_controller(
             writer,
             reducer,
             task_model,
-            quality_sender,
             task_cancellation,
             owner,
             controller_requests,
@@ -241,6 +430,7 @@ pub async fn spawn_with_controller(
 
     Ok(CollectorHandle {
         quality,
+        source_coverage,
         model,
         cancellation,
         task,
@@ -256,7 +446,6 @@ async fn run_collector(
     writer: WriterClient,
     mut reducer: Reducer,
     shared: SharedModel,
-    quality: watch::Sender<ObservationQuality>,
     cancellation: CancellationToken,
     mut owner: OwnerTracker,
     mut controller_requests: Option<ControllerRequestReceiver>,
@@ -290,7 +479,7 @@ async fn run_collector(
         } {
             Ok(stream) => stream,
             Err(_) => {
-                quality.send_replace(ObservationQuality::Disconnected);
+                provider.set_herdr_quality(ObservationQuality::Disconnected);
                 if wait_or_service_controller(
                     &cancellation,
                     RECONNECT_DELAY,
@@ -315,7 +504,7 @@ async fn run_collector(
         } else {
             GapKind::Reconnect
         };
-        quality.send_replace(ObservationQuality::Reconciling);
+        provider.set_herdr_quality(ObservationQuality::Reconciling);
 
         let reader_cancellation = cancellation.child_token();
         let (events, overflowed, reader) = spawn_event_reader(stream, reader_cancellation.clone());
@@ -324,7 +513,6 @@ async fn run_collector(
             &writer,
             &mut reducer,
             &shared,
-            &quality,
             &cancellation,
             &mut owner,
             &session,
@@ -346,7 +534,7 @@ async fn run_collector(
             previous_socket = socket_identity;
         }
         if let Err(error) = reader_result {
-            quality.send_replace(ObservationQuality::Disconnected);
+            provider.set_herdr_quality(ObservationQuality::Disconnected);
             if matches!(outcome.outcome, SubscriptionOutcome::Cancelled) {
                 return Ok(());
             }
@@ -355,7 +543,7 @@ async fn run_collector(
         match outcome.outcome {
             SubscriptionOutcome::Cancelled => return Ok(()),
             SubscriptionOutcome::Ended => {
-                quality.send_replace(ObservationQuality::Disconnected);
+                provider.set_herdr_quality(ObservationQuality::Disconnected);
             }
         }
     }
@@ -367,7 +555,6 @@ async fn converge(
     writer: &WriterClient,
     reducer: &mut Reducer,
     shared: &SharedModel,
-    quality: &watch::Sender<ObservationQuality>,
     cancellation: &CancellationToken,
     owner: &mut OwnerTracker,
     session: &str,
@@ -445,7 +632,7 @@ async fn converge(
                 ));
             }
             ReplayOutcome::Clean => {
-                quality.send_replace(ObservationQuality::Live);
+                provider.set_herdr_quality(ObservationQuality::Live);
                 match monitor_live(
                     reducer,
                     shared,
@@ -462,7 +649,7 @@ async fn converge(
                 .await?
                 {
                     ReplayOutcome::Dirty => {
-                        quality.send_replace(ObservationQuality::Reconciling);
+                        provider.set_herdr_quality(ObservationQuality::Reconciling);
                         resnapshot_attempts = 0;
                     }
                     ReplayOutcome::Ended => {
@@ -481,7 +668,7 @@ async fn converge(
                 }
             }
             ReplayOutcome::Dirty => {
-                quality.send_replace(ObservationQuality::Reconciling);
+                provider.set_herdr_quality(ObservationQuality::Reconciling);
                 if resnapshot_attempts == RESNAPSHOT_ATTEMPTS {
                     let outcome = monitor_reconciling(
                         reducer,
@@ -614,7 +801,7 @@ async fn monitor_live(
                 continue;
             }
             event = receive_provider(&mut provider.events) => {
-                service_provider_event(event, &mut provider.events, session, reducer, shared, writer).await?;
+                service_provider_event(event, provider, session, reducer, shared, writer).await?;
                 provider.publish_targets(shared);
                 continue;
             }
@@ -683,7 +870,7 @@ async fn monitor_reconciling(
                 continue;
             }
             event = receive_provider(&mut provider.events) => {
-                service_provider_event(event, &mut provider.events, session, reducer, shared, writer).await?;
+                service_provider_event(event, provider, session, reducer, shared, writer).await?;
                 provider.publish_targets(shared);
                 continue;
             }
@@ -1072,6 +1259,82 @@ struct ProviderIntegration {
     events: Option<mpsc::Receiver<ProviderEvent>>,
     target_publisher: ProviderTargetPublisher,
     published_targets: TargetSet,
+    coverage: CoverageTracker,
+}
+
+struct CoverageTracker {
+    registry: SourceCoverageRegistry,
+    herdr_quality: ObservationQuality,
+    coverage_sender: watch::Sender<SourceCoverageRegistry>,
+    quality_sender: watch::Sender<ObservationQuality>,
+}
+
+impl CoverageTracker {
+    fn new(
+        controller: SourceAvailability,
+        coverage_sender: watch::Sender<SourceCoverageRegistry>,
+        quality_sender: watch::Sender<ObservationQuality>,
+    ) -> Self {
+        Self {
+            registry: SourceCoverageRegistry::new(controller),
+            herdr_quality: ObservationQuality::Reconciling,
+            coverage_sender,
+            quality_sender,
+        }
+    }
+
+    fn set_herdr_quality(&mut self, quality: ObservationQuality) {
+        self.herdr_quality = quality;
+        let state = match quality {
+            ObservationQuality::Disconnected => SourceAvailability::Unavailable {
+                detail: "disconnected".to_owned(),
+            },
+            ObservationQuality::Live
+            | ObservationQuality::Reconciling
+            | ObservationQuality::Degraded => SourceAvailability::Available,
+        };
+        self.registry.set(CoverageSource::Herdr, state);
+        self.publish();
+    }
+
+    fn update_provider_state(&mut self, provider: Provider, state: ProviderSourceState) {
+        let source = match provider {
+            Provider::Claude => CoverageSource::Claude,
+            Provider::Codex => CoverageSource::Codex,
+        };
+        let state = match state {
+            ProviderSourceState::Available => SourceAvailability::Available,
+            ProviderSourceState::Unavailable { detail } => {
+                SourceAvailability::Unavailable { detail }
+            }
+            ProviderSourceState::NotApplicable => SourceAvailability::NotApplicable,
+        };
+        self.registry.set(source, state);
+        self.publish();
+    }
+
+    fn mark_egress_closed(&mut self) {
+        for source in [CoverageSource::Claude, CoverageSource::Codex] {
+            if !matches!(
+                self.registry.state(source),
+                SourceAvailability::NotApplicable
+            ) {
+                self.registry.set(
+                    source,
+                    SourceAvailability::Unavailable {
+                        detail: "provider_thread_closed".to_owned(),
+                    },
+                );
+            }
+        }
+        self.publish();
+    }
+
+    fn publish(&self) {
+        self.coverage_sender.send_replace(self.registry.clone());
+        self.quality_sender
+            .send_replace(self.registry.effective_quality(self.herdr_quality));
+    }
 }
 
 impl ProviderIntegration {
@@ -1079,12 +1342,22 @@ impl ProviderIntegration {
         events: mpsc::Receiver<ProviderEvent>,
         target_publisher: ProviderTargetPublisher,
         published_targets: TargetSet,
+        coverage: CoverageTracker,
     ) -> Self {
         Self {
             events: Some(events),
             target_publisher,
             published_targets,
+            coverage,
         }
+    }
+
+    fn set_herdr_quality(&mut self, quality: ObservationQuality) {
+        self.coverage.set_herdr_quality(quality);
+    }
+
+    fn update_source_state(&mut self, provider: Provider, state: ProviderSourceState) {
+        self.coverage.update_provider_state(provider, state);
     }
 
     fn publish_targets(&mut self, shared: &SharedModel) {
@@ -1247,8 +1520,9 @@ async fn apply_provider_event(
     reducer: &mut Reducer,
     shared: &SharedModel,
     writer: &WriterClient,
+    coverage: &SourceCoverageRegistry,
 ) -> Result<(), CollectorError> {
-    let normalized = normalize_provider_event(shared, session, event);
+    let normalized = normalize_provider_event(shared, session, event, coverage);
     let identity_disagreement = normalized.identity_disagreement;
     let events = normalized
         .events
@@ -2082,6 +2356,7 @@ fn normalize_provider_event(
     shared: &SharedModel,
     session: &str,
     event: ProviderEvent,
+    coverage: &SourceCoverageRegistry,
 ) -> NormalizedProviderObservation {
     match event {
         ProviderEvent::SessionResolved {
@@ -2155,6 +2430,7 @@ fn normalize_provider_event(
                 run_id,
                 &node_id,
                 provider_metadata.clone(),
+                coverage,
             );
             node_metadata.native_session_id = None;
             events.push(NormalizedEvent::AgentNodeUpsert {
@@ -2185,6 +2461,7 @@ fn normalize_provider_event(
                     run_id,
                     &node_id,
                     provider_metadata.clone(),
+                    coverage,
                 );
                 events.push(NormalizedEvent::AgentNodeUpsert {
                     metadata: link_metadata,
@@ -2210,6 +2487,7 @@ fn normalize_provider_event(
                 run_id,
                 &node_id,
                 provider_metadata,
+                coverage,
             );
             if !identity_disagreement {
                 resolved_metadata.native_session_id = owner_session_id;
@@ -2286,6 +2564,7 @@ fn normalize_provider_event(
                 run_id,
                 &node_id,
                 provider_metadata,
+                coverage,
             );
             NormalizedProviderObservation {
                 events: vec![NormalizedEvent::AgentNodeUpsert {
@@ -2337,6 +2616,7 @@ fn normalize_provider_event(
                 node.task_run_id,
                 &node.agent_node_id,
                 activity.clone(),
+                coverage,
             );
             NormalizedProviderObservation {
                 events: vec![NormalizedEvent::AgentActivity {
@@ -2366,6 +2646,7 @@ fn provider_metadata_for(
     run_id: RunId,
     agent_node_id: &str,
     provider_metadata: MinimalProviderMetadata,
+    coverage: &SourceCoverageRegistry,
 ) -> EventMetadata {
     EventMetadata {
         event_id,
@@ -2385,11 +2666,7 @@ fn provider_metadata_for(
         task_state: None,
         execution_parent: None,
         dependency: None,
-        source_coverage: vec![SourceCoverage {
-            source: provider_name(provider).to_owned(),
-            available: true,
-            detail: None,
-        }],
+        source_coverage: coverage.provider_metadata(),
         provider_metadata: Some(provider_metadata),
         label: None,
         reason: None,
@@ -2763,16 +3040,43 @@ async fn receive_provider(
 
 async fn service_provider_event(
     event: Option<ProviderEvent>,
-    receiver: &mut Option<mpsc::Receiver<ProviderEvent>>,
+    provider: &mut ProviderIntegration,
     session: &str,
     reducer: &mut Reducer,
     shared: &SharedModel,
     writer: &WriterClient,
 ) -> Result<(), CollectorError> {
     match event {
-        Some(event) => apply_provider_event(event, session, reducer, shared, writer).await,
+        Some(ProviderEvent::SourceState {
+            provider: source,
+            state,
+        }) => {
+            provider.update_source_state(source, state);
+            Ok(())
+        }
+        Some(ProviderEvent::Malformed {
+            provider: source,
+            path_display,
+            generation: _,
+            byte_offset,
+            error_code,
+        }) => {
+            tracing::warn!(
+                provider = provider_name(source),
+                path = path_display,
+                byte_offset,
+                error_code,
+                "malformed provider record"
+            );
+            Ok(())
+        }
+        Some(event) => {
+            let coverage = provider.coverage.registry.clone();
+            apply_provider_event(event, session, reducer, shared, writer, &coverage).await
+        }
         None => {
-            *receiver = None;
+            provider.events = None;
+            provider.coverage.mark_egress_closed();
             Ok(())
         }
     }
@@ -2815,7 +3119,7 @@ async fn wait_or_service_controller(
             event = receive_provider(&mut provider.events) => {
                 service_provider_event(
                     event,
-                    &mut provider.events,
+                    provider,
                     session,
                     reducer,
                     shared,
@@ -2853,6 +3157,72 @@ mod provider_integration_tests {
     };
 
     #[test]
+    fn not_applicable_provider_does_not_degrade_live_quality() {
+        let (quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
+        let (coverage_sender, _coverage) = watch::channel(SourceCoverageRegistry::new(
+            SourceAvailability::NotApplicable,
+        ));
+        let mut coverage = CoverageTracker::new(
+            SourceAvailability::NotApplicable,
+            coverage_sender,
+            quality_sender,
+        );
+
+        coverage.set_herdr_quality(ObservationQuality::Live);
+        coverage.update_provider_state(Provider::Claude, ProviderSourceState::NotApplicable);
+
+        assert_eq!(*quality.borrow(), ObservationQuality::Live);
+    }
+
+    #[test]
+    fn unavailable_controller_remains_coverage_only() {
+        let registry = SourceCoverageRegistry::new(SourceAvailability::Unavailable {
+            detail: "bind_failure".to_owned(),
+        });
+
+        assert_eq!(
+            registry.effective_quality(ObservationQuality::Live),
+            ObservationQuality::Live
+        );
+        assert_eq!(
+            registry.state(CoverageSource::Controller),
+            &SourceAvailability::Unavailable {
+                detail: "bind_failure".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn unavailable_provider_degrades_and_available_clears_live_quality() {
+        let (quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
+        let (coverage_sender, coverage) =
+            watch::channel(SourceCoverageRegistry::new(SourceAvailability::Available));
+        let mut tracker = CoverageTracker::new(
+            SourceAvailability::Available,
+            coverage_sender,
+            quality_sender,
+        );
+
+        tracker.set_herdr_quality(ObservationQuality::Live);
+        tracker.update_provider_state(
+            Provider::Codex,
+            ProviderSourceState::Unavailable {
+                detail: "read_failed".to_owned(),
+            },
+        );
+        assert_eq!(*quality.borrow(), ObservationQuality::Degraded);
+        assert_eq!(
+            coverage.borrow().state(CoverageSource::Codex),
+            &SourceAvailability::Unavailable {
+                detail: "read_failed".to_owned(),
+            }
+        );
+
+        tracker.update_provider_state(Provider::Codex, ProviderSourceState::Available);
+        assert_eq!(*quality.borrow(), ObservationQuality::Live);
+    }
+
+    #[test]
     fn session_resolution_normalizes_stable_node_link_and_meta_effects() {
         let run_id = RunId::new();
         let path = "/tmp/provider/root.jsonl";
@@ -2885,7 +3255,9 @@ mod provider_integration_tests {
             },
         };
 
-        let normalized = normalize_provider_event(&shared, "session", event);
+        let mut coverage = SourceCoverageRegistry::new(SourceAvailability::Available);
+        coverage.set(CoverageSource::Codex, SourceAvailability::Available);
+        let normalized = normalize_provider_event(&shared, "session", event, &coverage);
         let ids = normalized
             .events
             .iter()
@@ -2904,8 +3276,14 @@ mod provider_integration_tests {
         let metadata = super::normalized_metadata(normalized.events.last().unwrap());
         assert_eq!(metadata.task_run_id, Some(run_id));
         assert_eq!(metadata.native_session_id.as_deref(), Some("owner"));
-        assert_eq!(metadata.source_coverage.len(), 1);
-        assert_eq!(metadata.source_coverage[0].source, "codex");
+        assert_eq!(
+            metadata
+                .source_coverage
+                .iter()
+                .map(|source| source.source.as_str())
+                .collect::<Vec<_>>(),
+            ["herdr", "controller", "codex"]
+        );
     }
 
     struct DropObservedWorker(Arc<AtomicBool>);
@@ -2926,13 +3304,14 @@ mod provider_integration_tests {
     async fn collector_timeout_still_stops_and_joins_the_provider_thread() {
         let dropped = Arc::new(AtomicBool::new(false));
         let (provider_sender, _provider_events) = mpsc::channel(1);
-        let provider_thread = spawn_provider_thread(
+        let provider_thread = crate::provider::spawn_provider_thread(
             DropObservedWorker(Arc::clone(&dropped)),
             provider_sender,
             None,
         )
         .unwrap();
         let (_quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
+        let (_coverage_sender, source_coverage) = watch::channel(SourceCoverageRegistry::default());
         let (_reducer, model) = Reducer::new(RestoredState {
             model: DomainModel::default(),
             next_ordinal: 1,
@@ -2941,6 +3320,7 @@ mod provider_integration_tests {
         });
         let handle = CollectorHandle {
             quality,
+            source_coverage,
             model,
             cancellation: CancellationToken::new(),
             task: tokio::spawn(async {
@@ -3009,6 +3389,7 @@ mod provider_integration_tests {
             &mut reducer,
             &shared,
             &writer,
+            &SourceCoverageRegistry::new(SourceAvailability::Available),
         )
         .await
         .unwrap();
@@ -3028,15 +3409,23 @@ mod provider_integration_tests {
                 offset: 10,
             },
         };
-        apply_provider_event(activity("first"), "session", &mut reducer, &shared, &writer)
-            .await
-            .unwrap();
+        apply_provider_event(
+            activity("first"),
+            "session",
+            &mut reducer,
+            &shared,
+            &writer,
+            &SourceCoverageRegistry::new(SourceAvailability::Available),
+        )
+        .await
+        .unwrap();
         apply_provider_event(
             activity("different-second"),
             "session",
             &mut reducer,
             &shared,
             &writer,
+            &SourceCoverageRegistry::new(SourceAvailability::Available),
         )
         .await
         .unwrap();
@@ -3160,6 +3549,7 @@ mod provider_integration_tests {
             &mut reducer,
             &shared,
             &writer,
+            &SourceCoverageRegistry::new(SourceAvailability::Available),
         )
         .await
         .unwrap();
@@ -3269,6 +3659,7 @@ mod provider_integration_tests {
             &mut reducer,
             &shared,
             &writer,
+            &SourceCoverageRegistry::new(SourceAvailability::Available),
         )
         .await
         .unwrap();
