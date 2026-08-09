@@ -254,6 +254,12 @@ impl ProviderDiagnostics {
         self.handle.fallback_baseline_approximations()
     }
 
+    /// Notify backends that failed creation and fell back to periodic polling.
+    #[must_use]
+    pub fn notify_creation_failures(&self) -> u64 {
+        self.handle.notify_creation_failures()
+    }
+
     #[must_use]
     pub fn provider_cycles(&self) -> u64 {
         self.handle.provider_cycles()
@@ -282,6 +288,7 @@ pub struct ProviderDiagnosticsHandle {
     malformed_records: Arc<AtomicU64>,
     watch_cap_fallbacks: Arc<AtomicU64>,
     fallback_baseline_approximations: Arc<AtomicU64>,
+    notify_creation_failures: Arc<AtomicU64>,
     provider_cycles: Arc<AtomicU64>,
     provider_io_errors: Arc<AtomicU64>,
 }
@@ -324,6 +331,11 @@ impl ProviderDiagnosticsHandle {
     /// Records capture-at-first-scan for a root that was not a spawn-resolved standard root.
     pub fn record_fallback_baseline_approximation(&self) {
         Self::increment(&self.fallback_baseline_approximations);
+    }
+
+    /// Records one notify backend creation failure handled by polling fallback.
+    pub fn record_notify_creation_failure(&self) {
+        Self::increment(&self.notify_creation_failures);
     }
 
     pub fn record_provider_cycle(&self) {
@@ -373,6 +385,11 @@ impl ProviderDiagnosticsHandle {
     pub fn fallback_baseline_approximations(&self) -> u64 {
         self.fallback_baseline_approximations
             .load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn notify_creation_failures(&self) -> u64 {
+        self.notify_creation_failures.load(Ordering::Relaxed)
     }
 
     #[must_use]

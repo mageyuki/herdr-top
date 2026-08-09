@@ -274,6 +274,14 @@ impl CollectorHandle {
             Some(provider) => provider.stop().await.map_err(CollectorError::from),
             None => Ok(()),
         };
+        if let Err(error) = &provider_result
+            && (collector_result.is_err() || controller_result.is_err())
+        {
+            tracing::warn!(
+                error = %error,
+                "provider shutdown error masked by earlier shutdown failure"
+            );
+        }
 
         collector_result?;
         controller_result?;
@@ -1033,6 +1041,36 @@ struct ResumeCursor {
     phase: ResumePhase,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum AvailabilitySweepMember {
+    Root(PathBuf),
+    File { root: PathBuf, path_id: u32 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AvailabilitySweepFailure {
+    RootNotFound,
+    RootPermissionDenied,
+    FileIoError,
+}
+
+impl AvailabilitySweepFailure {
+    const fn detail(self) -> &'static str {
+        match self {
+            Self::RootNotFound => "root_not_found",
+            Self::RootPermissionDenied => "root_permission_denied",
+            Self::FileIoError => "file_io_error",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ProviderAvailabilitySweep {
+    targeted: Option<bool>,
+    visited: HashSet<AvailabilitySweepMember>,
+    failure: Option<AvailabilitySweepFailure>,
+}
+
 #[derive(Clone, Debug)]
 struct AdapterWorkItem {
     provider: Provider,
@@ -1106,6 +1144,7 @@ struct AdapterProviderWorker {
     baselines_initialized: bool,
     diagnostics: crate::provider::ProviderDiagnostics,
     resume_cursor: Option<ResumeCursor>,
+    availability_sweeps: HashMap<Provider, ProviderAvailabilitySweep>,
 }
 
 impl AdapterProviderWorker {
@@ -1122,20 +1161,23 @@ impl AdapterProviderWorker {
             baselines_initialized: false,
             diagnostics,
             resume_cursor: None,
+            availability_sweeps: HashMap::new(),
         }
     }
 
-    fn initialize_standard_baselines(&mut self) -> io::Result<()> {
+    fn initialize_standard_baselines(&mut self) {
         if self.baselines_initialized {
-            return Ok(());
+            return;
         }
         for root in &self.standard_roots {
-            self.roots
-                .entry((root.provider, root.path.clone()))
-                .or_insert(AdapterRootState::new(root.provider, root.path.clone())?);
+            let key = (root.provider, root.path.clone());
+            if !self.roots.contains_key(&key)
+                && let Ok(state) = AdapterRootState::new(root.provider, root.path.clone())
+            {
+                self.roots.insert(key, state);
+            }
         }
         self.baselines_initialized = true;
-        Ok(())
     }
 
     fn is_standard_root(&self, provider: Provider, root: &Path) -> bool {
@@ -1161,6 +1203,72 @@ impl AdapterProviderWorker {
             .and_modify(|generation| *generation = (*generation).max(observed))
             .or_insert(observed);
     }
+
+    fn update_targeted_transition(
+        &mut self,
+        provider: Provider,
+        targeted: bool,
+        pending: &mut PendingEvents,
+    ) {
+        let sweep = self.availability_sweeps.entry(provider).or_default();
+        if sweep.targeted == Some(targeted) {
+            return;
+        }
+        sweep.targeted = Some(targeted);
+        if !targeted {
+            sweep.visited.clear();
+            sweep.failure = None;
+        }
+        let state = if targeted {
+            ProviderSourceState::Available
+        } else {
+            ProviderSourceState::NotApplicable
+        };
+        let _ = pending.merge(ProviderEvent::SourceState { provider, state });
+    }
+
+    fn visit_sweep_member(&mut self, provider: Provider, member: AvailabilitySweepMember) {
+        self.availability_sweeps
+            .entry(provider)
+            .or_default()
+            .visited
+            .insert(member);
+    }
+
+    fn record_sweep_failure(&mut self, provider: Provider, failure: AvailabilitySweepFailure) {
+        self.availability_sweeps
+            .entry(provider)
+            .or_default()
+            .failure
+            .get_or_insert(failure);
+    }
+
+    fn finish_completed_sweeps(
+        &mut self,
+        universes: &HashMap<Provider, HashSet<AvailabilitySweepMember>>,
+        pending: &mut PendingEvents,
+    ) {
+        for provider in [Provider::Claude, Provider::Codex] {
+            let Some(universe) = universes.get(&provider) else {
+                continue;
+            };
+            let sweep = self.availability_sweeps.entry(provider).or_default();
+            sweep.visited.retain(|member| universe.contains(member));
+            if !universe.is_subset(&sweep.visited) {
+                continue;
+            }
+            let state = sweep
+                .failure
+                .map_or(ProviderSourceState::Available, |failure| {
+                    ProviderSourceState::Unavailable {
+                        detail: failure.detail().to_owned(),
+                    }
+                });
+            let _ = pending.merge(ProviderEvent::SourceState { provider, state });
+            sweep.visited.clear();
+            sweep.failure = None;
+        }
+    }
 }
 
 impl Default for AdapterProviderWorker {
@@ -1171,7 +1279,7 @@ impl Default for AdapterProviderWorker {
 
 impl ProviderWorker for AdapterProviderWorker {
     fn process(&mut self, cycle: &mut ProviderCycle<'_>) -> io::Result<()> {
-        self.initialize_standard_baselines()?;
+        self.initialize_standard_baselines();
         if !drain_deferred_provider_events(&mut self.deferred, cycle.pending) {
             return Ok(());
         }
@@ -1185,17 +1293,10 @@ impl ProviderWorker for AdapterProviderWorker {
                 .insert(target.path.clone());
         }
         for provider in [Provider::Claude, Provider::Codex] {
-            let state = if targets_by_root
+            let targeted = targets_by_root
                 .keys()
-                .any(|(current, _)| *current == provider)
-            {
-                ProviderSourceState::Available
-            } else {
-                ProviderSourceState::NotApplicable
-            };
-            let _ = cycle
-                .pending
-                .merge(ProviderEvent::SourceState { provider, state });
+                .any(|(current, _)| *current == provider);
+            self.update_targeted_transition(provider, targeted, cycle.pending);
         }
 
         let mut roots = targets_by_root.into_iter().collect::<Vec<_>>();
@@ -1204,23 +1305,80 @@ impl ProviderWorker for AdapterProviderWorker {
                 .cmp(&integration_provider_rank((right.0).0))
                 .then_with(|| (left.0).1.cmp(&(right.0).1))
         });
+        let mut universes: HashMap<Provider, HashSet<AvailabilitySweepMember>> = HashMap::new();
         let mut work = Vec::new();
         for ((provider, root), targets) in roots {
-            let fallback_root = !self.is_standard_root(provider, &root);
-            let state = match self.roots.entry((provider, root.clone())) {
-                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    if fallback_root {
-                        self.diagnostics.record_fallback_baseline_approximation();
+            let root_member = AvailabilitySweepMember::Root(root.clone());
+            universes
+                .entry(provider)
+                .or_default()
+                .insert(root_member.clone());
+            if let Err(error) = std::fs::read_dir(&root) {
+                let failure = match error.kind() {
+                    io::ErrorKind::NotFound => AvailabilitySweepFailure::RootNotFound,
+                    io::ErrorKind::PermissionDenied => {
+                        AvailabilitySweepFailure::RootPermissionDenied
                     }
-                    entry.insert(AdapterRootState::new(provider, root.clone())?)
-                }
-            };
-            if root.is_dir() {
-                cycle.request_watch(root.clone());
+                    _ => AvailabilitySweepFailure::FileIoError,
+                };
+                self.record_sweep_failure(provider, failure);
+                self.visit_sweep_member(provider, root_member);
+                continue;
             }
-            let mut parser = AdapterBootstrapParser::default();
-            state.discovery.scan(&mut parser, &mut self.interner)?;
+            let fallback_root = !self.is_standard_root(provider, &root);
+            let root_key = (provider, root.clone());
+            if !self.roots.contains_key(&root_key) {
+                match AdapterRootState::new(provider, root.clone()) {
+                    Ok(state) => {
+                        self.roots.insert(root_key.clone(), state);
+                    }
+                    Err(error) => {
+                        if error.kind() != io::ErrorKind::NotFound {
+                            self.record_sweep_failure(
+                                provider,
+                                if error.kind() == io::ErrorKind::PermissionDenied {
+                                    AvailabilitySweepFailure::RootPermissionDenied
+                                } else {
+                                    AvailabilitySweepFailure::FileIoError
+                                },
+                            );
+                        }
+                        self.visit_sweep_member(provider, root_member);
+                        continue;
+                    }
+                }
+                if fallback_root {
+                    self.diagnostics.record_fallback_baseline_approximation();
+                }
+            }
+            cycle.request_watch(root.clone());
+            let scan_result = {
+                let state = self
+                    .roots
+                    .get_mut(&root_key)
+                    .expect("root state inserted before scan");
+                let mut parser = AdapterBootstrapParser::default();
+                state.discovery.scan(&mut parser, &mut self.interner)
+            };
+            if let Err(error) = scan_result {
+                if error.kind() != io::ErrorKind::NotFound {
+                    self.record_sweep_failure(
+                        provider,
+                        if error.kind() == io::ErrorKind::PermissionDenied {
+                            AvailabilitySweepFailure::RootPermissionDenied
+                        } else {
+                            AvailabilitySweepFailure::FileIoError
+                        },
+                    );
+                }
+                self.visit_sweep_member(provider, root_member);
+                continue;
+            }
+            self.visit_sweep_member(provider, root_member);
+            let state = self
+                .roots
+                .get_mut(&root_key)
+                .expect("root state remains after scan");
             let files = state
                 .discovery
                 .files()
@@ -1246,6 +1404,13 @@ impl ProviderWorker for AdapterProviderWorker {
                 .iter()
                 .map(|file| file.path_id)
                 .collect::<HashSet<_>>();
+            universes
+                .entry(provider)
+                .or_default()
+                .extend(relevant.iter().map(|file| AvailabilitySweepMember::File {
+                    root: root.clone(),
+                    path_id: file.path_id,
+                }));
             state.tails.retain(|path_id, tail| {
                 if relevant_ids.contains(path_id) {
                     true
@@ -1267,6 +1432,16 @@ impl ProviderWorker for AdapterProviderWorker {
             }));
         }
 
+        for provider in [Provider::Claude, Provider::Codex] {
+            if let Some(universe) = universes.get(&provider) {
+                self.availability_sweeps
+                    .entry(provider)
+                    .or_default()
+                    .visited
+                    .retain(|member| universe.contains(member));
+            }
+        }
+
         work.sort_by(|left, right| {
             compare_adapter_key(
                 left.provider,
@@ -1278,6 +1453,7 @@ impl ProviderWorker for AdapterProviderWorker {
             )
         });
         if work.is_empty() {
+            self.finish_completed_sweeps(&universes, cycle.pending);
             return Ok(());
         }
         let (start, first_phase) = resume_start(&work, self.resume_cursor.as_ref());
@@ -1306,29 +1482,46 @@ impl ProviderWorker for AdapterProviderWorker {
                     .get(&absolute)
                     .map_or(0, |generation| generation.saturating_add(1));
                 self.generations.insert(absolute, generation);
-                let tail = TailFile::open(
+                let tail = match TailFile::open(
                     &file.root,
                     &file.relative_path,
                     state.discovery.baseline(),
                     generation,
                     &mut boundary,
-                )?;
+                ) {
+                    Ok(tail) => tail,
+                    Err(error) => {
+                        let member = AvailabilitySweepMember::File {
+                            root: item.root.clone(),
+                            path_id: file.path_id,
+                        };
+                        let sweep = self.availability_sweeps.entry(provider).or_default();
+                        if error.kind() != io::ErrorKind::NotFound {
+                            sweep
+                                .failure
+                                .get_or_insert(AvailabilitySweepFailure::FileIoError);
+                        }
+                        sweep.visited.insert(member);
+                        continue;
+                    }
+                };
                 state.tails.insert(file.path_id, tail);
             }
-            let tail = state
+            let tail_generation = state
                 .tails
-                .get_mut(&file.path_id)
-                .expect("tail inserted for relevant file");
+                .get(&file.path_id)
+                .expect("tail inserted for relevant file")
+                .generation();
             if phase == ResumePhase::Bootstrap && state.bootstrap_emitted.insert(file.path_id) {
                 let event = match provider {
                     Provider::Codex => crate::provider::codex::CodexAdapter.bootstrap_event(
                         file,
-                        tail.generation(),
+                        tail_generation,
                         unix_now_ms(),
                     ),
                     Provider::Claude => crate::provider::claude::ClaudeAdapter.bootstrap_event(
                         file,
-                        tail.generation(),
+                        tail_generation,
                         unix_now_ms(),
                     ),
                 };
@@ -1340,15 +1533,42 @@ impl ProviderWorker for AdapterProviderWorker {
                     )
                 {
                     self.resume_cursor = Some(cursor_for_work(item, ResumePhase::TailPoll));
+                    self.finish_completed_sweeps(&universes, cycle.pending);
                     return Ok(());
                 }
             }
             let mut boundary = FsReadBoundary;
-            let mut records = tail.poll(&mut boundary)?.into_iter();
+            let poll_result = state
+                .tails
+                .get_mut(&file.path_id)
+                .expect("tail inserted for relevant file")
+                .poll(&mut boundary);
+            let tail_generation = state
+                .tails
+                .get(&file.path_id)
+                .expect("tail remains after poll")
+                .generation();
             self.generations
                 .entry(file.root.join(&file.relative_path))
-                .and_modify(|generation| *generation = (*generation).max(tail.generation()))
-                .or_insert(tail.generation());
+                .and_modify(|generation| *generation = (*generation).max(tail_generation))
+                .or_insert(tail_generation);
+            let member = AvailabilitySweepMember::File {
+                root: item.root.clone(),
+                path_id: file.path_id,
+            };
+            let sweep = self.availability_sweeps.entry(provider).or_default();
+            sweep.visited.insert(member);
+            let mut records = match poll_result {
+                Ok(records) => records.into_iter(),
+                Err(error) => {
+                    if error.kind() != io::ErrorKind::NotFound {
+                        sweep
+                            .failure
+                            .get_or_insert(AvailabilitySweepFailure::FileIoError);
+                    }
+                    continue;
+                }
+            };
             while let Some(record) = records.next() {
                 let events = parse_adapter_record(provider, &state.discovery, file, &record);
                 if !merge_adapter_events(events, cycle.pending, &mut self.deferred) {
@@ -1361,11 +1581,13 @@ impl ProviderWorker for AdapterProviderWorker {
                         &work[0]
                     };
                     self.resume_cursor = Some(cursor_for_work(next, ResumePhase::Bootstrap));
+                    self.finish_completed_sweeps(&universes, cycle.pending);
                     return Ok(());
                 }
             }
         }
         self.resume_cursor = None;
+        self.finish_completed_sweeps(&universes, cycle.pending);
         Ok(())
     }
 }
@@ -3443,6 +3665,505 @@ mod provider_integration_tests {
         state.tails.get(&path_id).map(TailFile::read_calls)
     }
 
+    fn provider_source_state(
+        events: &[ProviderEvent],
+        provider: Provider,
+    ) -> Option<ProviderSourceState> {
+        events.iter().rev().find_map(|event| match event {
+            ProviderEvent::SourceState {
+                provider: event_provider,
+                state,
+            } if *event_provider == provider => Some(state.clone()),
+            _ => None,
+        })
+    }
+
+    fn apply_source_states(tracker: &mut CoverageTracker, events: &[ProviderEvent]) {
+        for event in events {
+            if let ProviderEvent::SourceState { provider, state } = event {
+                tracker.update_provider_state(*provider, state.clone());
+            }
+        }
+    }
+
+    fn capacity_blocker(id: &str) -> ProviderEvent {
+        ProviderEvent::Activity {
+            provider: Provider::Codex,
+            agent_thread_id: id.to_owned(),
+            activity: MinimalProviderMetadata::default(),
+            depth: None,
+            event_id: format!("{id}-event"),
+            observed_at_ms: 0,
+            position: SourcePosition {
+                path_id: u32::MAX,
+                generation: 0,
+                offset: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn targeted_root_loss_degrades_coverage_and_restoration_recovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path: path.clone(),
+        }]);
+        let mut pending = PendingEvents::new(diagnostics);
+        let (quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
+        let (coverage_sender, coverage) =
+            watch::channel(SourceCoverageRegistry::new(SourceAvailability::Available));
+        let mut tracker = CoverageTracker::new(
+            SourceAvailability::Available,
+            coverage_sender,
+            quality_sender,
+        );
+        tracker.set_herdr_quality(ObservationQuality::Live);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        apply_source_states(&mut tracker, &drain_pending(&mut pending));
+        std::fs::remove_dir_all(&root).unwrap();
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let unavailable = drain_pending(&mut pending);
+        apply_source_states(&mut tracker, &unavailable);
+
+        assert_eq!(
+            provider_source_state(&unavailable, Provider::Codex),
+            Some(ProviderSourceState::Unavailable {
+                detail: "root_not_found".to_owned(),
+            })
+        );
+        assert!(
+            coverage
+                .borrow()
+                .summary()
+                .contains("codex=unavailable(root_not_found)")
+        );
+        assert_eq!(*quality.borrow(), ObservationQuality::Degraded);
+
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(path, b"").unwrap();
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let recovered = drain_pending(&mut pending);
+        apply_source_states(&mut tracker, &recovered);
+
+        assert_eq!(
+            provider_source_state(&recovered, Provider::Codex),
+            Some(ProviderSourceState::Available)
+        );
+        assert_eq!(*quality.borrow(), ObservationQuality::Live);
+    }
+
+    #[test]
+    fn one_failed_root_makes_the_provider_aggregate_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let good_root = directory.path().join("good/.codex/sessions");
+        let failed_root = directory.path().join("failed/.codex/sessions");
+        std::fs::create_dir_all(&good_root).unwrap();
+        let good = good_root.join("good.jsonl");
+        let failed = failed_root.join("failed.jsonl");
+        std::fs::write(&good, b"").unwrap();
+        let targets = TargetSet::new([
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: good,
+            },
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: failed,
+            },
+        ]);
+        let mut worker = AdapterProviderWorker::default();
+        let mut pending = PendingEvents::new(crate::provider::ProviderDiagnostics::default());
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let events = drain_pending(&mut pending);
+
+        assert_eq!(
+            provider_source_state(&events, Provider::Codex),
+            Some(ProviderSourceState::Unavailable {
+                detail: "root_not_found".to_owned(),
+            })
+        );
+        assert!(tail_read_calls(&worker, &good_root, "good.jsonl").is_some());
+    }
+
+    #[test]
+    fn target_before_root_exists_recovers_when_the_root_appears() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("fresh/.codex/sessions");
+        let path = root.join("future.jsonl");
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path,
+        }]);
+        let mut worker = AdapterProviderWorker::default();
+        let mut pending = PendingEvents::new(crate::provider::ProviderDiagnostics::default());
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let unavailable = drain_pending(&mut pending);
+        assert_eq!(
+            provider_source_state(&unavailable, Provider::Codex),
+            Some(ProviderSourceState::Unavailable {
+                detail: "root_not_found".to_owned(),
+            })
+        );
+
+        std::fs::create_dir_all(root).unwrap();
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let recovered = drain_pending(&mut pending);
+        assert_eq!(
+            provider_source_state(&recovered, Provider::Codex),
+            Some(ProviderSourceState::Available)
+        );
+    }
+
+    #[test]
+    fn targeted_file_not_found_is_normal_churn() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("vanishing.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path: path.clone(),
+        }]);
+        let mut worker = AdapterProviderWorker::default();
+        let mut pending = PendingEvents::new(crate::provider::ProviderDiagnostics::default());
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let _ = drain_pending(&mut pending);
+        std::fs::remove_file(path).unwrap();
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let events = drain_pending(&mut pending);
+
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::SourceState {
+                provider: Provider::Codex,
+                state: ProviderSourceState::Unavailable { .. },
+            }
+        )));
+        assert_eq!(
+            provider_source_state(&events, Provider::Codex),
+            Some(ProviderSourceState::Available)
+        );
+    }
+
+    #[test]
+    fn never_targeted_provider_emits_not_applicable_only_on_initial_transition() {
+        let mut worker = AdapterProviderWorker::default();
+        let mut pending = PendingEvents::new(crate::provider::ProviderDiagnostics::default());
+
+        process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
+        let initial = drain_pending(&mut pending);
+        process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
+        let repeated = drain_pending(&mut pending);
+
+        assert_eq!(
+            provider_source_state(&initial, Provider::Claude),
+            Some(ProviderSourceState::NotApplicable)
+        );
+        assert_eq!(
+            provider_source_state(&initial, Provider::Codex),
+            Some(ProviderSourceState::NotApplicable)
+        );
+        assert!(
+            repeated.is_empty(),
+            "targetless steady state re-emitted availability"
+        );
+    }
+
+    #[test]
+    fn failed_provider_root_does_not_affect_sibling_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let claude_root = directory.path().join("claude/.claude/projects");
+        let codex_root = directory.path().join("codex/.codex/sessions");
+        std::fs::create_dir_all(&claude_root).unwrap();
+        let claude = claude_root.join("good.jsonl");
+        std::fs::write(&claude, b"").unwrap();
+        let targets = TargetSet::new([
+            ProviderTarget {
+                provider: Provider::Claude,
+                path: claude,
+            },
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: codex_root.join("missing.jsonl"),
+            },
+        ]);
+        let mut worker = AdapterProviderWorker::default();
+        let mut pending = PendingEvents::new(crate::provider::ProviderDiagnostics::default());
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let events = drain_pending(&mut pending);
+
+        assert_eq!(
+            provider_source_state(&events, Provider::Claude),
+            Some(ProviderSourceState::Available)
+        );
+        assert_eq!(
+            provider_source_state(&events, Provider::Codex),
+            Some(ProviderSourceState::Unavailable {
+                detail: "root_not_found".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn logical_sweep_recovers_even_when_every_physical_cycle_saturates() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        let first = root.join("first.jsonl");
+        let second = root.join("second.jsonl");
+        let targets = TargetSet::new([
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: first.clone(),
+            },
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: second.clone(),
+            },
+        ]);
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let mut pending = PendingEvents::with_capacity(1, diagnostics);
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let _ = drain_pending(&mut pending);
+
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&first, codex_records("first-owner", "first-agent", "first")).unwrap();
+        std::fs::write(
+            &second,
+            codex_records("second-owner", "second-agent", "second"),
+        )
+        .unwrap();
+        let mut recovered = false;
+        for _ in 0..12 {
+            process_adapter_worker(&mut worker, &targets, &mut pending);
+            assert!(
+                !worker.deferred.is_empty(),
+                "physical cycle did not saturate as arranged"
+            );
+            let all_visited = ["first.jsonl", "second.jsonl"]
+                .into_iter()
+                .all(|name| tail_read_calls(&worker, &root, name).is_some_and(|calls| calls > 0));
+            let events = drain_pending(&mut pending);
+            if provider_source_state(&events, Provider::Codex)
+                == Some(ProviderSourceState::Available)
+            {
+                assert!(
+                    all_visited,
+                    "availability recovered before the logical sweep completed"
+                );
+                recovered = true;
+                break;
+            }
+        }
+
+        assert!(recovered, "logical sweep did not recover within 12 cycles");
+    }
+
+    #[test]
+    fn mid_order_topology_addition_blocks_completion_until_visited() {
+        let directory = tempfile::tempdir().unwrap();
+        let late_root = directory.path().join("z/.codex/sessions");
+        let added_root = directory.path().join("a/.codex/sessions");
+        std::fs::create_dir_all(&late_root).unwrap();
+        std::fs::create_dir_all(&added_root).unwrap();
+        let late = late_root.join("late.jsonl");
+        let added = added_root.join("added.jsonl");
+        std::fs::write(&late, codex_records("late-owner", "late-agent", "late")).unwrap();
+        let initial_targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path: late.clone(),
+        }]);
+        let expanded_targets = TargetSet::new([
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: late.clone(),
+            },
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: added.clone(),
+            },
+        ]);
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![
+                DiscoveryRoot {
+                    provider: Provider::Codex,
+                    path: added_root.clone(),
+                },
+                DiscoveryRoot {
+                    provider: Provider::Codex,
+                    path: late_root.clone(),
+                },
+            ],
+            diagnostics.clone(),
+        );
+        let mut pending = PendingEvents::with_capacity(1, diagnostics);
+        pending.merge(capacity_blocker("initial-blocker"));
+        process_adapter_worker(&mut worker, &initial_targets, &mut pending);
+        let _ = drain_pending(&mut pending);
+        append_codex_activity(&late, "late-appended-agent", "late-appended");
+        std::fs::write(&added, codex_records("added-owner", "added-agent", "added")).unwrap();
+
+        let mut observed_passed_addition = false;
+        for _ in 0..4 {
+            process_adapter_worker(&mut worker, &expanded_targets, &mut pending);
+            let late_visited =
+                tail_read_calls(&worker, &late_root, "late.jsonl").is_some_and(|calls| calls > 0);
+            let added_visited =
+                tail_read_calls(&worker, &added_root, "added.jsonl").is_some_and(|calls| calls > 0);
+            let events = drain_pending(&mut pending);
+            if late_visited && !added_visited {
+                assert_eq!(
+                    provider_source_state(&events, Provider::Codex),
+                    None,
+                    "positional end emitted before the added universe member was visited"
+                );
+                observed_passed_addition = true;
+                break;
+            }
+        }
+        assert!(
+            observed_passed_addition,
+            "cursor did not reach the post-addition position within four cycles"
+        );
+
+        let mut completed = false;
+        for _ in 0..6 {
+            process_adapter_worker(&mut worker, &expanded_targets, &mut pending);
+            let added_visited =
+                tail_read_calls(&worker, &added_root, "added.jsonl").is_some_and(|calls| calls > 0);
+            let events = drain_pending(&mut pending);
+            if provider_source_state(&events, Provider::Codex)
+                == Some(ProviderSourceState::Available)
+            {
+                assert!(added_visited);
+                completed = true;
+                break;
+            }
+        }
+        assert!(
+            completed,
+            "expanded sweep did not complete within six cycles"
+        );
+    }
+
+    #[test]
+    fn provisional_availability_precedes_sweep_and_unavailable_does_not_flicker() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let initial = root.join("initial.jsonl");
+        std::fs::write(
+            &initial,
+            codex_records("initial-owner", "initial-agent", "initial"),
+        )
+        .unwrap();
+        let initial_targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path: initial,
+        }]);
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::default();
+        let mut pending = PendingEvents::with_capacity(1, diagnostics);
+        pending.merge(capacity_blocker("startup-blocker"));
+        let (quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
+        let (coverage_sender, coverage) =
+            watch::channel(SourceCoverageRegistry::new(SourceAvailability::Available));
+        let mut tracker = CoverageTracker::new(
+            SourceAvailability::Available,
+            coverage_sender,
+            quality_sender,
+        );
+        tracker.set_herdr_quality(ObservationQuality::Live);
+
+        process_adapter_worker(&mut worker, &initial_targets, &mut pending);
+        let provisional = drain_pending(&mut pending);
+        apply_source_states(&mut tracker, &provisional);
+        assert_eq!(
+            provider_source_state(&provisional, Provider::Codex),
+            Some(ProviderSourceState::Available)
+        );
+        assert_eq!(tail_read_calls(&worker, &root, "initial.jsonl"), Some(0));
+
+        std::fs::remove_dir_all(&root).unwrap();
+        process_adapter_worker(&mut worker, &initial_targets, &mut pending);
+        let unavailable = drain_pending(&mut pending);
+        apply_source_states(&mut tracker, &unavailable);
+        assert_eq!(
+            provider_source_state(&unavailable, Provider::Codex),
+            Some(ProviderSourceState::Unavailable {
+                detail: "root_not_found".to_owned(),
+            })
+        );
+        assert_eq!(*quality.borrow(), ObservationQuality::Degraded);
+
+        std::fs::create_dir_all(&root).unwrap();
+        let recovery_paths = (0..3)
+            .map(|index| {
+                let path = root.join(format!("recovery-{index}.jsonl"));
+                std::fs::write(
+                    &path,
+                    codex_records(
+                        &format!("recovery-owner-{index}"),
+                        &format!("recovery-agent-{index}"),
+                        &format!("recovery-{index}"),
+                    ),
+                )
+                .unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let recovery_targets =
+            TargetSet::new(recovery_paths.into_iter().map(|path| ProviderTarget {
+                provider: Provider::Codex,
+                path,
+            }));
+
+        for _ in 0..2 {
+            process_adapter_worker(&mut worker, &recovery_targets, &mut pending);
+            let events = drain_pending(&mut pending);
+            apply_source_states(&mut tracker, &events);
+            assert_eq!(
+                provider_source_state(&events, Provider::Codex),
+                None,
+                "incomplete sweep flickered away from the unavailable aggregate"
+            );
+            assert!(
+                coverage
+                    .borrow()
+                    .summary()
+                    .contains("codex=unavailable(root_not_found)")
+            );
+            assert_eq!(*quality.borrow(), ObservationQuality::Degraded);
+        }
+    }
+
     #[tokio::test]
     async fn file_created_after_worker_readiness_before_first_target_starts_at_zero() {
         let directory = tempfile::tempdir().unwrap();
@@ -4102,6 +4823,72 @@ mod provider_integration_tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::Release);
         }
+    }
+
+    struct PanickingProviderWorker;
+
+    impl ProviderWorker for PanickingProviderWorker {
+        fn process(&mut self, _cycle: &mut ProviderCycle<'_>) -> std::io::Result<()> {
+            panic!("synthetic provider worker panic");
+        }
+    }
+
+    #[test]
+    fn collector_precedence_logs_masked_provider_shutdown_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let log_path = directory.path().join("collector-stop.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(log)
+            .finish();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                let (provider_sender, _provider_events) = mpsc::channel(1);
+                let provider_thread = crate::provider::spawn_provider_thread(
+                    PanickingProviderWorker,
+                    provider_sender,
+                    None,
+                )
+                .unwrap();
+                let (_quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
+                let (_coverage_sender, source_coverage) =
+                    watch::channel(SourceCoverageRegistry::default());
+                let (_reducer, model) = Reducer::new(RestoredState {
+                    model: DomainModel::default(),
+                    next_ordinal: 1,
+                    next_ingest_seq: Some(1),
+                    event_ledger: Vec::new(),
+                });
+                let handle = CollectorHandle {
+                    quality,
+                    source_coverage,
+                    model,
+                    cancellation: CancellationToken::new(),
+                    task: tokio::spawn(async {
+                        Err(CollectorError::Task(
+                            "synthetic collector failure".to_owned(),
+                        ))
+                    }),
+                    controller_acceptor: None,
+                    provider_thread: Some(provider_thread),
+                };
+
+                handle.stop_with_timeout(Duration::from_secs(1)).await
+            })
+        });
+
+        assert!(matches!(
+            result,
+            Err(CollectorError::Task(detail)) if detail == "synthetic collector failure"
+        ));
+        let contents = std::fs::read_to_string(log_path).unwrap();
+        assert!(
+            contents.contains("provider I/O thread panicked or exited without acknowledgement"),
+            "masked provider shutdown error was not logged: {contents}"
+        );
     }
 
     #[tokio::test]

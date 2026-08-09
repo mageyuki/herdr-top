@@ -837,6 +837,9 @@ impl ProviderDiagnostics {
     pub(crate) fn record_fallback_baseline_approximation(&self) {
         self.0.record_fallback_baseline_approximation();
     }
+    fn record_notify_creation_failure(&self) {
+        self.0.record_notify_creation_failure();
+    }
     fn record_cycle(&self) {
         self.0.record_provider_cycle();
     }
@@ -875,6 +878,10 @@ impl ProviderDiagnostics {
     #[must_use]
     pub fn fallback_baseline_approximations(&self) -> u64 {
         self.0.fallback_baseline_approximations()
+    }
+    #[must_use]
+    pub fn notify_creation_failures(&self) -> u64 {
+        self.0.notify_creation_failures()
     }
     #[must_use]
     pub fn provider_cycles(&self) -> u64 {
@@ -1265,7 +1272,17 @@ fn spawn_provider_thread_configured(
         diagnostics: diagnostics.clone(),
     };
     let watcher_backend = match notify_factory {
-        Some(factory) => factory.create(sink)?,
+        Some(factory) => match factory.create(sink) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "provider notify setup failed; falling back to polling"
+                );
+                diagnostics.record_notify_creation_failure();
+                Box::new(NoopWatcher)
+            }
+        },
         None => Box::new(NoopWatcher),
     };
     let watcher = Arc::new(Mutex::new(Some(WatchRegistry::new(
@@ -2030,6 +2047,37 @@ mod tests {
         emit: bool,
     }
 
+    struct FailingNotifyFactory;
+
+    impl NotifyFactory for FailingNotifyFactory {
+        fn create(self: Box<Self>, _sink: NotifySink) -> notify::Result<Box<dyn NotifyWatcher>> {
+            Err(notify::Error::generic("synthetic notify creation failure"))
+        }
+    }
+
+    struct AppendDetectingWorker {
+        path: PathBuf,
+        observed_len: u64,
+    }
+
+    impl ProviderWorker for AppendDetectingWorker {
+        fn process(&mut self, cycle: &mut ProviderCycle<'_>) -> io::Result<()> {
+            let length = fs::metadata(&self.path)?.len();
+            if length > self.observed_len {
+                self.observed_len = length;
+                let _ = cycle.pending.merge(activity(
+                    Provider::Codex,
+                    "polling-worker",
+                    "polling-append",
+                    1,
+                    position(99, 0, length),
+                    "append-detected",
+                ));
+            }
+            Ok(())
+        }
+    }
+
     impl ProviderWorker for CountingWorker {
         fn process(&mut self, cycle: &mut ProviderCycle<'_>) -> io::Result<()> {
             let call = self.calls.fetch_add(1, Ordering::Relaxed);
@@ -2089,6 +2137,47 @@ mod tests {
                 .unwrap()
                 .block_on(handle.stop())
                 .unwrap();
+        });
+    }
+
+    #[test]
+    fn notify_creation_failure_falls_back_to_rescan_detection() {
+        run_bounded("notify creation fallback", || {
+            use std::io::Write;
+
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("append.log");
+            fs::write(&path, b"").unwrap();
+            let worker = AppendDetectingWorker {
+                path: path.clone(),
+                observed_len: 0,
+            };
+            let (egress, mut events) = tokio_mpsc::channel(4);
+            let handle = spawn_provider_thread_with_rescan_interval(
+                worker,
+                egress,
+                Some(Box::new(FailingNotifyFactory)),
+                Duration::from_millis(10),
+            )
+            .expect("watcher creation failure should fall back to polling");
+            let diagnostics = handle.diagnostics();
+
+            writeln!(
+                fs::OpenOptions::new().append(true).open(path).unwrap(),
+                "append"
+            )
+            .unwrap();
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let event = runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(1), events.recv()).await
+                })
+                .expect("fallback rescan did not detect append")
+                .expect("provider egress closed before append detection");
+
+            assert_eq!(event_kind(event), "append-detected");
+            assert_eq!(diagnostics.notify_creation_failures(), 1);
+            runtime.block_on(handle.stop()).unwrap();
         });
     }
 
