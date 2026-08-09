@@ -180,9 +180,8 @@ impl ControllerDiagnostics {
             .saturating_add(count);
     }
 
-    pub(crate) fn record_dangling_announcement_components(&mut self, count: u64) {
-        self.dangling_announcement_components =
-            self.dangling_announcement_components.saturating_add(count);
+    pub(crate) fn set_dangling_announcement_components(&mut self, count: u64) {
+        self.dangling_announcement_components = count;
     }
 
     pub(crate) fn record_ingest_sequence_exhaustion(&mut self) {

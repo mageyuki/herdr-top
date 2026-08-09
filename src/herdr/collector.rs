@@ -6368,7 +6368,7 @@ mod provider_integration_tests {
                 },
                 display_ordinal: DisplayOrdinal::new(1),
                 state: TaskState::Running,
-                has_controller_task_state_event: false,
+                has_controller_task_state_event: true,
             },
             TaskRun {
                 run_id: path_run,
@@ -6378,7 +6378,7 @@ mod provider_integration_tests {
                 },
                 display_ordinal: DisplayOrdinal::new(2),
                 state: TaskState::Running,
-                has_controller_task_state_event: false,
+                has_controller_task_state_event: true,
             },
             TaskRun {
                 run_id: first_parent,

@@ -253,7 +253,28 @@ pub fn apply_binding_plan_at(
         BindingPlan::Merge { survivor, absorbed } => {
             let contracted = preflight_merge(model, survivor, absorbed)?;
             merge_in_memory(model, survivor, absorbed, contracted);
-            Ok(vec![PersistOp::MergeTaskRuns { survivor, absorbed }])
+            let task_run = model
+                .task_run(&survivor)
+                .cloned()
+                .ok_or(MergeConflict::MissingRun { run: survivor })?;
+            let native_session =
+                single_native_binding(model, survivor)?.map(|(provider, native_session_id)| {
+                    NativeSessionBinding {
+                        provider,
+                        native_session_id,
+                    }
+                });
+            let finished_at_ms = task_run.state.is_terminal().then_some(receipt_time_ms);
+            Ok(vec![
+                PersistOp::MergeTaskRuns { survivor, absorbed },
+                PersistOp::UpsertTaskRun(PersistTaskRun {
+                    task_run,
+                    native_session,
+                    created_at_ms: receipt_time_ms,
+                    updated_at_ms: receipt_time_ms,
+                    finished_at_ms,
+                }),
+            ])
         }
     }
 }
@@ -739,6 +760,15 @@ fn merge_in_memory(
     absorbed: RunId,
     contracted: ContractedGraphs,
 ) {
+    let absorbed_has_controller_evidence = model
+        .task_run(&absorbed)
+        .is_some_and(|task_run| task_run.has_controller_task_state_event);
+    if absorbed_has_controller_evidence
+        && let Some(mut task_run) = model.task_run(&survivor).cloned()
+    {
+        task_run.has_controller_task_state_event = true;
+        model.insert_task_run(task_run);
+    }
     let mut aliases: Vec<_> = model
         .task_run_bindings()
         .filter_map(|(key, owner)| (*owner == absorbed).then_some(key.clone()))
@@ -774,9 +804,9 @@ mod tests {
     use crate::lockfile::StateRoot;
     use crate::model::{
         AgentNode, DependencyEdge, DisplayOrdinal, ExecState, Execution, ExecutionEdge, TaskRun,
-        TaskState,
+        TaskState, graph::is_relationship_only,
     };
-    use crate::store::{NativeSessionBinding, PersistOp, PersistTaskRun, open_writer};
+    use crate::store::{NativeSessionBinding, PersistOp, PersistTaskRun, open_reader, open_writer};
 
     use super::*;
 
@@ -937,12 +967,24 @@ mod tests {
         let (mut model, survivor, absorbed) = merge_fixture();
 
         let plan = plan_binding(&model, &native_evidence(absorbed, "sid-1"));
-
         assert_eq!(plan, BindingPlan::Merge { survivor, absorbed });
-        assert_eq!(
-            apply_binding_plan(&mut model, plan).unwrap(),
-            vec![PersistOp::MergeTaskRuns { survivor, absorbed }]
-        );
+        let batch = apply_binding_plan(&mut model, plan).unwrap();
+        assert!(matches!(
+            batch.as_slice(),
+            [
+                PersistOp::MergeTaskRuns {
+                    survivor: actual_survivor,
+                    absorbed: actual_absorbed,
+                },
+                PersistOp::UpsertTaskRun(persisted),
+            ] if *actual_survivor == survivor
+                && *actual_absorbed == absorbed
+                && persisted.task_run.run_id == survivor
+                && persisted.native_session.as_ref().is_some_and(|binding| {
+                    binding.provider == Provider::Codex
+                        && binding.native_session_id == "sid-1"
+                })
+        ));
         assert!(model.task_run(&absorbed).is_none());
         assert_eq!(
             model
@@ -1297,7 +1339,18 @@ mod tests {
         let plan = plan_binding(&model, &native_evidence(absorbed, "sid-1"));
         let batch = apply_binding_plan(&mut model, plan).unwrap();
 
-        assert_eq!(batch, vec![PersistOp::MergeTaskRuns { survivor, absorbed }]);
+        assert!(matches!(
+            batch.as_slice(),
+            [
+                PersistOp::MergeTaskRuns {
+                    survivor: actual_survivor,
+                    absorbed: actual_absorbed,
+                },
+                PersistOp::UpsertTaskRun(persisted),
+            ] if *actual_survivor == survivor
+                && *actual_absorbed == absorbed
+                && persisted.task_run.run_id == survivor
+        ));
         assert_eq!(model.execution("execution").unwrap().task_run_id, survivor);
         assert_eq!(model.agent_node("node").unwrap().task_run_id, survivor);
         assert_eq!(model.execution_edges().count(), 1);
@@ -1403,6 +1456,79 @@ mod tests {
                 },
             ),
             BindingPlan::NoChange
+        );
+    }
+
+    #[test]
+    fn merge_propagates_controller_evidence_in_memory_and_across_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let survivor = RunId::new();
+        let absorbed = RunId::new();
+        let native_key = native(Provider::Codex, "absorbed-native");
+        let survivor_run = TaskRun {
+            run_id: survivor,
+            key: RunKey::Controller("survivor".to_owned()),
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Queued,
+            has_controller_task_state_event: false,
+        };
+        let absorbed_run = TaskRun {
+            run_id: absorbed,
+            key: native_key.clone(),
+            display_ordinal: DisplayOrdinal::new(2),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+        };
+        let native_session = NativeSessionBinding {
+            provider: Provider::Codex,
+            native_session_id: "absorbed-native".to_owned(),
+        };
+        store
+            .apply_batch(vec![
+                PersistOp::UpsertTaskRun(PersistTaskRun {
+                    task_run: survivor_run.clone(),
+                    native_session: None,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                    finished_at_ms: None,
+                }),
+                PersistOp::UpsertTaskRun(PersistTaskRun {
+                    task_run: absorbed_run.clone(),
+                    native_session: Some(native_session),
+                    created_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                    finished_at_ms: None,
+                }),
+            ])
+            .unwrap();
+        let mut model = DomainModel::default();
+        model.insert_task_run(survivor_run);
+        model.insert_task_run(absorbed_run);
+
+        let batch =
+            apply_binding_plan_at(&mut model, BindingPlan::Merge { survivor, absorbed }, 2_000)
+                .unwrap();
+        let in_memory_flag = model
+            .task_run(&survivor)
+            .unwrap()
+            .has_controller_task_state_event;
+        let in_memory_relationship_only = is_relationship_only(&model, survivor);
+        store.apply_batch(batch).unwrap();
+        drop(store);
+        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+        let durable_survivor = restored.model.task_run(&survivor).unwrap();
+        let durable_native_owner = restored.model.task_run_by_key(&native_key).unwrap().run_id;
+
+        assert_eq!(
+            (
+                in_memory_flag,
+                in_memory_relationship_only,
+                durable_survivor.has_controller_task_state_event,
+                durable_native_owner,
+            ),
+            (true, false, true, survivor)
         );
     }
 }

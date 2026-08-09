@@ -59,7 +59,7 @@ pub enum RejectReason {
 pub struct ControllerDiagnosticDeltas {
     pub terminal_blocked_progress_noops: u64,
     pub terminal_forward_reference_creations: u64,
-    pub dangling_announcement_components: u64,
+    pub post_dangling_announcement_components: u64,
 }
 
 /// Fully materialized result of successful Controller validation.
@@ -91,10 +91,15 @@ impl Reducer {
     /// Restores reducer state and returns a receiver for coherent model snapshots.
     #[must_use]
     pub fn new(restored: RestoredState) -> (Self, SharedModel) {
-        let (publisher, shared) = watch::channel(Arc::new(restored.model.clone()));
+        let mut model = restored.model;
+        let dangling_components = crate::model::graph::dangling_announcement_components(&model);
+        model
+            .controller_diagnostics_mut()
+            .set_dangling_announcement_components(dangling_components);
+        let (publisher, shared) = watch::channel(Arc::new(model.clone()));
         (
             Self {
-                model: restored.model,
+                model,
                 next_ordinal: restored.next_ordinal,
                 next_ingest_seq: restored.next_ingest_seq,
                 publisher,
@@ -136,6 +141,7 @@ impl Reducer {
                 }
             }
         }
+        self.recompute_dangling_announcement_components();
         self.publish();
         Ok(ApplyOutcome::Applied(persist))
     }
@@ -305,7 +311,7 @@ impl Reducer {
             _ => {}
         }
 
-        let diagnostic_deltas = validate_controller_transition(
+        let mut diagnostic_deltas = validate_controller_transition(
             &scratch.model,
             &event.event,
             subject,
@@ -328,6 +334,8 @@ impl Reducer {
             event: Box::new(normalized),
             seen_at_ms: metadata.receipt_time_ms,
         });
+        diagnostic_deltas.post_dangling_announcement_components =
+            crate::model::graph::dangling_announcement_components(&scratch.model);
 
         Ok(MaterializedDelta {
             post_model: scratch.model,
@@ -380,7 +388,7 @@ impl Reducer {
             deltas.terminal_forward_reference_creations,
         );
         diagnostics
-            .record_dangling_announcement_components(deltas.dangling_announcement_components);
+            .set_dangling_announcement_components(deltas.post_dangling_announcement_components);
     }
 
     fn apply_inner(&mut self, event: NormalizedEvent) -> Result<PersistBatch, ReducerError> {
@@ -529,6 +537,7 @@ impl Reducer {
             self.close_run_without_live_execution(run_id, now_ms, &mut persist);
         }
 
+        self.recompute_dangling_announcement_components();
         self.publish();
         Ok(persist)
     }
@@ -1392,8 +1401,16 @@ impl Reducer {
         for execution_id in execution_ids {
             self.end_execution(&execution_id, now_ms, &mut persist);
         }
+        self.recompute_dangling_announcement_components();
         self.publish();
         persist
+    }
+
+    fn recompute_dangling_announcement_components(&mut self) {
+        let count = crate::model::graph::dangling_announcement_components(&self.model);
+        self.model
+            .controller_diagnostics_mut()
+            .set_dangling_announcement_components(count);
     }
 
     fn publish(&self) {
@@ -1421,9 +1438,6 @@ fn validate_controller_transition(
             let edge = execution_edge.ok_or(RejectReason::Invalid)?;
             preflight_execution_edge(model, edge)
                 .map_err(|conflict| reject_merge_conflict(&conflict))?;
-            if subject_was_unknown {
-                deltas.dangling_announcement_components = 1;
-            }
         }
         ControllerEventKind::DependsOn { .. } => {
             let edge = dependency_edge.ok_or(RejectReason::Invalid)?;
@@ -1433,9 +1447,6 @@ fn validate_controller_transition(
             }
             preflight_dependency_edge(model, edge)
                 .map_err(|conflict| reject_merge_conflict(&conflict))?;
-            if subject_was_unknown {
-                deltas.dangling_announcement_components = 1;
-            }
         }
         ControllerEventKind::TaskStarted => {
             if matches!(
@@ -1757,11 +1768,12 @@ mod tests {
         AgentNode, AgentNodeObservation, AgentSessionReference, AgentSessionReferenceKind,
         ControllerEvent, ControllerEventKind, DependencyEdge, DisplayOrdinal, DomainModel,
         EventMetadata, ExecState, Execution, ExecutionEdge, GapKind, MinimalProviderMetadata,
-        NormalizedEvent, PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SnapshotAgent,
-        TaskRun, TaskState, TopologyEntity, TopologySnapshot, Workspace,
+        NormalizedEvent, PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SharedModel,
+        SnapshotAgent, TaskRun, TaskState, TopologyEntity, TopologySnapshot, Workspace,
     };
     use crate::store::{
-        PersistOp, RestoredState, database_path, open_reader, open_writer, spawn_writer,
+        PersistOp, RestoredState, WriterClient, database_path, open_reader, open_writer,
+        spawn_writer,
     };
 
     use super::{ApplyOutcome, CommitStagedError, Reducer, ReducerError, RejectReason};
@@ -1828,6 +1840,28 @@ mod tests {
             metadata,
             event,
         }
+    }
+
+    async fn commit_controller(
+        reducer: &mut Reducer,
+        writer: &WriterClient,
+        event: ControllerEvent,
+    ) {
+        let delta = reducer.validate_controller_event(&event).unwrap();
+        let permit = writer.reserve_enqueue().unwrap();
+        reducer
+            .commit_staged(delta, permit)
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+    }
+
+    fn dangling_gauge(shared: &SharedModel) -> u64 {
+        shared
+            .borrow()
+            .controller_diagnostics()
+            .dangling_announcement_components()
     }
 
     #[test]
@@ -2992,6 +3026,371 @@ mod tests {
                 .dangling_announcement_components(),
             1
         );
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_placeholder_under_running_parent_is_not_dangling() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        commit_controller(
+            &mut reducer,
+            &writer,
+            controller_event("parent-started", "parent", ControllerEventKind::TaskStarted),
+        )
+        .await;
+        commit_controller(
+            &mut reducer,
+            &writer,
+            controller_event(
+                "child-dispatched",
+                "child",
+                ControllerEventKind::Dispatch {
+                    parent_task_run_id: "parent".to_owned(),
+                },
+            ),
+        )
+        .await;
+
+        assert_eq!(dangling_gauge(&shared), 0);
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn task_started_resolves_a_dangling_component_member() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        commit_controller(
+            &mut reducer,
+            &writer,
+            controller_event(
+                "island",
+                "child",
+                ControllerEventKind::Dispatch {
+                    parent_task_run_id: "parent".to_owned(),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(dangling_gauge(&shared), 1);
+
+        commit_controller(
+            &mut reducer,
+            &writer,
+            controller_event("child-started", "child", ControllerEventKind::TaskStarted),
+        )
+        .await;
+
+        assert_eq!(dangling_gauge(&shared), 0);
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execution_binding_resolves_a_dangling_component_member() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        commit_controller(
+            &mut reducer,
+            &writer,
+            controller_event(
+                "island",
+                "child",
+                ControllerEventKind::Dispatch {
+                    parent_task_run_id: "parent".to_owned(),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(dangling_gauge(&shared), 1);
+        let child = reducer.resolve_controller_run("child").unwrap();
+        let mut begin_metadata = metadata("child-execution", 100);
+        begin_metadata.terminal_id = Some("terminal-child".to_owned());
+
+        reducer
+            .apply(NormalizedEvent::ExecutionBegin {
+                metadata: begin_metadata,
+                execution: Execution {
+                    execution_id: "child-execution".to_owned(),
+                    pane_id: "pane-child".to_owned(),
+                    terminal_id: "terminal-child".to_owned(),
+                    task_run_id: child,
+                    state: ExecState::Working,
+                },
+            })
+            .unwrap();
+
+        assert_eq!(dangling_gauge(&shared), 0);
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dangling_gauge_replaces_old_value_after_resolution_and_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        commit_controller(
+            &mut reducer,
+            &writer,
+            controller_event(
+                "first-island",
+                "child-1",
+                ControllerEventKind::Dispatch {
+                    parent_task_run_id: "parent-1".to_owned(),
+                },
+            ),
+        )
+        .await;
+        commit_controller(
+            &mut reducer,
+            &writer,
+            controller_event(
+                "first-resolved",
+                "child-1",
+                ControllerEventKind::TaskStarted,
+            ),
+        )
+        .await;
+        commit_controller(
+            &mut reducer,
+            &writer,
+            controller_event(
+                "second-island",
+                "child-2",
+                ControllerEventKind::Dispatch {
+                    parent_task_run_id: "parent-2".to_owned(),
+                },
+            ),
+        )
+        .await;
+
+        assert_eq!(dangling_gauge(&shared), 1);
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn restored_dangling_island_initializes_gauge_before_first_event() {
+        let parent = RunId::new();
+        let child = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            parent,
+            RunKey::Controller("parent".to_owned()),
+            1,
+            TaskState::Queued,
+        ));
+        model.insert_task_run(run(
+            child,
+            RunKey::Controller("child".to_owned()),
+            2,
+            TaskState::Queued,
+        ));
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: parent,
+            child_run_id: child,
+        });
+
+        let (_reducer, shared) = Reducer::new(restored(model, 3));
+
+        assert_eq!(dangling_gauge(&shared), 1);
+    }
+
+    #[test]
+    fn stale_sweep_terminal_neighbor_flips_dangling_gauge() {
+        let outside = RunId::new();
+        let relationship_only = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            outside,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "outside".to_owned(),
+            },
+            1,
+            TaskState::Running,
+        ));
+        model.insert_task_run(run(
+            relationship_only,
+            RunKey::Controller("relationship-only".to_owned()),
+            2,
+            TaskState::Queued,
+        ));
+        model.insert_execution(execution(
+            outside,
+            "outside-execution",
+            ExecState::Stale { since_ms: 1_000 },
+        ));
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: outside,
+            child_run_id: relationship_only,
+        });
+        let (mut reducer, shared) = Reducer::new(restored(model, 3));
+        assert_eq!(dangling_gauge(&shared), 0);
+
+        reducer.sweep_stale(31_000);
+
+        assert_eq!(dangling_gauge(&shared), 1);
+        assert_eq!(
+            shared.borrow().task_run(&outside).unwrap().state,
+            TaskState::EndedUnknown
+        );
+    }
+
+    #[test]
+    fn rejected_controller_event_leaves_dangling_gauge_unchanged() {
+        let parent = RunId::new();
+        let child = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            parent,
+            RunKey::Controller("parent".to_owned()),
+            1,
+            TaskState::Queued,
+        ));
+        model.insert_task_run(run(
+            child,
+            RunKey::Controller("child".to_owned()),
+            2,
+            TaskState::Queued,
+        ));
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: parent,
+            child_run_id: child,
+        });
+        let (reducer, shared) = Reducer::new(restored(model, 3));
+        assert_eq!(dangling_gauge(&shared), 1);
+
+        let result = reducer.validate_controller_event(&controller_event(
+            "rejected-cycle",
+            "self",
+            ControllerEventKind::Dispatch {
+                parent_task_run_id: "self".to_owned(),
+            },
+        ));
+
+        assert!(matches!(result, Err(RejectReason::Cycle)));
+        assert_eq!(dangling_gauge(&shared), 1);
+    }
+
+    #[test]
+    fn progress_forward_reference_is_not_relationship_only() {
+        let (reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let delta = reducer
+            .validate_controller_event(&controller_event(
+                "progress-forward",
+                "progress-run",
+                ControllerEventKind::Progress,
+            ))
+            .unwrap();
+        let run_id = delta
+            .post_model
+            .task_run_by_key(&RunKey::Controller("progress-run".to_owned()))
+            .unwrap()
+            .run_id;
+
+        assert!(!crate::model::graph::is_relationship_only(
+            &delta.post_model,
+            run_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn two_disjoint_placeholder_islands_count_as_two() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        for (event_id, child, parent) in [
+            ("island-1", "child-1", "parent-1"),
+            ("island-2", "child-2", "parent-2"),
+        ] {
+            commit_controller(
+                &mut reducer,
+                &writer,
+                controller_event(
+                    event_id,
+                    child,
+                    ControllerEventKind::Dispatch {
+                        parent_task_run_id: parent.to_owned(),
+                    },
+                ),
+            )
+            .await;
+        }
+
+        assert_eq!(dangling_gauge(&shared), 2);
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn zero_outside_neighbor_island_is_dangling() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        commit_controller(
+            &mut reducer,
+            &writer,
+            controller_event(
+                "dependency-island",
+                "dependent",
+                ControllerEventKind::DependsOn {
+                    depends_on_id: "prerequisite".to_owned(),
+                },
+            ),
+        )
+        .await;
+
+        assert_eq!(dangling_gauge(&shared), 1);
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_only_outside_neighbor_keeps_component_dangling() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        commit_controller(
+            &mut reducer,
+            &writer,
+            controller_event(
+                "island",
+                "child",
+                ControllerEventKind::Dispatch {
+                    parent_task_run_id: "parent".to_owned(),
+                },
+            ),
+        )
+        .await;
+        commit_controller(
+            &mut reducer,
+            &writer,
+            controller_event("parent-complete", "parent", ControllerEventKind::Complete),
+        )
+        .await;
+
+        assert_eq!(dangling_gauge(&shared), 1);
         lifecycle.shutdown().await.unwrap();
     }
 

@@ -1,6 +1,7 @@
 //! T4C domain model types for monitored sessions.
 
 pub mod entities;
+pub mod graph;
 pub mod ids;
 pub mod state;
 
