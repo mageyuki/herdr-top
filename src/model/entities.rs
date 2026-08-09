@@ -115,6 +115,12 @@ impl ControllerDiagnostics {
         self.acceptor.socket_saturations()
     }
 
+    /// Controller listener accept calls that failed transiently.
+    #[must_use]
+    pub fn accept_failures(&self) -> u64 {
+        self.acceptor.accept_failures()
+    }
+
     /// Returns the atomic counter handle shared with the socket acceptor.
     #[must_use]
     pub fn acceptor_handle(&self) -> ControllerDiagnosticsHandle {
@@ -150,9 +156,25 @@ impl ControllerDiagnostics {
 #[derive(Clone, Debug, Default)]
 pub struct ControllerDiagnosticsHandle {
     socket_saturations: Arc<AtomicU64>,
+    accept_failures: Arc<AtomicU64>,
 }
 
 impl ControllerDiagnosticsHandle {
+    /// Records one failed Controller listener accept call.
+    pub fn record_accept_failure(&self) {
+        let _ = self
+            .accept_failures
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_add(1))
+            });
+    }
+
+    /// Returns the current failed-accept count.
+    #[must_use]
+    pub fn accept_failures(&self) -> u64 {
+        self.accept_failures.load(Ordering::Relaxed)
+    }
+
     /// Records one admission rejected because the Controller socket was saturated.
     pub fn record_socket_saturation(&self) {
         let _ =
@@ -666,6 +688,17 @@ mod tests {
 
         assert_eq!(model.controller_diagnostics().socket_saturations(), 1);
         assert_eq!(cloned.controller_diagnostics().socket_saturations(), 1);
+    }
+
+    #[test]
+    fn controller_diagnostics_accept_failure_handle_is_shared() {
+        let model = DomainModel::default();
+        let acceptor = model.controller_diagnostics().acceptor_handle();
+
+        acceptor.record_accept_failure();
+
+        assert_eq!(acceptor.accept_failures(), 1);
+        assert_eq!(model.controller_diagnostics().accept_failures(), 1);
     }
 
     #[test]

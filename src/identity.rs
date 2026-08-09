@@ -194,8 +194,9 @@ pub fn plan_binding(model: &DomainModel, ev: &BindingEvidence) -> BindingPlan {
 
 /// Applies the sole public identity mutation path and returns its durable half.
 ///
-/// Reducers must resolve aliases through the model immediately after admission,
-/// before event-ledger lookup and before staging any placeholder Task Runs.
+/// Reducers resolve aliases inside Controller validation against current model state before
+/// staging any placeholder Task Runs. Event-ledger lookup is keyed by `event_id` alone, so its
+/// ordering relative to alias resolution is unobservable.
 pub fn apply_binding_plan(
     model: &mut DomainModel,
     plan: BindingPlan,

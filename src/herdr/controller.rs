@@ -1,5 +1,6 @@
 //! Session-scoped Controller event transport, admission, and emit client.
 
+use std::future::Future;
 use std::io;
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::Path;
@@ -23,10 +24,15 @@ use crate::store::writer::WriterClient;
 
 /// Maximum JSON payload size, excluding the newline delimiter.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
+/// Bounds concurrent pre-frame connection tasks; the kernel listen backlog queues beyond it —
+/// implements design §9.2 "connection queueing bounded by the acceptor."
+pub const MAX_CONTROLLER_CONNECTIONS: usize = 64;
 /// Per-operation transport timeout for Controller sockets.
 pub const CONTROLLER_IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Production capacity of the bounded acceptor-to-reducer request queue.
 pub const CONTROLLER_REQUEST_QUEUE_CAPACITY: usize = 64;
+
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// One Controller request as emitted by the standalone client.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -216,32 +222,60 @@ pub fn spawn_acceptor(
     cancellation: CancellationToken,
 ) -> Result<JoinHandle<Result<(), ControllerServerError>>, ControllerServerError> {
     listener.set_nonblocking(true)?;
-    let listener = UnixListener::from_std(listener)?;
+    let mut listener = UnixListener::from_std(listener)?;
     Ok(tokio::spawn(async move {
-        let mut connections = JoinSet::new();
-        loop {
-            tokio::select! {
-                () = cancellation.cancelled() => break,
-                accepted = listener.accept() => {
-                    let (stream, _address) = accepted?;
-                    let request_sender = sender.clone();
-                    connections.spawn(async move {
-                        if let Err(error) = handle_connection(stream, request_sender).await {
-                            tracing::warn!(error = %error, "Controller connection ended without a response");
-                        }
-                    });
-                }
-                result = connections.join_next(), if !connections.is_empty() => {
-                    if let Some(Err(error)) = result {
-                        tracing::warn!(error = %error, "Controller connection task failed");
+        run_acceptor(&mut listener, sender, cancellation).await
+    }))
+}
+
+trait AcceptSource {
+    fn accept(&mut self) -> impl Future<Output = io::Result<UnixStream>> + Send;
+}
+
+impl AcceptSource for UnixListener {
+    async fn accept(&mut self) -> io::Result<UnixStream> {
+        UnixListener::accept(self)
+            .await
+            .map(|(stream, _address)| stream)
+    }
+}
+
+async fn run_acceptor(
+    source: &mut impl AcceptSource,
+    sender: ControllerRequestSender,
+    cancellation: CancellationToken,
+) -> Result<(), ControllerServerError> {
+    let mut connections = JoinSet::new();
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            accepted = source.accept(), if connections.len() < MAX_CONTROLLER_CONNECTIONS => {
+                match accepted {
+                    Ok(stream) => {
+                        let request_sender = sender.clone();
+                        connections.spawn(async move {
+                            if let Err(error) = handle_connection(stream, request_sender).await {
+                                tracing::warn!(error = %error, "Controller connection ended without a response");
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        sender.diagnostics.record_accept_failure();
+                        tracing::warn!(error = %error, "Controller accept failed; retrying");
+                        tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
                     }
                 }
             }
+            result = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = result {
+                    tracing::warn!(error = %error, "Controller connection task failed");
+                }
+            }
         }
-        connections.abort_all();
-        while connections.join_next().await.is_some() {}
-        Ok(())
-    }))
+    }
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    Ok(())
 }
 
 async fn handle_connection(
@@ -283,9 +317,12 @@ async fn handle_connection(
                 reason: RejectResponseReason::Invalid,
             }
         }
-        Err(_) => ControllerResponse::Rejected {
-            reason: RejectResponseReason::Invalid,
-        },
+        Err(_) => {
+            should_drain = true;
+            ControllerResponse::Rejected {
+                reason: RejectResponseReason::Invalid,
+            }
+        }
     };
     let mut bytes = serde_json::to_vec(&response).map_err(invalid_data)?;
     bytes.push(b'\n');
@@ -352,9 +389,9 @@ pub(crate) async fn service_request(
     writer: &WriterClient,
 ) {
     let decoded = decode_envelope(&request.frame);
-    for raw in decoded.alias_keys() {
-        let _ = reducer.resolve_controller_run(raw);
-    }
+    // Alias resolution for a merged-away key happens inside `validate_controller_event`
+    // against current reducer state before any placeholder is staged. Event-id deduplication
+    // is independent of alias keys, so there is no observable ordering interaction.
     if decoded
         .event_id
         .as_deref()
@@ -404,21 +441,10 @@ pub(crate) async fn service_request(
 
 struct DecodedEnvelope {
     event_id: Option<String>,
-    task_run_id: Option<String>,
-    parent_task_run_id: Option<String>,
-    depends_on_id: Option<String>,
     object: Result<Map<String, Value>, RejectReason>,
 }
 
 impl DecodedEnvelope {
-    fn alias_keys(&self) -> impl Iterator<Item = &str> {
-        self.task_run_id
-            .iter()
-            .chain(self.parent_task_run_id.iter())
-            .chain(self.depends_on_id.iter())
-            .map(String::as_str)
-    }
-
     fn decode_event(
         &self,
         receipt_time_ms: i64,
@@ -436,21 +462,12 @@ fn decode_envelope(frame: &[u8]) -> DecodedEnvelope {
     let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(frame) else {
         return DecodedEnvelope {
             event_id: None,
-            task_run_id: None,
-            parent_task_run_id: None,
-            depends_on_id: None,
             object: Err(RejectReason::Invalid),
         };
     };
     let event_id = optional_valid_string(&object, "event_id");
-    let task_run_id = optional_valid_string(&object, "task_run_id");
-    let parent_task_run_id = optional_valid_string(&object, "parent_task_run_id");
-    let depends_on_id = optional_valid_string(&object, "depends_on_id");
     DecodedEnvelope {
         event_id,
-        task_run_id,
-        parent_task_run_id,
-        depends_on_id,
         object: Ok(object),
     }
 }
@@ -669,7 +686,11 @@ fn unix_now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::future::pending;
+
     use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, BufReader};
 
     use super::*;
     use crate::lockfile::StateRoot;
@@ -694,6 +715,112 @@ mod tests {
         )
         .await;
         response.await.unwrap()
+    }
+
+    struct ScriptedAcceptSource {
+        accepts: VecDeque<io::Result<UnixStream>>,
+    }
+
+    impl AcceptSource for ScriptedAcceptSource {
+        async fn accept(&mut self) -> io::Result<UnixStream> {
+            let accepted = self.accepts.pop_front();
+            match accepted {
+                Some(accepted) => accepted,
+                None => pending().await,
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acceptor_retries_after_accept_error() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut source = ScriptedAcceptSource {
+            accepts: VecDeque::from([Err(io::Error::from_raw_os_error(libc::EMFILE)), Ok(server)]),
+        };
+        let diagnostics = ControllerDiagnosticsHandle::default();
+        let (sender, mut receiver) = request_channel(1, diagnostics.clone());
+        let responder = tokio::spawn(async move {
+            let request = receiver.recv().await.unwrap();
+            request
+                .responder
+                .send(ControllerResponse::Accepted)
+                .unwrap();
+        });
+        let cancellation = CancellationToken::new();
+        let cancel_after_response = cancellation.clone();
+        let client_exchange = async move {
+            let mut frame = serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "event_id": "after-accept-error",
+                "emitted_at_ms": 1,
+                "source": "test",
+                "event_type": "task_started",
+                "task_run_id": "run"
+            }))
+            .unwrap();
+            frame.push(b'\n');
+            client.write_all(&frame).await.unwrap();
+            client.shutdown().await.unwrap();
+
+            let mut response = Vec::new();
+            let mut reader = BufReader::new(client);
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                reader.read_until(b'\n', &mut response),
+            )
+            .await
+            .expect("acceptor did not handle the scripted connection")
+            .unwrap();
+            cancel_after_response.cancel();
+            serde_json::from_slice::<ControllerResponse>(&response).unwrap()
+        };
+
+        let (acceptor, response) = tokio::join!(
+            run_acceptor(&mut source, sender, cancellation),
+            client_exchange
+        );
+
+        assert_eq!(response, ControllerResponse::Accepted);
+        assert_eq!(diagnostics.accept_failures(), 1);
+        acceptor.unwrap();
+        responder.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_timeout_drains_before_handler_completion() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let diagnostics = ControllerDiagnosticsHandle::default();
+        let (sender, _receiver) = request_channel(1, diagnostics);
+        let handle = tokio::spawn(handle_connection(server, sender));
+
+        client.write_all(b"{").await.unwrap();
+        let mut response = Vec::new();
+        {
+            let mut reader = BufReader::new(&mut client);
+            tokio::time::timeout(
+                Duration::from_secs(8),
+                reader.read_until(b'\n', &mut response),
+            )
+            .await
+            .expect("read-timeout response did not arrive")
+            .unwrap();
+        }
+        assert_eq!(
+            serde_json::from_slice::<ControllerResponse>(&response).unwrap(),
+            ControllerResponse::Rejected {
+                reason: RejectResponseReason::Invalid,
+            }
+        );
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!handle.is_finished());
+
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("handler did not finish after inbound EOF")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

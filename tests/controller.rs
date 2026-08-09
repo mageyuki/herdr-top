@@ -21,7 +21,7 @@ use herdr_top::session_key;
 use herdr_top::store::{self, PersistOp, PersistTaskRun, WriterClient, WriterLifecycle};
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 const SESSION: &str = "controller-test-session";
@@ -1144,15 +1144,46 @@ async fn malformed_frame_and_frame_limit_and_timeout() {
     );
     let mut timed_out = UnixStream::connect(&running.socket_path).await.unwrap();
     let mut response = Vec::new();
-    tokio::time::timeout(Duration::from_secs(6), timed_out.read_to_end(&mut response))
+    {
+        let mut reader = BufReader::new(&mut timed_out);
+        tokio::time::timeout(
+            Duration::from_secs(6),
+            reader.read_until(b'\n', &mut response),
+        )
         .await
         .unwrap()
         .unwrap();
+    }
     assert_eq!(
         serde_json::from_slice::<ControllerResponse>(&response).unwrap(),
         rejected(RejectResponseReason::Invalid)
     );
+    drop(timed_out);
     running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn controller_connection_cap_defers_excess_connections() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let running = RunningController::start().await;
+        let mut idle_connections = Vec::new();
+        for _ in 0..herdr_top::herdr::controller::MAX_CONTROLLER_CONNECTIONS + 8 {
+            idle_connections.push(UnixStream::connect(&running.socket_path).await.unwrap());
+        }
+
+        let started = tokio::time::Instant::now();
+        let response = running
+            .send(&envelope("after-cap", "task_started", "run"))
+            .await;
+
+        assert_eq!(response, ControllerResponse::Accepted);
+        assert!(started.elapsed() >= Duration::from_secs(3));
+
+        drop(idle_connections);
+        running.stop().await;
+    })
+    .await
+    .expect("connection-cap integration test timed out");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
