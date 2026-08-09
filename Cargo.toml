@@ -19,6 +19,7 @@ thiserror = "2"
 ulid = "1"
 sha2 = "0.10"
 libc = "0.2"
+notify = "8"
 
 [dev-dependencies]
 tempfile = "3"

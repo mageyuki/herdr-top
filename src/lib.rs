@@ -6,6 +6,7 @@ pub mod herdr;
 pub mod identity;
 pub mod lockfile;
 pub mod model;
+pub mod provider;
 pub mod reducer;
 pub mod rendezvous;
 pub mod session_key;
