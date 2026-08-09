@@ -55,6 +55,19 @@ pub trait ReadBoundary {
 
     /// Opens the same contained path and reads one bounded chunk from `offset`.
     fn read_from(&mut self, root: &Path, relative: &Path, offset: u64) -> io::Result<ReadChunk>;
+
+    /// Reads one chunk capped at `max_bytes` without advancing past a frozen goalpost.
+    fn read_from_bounded(
+        &mut self,
+        root: &Path,
+        relative: &Path,
+        offset: u64,
+        max_bytes: usize,
+    ) -> io::Result<ReadChunk> {
+        let mut chunk = self.read_from(root, relative, offset)?;
+        chunk.bytes.truncate(max_bytes);
+        Ok(chunk)
+    }
 }
 
 /// Descriptor-relative, no-follow implementation of [`ReadBoundary`].
@@ -68,12 +81,22 @@ impl ReadBoundary for FsReadBoundary {
     }
 
     fn read_from(&mut self, root: &Path, relative: &Path, offset: u64) -> io::Result<ReadChunk> {
+        self.read_from_bounded(root, relative, offset, MAX_TAIL_CHUNK_BYTES)
+    }
+
+    fn read_from_bounded(
+        &mut self,
+        root: &Path,
+        relative: &Path,
+        offset: u64,
+        max_bytes: usize,
+    ) -> io::Result<ReadChunk> {
         let mut file = super::open_contained_regular_file(root, relative)?;
         let snapshot = FileSnapshot::from_file(&file)?;
         file.seek(SeekFrom::Start(offset))?;
-        let mut bytes = Vec::with_capacity(MAX_TAIL_CHUNK_BYTES);
-        file.take(MAX_TAIL_CHUNK_BYTES as u64)
-            .read_to_end(&mut bytes)?;
+        let max_bytes = max_bytes.min(MAX_TAIL_CHUNK_BYTES);
+        let mut bytes = Vec::with_capacity(max_bytes);
+        file.take(max_bytes as u64).read_to_end(&mut bytes)?;
         Ok(ReadChunk { snapshot, bytes })
     }
 }
@@ -193,24 +216,43 @@ impl TailFile {
     /// Stats the file and returns only newly completed records.
     pub fn poll(&mut self, boundary: &mut impl ReadBoundary) -> io::Result<Vec<TailRecord>> {
         let snapshot = boundary.snapshot(&self.root, &self.relative)?;
-        let rotated = snapshot.identity() != self.identity;
-        let truncated = snapshot.size < self.last_size || snapshot.size < self.offset;
-        if rotated || truncated {
-            self.generation = self.generation.saturating_add(1);
-            self.offset = 0;
-            self.partial.clear();
-            self.partial_offset = 0;
-            self.discarding = false;
-            self.identity = snapshot.identity();
-        }
-        self.last_size = snapshot.size;
+        self.poll_snapshot_to_goalpost(boundary, snapshot, snapshot.size)
+    }
 
-        if snapshot.size <= self.offset {
+    /// Freezes the current file size for a bounded worker cycle.
+    pub fn cycle_goalpost(&mut self, boundary: &mut impl ReadBoundary) -> io::Result<u64> {
+        let snapshot = boundary.snapshot(&self.root, &self.relative)?;
+        self.observe_snapshot(snapshot);
+        Ok(snapshot.size)
+    }
+
+    /// Reads one chunk without advancing beyond the supplied cycle goalpost.
+    pub fn poll_to_goalpost(
+        &mut self,
+        boundary: &mut impl ReadBoundary,
+        goalpost: u64,
+    ) -> io::Result<Vec<TailRecord>> {
+        let snapshot = boundary.snapshot(&self.root, &self.relative)?;
+        self.poll_snapshot_to_goalpost(boundary, snapshot, goalpost)
+    }
+
+    fn poll_snapshot_to_goalpost(
+        &mut self,
+        boundary: &mut impl ReadBoundary,
+        snapshot: FileSnapshot,
+        goalpost: u64,
+    ) -> io::Result<Vec<TailRecord>> {
+        self.observe_snapshot(snapshot);
+        if snapshot.size <= self.offset || goalpost <= self.offset {
             return Ok(Vec::new());
         }
 
         let requested_offset = self.offset;
-        let chunk = boundary.read_from(&self.root, &self.relative, requested_offset)?;
+        let max_bytes = usize::try_from(goalpost.saturating_sub(requested_offset))
+            .unwrap_or(usize::MAX)
+            .min(MAX_TAIL_CHUNK_BYTES);
+        let chunk =
+            boundary.read_from_bounded(&self.root, &self.relative, requested_offset, max_bytes)?;
         self.read_calls = self.read_calls.saturating_add(1);
         self.bytes_read = self.bytes_read.saturating_add(chunk.bytes.len() as u64);
 
@@ -222,7 +264,11 @@ impl TailFile {
             self.discarding = false;
             self.identity = chunk.snapshot.identity();
             self.last_size = chunk.snapshot.size;
-            let replacement = boundary.read_from(&self.root, &self.relative, 0)?;
+            let replacement_limit = usize::try_from(goalpost)
+                .unwrap_or(usize::MAX)
+                .min(MAX_TAIL_CHUNK_BYTES);
+            let replacement =
+                boundary.read_from_bounded(&self.root, &self.relative, 0, replacement_limit)?;
             self.read_calls = self.read_calls.saturating_add(1);
             self.bytes_read = self
                 .bytes_read
@@ -235,6 +281,20 @@ impl TailFile {
 
         self.last_size = chunk.snapshot.size;
         Ok(self.accept_bytes(requested_offset, chunk.bytes))
+    }
+
+    fn observe_snapshot(&mut self, snapshot: FileSnapshot) {
+        let rotated = snapshot.identity() != self.identity;
+        let truncated = snapshot.size < self.last_size || snapshot.size < self.offset;
+        if rotated || truncated {
+            self.generation = self.generation.saturating_add(1);
+            self.offset = 0;
+            self.partial.clear();
+            self.partial_offset = 0;
+            self.discarding = false;
+            self.identity = snapshot.identity();
+        }
+        self.last_size = snapshot.size;
     }
 
     fn accept_bytes(&mut self, start: u64, bytes: Vec<u8>) -> Vec<TailRecord> {

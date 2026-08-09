@@ -228,6 +228,18 @@ impl ProviderDiagnostics {
         self.handle.duplicate_events()
     }
 
+    /// Invalid provider targets skipped without interrupting sibling work.
+    #[must_use]
+    pub fn invalid_targets(&self) -> u64 {
+        self.handle.invalid_targets()
+    }
+
+    /// Duplicate target decompositions collapsed to one path owner per cycle.
+    #[must_use]
+    pub fn duplicate_path_targets(&self) -> u64 {
+        self.handle.duplicate_path_targets()
+    }
+
     #[must_use]
     pub fn egress_saturations(&self) -> u64 {
         self.handle.egress_saturations()
@@ -248,10 +260,10 @@ impl ProviderDiagnostics {
         self.handle.watch_cap_fallbacks()
     }
 
-    /// Non-standard roots whose run baseline was approximated at their first scan.
+    /// Roots whose baseline was captured late or approximated at their first scan.
     #[must_use]
-    pub fn fallback_baseline_approximations(&self) -> u64 {
-        self.handle.fallback_baseline_approximations()
+    pub fn baseline_approximations(&self) -> u64 {
+        self.handle.baseline_approximations()
     }
 
     /// Notify backends that failed creation and fell back to periodic polling.
@@ -283,11 +295,13 @@ pub struct ProviderDiagnosticsHandle {
     dropped_hints: Arc<AtomicU64>,
     coalesced_updates: Arc<AtomicU64>,
     duplicate_events: Arc<AtomicU64>,
+    invalid_targets: Arc<AtomicU64>,
+    duplicate_path_targets: Arc<AtomicU64>,
     egress_saturations: Arc<AtomicU64>,
     egress_closed: Arc<AtomicU64>,
     malformed_records: Arc<AtomicU64>,
     watch_cap_fallbacks: Arc<AtomicU64>,
-    fallback_baseline_approximations: Arc<AtomicU64>,
+    baseline_approximations: Arc<AtomicU64>,
     notify_creation_failures: Arc<AtomicU64>,
     provider_cycles: Arc<AtomicU64>,
     provider_io_errors: Arc<AtomicU64>,
@@ -312,6 +326,14 @@ impl ProviderDiagnosticsHandle {
         Self::increment(&self.duplicate_events);
     }
 
+    pub fn record_invalid_target(&self) {
+        Self::increment(&self.invalid_targets);
+    }
+
+    pub fn record_duplicate_path_target(&self) {
+        Self::increment(&self.duplicate_path_targets);
+    }
+
     pub fn record_egress_saturation(&self) {
         Self::increment(&self.egress_saturations);
     }
@@ -328,9 +350,9 @@ impl ProviderDiagnosticsHandle {
         Self::increment(&self.watch_cap_fallbacks);
     }
 
-    /// Records capture-at-first-scan for a root that was not a spawn-resolved standard root.
-    pub fn record_fallback_baseline_approximation(&self) {
-        Self::increment(&self.fallback_baseline_approximations);
+    /// Records one late or first-scan-approximated root baseline.
+    pub fn record_baseline_approximation(&self) {
+        Self::increment(&self.baseline_approximations);
     }
 
     /// Records one notify backend creation failure handled by polling fallback.
@@ -362,6 +384,16 @@ impl ProviderDiagnosticsHandle {
     }
 
     #[must_use]
+    pub fn invalid_targets(&self) -> u64 {
+        self.invalid_targets.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn duplicate_path_targets(&self) -> u64 {
+        self.duplicate_path_targets.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
     pub fn egress_saturations(&self) -> u64 {
         self.egress_saturations.load(Ordering::Relaxed)
     }
@@ -382,9 +414,8 @@ impl ProviderDiagnosticsHandle {
     }
 
     #[must_use]
-    pub fn fallback_baseline_approximations(&self) -> u64 {
-        self.fallback_baseline_approximations
-            .load(Ordering::Relaxed)
+    pub fn baseline_approximations(&self) -> u64 {
+        self.baseline_approximations.load(Ordering::Relaxed)
     }
 
     #[must_use]

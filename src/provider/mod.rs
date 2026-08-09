@@ -251,6 +251,27 @@ pub struct DiscoveryIndex {
     baseline: FirstSeenBaseline,
 }
 
+/// Per-file results from a successful root discovery pass.
+#[derive(Debug, Default)]
+pub struct DiscoveryScanOutcome {
+    file_io_error: bool,
+    removed_path_ids: Vec<u32>,
+}
+
+impl DiscoveryScanOutcome {
+    /// Reports whether any individual file could not be interned or bootstrapped.
+    #[must_use]
+    pub const fn had_file_io_error(&self) -> bool {
+        self.file_io_error
+    }
+
+    /// Returns paths removed from discovery during this scan.
+    #[must_use]
+    pub fn removed_path_ids(&self) -> &[u32] {
+        &self.removed_path_ids
+    }
+}
+
 impl DiscoveryIndex {
     /// Captures the per-run first-seen baseline immediately for all supplied roots.
     pub fn new(roots: Vec<DiscoveryRoot>) -> io::Result<Self> {
@@ -274,8 +295,9 @@ impl DiscoveryIndex {
         &mut self,
         parser: &mut impl BootstrapParser,
         interner: &mut PathInterner,
-    ) -> io::Result<()> {
+    ) -> io::Result<DiscoveryScanOutcome> {
         let mut seen = HashSet::new();
+        let mut outcome = DiscoveryScanOutcome::default();
         for root in self.roots.clone() {
             let mut root_seen = HashSet::new();
             for relative in discover_artifacts(&root.path)? {
@@ -286,8 +308,20 @@ impl DiscoveryIndex {
                 if self.files.contains_key(&file_key) {
                     continue;
                 }
-                let path_id = interner.intern(&absolute)?;
-                let bootstrap = bootstrap_file(&root, &relative, parser)?;
+                let path_id = match interner.intern(&absolute) {
+                    Ok(path_id) => path_id,
+                    Err(_) => {
+                        outcome.file_io_error = true;
+                        continue;
+                    }
+                };
+                let bootstrap = match bootstrap_file(&root, &relative, parser) {
+                    Ok(bootstrap) => bootstrap,
+                    Err(_) => {
+                        outcome.file_io_error = true;
+                        continue;
+                    }
+                };
                 if let Some(identity) = bootstrap.as_ref()
                     && valid_native_id(&identity.thread_id)
                     && identity
@@ -316,9 +350,18 @@ impl DiscoveryIndex {
             }
             self.baseline.retain_existing(&root.path, &root_seen);
         }
-        self.files.retain(|key, _| seen.contains(key));
+        self.files.retain(|key, file| {
+            if seen.contains(key) {
+                true
+            } else {
+                outcome.removed_path_ids.push(file.path_id);
+                false
+            }
+        });
+        outcome.removed_path_ids.sort_unstable();
+        outcome.removed_path_ids.dedup();
         self.rebuild_identities();
-        Ok(())
+        Ok(outcome)
     }
 
     fn rebuild_identities(&mut self) {
@@ -822,6 +865,12 @@ impl ProviderDiagnostics {
     fn record_duplicate(&self) {
         self.0.record_duplicate_event();
     }
+    pub(crate) fn record_invalid_target(&self) {
+        self.0.record_invalid_target();
+    }
+    pub(crate) fn record_duplicate_path_target(&self) {
+        self.0.record_duplicate_path_target();
+    }
     fn record_egress_saturation(&self) {
         self.0.record_egress_saturation();
     }
@@ -834,8 +883,8 @@ impl ProviderDiagnostics {
     fn record_watch_cap_fallback(&self) {
         self.0.record_watch_cap_fallback();
     }
-    pub(crate) fn record_fallback_baseline_approximation(&self) {
-        self.0.record_fallback_baseline_approximation();
+    pub(crate) fn record_baseline_approximation(&self) {
+        self.0.record_baseline_approximation();
     }
     fn record_notify_creation_failure(&self) {
         self.0.record_notify_creation_failure();
@@ -860,6 +909,14 @@ impl ProviderDiagnostics {
         self.0.duplicate_events()
     }
     #[must_use]
+    pub fn invalid_targets(&self) -> u64 {
+        self.0.invalid_targets()
+    }
+    #[must_use]
+    pub fn duplicate_path_targets(&self) -> u64 {
+        self.0.duplicate_path_targets()
+    }
+    #[must_use]
     pub fn egress_saturations(&self) -> u64 {
         self.0.egress_saturations()
     }
@@ -876,8 +933,8 @@ impl ProviderDiagnostics {
         self.0.watch_cap_fallbacks()
     }
     #[must_use]
-    pub fn fallback_baseline_approximations(&self) -> u64 {
-        self.0.fallback_baseline_approximations()
+    pub fn baseline_approximations(&self) -> u64 {
+        self.0.baseline_approximations()
     }
     #[must_use]
     pub fn notify_creation_failures(&self) -> u64 {
@@ -1075,6 +1132,7 @@ pub struct ProviderCycle<'a> {
     pub hint: Option<&'a Path>,
     pub force_rescan: bool,
     pub pending: &'a mut PendingEvents,
+    stop_flag: &'a AtomicBool,
     watch_requests: &'a mut Vec<PathBuf>,
 }
 
@@ -1083,7 +1141,16 @@ impl ProviderCycle<'_> {
     pub fn request_watch(&mut self, directory: PathBuf) {
         self.watch_requests.push(directory);
     }
+
+    /// Reports whether provider-thread shutdown has been requested.
+    #[must_use]
+    pub fn should_stop(&self) -> bool {
+        self.stop_flag.load(Ordering::Acquire)
+    }
 }
+
+#[cfg(test)]
+static TEST_PROVIDER_STOP_FLAG: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]
 pub(crate) fn test_provider_cycle<'a>(
@@ -1096,6 +1163,24 @@ pub(crate) fn test_provider_cycle<'a>(
         hint: None,
         force_rescan: true,
         pending,
+        stop_flag: &TEST_PROVIDER_STOP_FLAG,
+        watch_requests,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_provider_cycle_with_stop<'a>(
+    targets: &'a TargetSet,
+    pending: &'a mut PendingEvents,
+    stop_flag: &'a AtomicBool,
+    watch_requests: &'a mut Vec<PathBuf>,
+) -> ProviderCycle<'a> {
+    ProviderCycle {
+        targets,
+        hint: None,
+        force_rescan: true,
+        pending,
+        stop_flag,
         watch_requests,
     }
 }
@@ -1276,7 +1361,7 @@ fn spawn_provider_thread_configured(
             Ok(watcher) => watcher,
             Err(error) => {
                 tracing::warn!(
-                    error = %error,
+                    error_code = notify_error_code(&error),
                     "provider notify setup failed; falling back to polling"
                 );
                 diagnostics.record_notify_creation_failure();
@@ -1326,6 +1411,17 @@ fn spawn_provider_thread_configured(
     })
 }
 
+const fn notify_error_code(error: &notify::Error) -> &'static str {
+    match &error.kind {
+        notify::ErrorKind::Generic(_) => "notify_generic",
+        notify::ErrorKind::Io(_) => "notify_io",
+        notify::ErrorKind::PathNotFound => "notify_path_not_found",
+        notify::ErrorKind::WatchNotFound => "notify_watch_not_found",
+        notify::ErrorKind::InvalidConfig(_) => "notify_invalid_config",
+        notify::ErrorKind::MaxFilesWatch => "notify_max_files_watch",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn provider_thread_main(
     mut worker: impl ProviderWorker,
@@ -1344,6 +1440,7 @@ fn provider_thread_main(
         &egress,
         &targets,
         &force_rescan,
+        &stop_flag,
         &watcher,
         &diagnostics,
         &mut pending,
@@ -1368,6 +1465,7 @@ fn provider_thread_main(
             &egress,
             &targets,
             &force_rescan,
+            &stop_flag,
             &watcher,
             &diagnostics,
             &mut pending,
@@ -1383,6 +1481,7 @@ fn run_provider_cycle(
     egress: &tokio_mpsc::Sender<ProviderEvent>,
     targets: &Arc<Mutex<Option<TargetSet>>>,
     force_rescan: &AtomicBool,
+    stop_flag: &AtomicBool,
     watcher: &Arc<Mutex<Option<WatchRegistry>>>,
     diagnostics: &ProviderDiagnostics,
     pending: &mut PendingEvents,
@@ -1398,6 +1497,7 @@ fn run_provider_cycle(
         hint,
         force_rescan: force,
         pending,
+        stop_flag,
         watch_requests: &mut watch_requests,
     };
     if worker.process(&mut cycle).is_err() {
@@ -2055,6 +2155,15 @@ mod tests {
         }
     }
 
+    struct SentinelFailingNotifyFactory;
+
+    impl NotifyFactory for SentinelFailingNotifyFactory {
+        fn create(self: Box<Self>, _sink: NotifySink) -> notify::Result<Box<dyn NotifyWatcher>> {
+            Err(notify::Error::generic("NOTIFY_MESSAGE_SENTINEL")
+                .add_path(PathBuf::from("NOTIFY_PATH_SENTINEL")))
+        }
+    }
+
     struct AppendDetectingWorker {
         path: PathBuf,
         observed_len: u64,
@@ -2178,6 +2287,42 @@ mod tests {
             assert_eq!(event_kind(event), "append-detected");
             assert_eq!(diagnostics.notify_creation_failures(), 1);
             runtime.block_on(handle.stop()).unwrap();
+        });
+    }
+
+    #[test]
+    fn notify_creation_warning_uses_frozen_code_without_error_payloads() {
+        run_bounded("content-free notify creation warning", || {
+            let directory = tempfile::tempdir().unwrap();
+            let log_path = directory.path().join("notify.log");
+            let log = fs::File::create(&log_path).unwrap();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_writer(log)
+                .finish();
+            let worker = CountingWorker {
+                calls: Arc::new(AtomicUsize::new(0)),
+                emit: false,
+            };
+            let (egress, _events) = tokio_mpsc::channel(1);
+
+            let handle = tracing::subscriber::with_default(subscriber, || {
+                spawn_provider_thread(worker, egress, Some(Box::new(SentinelFailingNotifyFactory)))
+                    .unwrap()
+            });
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(handle.stop())
+                .unwrap();
+            let contents = fs::read_to_string(log_path).unwrap();
+
+            assert!(
+                contents.contains("notify_generic"),
+                "notify warning omitted the frozen error code: {contents}"
+            );
+            assert!(!contents.contains("NOTIFY_MESSAGE_SENTINEL"));
+            assert!(!contents.contains("NOTIFY_PATH_SENTINEL"));
         });
     }
 

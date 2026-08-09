@@ -988,8 +988,6 @@ struct ReceivedEvent {
 #[derive(Debug)]
 struct AdapterRootState {
     discovery: DiscoveryIndex,
-    tails: HashMap<u32, TailFile>,
-    bootstrap_emitted: HashSet<u32>,
 }
 
 impl AdapterRootState {
@@ -999,11 +997,13 @@ impl AdapterRootState {
                 provider,
                 path: root,
             }])?,
-            tails: HashMap::new(),
-            bootstrap_emitted: HashSet::new(),
         })
     }
 }
+
+type RootStateFactory = Box<dyn FnMut(Provider, PathBuf) -> io::Result<AdapterRootState> + Send>;
+#[cfg(test)]
+type AfterTailChunkHook = Box<dyn FnMut(&Path, u64) + Send>;
 
 #[derive(Debug, Default)]
 struct AdapterBootstrapParser {
@@ -1044,7 +1044,7 @@ struct ResumeCursor {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum AvailabilitySweepMember {
     Root(PathBuf),
-    File { root: PathBuf, path_id: u32 },
+    File(u32),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1133,18 +1133,22 @@ fn resume_start(work: &[AdapterWorkItem], cursor: Option<&ResumeCursor>) -> (usi
     (index, ResumePhase::Bootstrap)
 }
 
-#[derive(Debug)]
 struct AdapterProviderWorker {
     roots: HashMap<(Provider, PathBuf), AdapterRootState>,
     interner: PathInterner,
+    tails: HashMap<u32, TailFile>,
+    bootstrap_emitted: HashSet<u32>,
     /// Highest generation observed per absolute path. Tombstones live for the whole run.
     generations: HashMap<PathBuf, u64>,
     deferred: VecDeque<ProviderEvent>,
     standard_roots: Vec<DiscoveryRoot>,
-    baselines_initialized: bool,
+    late_standard_baselines: HashSet<(Provider, PathBuf)>,
+    root_state_factory: RootStateFactory,
     diagnostics: crate::provider::ProviderDiagnostics,
     resume_cursor: Option<ResumeCursor>,
     availability_sweeps: HashMap<Provider, ProviderAvailabilitySweep>,
+    #[cfg(test)]
+    after_tail_chunk: Option<AfterTailChunkHook>,
 }
 
 impl AdapterProviderWorker {
@@ -1155,29 +1159,60 @@ impl AdapterProviderWorker {
         Self {
             roots: HashMap::new(),
             interner: PathInterner::default(),
+            tails: HashMap::new(),
+            bootstrap_emitted: HashSet::new(),
             generations: HashMap::new(),
             deferred: VecDeque::new(),
             standard_roots,
-            baselines_initialized: false,
+            late_standard_baselines: HashSet::new(),
+            root_state_factory: Box::new(AdapterRootState::new),
             diagnostics,
             resume_cursor: None,
             availability_sweeps: HashMap::new(),
+            #[cfg(test)]
+            after_tail_chunk: None,
         }
     }
 
-    fn initialize_standard_baselines(&mut self) {
-        if self.baselines_initialized {
-            return;
-        }
-        for root in &self.standard_roots {
+    #[cfg(test)]
+    fn new_with_root_state_factory(
+        standard_roots: Vec<DiscoveryRoot>,
+        diagnostics: crate::provider::ProviderDiagnostics,
+        factory: impl FnMut(Provider, PathBuf) -> io::Result<AdapterRootState> + Send + 'static,
+    ) -> Self {
+        let mut worker = Self::new(standard_roots, diagnostics);
+        worker.root_state_factory = Box::new(factory);
+        worker
+    }
+
+    #[cfg(test)]
+    fn set_after_tail_chunk(&mut self, hook: impl FnMut(&Path, u64) + Send + 'static) {
+        self.after_tail_chunk = Some(Box::new(hook));
+    }
+
+    fn initialize_standard_baselines(&mut self) -> HashMap<(Provider, PathBuf), io::ErrorKind> {
+        let mut failures = HashMap::new();
+        for root in self.standard_roots.clone() {
             let key = (root.provider, root.path.clone());
-            if !self.roots.contains_key(&key)
-                && let Ok(state) = AdapterRootState::new(root.provider, root.path.clone())
-            {
-                self.roots.insert(key, state);
+            if !self.roots.contains_key(&key) {
+                let state = (self.root_state_factory)(root.provider, root.path);
+                match state {
+                    Ok(state) => {
+                        if self.late_standard_baselines.remove(&key) {
+                            self.diagnostics.record_baseline_approximation();
+                        }
+                        self.roots.insert(key, state);
+                    }
+                    Err(error) => {
+                        if error.kind() != io::ErrorKind::NotFound {
+                            self.late_standard_baselines.insert(key.clone());
+                        }
+                        failures.insert(key, error.kind());
+                    }
+                }
             }
         }
-        self.baselines_initialized = true;
+        failures
     }
 
     fn is_standard_root(&self, provider: Provider, root: &Path) -> bool {
@@ -1279,14 +1314,13 @@ impl Default for AdapterProviderWorker {
 
 impl ProviderWorker for AdapterProviderWorker {
     fn process(&mut self, cycle: &mut ProviderCycle<'_>) -> io::Result<()> {
-        self.initialize_standard_baselines();
-        if !drain_deferred_provider_events(&mut self.deferred, cycle.pending) {
-            return Ok(());
-        }
-
+        let baseline_failures = self.initialize_standard_baselines();
         let mut targets_by_root: HashMap<(Provider, PathBuf), HashSet<PathBuf>> = HashMap::new();
         for target in cycle.targets.iter() {
-            let root = provider_root_for_target(target.provider, &target.path)?;
+            let Ok(root) = provider_root_for_target(target.provider, &target.path) else {
+                self.diagnostics.record_invalid_target();
+                continue;
+            };
             targets_by_root
                 .entry((target.provider, root))
                 .or_default()
@@ -1297,6 +1331,9 @@ impl ProviderWorker for AdapterProviderWorker {
                 .keys()
                 .any(|(current, _)| *current == provider);
             self.update_targeted_transition(provider, targeted, cycle.pending);
+        }
+        if !drain_deferred_provider_events(&mut self.deferred, cycle.pending) {
+            return Ok(());
         }
 
         let mut roots = targets_by_root.into_iter().collect::<Vec<_>>();
@@ -1327,8 +1364,20 @@ impl ProviderWorker for AdapterProviderWorker {
             }
             let fallback_root = !self.is_standard_root(provider, &root);
             let root_key = (provider, root.clone());
+            if let Some(kind) = baseline_failures.get(&root_key) {
+                self.record_sweep_failure(
+                    provider,
+                    if *kind == io::ErrorKind::PermissionDenied {
+                        AvailabilitySweepFailure::RootPermissionDenied
+                    } else {
+                        AvailabilitySweepFailure::FileIoError
+                    },
+                );
+                self.visit_sweep_member(provider, root_member);
+                continue;
+            }
             if !self.roots.contains_key(&root_key) {
-                match AdapterRootState::new(provider, root.clone()) {
+                match (self.root_state_factory)(provider, root.clone()) {
                     Ok(state) => {
                         self.roots.insert(root_key.clone(), state);
                     }
@@ -1348,7 +1397,7 @@ impl ProviderWorker for AdapterProviderWorker {
                     }
                 }
                 if fallback_root {
-                    self.diagnostics.record_fallback_baseline_approximation();
+                    self.diagnostics.record_baseline_approximation();
                 }
             }
             cycle.request_watch(root.clone());
@@ -1360,19 +1409,34 @@ impl ProviderWorker for AdapterProviderWorker {
                 let mut parser = AdapterBootstrapParser::default();
                 state.discovery.scan(&mut parser, &mut self.interner)
             };
-            if let Err(error) = scan_result {
-                if error.kind() != io::ErrorKind::NotFound {
-                    self.record_sweep_failure(
-                        provider,
-                        if error.kind() == io::ErrorKind::PermissionDenied {
-                            AvailabilitySweepFailure::RootPermissionDenied
-                        } else {
-                            AvailabilitySweepFailure::FileIoError
-                        },
-                    );
+            let scan_outcome = match scan_result {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    if error.kind() != io::ErrorKind::NotFound {
+                        self.record_sweep_failure(
+                            provider,
+                            if error.kind() == io::ErrorKind::PermissionDenied {
+                                AvailabilitySweepFailure::RootPermissionDenied
+                            } else {
+                                AvailabilitySweepFailure::FileIoError
+                            },
+                        );
+                    }
+                    self.visit_sweep_member(provider, root_member);
+                    continue;
                 }
-                self.visit_sweep_member(provider, root_member);
-                continue;
+            };
+            if scan_outcome.had_file_io_error() {
+                self.record_sweep_failure(provider, AvailabilitySweepFailure::FileIoError);
+            }
+            for path_id in scan_outcome.removed_path_ids() {
+                if let Some(tail) = self.tails.remove(path_id) {
+                    self.generations
+                        .entry(tail.absolute_path())
+                        .and_modify(|generation| *generation = (*generation).max(tail.generation()))
+                        .or_insert(tail.generation());
+                }
+                self.bootstrap_emitted.remove(path_id);
             }
             self.visit_sweep_member(provider, root_member);
             let state = self
@@ -1400,31 +1464,11 @@ impl ProviderWorker for AdapterProviderWorker {
                 })
                 .collect::<Vec<_>>();
             relevant.sort_by_key(|file| file.path_id);
-            let relevant_ids = relevant
-                .iter()
-                .map(|file| file.path_id)
-                .collect::<HashSet<_>>();
-            universes
-                .entry(provider)
-                .or_default()
-                .extend(relevant.iter().map(|file| AvailabilitySweepMember::File {
-                    root: root.clone(),
-                    path_id: file.path_id,
-                }));
-            state.tails.retain(|path_id, tail| {
-                if relevant_ids.contains(path_id) {
-                    true
-                } else {
-                    self.generations
-                        .entry(tail.absolute_path())
-                        .and_modify(|generation| *generation = (*generation).max(tail.generation()))
-                        .or_insert(tail.generation());
-                    false
-                }
-            });
-            state
-                .bootstrap_emitted
-                .retain(|path_id| relevant_ids.contains(path_id));
+            universes.entry(provider).or_default().extend(
+                relevant
+                    .iter()
+                    .map(|file| AvailabilitySweepMember::File(file.path_id)),
+            );
             work.extend(relevant.into_iter().map(|file| AdapterWorkItem {
                 provider,
                 root: root.clone(),
@@ -1452,17 +1496,21 @@ impl ProviderWorker for AdapterProviderWorker {
                 right.file.path_id,
             )
         });
+        let mut owned_paths = HashSet::new();
+        work.retain(|item| {
+            if owned_paths.insert(item.file.path_id) {
+                true
+            } else {
+                self.diagnostics.record_duplicate_path_target();
+                false
+            }
+        });
         if work.is_empty() {
             self.finish_completed_sweeps(&universes, cycle.pending);
             return Ok(());
         }
-        let (start, first_phase) = resume_start(&work, self.resume_cursor.as_ref());
+        let (start, _first_phase) = resume_start(&work, self.resume_cursor.as_ref());
         for (index, item) in work.iter().enumerate().skip(start) {
-            let phase = if index == start {
-                first_phase
-            } else {
-                ResumePhase::Bootstrap
-            };
             let provider = item.provider;
             let file = &item.file;
             if let Some(parent) = file.root.join(&file.relative_path).parent()
@@ -1470,11 +1518,7 @@ impl ProviderWorker for AdapterProviderWorker {
             {
                 cycle.request_watch(parent.to_path_buf());
             }
-            let state = self
-                .roots
-                .get_mut(&(provider, item.root.clone()))
-                .expect("work root was scanned");
-            if !state.tails.contains_key(&file.path_id) {
+            if !self.tails.contains_key(&file.path_id) {
                 let mut boundary = FsReadBoundary;
                 let absolute = file.root.join(&file.relative_path);
                 let generation = self
@@ -1482,19 +1526,23 @@ impl ProviderWorker for AdapterProviderWorker {
                     .get(&absolute)
                     .map_or(0, |generation| generation.saturating_add(1));
                 self.generations.insert(absolute, generation);
+                let baseline = self
+                    .roots
+                    .get(&(provider, item.root.clone()))
+                    .expect("work root was scanned")
+                    .discovery
+                    .baseline()
+                    .clone();
                 let tail = match TailFile::open(
                     &file.root,
                     &file.relative_path,
-                    state.discovery.baseline(),
+                    &baseline,
                     generation,
                     &mut boundary,
                 ) {
                     Ok(tail) => tail,
                     Err(error) => {
-                        let member = AvailabilitySweepMember::File {
-                            root: item.root.clone(),
-                            path_id: file.path_id,
-                        };
+                        let member = AvailabilitySweepMember::File(file.path_id);
                         let sweep = self.availability_sweeps.entry(provider).or_default();
                         if error.kind() != io::ErrorKind::NotFound {
                             sweep
@@ -1505,14 +1553,35 @@ impl ProviderWorker for AdapterProviderWorker {
                         continue;
                     }
                 };
-                state.tails.insert(file.path_id, tail);
+                self.tails.insert(file.path_id, tail);
             }
-            let tail_generation = state
+            let mut boundary = FsReadBoundary;
+            let goalpost = match self
+                .tails
+                .get_mut(&file.path_id)
+                .expect("tail inserted for relevant file")
+                .cycle_goalpost(&mut boundary)
+            {
+                Ok(goalpost) => goalpost,
+                Err(error) => {
+                    let sweep = self.availability_sweeps.entry(provider).or_default();
+                    if error.kind() != io::ErrorKind::NotFound {
+                        sweep
+                            .failure
+                            .get_or_insert(AvailabilitySweepFailure::FileIoError);
+                    }
+                    sweep
+                        .visited
+                        .insert(AvailabilitySweepMember::File(file.path_id));
+                    continue;
+                }
+            };
+            let tail_generation = self
                 .tails
                 .get(&file.path_id)
-                .expect("tail inserted for relevant file")
+                .expect("tail remains after goalpost snapshot")
                 .generation();
-            if phase == ResumePhase::Bootstrap && state.bootstrap_emitted.insert(file.path_id) {
+            if self.bootstrap_emitted.insert(file.path_id) {
                 let event = match provider {
                     Provider::Codex => crate::provider::codex::CodexAdapter.bootstrap_event(
                         file,
@@ -1537,53 +1606,85 @@ impl ProviderWorker for AdapterProviderWorker {
                     return Ok(());
                 }
             }
-            let mut boundary = FsReadBoundary;
-            let poll_result = state
-                .tails
-                .get_mut(&file.path_id)
-                .expect("tail inserted for relevant file")
-                .poll(&mut boundary);
-            let tail_generation = state
-                .tails
-                .get(&file.path_id)
-                .expect("tail remains after poll")
-                .generation();
-            self.generations
-                .entry(file.root.join(&file.relative_path))
-                .and_modify(|generation| *generation = (*generation).max(tail_generation))
-                .or_insert(tail_generation);
-            let member = AvailabilitySweepMember::File {
-                root: item.root.clone(),
-                path_id: file.path_id,
-            };
-            let sweep = self.availability_sweeps.entry(provider).or_default();
-            sweep.visited.insert(member);
-            let mut records = match poll_result {
-                Ok(records) => records.into_iter(),
-                Err(error) => {
-                    if error.kind() != io::ErrorKind::NotFound {
-                        sweep
-                            .failure
-                            .get_or_insert(AvailabilitySweepFailure::FileIoError);
+            self.availability_sweeps
+                .entry(provider)
+                .or_default()
+                .visited
+                .insert(AvailabilitySweepMember::File(file.path_id));
+            loop {
+                let previous_offset = self
+                    .tails
+                    .get(&file.path_id)
+                    .expect("tail inserted for relevant file")
+                    .offset();
+                if previous_offset >= goalpost || cycle.should_stop() {
+                    break;
+                }
+                let mut boundary = FsReadBoundary;
+                let poll_result = self
+                    .tails
+                    .get_mut(&file.path_id)
+                    .expect("tail inserted for relevant file")
+                    .poll_to_goalpost(&mut boundary, goalpost);
+                let tail = self
+                    .tails
+                    .get(&file.path_id)
+                    .expect("tail remains after poll");
+                let tail_generation = tail.generation();
+                let current_offset = tail.offset();
+                #[cfg(test)]
+                if current_offset != previous_offset
+                    && let Some(hook) = self.after_tail_chunk.as_mut()
+                {
+                    hook(&file.root.join(&file.relative_path), current_offset);
+                }
+                self.generations
+                    .entry(file.root.join(&file.relative_path))
+                    .and_modify(|generation| *generation = (*generation).max(tail_generation))
+                    .or_insert(tail_generation);
+                let mut records = match poll_result {
+                    Ok(records) => records.into_iter(),
+                    Err(error) => {
+                        if error.kind() != io::ErrorKind::NotFound {
+                            self.availability_sweeps
+                                .entry(provider)
+                                .or_default()
+                                .failure
+                                .get_or_insert(AvailabilitySweepFailure::FileIoError);
+                        }
+                        break;
                     }
-                    continue;
+                };
+                while let Some(record) = records.next() {
+                    let discovery = &self
+                        .roots
+                        .get(&(provider, item.root.clone()))
+                        .expect("work root remains after tail poll")
+                        .discovery;
+                    let events = parse_adapter_record(provider, discovery, file, &record);
+                    if !merge_adapter_events(events, cycle.pending, &mut self.deferred) {
+                        let remaining = records
+                            .flat_map(|record| {
+                                parse_adapter_record(provider, discovery, file, &record)
+                            })
+                            .collect::<Vec<_>>();
+                        self.deferred.extend(remaining);
+                        let next = if index + 1 < work.len() {
+                            &work[index + 1]
+                        } else {
+                            &work[0]
+                        };
+                        self.resume_cursor = Some(cursor_for_work(next, ResumePhase::Bootstrap));
+                        self.finish_completed_sweeps(&universes, cycle.pending);
+                        return Ok(());
+                    }
                 }
-            };
-            while let Some(record) = records.next() {
-                let events = parse_adapter_record(provider, &state.discovery, file, &record);
-                if !merge_adapter_events(events, cycle.pending, &mut self.deferred) {
-                    self.deferred.extend(records.flat_map(|record| {
-                        parse_adapter_record(provider, &state.discovery, file, &record)
-                    }));
-                    let next = if index + 1 < work.len() {
-                        &work[index + 1]
-                    } else {
-                        &work[0]
-                    };
-                    self.resume_cursor = Some(cursor_for_work(next, ResumePhase::Bootstrap));
-                    self.finish_completed_sweeps(&universes, cycle.pending);
-                    return Ok(());
+                if current_offset <= previous_offset {
+                    break;
                 }
+            }
+            if cycle.should_stop() {
+                return Ok(());
             }
         }
         self.resume_cursor = None;
@@ -3582,8 +3683,10 @@ fn unix_now_ms() -> i64 {
 #[cfg(test)]
 mod provider_integration_tests {
     use std::collections::HashSet;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use tokio::sync::watch;
 
@@ -3616,9 +3719,33 @@ mod provider_integration_tests {
         targets: &TargetSet,
         pending: &mut PendingEvents,
     ) {
+        try_process_adapter_worker(worker, targets, pending).unwrap();
+    }
+
+    fn try_process_adapter_worker(
+        worker: &mut AdapterProviderWorker,
+        targets: &TargetSet,
+        pending: &mut PendingEvents,
+    ) -> io::Result<()> {
         let mut watch_requests = Vec::new();
         let mut cycle = crate::provider::test_provider_cycle(targets, pending, &mut watch_requests);
-        worker.process(&mut cycle).unwrap();
+        worker.process(&mut cycle)
+    }
+
+    fn try_process_adapter_worker_with_stop(
+        worker: &mut AdapterProviderWorker,
+        targets: &TargetSet,
+        pending: &mut PendingEvents,
+        stop_flag: &AtomicBool,
+    ) -> io::Result<()> {
+        let mut watch_requests = Vec::new();
+        let mut cycle = crate::provider::test_provider_cycle_with_stop(
+            targets,
+            pending,
+            stop_flag,
+            &mut watch_requests,
+        );
+        worker.process(&mut cycle)
     }
 
     fn drain_pending(pending: &mut PendingEvents) -> Vec<ProviderEvent> {
@@ -3662,7 +3789,27 @@ mod provider_integration_tests {
             .into_iter()
             .find(|file| file.relative_path == Path::new(file_name))?
             .path_id;
-        state.tails.get(&path_id).map(TailFile::read_calls)
+        worker.tails.get(&path_id).map(TailFile::read_calls)
+    }
+
+    fn tail_count_for_absolute(worker: &AdapterProviderWorker, path: &Path) -> usize {
+        worker
+            .tails
+            .values()
+            .filter(|tail| tail.absolute_path() == path)
+            .count()
+    }
+
+    fn activity_generation(events: &[ProviderEvent], event: &str) -> Option<u64> {
+        let expected = format!("prov:codex:act:{event}");
+        events.iter().find_map(|candidate| match candidate {
+            ProviderEvent::Activity {
+                event_id,
+                position: SourcePosition { generation, .. },
+                ..
+            } if event_id == &expected => Some(*generation),
+            _ => None,
+        })
     }
 
     fn provider_source_state(
@@ -3802,6 +3949,69 @@ mod provider_integration_tests {
     }
 
     #[test]
+    fn unreadable_new_file_is_file_io_error_and_does_not_starve_sibling_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let mut pending = PendingEvents::new(diagnostics);
+        process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
+        let _ = drain_pending(&mut pending);
+
+        let unreadable = root.join("1-unreadable.jsonl");
+        let good = root.join("2-good.jsonl");
+        std::fs::write(
+            &unreadable,
+            codex_records("unreadable-owner", "unreadable-agent", "unreadable-event"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::write(
+            &good,
+            codex_records("good-owner", "good-agent", "good-event"),
+        )
+        .unwrap();
+        let targets = TargetSet::new([
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: unreadable.clone(),
+            },
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: good,
+            },
+        ]);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let events = drain_pending(&mut pending);
+
+        assert_eq!(
+            provider_source_state(&events, Provider::Codex),
+            Some(ProviderSourceState::Unavailable {
+                detail: "file_io_error".to_owned(),
+            }),
+            "per-file permission failure was mislabeled as a root failure"
+        );
+        assert!(
+            tail_read_calls(&worker, &root, "2-good.jsonl").is_some_and(|calls| calls > 0),
+            "unreadable file starved its readable sibling"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::Activity { event_id, .. }
+                if event_id == "prov:codex:act:good-event"
+        )));
+    }
+
+    #[test]
     fn target_before_root_exists_recovers_when_the_root_appears() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("fresh/.codex/sessions");
@@ -3922,6 +4132,99 @@ mod provider_integration_tests {
                 detail: "root_not_found".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn relative_target_is_skipped_without_aborting_sibling_provider_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("codex/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let mut pending = PendingEvents::new(diagnostics.clone());
+        process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
+        let _ = drain_pending(&mut pending);
+
+        let valid = root.join("valid.jsonl");
+        std::fs::write(
+            &valid,
+            codex_records("valid-owner", "valid-agent", "valid-event"),
+        )
+        .unwrap();
+        let targets = TargetSet::new([
+            ProviderTarget {
+                provider: Provider::Claude,
+                path: PathBuf::from("relative.jsonl"),
+            },
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: valid,
+            },
+        ]);
+
+        let result = try_process_adapter_worker(&mut worker, &targets, &mut pending);
+
+        assert!(
+            result.is_ok(),
+            "relative target aborted the complete provider cycle: {result:?}"
+        );
+        let events = drain_pending(&mut pending);
+        assert_eq!(diagnostics.invalid_targets(), 1);
+        assert_eq!(
+            provider_source_state(&events, Provider::Codex),
+            Some(ProviderSourceState::Available)
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::Activity { event_id, .. }
+                if event_id == "prov:codex:act:valid-event"
+        )));
+        assert!(tail_read_calls(&worker, &root, "valid.jsonl").is_some_and(|calls| calls > 0));
+    }
+
+    #[test]
+    fn untargeting_transition_precedes_sustained_deferred_backlog_gate() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("codex/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("target.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root,
+            }],
+            diagnostics.clone(),
+        );
+        let mut pending = PendingEvents::with_capacity(1, diagnostics);
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path,
+        }]);
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let _ = drain_pending(&mut pending);
+        assert!(matches!(
+            pending.merge(capacity_blocker("resident")),
+            MergeOutcome::Accepted
+        ));
+        worker.deferred.push_back(capacity_blocker("deferred"));
+
+        process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
+        let events = drain_pending(&mut pending);
+
+        assert_eq!(
+            provider_source_state(&events, Provider::Codex),
+            Some(ProviderSourceState::NotApplicable),
+            "untargeting transition was hidden behind the deferred-entity drain gate"
+        );
+        assert_eq!(worker.deferred.len(), 1);
     }
 
     #[test]
@@ -4293,7 +4596,54 @@ mod provider_integration_tests {
 
         process_adapter_worker(&mut worker, &targets, &mut pending);
 
-        assert_eq!(diagnostics.fallback_baseline_approximations(), 1);
+        assert_eq!(diagnostics.baseline_approximations(), 1);
+    }
+
+    #[test]
+    fn standard_baseline_capture_failure_retries_and_counts_late_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("standard/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let factory_attempts = Arc::clone(&attempts);
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new_with_root_state_factory(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+            move |provider, path| {
+                if factory_attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "injected baseline capture failure",
+                    ))
+                } else {
+                    AdapterRootState::new(provider, path)
+                }
+            },
+        );
+        let mut pending = PendingEvents::new(diagnostics.clone());
+
+        process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
+        let first_cycle = drain_pending(&mut pending);
+        assert_eq!(
+            provider_source_state(&first_cycle, Provider::Codex),
+            Some(ProviderSourceState::NotApplicable),
+            "baseline capture failure blocked the readiness barrier"
+        );
+        assert!(!worker.roots.contains_key(&(Provider::Codex, root.clone())));
+
+        process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
+
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            2,
+            "standard baseline capture was not retried on the next cycle"
+        );
+        assert!(worker.roots.contains_key(&(Provider::Codex, root)));
+        assert_eq!(diagnostics.baseline_approximations(), 1);
     }
 
     #[test]
@@ -4315,15 +4665,7 @@ mod provider_integration_tests {
         let mut pending = PendingEvents::new(crate::provider::ProviderDiagnostics::default());
 
         process_adapter_worker(&mut worker, &targets, &mut pending);
-        let first_generation = worker
-            .roots
-            .get(&(Provider::Codex, root.clone()))
-            .unwrap()
-            .tails
-            .values()
-            .next()
-            .unwrap()
-            .generation();
+        let first_generation = worker.tails.values().next().unwrap().generation();
         let _ = drain_pending(&mut pending);
 
         std::fs::remove_file(&path).unwrap();
@@ -4339,15 +4681,7 @@ mod provider_integration_tests {
         .unwrap();
 
         process_adapter_worker(&mut worker, &targets, &mut pending);
-        let recreated_generation = worker
-            .roots
-            .get(&(Provider::Codex, root))
-            .unwrap()
-            .tails
-            .values()
-            .next()
-            .unwrap()
-            .generation();
+        let recreated_generation = worker.tails.values().next().unwrap().generation();
         let events = drain_pending(&mut pending);
 
         assert!(recreated_generation > first_generation);
@@ -4397,7 +4731,125 @@ mod provider_integration_tests {
     }
 
     #[test]
-    fn saturated_first_file_does_not_starve_second_file_tail_poll() {
+    fn overlapping_fallback_root_ownership_flaps_keep_one_monotone_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let outer = directory.path().join("fallback");
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let outer_target = outer.join("owner.jsonl");
+        let shared = inner.join("shared.jsonl");
+        std::fs::write(
+            &outer_target,
+            codex_records("shared-owner", "outer-agent", "outer-initial"),
+        )
+        .unwrap();
+        std::fs::write(
+            &shared,
+            codex_records("shared-owner", "shared-agent", "shared-initial"),
+        )
+        .unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(Vec::new(), diagnostics.clone());
+        let mut pending = PendingEvents::new(diagnostics.clone());
+        let outer_only = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path: outer_target.clone(),
+        }]);
+        let inner_only = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path: shared.clone(),
+        }]);
+        let both = TargetSet::new([
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: outer_target,
+            },
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: shared.clone(),
+            },
+        ]);
+
+        process_adapter_worker(&mut worker, &outer_only, &mut pending);
+        let _ = drain_pending(&mut pending);
+        append_codex_activity(&shared, "flap-agent-a", "flap-a");
+        process_adapter_worker(&mut worker, &outer_only, &mut pending);
+        let generation_a = activity_generation(&drain_pending(&mut pending), "flap-a").unwrap();
+
+        process_adapter_worker(&mut worker, &inner_only, &mut pending);
+        let _ = drain_pending(&mut pending);
+        append_codex_activity(&shared, "flap-agent-b", "flap-b");
+        process_adapter_worker(&mut worker, &inner_only, &mut pending);
+        let generation_b = activity_generation(&drain_pending(&mut pending), "flap-b").unwrap();
+
+        append_codex_activity(&shared, "flap-agent-c", "flap-c");
+        process_adapter_worker(&mut worker, &outer_only, &mut pending);
+        let generation_c = activity_generation(&drain_pending(&mut pending), "flap-c").unwrap();
+
+        assert_eq!(
+            [generation_a, generation_b, generation_c],
+            [generation_a; 3],
+            "root ownership flap resurrected a stale tail generation"
+        );
+        assert_eq!(tail_count_for_absolute(&worker, &shared), 1);
+
+        process_adapter_worker(&mut worker, &both, &mut pending);
+        assert_eq!(diagnostics.duplicate_path_targets(), 1);
+    }
+
+    #[test]
+    fn overlapping_root_aliases_collapse_to_one_file_sweep_member() {
+        let directory = tempfile::tempdir().unwrap();
+        let outer = directory.path().join("fallback");
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(&outer).unwrap();
+        let outer_target = outer.join("owner.jsonl");
+        let shared = inner.join("shared.jsonl");
+        std::fs::write(
+            &outer_target,
+            codex_records("shared-owner", "outer-agent", "outer-initial"),
+        )
+        .unwrap();
+        let targets = TargetSet::new([
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: outer_target,
+            },
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: shared.clone(),
+            },
+        ]);
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(Vec::new(), diagnostics.clone());
+        let mut pending = PendingEvents::new(diagnostics);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        assert_eq!(
+            provider_source_state(&drain_pending(&mut pending), Provider::Codex),
+            Some(ProviderSourceState::Unavailable {
+                detail: "root_not_found".to_owned(),
+            })
+        );
+
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(
+            &shared,
+            codex_records("shared-owner", "shared-agent", "shared-initial"),
+        )
+        .unwrap();
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let recovered = drain_pending(&mut pending);
+
+        assert_eq!(
+            provider_source_state(&recovered, Provider::Codex),
+            Some(ProviderSourceState::Available),
+            "unvisited root alias prevented the overlapping-root sweep from completing"
+        );
+    }
+
+    #[test]
+    fn green_guard_saturation_continues_after_current_file_without_starvation() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("standard/.codex/sessions");
         std::fs::create_dir_all(&root).unwrap();
@@ -4575,6 +5027,140 @@ mod provider_integration_tests {
     }
 
     #[test]
+    fn recreated_file_bootstrap_precedes_tail_after_stale_tail_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("standard/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let mut pending = PendingEvents::with_capacity(1, diagnostics);
+        process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
+        let _ = drain_pending(&mut pending);
+
+        let path = root.join("recreated.jsonl");
+        std::fs::write(
+            &path,
+            codex_records("old-owner", "old-owner", "old-activity"),
+        )
+        .unwrap();
+        assert!(matches!(
+            pending.merge(capacity_blocker("bootstrap-blocker")),
+            MergeOutcome::Accepted
+        ));
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path: path.clone(),
+        }]);
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        assert!(matches!(
+            worker.resume_cursor,
+            Some(ResumeCursor {
+                phase: ResumePhase::TailPoll,
+                ..
+            })
+        ));
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = drain_pending(&mut pending);
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let _ = drain_pending(&mut pending);
+        std::fs::write(
+            &path,
+            codex_records("fresh-owner", "fresh-owner", "fresh-activity"),
+        )
+        .unwrap();
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let events = drain_pending(&mut pending);
+        let bootstrap = events.iter().position(|event| {
+            matches!(
+                event,
+                ProviderEvent::SessionResolved {
+                    agent_thread_id,
+                    ..
+                } if agent_thread_id == "fresh-owner"
+            )
+        });
+        let activity = events.iter().position(|event| {
+            matches!(
+                event,
+                ProviderEvent::Activity { event_id, .. }
+                    if event_id == "prov:codex:act:fresh-activity"
+            )
+        });
+
+        assert!(
+            bootstrap.is_some(),
+            "recreated file skipped its fresh SessionResolved event at a stale TailPoll cursor"
+        );
+        assert!(
+            bootstrap < activity,
+            "recreated file activity preceded its fresh bootstrap: {events:?}"
+        );
+    }
+
+    #[test]
+    fn green_guard_in_place_rotation_does_not_reemit_bootstrap() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("standard/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let mut pending = PendingEvents::new(diagnostics);
+        process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
+        let _ = drain_pending(&mut pending);
+        let path = root.join("rotated.jsonl");
+        std::fs::write(
+            &path,
+            codex_records("original-owner", "original-owner", "original-activity"),
+        )
+        .unwrap();
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path: path.clone(),
+        }]);
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let _ = drain_pending(&mut pending);
+
+        std::fs::rename(&path, root.join("rotated.old")).unwrap();
+        std::fs::write(
+            &path,
+            codex_records(
+                "replacement-owner",
+                "replacement-owner",
+                "replacement-activity",
+            ),
+        )
+        .unwrap();
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let events = drain_pending(&mut pending);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::Activity { event_id, .. }
+                if event_id == "prov:codex:act:replacement-activity"
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::SessionResolved { .. })),
+            "continuous-path rotation re-emitted a stale discovery bootstrap"
+        );
+    }
+
+    #[test]
     fn capacity_stops_tail_reads_and_deferred_memory_growth() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("standard/.codex/sessions");
@@ -4620,6 +5206,181 @@ mod provider_integration_tests {
         assert_eq!(worker.deferred.len(), deferred_len);
         assert_eq!(worker.resume_cursor, cursor);
         assert_eq!(pending.entity_count(), 1);
+    }
+
+    #[test]
+    fn dormant_one_mib_backlog_drains_to_cycle_goalpost() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("standard/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let mut pending = PendingEvents::new(diagnostics);
+        process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
+        let _ = drain_pending(&mut pending);
+        let path = root.join("dormant.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path: path.clone(),
+        }]);
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let _ = drain_pending(&mut pending);
+
+        let mut backlog = vec![b'x'; 1024 * 1024];
+        backlog.extend_from_slice(
+            b"\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"sub_agent_activity\",\"event_id\":\"dormant-tail\",\"occurred_at_ms\":3,\"agent_thread_id\":\"dormant-agent\",\"agent_path\":\"/root\",\"kind\":\"interacted\"}}\n",
+        );
+        std::fs::write(&path, backlog).unwrap();
+        let goalpost = std::fs::metadata(&path).unwrap().len();
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let path_id = worker
+            .roots
+            .get(&(Provider::Codex, root))
+            .unwrap()
+            .discovery
+            .files()[0]
+            .path_id;
+        let offset = worker.tails.get(&path_id).unwrap().offset();
+
+        assert_eq!(
+            offset, goalpost,
+            "dormant backlog remained queued for another polling interval"
+        );
+    }
+
+    #[test]
+    fn active_appender_stops_at_first_poll_goalpost_and_later_file_is_polled() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("standard/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let mut pending = PendingEvents::new(diagnostics);
+        process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
+        let _ = drain_pending(&mut pending);
+        let active = root.join("1-active.jsonl");
+        let later = root.join("2-later.jsonl");
+        std::fs::write(&active, b"").unwrap();
+        std::fs::write(&later, b"").unwrap();
+        let targets = TargetSet::new([
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: active.clone(),
+            },
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: later.clone(),
+            },
+        ]);
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let _ = drain_pending(&mut pending);
+
+        std::fs::write(&active, vec![b'x'; 300 * 1024]).unwrap();
+        append_codex_activity(&later, "later-agent", "later-event");
+        let goalpost = std::fs::metadata(&active).unwrap().len();
+        let appended = Arc::new(AtomicBool::new(false));
+        let hook_appended = Arc::clone(&appended);
+        let hook_active = active.clone();
+        worker.set_after_tail_chunk(move |path, _| {
+            if path == hook_active && !hook_appended.swap(true, Ordering::AcqRel) {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(path)
+                    .unwrap()
+                    .write_all(&vec![b'y'; 300 * 1024])
+                    .unwrap();
+            }
+        });
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let events = drain_pending(&mut pending);
+        let active_id = worker
+            .roots
+            .get(&(Provider::Codex, root.clone()))
+            .unwrap()
+            .discovery
+            .files()
+            .into_iter()
+            .find(|file| file.relative_path == Path::new("1-active.jsonl"))
+            .unwrap()
+            .path_id;
+
+        assert_eq!(
+            worker.tails.get(&active_id).unwrap().offset(),
+            goalpost,
+            "tail chased bytes appended after the first-poll snapshot"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::Activity { event_id, .. }
+                if event_id == "prov:codex:act:later-event"
+        )));
+        assert!(tail_read_calls(&worker, &root, "2-later.jsonl").is_some_and(|calls| calls > 0));
+    }
+
+    #[test]
+    fn stop_flag_mid_drain_exits_after_current_chunk() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("standard/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let mut pending = PendingEvents::new(diagnostics);
+        process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
+        let _ = drain_pending(&mut pending);
+        let path = root.join("stopping.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path: path.clone(),
+        }]);
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let _ = drain_pending(&mut pending);
+        let mut backlog = vec![b'x'; 1024 * 1024];
+        backlog.push(b'\n');
+        std::fs::write(&path, backlog).unwrap();
+        let goalpost = std::fs::metadata(&path).unwrap().len();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let hook_stop = Arc::clone(&stop_flag);
+        worker.set_after_tail_chunk(move |_, _| hook_stop.store(true, Ordering::Release));
+        let reads_before = tail_read_calls(&worker, &root, "stopping.jsonl").unwrap();
+
+        try_process_adapter_worker_with_stop(&mut worker, &targets, &mut pending, &stop_flag)
+            .unwrap();
+        let path_id = worker
+            .roots
+            .get(&(Provider::Codex, root.clone()))
+            .unwrap()
+            .discovery
+            .files()[0]
+            .path_id;
+        let tail = worker.tails.get(&path_id).unwrap();
+
+        assert!(
+            tail.offset() < goalpost,
+            "stop flag was ignored until the complete backlog drained"
+        );
+        assert_eq!(tail.read_calls(), reads_before + 1);
     }
 
     #[test]
