@@ -20,6 +20,7 @@ use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
 use crate::model::{ExecState, MinimalProviderMetadata, Provider};
 
+pub mod codex;
 pub mod tail;
 
 pub use tail::{
@@ -176,7 +177,12 @@ pub struct DiscoveryRoot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BootstrapIdentity {
     pub thread_id: String,
+    pub owner_session_id: Option<String>,
     pub parent_thread_id: Option<String>,
+    pub model_id: Option<String>,
+    pub depth: Option<u32>,
+    pub agent_path: Option<String>,
+    pub byte_offset: u64,
 }
 
 /// Callback used to identify the first structural record in a file prefix.
@@ -213,6 +219,7 @@ pub struct DiscoveryIndex {
     roots: Vec<DiscoveryRoot>,
     files: HashMap<(Provider, PathBuf), DiscoveredFile>,
     identities: HashMap<(Provider, String), DiscoveredIdentity>,
+    agent_paths: HashMap<(Provider, Option<String>, String), String>,
     path_ids: HashMap<(Provider, PathBuf), u32>,
     next_path_id: u32,
     baseline: FirstSeenBaseline,
@@ -231,6 +238,7 @@ impl DiscoveryIndex {
             roots,
             files: HashMap::new(),
             identities: HashMap::new(),
+            agent_paths: HashMap::new(),
             path_ids: HashMap::new(),
             next_path_id: 0,
             baseline,
@@ -295,6 +303,7 @@ impl DiscoveryIndex {
 
     fn rebuild_identities(&mut self) {
         self.identities.clear();
+        self.agent_paths.clear();
         for file in self.files.values() {
             let Some(identity) = file.bootstrap.as_ref() else {
                 continue;
@@ -312,6 +321,16 @@ impl DiscoveryIndex {
                         parent_thread_id: identity.parent_thread_id.clone(),
                     },
                 );
+                let agent_path = identity.agent_path.clone().or_else(|| {
+                    (file.provider == Provider::Codex && identity.depth == Some(0))
+                        .then(|| "/root".to_owned())
+                });
+                if let Some(agent_path) = agent_path {
+                    self.agent_paths.insert(
+                        (file.provider, identity.owner_session_id.clone(), agent_path),
+                        identity.thread_id.clone(),
+                    );
+                }
             }
         }
     }
@@ -327,6 +346,23 @@ impl DiscoveryIndex {
     #[must_use]
     pub fn resolve(&self, provider: Provider, thread_id: &str) -> Option<&DiscoveredIdentity> {
         self.identities.get(&(provider, thread_id.to_owned()))
+    }
+
+    /// Resolves one provider-local agent path within its owner session.
+    #[must_use]
+    pub fn resolve_agent_path(
+        &self,
+        provider: Provider,
+        owner_session_id: Option<&str>,
+        agent_path: &str,
+    ) -> Option<&str> {
+        self.agent_paths
+            .get(&(
+                provider,
+                owner_session_id.map(str::to_owned),
+                agent_path.to_owned(),
+            ))
+            .map(String::as_str)
     }
 
     /// Returns the immutable run-start file baseline used by late targets.
@@ -358,7 +394,8 @@ fn bootstrap_file(
             record = &record[..record.len() - 1];
         }
         records += 1;
-        if let Some(identity) = parser.parse_structural(root.provider, relative, record) {
+        if let Some(mut identity) = parser.parse_structural(root.provider, relative, record) {
+            identity.byte_offset = start as u64;
             return Ok(Some(identity));
         }
         start = end + 1;
@@ -1395,7 +1432,12 @@ mod tests {
             let thread_id = text.strip_prefix("struct:")?;
             Some(BootstrapIdentity {
                 thread_id: thread_id.to_owned(),
+                owner_session_id: None,
                 parent_thread_id: Some("parent-1".to_owned()),
+                model_id: None,
+                depth: None,
+                agent_path: None,
+                byte_offset: 0,
             })
         }
     }

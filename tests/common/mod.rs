@@ -1,12 +1,37 @@
 //! Shared integration-test helpers.
 
 use std::ffi::OsStr;
+use std::fs;
+use std::path::Path;
 use std::process::{Command, Output};
+
+/// Loads one flat provider JSONL fixture as `(byte_offset, record_bytes)` pairs.
+#[allow(dead_code)]
+pub fn flat_jsonl_fixture(file_name: &str) -> Vec<(u64, Vec<u8>)> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/provider")
+        .join(file_name);
+    let bytes = fs::read(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let mut offset = 0_u64;
+
+    bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .map(|record| {
+            let record_offset = offset;
+            offset = offset.saturating_add(record.len() as u64);
+            let mut record = record.strip_suffix(b"\n").unwrap_or(record);
+            record = record.strip_suffix(b"\r").unwrap_or(record);
+            (record_offset, record.to_vec())
+        })
+        .collect()
+}
 
 /// Re-executes this integration-test binary and runs one exact helper test.
 ///
 /// Re-exec avoids `fork` in libtest's threaded process and lets tests exercise
 /// behavior that must cross an OS process boundary.
+#[allow(dead_code)]
 pub fn spawn_self_test_helper(test_name: &str, envs: &[(&str, &OsStr)]) -> Output {
     Command::new(std::env::current_exe().expect("current test executable should be available"))
         .args([test_name, "--exact", "--nocapture", "--test-threads=1"])

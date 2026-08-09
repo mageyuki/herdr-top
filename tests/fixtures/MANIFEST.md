@@ -29,15 +29,17 @@ The wire sanitization pass applied these replacements:
 
 ## Provider family
 
-The five files in `tests/fixtures/provider/` were adapted from the research staging manifest. The same replacement rules were re-applied during import, and one residual repository-path segment family was additionally replaced with `proj`.
+The five real files in `tests/fixtures/provider/` were adapted from the research staging manifest. The same replacement rules were re-applied during import, and one residual repository-path segment family was additionally replaced with `proj`.
 
 | File | Evidence retained |
 | --- | --- |
 | `codex-depth2-root.jsonl` | Root `session_meta` records without `agent_path`, `sub_agent_activity` events, and unknown-record `{"type": ..., "redacted": true}` stubs for tolerance tests. |
 | `codex-depth2-child.jsonl` | Depth-1 `session_meta`, where `agent_path` has two segments and `parent_thread_id` points to the root. |
 | `codex-depth2-grandchild.jsonl` | Depth-2 `session_meta`, where `agent_path` has three segments; this is the only locally evidenced depth-2 chain. |
+| `codex-depth3-synthetic.jsonl` | **Synthetic, format-plausible, unevidenced:** depth-3 `agent_path`, a deeper `started` activity for parent-prefix resolution, and a non-allowlisted prompt sentinel. |
+| `codex-fork-only-synthetic.jsonl` | **Synthetic, format-plausible, unevidenced:** `forked_from_id` without `parent_thread_id`, proving that a fork alone creates no parent edge. |
 | `claude-depth1-subagent.jsonl` | The `isSidechain`/`agentId`/parent `sessionId` structure and redacted message stubs. |
-| `claude-depth1-parent.jsonl` | Main-chain records, including `toolUseResult` agent-spawn results, limited to the first 50 records. |
+| `claude-depth1-parent.jsonl` | Main-chain records with redacted messages; `toolUseResult` is absent (0 records), limited to the first 50 records. |
 
 The provider staging sanitization retains:
 
