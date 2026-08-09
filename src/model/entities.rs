@@ -477,12 +477,11 @@ pub fn sanitize_controller_text(value: &str) -> String {
     let mut sanitized = String::new();
     for character in value.chars() {
         if character.is_control() {
-            for escaped in character.escape_default() {
-                if sanitized.len().saturating_add(escaped.len_utf8()) > MAX_BYTES {
-                    return sanitized;
-                }
-                sanitized.push(escaped);
+            let escaped = character.escape_default().collect::<String>();
+            if sanitized.len().saturating_add(escaped.len()) > MAX_BYTES {
+                return sanitized;
             }
+            sanitized.push_str(&escaped);
         } else {
             if sanitized.len().saturating_add(character.len_utf8()) > MAX_BYTES {
                 break;
@@ -754,6 +753,16 @@ mod tests {
         assert!(sanitized.starts_with("line\\n"));
         assert!(sanitized.len() <= 256);
         assert!(std::str::from_utf8(sanitized.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn controller_text_escape_is_atomic_at_byte_limit() {
+        let truncated = sanitize_controller_text(&("a".repeat(255) + "\n"));
+        assert_eq!(truncated, "a".repeat(255));
+
+        let exact = sanitize_controller_text(&("a".repeat(254) + "\n"));
+        assert_eq!(exact.len(), 256);
+        assert!(exact.ends_with("\\n"));
     }
 
     #[test]

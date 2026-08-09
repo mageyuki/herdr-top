@@ -173,6 +173,10 @@ impl Reducer {
             || event.metadata.source.is_empty()
             || event.task_run_id.is_empty()
             || event.metadata.native_session_id.is_some() && event.metadata.provider.is_none()
+            || event
+                .metadata
+                .progress
+                .is_some_and(|progress| progress > 10_000)
         {
             return Err(RejectReason::Invalid);
         }
@@ -2173,6 +2177,26 @@ mod tests {
         assert!(reducer.resolve_controller_run("raw run").is_none());
         assert!(!shared.has_changed().unwrap());
         assert!(Arc::ptr_eq(&initial, &shared.borrow()));
+    }
+
+    #[test]
+    fn controller_event_progress_must_be_within_basis_point_range() {
+        let (reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let mut above_max = controller_event(
+            "progress-above-max",
+            "raw run",
+            ControllerEventKind::Progress,
+        );
+        above_max.metadata.progress = Some(10_001);
+        assert!(matches!(
+            reducer.validate_controller_event(&above_max),
+            Err(RejectReason::Invalid)
+        ));
+
+        let mut at_max =
+            controller_event("progress-at-max", "raw run", ControllerEventKind::Progress);
+        at_max.metadata.progress = Some(10_000);
+        assert!(reducer.validate_controller_event(&at_max).is_ok());
     }
 
     #[tokio::test]
