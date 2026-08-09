@@ -116,6 +116,9 @@ pub enum ControllerClientUnavailable {
 pub enum ControllerInputUnavailable {
     /// A socket exists without the sentinel needed to establish its identity.
     UnsafeOrphan,
+    /// The sentinel exists but is not a regular 0600 own-uid file, so its
+    /// identity cannot be trusted.
+    SentinelMalformed,
     /// The sentinel identifies a different exact session name.
     Collision {
         /// The name found in the existing sentinel.
@@ -331,15 +334,33 @@ pub fn prepare_controller_socket(
             ControllerInputUnavailable::UnsafeOrphan,
         ));
     }
+    if sentinel_stat
+        .as_ref()
+        .is_some_and(|stat| !sentinel_stat_valid(stat, effective_uid()))
+    {
+        return Ok(ControllerSocketStatus::Unavailable(
+            ControllerInputUnavailable::SentinelMalformed,
+        ));
+    }
 
-    let sentinel_collision = if sentinel_stat.is_some() {
-        read_existing_sentinel(dir, key, &sentinel_name, &sentinel_path)?
+    let sentinel = if sentinel_stat.is_some() {
+        read_existing_sentinel(dir, &sentinel_name, &sentinel_path)?
     } else {
         publish_sentinel(dir, key, &sentinel_name, &sentinel_path)?
     };
-    if let Some(found) = sentinel_collision {
+    let found = match sentinel {
+        SentinelRead::Contents(found) => found,
+        SentinelRead::Malformed => {
+            return Ok(ControllerSocketStatus::Unavailable(
+                ControllerInputUnavailable::SentinelMalformed,
+            ));
+        }
+    };
+    if found != key.name().as_bytes() {
         return Ok(ControllerSocketStatus::Unavailable(
-            ControllerInputUnavailable::Collision { found },
+            ControllerInputUnavailable::Collision {
+                found: String::from_utf8_lossy(&found).into_owned(),
+            },
         ));
     }
 
@@ -450,17 +471,21 @@ pub fn resolve_controller_socket(
             ControllerClientUnavailable::SentinelAbsent,
         ));
     };
-    if stat.st_mode & libc::S_IFMT != libc::S_IFREG
-        || stat.st_mode & 0o7777 != FILE_MODE as libc::mode_t
-        || stat.st_uid != effective_uid()
-    {
+    if !sentinel_stat_valid(&stat, effective_uid()) {
         return Ok(ControllerEndpointStatus::Unavailable(
             ControllerClientUnavailable::SentinelMalformed,
         ));
     }
     let component = component_cstring(OsStr::new(&sentinel_name))
         .map_err(|source| io_error("encode sentinel name", sentinel_path.clone(), source))?;
-    let found = read_child(dir, &component, &sentinel_path)?;
+    let found = match read_child(dir, &component, &sentinel_path)? {
+        SentinelRead::Contents(found) => found,
+        SentinelRead::Malformed => {
+            return Ok(ControllerEndpointStatus::Unavailable(
+                ControllerClientUnavailable::SentinelMalformed,
+            ));
+        }
+    };
     let Ok(found) = String::from_utf8(found) else {
         return Ok(ControllerEndpointStatus::Unavailable(
             ControllerClientUnavailable::SentinelMalformed,
@@ -472,6 +497,12 @@ pub fn resolve_controller_socket(
         ));
     }
     Ok(ControllerEndpointStatus::Available(socket_path))
+}
+
+fn sentinel_stat_valid(stat: &libc::stat, expected_uid: u32) -> bool {
+    stat.st_mode & libc::S_IFMT == libc::S_IFREG
+        && stat.st_mode & 0o7777 == FILE_MODE as libc::mode_t
+        && stat.st_uid == expected_uid
 }
 
 fn fs_metadata(path: &Path) -> io::Result<std::fs::Metadata> {
@@ -523,18 +554,12 @@ impl Drop for OwnedSocketPath {
 
 fn read_existing_sentinel(
     dir: &ValidatedRuntimeDir,
-    key: &SessionKey,
     sentinel_name: &str,
     sentinel_path: &Path,
-) -> Result<Option<String>, RvError> {
+) -> Result<SentinelRead, RvError> {
     let sentinel_component = component_cstring(OsStr::new(sentinel_name))
         .map_err(|source| io_error("encode sentinel name", sentinel_path.to_path_buf(), source))?;
-    let found = read_child(dir, &sentinel_component, sentinel_path)?;
-    if found == key.name().as_bytes() {
-        Ok(None)
-    } else {
-        Ok(Some(String::from_utf8_lossy(&found).into_owned()))
-    }
+    read_child(dir, &sentinel_component, sentinel_path)
 }
 
 fn publish_sentinel(
@@ -542,7 +567,7 @@ fn publish_sentinel(
     key: &SessionKey,
     sentinel_name: &str,
     sentinel_path: &Path,
-) -> Result<Option<String>, RvError> {
+) -> Result<SentinelRead, RvError> {
     let temp_name = format!("{sentinel_name}.tmp.{}.{}", std::process::id(), Ulid::new());
     let temp_path = sentinel_path.with_file_name(&temp_name);
     let temp_component = component_cstring(OsStr::new(&temp_name))
@@ -586,15 +611,8 @@ fn publish_sentinel(
     temp_guard.discard()?;
 
     match publication? {
-        LinkOutcome::Installed => Ok(None),
-        LinkOutcome::AlreadyExists => {
-            let found = read_child(dir, &sentinel_component, sentinel_path)?;
-            if found == key.name().as_bytes() {
-                Ok(None)
-            } else {
-                Ok(Some(String::from_utf8_lossy(&found).into_owned()))
-            }
-        }
+        LinkOutcome::Installed => Ok(SentinelRead::Contents(key.name().as_bytes().to_vec())),
+        LinkOutcome::AlreadyExists => read_child(dir, &sentinel_component, sentinel_path),
     }
 }
 
@@ -626,19 +644,39 @@ fn remove_proven_stale_socket(
     }
 }
 
-fn read_child(dir: &ValidatedRuntimeDir, name: &CStr, path: &Path) -> Result<Vec<u8>, RvError> {
-    let fd = openat_owned(
+#[derive(Debug)]
+enum SentinelRead {
+    Contents(Vec<u8>),
+    Malformed,
+}
+
+fn read_child(
+    dir: &ValidatedRuntimeDir,
+    name: &CStr,
+    path: &Path,
+) -> Result<SentinelRead, RvError> {
+    let fd = match openat_owned(
         dir.0.as_raw_fd(),
         name,
-        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
         0,
-    )
-    .map_err(|source| io_error("open sentinel", path.to_path_buf(), source))?;
+    ) {
+        Ok(fd) => fd,
+        Err(source) if source.raw_os_error() == Some(libc::ELOOP) => {
+            return Ok(SentinelRead::Malformed);
+        }
+        Err(source) => return Err(io_error("open sentinel", path.to_path_buf(), source)),
+    };
+    let stat = fstat_fd(fd.as_raw_fd())
+        .map_err(|source| io_error("stat open sentinel", path.to_path_buf(), source))?;
+    if !sentinel_stat_valid(&stat, effective_uid()) {
+        return Ok(SentinelRead::Malformed);
+    }
     let mut file = File::from(fd);
     let mut found = Vec::new();
     file.read_to_end(&mut found)
         .map_err(|source| io_error("read sentinel", path.to_path_buf(), source))?;
-    Ok(found)
+    Ok(SentinelRead::Contents(found))
 }
 
 fn stat_child(
@@ -970,17 +1008,20 @@ impl Drop for TempEntry {
 mod tests {
     use std::ffi::OsStr;
     use std::fs::{self, Permissions};
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     use tempfile::TempDir;
 
     use super::{
         ControllerClientUnavailable, ControllerEndpointStatus, ControllerInputUnavailable,
-        ControllerSocketStatus, DIRECTORY_MODE, RvError, SOCKET_PATH_LIMIT, effective_uid,
-        open_runtime_dir_at, preflight_len, prepare_controller_socket, resolve_controller_socket,
-        runtime_base, shutdown_controller_socket, validate_directory_fields,
+        ControllerSocketStatus, DIRECTORY_MODE, FILE_MODE, RvError, SOCKET_PATH_LIMIT,
+        effective_uid, open_runtime_dir_at, preflight_len, prepare_controller_socket,
+        resolve_controller_socket, runtime_base, sentinel_stat_valid, shutdown_controller_socket,
+        validate_directory_fields,
     };
     use crate::lockfile::{OwnerLock, state_root_in, try_acquire};
     use crate::session_key::{SessionKey, encode};
@@ -1108,6 +1149,7 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         drop(listener);
         fs::write(&sentinel, b"different session").unwrap();
+        fs::set_permissions(&sentinel, Permissions::from_mode(0o600)).unwrap();
 
         assert!(matches!(
             prepare_controller_socket(&dir, &key, &lock).unwrap(),
@@ -1117,6 +1159,143 @@ mod tests {
         ));
         assert!(socket.exists());
         assert_eq!(fs::read(&sentinel).unwrap(), b"different session");
+    }
+
+    #[test]
+    fn sentinel_stat_validation_requires_private_regular_owner_file() {
+        let expected_uid = effective_uid();
+        // SAFETY: all-zero bytes are a valid baseline for libc::stat's integer fields,
+        // and the validator reads only the fields explicitly initialized below.
+        let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        stat.st_mode = libc::S_IFREG | FILE_MODE as libc::mode_t;
+        stat.st_uid = expected_uid;
+
+        assert!(sentinel_stat_valid(&stat, expected_uid));
+
+        stat.st_uid = expected_uid.wrapping_add(1);
+        assert!(!sentinel_stat_valid(&stat, expected_uid));
+
+        stat.st_uid = expected_uid;
+        stat.st_mode = libc::S_IFREG | 0o644;
+        assert!(!sentinel_stat_valid(&stat, expected_uid));
+
+        stat.st_mode = libc::S_IFIFO | FILE_MODE as libc::mode_t;
+        assert!(!sentinel_stat_valid(&stat, expected_uid));
+    }
+
+    #[test]
+    fn fifo_sentinel_is_malformed_without_blocking_owner_startup() {
+        let runtime_temp = tempfile::tempdir().unwrap();
+        let lock_temp = tempfile::tempdir().unwrap();
+        let key = session_key("fifo sentinel");
+        let (base, dir) = runtime_in(&runtime_temp);
+        let lock = owner_lock(&lock_temp, &key);
+        let socket = socket_path(&base, &key);
+        let sentinel = sentinel_path(&base, &key);
+        let sentinel_cstring = super::path_cstring(&sentinel).unwrap();
+        // SAFETY: the path is a live NUL-terminated C string and mkfifo retains no pointer.
+        let result = unsafe { libc::mkfifo(sentinel_cstring.as_ptr(), 0o600) };
+        assert_eq!(
+            result,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = sender.send(prepare_controller_socket(&dir, &key, &lock));
+        });
+        let result = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|source| panic!("owner startup timed out on FIFO sentinel: {source}"));
+        worker.join().unwrap();
+
+        assert!(matches!(
+            result.unwrap(),
+            ControllerSocketStatus::Unavailable(ControllerInputUnavailable::SentinelMalformed)
+        ));
+        assert!(!socket.exists());
+        assert!(
+            fs::symlink_metadata(&sentinel)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+    }
+
+    #[test]
+    fn symlink_sentinel_is_malformed_and_retained() {
+        let runtime_temp = tempfile::tempdir().unwrap();
+        let lock_temp = tempfile::tempdir().unwrap();
+        let key = session_key("symlink sentinel");
+        let (base, dir) = runtime_in(&runtime_temp);
+        let lock = owner_lock(&lock_temp, &key);
+        let socket = socket_path(&base, &key);
+        let sentinel = sentinel_path(&base, &key);
+        let target = runtime_temp.path().join("sentinel-target");
+        fs::write(&target, key.name().as_bytes()).unwrap();
+        fs::set_permissions(&target, Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &sentinel).unwrap();
+
+        assert!(matches!(
+            prepare_controller_socket(&dir, &key, &lock).unwrap(),
+            ControllerSocketStatus::Unavailable(ControllerInputUnavailable::SentinelMalformed)
+        ));
+        assert!(!socket.exists());
+        assert!(
+            fs::symlink_metadata(&sentinel)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn non_private_regular_sentinel_is_malformed_and_retained() {
+        let runtime_temp = tempfile::tempdir().unwrap();
+        let lock_temp = tempfile::tempdir().unwrap();
+        let key = session_key("non-private sentinel");
+        let (base, dir) = runtime_in(&runtime_temp);
+        let lock = owner_lock(&lock_temp, &key);
+        let socket = socket_path(&base, &key);
+        let sentinel = sentinel_path(&base, &key);
+        fs::write(&sentinel, key.name().as_bytes()).unwrap();
+        fs::set_permissions(&sentinel, Permissions::from_mode(0o644)).unwrap();
+
+        assert!(matches!(
+            prepare_controller_socket(&dir, &key, &lock).unwrap(),
+            ControllerSocketStatus::Unavailable(ControllerInputUnavailable::SentinelMalformed)
+        ));
+        assert!(!socket.exists());
+        assert_eq!(
+            fs::symlink_metadata(&sentinel)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn valid_existing_sentinel_allows_owner_to_bind() {
+        let runtime_temp = tempfile::tempdir().unwrap();
+        let lock_temp = tempfile::tempdir().unwrap();
+        let key = session_key("valid existing sentinel");
+        let (base, dir) = runtime_in(&runtime_temp);
+        let lock = owner_lock(&lock_temp, &key);
+        let sentinel = sentinel_path(&base, &key);
+        fs::write(&sentinel, key.name().as_bytes()).unwrap();
+        fs::set_permissions(&sentinel, Permissions::from_mode(0o600)).unwrap();
+
+        let status = prepare_controller_socket(&dir, &key, &lock).unwrap();
+        assert!(
+            matches!(status, ControllerSocketStatus::Bound(_)),
+            "expected a bound controller socket, got {status:?}"
+        );
+        shutdown_controller_socket(status, &lock).unwrap();
+        assert_eq!(fs::read(&sentinel).unwrap(), key.name().as_bytes());
     }
 
     #[test]
@@ -1147,7 +1326,9 @@ mod tests {
         let (base, dir) = runtime_in(&runtime_temp);
         let lock = owner_lock(&lock_temp, &key);
         let socket = socket_path(&base, &key);
-        fs::write(sentinel_path(&base, &key), key.name().as_bytes()).unwrap();
+        let sentinel = sentinel_path(&base, &key);
+        fs::write(&sentinel, key.name().as_bytes()).unwrap();
+        fs::set_permissions(&sentinel, Permissions::from_mode(0o600)).unwrap();
 
         let stale_listener = UnixListener::bind(&socket).unwrap();
         drop(stale_listener);
