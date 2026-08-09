@@ -301,11 +301,15 @@ impl DiscoveryIndex {
         interner: &mut PathInterner,
     ) -> io::Result<DiscoveryScanOutcome> {
         let mut seen = HashSet::new();
+        let mut dirty_roots = HashSet::new();
         let mut outcome = DiscoveryScanOutcome::default();
         for root in self.roots.clone() {
             let mut root_seen = HashSet::new();
             let discovery = discover_artifacts(&root.path)?;
             outcome.file_io_error |= discovery.had_errors;
+            if discovery.had_errors {
+                dirty_roots.insert(root.path.clone());
+            }
             for relative in discovery.paths {
                 let absolute = root.path.join(&relative);
                 let file_key = (root.provider, absolute.clone());
@@ -354,10 +358,12 @@ impl DiscoveryIndex {
                     },
                 );
             }
-            self.baseline.retain_existing(&root.path, &root_seen);
+            if !discovery.had_errors {
+                self.baseline.retain_existing(&root.path, &root_seen);
+            }
         }
         self.files.retain(|key, file| {
-            if seen.contains(key) {
+            if seen.contains(key) || dirty_roots.contains(&file.root) {
                 true
             } else {
                 outcome.removed_path_ids.push(file.path_id);
@@ -478,6 +484,35 @@ struct ArtifactDiscovery {
     had_errors: bool,
 }
 
+#[cfg(test)]
+type DiscoveryFileTypeHook = Box<dyn FnOnce(&Path) -> io::Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+    static DISCOVERY_FILE_TYPE_HOOK: std::cell::RefCell<Option<DiscoveryFileTypeHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_discovery_file_type_hook(hook: impl FnOnce(&Path) -> io::Result<()> + 'static) {
+    DISCOVERY_FILE_TYPE_HOOK.with(|slot| {
+        assert!(
+            slot.borrow_mut().replace(Box::new(hook)).is_none(),
+            "discovery file-type hook was already installed"
+        );
+    });
+}
+
+fn discovery_file_type(entry: &fs::DirEntry, path: &Path) -> io::Result<fs::FileType> {
+    #[cfg(test)]
+    if let Some(hook) = DISCOVERY_FILE_TYPE_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook(path)?;
+    }
+    #[cfg(not(test))]
+    let _ = path;
+    entry.file_type()
+}
+
 fn discover_artifacts(root: &Path) -> io::Result<ArtifactDiscovery> {
     let mut found = Vec::new();
     let mut had_errors = false;
@@ -501,14 +536,16 @@ fn discover_artifacts(root: &Path) -> io::Result<ArtifactDiscovery> {
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(_) => {
                     had_errors = true;
                     continue;
                 }
             };
             let relative = relative_directory.join(entry.file_name());
-            let kind = match entry.file_type() {
+            let kind = match discovery_file_type(&entry, &root.join(&relative)) {
                 Ok(kind) => kind,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(_) => {
                     had_errors = true;
                     continue;

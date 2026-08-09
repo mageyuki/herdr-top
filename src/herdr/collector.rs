@@ -1601,6 +1601,7 @@ impl ProviderWorker for AdapterProviderWorker {
                 .or_default()
                 .visited
                 .insert(AvailabilitySweepMember::File(file.path_id));
+            let mut replacement_goalpost_refrozen = false;
             loop {
                 let (previous_generation, previous_offset) = self
                     .tails
@@ -1670,6 +1671,10 @@ impl ProviderWorker for AdapterProviderWorker {
                     }
                 }
                 if tail_generation != previous_generation {
+                    if replacement_goalpost_refrozen {
+                        break;
+                    }
+                    replacement_goalpost_refrozen = true;
                     let mut boundary = FsReadBoundary;
                     goalpost = match self
                         .tails
@@ -4076,6 +4081,165 @@ mod provider_integration_tests {
     }
 
     #[test]
+    fn dirty_root_walk_preserves_tail_bootstrap_baseline_and_offset_until_clean_scan() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        let nested = root.join("nested");
+        let relative = Path::new("nested/session.jsonl");
+        let path = root.join(relative);
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            &path,
+            codex_records("retained-owner", "retained-agent", "historical-event"),
+        )
+        .unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path: path.clone(),
+        }]);
+        let mut pending = PendingEvents::new(diagnostics);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let _ = drain_pending(&mut pending);
+        append_codex_activity(&path, "retained-agent", "post-baseline-event");
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let appended = drain_pending(&mut pending);
+        assert!(appended.iter().any(|event| matches!(
+            event,
+            ProviderEvent::Activity { event_id, .. }
+                if event_id == "prov:codex:act:post-baseline-event"
+        )));
+
+        let state = worker.roots.get(&(Provider::Codex, root.clone())).unwrap();
+        let path_id = state
+            .discovery
+            .files()
+            .into_iter()
+            .find(|file| file.relative_path == relative)
+            .unwrap()
+            .path_id;
+        let tail_before = worker.tails.get(&path_id).unwrap();
+        let state_before = (tail_before.generation(), tail_before.offset());
+        assert!(state.discovery.baseline().contained(&root, relative));
+        assert!(worker.bootstrap_emitted.contains(&path_id));
+
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o000)).unwrap();
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let dirty_events = drain_pending(&mut pending);
+        let dirty_state = worker
+            .tails
+            .get(&path_id)
+            .map(|tail| (tail.generation(), tail.offset()));
+        let dirty_file_retained = worker
+            .roots
+            .get(&(Provider::Codex, root.clone()))
+            .unwrap()
+            .discovery
+            .files()
+            .into_iter()
+            .any(|file| file.path_id == path_id);
+        let dirty_bootstrap_retained = worker.bootstrap_emitted.contains(&path_id);
+        let dirty_baseline_retained = worker
+            .roots
+            .get(&(Provider::Codex, root.clone()))
+            .unwrap()
+            .discovery
+            .baseline()
+            .contained(&root, relative);
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(
+            dirty_state,
+            Some(state_before),
+            "dirty walk destroyed tail state"
+        );
+        assert!(
+            dirty_file_retained,
+            "dirty walk removed the discovered file"
+        );
+        assert!(
+            dirty_bootstrap_retained,
+            "dirty walk removed the bootstrap marker"
+        );
+        assert!(dirty_baseline_retained, "dirty walk pruned the baseline");
+        assert_eq!(
+            provider_source_state(&dirty_events, Provider::Codex),
+            Some(ProviderSourceState::Unavailable {
+                detail: "file_io_error".to_owned(),
+            })
+        );
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let restored_events = drain_pending(&mut pending);
+        assert_eq!(
+            worker
+                .tails
+                .get(&path_id)
+                .map(|tail| (tail.generation(), tail.offset())),
+            Some(state_before)
+        );
+        assert!(
+            !restored_events.iter().any(|event| matches!(
+                event,
+                ProviderEvent::SessionResolved { .. } | ProviderEvent::Activity { .. }
+            )),
+            "clean recovery re-emitted retained provider history: {restored_events:?}"
+        );
+    }
+
+    #[test]
+    fn per_entry_not_found_is_silent_churn_and_does_not_reject_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("vanishing.jsonl");
+        std::fs::write(&path, codex_records("owner", "agent", "event")).unwrap();
+        let hook_path = path.clone();
+        crate::provider::set_discovery_file_type_hook(move |entry_path| {
+            assert_eq!(entry_path, hook_path);
+            std::fs::remove_file(entry_path).unwrap();
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "injected enumeration-to-stat deletion race",
+            ))
+        });
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path,
+        }]);
+        let mut pending = PendingEvents::new(diagnostics);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let events = drain_pending(&mut pending);
+
+        assert!(
+            worker.roots.contains_key(&(Provider::Codex, root)),
+            "NotFound churn rejected the run baseline"
+        );
+        assert_eq!(
+            provider_source_state(&events, Provider::Codex),
+            Some(ProviderSourceState::Available),
+            "NotFound churn poisoned the availability sweep: {events:?}"
+        );
+    }
+
+    #[test]
     fn target_before_root_exists_recovers_when_the_root_appears() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("fresh/.codex/sessions");
@@ -5414,6 +5578,105 @@ mod provider_integration_tests {
             event,
             ProviderEvent::Activity { event_id, .. }
                 if event_id == "prov:codex:act:replacement-tail"
+        )));
+    }
+
+    #[test]
+    fn second_generation_change_defers_remaining_drain_to_next_cycle() {
+        use crate::provider::tail::MAX_TAIL_CHUNK_BYTES;
+
+        fn rotating_contents(index: usize) -> Vec<u8> {
+            let mut contents = codex_records(
+                &format!("swap-owner-{index}"),
+                &format!("swap-agent-{index}"),
+                &format!("swap-event-{index}"),
+            )
+            .into_bytes();
+            contents.resize(MAX_TAIL_CHUNK_BYTES * 2 + 64 * 1024, b'x');
+            contents
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("standard/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("1-rotating.jsonl");
+        let sibling = root.join("2-sibling.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::write(&sibling, b"").unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let targets = TargetSet::new([
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: path.clone(),
+            },
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: sibling.clone(),
+            },
+        ]);
+        let mut pending = PendingEvents::new(diagnostics);
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let _ = drain_pending(&mut pending);
+
+        std::fs::write(&path, rotating_contents(0)).unwrap();
+        append_codex_activity(&sibling, "sibling-agent", "sibling-event");
+        let swaps = Arc::new(AtomicUsize::new(0));
+        let hook_swaps = Arc::clone(&swaps);
+        let hook_path = path.clone();
+        let hook_root = root.clone();
+        worker.set_after_tail_chunk(move |read_path, _| {
+            if read_path != hook_path || hook_swaps.load(Ordering::Acquire) >= 8 {
+                return;
+            }
+            let index = hook_swaps.fetch_add(1, Ordering::AcqRel);
+            std::fs::rename(read_path, hook_root.join(format!("rotating-{index}.old"))).unwrap();
+            std::fs::write(read_path, rotating_contents(index + 1)).unwrap();
+        });
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let first_cycle = drain_pending(&mut pending);
+
+        assert_eq!(
+            swaps.load(Ordering::Acquire),
+            3,
+            "drain refroze more than one replacement goalpost"
+        );
+        assert!(
+            first_cycle.iter().any(|event| matches!(
+                event,
+                ProviderEvent::Activity { event_id, .. }
+                    if event_id == "prov:codex:act:swap-event-2"
+            )),
+            "records consumed by the second-change poll were dropped: {first_cycle:?}"
+        );
+        assert!(
+            first_cycle.iter().any(|event| matches!(
+                event,
+                ProviderEvent::Activity { event_id, .. }
+                    if event_id == "prov:codex:act:sibling-event"
+            )),
+            "continuously replaced path pinned out its sibling"
+        );
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let second_cycle = drain_pending(&mut pending);
+
+        assert_eq!(
+            swaps.load(Ordering::Acquire),
+            6,
+            "next cycle did not continue the deferred drain"
+        );
+        assert!(second_cycle.iter().any(|event| matches!(
+            event,
+            ProviderEvent::Activity { event_id, .. }
+                if event_id == "prov:codex:act:swap-event-5"
         )));
     }
 
