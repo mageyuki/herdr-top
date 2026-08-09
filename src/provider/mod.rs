@@ -83,6 +83,7 @@ pub enum ProviderEvent {
         parent_thread_id: Option<String>,
         state: Option<ExecState>,
         model_id: Option<String>,
+        depth: Option<u32>,
         event_id: String,
         observed_at_ms: i64,
         position: SourcePosition,
@@ -91,6 +92,7 @@ pub enum ProviderEvent {
         provider: Provider,
         agent_thread_id: String,
         activity: MinimalProviderMetadata,
+        depth: Option<u32>,
         event_id: String,
         observed_at_ms: i64,
         position: SourcePosition,
@@ -214,15 +216,38 @@ pub struct DiscoveredIdentity {
     pub parent_thread_id: Option<String>,
 }
 
-/// Persistent path interning and bounded bootstrap state for configured roots.
+/// Run-scoped absolute-path interner shared by every discovery root.
+///
+/// Entries are intentionally never pruned or reused during a run so coalescing positions remain
+/// unambiguous after root overlap, deletion, and recreation.
+#[derive(Debug, Default)]
+pub struct PathInterner {
+    path_ids: HashMap<PathBuf, u32>,
+    next_path_id: u32,
+}
+
+impl PathInterner {
+    fn intern(&mut self, path: &Path) -> io::Result<u32> {
+        if let Some(path_id) = self.path_ids.get(path) {
+            return Ok(*path_id);
+        }
+        let path_id = self.next_path_id;
+        self.next_path_id = self
+            .next_path_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("provider path-id space exhausted"))?;
+        self.path_ids.insert(path.to_path_buf(), path_id);
+        Ok(path_id)
+    }
+}
+
+/// Bounded bootstrap and first-seen state for configured roots.
 #[derive(Debug)]
 pub struct DiscoveryIndex {
     roots: Vec<DiscoveryRoot>,
     files: HashMap<(Provider, PathBuf), DiscoveredFile>,
     identities: HashMap<(Provider, String), DiscoveredIdentity>,
     agent_paths: HashMap<(Provider, Option<String>, String), String>,
-    path_ids: HashMap<(Provider, PathBuf), u32>,
-    next_path_id: u32,
     baseline: FirstSeenBaseline,
 }
 
@@ -240,35 +265,28 @@ impl DiscoveryIndex {
             files: HashMap::new(),
             identities: HashMap::new(),
             agent_paths: HashMap::new(),
-            path_ids: HashMap::new(),
-            next_path_id: 0,
             baseline,
         })
     }
 
     /// Rescans roots, bootstrapping only newly discovered allowlisted files.
-    pub fn scan(&mut self, parser: &mut impl BootstrapParser) -> io::Result<()> {
+    pub fn scan(
+        &mut self,
+        parser: &mut impl BootstrapParser,
+        interner: &mut PathInterner,
+    ) -> io::Result<()> {
         let mut seen = HashSet::new();
         for root in self.roots.clone() {
+            let mut root_seen = HashSet::new();
             for relative in discover_artifacts(&root.path)? {
                 let absolute = root.path.join(&relative);
                 let file_key = (root.provider, absolute.clone());
+                root_seen.insert(absolute.clone());
                 seen.insert(file_key.clone());
                 if self.files.contains_key(&file_key) {
                     continue;
                 }
-                let path_id = match self.path_ids.get(&file_key) {
-                    Some(path_id) => *path_id,
-                    None => {
-                        let path_id = self.next_path_id;
-                        self.next_path_id = self
-                            .next_path_id
-                            .checked_add(1)
-                            .ok_or_else(|| io::Error::other("provider path-id space exhausted"))?;
-                        self.path_ids.insert(file_key.clone(), path_id);
-                        path_id
-                    }
-                };
+                let path_id = interner.intern(&absolute)?;
                 let bootstrap = bootstrap_file(&root, &relative, parser)?;
                 if let Some(identity) = bootstrap.as_ref()
                     && valid_native_id(&identity.thread_id)
@@ -296,6 +314,7 @@ impl DiscoveryIndex {
                     },
                 );
             }
+            self.baseline.retain_existing(&root.path, &root_seen);
         }
         self.files.retain(|key, _| seen.contains(key));
         self.rebuild_identities();
@@ -512,6 +531,17 @@ impl PendingEvents {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_capacity(capacity: usize, diagnostics: ProviderDiagnostics) -> Self {
+        Self {
+            capacity,
+            sources: HashMap::new(),
+            entities: HashMap::new(),
+            malformed: HashMap::new(),
+            diagnostics,
+        }
+    }
+
     /// Merges one event. A returned `AtCapacity` event must be retried before tail advancement.
     pub fn merge(&mut self, event: ProviderEvent) -> MergeOutcome {
         match event {
@@ -583,9 +613,23 @@ impl PendingEvents {
                 parent_thread_id.clone()
             }
             ProviderEvent::AgentUpsert {
-                parent_thread_id, ..
-            } => parent_thread_id.clone(),
-            ProviderEvent::Activity { activity, .. } => activity.parent_agent_id.clone(),
+                parent_thread_id,
+                depth,
+                ..
+            } => {
+                if let Some(depth) = depth {
+                    entity.depth = Some(*depth);
+                }
+                parent_thread_id.clone()
+            }
+            ProviderEvent::Activity {
+                activity, depth, ..
+            } => {
+                if let Some(depth) = depth {
+                    entity.depth = Some(*depth);
+                }
+                activity.parent_agent_id.clone()
+            }
             ProviderEvent::SourceState { .. } | ProviderEvent::Malformed { .. } => None,
         };
         if incoming_parent.is_some() {
@@ -790,6 +834,9 @@ impl ProviderDiagnostics {
     fn record_watch_cap_fallback(&self) {
         self.0.record_watch_cap_fallback();
     }
+    pub(crate) fn record_fallback_baseline_approximation(&self) {
+        self.0.record_fallback_baseline_approximation();
+    }
     fn record_cycle(&self) {
         self.0.record_provider_cycle();
     }
@@ -824,6 +871,10 @@ impl ProviderDiagnostics {
     #[must_use]
     pub fn watch_cap_fallbacks(&self) -> u64 {
         self.0.watch_cap_fallbacks()
+    }
+    #[must_use]
+    pub fn fallback_baseline_approximations(&self) -> u64 {
+        self.0.fallback_baseline_approximations()
     }
     #[must_use]
     pub fn provider_cycles(&self) -> u64 {
@@ -1024,6 +1075,21 @@ impl ProviderCycle<'_> {
     /// Requests a non-recursive per-directory watch.
     pub fn request_watch(&mut self, directory: PathBuf) {
         self.watch_requests.push(directory);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_provider_cycle<'a>(
+    targets: &'a TargetSet,
+    pending: &'a mut PendingEvents,
+    watch_requests: &'a mut Vec<PathBuf>,
+) -> ProviderCycle<'a> {
+    ProviderCycle {
+        targets,
+        hint: None,
+        force_rescan: true,
+        pending,
+        watch_requests,
     }
 }
 
@@ -1507,8 +1573,9 @@ mod tests {
         }])
         .unwrap();
         let mut parser = LineParser { calls: 0 };
+        let mut interner = PathInterner::default();
 
-        index.scan(&mut parser).unwrap();
+        index.scan(&mut parser, &mut interner).unwrap();
 
         assert_eq!(parser.calls, 2);
         assert_eq!(
@@ -1538,8 +1605,11 @@ mod tests {
         }])
         .unwrap();
         let mut capped_parser = LineParser { calls: 0 };
+        let mut capped_interner = PathInterner::default();
 
-        capped_index.scan(&mut capped_parser).unwrap();
+        capped_index
+            .scan(&mut capped_parser, &mut capped_interner)
+            .unwrap();
 
         assert!(capped_index.resolve(Provider::Codex, "too-late").is_none());
         assert!(
@@ -1566,14 +1636,83 @@ mod tests {
         }])
         .unwrap();
         let mut parser = LineParser { calls: 0 };
+        let mut interner = PathInterner::default();
 
-        index.scan(&mut parser).unwrap();
+        index.scan(&mut parser, &mut interner).unwrap();
         let original_id = index.files()[0].path_id;
-        index.scan(&mut parser).unwrap();
+        index.scan(&mut parser, &mut interner).unwrap();
 
         assert_eq!(index.files().len(), 1);
         assert_eq!(index.files()[0].path_id, original_id);
         assert_eq!(parser.calls, 1);
+    }
+
+    #[test]
+    fn same_provider_files_in_different_roots_use_distinct_path_ids_for_freshness() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        fs::write(first.path().join("session.jsonl"), b"struct:first\n").unwrap();
+        fs::write(second.path().join("session.jsonl"), b"struct:second\n").unwrap();
+        let mut first_index = DiscoveryIndex::new(vec![DiscoveryRoot {
+            provider: Provider::Codex,
+            path: first.path().to_path_buf(),
+        }])
+        .unwrap();
+        let mut second_index = DiscoveryIndex::new(vec![DiscoveryRoot {
+            provider: Provider::Codex,
+            path: second.path().to_path_buf(),
+        }])
+        .unwrap();
+        let mut parser = LineParser { calls: 0 };
+        let mut interner = PathInterner::default();
+        first_index.scan(&mut parser, &mut interner).unwrap();
+        second_index.scan(&mut parser, &mut interner).unwrap();
+        let first_path_id = first_index.files()[0].path_id;
+        let second_path_id = second_index.files()[0].path_id;
+
+        assert_ne!(first_path_id, second_path_id);
+
+        let mut pending = PendingEvents::new(ProviderDiagnostics::default());
+        pending.merge(activity(
+            Provider::Codex,
+            "shared-agent",
+            "fresh-event",
+            20,
+            position(first_path_id, 0, 100),
+            "fresh",
+        ));
+        pending.merge(activity(
+            Provider::Codex,
+            "shared-agent",
+            "older-event",
+            10,
+            position(second_path_id, 0, 200),
+            "older",
+        ));
+        let (sender, mut receiver) = tokio_mpsc::channel(1);
+        pending.flush_to(&sender);
+        assert_eq!(event_kind(receiver.try_recv().unwrap()), "fresh");
+    }
+
+    #[test]
+    fn missing_discovered_file_is_pruned_from_first_seen_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let relative = Path::new("recreated.jsonl");
+        let path = directory.path().join(relative);
+        fs::write(&path, b"struct:original\n").unwrap();
+        let mut index = DiscoveryIndex::new(vec![DiscoveryRoot {
+            provider: Provider::Claude,
+            path: directory.path().to_path_buf(),
+        }])
+        .unwrap();
+        let mut parser = LineParser { calls: 0 };
+        let mut interner = PathInterner::default();
+        index.scan(&mut parser, &mut interner).unwrap();
+
+        fs::remove_file(&path).unwrap();
+        index.scan(&mut parser, &mut interner).unwrap();
+
+        assert!(!index.baseline().contained(directory.path(), relative));
     }
 
     fn position(path_id: u32, generation: u64, offset: u64) -> SourcePosition {
@@ -1599,6 +1738,7 @@ mod tests {
                 event_kind: Some(kind.to_owned()),
                 ..MinimalProviderMetadata::default()
             },
+            depth: None,
             event_id: event_id.to_owned(),
             observed_at_ms: observed,
             position,
@@ -1721,6 +1861,38 @@ mod tests {
     }
 
     #[test]
+    fn newer_generation_at_lower_offset_replaces_distinct_pending_event() {
+        let mut pending = PendingEvents::new(ProviderDiagnostics::default());
+        pending.merge(activity(
+            Provider::Codex,
+            "agent",
+            "event-x",
+            10,
+            position(1, 100, 100),
+            "old-generation",
+        ));
+
+        assert_eq!(
+            pending.merge(activity(
+                Provider::Codex,
+                "agent",
+                "event-y",
+                10,
+                position(1, 101, 0),
+                "replacement-generation",
+            )),
+            MergeOutcome::Coalesced
+        );
+
+        let (sender, mut receiver) = tokio_mpsc::channel(1);
+        pending.flush_to(&sender);
+        assert_eq!(
+            event_kind(receiver.try_recv().unwrap()),
+            "replacement-generation"
+        );
+    }
+
+    #[test]
     fn cross_path_replacement_uses_semantic_freshness() {
         let mut pending = PendingEvents::new(ProviderDiagnostics::default());
         pending.merge(activity(
@@ -1814,6 +1986,42 @@ mod tests {
                 "malformed"
             ]
         );
+    }
+
+    #[test]
+    fn agent_upsert_depth_orders_entity_before_unknown_activity() {
+        let mut pending = PendingEvents::new(ProviderDiagnostics::default());
+        pending.merge(activity(
+            Provider::Codex,
+            "000-unknown",
+            "unknown-event",
+            1,
+            position(10, 0, 0),
+            "unknown",
+        ));
+        pending.merge(ProviderEvent::AgentUpsert {
+            provider: Provider::Codex,
+            agent_thread_id: "depth-two-agent".to_owned(),
+            owner_session_id: None,
+            parent_thread_id: None,
+            state: Some(ExecState::Working),
+            model_id: None,
+            depth: Some(2),
+            event_id: "depth-two-upsert".to_owned(),
+            observed_at_ms: 2,
+            position: position(11, 0, 0),
+        });
+        let (sender, mut receiver) = tokio_mpsc::channel(2);
+
+        pending.flush_to(&sender);
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ProviderEvent::AgentUpsert {
+                agent_thread_id,
+                ..
+            } if agent_thread_id == "depth-two-agent"
+        ));
     }
 
     #[derive(Clone)]

@@ -6,7 +6,7 @@ use std::path::Path;
 use herdr_top::model::{ExecState, Provider};
 use herdr_top::provider::codex::{CodexAdapter, CodexBootstrapParser};
 use herdr_top::provider::{
-    BootstrapParser, DiscoveryIndex, DiscoveryRoot, MergeOutcome, PendingEvents,
+    BootstrapParser, DiscoveryIndex, DiscoveryRoot, MergeOutcome, PathInterner, PendingEvents,
     ProviderDiagnostics, ProviderEvent, SourcePosition, TailRecord,
 };
 
@@ -40,7 +40,9 @@ impl FixtureIndex {
             path: directory.path().to_path_buf(),
         }])
         .unwrap();
-        index.scan(&mut CodexBootstrapParser).unwrap();
+        index
+            .scan(&mut CodexBootstrapParser, &mut PathInterner::default())
+            .unwrap();
         Self {
             _directory: directory,
             index,
@@ -66,8 +68,7 @@ impl FixtureIndex {
             events.extend(adapter.parse_record(
                 &self.index,
                 file,
-                generation,
-                &TailRecord { offset, bytes },
+                &TailRecord::data(offset, generation, bytes),
             ));
         }
         events
@@ -111,11 +112,7 @@ fn parse_inline(
             adapter.parse_record(
                 index,
                 file,
-                generation,
-                &TailRecord {
-                    offset: *offset,
-                    bytes: bytes.to_vec(),
-                },
+                &TailRecord::data(*offset, generation, bytes.to_vec()),
             )
         })
         .collect()
@@ -498,6 +495,7 @@ fn synthetic_depth_three_identity_and_deeper_started_parent_resolve() {
                 agent_thread_id,
                 parent_thread_id,
                 state: Some(ExecState::Working),
+                depth: Some(4),
                 event_id,
                 ..
             } if agent_thread_id == "codex-depth4-worker"
@@ -505,4 +503,54 @@ fn synthetic_depth_three_identity_and_deeper_started_parent_resolve() {
                 && event_id == "prov:codex:up:call_depth4_worker_started"
         )
     }));
+}
+
+#[test]
+fn activity_only_entity_flushes_at_validated_agent_path_depth() {
+    let fixtures = FixtureIndex::new(&[
+        "codex-depth2-root.jsonl",
+        "codex-depth2-child.jsonl",
+        "codex-depth2-grandchild.jsonl",
+        "codex-depth3-synthetic.jsonl",
+    ]);
+    let deep_activity = fixtures
+        .events("codex-depth3-synthetic.jsonl", 0)
+        .into_iter()
+        .find(|event| {
+            matches!(
+                event,
+                ProviderEvent::Activity {
+                    agent_thread_id,
+                    ..
+                } if agent_thread_id == "codex-depth4-worker"
+            )
+        })
+        .expect("synthetic activity exists");
+    let unknown_depth = ProviderEvent::Activity {
+        provider: Provider::Codex,
+        agent_thread_id: "000-unknown-depth".to_owned(),
+        activity: Default::default(),
+        depth: None,
+        event_id: "unknown-depth-event".to_owned(),
+        observed_at_ms: 1,
+        position: SourcePosition {
+            path_id: 99,
+            generation: 0,
+            offset: 0,
+        },
+    };
+    let mut pending = PendingEvents::new(ProviderDiagnostics::default());
+    pending.merge(unknown_depth);
+    pending.merge(deep_activity);
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+
+    pending.flush_to(&sender);
+
+    assert!(matches!(
+        receiver.try_recv().unwrap(),
+        ProviderEvent::Activity {
+            agent_thread_id,
+            ..
+        } if agent_thread_id == "codex-depth4-worker"
+    ));
 }

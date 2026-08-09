@@ -190,6 +190,7 @@ impl ProviderWorker for RealWatcherWorker {
                 &self.root,
                 &self.relative,
                 &self.baseline,
+                0,
                 &mut boundary,
             )?);
         }
@@ -209,6 +210,7 @@ impl ProviderWorker for RealWatcherWorker {
                         event_kind: Some(String::from_utf8_lossy(&record.bytes).into_owned()),
                         ..MinimalProviderMetadata::default()
                     },
+                    depth: None,
                     event_id: "real-watcher-append".to_owned(),
                     observed_at_ms: 1,
                     position: SourcePosition {

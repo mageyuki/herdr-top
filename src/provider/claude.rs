@@ -145,19 +145,38 @@ impl ClaudeAdapter {
         self,
         _discovery: &DiscoveryIndex,
         file: &DiscoveredFile,
-        generation: u64,
         record: &TailRecord,
     ) -> Vec<ProviderEvent> {
+        if let Some(error_code) = record.error_code {
+            return vec![malformed(
+                file,
+                record.generation,
+                record.offset,
+                error_code,
+            )];
+        }
         let record_type = match record_type(&record.bytes) {
             Ok(record_type) => record_type,
-            Err(()) => return vec![malformed(file, generation, record.offset, JSON_ERROR)],
+            Err(()) => {
+                return vec![malformed(
+                    file,
+                    record.generation,
+                    record.offset,
+                    JSON_ERROR,
+                )];
+            }
         };
         if !record_type.as_deref().is_some_and(is_activity_type) {
             return Vec::new();
         }
         match parse_activity(&file.relative_path, &record.bytes) {
-            Ok(activity) => vec![activity_event(file, generation, record, activity)],
-            Err(error) => vec![malformed(file, generation, record.offset, error.code())],
+            Ok(activity) => vec![activity_event(file, record, activity)],
+            Err(error) => vec![malformed(
+                file,
+                record.generation,
+                record.offset,
+                error.code(),
+            )],
         }
     }
 }
@@ -251,7 +270,6 @@ fn path_topology(relative_path: &Path) -> Option<PathTopology> {
 
 fn activity_event(
     file: &DiscoveredFile,
-    generation: u64,
     record: &TailRecord,
     activity: ParsedActivity,
 ) -> ProviderEvent {
@@ -264,11 +282,12 @@ fn activity_event(
             event_kind: Some(activity.record_type),
             ..MinimalProviderMetadata::default()
         },
+        depth: Some(activity.depth),
         event_id: format!("prov:claude:rec:{}", activity.uuid),
         observed_at_ms: activity.observed_at_ms,
         position: SourcePosition {
             path_id: file.path_id,
-            generation,
+            generation: record.generation,
             offset: record.offset,
         },
     }

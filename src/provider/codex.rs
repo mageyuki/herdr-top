@@ -150,19 +150,33 @@ impl CodexAdapter {
         self,
         discovery: &DiscoveryIndex,
         file: &DiscoveredFile,
-        generation: u64,
         record: &TailRecord,
     ) -> Vec<ProviderEvent> {
+        if let Some(error_code) = record.error_code {
+            return vec![malformed(
+                file,
+                record.generation,
+                record.offset,
+                error_code,
+            )];
+        }
         let record_type = match record_type(&record.bytes) {
             Ok(record_type) => record_type,
-            Err(()) => return vec![malformed(file, generation, record.offset, JSON_ERROR)],
+            Err(()) => {
+                return vec![malformed(
+                    file,
+                    record.generation,
+                    record.offset,
+                    JSON_ERROR,
+                )];
+            }
         };
         match record_type.as_deref() {
             Some("session_meta") => match parse_session(&record.bytes) {
                 Ok(_) => Vec::new(),
                 Err(error) => vec![malformed(
                     file,
-                    generation,
+                    record.generation,
                     record.offset,
                     error.session_code(),
                 )],
@@ -176,10 +190,10 @@ impl CodexAdapter {
                     return Vec::new();
                 }
                 match parse_activity(&record.bytes) {
-                    Ok(activity) => activity_events(discovery, file, generation, record, activity),
+                    Ok(activity) => activity_events(discovery, file, record, activity),
                     Err(error) => vec![malformed(
                         file,
-                        generation,
+                        record.generation,
                         record.offset,
                         error.activity_code(),
                     )],
@@ -269,7 +283,6 @@ fn parent_agent_path(agent_path: &str) -> Option<&str> {
 fn activity_events(
     discovery: &DiscoveryIndex,
     file: &DiscoveredFile,
-    generation: u64,
     record: &TailRecord,
     activity: ActivityPayload,
 ) -> Vec<ProviderEvent> {
@@ -281,6 +294,7 @@ fn activity_events(
         .agent_thread_id
         .expect("validated activity thread id");
     let agent_path = activity.agent_path.expect("validated activity path");
+    let depth = Some(agent_path_depth(&agent_path).expect("validated activity path"));
     let kind = activity.kind.expect("validated activity kind");
     let owner_session_id = file
         .bootstrap
@@ -291,7 +305,7 @@ fn activity_events(
         .map(str::to_owned);
     let position = SourcePosition {
         path_id: file.path_id,
-        generation,
+        generation: record.generation,
         offset: record.offset,
     };
     let mut events = vec![ProviderEvent::Activity {
@@ -303,6 +317,7 @@ fn activity_events(
             event_kind: Some(kind.clone()),
             ..MinimalProviderMetadata::default()
         },
+        depth,
         event_id: format!("prov:codex:act:{event_id}"),
         observed_at_ms,
         position,
@@ -315,6 +330,7 @@ fn activity_events(
             parent_thread_id,
             state: Some(ExecState::Working),
             model_id: None,
+            depth,
             event_id: format!("prov:codex:up:{event_id}"),
             observed_at_ms,
             position,

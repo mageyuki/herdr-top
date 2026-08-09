@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use herdr_top::model::Provider;
 use herdr_top::provider::claude::{ClaudeAdapter, ClaudeBootstrapParser};
 use herdr_top::provider::{
-    DiscoveryIndex, DiscoveryRoot, ProviderEvent, SourcePosition, TailRecord,
+    DiscoveryIndex, DiscoveryRoot, PathInterner, ProviderEvent, SourcePosition, TailRecord,
 };
 
 use common::flat_jsonl_fixture;
@@ -62,8 +62,7 @@ impl FixtureIndex {
             events.extend(adapter.parse_record(
                 &self.index,
                 file,
-                generation,
-                &TailRecord { offset, bytes },
+                &TailRecord::data(offset, generation, bytes),
             ));
         }
         events
@@ -108,8 +107,7 @@ impl SyntheticIndex {
             events.extend(adapter.parse_record(
                 &self.index,
                 file,
-                generation,
-                &TailRecord { offset, bytes },
+                &TailRecord::data(offset, generation, bytes),
             ));
         }
         events
@@ -122,7 +120,9 @@ fn scan(root: &Path) -> DiscoveryIndex {
         path: root.to_path_buf(),
     }])
     .unwrap();
-    index.scan(&mut ClaudeBootstrapParser).unwrap();
+    index
+        .scan(&mut ClaudeBootstrapParser, &mut PathInterner::default())
+        .unwrap();
     index
 }
 
@@ -184,11 +184,7 @@ fn parse_inline(
             ClaudeAdapter.parse_record(
                 index,
                 file,
-                generation,
-                &TailRecord {
-                    offset: *offset,
-                    bytes: bytes.to_vec(),
-                },
+                &TailRecord::data(*offset, generation, bytes.to_vec()),
             )
         })
         .collect()
@@ -242,6 +238,7 @@ fn real_parent_and_subagent_resolve_lineage_depth_and_activity() {
             ProviderEvent::Activity {
                 agent_thread_id,
                 activity,
+                depth: Some(0),
                 event_id,
                 ..
             } if agent_thread_id == ROOT_ID
@@ -257,6 +254,7 @@ fn real_parent_and_subagent_resolve_lineage_depth_and_activity() {
             ProviderEvent::Activity {
                 agent_thread_id,
                 activity,
+                depth: Some(1),
                 event_id,
                 ..
             } if agent_thread_id == CHILD_ID

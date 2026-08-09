@@ -26,7 +26,7 @@ use crate::model::{
 };
 use crate::provider::{
     BootstrapIdentity, BootstrapParser, DiscoveryIndex, DiscoveryRoot, FsReadBoundary,
-    MergeOutcome, PendingEvents, ProviderCycle, ProviderEvent, ProviderSourceState,
+    MergeOutcome, PathInterner, PendingEvents, ProviderCycle, ProviderEvent, ProviderSourceState,
     ProviderSpawnError, ProviderTarget, ProviderTargetPublisher, ProviderThreadError,
     ProviderThreadHandle, ProviderWorker, RecommendedNotifyFactory, TailFile, TargetSet,
     spawn_provider_thread_with_diagnostics,
@@ -381,8 +381,9 @@ async fn spawn_configured(
     let provider_diagnostics = crate::provider::ProviderDiagnostics::from_model_handle(
         reducer.provider_diagnostics_handle(),
     );
+    let standard_provider_roots = standard_provider_roots();
     let provider_thread = match spawn_provider_thread_with_diagnostics(
-        AdapterProviderWorker::default(),
+        AdapterProviderWorker::new(standard_provider_roots, provider_diagnostics.clone()),
         provider_sender,
         Some(Box::new(RecommendedNotifyFactory)),
         provider_diagnostics,
@@ -437,6 +438,26 @@ async fn spawn_configured(
         controller_acceptor,
         provider_thread: Some(provider_thread),
     })
+}
+
+fn standard_provider_roots() -> Vec<DiscoveryRoot> {
+    let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) else {
+        return Vec::new();
+    };
+    let home = PathBuf::from(home);
+    if !home.is_absolute() {
+        return Vec::new();
+    }
+    vec![
+        DiscoveryRoot {
+            provider: Provider::Claude,
+            path: home.join(".claude/projects"),
+        },
+        DiscoveryRoot {
+            provider: Provider::Codex,
+            path: home.join(".codex/sessions"),
+        },
+    ]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -998,14 +1019,159 @@ impl BootstrapParser for AdapterBootstrapParser {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResumePhase {
+    Bootstrap,
+    TailPoll,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResumeCursor {
+    provider: Provider,
+    root: PathBuf,
+    path_id: u32,
+    phase: ResumePhase,
+}
+
+#[derive(Clone, Debug)]
+struct AdapterWorkItem {
+    provider: Provider,
+    root: PathBuf,
+    file: crate::provider::DiscoveredFile,
+}
+
+fn compare_adapter_key(
+    left_provider: Provider,
+    left_root: &PathBuf,
+    left_path_id: u32,
+    right_provider: Provider,
+    right_root: &PathBuf,
+    right_path_id: u32,
+) -> std::cmp::Ordering {
+    integration_provider_rank(left_provider)
+        .cmp(&integration_provider_rank(right_provider))
+        .then_with(|| left_root.cmp(right_root))
+        .then_with(|| left_path_id.cmp(&right_path_id))
+}
+
+fn cursor_for_work(work: &AdapterWorkItem, phase: ResumePhase) -> ResumeCursor {
+    ResumeCursor {
+        provider: work.provider,
+        root: work.root.clone(),
+        path_id: work.file.path_id,
+        phase,
+    }
+}
+
+fn resume_start(work: &[AdapterWorkItem], cursor: Option<&ResumeCursor>) -> (usize, ResumePhase) {
+    let Some(cursor) = cursor else {
+        return (0, ResumePhase::Bootstrap);
+    };
+    if let Some(index) = work.iter().position(|item| {
+        compare_adapter_key(
+            item.provider,
+            &item.root,
+            item.file.path_id,
+            cursor.provider,
+            &cursor.root,
+            cursor.path_id,
+        ) == std::cmp::Ordering::Equal
+    }) {
+        return (index, cursor.phase);
+    }
+    let index = work
+        .iter()
+        .position(|item| {
+            compare_adapter_key(
+                item.provider,
+                &item.root,
+                item.file.path_id,
+                cursor.provider,
+                &cursor.root,
+                cursor.path_id,
+            ) == std::cmp::Ordering::Greater
+        })
+        .unwrap_or(0);
+    (index, ResumePhase::Bootstrap)
+}
+
+#[derive(Debug)]
 struct AdapterProviderWorker {
     roots: HashMap<(Provider, PathBuf), AdapterRootState>,
+    interner: PathInterner,
+    /// Highest generation observed per absolute path. Tombstones live for the whole run.
+    generations: HashMap<PathBuf, u64>,
     deferred: VecDeque<ProviderEvent>,
+    standard_roots: Vec<DiscoveryRoot>,
+    baselines_initialized: bool,
+    diagnostics: crate::provider::ProviderDiagnostics,
+    resume_cursor: Option<ResumeCursor>,
+}
+
+impl AdapterProviderWorker {
+    fn new(
+        standard_roots: Vec<DiscoveryRoot>,
+        diagnostics: crate::provider::ProviderDiagnostics,
+    ) -> Self {
+        Self {
+            roots: HashMap::new(),
+            interner: PathInterner::default(),
+            generations: HashMap::new(),
+            deferred: VecDeque::new(),
+            standard_roots,
+            baselines_initialized: false,
+            diagnostics,
+            resume_cursor: None,
+        }
+    }
+
+    fn initialize_standard_baselines(&mut self) -> io::Result<()> {
+        if self.baselines_initialized {
+            return Ok(());
+        }
+        for root in &self.standard_roots {
+            self.roots
+                .entry((root.provider, root.path.clone()))
+                .or_insert(AdapterRootState::new(root.provider, root.path.clone())?);
+        }
+        self.baselines_initialized = true;
+        Ok(())
+    }
+
+    fn is_standard_root(&self, provider: Provider, root: &Path) -> bool {
+        self.standard_roots
+            .iter()
+            .any(|standard| standard.provider == provider && standard.path == root)
+    }
+
+    #[cfg(test)]
+    fn next_open_generation(&mut self, path: &Path) -> u64 {
+        let generation = self
+            .generations
+            .get(path)
+            .map_or(0, |generation| generation.saturating_add(1));
+        self.generations.insert(path.to_path_buf(), generation);
+        generation
+    }
+
+    #[cfg(test)]
+    fn observe_generation(&mut self, path: PathBuf, observed: u64) {
+        self.generations
+            .entry(path)
+            .and_modify(|generation| *generation = (*generation).max(observed))
+            .or_insert(observed);
+    }
+}
+
+impl Default for AdapterProviderWorker {
+    fn default() -> Self {
+        Self::new(Vec::new(), crate::provider::ProviderDiagnostics::default())
+    }
 }
 
 impl ProviderWorker for AdapterProviderWorker {
     fn process(&mut self, cycle: &mut ProviderCycle<'_>) -> io::Result<()> {
+        self.initialize_standard_baselines()?;
         if !drain_deferred_provider_events(&mut self.deferred, cycle.pending) {
             return Ok(());
         }
@@ -1038,10 +1204,15 @@ impl ProviderWorker for AdapterProviderWorker {
                 .cmp(&integration_provider_rank((right.0).0))
                 .then_with(|| (left.0).1.cmp(&(right.0).1))
         });
+        let mut work = Vec::new();
         for ((provider, root), targets) in roots {
+            let fallback_root = !self.is_standard_root(provider, &root);
             let state = match self.roots.entry((provider, root.clone())) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
+                    if fallback_root {
+                        self.diagnostics.record_fallback_baseline_approximation();
+                    }
                     entry.insert(AdapterRootState::new(provider, root.clone())?)
                 }
             };
@@ -1049,7 +1220,7 @@ impl ProviderWorker for AdapterProviderWorker {
                 cycle.request_watch(root.clone());
             }
             let mut parser = AdapterBootstrapParser::default();
-            state.discovery.scan(&mut parser)?;
+            state.discovery.scan(&mut parser, &mut self.interner)?;
             let files = state
                 .discovery
                 .files()
@@ -1075,77 +1246,126 @@ impl ProviderWorker for AdapterProviderWorker {
                 .iter()
                 .map(|file| file.path_id)
                 .collect::<HashSet<_>>();
-            state
-                .tails
-                .retain(|path_id, _| relevant_ids.contains(path_id));
+            state.tails.retain(|path_id, tail| {
+                if relevant_ids.contains(path_id) {
+                    true
+                } else {
+                    self.generations
+                        .entry(tail.absolute_path())
+                        .and_modify(|generation| *generation = (*generation).max(tail.generation()))
+                        .or_insert(tail.generation());
+                    false
+                }
+            });
             state
                 .bootstrap_emitted
                 .retain(|path_id| relevant_ids.contains(path_id));
+            work.extend(relevant.into_iter().map(|file| AdapterWorkItem {
+                provider,
+                root: root.clone(),
+                file,
+            }));
+        }
 
-            for file in relevant {
-                if let Some(parent) = file.root.join(&file.relative_path).parent()
-                    && parent.is_dir()
-                {
-                    cycle.request_watch(parent.to_path_buf());
-                }
-                if !state.tails.contains_key(&file.path_id) {
-                    let mut boundary = FsReadBoundary;
-                    let tail = TailFile::open(
-                        &file.root,
-                        &file.relative_path,
-                        state.discovery.baseline(),
-                        &mut boundary,
-                    )?;
-                    state.tails.insert(file.path_id, tail);
-                }
-                let tail = state
-                    .tails
-                    .get_mut(&file.path_id)
-                    .expect("tail inserted for relevant file");
-                if state.bootstrap_emitted.insert(file.path_id) {
-                    let event =
-                        match provider {
-                            Provider::Codex => crate::provider::codex::CodexAdapter
-                                .bootstrap_event(&file, tail.generation(), unix_now_ms()),
-                            Provider::Claude => crate::provider::claude::ClaudeAdapter
-                                .bootstrap_event(&file, tail.generation(), unix_now_ms()),
-                        };
-                    if let Some(event) = event
-                        && !merge_adapter_events(
-                            std::iter::once(event),
-                            cycle.pending,
-                            &mut self.deferred,
-                        )
-                    {
-                        return Ok(());
-                    }
-                }
+        work.sort_by(|left, right| {
+            compare_adapter_key(
+                left.provider,
+                &left.root,
+                left.file.path_id,
+                right.provider,
+                &right.root,
+                right.file.path_id,
+            )
+        });
+        if work.is_empty() {
+            return Ok(());
+        }
+        let (start, first_phase) = resume_start(&work, self.resume_cursor.as_ref());
+        for (index, item) in work.iter().enumerate().skip(start) {
+            let phase = if index == start {
+                first_phase
+            } else {
+                ResumePhase::Bootstrap
+            };
+            let provider = item.provider;
+            let file = &item.file;
+            if let Some(parent) = file.root.join(&file.relative_path).parent()
+                && parent.is_dir()
+            {
+                cycle.request_watch(parent.to_path_buf());
+            }
+            let state = self
+                .roots
+                .get_mut(&(provider, item.root.clone()))
+                .expect("work root was scanned");
+            if !state.tails.contains_key(&file.path_id) {
                 let mut boundary = FsReadBoundary;
-                let generation = tail.generation();
-                let mut records = tail.poll(&mut boundary)?.into_iter();
-                while let Some(record) = records.next() {
-                    let events = parse_adapter_record(
-                        provider,
-                        &state.discovery,
-                        &file,
-                        generation,
-                        &record,
-                    );
-                    if !merge_adapter_events(events, cycle.pending, &mut self.deferred) {
-                        self.deferred.extend(records.flat_map(|record| {
-                            parse_adapter_record(
-                                provider,
-                                &state.discovery,
-                                &file,
-                                generation,
-                                &record,
-                            )
-                        }));
-                        return Ok(());
-                    }
+                let absolute = file.root.join(&file.relative_path);
+                let generation = self
+                    .generations
+                    .get(&absolute)
+                    .map_or(0, |generation| generation.saturating_add(1));
+                self.generations.insert(absolute, generation);
+                let tail = TailFile::open(
+                    &file.root,
+                    &file.relative_path,
+                    state.discovery.baseline(),
+                    generation,
+                    &mut boundary,
+                )?;
+                state.tails.insert(file.path_id, tail);
+            }
+            let tail = state
+                .tails
+                .get_mut(&file.path_id)
+                .expect("tail inserted for relevant file");
+            if phase == ResumePhase::Bootstrap && state.bootstrap_emitted.insert(file.path_id) {
+                let event = match provider {
+                    Provider::Codex => crate::provider::codex::CodexAdapter.bootstrap_event(
+                        file,
+                        tail.generation(),
+                        unix_now_ms(),
+                    ),
+                    Provider::Claude => crate::provider::claude::ClaudeAdapter.bootstrap_event(
+                        file,
+                        tail.generation(),
+                        unix_now_ms(),
+                    ),
+                };
+                if let Some(event) = event
+                    && !merge_adapter_events(
+                        std::iter::once(event),
+                        cycle.pending,
+                        &mut self.deferred,
+                    )
+                {
+                    self.resume_cursor = Some(cursor_for_work(item, ResumePhase::TailPoll));
+                    return Ok(());
+                }
+            }
+            let mut boundary = FsReadBoundary;
+            let mut records = tail.poll(&mut boundary)?.into_iter();
+            self.generations
+                .entry(file.root.join(&file.relative_path))
+                .and_modify(|generation| *generation = (*generation).max(tail.generation()))
+                .or_insert(tail.generation());
+            while let Some(record) = records.next() {
+                let events = parse_adapter_record(provider, &state.discovery, file, &record);
+                if !merge_adapter_events(events, cycle.pending, &mut self.deferred) {
+                    self.deferred.extend(records.flat_map(|record| {
+                        parse_adapter_record(provider, &state.discovery, file, &record)
+                    }));
+                    let next = if index + 1 < work.len() {
+                        &work[index + 1]
+                    } else {
+                        &work[0]
+                    };
+                    self.resume_cursor = Some(cursor_for_work(next, ResumePhase::Bootstrap));
+                    return Ok(());
                 }
             }
         }
+        self.resume_cursor = None;
         Ok(())
     }
 }
@@ -1154,15 +1374,14 @@ fn parse_adapter_record(
     provider: Provider,
     discovery: &DiscoveryIndex,
     file: &crate::provider::DiscoveredFile,
-    generation: u64,
     record: &crate::provider::TailRecord,
 ) -> Vec<ProviderEvent> {
     match provider {
         Provider::Codex => {
-            crate::provider::codex::CodexAdapter.parse_record(discovery, file, generation, record)
+            crate::provider::codex::CodexAdapter.parse_record(discovery, file, record)
         }
         Provider::Claude => {
-            crate::provider::claude::ClaudeAdapter.parse_record(discovery, file, generation, record)
+            crate::provider::claude::ClaudeAdapter.parse_record(discovery, file, record)
         }
     }
 }
@@ -3140,6 +3359,7 @@ fn unix_now_ms() -> i64 {
 
 #[cfg(test)]
 mod provider_integration_tests {
+    use std::collections::HashSet;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -3155,6 +3375,590 @@ mod provider_integration_tests {
     use crate::store::{
         NativeSessionBinding, PersistOp, PersistTaskRun, open_reader, open_writer, spawn_writer,
     };
+
+    async fn wait_for_provider_readiness(events: &mut mpsc::Receiver<ProviderEvent>) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut ready = HashSet::new();
+            while ready.len() < 2 {
+                if let Some(ProviderEvent::SourceState { provider, .. }) = events.recv().await {
+                    ready.insert(provider);
+                }
+            }
+        })
+        .await
+        .expect("provider readiness is bounded");
+    }
+
+    fn process_adapter_worker(
+        worker: &mut AdapterProviderWorker,
+        targets: &TargetSet,
+        pending: &mut PendingEvents,
+    ) {
+        let mut watch_requests = Vec::new();
+        let mut cycle = crate::provider::test_provider_cycle(targets, pending, &mut watch_requests);
+        worker.process(&mut cycle).unwrap();
+    }
+
+    fn drain_pending(pending: &mut PendingEvents) -> Vec<ProviderEvent> {
+        let (sender, mut receiver) = mpsc::channel(64);
+        pending.flush_to(&sender);
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn codex_records(owner: &str, agent: &str, event: &str) -> String {
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{owner}\",\"session_id\":\"{owner}\"}}}}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"sub_agent_activity\",\"event_id\":\"{event}\",\"occurred_at_ms\":1,\"agent_thread_id\":\"{agent}\",\"agent_path\":\"/root/{agent}\",\"kind\":\"interacted\"}}}}\n"
+        )
+    }
+
+    fn append_codex_activity(path: &Path, agent: &str, event: &str) {
+        use std::io::Write;
+
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .unwrap(),
+            "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"sub_agent_activity\",\"event_id\":\"{event}\",\"occurred_at_ms\":2,\"agent_thread_id\":\"{agent}\",\"agent_path\":\"/root/{agent}\",\"kind\":\"interacted\"}}}}"
+        )
+        .unwrap();
+    }
+
+    fn tail_read_calls(
+        worker: &AdapterProviderWorker,
+        root: &Path,
+        file_name: &str,
+    ) -> Option<u64> {
+        let state = worker.roots.get(&(Provider::Codex, root.to_path_buf()))?;
+        let path_id = state
+            .discovery
+            .files()
+            .into_iter()
+            .find(|file| file.relative_path == Path::new(file_name))?
+            .path_id;
+        state.tails.get(&path_id).map(TailFile::read_calls)
+    }
+
+    #[tokio::test]
+    async fn file_created_after_worker_readiness_before_first_target_starts_at_zero() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let (sender, mut events) = mpsc::channel(16);
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let thread = crate::provider::spawn_provider_thread_with_rescan_interval(
+            AdapterProviderWorker::new(
+                vec![DiscoveryRoot {
+                    provider: Provider::Codex,
+                    path: root.clone(),
+                }],
+                diagnostics,
+            ),
+            sender,
+            None,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        wait_for_provider_readiness(&mut events).await;
+
+        let path = root.join("created-after-ready.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"ready-owner\",\"session_id\":\"ready-owner\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"sub_agent_activity\",\"event_id\":\"after-ready-event\",\"occurred_at_ms\":1,\"agent_thread_id\":\"ready-owner\",\"agent_path\":\"/root\",\"kind\":\"interacted\"}}\n"
+            ),
+        )
+        .unwrap();
+        thread.update_targets(TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path,
+        }]));
+
+        let activity = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(event @ ProviderEvent::Activity { .. }) = events.recv().await {
+                    break event;
+                }
+            }
+        })
+        .await;
+        thread.stop().await.unwrap();
+
+        assert!(activity.is_ok(), "byte-zero activity was not emitted");
+    }
+
+    #[tokio::test]
+    async fn file_existing_before_worker_readiness_starts_at_eof() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("existing-before-ready.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"existing-owner\",\"session_id\":\"existing-owner\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"sub_agent_activity\",\"event_id\":\"existing-event\",\"occurred_at_ms\":1,\"agent_thread_id\":\"existing-owner\",\"agent_path\":\"/root\",\"kind\":\"interacted\"}}\n"
+            ),
+        )
+        .unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let (sender, mut events) = mpsc::channel(16);
+        let thread = crate::provider::spawn_provider_thread_with_rescan_interval(
+            AdapterProviderWorker::new(
+                vec![DiscoveryRoot {
+                    provider: Provider::Codex,
+                    path: root,
+                }],
+                diagnostics,
+            ),
+            sender,
+            None,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        wait_for_provider_readiness(&mut events).await;
+        thread.update_targets(TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path,
+        }]));
+
+        let activity = tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if let Some(event @ ProviderEvent::Activity { .. }) = events.recv().await {
+                    break event;
+                }
+            }
+        })
+        .await;
+        thread.stop().await.unwrap();
+
+        assert!(
+            activity.is_err(),
+            "pre-existing activity replayed from byte zero"
+        );
+    }
+
+    #[test]
+    fn foreign_root_uses_first_scan_approximation_and_counts_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let standard_root = directory.path().join("standard/.codex/sessions");
+        let fallback_root = directory.path().join("foreign/.codex/sessions");
+        std::fs::create_dir_all(&standard_root).unwrap();
+        std::fs::create_dir_all(&fallback_root).unwrap();
+        let path = fallback_root.join("fallback.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"fallback-owner\",\"session_id\":\"fallback-owner\"}}\n",
+        )
+        .unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: standard_root,
+            }],
+            diagnostics.clone(),
+        );
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path,
+        }]);
+        let mut pending = PendingEvents::new(diagnostics.clone());
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+
+        assert_eq!(diagnostics.fallback_baseline_approximations(), 1);
+    }
+
+    #[test]
+    fn delete_then_recreate_reopens_at_zero_with_a_new_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("fallback-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"recreate-owner\",\"session_id\":\"recreate-owner\"}}\n",
+        )
+        .unwrap();
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path: path.clone(),
+        }]);
+        let mut worker = AdapterProviderWorker::default();
+        let mut pending = PendingEvents::new(crate::provider::ProviderDiagnostics::default());
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let first_generation = worker
+            .roots
+            .get(&(Provider::Codex, root.clone()))
+            .unwrap()
+            .tails
+            .values()
+            .next()
+            .unwrap()
+            .generation();
+        let _ = drain_pending(&mut pending);
+
+        std::fs::remove_file(&path).unwrap();
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let _ = drain_pending(&mut pending);
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"recreate-owner\",\"session_id\":\"recreate-owner\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"sub_agent_activity\",\"event_id\":\"recreated-event\",\"occurred_at_ms\":2,\"agent_thread_id\":\"recreate-owner\",\"agent_path\":\"/root\",\"kind\":\"interacted\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let recreated_generation = worker
+            .roots
+            .get(&(Provider::Codex, root))
+            .unwrap()
+            .tails
+            .values()
+            .next()
+            .unwrap()
+            .generation();
+        let events = drain_pending(&mut pending);
+
+        assert!(recreated_generation > first_generation);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ProviderEvent::Activity {
+                    event_id,
+                    position: SourcePosition { offset, .. },
+                    ..
+                } if event_id == "prov:codex:act:recreated-event" && *offset > 0
+            )
+        }));
+    }
+
+    #[test]
+    fn overlapping_roots_share_one_path_id_and_generation_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let outer = directory.path().join("outer");
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let absolute = inner.join("shared.jsonl");
+        std::fs::write(&absolute, b"{}\n").unwrap();
+        let mut outer_state = AdapterRootState::new(Provider::Codex, outer).unwrap();
+        let mut inner_state = AdapterRootState::new(Provider::Codex, inner).unwrap();
+        let mut worker = AdapterProviderWorker::default();
+        let mut parser = AdapterBootstrapParser::default();
+
+        outer_state
+            .discovery
+            .scan(&mut parser, &mut worker.interner)
+            .unwrap();
+        inner_state
+            .discovery
+            .scan(&mut parser, &mut worker.interner)
+            .unwrap();
+        let outer_id = outer_state.discovery.files()[0].path_id;
+        let inner_id = inner_state.discovery.files()[0].path_id;
+        let first = worker.next_open_generation(&absolute);
+        worker.observe_generation(absolute.clone(), first + 4);
+        let reopened = worker.next_open_generation(&absolute);
+
+        assert_eq!(outer_id, inner_id);
+        assert_eq!(first, 0);
+        assert_eq!(reopened, 5);
+        assert_eq!(worker.generations.len(), 1);
+    }
+
+    #[test]
+    fn saturated_first_file_does_not_starve_second_file_tail_poll() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("standard/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let mut pending = PendingEvents::with_capacity(1, diagnostics);
+        process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
+        let _ = drain_pending(&mut pending);
+
+        let first = root.join("1-first.jsonl");
+        let second = root.join("2-second.jsonl");
+        std::fs::write(
+            &first,
+            codex_records("first-owner", "first-agent-0", "first-0"),
+        )
+        .unwrap();
+        std::fs::write(
+            &second,
+            codex_records("second-owner", "second-owner", "second-0"),
+        )
+        .unwrap();
+        let targets = TargetSet::new([
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: first.clone(),
+            },
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: second,
+            },
+        ]);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        for cycle in 1..=4 {
+            let _ = drain_pending(&mut pending);
+            append_codex_activity(
+                &first,
+                &format!("first-agent-{cycle}"),
+                &format!("first-{cycle}"),
+            );
+            process_adapter_worker(&mut worker, &targets, &mut pending);
+            if tail_read_calls(&worker, &root, "2-second.jsonl").is_some_and(|calls| calls > 0) {
+                break;
+            }
+        }
+
+        assert!(
+            tail_read_calls(&worker, &root, "2-second.jsonl").is_some_and(|calls| calls > 0),
+            "second file was not polled within the bounded cycle budget"
+        );
+    }
+
+    #[test]
+    fn vanished_cursor_key_resumes_at_next_greater_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("standard/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let mut pending = PendingEvents::with_capacity(1, diagnostics);
+        process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
+        let _ = drain_pending(&mut pending);
+
+        let first = root.join("1-first.jsonl");
+        let vanished = root.join("2-vanished.jsonl");
+        let third = root.join("3-third.jsonl");
+        std::fs::write(
+            &first,
+            codex_records("first-owner", "first-agent-0", "first-0"),
+        )
+        .unwrap();
+        std::fs::write(
+            &vanished,
+            codex_records("middle-owner", "middle-owner", "middle-0"),
+        )
+        .unwrap();
+        std::fs::write(
+            &third,
+            codex_records("third-owner", "third-owner", "third-0"),
+        )
+        .unwrap();
+        let targets = TargetSet::new([
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: first.clone(),
+            },
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: vanished.clone(),
+            },
+            ProviderTarget {
+                provider: Provider::Codex,
+                path: third,
+            },
+        ]);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let _ = drain_pending(&mut pending);
+        std::fs::remove_file(&vanished).unwrap();
+        append_codex_activity(&first, "first-agent-1", "first-1");
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+
+        assert!(
+            tail_read_calls(&worker, &root, "3-third.jsonl").is_some(),
+            "cursor disappearance restarted at the starving first file"
+        );
+    }
+
+    #[test]
+    fn bootstrap_saturation_resumes_same_file_at_tail_phase() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("standard/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let mut pending = PendingEvents::with_capacity(1, diagnostics);
+        process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
+        let _ = drain_pending(&mut pending);
+        let path = root.join("bootstrap.jsonl");
+        std::fs::write(
+            &path,
+            codex_records("bootstrap-owner", "bootstrap-owner", "bootstrap-activity"),
+        )
+        .unwrap();
+        pending.merge(ProviderEvent::Activity {
+            provider: Provider::Codex,
+            agent_thread_id: "capacity-blocker".to_owned(),
+            activity: MinimalProviderMetadata::default(),
+            depth: None,
+            event_id: "capacity-blocker-event".to_owned(),
+            observed_at_ms: 0,
+            position: SourcePosition {
+                path_id: u32::MAX,
+                generation: 0,
+                offset: 0,
+            },
+        });
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path,
+        }]);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        assert_eq!(tail_read_calls(&worker, &root, "bootstrap.jsonl"), Some(0));
+        assert!(matches!(
+            worker.resume_cursor,
+            Some(ResumeCursor {
+                phase: ResumePhase::TailPoll,
+                ..
+            })
+        ));
+
+        let _ = drain_pending(&mut pending);
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+
+        assert_eq!(tail_read_calls(&worker, &root, "bootstrap.jsonl"), Some(1));
+    }
+
+    #[test]
+    fn capacity_stops_tail_reads_and_deferred_memory_growth() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("standard/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let mut pending = PendingEvents::with_capacity(1, diagnostics);
+        process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
+        let _ = drain_pending(&mut pending);
+        let path = root.join("bounded.jsonl");
+        let mut contents = codex_records("bounded-owner", "bounded-agent-0", "bounded-0");
+        for index in 1..8 {
+            contents.push_str(&format!(
+                "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"sub_agent_activity\",\"event_id\":\"bounded-{index}\",\"occurred_at_ms\":1,\"agent_thread_id\":\"bounded-agent-{index}\",\"agent_path\":\"/root/bounded-agent-{index}\",\"kind\":\"interacted\"}}}}\n"
+            ));
+        }
+        std::fs::write(&path, contents).unwrap();
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path,
+        }]);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let read_calls = tail_read_calls(&worker, &root, "bounded.jsonl").unwrap();
+        let deferred_len = worker.deferred.len();
+        let cursor = worker.resume_cursor.clone();
+        assert!(deferred_len > 0);
+
+        for _ in 0..3 {
+            process_adapter_worker(&mut worker, &targets, &mut pending);
+        }
+
+        assert_eq!(
+            tail_read_calls(&worker, &root, "bounded.jsonl"),
+            Some(read_calls)
+        );
+        assert_eq!(worker.deferred.len(), deferred_len);
+        assert_eq!(worker.resume_cursor, cursor);
+        assert_eq!(pending.entity_count(), 1);
+    }
+
+    #[test]
+    fn oversized_record_emits_one_malformed_then_valid_activity_lands() {
+        use crate::provider::tail::{MAX_TAIL_CHUNK_BYTES, MAX_TAIL_RECORD_BYTES};
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("standard/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let mut pending = PendingEvents::new(diagnostics);
+        process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
+        let _ = drain_pending(&mut pending);
+        let path = root.join("oversized.jsonl");
+        let mut contents = vec![b'x'; MAX_TAIL_RECORD_BYTES + MAX_TAIL_CHUNK_BYTES + 1];
+        contents.extend_from_slice(
+            b"\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"sub_agent_activity\",\"event_id\":\"after-oversized\",\"occurred_at_ms\":3,\"agent_thread_id\":\"after-oversized-agent\",\"agent_path\":\"/root\",\"kind\":\"interacted\"}}\n",
+        );
+        std::fs::write(&path, contents).unwrap();
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path,
+        }]);
+        let mut events = Vec::new();
+
+        for _ in 0..8 {
+            process_adapter_worker(&mut worker, &targets, &mut pending);
+            events.extend(drain_pending(&mut pending));
+        }
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        ProviderEvent::Malformed {
+                            error_code: "record_too_long",
+                            ..
+                        }
+                    )
+                })
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ProviderEvent::Activity { event_id, .. }
+                    if event_id == "prov:codex:act:after-oversized"
+            )
+        }));
+    }
 
     #[test]
     fn not_applicable_provider_does_not_degrade_live_quality() {
@@ -3401,6 +4205,7 @@ mod provider_integration_tests {
                 event_kind: Some(kind.to_owned()),
                 ..MinimalProviderMetadata::default()
             },
+            depth: Some(0),
             event_id: "prov:codex:act:same".to_owned(),
             observed_at_ms: 200,
             position: SourcePosition {

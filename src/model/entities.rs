@@ -248,6 +248,12 @@ impl ProviderDiagnostics {
         self.handle.watch_cap_fallbacks()
     }
 
+    /// Non-standard roots whose run baseline was approximated at their first scan.
+    #[must_use]
+    pub fn fallback_baseline_approximations(&self) -> u64 {
+        self.handle.fallback_baseline_approximations()
+    }
+
     #[must_use]
     pub fn provider_cycles(&self) -> u64 {
         self.handle.provider_cycles()
@@ -275,6 +281,7 @@ pub struct ProviderDiagnosticsHandle {
     egress_closed: Arc<AtomicU64>,
     malformed_records: Arc<AtomicU64>,
     watch_cap_fallbacks: Arc<AtomicU64>,
+    fallback_baseline_approximations: Arc<AtomicU64>,
     provider_cycles: Arc<AtomicU64>,
     provider_io_errors: Arc<AtomicU64>,
 }
@@ -312,6 +319,11 @@ impl ProviderDiagnosticsHandle {
 
     pub fn record_watch_cap_fallback(&self) {
         Self::increment(&self.watch_cap_fallbacks);
+    }
+
+    /// Records capture-at-first-scan for a root that was not a spawn-resolved standard root.
+    pub fn record_fallback_baseline_approximation(&self) {
+        Self::increment(&self.fallback_baseline_approximations);
     }
 
     pub fn record_provider_cycle(&self) {
@@ -355,6 +367,12 @@ impl ProviderDiagnosticsHandle {
     #[must_use]
     pub fn watch_cap_fallbacks(&self) -> u64 {
         self.watch_cap_fallbacks.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn fallback_baseline_approximations(&self) -> u64 {
+        self.fallback_baseline_approximations
+            .load(Ordering::Relaxed)
     }
 
     #[must_use]
