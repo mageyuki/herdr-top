@@ -746,10 +746,13 @@ async fn retryable_on_unhealthy_writer() {
     assert!(
         running
             .writer
-            .apply(vec![herdr_top::store::PersistOp::UpsertTab(Tab {
-                tab_id: "orphan".to_owned(),
-                workspace_id: "missing".to_owned(),
-            })])
+            .apply(vec![herdr_top::store::PersistOp::UpsertTab {
+                tab: Tab {
+                    tab_id: "orphan".to_owned(),
+                    workspace_id: "missing".to_owned(),
+                },
+                display_ordinal: DisplayOrdinal::new(1),
+            }])
             .await
             .is_err()
     );
@@ -779,10 +782,13 @@ async fn conflict_vs_unhealthy_precedence() {
     assert!(
         running
             .writer
-            .apply(vec![herdr_top::store::PersistOp::UpsertTab(Tab {
-                tab_id: "orphan".to_owned(),
-                workspace_id: "missing".to_owned(),
-            })])
+            .apply(vec![herdr_top::store::PersistOp::UpsertTab {
+                tab: Tab {
+                    tab_id: "orphan".to_owned(),
+                    workspace_id: "missing".to_owned(),
+                },
+                display_ordinal: DisplayOrdinal::new(1),
+            }])
             .await
             .is_err()
     );
@@ -807,10 +813,13 @@ async fn response_precedence_full() {
     assert!(
         running
             .writer
-            .apply(vec![herdr_top::store::PersistOp::UpsertTab(Tab {
-                tab_id: "orphan".to_owned(),
-                workspace_id: "missing".to_owned(),
-            })])
+            .apply(vec![herdr_top::store::PersistOp::UpsertTab {
+                tab: Tab {
+                    tab_id: "orphan".to_owned(),
+                    workspace_id: "missing".to_owned(),
+                },
+                display_ordinal: DisplayOrdinal::new(1),
+            }])
             .await
             .is_err()
     );
@@ -1000,10 +1009,13 @@ async fn staged_discard_for_every_reject_and_retryable() {
     assert!(
         running
             .writer
-            .apply(vec![herdr_top::store::PersistOp::UpsertTab(Tab {
-                tab_id: "orphan".to_owned(),
-                workspace_id: "missing".to_owned(),
-            })])
+            .apply(vec![herdr_top::store::PersistOp::UpsertTab {
+                tab: Tab {
+                    tab_id: "orphan".to_owned(),
+                    workspace_id: "missing".to_owned(),
+                },
+                display_ordinal: DisplayOrdinal::new(1),
+            }])
             .await
             .is_err()
     );

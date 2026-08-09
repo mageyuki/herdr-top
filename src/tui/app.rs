@@ -119,39 +119,15 @@ pub(crate) struct AppState {
     selected_run_key: Option<RunKey>,
     follow: bool,
     selection_reason: Option<String>,
-    workspace_order: StableOrder,
-    tab_order: StableOrder,
-    pane_order: StableOrder,
     execution_order: StableOrder,
 }
 
 impl AppState {
     fn adopt_model(&mut self, model: &DomainModel) {
-        // Topology rows do not yet carry persisted ordinals. Identity is used only to
-        // deterministically adopt a first snapshot; the resulting local order is retained for
-        // this App's lifetime and is never recomputed during a refresh. Agent rows use their
-        // persisted model ordinals directly. Executions use the same observation order to choose
-        // a run's most recent known hosting pane.
-        self.workspace_order
-            .adopt(model.workspaces().map(|item| item.workspace_id.clone()));
-        self.tab_order
-            .adopt(model.tabs().map(|item| item.tab_id.clone()));
-        self.pane_order
-            .adopt(model.panes().map(|item| item.pane_id.clone()));
+        // Topology rows and semantic rows use persisted model ordinals. Executions are not rows;
+        // their in-session adoption order chooses a run's most recent known hosting pane.
         self.execution_order
             .adopt(model.executions().map(|item| item.execution_id.clone()));
-    }
-
-    pub(super) fn workspace_order(&self, id: &str) -> u64 {
-        self.workspace_order.get(id)
-    }
-
-    pub(super) fn tab_order(&self, id: &str) -> u64 {
-        self.tab_order.get(id)
-    }
-
-    pub(super) fn pane_order(&self, id: &str) -> u64 {
-        self.pane_order.get(id)
     }
 
     pub(super) fn execution_order(&self, id: &str) -> u64 {

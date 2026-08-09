@@ -230,6 +230,24 @@ async fn restore_across_cold_restart() {
         .executions()
         .map(|execution| execution.execution_id.clone())
         .collect();
+    let old_workspace_ordinal = before
+        .workspace_ordinal("w1")
+        .expect("workspace should have a display ordinal");
+    let old_tab_ordinal = before
+        .tab_ordinal("w1:t1")
+        .expect("tab should have a display ordinal");
+    let old_pane_ordinals: HashMap<String, i64> = before
+        .panes()
+        .map(|pane| {
+            (
+                pane.pane_id.clone(),
+                before
+                    .pane_ordinal(&pane.pane_id)
+                    .expect("pane should have a display ordinal")
+                    .get(),
+            )
+        })
+        .collect();
     let latched_run = run_for_sid(&before, Provider::Codex, "latched-sid");
     let retired_run = run_for_sid(&before, Provider::Claude, "retired-sid");
     assert_eq!(old_ordinals.len(), 2);
@@ -252,6 +270,24 @@ async fn restore_across_cold_restart() {
         restored_after_a.model.task_runs().count(),
         old_ordinals.len()
     );
+    assert_eq!(
+        restored_after_a.model.workspace_ordinal("w1"),
+        Some(old_workspace_ordinal)
+    );
+    assert_eq!(
+        restored_after_a.model.tab_ordinal("w1:t1"),
+        Some(old_tab_ordinal)
+    );
+    for (pane_id, ordinal) in &old_pane_ordinals {
+        assert_eq!(
+            restored_after_a
+                .model
+                .pane_ordinal(pane_id)
+                .map(herdr_top::model::DisplayOrdinal::get),
+            Some(*ordinal),
+            "pane {pane_id} should keep its ordinal across restart"
+        );
+    }
     let owner_a = reader_a
         .read_owner()
         .expect("first owner should read")

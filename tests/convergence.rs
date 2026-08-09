@@ -589,11 +589,12 @@ async fn snapshot_maps_to_topology() {
 async fn writer_barrier_orders_assertions() {
     let (_directory, root, lifecycle, writer) = test_writer();
     writer
-        .apply(vec![PersistOp::UpsertWorkspace(
-            herdr_top::model::Workspace {
+        .apply(vec![PersistOp::UpsertWorkspace {
+            workspace: herdr_top::model::Workspace {
                 workspace_id: "barrier-workspace".to_owned(),
             },
-        )])
+            display_ordinal: DisplayOrdinal::new(1),
+        }])
         .await
         .expect("write should commit");
     writer.barrier().await.expect("barrier should acknowledge");
@@ -1569,34 +1570,29 @@ async fn topology_closure_cascades_and_persists() {
 
 #[tokio::test]
 async fn gap_replacement_prunes_absent_topology_on_restore() {
-    let mut old_model = DomainModel::default();
-    old_model.insert_workspace(Workspace {
-        workspace_id: "old-workspace".to_owned(),
-    });
-    old_model.insert_tab(Tab {
-        tab_id: "old-tab".to_owned(),
-        workspace_id: "old-workspace".to_owned(),
-    });
-    old_model.insert_pane(Pane {
-        pane_id: "old-pane".to_owned(),
-        workspace_id: "old-workspace".to_owned(),
-        tab_id: "old-tab".to_owned(),
-        terminal_id: "old-terminal".to_owned(),
-    });
     let seed = vec![
-        PersistOp::UpsertWorkspace(Workspace {
-            workspace_id: "old-workspace".to_owned(),
-        }),
-        PersistOp::UpsertTab(Tab {
-            tab_id: "old-tab".to_owned(),
-            workspace_id: "old-workspace".to_owned(),
-        }),
-        PersistOp::UpsertPane(Pane {
-            pane_id: "old-pane".to_owned(),
-            workspace_id: "old-workspace".to_owned(),
-            tab_id: "old-tab".to_owned(),
-            terminal_id: "old-terminal".to_owned(),
-        }),
+        PersistOp::UpsertWorkspace {
+            workspace: Workspace {
+                workspace_id: "old-workspace".to_owned(),
+            },
+            display_ordinal: DisplayOrdinal::new(1),
+        },
+        PersistOp::UpsertTab {
+            tab: Tab {
+                tab_id: "old-tab".to_owned(),
+                workspace_id: "old-workspace".to_owned(),
+            },
+            display_ordinal: DisplayOrdinal::new(2),
+        },
+        PersistOp::UpsertPane {
+            pane: Pane {
+                pane_id: "old-pane".to_owned(),
+                workspace_id: "old-workspace".to_owned(),
+                tab_id: "old-tab".to_owned(),
+                terminal_id: "old-terminal".to_owned(),
+            },
+            display_ordinal: DisplayOrdinal::new(3),
+        },
     ];
     let mock = MockHerdr::start(
         MockConfig::default().respond("session.snapshot", snapshot_result(p1_snapshot())),
@@ -1604,15 +1600,11 @@ async fn gap_replacement_prunes_absent_topology_on_restore() {
     .await
     .expect("mock server should bind");
     let (_directory, root, lifecycle, writer) = test_writer_seeded(seed);
+    let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
     let mut handle = collector::spawn(
         mock.socket_path().to_path_buf(),
         test_session(),
-        RestoredState {
-            model: old_model,
-            next_ordinal: 1,
-            next_ingest_seq: Some(1),
-            event_ledger: Vec::new(),
-        },
+        restored,
         writer,
     )
     .await
@@ -1625,6 +1617,17 @@ async fn gap_replacement_prunes_absent_topology_on_restore() {
     assert!(restored.model.tab("old-tab").is_none());
     assert!(restored.model.pane("old-pane").is_none());
     assert!(restored.model.workspace("w1").is_some());
+    let connection = Connection::open(database_path(&root)).unwrap();
+    let orphaned_old_ordinals: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM display_ordinals \
+             WHERE entity_kind IN ('workspace', 'tab', 'pane') \
+               AND entity_id IN ('old-workspace', 'old-tab', 'old-pane')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(orphaned_old_ordinals, 0);
 }
 
 #[tokio::test]

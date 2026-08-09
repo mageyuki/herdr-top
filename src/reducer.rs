@@ -444,7 +444,7 @@ impl Reducer {
             persist.push(persist_execution(execution, now_ms));
         }
 
-        self.replace_topology(&topology, &mut persist);
+        self.replace_topology(&topology, &mut persist)?;
 
         for pane in topology.panes {
             let Some(agent) = pane.agent else {
@@ -750,16 +750,29 @@ impl Reducer {
             NormalizedEvent::ControllerEvent { .. } => {}
             NormalizedEvent::TopologyUpsert { entity, .. } => match entity {
                 TopologyEntity::Workspace(workspace) => {
+                    let display_ordinal =
+                        self.workspace_ordinal_or_allocate(&workspace.workspace_id)?;
                     self.model.insert_workspace(workspace.clone());
-                    persist.push(PersistOp::UpsertWorkspace(workspace.clone()));
+                    persist.push(PersistOp::UpsertWorkspace {
+                        workspace: workspace.clone(),
+                        display_ordinal,
+                    });
                 }
                 TopologyEntity::Tab(tab) => {
+                    let display_ordinal = self.tab_ordinal_or_allocate(&tab.tab_id)?;
                     self.model.insert_tab(tab.clone());
-                    persist.push(PersistOp::UpsertTab(tab.clone()));
+                    persist.push(PersistOp::UpsertTab {
+                        tab: tab.clone(),
+                        display_ordinal,
+                    });
                 }
                 TopologyEntity::Pane(pane) => {
+                    let display_ordinal = self.pane_ordinal_or_allocate(&pane.pane_id)?;
                     self.model.insert_pane(pane.clone());
-                    persist.push(PersistOp::UpsertPane(pane.clone()));
+                    persist.push(PersistOp::UpsertPane {
+                        pane: pane.clone(),
+                        display_ordinal,
+                    });
                 }
             },
             NormalizedEvent::TopologyClosure { entity, .. } => {
@@ -995,6 +1008,7 @@ impl Reducer {
                     self.close_tab(&tab_id, timestamp_ms, persist);
                 }
                 if self.model.remove_workspace(workspace_id).is_some() {
+                    self.model.remove_workspace_ordinal(workspace_id);
                     persist.push(PersistOp::DeleteWorkspace {
                         workspace_id: workspace_id.clone(),
                     });
@@ -1020,6 +1034,7 @@ impl Reducer {
             self.close_pane(&pane_id, timestamp_ms, persist);
         }
         if self.model.remove_tab(tab_id).is_some() {
+            self.model.remove_tab_ordinal(tab_id);
             persist.push(PersistOp::DeleteTab {
                 tab_id: tab_id.to_owned(),
             });
@@ -1037,6 +1052,7 @@ impl Reducer {
             self.end_execution(&execution_id, timestamp_ms, persist);
         }
         if self.model.remove_pane(pane_id).is_some() {
+            self.model.remove_pane_ordinal(pane_id);
             persist.push(PersistOp::DeletePane {
                 pane_id: pane_id.to_owned(),
             });
@@ -1255,7 +1271,34 @@ impl Reducer {
         &mut self,
         topology: &crate::model::TopologySnapshot,
         persist: &mut PersistBatch,
-    ) {
+    ) -> Result<(), ReducerError> {
+        let retained_workspace_ordinals = topology
+            .workspaces
+            .iter()
+            .filter_map(|workspace| {
+                self.model
+                    .workspace_ordinal(&workspace.workspace_id)
+                    .map(|ordinal| (workspace.workspace_id.clone(), ordinal))
+            })
+            .collect::<Vec<_>>();
+        let retained_tab_ordinals = topology
+            .tabs
+            .iter()
+            .filter_map(|tab| {
+                self.model
+                    .tab_ordinal(&tab.tab_id)
+                    .map(|ordinal| (tab.tab_id.clone(), ordinal))
+            })
+            .collect::<Vec<_>>();
+        let retained_pane_ordinals = topology
+            .panes
+            .iter()
+            .filter_map(|pane| {
+                self.model
+                    .pane_ordinal(&pane.pane_id)
+                    .map(|ordinal| (pane.pane_id.clone(), ordinal))
+            })
+            .collect::<Vec<_>>();
         let workspace_ids: Vec<_> = self
             .model
             .workspaces()
@@ -1272,22 +1315,42 @@ impl Reducer {
         }
         for tab_id in tab_ids {
             if self.model.remove_tab(&tab_id).is_some() {
+                self.model.remove_tab_ordinal(&tab_id);
                 persist.push(PersistOp::DeleteTab { tab_id });
             }
         }
         for workspace_id in workspace_ids {
             if self.model.remove_workspace(&workspace_id).is_some() {
+                self.model.remove_workspace_ordinal(&workspace_id);
                 persist.push(PersistOp::DeleteWorkspace { workspace_id });
             }
         }
 
+        for (workspace_id, ordinal) in retained_workspace_ordinals {
+            self.model.set_workspace_ordinal(workspace_id, ordinal);
+        }
+        for (tab_id, ordinal) in retained_tab_ordinals {
+            self.model.set_tab_ordinal(tab_id, ordinal);
+        }
+        for (pane_id, ordinal) in retained_pane_ordinals {
+            self.model.set_pane_ordinal(pane_id, ordinal);
+        }
+
         for workspace in &topology.workspaces {
+            let display_ordinal = self.workspace_ordinal_or_allocate(&workspace.workspace_id)?;
             self.model.insert_workspace(workspace.clone());
-            persist.push(PersistOp::UpsertWorkspace(workspace.clone()));
+            persist.push(PersistOp::UpsertWorkspace {
+                workspace: workspace.clone(),
+                display_ordinal,
+            });
         }
         for tab in &topology.tabs {
+            let display_ordinal = self.tab_ordinal_or_allocate(&tab.tab_id)?;
             self.model.insert_tab(tab.clone());
-            persist.push(PersistOp::UpsertTab(tab.clone()));
+            persist.push(PersistOp::UpsertTab {
+                tab: tab.clone(),
+                display_ordinal,
+            });
         }
         for pane in &topology.panes {
             let pane = Pane {
@@ -1296,9 +1359,14 @@ impl Reducer {
                 tab_id: pane.tab_id.clone(),
                 terminal_id: pane.terminal_id.clone(),
             };
+            let display_ordinal = self.pane_ordinal_or_allocate(&pane.pane_id)?;
             self.model.insert_pane(pane.clone());
-            persist.push(PersistOp::UpsertPane(pane));
+            persist.push(PersistOp::UpsertPane {
+                pane,
+                display_ordinal,
+            });
         }
+        Ok(())
     }
 
     fn insert_snapshot_run(
@@ -1377,6 +1445,37 @@ impl Reducer {
             .next_ordinal
             .checked_add(1)
             .ok_or(ReducerError::OrdinalExhausted)?;
+        Ok(ordinal)
+    }
+
+    fn workspace_ordinal_or_allocate(
+        &mut self,
+        workspace_id: &str,
+    ) -> Result<DisplayOrdinal, ReducerError> {
+        if let Some(ordinal) = self.model.workspace_ordinal(workspace_id) {
+            return Ok(ordinal);
+        }
+        let ordinal = self.allocate_ordinal()?;
+        self.model
+            .set_workspace_ordinal(workspace_id.to_owned(), ordinal);
+        Ok(ordinal)
+    }
+
+    fn tab_ordinal_or_allocate(&mut self, tab_id: &str) -> Result<DisplayOrdinal, ReducerError> {
+        if let Some(ordinal) = self.model.tab_ordinal(tab_id) {
+            return Ok(ordinal);
+        }
+        let ordinal = self.allocate_ordinal()?;
+        self.model.set_tab_ordinal(tab_id.to_owned(), ordinal);
+        Ok(ordinal)
+    }
+
+    fn pane_ordinal_or_allocate(&mut self, pane_id: &str) -> Result<DisplayOrdinal, ReducerError> {
+        if let Some(ordinal) = self.model.pane_ordinal(pane_id) {
+            return Ok(ordinal);
+        }
+        let ordinal = self.allocate_ordinal()?;
+        self.model.set_pane_ordinal(pane_id.to_owned(), ordinal);
         Ok(ordinal)
     }
 
@@ -1768,8 +1867,9 @@ mod tests {
         AgentNode, AgentNodeObservation, AgentSessionReference, AgentSessionReferenceKind,
         ControllerEvent, ControllerEventKind, DependencyEdge, DisplayOrdinal, DomainModel,
         EventMetadata, ExecState, Execution, ExecutionEdge, GapKind, MinimalProviderMetadata,
-        NormalizedEvent, PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SharedModel,
-        SnapshotAgent, TaskRun, TaskState, TopologyEntity, TopologySnapshot, Workspace,
+        NormalizedEvent, Pane, PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SharedModel,
+        SnapshotAgent, Tab, TaskRun, TaskState, TopologyEntity, TopologyEntityId, TopologySnapshot,
+        Workspace,
     };
     use crate::store::{
         PersistOp, RestoredState, WriterClient, database_path, open_reader, open_writer,
@@ -2229,6 +2329,280 @@ mod tests {
         }
     }
 
+    fn topology_entity_event(event_id: &str, entity: TopologyEntity) -> NormalizedEvent {
+        NormalizedEvent::TopologyUpsert {
+            metadata: metadata(event_id, 1_000),
+            entity,
+        }
+    }
+
+    fn topology_snapshot(
+        workspaces: &[&str],
+        tabs: &[(&str, &str)],
+        panes: &[(&str, &str, &str)],
+    ) -> TopologySnapshot {
+        TopologySnapshot {
+            workspaces: workspaces
+                .iter()
+                .map(|workspace_id| Workspace {
+                    workspace_id: (*workspace_id).to_owned(),
+                })
+                .collect(),
+            tabs: tabs
+                .iter()
+                .map(|(tab_id, workspace_id)| Tab {
+                    tab_id: (*tab_id).to_owned(),
+                    workspace_id: (*workspace_id).to_owned(),
+                })
+                .collect(),
+            panes: panes
+                .iter()
+                .map(|(pane_id, workspace_id, tab_id)| PaneSnapshot {
+                    pane_id: (*pane_id).to_owned(),
+                    workspace_id: (*workspace_id).to_owned(),
+                    tab_id: (*tab_id).to_owned(),
+                    terminal_id: format!("terminal-{pane_id}"),
+                    agent: None,
+                    agent_session: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn topology_upsert_allocates_once_and_failed_batch_rolls_allocator_back() {
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 40));
+
+        let outcome = reducer
+            .apply(topology_entity_event(
+                "workspace-first",
+                TopologyEntity::Workspace(Workspace {
+                    workspace_id: "workspace".to_owned(),
+                }),
+            ))
+            .unwrap();
+        let ApplyOutcome::Applied(batch) = outcome else {
+            panic!("topology upsert should apply");
+        };
+        assert!(batch.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertWorkspace {
+                workspace,
+                display_ordinal,
+            } if workspace.workspace_id == "workspace"
+                && *display_ordinal == DisplayOrdinal::new(40)
+        )));
+        assert_eq!(
+            shared.borrow().workspace_ordinal("workspace"),
+            Some(DisplayOrdinal::new(40))
+        );
+
+        reducer
+            .apply(topology_entity_event(
+                "workspace-refresh",
+                TopologyEntity::Workspace(Workspace {
+                    workspace_id: "workspace".to_owned(),
+                }),
+            ))
+            .unwrap();
+        assert_eq!(
+            shared.borrow().workspace_ordinal("workspace"),
+            Some(DisplayOrdinal::new(40))
+        );
+
+        let (mut exhausting, exhausting_shared) =
+            Reducer::new(restored(DomainModel::default(), i64::MAX - 1));
+        let rejected = exhausting.apply_observation(vec![
+            topology_entity_event(
+                "rolled-back-first",
+                TopologyEntity::Workspace(Workspace {
+                    workspace_id: "rolled-back-first".to_owned(),
+                }),
+            ),
+            topology_entity_event(
+                "rolled-back-second",
+                TopologyEntity::Workspace(Workspace {
+                    workspace_id: "rolled-back-second".to_owned(),
+                }),
+            ),
+        ]);
+        assert_eq!(rejected, Err(ReducerError::OrdinalExhausted));
+        assert!(exhausting_shared.borrow().workspaces().next().is_none());
+
+        exhausting
+            .apply(topology_entity_event(
+                "after-rollback",
+                TopologyEntity::Workspace(Workspace {
+                    workspace_id: "after-rollback".to_owned(),
+                }),
+            ))
+            .unwrap();
+        assert_eq!(
+            exhausting_shared
+                .borrow()
+                .workspace_ordinal("after-rollback"),
+            Some(DisplayOrdinal::new(i64::MAX - 1))
+        );
+    }
+
+    #[test]
+    fn snapshot_replacement_retains_survivors_drops_absent_and_closure_reallocates() {
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 10));
+        for (event_id, entity) in [
+            (
+                "workspace-keep",
+                TopologyEntity::Workspace(Workspace {
+                    workspace_id: "workspace-keep".to_owned(),
+                }),
+            ),
+            (
+                "workspace-drop",
+                TopologyEntity::Workspace(Workspace {
+                    workspace_id: "workspace-drop".to_owned(),
+                }),
+            ),
+            (
+                "tab-keep",
+                TopologyEntity::Tab(Tab {
+                    tab_id: "tab-keep".to_owned(),
+                    workspace_id: "workspace-keep".to_owned(),
+                }),
+            ),
+            (
+                "pane-keep",
+                TopologyEntity::Pane(Pane {
+                    pane_id: "pane-keep".to_owned(),
+                    workspace_id: "workspace-keep".to_owned(),
+                    tab_id: "tab-keep".to_owned(),
+                    terminal_id: "terminal-keep".to_owned(),
+                }),
+            ),
+        ] {
+            reducer
+                .apply(topology_entity_event(event_id, entity))
+                .unwrap();
+        }
+        let before = shared.borrow();
+        let workspace_ordinal = before.workspace_ordinal("workspace-keep").unwrap();
+        let tab_ordinal = before.tab_ordinal("tab-keep").unwrap();
+        let pane_ordinal = before.pane_ordinal("pane-keep").unwrap();
+        drop(before);
+
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: topology_snapshot(
+                    &["workspace-keep"],
+                    &[("tab-keep", "workspace-keep")],
+                    &[("pane-keep", "workspace-keep", "tab-keep")],
+                ),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        assert_eq!(
+            shared.borrow().workspace_ordinal("workspace-keep"),
+            Some(workspace_ordinal)
+        );
+        assert_eq!(shared.borrow().tab_ordinal("tab-keep"), Some(tab_ordinal));
+        assert_eq!(
+            shared.borrow().pane_ordinal("pane-keep"),
+            Some(pane_ordinal)
+        );
+        assert_eq!(shared.borrow().workspace_ordinal("workspace-drop"), None);
+
+        reducer
+            .apply(NormalizedEvent::TopologyClosure {
+                metadata: metadata("pane-closed", 2_000),
+                entity: TopologyEntityId::Pane {
+                    pane_id: "pane-keep".to_owned(),
+                },
+            })
+            .unwrap();
+        assert_eq!(shared.borrow().pane_ordinal("pane-keep"), None);
+
+        reducer
+            .apply(topology_entity_event(
+                "pane-reobserved",
+                TopologyEntity::Pane(Pane {
+                    pane_id: "pane-keep".to_owned(),
+                    workspace_id: "workspace-keep".to_owned(),
+                    tab_id: "tab-keep".to_owned(),
+                    terminal_id: "terminal-keep".to_owned(),
+                }),
+            ))
+            .unwrap();
+        assert!(shared.borrow().pane_ordinal("pane-keep").unwrap() > pane_ordinal);
+    }
+
+    #[test]
+    fn gap_replacement_delete_reinsert_round_trips_topology_ordinals() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let restored_state = store.load_restored_state().unwrap();
+        let (mut reducer, shared) = Reducer::new(restored_state);
+
+        for (event_id, entity) in [
+            (
+                "round-trip-workspace",
+                TopologyEntity::Workspace(Workspace {
+                    workspace_id: "workspace".to_owned(),
+                }),
+            ),
+            (
+                "round-trip-tab",
+                TopologyEntity::Tab(Tab {
+                    tab_id: "tab".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                }),
+            ),
+            (
+                "round-trip-pane",
+                TopologyEntity::Pane(Pane {
+                    pane_id: "pane".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    tab_id: "tab".to_owned(),
+                    terminal_id: "terminal".to_owned(),
+                }),
+            ),
+        ] {
+            let ApplyOutcome::Applied(batch) = reducer
+                .apply(topology_entity_event(event_id, entity))
+                .unwrap()
+            else {
+                panic!("topology event should apply");
+            };
+            store.apply_batch(batch).unwrap();
+        }
+        let before = shared.borrow();
+        let expected = (
+            before.workspace_ordinal("workspace").unwrap(),
+            before.tab_ordinal("tab").unwrap(),
+            before.pane_ordinal("pane").unwrap(),
+        );
+        drop(before);
+
+        let batch = reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: topology_snapshot(
+                    &["workspace"],
+                    &[("tab", "workspace")],
+                    &[("pane", "workspace", "tab")],
+                ),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        store.apply_batch(batch).unwrap();
+        drop(store);
+
+        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+        assert_eq!(
+            restored.model.workspace_ordinal("workspace"),
+            Some(expected.0)
+        );
+        assert_eq!(restored.model.tab_ordinal("tab"), Some(expected.1));
+        assert_eq!(restored.model.pane_ordinal("pane"), Some(expected.2));
+    }
+
     fn native_snapshot(sid: &str) -> TopologySnapshot {
         TopologySnapshot {
             workspaces: vec![Workspace {
@@ -2543,7 +2917,7 @@ mod tests {
         );
         assert_eq!(
             shared.borrow().task_run(&second).unwrap().display_ordinal,
-            DisplayOrdinal::new(43)
+            DisplayOrdinal::new(44)
         );
     }
 
@@ -2925,10 +3299,13 @@ mod tests {
         let (lifecycle, writer) = spawn_writer(store).unwrap();
         assert!(
             writer
-                .apply(vec![PersistOp::UpsertTab(crate::model::Tab {
-                    tab_id: "orphan-tab".to_owned(),
-                    workspace_id: "missing-workspace".to_owned(),
-                })])
+                .apply(vec![PersistOp::UpsertTab {
+                    tab: crate::model::Tab {
+                        tab_id: "orphan-tab".to_owned(),
+                        workspace_id: "missing-workspace".to_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(1),
+                }])
                 .await
                 .is_err()
         );

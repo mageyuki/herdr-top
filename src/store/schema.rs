@@ -1,4 +1,4 @@
-//! SQLite schema v3, read-only preflight, online backup, and migration support.
+//! SQLite schema v4, read-only preflight, online backup, and migration support.
 
 use std::fs::{self, OpenOptions, Permissions};
 use std::io;
@@ -12,7 +12,7 @@ use rusqlite::{Connection, MAIN_DB, OpenFlags};
 use super::StoreError;
 use crate::lockfile::StateRoot;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 4;
 pub(super) const DATABASE_FILE: &str = "herdr-top.sqlite3";
 const FILE_MODE: u32 = 0o600;
 
@@ -169,12 +169,20 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), St
             "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (3, ?1)",
             [now_ms],
         )?;
+        version = 3;
+    }
+    if version < 4 {
+        transaction.execute_batch(SCHEMA_V4)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (4, ?1)",
+            [now_ms],
+        )?;
     }
     transaction.commit()?;
     Ok(())
 }
 
-const SCHEMA_V2: &str = r#"
+pub(super) const SCHEMA_V2: &str = r#"
 ALTER TABLE events ADD COLUMN ingest_seq INTEGER NULL;
 
 CREATE TABLE meta (
@@ -184,7 +192,7 @@ CREATE TABLE meta (
 INSERT INTO meta(key, value) VALUES ('ingest_seq_high_water', 0);
 "#;
 
-const SCHEMA_V3: &str = r#"
+pub(super) const SCHEMA_V3: &str = r#"
 ALTER TABLE agent_nodes ADD COLUMN parent_agent_node_id TEXT;
 ALTER TABLE agent_nodes ADD COLUMN state TEXT CHECK (state IS NULL OR state = 'working');
 ALTER TABLE agent_nodes ADD COLUMN model_id TEXT;
@@ -214,6 +222,44 @@ FROM (
 ALTER TABLE events ADD COLUMN provider_agent_id TEXT;
 ALTER TABLE events ADD COLUMN provider_parent_agent_id TEXT;
 ALTER TABLE events ADD COLUMN source_coverage TEXT;
+"#;
+
+const SCHEMA_V4: &str = r#"
+INSERT INTO display_ordinals(entity_kind, entity_id, ordinal)
+SELECT
+    'workspace',
+    ordered.workspace_id,
+    (SELECT COALESCE(MAX(ordinal), 0) FROM display_ordinals) + ordered.row_number
+FROM (
+    SELECT
+        workspace_id,
+        ROW_NUMBER() OVER (ORDER BY workspace_id) AS row_number
+    FROM workspaces
+) AS ordered;
+
+INSERT INTO display_ordinals(entity_kind, entity_id, ordinal)
+SELECT
+    'tab',
+    ordered.tab_id,
+    (SELECT COALESCE(MAX(ordinal), 0) FROM display_ordinals) + ordered.row_number
+FROM (
+    SELECT
+        tab_id,
+        ROW_NUMBER() OVER (ORDER BY workspace_id, tab_id) AS row_number
+    FROM tabs
+) AS ordered;
+
+INSERT INTO display_ordinals(entity_kind, entity_id, ordinal)
+SELECT
+    'pane',
+    ordered.pane_id,
+    (SELECT COALESCE(MAX(ordinal), 0) FROM display_ordinals) + ordered.row_number
+FROM (
+    SELECT
+        pane_id,
+        ROW_NUMBER() OVER (ORDER BY workspace_id, tab_id, pane_id) AS row_number
+    FROM panes
+) AS ordered;
 "#;
 
 pub(super) const SCHEMA_V1: &str = r#"

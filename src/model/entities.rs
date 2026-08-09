@@ -470,6 +470,7 @@ pub struct DomainModel {
     workspaces: HashMap<String, Workspace>,
     tabs: HashMap<String, Tab>,
     panes: HashMap<String, Pane>,
+    topology_ordinals: HashMap<(TopologyKind, String), DisplayOrdinal>,
     task_runs: HashMap<RunId, TaskRun>,
     run_ids_by_key: HashMap<RunKey, RunId>,
     executions: HashMap<String, Execution>,
@@ -478,6 +479,13 @@ pub struct DomainModel {
     dependency_edges: HashSet<DependencyEdge>,
     controller_diagnostics: ControllerDiagnostics,
     provider_diagnostics: ProviderDiagnostics,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum TopologyKind {
+    Workspace,
+    Tab,
+    Pane,
 }
 
 impl DomainModel {
@@ -511,6 +519,27 @@ impl DomainModel {
         self.workspaces.values()
     }
 
+    /// Returns a workspace's persisted display ordinal.
+    #[must_use]
+    pub fn workspace_ordinal(&self, workspace_id: &str) -> Option<DisplayOrdinal> {
+        self.topology_ordinal(TopologyKind::Workspace, workspace_id)
+    }
+
+    pub(crate) fn set_workspace_ordinal(
+        &mut self,
+        workspace_id: String,
+        ordinal: DisplayOrdinal,
+    ) -> Option<DisplayOrdinal> {
+        self.set_topology_ordinal(TopologyKind::Workspace, workspace_id, ordinal)
+    }
+
+    pub(crate) fn remove_workspace_ordinal(
+        &mut self,
+        workspace_id: &str,
+    ) -> Option<DisplayOrdinal> {
+        self.remove_topology_ordinal(TopologyKind::Workspace, workspace_id)
+    }
+
     pub fn insert_tab(&mut self, tab: Tab) -> Option<Tab> {
         self.tabs.insert(tab.tab_id.clone(), tab)
     }
@@ -524,6 +553,24 @@ impl DomainModel {
         self.tabs.values()
     }
 
+    /// Returns a tab's persisted display ordinal.
+    #[must_use]
+    pub fn tab_ordinal(&self, tab_id: &str) -> Option<DisplayOrdinal> {
+        self.topology_ordinal(TopologyKind::Tab, tab_id)
+    }
+
+    pub(crate) fn set_tab_ordinal(
+        &mut self,
+        tab_id: String,
+        ordinal: DisplayOrdinal,
+    ) -> Option<DisplayOrdinal> {
+        self.set_topology_ordinal(TopologyKind::Tab, tab_id, ordinal)
+    }
+
+    pub(crate) fn remove_tab_ordinal(&mut self, tab_id: &str) -> Option<DisplayOrdinal> {
+        self.remove_topology_ordinal(TopologyKind::Tab, tab_id)
+    }
+
     pub fn insert_pane(&mut self, pane: Pane) -> Option<Pane> {
         self.panes.insert(pane.pane_id.clone(), pane)
     }
@@ -535,6 +582,41 @@ impl DomainModel {
 
     pub fn panes(&self) -> impl Iterator<Item = &Pane> {
         self.panes.values()
+    }
+
+    /// Returns a pane's persisted display ordinal.
+    #[must_use]
+    pub fn pane_ordinal(&self, pane_id: &str) -> Option<DisplayOrdinal> {
+        self.topology_ordinal(TopologyKind::Pane, pane_id)
+    }
+
+    pub(crate) fn set_pane_ordinal(
+        &mut self,
+        pane_id: String,
+        ordinal: DisplayOrdinal,
+    ) -> Option<DisplayOrdinal> {
+        self.set_topology_ordinal(TopologyKind::Pane, pane_id, ordinal)
+    }
+
+    pub(crate) fn remove_pane_ordinal(&mut self, pane_id: &str) -> Option<DisplayOrdinal> {
+        self.remove_topology_ordinal(TopologyKind::Pane, pane_id)
+    }
+
+    fn topology_ordinal(&self, kind: TopologyKind, id: &str) -> Option<DisplayOrdinal> {
+        self.topology_ordinals.get(&(kind, id.to_owned())).copied()
+    }
+
+    fn set_topology_ordinal(
+        &mut self,
+        kind: TopologyKind,
+        id: String,
+        ordinal: DisplayOrdinal,
+    ) -> Option<DisplayOrdinal> {
+        self.topology_ordinals.insert((kind, id), ordinal)
+    }
+
+    fn remove_topology_ordinal(&mut self, kind: TopologyKind, id: &str) -> Option<DisplayOrdinal> {
+        self.topology_ordinals.remove(&(kind, id.to_owned()))
     }
 
     pub fn insert_task_run(&mut self, task_run: TaskRun) -> Option<TaskRun> {

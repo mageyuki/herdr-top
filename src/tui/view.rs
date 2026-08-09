@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::herdr::collector::ObservationQuality;
 use crate::model::{
-    AgentNode, DomainModel, ExecState, Provider, RunId, RunKey, TaskRun, TaskState,
+    AgentNode, DisplayOrdinal, DomainModel, ExecState, Provider, RunId, RunKey, TaskRun, TaskState,
 };
 
 use super::app::{AppState, HeaderInputs, NodeKey};
@@ -327,7 +327,10 @@ fn build_tree_rows_named(
     let mut workspaces = model.workspaces().collect::<Vec<_>>();
     workspaces.sort_by_key(|workspace| {
         (
-            state.workspace_order(&workspace.workspace_id),
+            model
+                .workspace_ordinal(&workspace.workspace_id)
+                .map(DisplayOrdinal::get)
+                .unwrap_or(i64::MAX),
             workspace.workspace_id.as_str(),
         )
     });
@@ -341,7 +344,15 @@ fn build_tree_rows_named(
             .tabs()
             .filter(|tab| tab.workspace_id == workspace.workspace_id)
             .collect::<Vec<_>>();
-        tabs.sort_by_key(|tab| (state.tab_order(&tab.tab_id), tab.tab_id.as_str()));
+        tabs.sort_by_key(|tab| {
+            (
+                model
+                    .tab_ordinal(&tab.tab_id)
+                    .map(DisplayOrdinal::get)
+                    .unwrap_or(i64::MAX),
+                tab.tab_id.as_str(),
+            )
+        });
         for tab in tabs {
             rows.push(TreeRow {
                 key: NodeKey::Tab(tab.tab_id.clone()),
@@ -354,7 +365,15 @@ fn build_tree_rows_named(
                     pane.workspace_id == workspace.workspace_id && pane.tab_id == tab.tab_id
                 })
                 .collect::<Vec<_>>();
-            panes.sort_by_key(|pane| (state.pane_order(&pane.pane_id), pane.pane_id.as_str()));
+            panes.sort_by_key(|pane| {
+                (
+                    model
+                        .pane_ordinal(&pane.pane_id)
+                        .map(DisplayOrdinal::get)
+                        .unwrap_or(i64::MAX),
+                    pane.pane_id.as_str(),
+                )
+            });
             for pane in panes {
                 rows.push(TreeRow {
                     key: NodeKey::Pane(pane.pane_id.clone()),
@@ -723,7 +742,7 @@ mod tests {
         AgentNode, DisplayOrdinal, DomainModel, ExecState, Execution, ExecutionEdge, Pane,
         Provider, RunId, RunKey, Tab, TaskRun, TaskState, Workspace,
     };
-    use crate::tui::app::{App, HeaderInputs};
+    use crate::tui::app::{App, AppState, HeaderInputs};
 
     fn run_id(value: &str) -> RunId {
         RunId::parse(value).unwrap()
@@ -1048,6 +1067,116 @@ mod tests {
             vec!["ordinal-first", "lexical-first"]
         );
         assert_eq!(run_row_order(&after), run_row_order(&before));
+    }
+
+    #[test]
+    fn topology_sibling_rows_follow_persisted_ordinals() {
+        let mut model = DomainModel::default();
+        for (workspace_id, ordinal) in [("workspace-a", 2), ("workspace-z", 1)] {
+            model.insert_workspace(Workspace {
+                workspace_id: workspace_id.to_owned(),
+            });
+            model.set_workspace_ordinal(workspace_id.to_owned(), DisplayOrdinal::new(ordinal));
+        }
+        for (tab_id, ordinal) in [("tab-a", 4), ("tab-z", 3)] {
+            model.insert_tab(Tab {
+                tab_id: tab_id.to_owned(),
+                workspace_id: "workspace-z".to_owned(),
+            });
+            model.set_tab_ordinal(tab_id.to_owned(), DisplayOrdinal::new(ordinal));
+        }
+        for (pane_id, ordinal) in [("pane-a", 6), ("pane-z", 5)] {
+            model.insert_pane(Pane {
+                pane_id: pane_id.to_owned(),
+                workspace_id: "workspace-z".to_owned(),
+                tab_id: "tab-z".to_owned(),
+                terminal_id: format!("terminal-{pane_id}"),
+            });
+            model.set_pane_ordinal(pane_id.to_owned(), DisplayOrdinal::new(ordinal));
+        }
+
+        let rows = build_tree_rows(&model, &AppState::default());
+        let topology = rows
+            .iter()
+            .filter_map(|row| match &row.key {
+                NodeKey::Workspace(id) | NodeKey::Tab(id) | NodeKey::Pane(id) => Some(id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            topology,
+            [
+                "workspace-z",
+                "tab-z",
+                "pane-z",
+                "pane-a",
+                "tab-a",
+                "workspace-a",
+            ]
+        );
+    }
+
+    #[test]
+    fn execution_placement_order_remains_in_session_across_refresh() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut initial = DomainModel::default();
+        initial.insert_workspace(Workspace {
+            workspace_id: "workspace".to_owned(),
+        });
+        initial.set_workspace_ordinal("workspace".to_owned(), DisplayOrdinal::new(1));
+        initial.insert_tab(Tab {
+            tab_id: "tab".to_owned(),
+            workspace_id: "workspace".to_owned(),
+        });
+        initial.set_tab_ordinal("tab".to_owned(), DisplayOrdinal::new(2));
+        for (pane_id, ordinal) in [("pane-old", 3), ("pane-new", 4)] {
+            initial.insert_pane(Pane {
+                pane_id: pane_id.to_owned(),
+                workspace_id: "workspace".to_owned(),
+                tab_id: "tab".to_owned(),
+                terminal_id: format!("terminal-{pane_id}"),
+            });
+            initial.set_pane_ordinal(pane_id.to_owned(), DisplayOrdinal::new(ordinal));
+        }
+        initial.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::Controller("placement".to_owned()),
+            display_ordinal: DisplayOrdinal::new(5),
+            state: TaskState::Completed,
+            has_controller_task_state_event: true,
+        });
+        initial.insert_execution(Execution {
+            execution_id: "z-old-execution".to_owned(),
+            pane_id: "pane-old".to_owned(),
+            terminal_id: "terminal-pane-old".to_owned(),
+            task_run_id: run_id,
+            state: ExecState::Ended,
+        });
+        let mut refreshed = initial.clone();
+        refreshed.insert_execution(Execution {
+            execution_id: "a-new-execution".to_owned(),
+            pane_id: "pane-new".to_owned(),
+            terminal_id: "terminal-pane-new".to_owned(),
+            task_run_id: run_id,
+            state: ExecState::Ended,
+        });
+        let (model_sender, model_receiver) = watch::channel(Arc::new(initial));
+        let (_quality_sender, quality_receiver) = watch::channel(ObservationQuality::Live);
+        let mut app = App::new(model_receiver, quality_receiver, HeaderInputs::default());
+
+        model_sender.send(Arc::new(refreshed)).unwrap();
+        app.refresh();
+        let rows = build_tree_rows(app.model(), app.state());
+        let hosting_pane = rows.iter().find_map(|row| match &row.key {
+            NodeKey::Run {
+                run_id: actual,
+                pane_id,
+            } if *actual == run_id => pane_id.as_deref(),
+            _ => None,
+        });
+
+        assert_eq!(hosting_pane, Some("pane-new"));
     }
 
     #[test]

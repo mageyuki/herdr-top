@@ -175,11 +175,26 @@ pub struct CollectorGap {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PersistOp {
     /// Upsert a physical workspace.
-    UpsertWorkspace(Workspace),
+    UpsertWorkspace {
+        /// The physical workspace.
+        workspace: Workspace,
+        /// Its immutable display ordinal.
+        display_ordinal: DisplayOrdinal,
+    },
     /// Upsert a physical tab.
-    UpsertTab(Tab),
+    UpsertTab {
+        /// The physical tab.
+        tab: Tab,
+        /// Its immutable display ordinal.
+        display_ordinal: DisplayOrdinal,
+    },
     /// Upsert a physical pane.
-    UpsertPane(Pane),
+    UpsertPane {
+        /// The physical pane.
+        pane: Pane,
+        /// Its immutable display ordinal.
+        display_ordinal: DisplayOrdinal,
+    },
     /// Delete a physical workspace and its database-cascaded descendants.
     DeleteWorkspace {
         /// The workspace identity to remove.
@@ -693,44 +708,66 @@ impl Store {
     }
 
     fn restore_workspaces(&self, model: &mut crate::model::DomainModel) -> Result<(), StoreError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT workspace_id FROM workspaces")?;
+        let mut statement = self.connection.prepare(
+            "SELECT workspace.workspace_id, ordinal.ordinal \
+             FROM workspaces AS workspace \
+             LEFT JOIN display_ordinals AS ordinal \
+               ON ordinal.entity_kind = 'workspace' \
+              AND ordinal.entity_id = workspace.workspace_id",
+        )?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
+            let workspace_id: String = row.get(0)?;
+            let ordinal = required_topology_ordinal(row.get(1)?, "workspace", &workspace_id)?;
             model.insert_workspace(Workspace {
-                workspace_id: row.get(0)?,
+                workspace_id: workspace_id.clone(),
             });
+            model.set_workspace_ordinal(workspace_id, ordinal);
         }
         Ok(())
     }
 
     fn restore_tabs(&self, model: &mut crate::model::DomainModel) -> Result<(), StoreError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT tab_id, workspace_id FROM tabs")?;
+        let mut statement = self.connection.prepare(
+            "SELECT tab.tab_id, tab.workspace_id, ordinal.ordinal \
+             FROM tabs AS tab \
+             LEFT JOIN display_ordinals AS ordinal \
+               ON ordinal.entity_kind = 'tab' \
+              AND ordinal.entity_id = tab.tab_id",
+        )?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
+            let tab_id: String = row.get(0)?;
+            let ordinal = required_topology_ordinal(row.get(2)?, "tab", &tab_id)?;
             model.insert_tab(Tab {
-                tab_id: row.get(0)?,
+                tab_id: tab_id.clone(),
                 workspace_id: row.get(1)?,
             });
+            model.set_tab_ordinal(tab_id, ordinal);
         }
         Ok(())
     }
 
     fn restore_panes(&self, model: &mut crate::model::DomainModel) -> Result<(), StoreError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT pane_id, workspace_id, tab_id, terminal_id FROM panes")?;
+        let mut statement = self.connection.prepare(
+            "SELECT pane.pane_id, pane.workspace_id, pane.tab_id, pane.terminal_id, \
+                    ordinal.ordinal \
+             FROM panes AS pane \
+             LEFT JOIN display_ordinals AS ordinal \
+               ON ordinal.entity_kind = 'pane' \
+              AND ordinal.entity_id = pane.pane_id",
+        )?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
+            let pane_id: String = row.get(0)?;
+            let ordinal = required_topology_ordinal(row.get(4)?, "pane", &pane_id)?;
             model.insert_pane(Pane {
-                pane_id: row.get(0)?,
+                pane_id: pane_id.clone(),
                 workspace_id: row.get(1)?,
                 tab_id: row.get(2)?,
                 terminal_id: row.get(3)?,
             });
+            model.set_pane_ordinal(pane_id, ordinal);
         }
         Ok(())
     }
@@ -959,23 +996,94 @@ fn resolve_alias_root(alias: RunId, aliases: &HashMap<RunId, RunId>) -> Result<R
     Ok(current)
 }
 
+fn required_topology_ordinal(
+    ordinal: Option<i64>,
+    entity_kind: &str,
+    entity_id: &str,
+) -> Result<DisplayOrdinal, StoreError> {
+    ordinal.map(DisplayOrdinal::new).ok_or_else(|| {
+        StoreError::invalid(
+            "display_ordinal",
+            format!("{entity_kind}:{entity_id}"),
+            "topology entity is missing its persisted display ordinal",
+        )
+    })
+}
+
+fn upsert_display_ordinal(
+    transaction: &Transaction<'_>,
+    entity_kind: &str,
+    entity_id: &str,
+    display_ordinal: DisplayOrdinal,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "INSERT INTO display_ordinals(entity_kind, entity_id, ordinal) \
+         VALUES (?1, ?2, ?3) \
+         ON CONFLICT(entity_kind, entity_id) DO NOTHING",
+        params![entity_kind, entity_id, display_ordinal.get()],
+    )?;
+    let persisted_ordinal: i64 = transaction.query_row(
+        "SELECT ordinal FROM display_ordinals \
+         WHERE entity_kind = ?1 AND entity_id = ?2",
+        (entity_kind, entity_id),
+        |row| row.get(0),
+    )?;
+    if persisted_ordinal != display_ordinal.get() {
+        return Err(StoreError::invalid(
+            "display_ordinal",
+            display_ordinal.get().to_string(),
+            format!("{entity_kind} {entity_id} already owns ordinal {persisted_ordinal}"),
+        ));
+    }
+    Ok(())
+}
+
+fn delete_display_ordinal(
+    transaction: &Transaction<'_>,
+    entity_kind: &str,
+    entity_id: &str,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "DELETE FROM display_ordinals WHERE entity_kind = ?1 AND entity_id = ?2",
+        (entity_kind, entity_id),
+    )?;
+    Ok(())
+}
+
 fn apply_operation(transaction: &Transaction<'_>, operation: PersistOp) -> Result<(), StoreError> {
     match operation {
-        PersistOp::UpsertWorkspace(workspace) => {
+        PersistOp::UpsertWorkspace {
+            workspace,
+            display_ordinal,
+        } => {
+            upsert_display_ordinal(
+                transaction,
+                "workspace",
+                &workspace.workspace_id,
+                display_ordinal,
+            )?;
             transaction.execute(
                 "INSERT INTO workspaces(workspace_id) VALUES (?1) \
                  ON CONFLICT(workspace_id) DO NOTHING",
                 [&workspace.workspace_id],
             )?;
         }
-        PersistOp::UpsertTab(tab) => {
+        PersistOp::UpsertTab {
+            tab,
+            display_ordinal,
+        } => {
+            upsert_display_ordinal(transaction, "tab", &tab.tab_id, display_ordinal)?;
             transaction.execute(
                 "INSERT INTO tabs(tab_id, workspace_id) VALUES (?1, ?2) \
                  ON CONFLICT(tab_id) DO UPDATE SET workspace_id = excluded.workspace_id",
                 (&tab.tab_id, &tab.workspace_id),
             )?;
         }
-        PersistOp::UpsertPane(pane) => {
+        PersistOp::UpsertPane {
+            pane,
+            display_ordinal,
+        } => {
+            upsert_display_ordinal(transaction, "pane", &pane.pane_id, display_ordinal)?;
             transaction.execute(
                 "INSERT INTO panes(pane_id, workspace_id, tab_id, terminal_id) \
                  VALUES (?1, ?2, ?3, ?4) \
@@ -996,12 +1104,15 @@ fn apply_operation(transaction: &Transaction<'_>, operation: PersistOp) -> Resul
                 "DELETE FROM workspaces WHERE workspace_id = ?1",
                 [&workspace_id],
             )?;
+            delete_display_ordinal(transaction, "workspace", &workspace_id)?;
         }
         PersistOp::DeleteTab { tab_id } => {
             transaction.execute("DELETE FROM tabs WHERE tab_id = ?1", [&tab_id])?;
+            delete_display_ordinal(transaction, "tab", &tab_id)?;
         }
         PersistOp::DeletePane { pane_id } => {
             transaction.execute("DELETE FROM panes WHERE pane_id = ?1", [&pane_id])?;
+            delete_display_ordinal(transaction, "pane", &pane_id)?;
         }
         PersistOp::UpsertTaskRun(task_run) => upsert_task_run(transaction, &task_run)?,
         PersistOp::PromoteTaskRunKey {
@@ -2038,7 +2149,7 @@ mod tests {
 
         assert!(database_path(&root).is_file());
         assert!(backup_files(directory.path()).is_empty());
-        assert_eq!(schema_version(&store.connection), 3);
+        assert_eq!(schema_version(&store.connection), 4);
         for (table, column) in [
             ("agent_nodes", "parent_agent_node_id"),
             ("agent_nodes", "state"),
@@ -2105,7 +2216,7 @@ mod tests {
                     "CREATE TABLE schema_migrations(\
                          version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL\
                      );\
-                     INSERT INTO schema_migrations(version, applied_at_ms) VALUES (4, 0);",
+                     INSERT INTO schema_migrations(version, applied_at_ms) VALUES (5, 0);",
                 )
                 .unwrap();
         }
@@ -2114,15 +2225,15 @@ mod tests {
         assert!(matches!(
             preflight_schema(&root),
             Err(StoreError::NewerSchema {
-                found: 4,
-                supported: 3
+                found: 5,
+                supported: 4
             })
         ));
         assert!(matches!(
             open_writer(&root),
             Err(StoreError::NewerSchema {
-                found: 4,
-                supported: 3
+                found: 5,
+                supported: 4
             })
         ));
 
@@ -2151,7 +2262,7 @@ mod tests {
         let backups = backup_files(directory.path());
 
         assert_eq!(backups.len(), 1);
-        assert_eq!(schema_version(&store.connection), 3);
+        assert_eq!(schema_version(&store.connection), 4);
         let backup = Connection::open_with_flags(
             &backups[0],
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -2182,7 +2293,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_to_v3_migration() {
+    fn schema_v1_to_v4_migration() {
         let (_directory, root) = test_root();
         let database = database_path(&root);
         {
@@ -2198,7 +2309,7 @@ mod tests {
 
         assert_eq!(preflight_schema(&root).unwrap(), SchemaVerdict::Migratable);
         let store = open_writer(&root).unwrap();
-        assert_eq!(schema_version(&store.connection), 3);
+        assert_eq!(schema_version(&store.connection), 4);
         let has_ingest_seq: bool = store
             .connection
             .query_row(
@@ -2224,7 +2335,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v2_to_v3_backfills_agent_ordinals_by_run_ordinal_then_node_id() {
+    fn schema_v2_to_v4_backfills_agent_ordinals_by_run_ordinal_then_node_id() {
         let (_directory, root) = test_root();
         let database = database_path(&root);
         let first_run = RunId::new();
@@ -2270,7 +2381,7 @@ mod tests {
         }
 
         let store = open_writer(&root).unwrap();
-        assert_eq!(schema_version(&store.connection), 3);
+        assert_eq!(schema_version(&store.connection), 4);
         let ordinals = ["gap-agent-m", "gap-agent-a", "gap-agent-z"].map(|node_id| {
             store
                 .connection
@@ -2298,6 +2409,87 @@ mod tests {
             restored.model.agent_node("gap-agent-a").unwrap().state,
             None
         );
+    }
+
+    #[test]
+    fn schema_v3_to_v4_backfills_topology_ordinals_deterministically_and_once() {
+        let (_directory, root) = test_root();
+        let database = database_path(&root);
+        let existing_run = RunId::new();
+        {
+            let mut connection = Connection::open(&database).unwrap();
+            connection.execute_batch(schema::SCHEMA_V1).unwrap();
+            connection.execute_batch(schema::SCHEMA_V2).unwrap();
+            connection.execute_batch(schema::SCHEMA_V3).unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (1, 1);\
+                     INSERT INTO schema_migrations(version, applied_at_ms) VALUES (2, 2);\
+                     INSERT INTO schema_migrations(version, applied_at_ms) VALUES (3, 3);\
+                     INSERT INTO workspaces(workspace_id) VALUES ('workspace-z'), ('workspace-a');\
+                     INSERT INTO tabs(tab_id, workspace_id) VALUES\
+                         ('tab-z', 'workspace-z'),\
+                         ('tab-a2', 'workspace-a'),\
+                         ('tab-a1', 'workspace-a');\
+                     INSERT INTO panes(pane_id, workspace_id, tab_id, terminal_id) VALUES\
+                         ('pane-z', 'workspace-z', 'tab-z', 'terminal-z'),\
+                         ('pane-a2', 'workspace-a', 'tab-a2', 'terminal-a2'),\
+                         ('pane-a1b', 'workspace-a', 'tab-a1', 'terminal-a1b'),\
+                         ('pane-a1a', 'workspace-a', 'tab-a1', 'terminal-a1a');",
+                )
+                .unwrap();
+            let transaction = connection.transaction().unwrap();
+            upsert_task_run(
+                &transaction,
+                &persisted_run(existing_run, 20, TaskState::Running, 1, false),
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        let mut store = open_writer(&root).unwrap();
+        assert_eq!(schema_version(&store.connection), 4);
+        let topology_ordinals = [
+            ("workspace", "workspace-a", 21),
+            ("workspace", "workspace-z", 22),
+            ("tab", "tab-a1", 23),
+            ("tab", "tab-a2", 24),
+            ("tab", "tab-z", 25),
+            ("pane", "pane-a1a", 26),
+            ("pane", "pane-a1b", 27),
+            ("pane", "pane-a2", 28),
+            ("pane", "pane-z", 29),
+        ];
+        for (kind, entity_id, expected) in topology_ordinals {
+            assert_eq!(
+                store
+                    .connection
+                    .query_row(
+                        "SELECT ordinal FROM display_ordinals \
+                         WHERE entity_kind = ?1 AND entity_id = ?2",
+                        (kind, entity_id),
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                expected,
+                "unexpected ordinal for {kind}:{entity_id}"
+            );
+        }
+        assert_eq!(store.load_restored_state().unwrap().next_ordinal, 30);
+
+        schema::migrate(&mut store.connection, 999).unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 4",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(count(&store.connection, "display_ordinals"), 10);
     }
 
     #[test]
@@ -2485,19 +2677,28 @@ mod tests {
         let child = RunId::new();
         store
             .apply_batch(vec![
-                PersistOp::UpsertWorkspace(Workspace {
-                    workspace_id: "workspace-1".to_owned(),
-                }),
-                PersistOp::UpsertTab(Tab {
-                    tab_id: "tab-1".to_owned(),
-                    workspace_id: "workspace-1".to_owned(),
-                }),
-                PersistOp::UpsertPane(Pane {
-                    pane_id: "pane-1".to_owned(),
-                    workspace_id: "workspace-1".to_owned(),
-                    tab_id: "tab-1".to_owned(),
-                    terminal_id: "terminal-1".to_owned(),
-                }),
+                PersistOp::UpsertWorkspace {
+                    workspace: Workspace {
+                        workspace_id: "workspace-1".to_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(1),
+                },
+                PersistOp::UpsertTab {
+                    tab: Tab {
+                        tab_id: "tab-1".to_owned(),
+                        workspace_id: "workspace-1".to_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(2),
+                },
+                PersistOp::UpsertPane {
+                    pane: Pane {
+                        pane_id: "pane-1".to_owned(),
+                        workspace_id: "workspace-1".to_owned(),
+                        tab_id: "tab-1".to_owned(),
+                        terminal_id: "terminal-1".to_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(4),
+                },
                 run_op(parent, 3, TaskState::Running, now, false),
                 run_op(child, 7, TaskState::Blocked, now, false),
                 PersistOp::UpsertExecution(PersistExecution {
@@ -2577,6 +2778,219 @@ mod tests {
         );
         assert_eq!(restored.model.execution_edges().count(), 1);
         assert_eq!(restored.model.dependency_edges().count(), 1);
+    }
+
+    #[test]
+    fn topology_ordinals_survive_delete_reinsert_and_delete_cleanup_removes_rows() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let workspace = Workspace {
+            workspace_id: "workspace".to_owned(),
+        };
+        let tab = Tab {
+            tab_id: "tab".to_owned(),
+            workspace_id: workspace.workspace_id.clone(),
+        };
+        let pane = Pane {
+            pane_id: "pane".to_owned(),
+            workspace_id: workspace.workspace_id.clone(),
+            tab_id: tab.tab_id.clone(),
+            terminal_id: "terminal".to_owned(),
+        };
+        let upserts = || {
+            vec![
+                PersistOp::UpsertWorkspace {
+                    workspace: workspace.clone(),
+                    display_ordinal: DisplayOrdinal::new(31),
+                },
+                PersistOp::UpsertTab {
+                    tab: tab.clone(),
+                    display_ordinal: DisplayOrdinal::new(32),
+                },
+                PersistOp::UpsertPane {
+                    pane: pane.clone(),
+                    display_ordinal: DisplayOrdinal::new(33),
+                },
+            ]
+        };
+
+        store.apply_batch(upserts()).unwrap();
+        let restored = store.load_restored_state().unwrap();
+        assert_eq!(
+            restored.model.workspace_ordinal("workspace"),
+            Some(DisplayOrdinal::new(31))
+        );
+        assert_eq!(
+            restored.model.tab_ordinal("tab"),
+            Some(DisplayOrdinal::new(32))
+        );
+        assert_eq!(
+            restored.model.pane_ordinal("pane"),
+            Some(DisplayOrdinal::new(33))
+        );
+
+        let mut replace = vec![
+            PersistOp::DeletePane {
+                pane_id: pane.pane_id.clone(),
+            },
+            PersistOp::DeleteTab {
+                tab_id: tab.tab_id.clone(),
+            },
+            PersistOp::DeleteWorkspace {
+                workspace_id: workspace.workspace_id.clone(),
+            },
+        ];
+        replace.extend(upserts());
+        store.apply_batch(replace).unwrap();
+        let restored = store.load_restored_state().unwrap();
+        assert_eq!(
+            restored.model.workspace_ordinal("workspace"),
+            Some(DisplayOrdinal::new(31))
+        );
+        assert_eq!(
+            restored.model.tab_ordinal("tab"),
+            Some(DisplayOrdinal::new(32))
+        );
+        assert_eq!(
+            restored.model.pane_ordinal("pane"),
+            Some(DisplayOrdinal::new(33))
+        );
+
+        assert!(matches!(
+            store.apply_batch(vec![PersistOp::UpsertPane {
+                pane: pane.clone(),
+                display_ordinal: DisplayOrdinal::new(99),
+            }]),
+            Err(StoreError::InvalidData { .. })
+        ));
+
+        store
+            .apply_batch(vec![
+                PersistOp::DeletePane {
+                    pane_id: pane.pane_id,
+                },
+                PersistOp::DeleteTab { tab_id: tab.tab_id },
+                PersistOp::DeleteWorkspace {
+                    workspace_id: workspace.workspace_id,
+                },
+            ])
+            .unwrap();
+        assert_eq!(
+            count_where(
+                &store.connection,
+                "display_ordinals",
+                "entity_kind IN ('workspace', 'tab', 'pane')",
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn topology_restore_rejects_entity_missing_ordinal() {
+        let (_directory, root) = test_root();
+        let store = open_writer(&root).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO workspaces(workspace_id) VALUES ('missing-ordinal')",
+                [],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.load_restored_state(),
+            Err(StoreError::InvalidData { .. })
+        ));
+    }
+
+    #[test]
+    fn topology_sibling_order_survives_restart_in_adoption_order() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        store
+            .apply_batch(vec![
+                PersistOp::UpsertWorkspace {
+                    workspace: Workspace {
+                        workspace_id: "workspace-z".to_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(1),
+                },
+                PersistOp::UpsertWorkspace {
+                    workspace: Workspace {
+                        workspace_id: "workspace-a".to_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(2),
+                },
+                PersistOp::UpsertTab {
+                    tab: Tab {
+                        tab_id: "tab-z".to_owned(),
+                        workspace_id: "workspace-z".to_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(3),
+                },
+                PersistOp::UpsertTab {
+                    tab: Tab {
+                        tab_id: "tab-a".to_owned(),
+                        workspace_id: "workspace-z".to_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(4),
+                },
+                PersistOp::UpsertPane {
+                    pane: Pane {
+                        pane_id: "pane-z".to_owned(),
+                        workspace_id: "workspace-z".to_owned(),
+                        tab_id: "tab-z".to_owned(),
+                        terminal_id: "terminal-z".to_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(5),
+                },
+                PersistOp::UpsertPane {
+                    pane: Pane {
+                        pane_id: "pane-a".to_owned(),
+                        workspace_id: "workspace-z".to_owned(),
+                        tab_id: "tab-z".to_owned(),
+                        terminal_id: "terminal-a".to_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(6),
+                },
+            ])
+            .unwrap();
+        drop(store);
+
+        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+        let mut workspaces = restored.model.workspaces().collect::<Vec<_>>();
+        workspaces.sort_by_key(|workspace| {
+            restored
+                .model
+                .workspace_ordinal(&workspace.workspace_id)
+                .unwrap()
+                .get()
+        });
+        let mut tabs = restored.model.tabs().collect::<Vec<_>>();
+        tabs.sort_by_key(|tab| restored.model.tab_ordinal(&tab.tab_id).unwrap().get());
+        let mut panes = restored.model.panes().collect::<Vec<_>>();
+        panes.sort_by_key(|pane| restored.model.pane_ordinal(&pane.pane_id).unwrap().get());
+
+        assert_eq!(
+            workspaces
+                .iter()
+                .map(|workspace| workspace.workspace_id.as_str())
+                .collect::<Vec<_>>(),
+            ["workspace-z", "workspace-a"]
+        );
+        assert_eq!(
+            tabs.iter()
+                .map(|tab| tab.tab_id.as_str())
+                .collect::<Vec<_>>(),
+            ["tab-z", "tab-a"]
+        );
+        assert_eq!(
+            panes
+                .iter()
+                .map(|pane| pane.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            ["pane-z", "pane-a"]
+        );
     }
 
     #[test]
@@ -2745,19 +3159,28 @@ mod tests {
         let dependent = RunId::new();
         store
             .apply_batch(vec![
-                PersistOp::UpsertWorkspace(Workspace {
-                    workspace_id: "workspace-1".to_owned(),
-                }),
-                PersistOp::UpsertTab(Tab {
-                    tab_id: "tab-1".to_owned(),
-                    workspace_id: "workspace-1".to_owned(),
-                }),
-                PersistOp::UpsertPane(Pane {
-                    pane_id: "pane-1".to_owned(),
-                    workspace_id: "workspace-1".to_owned(),
-                    tab_id: "tab-1".to_owned(),
-                    terminal_id: "terminal-1".to_owned(),
-                }),
+                PersistOp::UpsertWorkspace {
+                    workspace: Workspace {
+                        workspace_id: "workspace-1".to_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(6),
+                },
+                PersistOp::UpsertTab {
+                    tab: Tab {
+                        tab_id: "tab-1".to_owned(),
+                        workspace_id: "workspace-1".to_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(7),
+                },
+                PersistOp::UpsertPane {
+                    pane: Pane {
+                        pane_id: "pane-1".to_owned(),
+                        workspace_id: "workspace-1".to_owned(),
+                        tab_id: "tab-1".to_owned(),
+                        terminal_id: "terminal-1".to_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(8),
+                },
                 run_op(survivor, 1, TaskState::Running, now, false),
                 run_op(absorbed, 2, TaskState::Running, now, false),
                 run_op(parent, 3, TaskState::Running, now, false),
@@ -3116,9 +3539,12 @@ mod tests {
             .unwrap();
 
         let error = store.apply_batch(vec![
-            PersistOp::UpsertWorkspace(Workspace {
-                workspace_id: "must-roll-back".to_owned(),
-            }),
+            PersistOp::UpsertWorkspace {
+                workspace: Workspace {
+                    workspace_id: "must-roll-back".to_owned(),
+                },
+                display_ordinal: DisplayOrdinal::new(3),
+            },
             PersistOp::MergeTaskRuns { survivor, absorbed },
         ]);
 
