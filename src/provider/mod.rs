@@ -277,7 +277,11 @@ impl DiscoveryIndex {
     pub fn new(roots: Vec<DiscoveryRoot>) -> io::Result<Self> {
         let mut baseline = FirstSeenBaseline::default();
         for root in &roots {
-            for relative in discover_artifacts(&root.path)? {
+            let discovery = discover_artifacts(&root.path)?;
+            if discovery.had_errors {
+                return Err(io::Error::other("provider baseline discovery incomplete"));
+            }
+            for relative in discovery.paths {
                 baseline.record(root.path.join(relative));
             }
         }
@@ -300,7 +304,9 @@ impl DiscoveryIndex {
         let mut outcome = DiscoveryScanOutcome::default();
         for root in self.roots.clone() {
             let mut root_seen = HashSet::new();
-            for relative in discover_artifacts(&root.path)? {
+            let discovery = discover_artifacts(&root.path)?;
+            outcome.file_io_error |= discovery.had_errors;
+            for relative in discovery.paths {
                 let absolute = root.path.join(&relative);
                 let file_key = (root.provider, absolute.clone());
                 root_seen.insert(absolute.clone());
@@ -466,20 +472,48 @@ fn bootstrap_file(
     Ok(None)
 }
 
-fn discover_artifacts(root: &Path) -> io::Result<Vec<PathBuf>> {
+#[derive(Debug, Default)]
+struct ArtifactDiscovery {
+    paths: Vec<PathBuf>,
+    had_errors: bool,
+}
+
+fn discover_artifacts(root: &Path) -> io::Result<ArtifactDiscovery> {
     let mut found = Vec::new();
+    let mut had_errors = false;
     let mut directories = vec![PathBuf::new()];
     while let Some(relative_directory) = directories.pop() {
         let directory = root.join(&relative_directory);
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
+            Err(error) if relative_directory.as_os_str().is_empty() => {
+                if error.kind() == io::ErrorKind::NotFound {
+                    return Ok(ArtifactDiscovery::default());
+                }
+                return Err(error);
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
+            Err(_) => {
+                had_errors = true;
+                continue;
+            }
         };
         for entry in entries {
-            let entry = entry?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    had_errors = true;
+                    continue;
+                }
+            };
             let relative = relative_directory.join(entry.file_name());
-            let kind = entry.file_type()?;
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(_) => {
+                    had_errors = true;
+                    continue;
+                }
+            };
             if kind.is_dir() {
                 directories.push(relative);
             } else if kind.is_file() && is_provider_artifact(&relative) {
@@ -488,7 +522,10 @@ fn discover_artifacts(root: &Path) -> io::Result<Vec<PathBuf>> {
         }
     }
     found.sort();
-    Ok(found)
+    Ok(ArtifactDiscovery {
+        paths: found,
+        had_errors,
+    })
 }
 
 /// Returns whether a discovered entry is an adapter input artifact.
