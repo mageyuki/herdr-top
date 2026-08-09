@@ -11,7 +11,8 @@ use herdr_top::herdr::controller::{
 use herdr_top::lockfile::{OwnerLock, StateRoot, state_root_in, try_acquire};
 use herdr_top::model::{
     ControllerDiagnosticsHandle, ControllerEventKind, DisplayOrdinal, EventMetadata,
-    NormalizedEvent, RunId, RunKey, Tab, TaskRun, TaskState,
+    MinimalProviderMetadata, NormalizedEvent, Provider, RunId, RunKey, SourceCoverage, Tab,
+    TaskRun, TaskState,
 };
 use herdr_top::rendezvous::{
     ControllerSocketStatus, ValidatedRuntimeDir, open_runtime_dir_at, prepare_controller_socket,
@@ -162,6 +163,50 @@ fn depends_on(event_id: &str, dependent: &str, prerequisite: &str) -> Value {
     value
 }
 
+fn provider_record(event_id: &str, event_kind: &str) -> PersistOp {
+    let activity = MinimalProviderMetadata {
+        agent_id: Some("provider-agent".to_owned()),
+        event_kind: Some(event_kind.to_owned()),
+        ..MinimalProviderMetadata::default()
+    };
+    PersistOp::RecordEvent {
+        event: Box::new(NormalizedEvent::AgentActivity {
+            metadata: EventMetadata {
+                event_id: event_id.to_owned(),
+                timestamp_ms: 123,
+                receipt_time_ms: 124,
+                source: "provider".to_owned(),
+                source_event_type: "activity".to_owned(),
+                herdr_session: SESSION.to_owned(),
+                workspace_id: None,
+                tab_id: None,
+                pane_id: None,
+                terminal_id: None,
+                provider: Some(Provider::Codex),
+                native_session_id: Some("provider-agent".to_owned()),
+                task_run_id: None,
+                agent_node_id: Some("agent:codex:provider-agent".to_owned()),
+                task_state: None,
+                execution_parent: None,
+                dependency: None,
+                source_coverage: vec![SourceCoverage {
+                    source: "codex".to_owned(),
+                    available: true,
+                    detail: None,
+                }],
+                provider_metadata: Some(activity.clone()),
+                label: None,
+                reason: None,
+                progress: None,
+                ingest_seq: None,
+            },
+            agent_node_id: "agent:codex:provider-agent".to_owned(),
+            activity,
+        }),
+        seen_at_ms: unix_now_ms(),
+    }
+}
+
 async fn send_raw(path: &Path, value: &Value) -> ControllerResponse {
     let mut bytes = serde_json::to_vec(value).unwrap();
     bytes.push(b'\n');
@@ -294,6 +339,54 @@ async fn duplicate_event_id_is_duplicate() {
     let event = envelope("same-event", "task_started", "run");
     assert_eq!(running.send(&event).await, ControllerResponse::Accepted);
     assert_eq!(running.send(&event).await, ControllerResponse::Duplicate);
+    running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn controller_first_reserved_provider_id_is_invalid_and_never_reserves_ledger() {
+    let running = RunningController::start().await;
+    let event_id = "prov:codex:act:controller-first";
+    assert_eq!(
+        running
+            .send(&envelope(event_id, "task_started", "run"))
+            .await,
+        rejected(RejectResponseReason::Invalid)
+    );
+    assert!(!running.writer.is_duplicate(event_id));
+
+    running
+        .writer
+        .apply(vec![provider_record(event_id, "provider-wins")])
+        .await
+        .unwrap();
+    assert!(running.writer.is_duplicate(event_id));
+    running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provider_first_reserved_provider_id_keeps_duplicate_precedence() {
+    let running = RunningController::start().await;
+    let event_id = "prov:codex:act:provider-first";
+    running
+        .writer
+        .apply(vec![provider_record(event_id, "first")])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        running
+            .send(&envelope(event_id, "task_started", "run"))
+            .await,
+        ControllerResponse::Duplicate
+    );
+    assert!(
+        running
+            .collector
+            .model
+            .borrow()
+            .task_run_by_key(&RunKey::Controller("run".to_owned()))
+            .is_none()
+    );
     running.stop().await;
 }
 

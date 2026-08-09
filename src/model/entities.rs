@@ -51,8 +51,32 @@ pub struct TaskRun {
 pub struct AgentNode {
     pub agent_node_id: String,
     pub provider: Provider,
+    /// This node's own provider-native thread/session identifier.
     pub native_session_id: Option<String>,
     pub task_run_id: RunId,
+    pub display_ordinal: DisplayOrdinal,
+    pub parent_agent_node_id: Option<String>,
+    pub state: Option<ExecState>,
+    pub model_id: Option<String>,
+    pub last_event_kind: Option<String>,
+    pub last_tool_name: Option<String>,
+    pub last_item_count: Option<u64>,
+    pub last_byte_count: Option<u64>,
+    pub last_activity_at_ms: Option<i64>,
+    pub session_file: Option<String>,
+}
+
+/// Provider observation used to insert or patch an [`AgentNode`].
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentNodeObservation {
+    pub agent_node_id: String,
+    pub provider: Provider,
+    pub native_session_id: Option<String>,
+    pub task_run_id: RunId,
+    pub parent_agent_node_id: Option<String>,
+    pub state: Option<ExecState>,
+    pub model_id: Option<String>,
+    pub session_file: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -75,6 +99,8 @@ pub struct ControllerDiagnostics {
     terminal_forward_reference_creations: u64,
     dangling_announcement_components: u64,
     ingest_sequence_exhaustions: u64,
+    provider_parent_conflicts: u64,
+    provider_identity_disagreements: u64,
     acceptor: ControllerDiagnosticsHandle,
 }
 
@@ -107,6 +133,18 @@ impl ControllerDiagnostics {
     #[must_use]
     pub const fn ingest_sequence_exhaustions(&self) -> u64 {
         self.ingest_sequence_exhaustions
+    }
+
+    /// Provider parent links rejected because they were self-links or cycles.
+    #[must_use]
+    pub const fn provider_parent_conflicts(&self) -> u64 {
+        self.provider_parent_conflicts
+    }
+
+    /// Herdr ID-kind identity facts that disagreed with adapter-resolved identity.
+    #[must_use]
+    pub const fn provider_identity_disagreements(&self) -> u64 {
+        self.provider_identity_disagreements
     }
 
     /// Controller socket admissions rejected because the acceptor was saturated.
@@ -149,6 +187,15 @@ impl ControllerDiagnostics {
 
     pub(crate) fn record_ingest_sequence_exhaustion(&mut self) {
         self.ingest_sequence_exhaustions = self.ingest_sequence_exhaustions.saturating_add(1);
+    }
+
+    pub(crate) fn record_provider_parent_conflict(&mut self) {
+        self.provider_parent_conflicts = self.provider_parent_conflicts.saturating_add(1);
+    }
+
+    pub(crate) fn record_provider_identity_disagreement(&mut self) {
+        self.provider_identity_disagreements =
+            self.provider_identity_disagreements.saturating_add(1);
     }
 }
 
@@ -525,6 +572,15 @@ pub enum NormalizedEvent {
         execution_id: String,
         state: ExecState,
     },
+    AgentNodeUpsert {
+        metadata: EventMetadata,
+        node: AgentNodeObservation,
+    },
+    AgentActivity {
+        metadata: EventMetadata,
+        agent_node_id: String,
+        activity: MinimalProviderMetadata,
+    },
     ExecutionBegin {
         metadata: EventMetadata,
         execution: Execution,
@@ -641,6 +697,16 @@ mod tests {
             provider: Provider::Codex,
             native_session_id: Some("session-1".to_owned()),
             task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(5),
+            parent_agent_node_id: None,
+            state: None,
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
         });
         let execution_edge = ExecutionEdge {
             parent_run_id: dependency_id,

@@ -1084,11 +1084,34 @@ pub struct ProviderThreadHandle {
     diagnostics: ProviderDiagnostics,
 }
 
-impl ProviderThreadHandle {
+/// Cloneable latest-value target publisher retained by the collector task.
+#[derive(Clone)]
+pub struct ProviderTargetPublisher {
+    control: SyncSender<Control>,
+    targets: Arc<Mutex<Option<TargetSet>>>,
+}
+
+impl ProviderTargetPublisher {
     /// Publishes the latest target set and sends a best-effort wake notification.
     pub fn update_targets(&self, targets: TargetSet) {
         *lock_unpoisoned(&self.targets) = Some(targets);
         let _ = self.control.try_send(Control::TargetsUpdated);
+    }
+}
+
+impl ProviderThreadHandle {
+    /// Publishes the latest target set and sends a best-effort wake notification.
+    pub fn update_targets(&self, targets: TargetSet) {
+        self.target_publisher().update_targets(targets);
+    }
+
+    /// Returns a cloneable target publisher that does not own thread shutdown.
+    #[must_use]
+    pub fn target_publisher(&self) -> ProviderTargetPublisher {
+        ProviderTargetPublisher {
+            control: self.control.clone(),
+            targets: Arc::clone(&self.targets),
+        }
     }
 
     /// Sends one non-blocking filesystem hint, forcing fallback rescan on saturation.

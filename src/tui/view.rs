@@ -9,7 +9,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::herdr::collector::ObservationQuality;
-use crate::model::{DomainModel, Provider, RunId, RunKey, TaskRun, TaskState};
+use crate::model::{
+    AgentNode, DomainModel, ExecState, Provider, RunId, RunKey, TaskRun, TaskState,
+};
 
 use super::app::{AppState, HeaderInputs, NodeKey};
 
@@ -359,7 +361,7 @@ fn build_tree_rows_named(
                     label: format!("Pane: {}", safe_text(&pane.pane_id)),
                 });
                 if let Some(runs) = pane_runs.remove(&pane.pane_id) {
-                    append_run_rows(&mut rows, model, state, runs, Some(&pane.pane_id), 4);
+                    append_run_rows(&mut rows, model, runs, Some(&pane.pane_id), 4);
                 }
             }
         }
@@ -375,7 +377,7 @@ fn build_tree_rows_named(
             .into_iter()
             .map(|run_id| (run_id, false))
             .collect();
-        append_run_rows(&mut rows, model, state, runs, None, 2);
+        append_run_rows(&mut rows, model, runs, None, 2);
     }
     rows
 }
@@ -450,7 +452,6 @@ fn pane_is_renderable(model: &DomainModel, pane_id: &str) -> bool {
 fn append_run_rows(
     rows: &mut Vec<TreeRow>,
     model: &DomainModel,
-    state: &AppState,
     runs: Vec<RunPlacement>,
     pane_id: Option<&str>,
     depth: usize,
@@ -467,38 +468,108 @@ fn append_run_rows(
             depth,
             label: task_run_label(model, run, shared),
         });
-        let mut agents = model
+        let agents = model
             .agent_nodes()
             .filter(|agent| agent.task_run_id == run_id)
             .filter(|agent| {
                 provider_from_key(&run.key).is_none_or(|provider| provider == agent.provider)
             })
             .collect::<Vec<_>>();
-        agents.sort_by_key(|agent| {
-            (
-                state.agent_order(&agent.agent_node_id),
-                agent.agent_node_id.as_str(),
-            )
-        });
-        for agent in agents {
-            let identity = agent
-                .native_session_id
-                .as_deref()
-                .unwrap_or(&agent.agent_node_id);
-            rows.push(TreeRow {
-                key: NodeKey::Agent {
-                    agent_node_id: agent.agent_node_id.clone(),
-                    pane_id: pane_id.map(str::to_owned),
-                },
-                depth: depth.saturating_add(1),
-                label: format!(
-                    "{} native agent: {}",
-                    provider_label(agent.provider),
-                    safe_text(identity)
-                ),
-            });
+        append_agent_rows(rows, agents, pane_id, depth.saturating_add(1));
+    }
+}
+
+fn append_agent_rows(
+    rows: &mut Vec<TreeRow>,
+    agents: Vec<&AgentNode>,
+    pane_id: Option<&str>,
+    depth: usize,
+) {
+    let by_id = agents
+        .iter()
+        .map(|agent| (agent.agent_node_id.as_str(), *agent))
+        .collect::<HashMap<_, _>>();
+    let mut children = HashMap::<&str, Vec<&AgentNode>>::new();
+    let mut roots = Vec::new();
+    for agent in agents {
+        match agent.parent_agent_node_id.as_deref() {
+            Some(parent_id) if by_id.contains_key(parent_id) => {
+                children.entry(parent_id).or_default().push(agent);
+            }
+            Some(_) | None => roots.push(agent),
         }
     }
+    sort_agents(&mut roots);
+    for values in children.values_mut() {
+        sort_agents(values);
+    }
+
+    let mut visited = HashSet::new();
+    for root in roots {
+        append_agent_subtree(rows, root, &children, pane_id, depth, &mut visited);
+    }
+}
+
+fn sort_agents(agents: &mut Vec<&AgentNode>) {
+    agents.sort_by_key(|agent| (agent.display_ordinal.get(), agent.agent_node_id.as_str()));
+}
+
+fn append_agent_subtree(
+    rows: &mut Vec<TreeRow>,
+    agent: &AgentNode,
+    children: &HashMap<&str, Vec<&AgentNode>>,
+    pane_id: Option<&str>,
+    depth: usize,
+    visited: &mut HashSet<String>,
+) {
+    if !visited.insert(agent.agent_node_id.clone()) {
+        return;
+    }
+    rows.push(TreeRow {
+        key: NodeKey::Agent {
+            agent_node_id: agent.agent_node_id.clone(),
+            pane_id: pane_id.map(str::to_owned),
+        },
+        depth,
+        label: agent_node_label(agent),
+    });
+    if let Some(child_nodes) = children.get(agent.agent_node_id.as_str()) {
+        for child in child_nodes {
+            append_agent_subtree(
+                rows,
+                child,
+                children,
+                pane_id,
+                depth.saturating_add(1),
+                visited,
+            );
+        }
+    }
+}
+
+fn agent_node_label(agent: &AgentNode) -> String {
+    let identity = agent
+        .native_session_id
+        .as_deref()
+        .unwrap_or(&agent.agent_node_id);
+    let state = agent
+        .state
+        .as_ref()
+        .map(exec_state_label)
+        .unwrap_or("unknown");
+    let model = agent
+        .model_id
+        .as_deref()
+        .map(safe_text)
+        .unwrap_or_else(|| "unknown".to_owned());
+    let activity = agent
+        .last_activity_at_ms
+        .map_or_else(|| "unknown".to_owned(), |value| format!("{value}ms"));
+    format!(
+        "{} native agent: {} [state:{state}] [model:{model}] [last:{activity}]",
+        provider_label(agent.provider),
+        safe_text(identity),
+    )
 }
 
 fn task_run_label(model: &DomainModel, run: &TaskRun, shared: bool) -> String {
@@ -580,6 +651,17 @@ fn task_state_label(state: TaskState) -> &'static str {
         TaskState::Failed => "failed",
         TaskState::Cancelled => "cancelled",
         TaskState::EndedUnknown => "ended_unknown",
+    }
+}
+
+fn exec_state_label(state: &ExecState) -> &'static str {
+    match state {
+        ExecState::Unknown => "unknown",
+        ExecState::Idle => "idle",
+        ExecState::Working => "working",
+        ExecState::Blocked => "blocked",
+        ExecState::Ended => "ended",
+        ExecState::Stale { .. } => "stale",
     }
 }
 
@@ -684,6 +766,16 @@ mod tests {
             provider: Provider::Codex,
             native_session_id: Some("investigate".to_owned()),
             task_run_id: run,
+            display_ordinal: DisplayOrdinal::new(8),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Working),
+            model_id: Some("gpt-test".to_owned()),
+            last_event_kind: Some("assistant".to_owned()),
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: Some(42),
+            session_file: None,
         });
         model
     }
@@ -947,6 +1039,61 @@ mod tests {
             vec!["ordinal-first", "lexical-first"]
         );
         assert_eq!(run_row_order(&after), run_row_order(&before));
+    }
+
+    #[test]
+    fn agent_rows_follow_persisted_ordinals_and_render_recursive_parentage() {
+        let mut model = populated_model();
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "agent-missing-parent".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some("orphan".to_owned()),
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(9),
+            parent_agent_node_id: Some("agent-never-arrived".to_owned()),
+            state: None,
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
+        });
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "agent-child".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some("child".to_owned()),
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(10),
+            parent_agent_node_id: Some("agent-1".to_owned()),
+            state: Some(ExecState::Working),
+            model_id: Some("gpt-child".to_owned()),
+            last_event_kind: Some("tool".to_owned()),
+            last_tool_name: Some("Read".to_owned()),
+            last_item_count: Some(3),
+            last_byte_count: Some(512),
+            last_activity_at_ms: Some(99),
+            session_file: None,
+        });
+        let app = app(model, ObservationQuality::Live, "demo");
+
+        let rows = build_tree_rows(app.model(), app.state());
+        let agent_rows = rows
+            .iter()
+            .filter(|row| matches!(row.key, NodeKey::Agent { .. }))
+            .collect::<Vec<_>>();
+
+        assert_eq!(agent_rows.len(), 3);
+        assert!(agent_rows[0].label.contains("investigate"));
+        assert_eq!(agent_rows[0].depth + 1, agent_rows[1].depth);
+        assert!(agent_rows[1].label.contains("child"));
+        assert!(agent_rows[1].label.contains("state:working"));
+        assert!(agent_rows[1].label.contains("model:gpt-child"));
+        assert!(agent_rows[1].label.contains("last:99ms"));
+        assert_eq!(agent_rows[0].depth, agent_rows[2].depth);
+        assert!(agent_rows[2].label.contains("orphan"));
     }
 
     #[test]

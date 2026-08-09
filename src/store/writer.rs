@@ -421,6 +421,8 @@ fn normalized_event_id(event: &crate::model::NormalizedEvent) -> &str {
         | NormalizedEvent::TopologyUpsert { metadata, .. }
         | NormalizedEvent::TopologyClosure { metadata, .. }
         | NormalizedEvent::AgentStatusChanged { metadata, .. }
+        | NormalizedEvent::AgentNodeUpsert { metadata, .. }
+        | NormalizedEvent::AgentActivity { metadata, .. }
         | NormalizedEvent::ExecutionBegin { metadata, .. }
         | NormalizedEvent::ExecutionEnd { metadata, .. } => &metadata.event_id,
     }

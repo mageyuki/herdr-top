@@ -625,15 +625,20 @@ impl Store {
              WHERE task_run_id IN (SELECT run_id FROM cleanup_doomed_runs)",
             [],
         )?);
+        stats.display_ordinals_pruned = changed(transaction.execute(
+            "DELETE FROM display_ordinals \
+             WHERE (entity_kind = 'task_run' \
+                    AND entity_id IN (SELECT run_id FROM cleanup_doomed_runs)) \
+                OR (entity_kind = 'agent_node' \
+                    AND entity_id IN (\
+                        SELECT agent_node_id FROM agent_nodes \
+                        WHERE task_run_id IN (SELECT run_id FROM cleanup_doomed_runs)\
+                    ))",
+            [],
+        )?);
         stats.agent_nodes_pruned = changed(transaction.execute(
             "DELETE FROM agent_nodes \
              WHERE task_run_id IN (SELECT run_id FROM cleanup_doomed_runs)",
-            [],
-        )?);
-        stats.display_ordinals_pruned = changed(transaction.execute(
-            "DELETE FROM display_ordinals \
-             WHERE entity_kind = 'task_run' \
-               AND entity_id IN (SELECT run_id FROM cleanup_doomed_runs)",
             [],
         )?);
         let doomed_run_count: i64 =
@@ -854,7 +859,14 @@ impl Store {
 
     fn restore_agent_nodes(&self, model: &mut crate::model::DomainModel) -> Result<(), StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT agent_node_id, provider, native_session_id, task_run_id FROM agent_nodes",
+            "SELECT node.agent_node_id, node.provider, node.native_session_id, node.task_run_id, \
+                    ordinal.ordinal, node.parent_agent_node_id, node.state, node.model_id, \
+                    node.last_event_kind, node.last_tool_name, node.last_item_count, \
+                    node.last_byte_count, node.last_activity_at_ms, node.session_file \
+             FROM agent_nodes AS node \
+             JOIN display_ordinals AS ordinal \
+               ON ordinal.entity_kind = 'agent_node' \
+              AND ordinal.entity_id = node.agent_node_id",
         )?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
@@ -865,6 +877,22 @@ impl Store {
                 provider: parse_provider(&provider_text)?,
                 native_session_id: row.get(2)?,
                 task_run_id: parse_run_id(&run_id_text)?,
+                display_ordinal: DisplayOrdinal::new(row.get(4)?),
+                parent_agent_node_id: row.get(5)?,
+                state: parse_agent_node_state(row.get(6)?)?,
+                model_id: row.get(7)?,
+                last_event_kind: row.get(8)?,
+                last_tool_name: row.get(9)?,
+                last_item_count: optional_unsigned_count(
+                    "agent_nodes.last_item_count",
+                    row.get(10)?,
+                )?,
+                last_byte_count: optional_unsigned_count(
+                    "agent_nodes.last_byte_count",
+                    row.get(11)?,
+                )?,
+                last_activity_at_ms: row.get(12)?,
+                session_file: row.get(13)?,
             });
         }
         Ok(())
@@ -1534,17 +1562,73 @@ fn upsert_agent_node(
         )?;
     }
     transaction.execute(
-        "INSERT INTO agent_nodes(agent_node_id, provider, native_session_id, task_run_id) \
-         VALUES (?1, ?2, ?3, ?4) \
+        "INSERT INTO display_ordinals(entity_kind, entity_id, ordinal) \
+         VALUES ('agent_node', ?1, ?2) \
+         ON CONFLICT(entity_kind, entity_id) DO NOTHING",
+        params![agent_node.agent_node_id, agent_node.display_ordinal.get()],
+    )?;
+    let persisted_ordinal: i64 = transaction.query_row(
+        "SELECT ordinal FROM display_ordinals \
+         WHERE entity_kind = 'agent_node' AND entity_id = ?1",
+        [&agent_node.agent_node_id],
+        |row| row.get(0),
+    )?;
+    if persisted_ordinal != agent_node.display_ordinal.get() {
+        return Err(StoreError::invalid(
+            "display_ordinal",
+            agent_node.display_ordinal.get().to_string(),
+            format!(
+                "agent node {} already owns ordinal {persisted_ordinal}",
+                agent_node.agent_node_id
+            ),
+        ));
+    }
+    let state = agent_node
+        .state
+        .as_ref()
+        .map(agent_node_state_text)
+        .transpose()?;
+    let item_count = agent_node
+        .last_item_count
+        .map(|value| signed_count("agent_nodes.last_item_count", value))
+        .transpose()?;
+    let byte_count = agent_node
+        .last_byte_count
+        .map(|value| signed_count("agent_nodes.last_byte_count", value))
+        .transpose()?;
+    transaction.execute(
+        "INSERT INTO agent_nodes(\
+             agent_node_id, provider, native_session_id, task_run_id, parent_agent_node_id, \
+             state, model_id, last_event_kind, last_tool_name, last_item_count, \
+             last_byte_count, last_activity_at_ms, session_file\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
          ON CONFLICT(agent_node_id) DO UPDATE SET \
              provider = excluded.provider, \
              native_session_id = excluded.native_session_id, \
-             task_run_id = excluded.task_run_id",
+             task_run_id = excluded.task_run_id, \
+             parent_agent_node_id = excluded.parent_agent_node_id, \
+             state = excluded.state, \
+             model_id = excluded.model_id, \
+             last_event_kind = excluded.last_event_kind, \
+             last_tool_name = excluded.last_tool_name, \
+             last_item_count = excluded.last_item_count, \
+             last_byte_count = excluded.last_byte_count, \
+             last_activity_at_ms = excluded.last_activity_at_ms, \
+             session_file = excluded.session_file",
         params![
             agent_node.agent_node_id,
             provider,
             agent_node.native_session_id,
-            agent_node.task_run_id.to_string()
+            agent_node.task_run_id.to_string(),
+            agent_node.parent_agent_node_id,
+            state,
+            agent_node.model_id,
+            agent_node.last_event_kind,
+            agent_node.last_tool_name,
+            item_count,
+            byte_count,
+            agent_node.last_activity_at_ms,
+            agent_node.session_file,
         ],
     )?;
     Ok(())
@@ -1586,15 +1670,28 @@ fn record_event(
             })
         })
         .transpose()?;
+    let provider_agent_id = provider_metadata.and_then(|value| value.agent_id.as_deref());
+    let provider_parent_agent_id =
+        provider_metadata.and_then(|value| value.parent_agent_id.as_deref());
+    let source_coverage = if metadata.source == "provider" {
+        Some(
+            serde_json::to_string(&metadata.source_coverage).map_err(|error| {
+                StoreError::invalid("event.source_coverage", "provider", error.to_string())
+            })?,
+        )
+    } else {
+        None
+    };
     transaction.execute(
         "INSERT INTO events(\
              event_id, seen_at_ms, event_timestamp_ms, herdr_session, source, normalized_kind, \
              source_event_type, workspace_id, tab_id, pane_id, terminal_id, provider, \
              native_session_id, task_run_id, agent_node_id, task_state, model_id, \
-             provider_event_kind, tool_name, item_count, byte_count, gap_kind, ingest_seq\
+             provider_event_kind, tool_name, item_count, byte_count, gap_kind, ingest_seq, \
+             provider_agent_id, provider_parent_agent_id, source_coverage\
          ) VALUES (\
              ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-             ?16, ?17, ?18, ?19, ?20, ?21, NULL, ?22\
+             ?16, ?17, ?18, ?19, ?20, ?21, NULL, ?22, ?23, ?24, ?25\
          )",
         params![
             metadata.event_id,
@@ -1618,7 +1715,10 @@ fn record_event(
             provider_metadata.and_then(|value| value.tool_name.as_deref()),
             item_count,
             byte_count,
-            ingest_seq
+            ingest_seq,
+            provider_agent_id,
+            provider_parent_agent_id,
+            source_coverage,
         ],
     )?;
     Ok(())
@@ -1669,6 +1769,8 @@ fn event_metadata(event: &NormalizedEvent) -> (&EventMetadata, &'static str) {
         NormalizedEvent::TopologyUpsert { metadata, .. } => (metadata, "topology_upsert"),
         NormalizedEvent::TopologyClosure { metadata, .. } => (metadata, "topology_closure"),
         NormalizedEvent::AgentStatusChanged { metadata, .. } => (metadata, "agent_status_changed"),
+        NormalizedEvent::AgentNodeUpsert { metadata, .. } => (metadata, "agent_node_upsert"),
+        NormalizedEvent::AgentActivity { metadata, .. } => (metadata, "agent_activity"),
         NormalizedEvent::ExecutionBegin { metadata, .. } => (metadata, "execution_begin"),
         NormalizedEvent::ExecutionEnd { metadata, .. } => (metadata, "execution_end"),
     }
@@ -1854,6 +1956,42 @@ fn parse_exec_state(value: &str, stale_since_ms: Option<i64>) -> Result<ExecStat
     }
 }
 
+fn agent_node_state_text(state: &ExecState) -> Result<&'static str, StoreError> {
+    match state {
+        ExecState::Working => Ok("working"),
+        _ => Err(StoreError::invalid(
+            "agent_nodes.state",
+            format!("{state:?}"),
+            "provider agent nodes may persist only the working state",
+        )),
+    }
+}
+
+fn parse_agent_node_state(value: Option<String>) -> Result<Option<ExecState>, StoreError> {
+    match value.as_deref() {
+        None => Ok(None),
+        Some("working") => Ok(Some(ExecState::Working)),
+        Some(value) => Err(StoreError::invalid(
+            "agent_nodes.state",
+            value,
+            "unknown provider agent-node state",
+        )),
+    }
+}
+
+fn optional_unsigned_count(
+    field: &'static str,
+    value: Option<i64>,
+) -> Result<Option<u64>, StoreError> {
+    value
+        .map(|value| {
+            u64::try_from(value).map_err(|_| {
+                StoreError::invalid(field, value.to_string(), "count cannot be negative")
+            })
+        })
+        .transpose()
+}
+
 const fn gap_kind_text(kind: GapKind) -> &'static str {
     match kind {
         GapKind::Startup => "startup",
@@ -1900,7 +2038,57 @@ mod tests {
 
         assert!(database_path(&root).is_file());
         assert!(backup_files(directory.path()).is_empty());
-        assert_eq!(schema_version(&store.connection), 2);
+        assert_eq!(schema_version(&store.connection), 3);
+        for (table, column) in [
+            ("agent_nodes", "parent_agent_node_id"),
+            ("agent_nodes", "state"),
+            ("agent_nodes", "model_id"),
+            ("agent_nodes", "last_event_kind"),
+            ("agent_nodes", "last_tool_name"),
+            ("agent_nodes", "last_item_count"),
+            ("agent_nodes", "last_byte_count"),
+            ("agent_nodes", "last_activity_at_ms"),
+            ("agent_nodes", "session_file"),
+            ("events", "provider_agent_id"),
+            ("events", "provider_parent_agent_id"),
+            ("events", "source_coverage"),
+        ] {
+            let present: bool = store
+                .connection
+                .query_row(
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1)"
+                    ),
+                    [column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "missing {table}.{column}");
+        }
+        let parent_indexed: bool = store
+            .connection
+            .query_row(
+                "SELECT EXISTS(\
+                     SELECT 1 FROM pragma_index_list('agent_nodes') \
+                     WHERE name = 'agent_nodes_parent_idx'\
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let parent_fk: bool = store
+            .connection
+            .query_row(
+                "SELECT EXISTS(\
+                     SELECT 1 FROM pragma_foreign_key_list('agent_nodes') \
+                     WHERE \"from\" = 'parent_agent_node_id'\
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(parent_indexed);
+        assert!(!parent_fk);
     }
 
     #[test]
@@ -1917,7 +2105,7 @@ mod tests {
                     "CREATE TABLE schema_migrations(\
                          version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL\
                      );\
-                     INSERT INTO schema_migrations(version, applied_at_ms) VALUES (3, 0);",
+                     INSERT INTO schema_migrations(version, applied_at_ms) VALUES (4, 0);",
                 )
                 .unwrap();
         }
@@ -1926,15 +2114,15 @@ mod tests {
         assert!(matches!(
             preflight_schema(&root),
             Err(StoreError::NewerSchema {
-                found: 3,
-                supported: 2
+                found: 4,
+                supported: 3
             })
         ));
         assert!(matches!(
             open_writer(&root),
             Err(StoreError::NewerSchema {
-                found: 3,
-                supported: 2
+                found: 4,
+                supported: 3
             })
         ));
 
@@ -1963,7 +2151,7 @@ mod tests {
         let backups = backup_files(directory.path());
 
         assert_eq!(backups.len(), 1);
-        assert_eq!(schema_version(&store.connection), 2);
+        assert_eq!(schema_version(&store.connection), 3);
         let backup = Connection::open_with_flags(
             &backups[0],
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -1994,7 +2182,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_to_v2_migration() {
+    fn schema_v1_to_v3_migration() {
         let (_directory, root) = test_root();
         let database = database_path(&root);
         {
@@ -2010,7 +2198,7 @@ mod tests {
 
         assert_eq!(preflight_schema(&root).unwrap(), SchemaVerdict::Migratable);
         let store = open_writer(&root).unwrap();
-        assert_eq!(schema_version(&store.connection), 2);
+        assert_eq!(schema_version(&store.connection), 3);
         let has_ingest_seq: bool = store
             .connection
             .query_row(
@@ -2032,6 +2220,83 @@ mod tests {
         assert_eq!(
             store.load_restored_state().unwrap().next_ingest_seq,
             Some(1)
+        );
+    }
+
+    #[test]
+    fn schema_v2_to_v3_backfills_agent_ordinals_by_run_ordinal_then_node_id() {
+        let (_directory, root) = test_root();
+        let database = database_path(&root);
+        let first_run = RunId::new();
+        let second_run = RunId::new();
+        {
+            let mut connection = Connection::open(&database).unwrap();
+            connection.execute_batch(schema::SCHEMA_V1).unwrap();
+            connection
+                .execute_batch(
+                    "ALTER TABLE events ADD COLUMN ingest_seq INTEGER NULL;\
+                     CREATE TABLE meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);\
+                     INSERT INTO meta(key, value) VALUES ('ingest_seq_high_water', 0);\
+                     INSERT INTO schema_migrations(version, applied_at_ms) VALUES (1, 1);\
+                     INSERT INTO schema_migrations(version, applied_at_ms) VALUES (2, 2);",
+                )
+                .unwrap();
+            let transaction = connection.transaction().unwrap();
+            upsert_task_run(
+                &transaction,
+                &persisted_run(first_run, 3, TaskState::Running, 1, false),
+            )
+            .unwrap();
+            upsert_task_run(
+                &transaction,
+                &persisted_run(second_run, 7, TaskState::Running, 1, false),
+            )
+            .unwrap();
+            for (node_id, run_id) in [
+                ("gap-agent-z", second_run),
+                ("gap-agent-a", second_run),
+                ("gap-agent-m", first_run),
+            ] {
+                transaction
+                    .execute(
+                        "INSERT INTO agent_nodes(\
+                             agent_node_id, provider, native_session_id, task_run_id\
+                         ) VALUES (?1, 'codex', NULL, ?2)",
+                        (node_id, run_id.to_string()),
+                    )
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+
+        let store = open_writer(&root).unwrap();
+        assert_eq!(schema_version(&store.connection), 3);
+        let ordinals = ["gap-agent-m", "gap-agent-a", "gap-agent-z"].map(|node_id| {
+            store
+                .connection
+                .query_row(
+                    "SELECT ordinal FROM display_ordinals \
+                         WHERE entity_kind = 'agent_node' AND entity_id = ?1",
+                    [node_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        });
+        assert_eq!(ordinals, [8, 9, 10]);
+
+        let restored = store.load_restored_state().unwrap();
+        assert_eq!(restored.next_ordinal, 11);
+        assert_eq!(
+            restored
+                .model
+                .agent_node("gap-agent-a")
+                .unwrap()
+                .display_ordinal,
+            DisplayOrdinal::new(9)
+        );
+        assert_eq!(
+            restored.model.agent_node("gap-agent-a").unwrap().state,
+            None
         );
     }
 
@@ -2120,6 +2385,22 @@ mod tests {
             .apply_batch(vec![
                 run_op(stale, 1, TaskState::Completed, now - 31 * DAY_MS, false),
                 run_op(recent, 2, TaskState::Failed, now - 29 * DAY_MS, false),
+                PersistOp::UpsertAgentNode(AgentNode {
+                    agent_node_id: "agent-stale".to_owned(),
+                    provider: Provider::Codex,
+                    native_session_id: Some("stale-native".to_owned()),
+                    task_run_id: stale,
+                    display_ordinal: DisplayOrdinal::new(3),
+                    parent_agent_node_id: None,
+                    state: None,
+                    model_id: None,
+                    last_event_kind: None,
+                    last_tool_name: None,
+                    last_item_count: None,
+                    last_byte_count: None,
+                    last_activity_at_ms: None,
+                    session_file: None,
+                }),
             ])
             .unwrap();
 
@@ -2127,8 +2408,18 @@ mod tests {
         let restored = store.load_restored_state().unwrap();
 
         assert_eq!(stats.runs_pruned, 1);
+        assert_eq!(stats.agent_nodes_pruned, 1);
+        assert_eq!(stats.display_ordinals_pruned, 2);
         assert!(restored.model.task_run(&stale).is_none());
         assert!(restored.model.task_run(&recent).is_some());
+        assert_eq!(
+            count_where(
+                &store.connection,
+                "display_ordinals",
+                "entity_kind = 'agent_node'",
+            ),
+            0
+        );
     }
 
     #[test]
@@ -2226,6 +2517,16 @@ mod tests {
                     provider: Provider::Codex,
                     native_session_id: Some("native-1".to_owned()),
                     task_run_id: child,
+                    display_ordinal: DisplayOrdinal::new(8),
+                    parent_agent_node_id: None,
+                    state: Some(ExecState::Working),
+                    model_id: Some("gpt-test".to_owned()),
+                    last_event_kind: Some("assistant".to_owned()),
+                    last_tool_name: None,
+                    last_item_count: Some(2),
+                    last_byte_count: Some(3),
+                    last_activity_at_ms: Some(now),
+                    session_file: Some("/sessions/native-1.jsonl".to_owned()),
                 }),
                 PersistOp::UpsertExecutionEdge {
                     edge: ExecutionEdge {
@@ -2248,15 +2549,123 @@ mod tests {
         let reader = open_reader(&root).unwrap();
         let restored = reader.load_restored_state().unwrap();
 
-        assert_eq!(restored.next_ordinal, 8);
+        assert_eq!(restored.next_ordinal, 9);
         assert!(restored.model.workspace("workspace-1").is_some());
         assert!(restored.model.tab("tab-1").is_some());
         assert!(restored.model.pane("pane-1").is_some());
         assert_eq!(restored.model.task_runs().count(), 2);
         assert_eq!(restored.model.executions().count(), 1);
         assert_eq!(restored.model.agent_nodes().count(), 1);
+        assert_eq!(
+            restored.model.agent_node("agent-1"),
+            Some(&AgentNode {
+                agent_node_id: "agent-1".to_owned(),
+                provider: Provider::Codex,
+                native_session_id: Some("native-1".to_owned()),
+                task_run_id: child,
+                display_ordinal: DisplayOrdinal::new(8),
+                parent_agent_node_id: None,
+                state: Some(ExecState::Working),
+                model_id: Some("gpt-test".to_owned()),
+                last_event_kind: Some("assistant".to_owned()),
+                last_tool_name: None,
+                last_item_count: Some(2),
+                last_byte_count: Some(3),
+                last_activity_at_ms: Some(now),
+                session_file: Some("/sessions/native-1.jsonl".to_owned()),
+            })
+        );
         assert_eq!(restored.model.execution_edges().count(), 1);
         assert_eq!(restored.model.dependency_edges().count(), 1);
+    }
+
+    #[test]
+    fn provider_event_columns_persist_allowlisted_identity_and_coverage_only() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let now = unix_now_ms().unwrap();
+        let activity = crate::model::MinimalProviderMetadata {
+            agent_id: Some("child".to_owned()),
+            parent_agent_id: Some("parent".to_owned()),
+            model_id: Some("gpt-test".to_owned()),
+            event_kind: Some("interacted".to_owned()),
+            ..crate::model::MinimalProviderMetadata::default()
+        };
+        let provider = NormalizedEvent::AgentActivity {
+            metadata: EventMetadata {
+                event_id: "provider-event".to_owned(),
+                timestamp_ms: now,
+                receipt_time_ms: now,
+                source: "provider".to_owned(),
+                source_event_type: "activity".to_owned(),
+                herdr_session: "session-a".to_owned(),
+                workspace_id: None,
+                tab_id: None,
+                pane_id: None,
+                terminal_id: None,
+                provider: Some(Provider::Codex),
+                native_session_id: None,
+                task_run_id: None,
+                agent_node_id: Some("agent:codex:child".to_owned()),
+                task_state: None,
+                execution_parent: None,
+                dependency: None,
+                source_coverage: vec![crate::model::SourceCoverage {
+                    source: "codex".to_owned(),
+                    available: true,
+                    detail: None,
+                }],
+                provider_metadata: Some(activity.clone()),
+                label: None,
+                reason: None,
+                progress: None,
+                ingest_seq: None,
+            },
+            agent_node_id: "agent:codex:child".to_owned(),
+            activity,
+        };
+        let mut herdr = old_topology_event(now);
+        let NormalizedEvent::TopologyClosure { metadata, .. } = &mut herdr else {
+            unreachable!();
+        };
+        metadata.event_id = "herdr-event".to_owned();
+        store
+            .apply_batch(vec![
+                PersistOp::RecordEvent {
+                    event: Box::new(provider),
+                    seen_at_ms: now,
+                },
+                PersistOp::RecordEvent {
+                    event: Box::new(herdr),
+                    seen_at_ms: now,
+                },
+            ])
+            .unwrap();
+
+        let provider_row: (Option<String>, Option<String>, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT provider_agent_id, provider_parent_agent_id, source_coverage \
+                 FROM events WHERE event_id = 'provider-event'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(provider_row.0.as_deref(), Some("child"));
+        assert_eq!(provider_row.1.as_deref(), Some("parent"));
+        assert_eq!(
+            provider_row.2.as_deref(),
+            Some(r#"[{"source":"codex","available":true,"detail":null}]"#)
+        );
+        let herdr_coverage: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT source_coverage FROM events WHERE event_id = 'herdr-event'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(herdr_coverage, None);
     }
 
     #[test]
@@ -2370,6 +2779,16 @@ mod tests {
                     provider: Provider::Codex,
                     native_session_id: Some("native-1".to_owned()),
                     task_run_id: absorbed,
+                    display_ordinal: DisplayOrdinal::new(5),
+                    parent_agent_node_id: None,
+                    state: None,
+                    model_id: None,
+                    last_event_kind: None,
+                    last_tool_name: None,
+                    last_item_count: None,
+                    last_byte_count: None,
+                    last_activity_at_ms: None,
+                    session_file: None,
                 }),
                 PersistOp::RecordEvent {
                     event: Box::new(run_event("event-1", absorbed, now)),
@@ -3039,6 +3458,19 @@ mod tests {
         )
     }
 
+    fn persisted_run(
+        run_id: RunId,
+        ordinal: i64,
+        state: TaskState,
+        state_at_ms: i64,
+        controller_flag: bool,
+    ) -> PersistTaskRun {
+        match run_op(run_id, ordinal, state, state_at_ms, controller_flag) {
+            PersistOp::UpsertTaskRun(run) => run,
+            _ => unreachable!(),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_op_with_key(
         run_id: RunId,
@@ -3243,6 +3675,16 @@ mod tests {
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
                 row.get(0)
             })
+            .unwrap()
+    }
+
+    fn count_where(connection: &Connection, table: &str, predicate: &str) -> i64 {
+        connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"),
+                [],
+                |row| row.get(0),
+            )
             .unwrap()
     }
 }

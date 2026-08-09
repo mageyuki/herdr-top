@@ -20,6 +20,15 @@ pub enum BindingEvidence {
         /// The provider-native session ID.
         sid: String,
     },
+    /// A provider adapter resolved a path-keyed run to its native session ID.
+    NativePathResolved {
+        /// The path-keyed run whose provider file supplied the evidence.
+        run: RunId,
+        /// The provider that owns both the path and session namespaces.
+        provider: Provider,
+        /// The provider-native session ID resolved from the file.
+        sid: String,
+    },
     /// A Controller event explicitly tied its run to a native session.
     ControllerNativeSession {
         /// The Controller-keyed run being bound.
@@ -180,6 +189,9 @@ pub fn plan_binding(model: &DomainModel, ev: &BindingEvidence) -> BindingPlan {
         BindingEvidence::NativeSession { run, provider, sid } => {
             plan_native_session(model, *run, *provider, sid)
         }
+        BindingEvidence::NativePathResolved { run, provider, sid } => {
+            plan_native_path_resolution(model, *run, *provider, sid)
+        }
         BindingEvidence::ControllerNativeSession {
             controller_run,
             provider,
@@ -189,6 +201,30 @@ pub fn plan_binding(model: &DomainModel, ev: &BindingEvidence) -> BindingPlan {
             controller_run,
             terminal_id,
         } => plan_controller_terminal(model, *controller_run, terminal_id),
+    }
+}
+
+fn plan_native_path_resolution(
+    model: &DomainModel,
+    run: RunId,
+    provider: Provider,
+    sid: &str,
+) -> BindingPlan {
+    let Some(observed) = model.task_run(&run) else {
+        return BindingPlan::Conflict(MergeConflict::MissingRun { run });
+    };
+    if !matches!(observed.key, RunKey::NativePath { provider: current, .. } if current == provider)
+    {
+        return BindingPlan::Conflict(MergeConflict::EvidenceMismatch { run });
+    }
+    let key = RunKey::Native {
+        provider,
+        sid: sid.to_owned(),
+    };
+    match model.task_run_by_key(&key) {
+        Some(owner) if owner.run_id == run => BindingPlan::NoChange,
+        Some(owner) => planned_merge(model, owner.run_id, run),
+        None => BindingPlan::Bind { run, key },
     }
 }
 
@@ -780,27 +816,71 @@ mod tests {
     }
 
     #[test]
-    fn native_path_resolved_removed_compiles() {
+    fn native_path_resolution_promotes_an_unowned_session_id() {
         fn assert_exhaustive(evidence: BindingEvidence) {
             match evidence {
                 BindingEvidence::NativeSession { .. }
+                | BindingEvidence::NativePathResolved { .. }
                 | BindingEvidence::ControllerNativeSession { .. }
                 | BindingEvidence::ControllerTerminal { .. } => {}
             }
         }
 
-        assert_exhaustive(BindingEvidence::NativeSession {
-            run: RunId::new(),
+        let mut model = DomainModel::default();
+        let run = insert_run(
+            &mut model,
+            RunKey::NativePath {
+                provider: Provider::Codex,
+                path: "/sessions/pending.jsonl".to_owned(),
+            },
+            1,
+        );
+        let evidence = BindingEvidence::NativePathResolved {
+            run,
             provider: Provider::Codex,
             sid: "native-sid".to_owned(),
-        });
-        assert!(matches!(
+        };
+
+        assert_exhaustive(evidence.clone());
+        assert_eq!(
+            plan_binding(&model, &evidence),
+            BindingPlan::Bind {
+                run,
+                key: RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: "native-sid".to_owned(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn native_path_resolution_merges_into_the_existing_session_owner() {
+        let mut model = DomainModel::default();
+        let owner = insert_run(&mut model, native(Provider::Claude, "native-sid"), 1);
+        let path_run = insert_run(
+            &mut model,
             RunKey::NativePath {
                 provider: Provider::Claude,
                 path: "/sessions/pending.jsonl".to_owned(),
             },
-            RunKey::NativePath { .. }
-        ));
+            2,
+        );
+
+        assert_eq!(
+            plan_binding(
+                &model,
+                &BindingEvidence::NativePathResolved {
+                    run: path_run,
+                    provider: Provider::Claude,
+                    sid: "native-sid".to_owned(),
+                },
+            ),
+            BindingPlan::Merge {
+                survivor: owner,
+                absorbed: path_run,
+            }
+        );
     }
 
     fn merge_fixture() -> (DomainModel, RunId, RunId) {
@@ -1186,6 +1266,16 @@ mod tests {
             provider: Provider::Codex,
             native_session_id: Some("sid-1".to_owned()),
             task_run_id: absorbed,
+            display_ordinal: DisplayOrdinal::new(5),
+            parent_agent_node_id: None,
+            state: None,
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
         });
         model.insert_execution_edge(ExecutionEdge {
             parent_run_id: parent,

@@ -11,10 +11,11 @@ use crate::identity::{
     preflight_execution_edge,
 };
 use crate::model::{
-    AgentNode, AgentSessionReferenceKind, ControllerDiagnosticsHandle, ControllerEvent,
-    ControllerEventKind, DependencyEdge, DisplayOrdinal, DomainModel, EventMetadata, ExecState,
-    Execution, ExecutionEdge, NormalizedEvent, Pane, Provider, ReconcileBatch, RunId, RunKey,
-    SharedModel, TaskRun, TaskState, TopologyEntity, TopologyEntityId, sanitize_controller_text,
+    AgentNode, AgentNodeObservation, AgentSessionReferenceKind, ControllerDiagnosticsHandle,
+    ControllerEvent, ControllerEventKind, DependencyEdge, DisplayOrdinal, DomainModel,
+    EventMetadata, ExecState, Execution, ExecutionEdge, MinimalProviderMetadata, NormalizedEvent,
+    Pane, Provider, ReconcileBatch, RunId, RunKey, SharedModel, TaskRun, TaskState, TopologyEntity,
+    TopologyEntityId, sanitize_controller_text,
 };
 use crate::store::{
     EnqueuePermit, NativeSessionBinding, PendingEnqueue, PersistBatch, PersistExecution, PersistOp,
@@ -152,6 +153,13 @@ impl Reducer {
         self.publish();
     }
 
+    pub(crate) fn record_provider_identity_disagreement(&mut self) {
+        self.model
+            .controller_diagnostics_mut()
+            .record_provider_identity_disagreement();
+        self.publish();
+    }
+
     /// Resolves a raw Controller key through canonical and durable alias bindings.
     #[must_use]
     pub fn resolve_controller_run(&self, raw: &str) -> Option<RunId> {
@@ -170,6 +178,7 @@ impl Reducer {
         }
         if event.schema_version != 1
             || event.metadata.event_id.is_empty()
+            || event.metadata.event_id.starts_with("prov:")
             || event.metadata.source.is_empty()
             || event.task_run_id.is_empty()
             || event.metadata.native_session_id.is_some() && event.metadata.provider.is_none()
@@ -299,7 +308,9 @@ impl Reducer {
             metadata.dependency.as_ref(),
         )?;
         scratch.apply_controller_metadata(&metadata, &mut persist);
-        scratch.apply_event_body(&normalized, &metadata, &mut persist);
+        scratch
+            .apply_event_body(&normalized, &metadata, &mut persist)
+            .map_err(|_| RejectReason::Conflict)?;
         scratch
             .apply_identity_metadata(&normalized, &metadata, &mut persist)
             .map_err(|error| match error {
@@ -372,7 +383,7 @@ impl Reducer {
 
         self.ensure_event_runs(&event, &metadata, &mut persist)?;
         self.apply_controller_metadata(&metadata, &mut persist);
-        self.apply_event_body(&event, &metadata, &mut persist);
+        self.apply_event_body(&event, &metadata, &mut persist)?;
         self.apply_identity_metadata(&event, &metadata, &mut persist)?;
         self.persist_event_execution(&event, metadata.receipt_time_ms, &mut persist);
         persist.push(PersistOp::RecordEvent {
@@ -470,7 +481,7 @@ impl Reducer {
             }
 
             if let Some(provider) = provider {
-                let existing_node_id = native_sid
+                let existing_node = native_sid
                     .as_deref()
                     .filter(|sid| !sid.is_empty())
                     .and_then(|sid| {
@@ -481,14 +492,27 @@ impl Reducer {
                                     && node.provider == provider
                                     && node.native_session_id.as_deref() == Some(sid)
                             })
-                            .map(|node| node.agent_node_id.clone())
-                            .min()
+                            .min_by_key(|node| node.agent_node_id.as_str())
+                            .cloned()
                     });
-                let agent_node = AgentNode {
-                    agent_node_id: existing_node_id.unwrap_or_else(|| format!("gap-agent-{token}")),
-                    provider,
-                    native_session_id: native_sid.clone(),
-                    task_run_id: run_id,
+                let agent_node = match existing_node {
+                    Some(node) => node,
+                    None => AgentNode {
+                        agent_node_id: format!("gap-agent-{token}"),
+                        provider,
+                        native_session_id: native_sid.clone(),
+                        task_run_id: run_id,
+                        display_ordinal: self.allocate_ordinal()?,
+                        parent_agent_node_id: None,
+                        state: None,
+                        model_id: None,
+                        last_event_kind: None,
+                        last_tool_name: None,
+                        last_item_count: None,
+                        last_byte_count: None,
+                        last_activity_at_ms: None,
+                        session_file: None,
+                    },
                 };
                 self.model.insert_agent_node(agent_node.clone());
                 persist.push(PersistOp::UpsertAgentNode(agent_node));
@@ -513,7 +537,9 @@ impl Reducer {
             self.ensure_execution_run(execution, metadata, persist)?;
         }
 
-        if let Some(run_id) = metadata.task_run_id {
+        if let Some(run_id) = metadata.task_run_id
+            && metadata.source != "provider"
+        {
             let controller_reference = metadata.task_state.is_some()
                 || metadata.execution_parent.is_some()
                 || metadata.dependency.is_some();
@@ -704,7 +730,7 @@ impl Reducer {
         event: &NormalizedEvent,
         metadata: &EventMetadata,
         persist: &mut PersistBatch,
-    ) {
+    ) -> Result<(), ReducerError> {
         match event {
             NormalizedEvent::ControllerEvent { .. } => {}
             NormalizedEvent::TopologyUpsert { entity, .. } => match entity {
@@ -731,6 +757,14 @@ impl Reducer {
             } => {
                 self.apply_execution_state(execution_id, state, metadata, persist);
             }
+            NormalizedEvent::AgentNodeUpsert { node, .. } => {
+                self.apply_agent_node_observation(node, persist)?;
+            }
+            NormalizedEvent::AgentActivity {
+                agent_node_id,
+                activity,
+                ..
+            } => self.apply_agent_activity(agent_node_id, activity, metadata, persist),
             NormalizedEvent::ExecutionBegin { execution, .. } => {
                 self.model.insert_execution(execution.clone());
             }
@@ -738,6 +772,194 @@ impl Reducer {
                 self.end_execution(execution_id, metadata.receipt_time_ms, persist);
             }
         }
+        Ok(())
+    }
+
+    fn apply_agent_node_observation(
+        &mut self,
+        observed: &AgentNodeObservation,
+        persist: &mut PersistBatch,
+    ) -> Result<(), ReducerError> {
+        if self.model.task_run(&observed.task_run_id).is_none() {
+            return Ok(());
+        }
+        let existing_id = observed
+            .native_session_id
+            .as_deref()
+            .and_then(|sid| {
+                self.agent_node_id_for_native(observed.provider, sid, observed.task_run_id)
+            })
+            .or_else(|| {
+                self.model
+                    .agent_node(&observed.agent_node_id)
+                    .map(|node| node.agent_node_id.clone())
+            });
+        let mut node = match existing_id
+            .as_deref()
+            .and_then(|node_id| self.model.agent_node(node_id))
+            .cloned()
+        {
+            Some(node) => node,
+            None => AgentNode {
+                agent_node_id: observed.native_session_id.as_deref().map_or_else(
+                    || observed.agent_node_id.clone(),
+                    |sid| deterministic_agent_node_id(observed.provider, sid),
+                ),
+                provider: observed.provider,
+                native_session_id: observed.native_session_id.clone(),
+                task_run_id: observed.task_run_id,
+                display_ordinal: self.allocate_ordinal()?,
+                parent_agent_node_id: None,
+                state: None,
+                model_id: None,
+                last_event_kind: None,
+                last_tool_name: None,
+                last_item_count: None,
+                last_byte_count: None,
+                last_activity_at_ms: None,
+                session_file: None,
+            },
+        };
+        if let Some(native_session_id) = &observed.native_session_id {
+            node.native_session_id = Some(native_session_id.clone());
+        }
+        if observed.state == Some(ExecState::Working) {
+            node.state = Some(ExecState::Working);
+        }
+        if let Some(model_id) = &observed.model_id {
+            node.model_id = Some(model_id.clone());
+        }
+        if let Some(session_file) = &observed.session_file {
+            node.session_file = Some(session_file.clone());
+        }
+        if let Some(parent_id) = &observed.parent_agent_node_id {
+            let parent_id = self.resolve_parent_node_id(parent_id, node.provider, node.task_run_id);
+            if self.provider_parent_is_valid(&node.agent_node_id, &parent_id) {
+                node.parent_agent_node_id = Some(parent_id);
+            } else {
+                self.model
+                    .controller_diagnostics_mut()
+                    .record_provider_parent_conflict();
+            }
+        }
+        self.model.insert_agent_node(node.clone());
+        persist.push(PersistOp::UpsertAgentNode(node));
+        Ok(())
+    }
+
+    fn apply_agent_activity(
+        &mut self,
+        requested_id: &str,
+        activity: &MinimalProviderMetadata,
+        metadata: &EventMetadata,
+        persist: &mut PersistBatch,
+    ) {
+        let resolved_id = self
+            .model
+            .agent_node(requested_id)
+            .map(|node| node.agent_node_id.clone())
+            .or_else(|| {
+                metadata
+                    .provider
+                    .zip(activity.agent_id.as_deref())
+                    .and_then(|(provider, sid)| {
+                        self.model
+                            .agent_nodes()
+                            .filter(|node| {
+                                node.provider == provider
+                                    && node.native_session_id.as_deref() == Some(sid)
+                            })
+                            .map(|node| node.agent_node_id.clone())
+                            .min()
+                    })
+            });
+        let Some(mut node) = resolved_id
+            .as_deref()
+            .and_then(|node_id| self.model.agent_node(node_id))
+            .cloned()
+        else {
+            return;
+        };
+        if node
+            .last_activity_at_ms
+            .is_some_and(|observed| observed > metadata.timestamp_ms)
+        {
+            return;
+        }
+        node.last_activity_at_ms = Some(metadata.timestamp_ms);
+        if let Some(model_id) = &activity.model_id {
+            node.model_id = Some(model_id.clone());
+        }
+        if let Some(event_kind) = &activity.event_kind {
+            node.last_event_kind = Some(event_kind.clone());
+        }
+        if let Some(tool_name) = &activity.tool_name {
+            node.last_tool_name = Some(tool_name.clone());
+        }
+        if let Some(item_count) = activity.item_count {
+            node.last_item_count = Some(item_count);
+        }
+        if let Some(byte_count) = activity.byte_count {
+            node.last_byte_count = Some(byte_count);
+        }
+        self.model.insert_agent_node(node.clone());
+        persist.push(PersistOp::UpsertAgentNode(node));
+    }
+
+    fn agent_node_id_for_native(
+        &self,
+        provider: Provider,
+        sid: &str,
+        run_id: RunId,
+    ) -> Option<String> {
+        self.model
+            .agent_nodes()
+            .filter(|node| {
+                node.task_run_id == run_id
+                    && node.provider == provider
+                    && node.native_session_id.as_deref() == Some(sid)
+            })
+            .map(|node| node.agent_node_id.clone())
+            .min()
+    }
+
+    fn resolve_parent_node_id(
+        &self,
+        requested_id: &str,
+        provider: Provider,
+        run_id: RunId,
+    ) -> String {
+        self.model
+            .agent_nodes()
+            .find(|node| {
+                node.task_run_id == run_id
+                    && node.provider == provider
+                    && node.native_session_id.as_deref().is_some_and(|sid| {
+                        deterministic_agent_node_id(provider, sid) == requested_id
+                    })
+            })
+            .map_or_else(
+                || requested_id.to_owned(),
+                |node| node.agent_node_id.clone(),
+            )
+    }
+
+    fn provider_parent_is_valid(&self, child_id: &str, parent_id: &str) -> bool {
+        if child_id == parent_id {
+            return false;
+        }
+        let mut current = Some(parent_id);
+        let mut visited = std::collections::HashSet::new();
+        while let Some(node_id) = current {
+            if node_id == child_id || !visited.insert(node_id.to_owned()) {
+                return false;
+            }
+            current = self
+                .model
+                .agent_node(node_id)
+                .and_then(|node| node.parent_agent_node_id.as_deref());
+        }
+        true
     }
 
     fn apply_topology_closure(
@@ -845,6 +1067,8 @@ impl Reducer {
         let event_run = match event {
             NormalizedEvent::ControllerEvent { .. } => None,
             NormalizedEvent::ExecutionBegin { execution, .. } => Some(execution.task_run_id),
+            NormalizedEvent::AgentNodeUpsert { node, .. } => Some(node.task_run_id),
+            NormalizedEvent::AgentActivity { .. } => None,
             NormalizedEvent::AgentStatusChanged { execution_id, .. }
             | NormalizedEvent::ExecutionEnd { execution_id, .. } => self
                 .model
@@ -867,7 +1091,16 @@ impl Reducer {
             .zip(metadata.native_session_id.as_deref())
             .filter(|(_, sid)| !sid.is_empty())
         {
-            let evidence = if matches!(task_run.key, RunKey::Controller(_)) {
+            let evidence = if metadata.source == "provider"
+                && metadata.source_event_type == "session_resolved"
+                && matches!(task_run.key, RunKey::NativePath { .. })
+            {
+                BindingEvidence::NativePathResolved {
+                    run: run_id,
+                    provider,
+                    sid: sid.to_owned(),
+                }
+            } else if matches!(task_run.key, RunKey::Controller(_)) {
                 BindingEvidence::ControllerNativeSession {
                     controller_run: run_id,
                     provider,
@@ -937,6 +1170,7 @@ impl Reducer {
             NormalizedEvent::ControllerEvent { .. } => None,
             NormalizedEvent::AgentStatusChanged { execution_id, .. } => Some(execution_id.as_str()),
             NormalizedEvent::ExecutionEnd { .. } => None,
+            NormalizedEvent::AgentNodeUpsert { .. } | NormalizedEvent::AgentActivity { .. } => None,
             NormalizedEvent::ExecutionBegin { execution, .. } => {
                 Some(execution.execution_id.as_str())
             }
@@ -1273,6 +1507,8 @@ fn event_metadata(event: &NormalizedEvent) -> &EventMetadata {
         | NormalizedEvent::TopologyUpsert { metadata, .. }
         | NormalizedEvent::TopologyClosure { metadata, .. }
         | NormalizedEvent::AgentStatusChanged { metadata, .. }
+        | NormalizedEvent::AgentNodeUpsert { metadata, .. }
+        | NormalizedEvent::AgentActivity { metadata, .. }
         | NormalizedEvent::ExecutionBegin { metadata, .. }
         | NormalizedEvent::ExecutionEnd { metadata, .. } => metadata,
     }
@@ -1284,9 +1520,19 @@ fn event_metadata_mut(event: &mut NormalizedEvent) -> &mut EventMetadata {
         | NormalizedEvent::TopologyUpsert { metadata, .. }
         | NormalizedEvent::TopologyClosure { metadata, .. }
         | NormalizedEvent::AgentStatusChanged { metadata, .. }
+        | NormalizedEvent::AgentNodeUpsert { metadata, .. }
+        | NormalizedEvent::AgentActivity { metadata, .. }
         | NormalizedEvent::ExecutionBegin { metadata, .. }
         | NormalizedEvent::ExecutionEnd { metadata, .. } => metadata,
     }
+}
+
+fn deterministic_agent_node_id(provider: Provider, sid: &str) -> String {
+    let provider = match provider {
+        Provider::Claude => "claude",
+        Provider::Codex => "codex",
+    };
+    format!("agent:{provider}:{sid}")
 }
 
 fn initial_controller_state(source_event_type: &str, supplied: TaskState) -> TaskState {
@@ -1502,11 +1748,11 @@ mod tests {
 
     use crate::lockfile::StateRoot;
     use crate::model::{
-        AgentNode, AgentSessionReference, AgentSessionReferenceKind, ControllerEvent,
-        ControllerEventKind, DependencyEdge, DisplayOrdinal, DomainModel, EventMetadata, ExecState,
-        Execution, ExecutionEdge, GapKind, NormalizedEvent, PaneSnapshot, Provider, ReconcileBatch,
-        RunId, RunKey, SnapshotAgent, TaskRun, TaskState, TopologyEntity, TopologySnapshot,
-        Workspace,
+        AgentNode, AgentNodeObservation, AgentSessionReference, AgentSessionReferenceKind,
+        ControllerEvent, ControllerEventKind, DependencyEdge, DisplayOrdinal, DomainModel,
+        EventMetadata, ExecState, Execution, ExecutionEdge, GapKind, MinimalProviderMetadata,
+        NormalizedEvent, PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SnapshotAgent,
+        TaskRun, TaskState, TopologyEntity, TopologySnapshot, Workspace,
     };
     use crate::store::{
         PersistOp, RestoredState, database_path, open_reader, open_writer, spawn_writer,
@@ -1556,6 +1802,21 @@ mod tests {
             metadata,
             event,
         }
+    }
+
+    #[test]
+    fn controller_reserved_provider_event_id_is_invalid_at_schema_v1() {
+        let (reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let event = controller_event(
+            "prov:codex:node:native",
+            "run",
+            ControllerEventKind::TaskStarted,
+        );
+
+        assert!(matches!(
+            reducer.validate_controller_event(&event),
+            Err(RejectReason::Invalid)
+        ));
     }
 
     fn controller_model(raw_run_id: &str, state: TaskState) -> (DomainModel, RunId) {
@@ -1610,6 +1871,293 @@ mod tests {
             execution_id: execution_id.to_owned(),
             state,
         }
+    }
+
+    fn provider_node_event(
+        event_id: &str,
+        run_id: RunId,
+        native_session_id: &str,
+        state: Option<ExecState>,
+        model_id: Option<&str>,
+        parent_agent_node_id: Option<&str>,
+    ) -> NormalizedEvent {
+        let mut metadata = metadata(event_id, 100);
+        metadata.source = "provider".to_owned();
+        metadata.source_event_type = "agent_upsert".to_owned();
+        metadata.provider = Some(Provider::Codex);
+        metadata.task_run_id = Some(run_id);
+        NormalizedEvent::AgentNodeUpsert {
+            metadata,
+            node: AgentNodeObservation {
+                agent_node_id: format!("agent:codex:{native_session_id}"),
+                provider: Provider::Codex,
+                native_session_id: Some(native_session_id.to_owned()),
+                task_run_id: run_id,
+                parent_agent_node_id: parent_agent_node_id.map(str::to_owned),
+                state,
+                model_id: model_id.map(str::to_owned),
+                session_file: None,
+            },
+        }
+    }
+
+    fn provider_activity_event(
+        event_id: &str,
+        observed_at_ms: i64,
+        agent_node_id: &str,
+        event_kind: &str,
+    ) -> NormalizedEvent {
+        let mut metadata = metadata(event_id, observed_at_ms);
+        metadata.source = "provider".to_owned();
+        metadata.source_event_type = "activity".to_owned();
+        metadata.provider = Some(Provider::Codex);
+        NormalizedEvent::AgentActivity {
+            metadata,
+            agent_node_id: agent_node_id.to_owned(),
+            activity: MinimalProviderMetadata {
+                event_kind: Some(event_kind.to_owned()),
+                item_count: Some(3),
+                ..MinimalProviderMetadata::default()
+            },
+        }
+    }
+
+    #[test]
+    fn provider_upsert_reuses_gap_node_patches_fields_and_never_reactivates_run() {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "root-session".to_owned(),
+            },
+            7,
+            TaskState::EndedUnknown,
+        ));
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "gap-agent-existing".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some("child-1".to_owned()),
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(8),
+            parent_agent_node_id: None,
+            state: None,
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: Some("/kept/session.jsonl".to_owned()),
+        });
+        let (mut reducer, shared) = Reducer::new(restored(model, 20));
+
+        let outcome = reducer
+            .apply(provider_node_event(
+                "prov:codex:up:call-1",
+                run_id,
+                "child-1",
+                Some(ExecState::Working),
+                Some("gpt-5.6"),
+                None,
+            ))
+            .unwrap();
+
+        assert!(matches!(outcome, ApplyOutcome::Applied(_)));
+        let model = shared.borrow();
+        assert_eq!(model.agent_nodes().count(), 1);
+        let node = model.agent_node("gap-agent-existing").unwrap();
+        assert_eq!(node.display_ordinal, DisplayOrdinal::new(8));
+        assert_eq!(node.state, Some(ExecState::Working));
+        assert_eq!(node.model_id.as_deref(), Some("gpt-5.6"));
+        assert_eq!(node.session_file.as_deref(), Some("/kept/session.jsonl"));
+        assert_eq!(
+            model.task_run(&run_id).unwrap().state,
+            TaskState::EndedUnknown
+        );
+    }
+
+    #[test]
+    fn provider_upsert_mints_the_frozen_deterministic_node_id() {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "root-session".to_owned(),
+            },
+            1,
+            TaskState::Running,
+        ));
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+        let mut event = provider_node_event(
+            "prov:codex:node:child-1",
+            run_id,
+            "child-1",
+            None,
+            None,
+            None,
+        );
+        let NormalizedEvent::AgentNodeUpsert { node, .. } = &mut event else {
+            unreachable!();
+        };
+        node.agent_node_id = "caller-chosen-id".to_owned();
+
+        reducer.apply(event).unwrap();
+        for state in [
+            ExecState::Idle,
+            ExecState::Blocked,
+            ExecState::Ended,
+            ExecState::Stale { since_ms: 1 },
+        ] {
+            reducer
+                .apply(provider_node_event(
+                    &format!("prov:codex:up:{state:?}"),
+                    run_id,
+                    "child-1",
+                    Some(state),
+                    None,
+                    None,
+                ))
+                .unwrap();
+        }
+
+        assert!(shared.borrow().agent_node("caller-chosen-id").is_none());
+        assert_eq!(
+            shared
+                .borrow()
+                .agent_node("agent:codex:child-1")
+                .unwrap()
+                .state,
+            None
+        );
+    }
+
+    #[test]
+    fn provider_activity_keeps_newest_observed_time_then_latest_arrival() {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "root-session".to_owned(),
+            },
+            1,
+            TaskState::Running,
+        ));
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+        reducer
+            .apply(provider_node_event(
+                "prov:codex:node:child-1",
+                run_id,
+                "child-1",
+                None,
+                None,
+                None,
+            ))
+            .unwrap();
+        reducer
+            .apply(provider_activity_event(
+                "prov:codex:act:new",
+                200,
+                "agent:codex:child-1",
+                "new",
+            ))
+            .unwrap();
+        reducer
+            .apply(provider_activity_event(
+                "prov:codex:act:old",
+                199,
+                "agent:codex:child-1",
+                "old",
+            ))
+            .unwrap();
+        reducer
+            .apply(provider_activity_event(
+                "prov:codex:act:tie",
+                200,
+                "agent:codex:child-1",
+                "tie-wins",
+            ))
+            .unwrap();
+
+        let model = shared.borrow();
+        let node = model.agent_node("agent:codex:child-1").unwrap();
+        assert_eq!(node.last_activity_at_ms, Some(200));
+        assert_eq!(node.last_event_kind.as_deref(), Some("tie-wins"));
+        assert_eq!(node.last_item_count, Some(3));
+        assert_eq!(node.display_ordinal, DisplayOrdinal::new(2));
+    }
+
+    #[test]
+    fn provider_parent_self_link_and_cycle_are_dropped_and_counted_without_dropping_nodes() {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "root-session".to_owned(),
+            },
+            1,
+            TaskState::Running,
+        ));
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+        reducer
+            .apply(provider_node_event(
+                "prov:codex:link:a:b",
+                run_id,
+                "a",
+                None,
+                None,
+                Some("agent:codex:b"),
+            ))
+            .unwrap();
+        reducer
+            .apply(provider_node_event(
+                "prov:codex:link:b:a",
+                run_id,
+                "b",
+                None,
+                None,
+                Some("agent:codex:a"),
+            ))
+            .unwrap();
+        reducer
+            .apply(provider_node_event(
+                "prov:codex:link:c:c",
+                run_id,
+                "c",
+                None,
+                None,
+                Some("agent:codex:c"),
+            ))
+            .unwrap();
+
+        let model = shared.borrow();
+        assert!(model.agent_node("agent:codex:b").is_some());
+        assert!(model.agent_node("agent:codex:c").is_some());
+        assert_eq!(
+            model
+                .agent_node("agent:codex:b")
+                .unwrap()
+                .parent_agent_node_id,
+            None
+        );
+        assert_eq!(
+            model
+                .agent_node("agent:codex:c")
+                .unwrap()
+                .parent_agent_node_id,
+            None
+        );
+        assert_eq!(
+            model.controller_diagnostics().provider_parent_conflicts(),
+            2
+        );
     }
 
     fn topology_event(metadata: EventMetadata, workspace_id: &str) -> NormalizedEvent {
@@ -2078,14 +2626,34 @@ mod tests {
             provider: Provider::Codex,
             native_session_id: Some("reattach-sid".to_owned()),
             task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(2),
+            parent_agent_node_id: None,
+            state: None,
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
         });
         model.insert_agent_node(AgentNode {
             agent_node_id: "sub-agent-node".to_owned(),
             provider: Provider::Codex,
             native_session_id: Some("child-sid".to_owned()),
             task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(3),
+            parent_agent_node_id: None,
+            state: None,
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
         });
-        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+        let (mut reducer, shared) = Reducer::new(restored(model, 4));
 
         reducer
             .reconcile_gap(ReconcileBatch {

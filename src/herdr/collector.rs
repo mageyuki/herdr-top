@@ -1,8 +1,10 @@
 //! T9 subscribe/buffer/snapshot/replay collector, convergence, and gap reconciliation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
+use std::ffi::OsStr;
 use std::future::pending;
+use std::io;
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,9 +19,17 @@ use tokio_util::sync::CancellationToken;
 
 use crate::lockfile::OwnerRecord;
 use crate::model::{
-    AgentSessionReference, AgentSessionReferenceKind, EventMetadata, ExecState, Execution, GapKind,
-    NormalizedEvent, Pane, PaneSnapshot, Provider, ReconcileBatch, RunId, SharedModel,
-    SnapshotAgent, Tab, TopologyEntity, TopologyEntityId, TopologySnapshot, Workspace,
+    AgentNodeObservation, AgentSessionReference, AgentSessionReferenceKind, DomainModel,
+    EventMetadata, ExecState, Execution, GapKind, MinimalProviderMetadata, NormalizedEvent, Pane,
+    PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SharedModel, SnapshotAgent,
+    SourceCoverage, Tab, TopologyEntity, TopologyEntityId, TopologySnapshot, Workspace,
+};
+use crate::provider::{
+    BootstrapIdentity, BootstrapParser, DiscoveryIndex, DiscoveryRoot, FsReadBoundary,
+    MergeOutcome, PendingEvents, ProviderCycle, ProviderEvent, ProviderSourceState,
+    ProviderSpawnError, ProviderTarget, ProviderTargetPublisher, ProviderThreadError,
+    ProviderThreadHandle, ProviderWorker, RecommendedNotifyFactory, TailFile, TargetSet,
+    spawn_provider_thread,
 };
 use crate::reducer::{ApplyOutcome, Reducer, ReducerError};
 use crate::store::writer::{WriterClient, WriterError};
@@ -78,6 +88,12 @@ pub enum CollectorError {
     /// The Controller acceptor task panicked or was cancelled externally.
     #[error("Controller acceptor task failed: {0}")]
     ControllerTask(String),
+    /// The provider I/O thread or notify backend could not be started.
+    #[error(transparent)]
+    ProviderSpawn(#[from] ProviderSpawnError),
+    /// The provider I/O thread did not stop cleanly.
+    #[error(transparent)]
+    ProviderThread(#[from] ProviderThreadError),
 }
 
 /// Handle to the collector's coherent model and observation-quality streams.
@@ -89,38 +105,54 @@ pub struct CollectorHandle {
     cancellation: CancellationToken,
     task: JoinHandle<Result<(), CollectorError>>,
     controller_acceptor: Option<JoinHandle<Result<(), ControllerServerError>>>,
+    provider_thread: Option<ProviderThreadHandle>,
 }
 
 impl CollectorHandle {
     /// Cancels the collector and waits for its subscription task to exit.
     pub async fn stop(self) -> Result<(), CollectorError> {
+        self.stop_with_timeout(STOP_TIMEOUT).await
+    }
+
+    async fn stop_with_timeout(self, timeout: Duration) -> Result<(), CollectorError> {
         self.cancellation.cancel();
         let mut task = self.task;
-        let collector_result = match tokio::time::timeout(STOP_TIMEOUT, &mut task).await {
-            Ok(result) => result.map_err(|error| CollectorError::Task(error.to_string()))?,
+        let collector_result = match tokio::time::timeout(timeout, &mut task).await {
+            Ok(result) => result
+                .map_err(|error| CollectorError::Task(error.to_string()))
+                .and_then(std::convert::identity),
             Err(_) => {
                 task.abort();
                 let _ = task.await;
-                return Err(CollectorError::StopTimeout {
-                    seconds: STOP_TIMEOUT.as_secs(),
-                });
+                Err(CollectorError::StopTimeout {
+                    seconds: timeout.as_secs(),
+                })
             }
         };
-        if let Some(mut acceptor) = self.controller_acceptor {
-            match tokio::time::timeout(STOP_TIMEOUT, &mut acceptor).await {
-                Ok(result) => {
-                    result.map_err(|error| CollectorError::ControllerTask(error.to_string()))??
-                }
+        let controller_result = if let Some(mut acceptor) = self.controller_acceptor {
+            match tokio::time::timeout(timeout, &mut acceptor).await {
+                Ok(result) => result
+                    .map_err(|error| CollectorError::ControllerTask(error.to_string()))
+                    .and_then(|result| result.map_err(CollectorError::from)),
                 Err(_) => {
                     acceptor.abort();
                     let _ = acceptor.await;
-                    return Err(CollectorError::StopTimeout {
-                        seconds: STOP_TIMEOUT.as_secs(),
-                    });
+                    Err(CollectorError::StopTimeout {
+                        seconds: timeout.as_secs(),
+                    })
                 }
             }
-        }
-        collector_result
+        } else {
+            Ok(())
+        };
+        let provider_result = match self.provider_thread {
+            Some(provider) => provider.stop().await.map_err(CollectorError::from),
+            None => Ok(()),
+        };
+
+        collector_result?;
+        controller_result?;
+        provider_result
     }
 }
 
@@ -156,7 +188,7 @@ pub async fn spawn_with_controller(
             );
             (Some(sender), Some(receiver))
         });
-    let controller_acceptor = match (controller_listener, controller_sender) {
+    let mut controller_acceptor = match (controller_listener, controller_sender) {
         (Some(listener), Some(sender)) => Some(controller::spawn_acceptor(
             listener,
             sender,
@@ -164,6 +196,31 @@ pub async fn spawn_with_controller(
         )?),
         _ => None,
     };
+    let (provider_sender, provider_events) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+    let provider_thread = match spawn_provider_thread(
+        AdapterProviderWorker::default(),
+        provider_sender,
+        Some(Box::new(RecommendedNotifyFactory)),
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            cancellation.cancel();
+            if let Some(mut acceptor) = controller_acceptor.take()
+                && tokio::time::timeout(STOP_TIMEOUT, &mut acceptor)
+                    .await
+                    .is_err()
+            {
+                acceptor.abort();
+                let _ = acceptor.await;
+            }
+            return Err(error.into());
+        }
+    };
+    let provider_publisher = provider_thread.target_publisher();
+    let restored_targets = derive_provider_targets(&model.borrow());
+    provider_publisher.update_targets(restored_targets.clone());
+    let provider_integration =
+        ProviderIntegration::new(provider_events, provider_publisher, restored_targets);
     let task_cancellation = cancellation.clone();
     let task_model = model.clone();
     let task = tokio::spawn(async move {
@@ -177,6 +234,7 @@ pub async fn spawn_with_controller(
             task_cancellation,
             owner,
             controller_requests,
+            provider_integration,
         )
         .await
     });
@@ -187,6 +245,7 @@ pub async fn spawn_with_controller(
         cancellation,
         task,
         controller_acceptor,
+        provider_thread: Some(provider_thread),
     })
 }
 
@@ -201,6 +260,7 @@ async fn run_collector(
     cancellation: CancellationToken,
     mut owner: OwnerTracker,
     mut controller_requests: Option<ControllerRequestReceiver>,
+    mut provider: ProviderIntegration,
 ) -> Result<(), CollectorError> {
     let mut first_subscription = true;
     let mut previous_socket = None;
@@ -223,6 +283,7 @@ async fn run_collector(
             }
             request = receive_controller(&mut controller_requests) => {
                 service_controller(request, &mut controller_requests, &session, &mut reducer, &writer).await;
+                provider.publish_targets(&shared);
                 continue;
             }
             result = wire::subscribe(&sock, &subscriptions) => result,
@@ -237,8 +298,10 @@ async fn run_collector(
                     &session,
                     &mut reducer,
                     &writer,
+                    &shared,
+                    &mut provider,
                 )
-                .await
+                .await?
                 {
                     return Ok(());
                 }
@@ -269,6 +332,7 @@ async fn run_collector(
             events,
             Arc::clone(&overflowed),
             &mut controller_requests,
+            &mut provider,
         )
         .await;
 
@@ -311,6 +375,7 @@ async fn converge(
     mut events: mpsc::Receiver<ReceivedEvent>,
     overflowed: Arc<AtomicBool>,
     controller_requests: &mut Option<ControllerRequestReceiver>,
+    provider: &mut ProviderIntegration,
 ) -> Result<ConvergeOutcome, CollectorError> {
     let mut first_generation = true;
     let mut resnapshot_attempts = 0;
@@ -322,6 +387,7 @@ async fn converge(
             () = cancellation.cancelled() => return Ok(ConvergeOutcome::new(SubscriptionOutcome::Cancelled, !first_generation)),
             request = receive_controller(controller_requests) => {
                 service_controller(request, controller_requests, session, reducer, writer).await;
+                provider.publish_targets(shared);
                 continue;
             }
             result = wire::request(sock, "session.snapshot", json!({})) => {
@@ -347,6 +413,7 @@ async fn converge(
             apply_snapshot_in_place(reducer, shared, topology, session, &mut pending_closures)?
         };
         writer.apply(std::mem::take(&mut batch)).await?;
+        provider.publish_targets(shared);
         owner.refresh_from_snapshot(&snapshot, writer).await?;
 
         let replay = replay_generation(
@@ -361,6 +428,7 @@ async fn converge(
             cancellation,
             &mut pending_closures,
             controller_requests,
+            provider,
         )
         .await?;
         match replay {
@@ -389,6 +457,7 @@ async fn converge(
                     cancellation,
                     &mut pending_closures,
                     controller_requests,
+                    provider,
                 )
                 .await?
                 {
@@ -424,6 +493,7 @@ async fn converge(
                         cancellation,
                         &mut pending_closures,
                         controller_requests,
+                        provider,
                     )
                     .await?;
                     return Ok(ConvergeOutcome::new(outcome, !first_generation));
@@ -447,6 +517,7 @@ async fn replay_generation(
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
     controller_requests: &mut Option<ControllerRequestReceiver>,
+    provider: &mut ProviderIntegration,
 ) -> Result<ReplayOutcome, CollectorError> {
     let snapshot_entities = snapshot_entity_keys(snapshot);
     let mut buffered = Vec::new();
@@ -476,6 +547,7 @@ async fn replay_generation(
                 session,
                 received,
                 pending_closures,
+                provider,
             )
             .await?;
             next += 1;
@@ -488,6 +560,7 @@ async fn replay_generation(
             () = cancellation.cancelled() => return Ok(ReplayOutcome::Cancelled),
             request = receive_controller(controller_requests) => {
                 service_controller(request, controller_requests, session, reducer, writer).await;
+                provider.publish_targets(shared);
                 continue;
             }
             result = tokio::time::timeout(DRAIN_QUIET_PERIOD, events.recv()) => result,
@@ -527,6 +600,7 @@ async fn monitor_live(
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
     controller_requests: &mut Option<ControllerRequestReceiver>,
+    provider: &mut ProviderIntegration,
 ) -> Result<ReplayOutcome, CollectorError> {
     let mut stale_sweep = tokio::time::interval(STALE_SWEEP_INTERVAL);
     stale_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -536,6 +610,12 @@ async fn monitor_live(
             () = cancellation.cancelled() => return Ok(ReplayOutcome::Cancelled),
             request = receive_controller(controller_requests) => {
                 service_controller(request, controller_requests, session, reducer, writer).await;
+                provider.publish_targets(shared);
+                continue;
+            }
+            event = receive_provider(&mut provider.events) => {
+                service_provider_event(event, &mut provider.events, session, reducer, shared, writer).await?;
+                provider.publish_targets(shared);
                 continue;
             }
             received = events.recv() => match received {
@@ -554,6 +634,7 @@ async fn monitor_live(
             )?);
             if !persist.is_empty() {
                 writer.apply(persist).await?;
+                provider.publish_targets(shared);
             }
             let _ = writer.cleanup(unix_now_ms()).await?;
             continue;
@@ -568,6 +649,7 @@ async fn monitor_live(
             session,
             received,
             pending_closures,
+            provider,
         )
         .await?;
         if anomalous || overflowed.swap(false, Ordering::AcqRel) {
@@ -587,6 +669,7 @@ async fn monitor_reconciling(
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
     controller_requests: &mut Option<ControllerRequestReceiver>,
+    provider: &mut ProviderIntegration,
 ) -> Result<SubscriptionOutcome, CollectorError> {
     let mut stale_sweep = tokio::time::interval(STALE_SWEEP_INTERVAL);
     stale_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -596,6 +679,12 @@ async fn monitor_reconciling(
             () = cancellation.cancelled() => return Ok(SubscriptionOutcome::Cancelled),
             request = receive_controller(controller_requests) => {
                 service_controller(request, controller_requests, session, reducer, writer).await;
+                provider.publish_targets(shared);
+                continue;
+            }
+            event = receive_provider(&mut provider.events) => {
+                service_provider_event(event, &mut provider.events, session, reducer, shared, writer).await?;
+                provider.publish_targets(shared);
                 continue;
             }
             received = events.recv() => match received {
@@ -614,6 +703,7 @@ async fn monitor_reconciling(
             )?);
             if !persist.is_empty() {
                 writer.apply(persist).await?;
+                provider.publish_targets(shared);
             }
             let _ = writer.cleanup(unix_now_ms()).await?;
             continue;
@@ -626,6 +716,7 @@ async fn monitor_reconciling(
             session,
             received,
             pending_closures,
+            provider,
         )
         .await?;
     }
@@ -676,6 +767,356 @@ fn spawn_event_reader(
 struct ReceivedEvent {
     event: String,
     data: Value,
+}
+
+#[derive(Debug)]
+struct AdapterRootState {
+    discovery: DiscoveryIndex,
+    tails: HashMap<u32, TailFile>,
+    bootstrap_emitted: HashSet<u32>,
+}
+
+impl AdapterRootState {
+    fn new(provider: Provider, root: PathBuf) -> io::Result<Self> {
+        Ok(Self {
+            discovery: DiscoveryIndex::new(vec![DiscoveryRoot {
+                provider,
+                path: root,
+            }])?,
+            tails: HashMap::new(),
+            bootstrap_emitted: HashSet::new(),
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct AdapterBootstrapParser {
+    codex: crate::provider::codex::CodexBootstrapParser,
+    claude: crate::provider::claude::ClaudeBootstrapParser,
+}
+
+impl BootstrapParser for AdapterBootstrapParser {
+    fn parse_structural(
+        &mut self,
+        provider: Provider,
+        relative_path: &Path,
+        record: &[u8],
+    ) -> Option<BootstrapIdentity> {
+        match provider {
+            Provider::Codex => self.codex.parse_structural(provider, relative_path, record),
+            Provider::Claude => self
+                .claude
+                .parse_structural(provider, relative_path, record),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct AdapterProviderWorker {
+    roots: HashMap<(Provider, PathBuf), AdapterRootState>,
+    deferred: VecDeque<ProviderEvent>,
+}
+
+impl ProviderWorker for AdapterProviderWorker {
+    fn process(&mut self, cycle: &mut ProviderCycle<'_>) -> io::Result<()> {
+        if !drain_deferred_provider_events(&mut self.deferred, cycle.pending) {
+            return Ok(());
+        }
+
+        let mut targets_by_root: HashMap<(Provider, PathBuf), HashSet<PathBuf>> = HashMap::new();
+        for target in cycle.targets.iter() {
+            let root = provider_root_for_target(target.provider, &target.path)?;
+            targets_by_root
+                .entry((target.provider, root))
+                .or_default()
+                .insert(target.path.clone());
+        }
+        for provider in [Provider::Claude, Provider::Codex] {
+            let state = if targets_by_root
+                .keys()
+                .any(|(current, _)| *current == provider)
+            {
+                ProviderSourceState::Available
+            } else {
+                ProviderSourceState::NotApplicable
+            };
+            let _ = cycle
+                .pending
+                .merge(ProviderEvent::SourceState { provider, state });
+        }
+
+        let mut roots = targets_by_root.into_iter().collect::<Vec<_>>();
+        roots.sort_by(|left, right| {
+            integration_provider_rank((left.0).0)
+                .cmp(&integration_provider_rank((right.0).0))
+                .then_with(|| (left.0).1.cmp(&(right.0).1))
+        });
+        for ((provider, root), targets) in roots {
+            let state = match self.roots.entry((provider, root.clone())) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(AdapterRootState::new(provider, root.clone())?)
+                }
+            };
+            if root.is_dir() {
+                cycle.request_watch(root.clone());
+            }
+            let mut parser = AdapterBootstrapParser::default();
+            state.discovery.scan(&mut parser)?;
+            let files = state
+                .discovery
+                .files()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            let owner_sessions = target_owner_sessions(&files, &targets);
+            let mut relevant = files
+                .into_iter()
+                .filter(|file| {
+                    let absolute = file.root.join(&file.relative_path);
+                    targets.contains(&absolute)
+                        || file.bootstrap.as_ref().is_some_and(|identity| {
+                            identity.owner_session_id.as_ref().map_or_else(
+                                || owner_sessions.contains(&identity.thread_id),
+                                |id| owner_sessions.contains(id),
+                            )
+                        })
+                })
+                .collect::<Vec<_>>();
+            relevant.sort_by_key(|file| file.path_id);
+            let relevant_ids = relevant
+                .iter()
+                .map(|file| file.path_id)
+                .collect::<HashSet<_>>();
+            state
+                .tails
+                .retain(|path_id, _| relevant_ids.contains(path_id));
+            state
+                .bootstrap_emitted
+                .retain(|path_id| relevant_ids.contains(path_id));
+
+            for file in relevant {
+                if let Some(parent) = file.root.join(&file.relative_path).parent()
+                    && parent.is_dir()
+                {
+                    cycle.request_watch(parent.to_path_buf());
+                }
+                if !state.tails.contains_key(&file.path_id) {
+                    let mut boundary = FsReadBoundary;
+                    let tail = TailFile::open(
+                        &file.root,
+                        &file.relative_path,
+                        state.discovery.baseline(),
+                        &mut boundary,
+                    )?;
+                    state.tails.insert(file.path_id, tail);
+                }
+                let tail = state
+                    .tails
+                    .get_mut(&file.path_id)
+                    .expect("tail inserted for relevant file");
+                if state.bootstrap_emitted.insert(file.path_id) {
+                    let event =
+                        match provider {
+                            Provider::Codex => crate::provider::codex::CodexAdapter
+                                .bootstrap_event(&file, tail.generation(), unix_now_ms()),
+                            Provider::Claude => crate::provider::claude::ClaudeAdapter
+                                .bootstrap_event(&file, tail.generation(), unix_now_ms()),
+                        };
+                    if let Some(event) = event
+                        && !merge_adapter_events(
+                            std::iter::once(event),
+                            cycle.pending,
+                            &mut self.deferred,
+                        )
+                    {
+                        return Ok(());
+                    }
+                }
+                let mut boundary = FsReadBoundary;
+                let generation = tail.generation();
+                let mut records = tail.poll(&mut boundary)?.into_iter();
+                while let Some(record) = records.next() {
+                    let events = parse_adapter_record(
+                        provider,
+                        &state.discovery,
+                        &file,
+                        generation,
+                        &record,
+                    );
+                    if !merge_adapter_events(events, cycle.pending, &mut self.deferred) {
+                        self.deferred.extend(records.flat_map(|record| {
+                            parse_adapter_record(
+                                provider,
+                                &state.discovery,
+                                &file,
+                                generation,
+                                &record,
+                            )
+                        }));
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn parse_adapter_record(
+    provider: Provider,
+    discovery: &DiscoveryIndex,
+    file: &crate::provider::DiscoveredFile,
+    generation: u64,
+    record: &crate::provider::TailRecord,
+) -> Vec<ProviderEvent> {
+    match provider {
+        Provider::Codex => {
+            crate::provider::codex::CodexAdapter.parse_record(discovery, file, generation, record)
+        }
+        Provider::Claude => {
+            crate::provider::claude::ClaudeAdapter.parse_record(discovery, file, generation, record)
+        }
+    }
+}
+
+fn target_owner_sessions(
+    files: &[crate::provider::DiscoveredFile],
+    targets: &HashSet<PathBuf>,
+) -> HashSet<String> {
+    files
+        .iter()
+        .filter(|file| targets.contains(&file.root.join(&file.relative_path)))
+        .filter_map(|file| file.bootstrap.as_ref())
+        .map(|identity| {
+            identity
+                .owner_session_id
+                .clone()
+                .unwrap_or_else(|| identity.thread_id.clone())
+        })
+        .collect()
+}
+
+fn drain_deferred_provider_events(
+    deferred: &mut VecDeque<ProviderEvent>,
+    pending: &mut PendingEvents,
+) -> bool {
+    while let Some(event) = deferred.pop_front() {
+        match pending.merge(event) {
+            MergeOutcome::AtCapacity(event) => {
+                deferred.push_front(*event);
+                return false;
+            }
+            MergeOutcome::Accepted | MergeOutcome::Coalesced | MergeOutcome::Duplicate => {}
+        }
+    }
+    true
+}
+
+fn merge_adapter_events(
+    events: impl IntoIterator<Item = ProviderEvent>,
+    pending: &mut PendingEvents,
+    deferred: &mut VecDeque<ProviderEvent>,
+) -> bool {
+    let mut events = events.into_iter();
+    while let Some(event) = events.next() {
+        match pending.merge(event) {
+            MergeOutcome::AtCapacity(event) => {
+                deferred.push_back(*event);
+                deferred.extend(events);
+                return false;
+            }
+            MergeOutcome::Accepted | MergeOutcome::Coalesced | MergeOutcome::Duplicate => {}
+        }
+    }
+    true
+}
+
+fn provider_root_for_target(provider: Provider, target: &Path) -> io::Result<PathBuf> {
+    if !target.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "provider target must be an absolute path",
+        ));
+    }
+    let anchor = match provider {
+        Provider::Codex => "sessions",
+        Provider::Claude => "projects",
+    };
+    if let Some(root) = target.ancestors().find(|ancestor| {
+        ancestor.file_name() == Some(OsStr::new(anchor))
+            && ancestor.parent().is_some_and(|parent| {
+                parent.file_name()
+                    == Some(OsStr::new(match provider {
+                        Provider::Codex => ".codex",
+                        Provider::Claude => ".claude",
+                    }))
+            })
+    }) {
+        return Ok(root.to_path_buf());
+    }
+    target
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "provider target has no parent"))
+}
+
+const fn integration_provider_rank(provider: Provider) -> u8 {
+    match provider {
+        Provider::Claude => 0,
+        Provider::Codex => 1,
+    }
+}
+
+struct ProviderIntegration {
+    events: Option<mpsc::Receiver<ProviderEvent>>,
+    target_publisher: ProviderTargetPublisher,
+    published_targets: TargetSet,
+}
+
+impl ProviderIntegration {
+    fn new(
+        events: mpsc::Receiver<ProviderEvent>,
+        target_publisher: ProviderTargetPublisher,
+        published_targets: TargetSet,
+    ) -> Self {
+        Self {
+            events: Some(events),
+            target_publisher,
+            published_targets,
+        }
+    }
+
+    fn publish_targets(&mut self, shared: &SharedModel) {
+        let targets = derive_provider_targets(&shared.borrow());
+        if targets != self.published_targets {
+            self.target_publisher.update_targets(targets.clone());
+            self.published_targets = targets;
+        }
+    }
+}
+
+fn derive_provider_targets(model: &DomainModel) -> TargetSet {
+    let run_targets = model.task_runs().filter_map(|run| match &run.key {
+        RunKey::NativePath { provider, path } if !path.is_empty() => Some(ProviderTarget {
+            provider: *provider,
+            path: PathBuf::from(path),
+        }),
+        RunKey::Controller(_)
+        | RunKey::Native { .. }
+        | RunKey::NativePath { .. }
+        | RunKey::Provisional { .. } => None,
+    });
+    let node_targets = model.agent_nodes().filter_map(|node| {
+        node.session_file
+            .as_deref()
+            .filter(|path| !path.is_empty())
+            .map(|path| ProviderTarget {
+                provider: node.provider,
+                path: PathBuf::from(path),
+            })
+    });
+    TargetSet::new(run_targets.chain(node_targets))
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -758,6 +1199,7 @@ fn drain_events(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_received_event(
     reducer: &mut Reducer,
     shared: &SharedModel,
@@ -766,6 +1208,7 @@ async fn apply_received_event(
     session: &str,
     received: ReceivedEvent,
     pending_closures: &mut PendingTopologyClosures,
+    provider: &mut ProviderIntegration,
 ) -> Result<(), CollectorError> {
     if received.event == "pane_moved" {
         owner.refresh_from_move(&received.data, writer).await?;
@@ -777,6 +1220,7 @@ async fn apply_received_event(
     if !persist.is_empty() {
         writer.apply(persist).await?;
     }
+    provider.publish_targets(shared);
     cancel_pending_topology_closures(&received, pending_closures);
     Ok(())
 }
@@ -795,6 +1239,38 @@ fn apply_collector_observation(
 ) -> Result<Option<PersistBatch>, ReducerError> {
     let outcome = reducer.apply_observation(events)?;
     Ok(collector_apply_outcome(reducer, outcome))
+}
+
+async fn apply_provider_event(
+    event: ProviderEvent,
+    session: &str,
+    reducer: &mut Reducer,
+    shared: &SharedModel,
+    writer: &WriterClient,
+) -> Result<(), CollectorError> {
+    let normalized = normalize_provider_event(shared, session, event);
+    let identity_disagreement = normalized.identity_disagreement;
+    let events = normalized
+        .events
+        .into_iter()
+        .filter(|event| !writer.is_duplicate(&normalized_metadata(event).event_id))
+        .collect::<Vec<_>>();
+    if events.is_empty() {
+        return Ok(());
+    }
+    let disagreement_is_new = identity_disagreement
+        && events
+            .iter()
+            .any(|event| normalized_metadata(event).source_event_type == "session_resolved");
+    if let Some(persist) = apply_collector_observation(reducer, events)?
+        && !persist.is_empty()
+    {
+        writer.apply(persist).await?;
+    }
+    if disagreement_is_new {
+        reducer.record_provider_identity_disagreement();
+    }
+    Ok(())
 }
 
 fn collector_apply_outcome(reducer: &mut Reducer, outcome: ApplyOutcome) -> Option<PersistBatch> {
@@ -1597,6 +2073,355 @@ fn metadata(session: &str, kind: &str) -> EventMetadata {
     }
 }
 
+struct NormalizedProviderObservation {
+    events: Vec<NormalizedEvent>,
+    identity_disagreement: bool,
+}
+
+fn normalize_provider_event(
+    shared: &SharedModel,
+    session: &str,
+    event: ProviderEvent,
+) -> NormalizedProviderObservation {
+    match event {
+        ProviderEvent::SessionResolved {
+            provider,
+            agent_thread_id,
+            owner_session_id,
+            parent_thread_id,
+            path,
+            model_id,
+            event_id,
+            observed_at_ms,
+            ..
+        } => {
+            let path_text = path.to_string_lossy().into_owned();
+            let model = shared.borrow();
+            let path_key = RunKey::NativePath {
+                provider,
+                path: path_text.clone(),
+            };
+            let path_run = model.task_run_by_key(&path_key).map(|run| run.run_id);
+            let file_run = model
+                .agent_nodes()
+                .filter(|node| {
+                    node.provider == provider
+                        && node.session_file.as_deref() == Some(path_text.as_str())
+                })
+                .map(|node| node.task_run_id)
+                .min();
+            let owner_run = owner_session_id.as_deref().and_then(|sid| {
+                model
+                    .task_run_by_key(&RunKey::Native {
+                        provider,
+                        sid: sid.to_owned(),
+                    })
+                    .map(|run| run.run_id)
+            });
+            let Some(run_id) = path_run.or(file_run).or(owner_run) else {
+                return NormalizedProviderObservation {
+                    events: Vec::new(),
+                    identity_disagreement: false,
+                };
+            };
+            let identity_disagreement = owner_session_id.as_deref().is_some_and(|resolved_sid| {
+                matches!(
+                    model.task_run(&run_id).map(|run| &run.key),
+                    Some(RunKey::Native { provider: current_provider, sid })
+                        if *current_provider == provider && sid != resolved_sid
+                )
+            });
+            drop(model);
+
+            let node_id = deterministic_agent_node_id(provider, &agent_thread_id);
+            let parent_node_id = parent_thread_id
+                .as_deref()
+                .map(|parent| deterministic_agent_node_id(provider, parent));
+            let provider_metadata = MinimalProviderMetadata {
+                agent_id: Some(agent_thread_id.clone()),
+                parent_agent_id: parent_thread_id.clone(),
+                model_id: model_id.clone(),
+                event_kind: Some("session_resolved".to_owned()),
+                ..MinimalProviderMetadata::default()
+            };
+            let mut events = Vec::new();
+
+            let mut node_metadata = provider_metadata_for(
+                session,
+                provider,
+                format!("prov:{}:node:{agent_thread_id}", provider_name(provider)),
+                "agent_node",
+                observed_at_ms,
+                run_id,
+                &node_id,
+                provider_metadata.clone(),
+            );
+            node_metadata.native_session_id = None;
+            events.push(NormalizedEvent::AgentNodeUpsert {
+                metadata: node_metadata,
+                node: AgentNodeObservation {
+                    agent_node_id: node_id.clone(),
+                    provider,
+                    native_session_id: Some(agent_thread_id.clone()),
+                    task_run_id: run_id,
+                    parent_agent_node_id: None,
+                    state: None,
+                    model_id: None,
+                    session_file: None,
+                },
+            });
+
+            if let Some(parent_agent_node_id) = parent_node_id {
+                let link_metadata = provider_metadata_for(
+                    session,
+                    provider,
+                    format!(
+                        "prov:{}:link:{agent_thread_id}:{}",
+                        provider_name(provider),
+                        parent_thread_id.as_deref().expect("parent ID exists")
+                    ),
+                    "agent_parent_link",
+                    observed_at_ms,
+                    run_id,
+                    &node_id,
+                    provider_metadata.clone(),
+                );
+                events.push(NormalizedEvent::AgentNodeUpsert {
+                    metadata: link_metadata,
+                    node: AgentNodeObservation {
+                        agent_node_id: node_id.clone(),
+                        provider,
+                        native_session_id: Some(agent_thread_id.clone()),
+                        task_run_id: run_id,
+                        parent_agent_node_id: Some(parent_agent_node_id),
+                        state: None,
+                        model_id: None,
+                        session_file: None,
+                    },
+                });
+            }
+
+            let mut resolved_metadata = provider_metadata_for(
+                session,
+                provider,
+                event_id,
+                "session_resolved",
+                observed_at_ms,
+                run_id,
+                &node_id,
+                provider_metadata,
+            );
+            if !identity_disagreement {
+                resolved_metadata.native_session_id = owner_session_id;
+            }
+            events.push(NormalizedEvent::AgentNodeUpsert {
+                metadata: resolved_metadata,
+                node: AgentNodeObservation {
+                    agent_node_id: node_id,
+                    provider,
+                    native_session_id: Some(agent_thread_id),
+                    task_run_id: run_id,
+                    parent_agent_node_id: None,
+                    state: None,
+                    model_id,
+                    session_file: Some(path_text),
+                },
+            });
+            NormalizedProviderObservation {
+                events,
+                identity_disagreement,
+            }
+        }
+        ProviderEvent::AgentUpsert {
+            provider,
+            agent_thread_id,
+            owner_session_id,
+            parent_thread_id,
+            state,
+            model_id,
+            event_id,
+            observed_at_ms,
+            ..
+        } => {
+            let model = shared.borrow();
+            let owner_run = owner_session_id.as_deref().and_then(|sid| {
+                model
+                    .task_run_by_key(&RunKey::Native {
+                        provider,
+                        sid: sid.to_owned(),
+                    })
+                    .map(|run| run.run_id)
+            });
+            let node_run = model
+                .agent_nodes()
+                .find(|node| {
+                    node.provider == provider
+                        && node.native_session_id.as_deref() == Some(agent_thread_id.as_str())
+                })
+                .map(|node| node.task_run_id);
+            let Some(run_id) = owner_run.or(node_run) else {
+                return NormalizedProviderObservation {
+                    events: Vec::new(),
+                    identity_disagreement: false,
+                };
+            };
+            drop(model);
+            let node_id = deterministic_agent_node_id(provider, &agent_thread_id);
+            let parent_agent_node_id = parent_thread_id
+                .as_deref()
+                .map(|parent| deterministic_agent_node_id(provider, parent));
+            let provider_metadata = MinimalProviderMetadata {
+                agent_id: Some(agent_thread_id.clone()),
+                parent_agent_id: parent_thread_id,
+                model_id: model_id.clone(),
+                event_kind: Some("agent_upsert".to_owned()),
+                ..MinimalProviderMetadata::default()
+            };
+            let metadata = provider_metadata_for(
+                session,
+                provider,
+                event_id,
+                "agent_upsert",
+                observed_at_ms,
+                run_id,
+                &node_id,
+                provider_metadata,
+            );
+            NormalizedProviderObservation {
+                events: vec![NormalizedEvent::AgentNodeUpsert {
+                    metadata,
+                    node: AgentNodeObservation {
+                        agent_node_id: node_id,
+                        provider,
+                        native_session_id: Some(agent_thread_id),
+                        task_run_id: run_id,
+                        parent_agent_node_id,
+                        state,
+                        model_id,
+                        session_file: None,
+                    },
+                }],
+                identity_disagreement: false,
+            }
+        }
+        ProviderEvent::Activity {
+            provider,
+            agent_thread_id,
+            activity,
+            event_id,
+            observed_at_ms,
+            ..
+        } => {
+            let model = shared.borrow();
+            let node = model
+                .agent_nodes()
+                .filter(|node| {
+                    node.provider == provider
+                        && node.native_session_id.as_deref() == Some(agent_thread_id.as_str())
+                })
+                .min_by_key(|node| node.agent_node_id.as_str())
+                .cloned();
+            let Some(node) = node else {
+                return NormalizedProviderObservation {
+                    events: Vec::new(),
+                    identity_disagreement: false,
+                };
+            };
+            drop(model);
+            let metadata = provider_metadata_for(
+                session,
+                provider,
+                event_id,
+                "activity",
+                observed_at_ms,
+                node.task_run_id,
+                &node.agent_node_id,
+                activity.clone(),
+            );
+            NormalizedProviderObservation {
+                events: vec![NormalizedEvent::AgentActivity {
+                    metadata,
+                    agent_node_id: node.agent_node_id,
+                    activity,
+                }],
+                identity_disagreement: false,
+            }
+        }
+        ProviderEvent::SourceState { .. } | ProviderEvent::Malformed { .. } => {
+            NormalizedProviderObservation {
+                events: Vec::new(),
+                identity_disagreement: false,
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn provider_metadata_for(
+    session: &str,
+    provider: Provider,
+    event_id: String,
+    kind: &str,
+    observed_at_ms: i64,
+    run_id: RunId,
+    agent_node_id: &str,
+    provider_metadata: MinimalProviderMetadata,
+) -> EventMetadata {
+    EventMetadata {
+        event_id,
+        timestamp_ms: observed_at_ms,
+        receipt_time_ms: unix_now_ms(),
+        source: "provider".to_owned(),
+        source_event_type: kind.to_owned(),
+        herdr_session: session.to_owned(),
+        workspace_id: None,
+        tab_id: None,
+        pane_id: None,
+        terminal_id: None,
+        provider: Some(provider),
+        native_session_id: None,
+        task_run_id: Some(run_id),
+        agent_node_id: Some(agent_node_id.to_owned()),
+        task_state: None,
+        execution_parent: None,
+        dependency: None,
+        source_coverage: vec![SourceCoverage {
+            source: provider_name(provider).to_owned(),
+            available: true,
+            detail: None,
+        }],
+        provider_metadata: Some(provider_metadata),
+        label: None,
+        reason: None,
+        progress: None,
+        ingest_seq: None,
+    }
+}
+
+fn normalized_metadata(event: &NormalizedEvent) -> &EventMetadata {
+    match event {
+        NormalizedEvent::ControllerEvent { metadata, .. }
+        | NormalizedEvent::TopologyUpsert { metadata, .. }
+        | NormalizedEvent::TopologyClosure { metadata, .. }
+        | NormalizedEvent::AgentStatusChanged { metadata, .. }
+        | NormalizedEvent::AgentNodeUpsert { metadata, .. }
+        | NormalizedEvent::AgentActivity { metadata, .. }
+        | NormalizedEvent::ExecutionBegin { metadata, .. }
+        | NormalizedEvent::ExecutionEnd { metadata, .. } => metadata,
+    }
+}
+
+fn deterministic_agent_node_id(provider: Provider, thread_id: &str) -> String {
+    format!("agent:{}:{thread_id}", provider_name(provider))
+}
+
+const fn provider_name(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude => "claude",
+        Provider::Codex => "codex",
+    }
+}
+
 fn pane_entity(pane: &PaneInfo) -> Result<Pane, CollectorError> {
     Ok(Pane {
         pane_id: pane.pane_id.clone(),
@@ -1927,6 +2752,32 @@ async fn receive_controller(
     }
 }
 
+async fn receive_provider(
+    receiver: &mut Option<mpsc::Receiver<ProviderEvent>>,
+) -> Option<ProviderEvent> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => pending().await,
+    }
+}
+
+async fn service_provider_event(
+    event: Option<ProviderEvent>,
+    receiver: &mut Option<mpsc::Receiver<ProviderEvent>>,
+    session: &str,
+    reducer: &mut Reducer,
+    shared: &SharedModel,
+    writer: &WriterClient,
+) -> Result<(), CollectorError> {
+    match event {
+        Some(event) => apply_provider_event(event, session, reducer, shared, writer).await,
+        None => {
+            *receiver = None;
+            Ok(())
+        }
+    }
+}
+
 async fn service_controller(
     request: Option<ControllerRequest>,
     receiver: &mut Option<ControllerRequestReceiver>,
@@ -1940,6 +2791,7 @@ async fn service_controller(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn wait_or_service_controller(
     cancellation: &CancellationToken,
     duration: Duration,
@@ -1947,15 +2799,29 @@ async fn wait_or_service_controller(
     session: &str,
     reducer: &mut Reducer,
     writer: &WriterClient,
-) -> bool {
+    shared: &SharedModel,
+    provider: &mut ProviderIntegration,
+) -> Result<bool, CollectorError> {
     let delay = tokio::time::sleep(duration);
     tokio::pin!(delay);
     loop {
         tokio::select! {
-            () = cancellation.cancelled() => return true,
-            () = &mut delay => return false,
+            () = cancellation.cancelled() => return Ok(true),
+            () = &mut delay => return Ok(false),
             request = receive_controller(receiver) => {
                 service_controller(request, receiver, session, reducer, writer).await;
+                provider.publish_targets(shared);
+            }
+            event = receive_provider(&mut provider.events) => {
+                service_provider_event(
+                    event,
+                    &mut provider.events,
+                    session,
+                    reducer,
+                    shared,
+                    writer,
+                ).await?;
+                provider.publish_targets(shared);
             }
         }
     }
@@ -1966,4 +2832,535 @@ fn unix_now_ms() -> i64 {
         return 0;
     };
     duration.as_millis().min(i64::MAX as u128) as i64
+}
+
+#[cfg(test)]
+mod provider_integration_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use tokio::sync::watch;
+
+    use super::*;
+    use crate::lockfile::StateRoot;
+    use crate::model::{
+        AgentNode, DisplayOrdinal, DomainModel, ExecState, ExecutionEdge, MinimalProviderMetadata,
+        RunKey, TaskRun, TaskState,
+    };
+    use crate::provider::{ProviderCycle, ProviderEvent, ProviderWorker, SourcePosition};
+    use crate::store::{
+        NativeSessionBinding, PersistOp, PersistTaskRun, open_reader, open_writer, spawn_writer,
+    };
+
+    #[test]
+    fn session_resolution_normalizes_stable_node_link_and_meta_effects() {
+        let run_id = RunId::new();
+        let path = "/tmp/provider/root.jsonl";
+        let mut model = DomainModel::default();
+        model.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::NativePath {
+                provider: Provider::Codex,
+                path: path.to_owned(),
+            },
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Running,
+            has_controller_task_state_event: false,
+        });
+        let (_sender, shared) = watch::channel(Arc::new(model));
+        let event = ProviderEvent::SessionResolved {
+            provider: Provider::Codex,
+            agent_thread_id: "child".to_owned(),
+            owner_session_id: Some("owner".to_owned()),
+            parent_thread_id: Some("parent".to_owned()),
+            path: PathBuf::from(path),
+            model_id: Some("gpt-test".to_owned()),
+            depth: Some(1),
+            event_id: "prov:codex:meta:child".to_owned(),
+            observed_at_ms: 123,
+            position: SourcePosition {
+                path_id: 1,
+                generation: 0,
+                offset: 2,
+            },
+        };
+
+        let normalized = normalize_provider_event(&shared, "session", event);
+        let ids = normalized
+            .events
+            .iter()
+            .map(|event| super::normalized_metadata(event).event_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ids,
+            [
+                "prov:codex:node:child",
+                "prov:codex:link:child:parent",
+                "prov:codex:meta:child",
+            ]
+        );
+        assert!(!normalized.identity_disagreement);
+        let metadata = super::normalized_metadata(normalized.events.last().unwrap());
+        assert_eq!(metadata.task_run_id, Some(run_id));
+        assert_eq!(metadata.native_session_id.as_deref(), Some("owner"));
+        assert_eq!(metadata.source_coverage.len(), 1);
+        assert_eq!(metadata.source_coverage[0].source, "codex");
+    }
+
+    struct DropObservedWorker(Arc<AtomicBool>);
+
+    impl ProviderWorker for DropObservedWorker {
+        fn process(&mut self, _cycle: &mut ProviderCycle<'_>) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for DropObservedWorker {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test]
+    async fn collector_timeout_still_stops_and_joins_the_provider_thread() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (provider_sender, _provider_events) = mpsc::channel(1);
+        let provider_thread = spawn_provider_thread(
+            DropObservedWorker(Arc::clone(&dropped)),
+            provider_sender,
+            None,
+        )
+        .unwrap();
+        let (_quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
+        let (_reducer, model) = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let handle = CollectorHandle {
+            quality,
+            model,
+            cancellation: CancellationToken::new(),
+            task: tokio::spawn(async {
+                std::future::pending::<()>().await;
+                Ok(())
+            }),
+            controller_acceptor: None,
+            provider_thread: Some(provider_thread),
+        };
+
+        assert!(matches!(
+            handle.stop_with_timeout(Duration::from_millis(10)).await,
+            Err(CollectorError::StopTimeout { .. })
+        ));
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn provider_fallback_promotes_path_and_duplicate_payload_is_first_wins() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let path = directory.path().join("provider/root.jsonl");
+        let run_id = RunId::new();
+        let task_run = TaskRun {
+            run_id,
+            key: RunKey::NativePath {
+                provider: Provider::Codex,
+                path: path.to_string_lossy().into_owned(),
+            },
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::EndedUnknown,
+            has_controller_task_state_event: false,
+        };
+        let mut store = open_writer(&root).unwrap();
+        store
+            .apply_batch(vec![PersistOp::UpsertTaskRun(PersistTaskRun {
+                task_run,
+                native_session: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                finished_at_ms: None,
+            })])
+            .unwrap();
+        let restored = store.load_restored_state().unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored);
+
+        apply_provider_event(
+            ProviderEvent::SessionResolved {
+                provider: Provider::Codex,
+                agent_thread_id: "owner".to_owned(),
+                owner_session_id: Some("owner".to_owned()),
+                parent_thread_id: None,
+                path: path.clone(),
+                model_id: Some("gpt-first".to_owned()),
+                depth: Some(0),
+                event_id: "prov:codex:meta:owner".to_owned(),
+                observed_at_ms: 100,
+                position: SourcePosition {
+                    path_id: 1,
+                    generation: 0,
+                    offset: 0,
+                },
+            },
+            "session",
+            &mut reducer,
+            &shared,
+            &writer,
+        )
+        .await
+        .unwrap();
+        let activity = |kind: &str| ProviderEvent::Activity {
+            provider: Provider::Codex,
+            agent_thread_id: "owner".to_owned(),
+            activity: MinimalProviderMetadata {
+                agent_id: Some("owner".to_owned()),
+                event_kind: Some(kind.to_owned()),
+                ..MinimalProviderMetadata::default()
+            },
+            event_id: "prov:codex:act:same".to_owned(),
+            observed_at_ms: 200,
+            position: SourcePosition {
+                path_id: 1,
+                generation: 0,
+                offset: 10,
+            },
+        };
+        apply_provider_event(activity("first"), "session", &mut reducer, &shared, &writer)
+            .await
+            .unwrap();
+        apply_provider_event(
+            activity("different-second"),
+            "session",
+            &mut reducer,
+            &shared,
+            &writer,
+        )
+        .await
+        .unwrap();
+
+        {
+            let model = shared.borrow();
+            assert_eq!(
+                model.task_run(&run_id).unwrap().key,
+                RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: "owner".to_owned(),
+                }
+            );
+            assert_eq!(
+                model.task_run(&run_id).unwrap().state,
+                TaskState::EndedUnknown
+            );
+            assert_eq!(
+                model
+                    .agent_node("agent:codex:owner")
+                    .unwrap()
+                    .last_event_kind
+                    .as_deref(),
+                Some("first")
+            );
+            let node = model.agent_node("agent:codex:owner").unwrap();
+            assert_eq!(node.model_id.as_deref(), Some("gpt-first"));
+            assert_eq!(node.session_file.as_deref(), path.to_str());
+        }
+        lifecycle.shutdown().await.unwrap();
+
+        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+        assert_eq!(
+            restored.model.task_run(&run_id).unwrap().key,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "owner".to_owned(),
+            }
+        );
+        assert_eq!(
+            restored
+                .model
+                .agent_node("agent:codex:owner")
+                .unwrap()
+                .last_event_kind
+                .as_deref(),
+            Some("first")
+        );
+    }
+
+    #[tokio::test]
+    async fn herdr_id_disagreement_is_counted_and_never_corroborates() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let path = directory.path().join("provider/root.jsonl");
+        let run_id = RunId::new();
+        let task_run = TaskRun {
+            run_id,
+            key: RunKey::Native {
+                provider: Provider::Codex,
+                sid: "herdr-sid".to_owned(),
+            },
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Running,
+            has_controller_task_state_event: false,
+        };
+        let agent_node = AgentNode {
+            agent_node_id: "gap-agent-herdr".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some("herdr-sid".to_owned()),
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(2),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Working),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: Some(path.to_string_lossy().into_owned()),
+        };
+        let mut store = open_writer(&root).unwrap();
+        store
+            .apply_batch(vec![
+                PersistOp::UpsertTaskRun(PersistTaskRun {
+                    task_run,
+                    native_session: Some(NativeSessionBinding {
+                        provider: Provider::Codex,
+                        native_session_id: "herdr-sid".to_owned(),
+                    }),
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                    finished_at_ms: None,
+                }),
+                PersistOp::UpsertAgentNode(agent_node),
+            ])
+            .unwrap();
+        let restored = store.load_restored_state().unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored);
+
+        apply_provider_event(
+            ProviderEvent::SessionResolved {
+                provider: Provider::Codex,
+                agent_thread_id: "adapter-sid".to_owned(),
+                owner_session_id: Some("adapter-sid".to_owned()),
+                parent_thread_id: None,
+                path,
+                model_id: None,
+                depth: Some(0),
+                event_id: "prov:codex:meta:adapter-sid".to_owned(),
+                observed_at_ms: 100,
+                position: SourcePosition {
+                    path_id: 1,
+                    generation: 0,
+                    offset: 0,
+                },
+            },
+            "session",
+            &mut reducer,
+            &shared,
+            &writer,
+        )
+        .await
+        .unwrap();
+
+        let model = shared.borrow();
+        assert_eq!(
+            model.task_run(&run_id).unwrap().key,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "herdr-sid".to_owned(),
+            }
+        );
+        assert_eq!(
+            model
+                .controller_diagnostics()
+                .provider_identity_disagreements(),
+            1
+        );
+        drop(model);
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn owned_session_merge_conflict_is_diagnostic_and_non_fatal() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let path = directory.path().join("provider/root.jsonl");
+        let owner = RunId::new();
+        let path_run = RunId::new();
+        let first_parent = RunId::new();
+        let second_parent = RunId::new();
+        let mut model = DomainModel::default();
+        for task_run in [
+            TaskRun {
+                run_id: owner,
+                key: RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: "owner".to_owned(),
+                },
+                display_ordinal: DisplayOrdinal::new(1),
+                state: TaskState::Running,
+                has_controller_task_state_event: false,
+            },
+            TaskRun {
+                run_id: path_run,
+                key: RunKey::NativePath {
+                    provider: Provider::Codex,
+                    path: path.to_string_lossy().into_owned(),
+                },
+                display_ordinal: DisplayOrdinal::new(2),
+                state: TaskState::Running,
+                has_controller_task_state_event: false,
+            },
+            TaskRun {
+                run_id: first_parent,
+                key: RunKey::Controller("first-parent".to_owned()),
+                display_ordinal: DisplayOrdinal::new(3),
+                state: TaskState::Running,
+                has_controller_task_state_event: true,
+            },
+            TaskRun {
+                run_id: second_parent,
+                key: RunKey::Controller("second-parent".to_owned()),
+                display_ordinal: DisplayOrdinal::new(4),
+                state: TaskState::Running,
+                has_controller_task_state_event: true,
+            },
+        ] {
+            model.insert_task_run(task_run);
+        }
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: first_parent,
+            child_run_id: owner,
+        });
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: second_parent,
+            child_run_id: path_run,
+        });
+        let restored = RestoredState {
+            model,
+            next_ordinal: 5,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        };
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored);
+
+        apply_provider_event(
+            ProviderEvent::SessionResolved {
+                provider: Provider::Codex,
+                agent_thread_id: "owner".to_owned(),
+                owner_session_id: Some("owner".to_owned()),
+                parent_thread_id: None,
+                path,
+                model_id: None,
+                depth: Some(0),
+                event_id: "prov:codex:meta:owner".to_owned(),
+                observed_at_ms: 100,
+                position: SourcePosition {
+                    path_id: 1,
+                    generation: 0,
+                    offset: 0,
+                },
+            },
+            "session",
+            &mut reducer,
+            &shared,
+            &writer,
+        )
+        .await
+        .unwrap();
+
+        let model = shared.borrow();
+        assert!(model.task_run(&owner).is_some());
+        assert!(model.task_run(&path_run).is_some());
+        assert_eq!(model.agent_nodes().count(), 0);
+        assert_eq!(model.controller_diagnostics().binding_conflicts(), 1);
+        drop(model);
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restored_targets_feed_provider_events_during_herdr_reconnect_wait() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let sessions = directory.path().join("home/.codex/sessions/2026/08/09");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let session_file = sessions.join("rollout-owner.jsonl");
+        std::fs::write(
+            &session_file,
+            br#"{"type":"session_meta","payload":{"id":"owner","session_id":"owner","model":"gpt-test"}}
+"#,
+        )
+        .unwrap();
+        let run_id = RunId::new();
+        let mut store = open_writer(&root).unwrap();
+        store
+            .apply_batch(vec![PersistOp::UpsertTaskRun(PersistTaskRun {
+                task_run: TaskRun {
+                    run_id,
+                    key: RunKey::NativePath {
+                        provider: Provider::Codex,
+                        path: session_file.to_string_lossy().into_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(1),
+                    state: TaskState::EndedUnknown,
+                    has_controller_task_state_event: false,
+                },
+                native_session: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                finished_at_ms: Some(1),
+            })])
+            .unwrap();
+        let restored = store.load_restored_state().unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut collector = spawn(
+            directory.path().join("missing-herdr.sock"),
+            "provider-reconnect".to_owned(),
+            restored,
+            writer,
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if collector
+                    .model
+                    .borrow()
+                    .agent_node("agent:codex:owner")
+                    .is_some()
+                {
+                    break;
+                }
+                collector.model.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+        {
+            let model = collector.model.borrow();
+            assert_eq!(
+                model.task_run(&run_id).unwrap().key,
+                RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: "owner".to_owned(),
+                }
+            );
+            assert_eq!(
+                model.task_run(&run_id).unwrap().state,
+                TaskState::EndedUnknown
+            );
+            assert_eq!(model.agent_nodes().count(), 1);
+            assert_eq!(model.panes().count(), 0);
+            assert_eq!(model.executions().count(), 0);
+        }
+
+        collector.stop().await.unwrap();
+        lifecycle.shutdown().await.unwrap();
+    }
 }

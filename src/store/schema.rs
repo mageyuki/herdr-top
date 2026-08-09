@@ -1,4 +1,4 @@
-//! SQLite schema v2, read-only preflight, online backup, and migration support.
+//! SQLite schema v3, read-only preflight, online backup, and migration support.
 
 use std::fs::{self, OpenOptions, Permissions};
 use std::io;
@@ -12,7 +12,7 @@ use rusqlite::{Connection, MAIN_DB, OpenFlags};
 use super::StoreError;
 use crate::lockfile::StateRoot;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 3;
 pub(super) const DATABASE_FILE: &str = "herdr-top.sqlite3";
 const FILE_MODE: u32 = 0o600;
 
@@ -161,6 +161,14 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), St
             "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (2, ?1)",
             [now_ms],
         )?;
+        version = 2;
+    }
+    if version < 3 {
+        transaction.execute_batch(SCHEMA_V3)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (3, ?1)",
+            [now_ms],
+        )?;
     }
     transaction.commit()?;
     Ok(())
@@ -174,6 +182,38 @@ CREATE TABLE meta (
     value INTEGER NOT NULL
 );
 INSERT INTO meta(key, value) VALUES ('ingest_seq_high_water', 0);
+"#;
+
+const SCHEMA_V3: &str = r#"
+ALTER TABLE agent_nodes ADD COLUMN parent_agent_node_id TEXT;
+ALTER TABLE agent_nodes ADD COLUMN state TEXT CHECK (state IS NULL OR state = 'working');
+ALTER TABLE agent_nodes ADD COLUMN model_id TEXT;
+ALTER TABLE agent_nodes ADD COLUMN last_event_kind TEXT;
+ALTER TABLE agent_nodes ADD COLUMN last_tool_name TEXT;
+ALTER TABLE agent_nodes ADD COLUMN last_item_count INTEGER;
+ALTER TABLE agent_nodes ADD COLUMN last_byte_count INTEGER;
+ALTER TABLE agent_nodes ADD COLUMN last_activity_at_ms INTEGER;
+ALTER TABLE agent_nodes ADD COLUMN session_file TEXT;
+CREATE INDEX agent_nodes_parent_idx ON agent_nodes(parent_agent_node_id);
+
+INSERT INTO display_ordinals(entity_kind, entity_id, ordinal)
+SELECT
+    'agent_node',
+    ordered.agent_node_id,
+    (SELECT COALESCE(MAX(ordinal), 0) FROM display_ordinals) + ordered.row_number
+FROM (
+    SELECT
+        node.agent_node_id,
+        ROW_NUMBER() OVER (
+            ORDER BY run.display_ordinal, node.agent_node_id
+        ) AS row_number
+    FROM agent_nodes AS node
+    JOIN task_runs AS run ON run.run_id = node.task_run_id
+) AS ordered;
+
+ALTER TABLE events ADD COLUMN provider_agent_id TEXT;
+ALTER TABLE events ADD COLUMN provider_parent_agent_id TEXT;
+ALTER TABLE events ADD COLUMN source_coverage TEXT;
 "#;
 
 pub(super) const SCHEMA_V1: &str = r#"
