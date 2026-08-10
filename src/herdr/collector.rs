@@ -6128,7 +6128,7 @@ mod provider_integration_tests {
             },
             display_ordinal: DisplayOrdinal::new(1),
             state: TaskState::EndedUnknown,
-            has_controller_task_state_event: false,
+            has_controller_task_state_event: true,
         };
         let mut store = open_writer(&root).unwrap();
         store
@@ -6267,7 +6267,7 @@ mod provider_integration_tests {
             },
             display_ordinal: DisplayOrdinal::new(1),
             state: TaskState::Running,
-            has_controller_task_state_event: false,
+            has_controller_task_state_event: true,
         };
         let agent_node = AgentNode {
             agent_node_id: "gap-agent-herdr".to_owned(),
@@ -6475,7 +6475,7 @@ mod provider_integration_tests {
                     },
                     display_ordinal: DisplayOrdinal::new(1),
                     state: TaskState::EndedUnknown,
-                    has_controller_task_state_event: false,
+                    has_controller_task_state_event: true,
                 },
                 native_session: None,
                 created_at_ms: 1,

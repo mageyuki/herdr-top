@@ -53,9 +53,8 @@ pub fn dangling_announcement_components(model: &DomainModel) -> u64 {
         adjacency.entry(first).or_default().push(second);
         adjacency.entry(second).or_default().push(first);
     }
-    let relationship_only_runs: HashSet<_> = adjacency
-        .keys()
-        .filter_map(|run_id| model.task_run(run_id))
+    let relationship_only_runs: HashSet<_> = model
+        .task_runs()
         .filter(|task_run| relationship_only_with_bindings(task_run, &execution_bound_runs))
         .map(|task_run| task_run.run_id)
         .collect();

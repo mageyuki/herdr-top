@@ -1982,7 +1982,7 @@ mod tests {
     fn controller_model(raw_run_id: &str, state: TaskState) -> (DomainModel, RunId) {
         let run_id = RunId::new();
         let mut model = DomainModel::default();
-        model.insert_task_run(run(
+        model.insert_task_run(run_with_controller_evidence(
             run_id,
             RunKey::Controller(raw_run_id.to_owned()),
             1,
@@ -1999,6 +1999,17 @@ mod tests {
             state,
             has_controller_task_state_event: false,
         }
+    }
+
+    fn run_with_controller_evidence(
+        run_id: RunId,
+        key: RunKey,
+        ordinal: i64,
+        state: TaskState,
+    ) -> TaskRun {
+        let mut task_run = run(run_id, key, ordinal, state);
+        task_run.has_controller_task_state_event = true;
+        task_run
     }
 
     fn execution(run_id: RunId, execution_id: &str, state: ExecState) -> Execution {
@@ -2086,7 +2097,7 @@ mod tests {
     fn provider_upsert_reuses_gap_node_patches_fields_and_never_reactivates_run() {
         let run_id = RunId::new();
         let mut model = DomainModel::default();
-        model.insert_task_run(run(
+        model.insert_task_run(run_with_controller_evidence(
             run_id,
             RunKey::Native {
                 provider: Provider::Codex,
@@ -2142,7 +2153,7 @@ mod tests {
     fn provider_upsert_mints_the_frozen_deterministic_node_id() {
         let run_id = RunId::new();
         let mut model = DomainModel::default();
-        model.insert_task_run(run(
+        model.insert_task_run(run_with_controller_evidence(
             run_id,
             RunKey::Native {
                 provider: Provider::Codex,
@@ -2199,7 +2210,7 @@ mod tests {
     fn provider_activity_keeps_newest_observed_time_then_latest_arrival() {
         let run_id = RunId::new();
         let mut model = DomainModel::default();
-        model.insert_task_run(run(
+        model.insert_task_run(run_with_controller_evidence(
             run_id,
             RunKey::Native {
                 provider: Provider::Codex,
@@ -2256,7 +2267,7 @@ mod tests {
     fn provider_parent_self_link_and_cycle_are_dropped_and_counted_without_dropping_nodes() {
         let run_id = RunId::new();
         let mut model = DomainModel::default();
-        model.insert_task_run(run(
+        model.insert_task_run(run_with_controller_evidence(
             run_id,
             RunKey::Native {
                 provider: Provider::Codex,
@@ -2810,6 +2821,7 @@ mod tests {
             1,
             TaskState::EndedUnknown,
         ));
+        model.insert_execution(execution(run_id, "ended", ExecState::Ended));
         let (mut reducer, shared) = Reducer::new(restored(model, 2));
         let mut begin_metadata = metadata("begin", 2_000);
         begin_metadata.provider = Some(Provider::Codex);
@@ -2838,7 +2850,7 @@ mod tests {
             seq: 1,
         };
         let mut model = DomainModel::default();
-        model.insert_task_run(run(
+        model.insert_task_run(run_with_controller_evidence(
             survivor,
             RunKey::Native {
                 provider: Provider::Codex,
@@ -2847,7 +2859,7 @@ mod tests {
             10,
             TaskState::Running,
         ));
-        model.insert_task_run(run(
+        model.insert_task_run(run_with_controller_evidence(
             absorbed,
             provisional_key.clone(),
             11,
@@ -2925,7 +2937,7 @@ mod tests {
     fn state_refresh_emits_no_reorder() {
         let run_id = RunId::new();
         let mut model = DomainModel::default();
-        model.insert_task_run(run(
+        model.insert_task_run(run_with_controller_evidence(
             run_id,
             RunKey::Controller("controller-1".to_owned()),
             9,
@@ -3055,6 +3067,7 @@ mod tests {
             1,
             TaskState::Running,
         ));
+        model.insert_execution(execution(run_id, "pre-gap", ExecState::Working));
         model.insert_agent_node(AgentNode {
             agent_node_id: "stable-top-level-node".to_owned(),
             provider: Provider::Codex,
@@ -3587,6 +3600,22 @@ mod tests {
     }
 
     #[test]
+    fn restored_isolated_relationship_only_run_initializes_gauge_before_first_event() {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            run_id,
+            RunKey::Controller("isolated".to_owned()),
+            1,
+            TaskState::Queued,
+        ));
+
+        let (_reducer, shared) = Reducer::new(restored(model, 2));
+
+        assert_eq!(dangling_gauge(&shared), 1);
+    }
+
+    #[test]
     fn stale_sweep_terminal_neighbor_flips_dangling_gauge() {
         let outside = RunId::new();
         let relationship_only = RunId::new();
@@ -3949,7 +3978,7 @@ mod tests {
         let native = RunId::new();
         let terminal = RunId::new();
         let mut model = DomainModel::default();
-        model.insert_task_run(run(
+        model.insert_task_run(run_with_controller_evidence(
             native,
             RunKey::Native {
                 provider: Provider::Codex,
