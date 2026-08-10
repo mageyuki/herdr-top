@@ -476,6 +476,28 @@ mod tests {
         );
         assert_eq!(dependent.prerequisites, ["Q", "P"]);
         assert_eq!(dependent.dependents, ["Z1", "Z2"]);
+        let second_hop = rows
+            .iter()
+            .find(|row| {
+                matches!(
+                    row.key,
+                    crate::tui::app::NodeKey::Run { run_id, .. } if run_id == ids["Z1"]
+                )
+            })
+            .unwrap();
+        assert_eq!(second_hop.prerequisites, ["D"]);
+        assert!(second_hop.dependents.is_empty());
+        let first_hop = rows
+            .iter()
+            .find(|row| {
+                matches!(
+                    row.key,
+                    crate::tui::app::NodeKey::Run { run_id, .. } if run_id == ids["P"]
+                )
+            })
+            .unwrap();
+        assert!(first_hop.prerequisites.is_empty());
+        assert_eq!(first_hop.dependents, ["D"]);
         let unlinked = rows
             .iter()
             .find(|row| {

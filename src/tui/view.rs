@@ -1474,16 +1474,68 @@ mod tests {
         });
         let mut app = app(model, ObservationQuality::Live, "dag-session");
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        let rows = render(&app, 48, 18);
-        let screen = rows.join("\n");
+        let rows = render(&app, 120, 18);
+        let columns = |row: &str| {
+            let parts = row.split('│').collect::<Vec<_>>();
+            assert_eq!(
+                parts.len(),
+                5,
+                "expected bordered three-column row: {row:?}"
+            );
+            [
+                parts[1].trim().to_owned(),
+                parts[2].trim().to_owned(),
+                parts[3].trim().to_owned(),
+            ]
+        };
+        let prerequisite_row = rows
+            .iter()
+            .find(|row| row.contains("Task Run: 前提🙂"))
+            .unwrap();
+        let dependent_row = rows
+            .iter()
+            .find(|row| row.contains("Task Run: 依存先🙂with-a-long-tail"))
+            .unwrap();
+        let prerequisite_columns = columns(prerequisite_row);
+        let dependent_columns = columns(dependent_row);
+
+        assert!(prerequisite_columns[1].is_empty());
+        assert_eq!(prerequisite_columns[2], "依存先🙂with-a-long-tail");
+        assert_eq!(dependent_columns[1], "前提🙂");
+        assert!(dependent_columns[2].is_empty());
+        assert!(!prerequisite_columns[1].contains("依存先"));
+        assert!(!dependent_columns[2].contains("前提"));
+
+        let initial_activity = rows.iter().find(|row| row.contains("Selected:")).unwrap();
+        assert!(initial_activity.contains("Selected: Task Run: 依存先🙂with-a-long-tail"));
+        assert!(!initial_activity.contains("Selected: Task Run: 前提🙂"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            app.state().selected(),
+            Some(&NodeKey::Run {
+                run_id: prerequisite,
+                pane_id: None,
+            })
+        );
+        let moved_rows = render(&app, 120, 18);
+        let moved_activity = moved_rows
+            .iter()
+            .find(|row| row.contains("Selected:"))
+            .unwrap();
+        assert!(moved_activity.contains("Selected: Task Run: 前提🙂"));
+        assert!(!moved_activity.contains("Selected: Task Run: 依存先"));
+
+        let minimum_rows = render(&app, 48, 18);
+        let screen = minimum_rows.join("\n");
 
         assert!(screen.contains("Dependency DAG"));
         assert!(screen.contains("Task Run"));
         assert!(screen.contains("Prereqs"));
         assert!(screen.contains("Dependents"));
         assert!(screen.contains("前提"));
-        assert!(screen.contains("Selected: Task Run: 依存先"));
-        for row in &rows {
+        assert!(screen.contains("Selected: Task Run: 前提"));
+        for row in &minimum_rows {
             assert!(
                 Line::raw(row.as_str()).width() <= 48,
                 "overflowing row: {row:?}"
@@ -1493,7 +1545,7 @@ mod tests {
     }
 
     #[test]
-    fn thousand_edge_dag_follow_window_shows_exact_tail() {
+    fn thousand_edge_dag_follow_and_non_follow_windows_are_exact() {
         let mut model = DomainModel::default();
         let ids = (0..=1_000).map(|_| RunId::new()).collect::<Vec<_>>();
         for (index, run_id) in ids.iter().copied().enumerate() {
@@ -1514,11 +1566,37 @@ mod tests {
         let mut app = app(model, ObservationQuality::Live, "large-dag");
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let rows = render(&app, 100, 14);
-        let dag = rows[3..9].join("\n");
+        let visible_run_names = |rows: &[String]| {
+            rows[3..9]
+                .iter()
+                .filter_map(|row| row.split("Task Run: ").nth(1))
+                .filter_map(|suffix| suffix.split_whitespace().next())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
 
-        assert!(dag.contains("Task Run: run-0998"));
-        assert!(dag.contains("Task Run: run-0999"));
-        assert!(dag.contains("Task Run: run-1000"));
-        assert!(!dag.contains("Task Run: run-0997"));
+        assert_eq!(
+            visible_run_names(&rows),
+            ["run-0998", "run-0999", "run-1000"]
+        );
+
+        for _ in 0..500 {
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        }
+        assert!(!app.is_following());
+        assert_eq!(app.selected_run_id(), Some(ids[500]));
+        assert_eq!(
+            app.state().selected(),
+            Some(&NodeKey::Run {
+                run_id: ids[500],
+                pane_id: None,
+            })
+        );
+
+        let rows = render(&app, 100, 14);
+        let visible = visible_run_names(&rows);
+        assert_eq!(visible, ["run-0498", "run-0499", "run-0500"]);
+        assert!(!visible.iter().any(|name| name == "run-0497"));
+        assert!(!visible.iter().any(|name| name == "run-0501"));
     }
 }

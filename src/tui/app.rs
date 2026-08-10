@@ -665,10 +665,12 @@ mod tests {
         ]));
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.selected_run_id(), Some(first));
+        assert!(!app.is_following());
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.state().view_mode(), ViewMode::DependencyDag);
         assert_eq!(app.selected_run_id(), Some(first));
+        assert!(!app.is_following());
         assert_eq!(
             app.state().selected(),
             Some(&NodeKey::Run {
@@ -676,6 +678,7 @@ mod tests {
                 pane_id: None,
             })
         );
+        assert!(render(&app).contains("Selected: Task Run: first"));
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.state().view_mode(), ViewMode::ExecutionTree);
@@ -836,20 +839,48 @@ mod tests {
         let first = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let middle = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
         let last = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
-        let (mut app, _model_sender) = app_with_model(model_with_runs(&[
+        let mut model = model_with_runs(&[
             (first, "first", 1, TaskState::Running),
             (middle, "middle", 2, TaskState::Running),
             (last, "last", 3, TaskState::Running),
-        ]));
+        ]);
+        model.insert_dependency_edge(DependencyEdge {
+            prerequisite_run_id: last,
+            dependent_run_id: first,
+        });
+        model.insert_dependency_edge(DependencyEdge {
+            prerequisite_run_id: first,
+            dependent_run_id: middle,
+        });
+        let (mut app, _model_sender) = app_with_model(model);
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.selected_run_id(), Some(last));
+        assert_eq!(displayed_run_names(&app), ["last", "first", "middle"]);
+        assert_eq!(
+            app.state().selected(),
+            Some(&NodeKey::Run {
+                run_id: last,
+                pane_id: None,
+            })
+        );
 
-        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.selected_run_id(), Some(middle));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            app.state().selected(),
+            Some(&NodeKey::Run {
+                run_id: first,
+                pane_id: None,
+            })
+        );
         assert!(!app.is_following());
 
         app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
-        assert_eq!(app.selected_run_id(), Some(last));
+        assert_eq!(
+            app.state().selected(),
+            Some(&NodeKey::Run {
+                run_id: middle,
+                pane_id: None,
+            })
+        );
         assert!(app.is_following());
     }
 
