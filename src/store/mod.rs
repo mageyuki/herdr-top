@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use thiserror::Error;
 
+use crate::activity::{ActivityDurability, ActivityIdentity, ActivityItem, RestoredOperatorState};
 use crate::lockfile::{OwnerRecord, StateRoot};
 use crate::model::{
     AgentNode, DependencyEdge, DisplayOrdinal, EventMetadata, ExecState, Execution, ExecutionEdge,
@@ -28,6 +29,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const EVENT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 const RUN_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 const EVENT_RING_LIMIT: i64 = 100_000;
+const OPERATOR_ACTIVITY_LIMIT: i64 = 10_000;
 const DISPLAY_ORDINAL_BASE: i64 = 1;
 
 /// Errors produced by the SQLite store.
@@ -455,6 +457,76 @@ impl Store {
             next_ordinal,
             next_ingest_seq,
             event_ledger,
+        })
+    }
+
+    /// Restores the bounded safe activity projection and canonical terminal times.
+    pub fn load_restored_operator_state(&self) -> Result<RestoredOperatorState, StoreError> {
+        let mut activity = Vec::new();
+        let mut statement = self.connection.prepare(
+            "SELECT event_id, event_timestamp_ms, seen_at_ms, ingest_seq, source, \
+                    normalized_kind, source_event_type, workspace_id, tab_id, pane_id, \
+                    terminal_id, provider, native_session_id, task_run_id, agent_node_id, \
+                    task_state, model_id, provider_event_kind, tool_name, item_count, \
+                    byte_count, provider_agent_id, provider_parent_agent_id \
+             FROM events \
+             WHERE gap_kind IS NULL \
+             ORDER BY event_timestamp_ms DESC, seen_at_ms DESC, \
+                      (ingest_seq IS NOT NULL) DESC, ingest_seq DESC, event_id DESC \
+             LIMIT ?1",
+        )?;
+        let mut rows = statement.query([OPERATOR_ACTIVITY_LIMIT])?;
+        while let Some(row) = rows.next()? {
+            let provider: Option<String> = row.get(11)?;
+            let task_run_id: Option<String> = row.get(13)?;
+            let task_state: Option<String> = row.get(15)?;
+            activity.push(ActivityItem {
+                identity: ActivityIdentity {
+                    event_id: row.get(0)?,
+                },
+                event_timestamp_ms: row.get(1)?,
+                seen_at_ms: row.get(2)?,
+                ingest_seq: optional_unsigned_integer("events.ingest_seq", row.get(3)?)?,
+                source: row.get(4)?,
+                normalized_kind: row.get(5)?,
+                source_event_type: row.get(6)?,
+                workspace_id: row.get(7)?,
+                tab_id: row.get(8)?,
+                pane_id: row.get(9)?,
+                terminal_id: row.get(10)?,
+                provider: provider.as_deref().map(parse_provider).transpose()?,
+                native_session_id: row.get(12)?,
+                task_run_id: task_run_id.as_deref().map(parse_run_id).transpose()?,
+                agent_node_id: row.get(14)?,
+                task_state: task_state.as_deref().map(parse_task_state).transpose()?,
+                model_id: row.get(16)?,
+                provider_event_kind: row.get(17)?,
+                tool_name: row.get(18)?,
+                item_count: optional_unsigned_count("events.item_count", row.get(19)?)?,
+                byte_count: optional_unsigned_count("events.byte_count", row.get(20)?)?,
+                provider_agent_id: row.get(21)?,
+                provider_parent_agent_id: row.get(22)?,
+                controller_label: None,
+                controller_reason: None,
+                durability: ActivityDurability::Durable,
+            });
+        }
+
+        let mut terminal_times = HashMap::new();
+        let mut statement = self.connection.prepare(
+            "SELECT run_id, finished_at_ms \
+             FROM task_runs \
+             WHERE merged_into IS NULL AND finished_at_ms IS NOT NULL",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let run_id: String = row.get(0)?;
+            terminal_times.insert(parse_run_id(&run_id)?, row.get(1)?);
+        }
+
+        Ok(RestoredOperatorState {
+            activity,
+            terminal_times,
         })
     }
 
@@ -1269,6 +1341,9 @@ fn promote_task_run_key(
 
 struct MergeParty {
     binding: Option<(String, String)>,
+    state: TaskState,
+    finished_at_ms: Option<i64>,
+    updated_at_ms: i64,
 }
 
 fn merge_task_runs(
@@ -1345,6 +1420,20 @@ fn merge_task_runs(
     replace_execution_edges(transaction, execution_edges)?;
     replace_dependency_edges(transaction, dependency_edges)?;
 
+    let finished_at_ms = if survivor_party.state.is_terminal() {
+        match (survivor_party.finished_at_ms, absorbed_party.finished_at_ms) {
+            (Some(survivor_time), Some(absorbed_time)) => Some(survivor_time.min(absorbed_time)),
+            (Some(time), None) | (None, Some(time)) => Some(time),
+            (None, None) => Some(survivor_party.updated_at_ms),
+        }
+    } else {
+        None
+    };
+    transaction.execute(
+        "UPDATE task_runs SET finished_at_ms = ?2 WHERE run_id = ?1",
+        (&survivor_text, finished_at_ms),
+    )?;
+
     transaction.execute(
         "UPDATE task_runs SET merged_into = ?1 WHERE merged_into = ?2",
         (&survivor_text, &absorbed_text),
@@ -1360,17 +1449,28 @@ fn read_canonical_merge_party(
     transaction: &Transaction<'_>,
     run_id: &str,
 ) -> Result<MergeParty, StoreError> {
-    let stored: Option<(Option<String>, Option<String>, Option<String>)> = transaction
+    let stored = transaction
         .query_row(
-            "SELECT native_provider, native_session_id, merged_into \
+            "SELECT native_provider, native_session_id, merged_into, task_state, \
+                    finished_at_ms, updated_at_ms \
              FROM task_runs WHERE run_id = ?1",
             [run_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
         )
         .optional()?;
-    let (native_provider, native_session_id, merged_into) = stored.ok_or_else(|| {
-        StoreError::invalid("task_run_merge", run_id, "merge party does not exist")
-    })?;
+    let (native_provider, native_session_id, merged_into, state, finished_at_ms, updated_at_ms) =
+        stored.ok_or_else(|| {
+            StoreError::invalid("task_run_merge", run_id, "merge party does not exist")
+        })?;
     if let Some(target) = merged_into {
         return Err(StoreError::invalid(
             "merged_into",
@@ -1389,7 +1489,12 @@ fn read_canonical_merge_party(
             ));
         }
     };
-    Ok(MergeParty { binding })
+    Ok(MergeParty {
+        binding,
+        state: parse_task_state(&state)?,
+        finished_at_ms,
+        updated_at_ms,
+    })
 }
 
 fn substituted_execution_edges(
@@ -1597,7 +1702,10 @@ fn upsert_task_run(
              native_session_id = excluded.native_session_id, \
              created_at_ms = MIN(task_runs.created_at_ms, excluded.created_at_ms), \
              updated_at_ms = excluded.updated_at_ms, \
-             finished_at_ms = excluded.finished_at_ms",
+             finished_at_ms = CASE \
+                 WHEN excluded.finished_at_ms IS NULL THEN NULL \
+                 ELSE COALESCE(task_runs.finished_at_ms, excluded.finished_at_ms) \
+             END",
         params![
             run_id,
             encoded_key.kind,
@@ -2104,6 +2212,19 @@ fn optional_unsigned_count(
         .transpose()
 }
 
+fn optional_unsigned_integer(
+    field: &'static str,
+    value: Option<i64>,
+) -> Result<Option<u64>, StoreError> {
+    value
+        .map(|value| {
+            u64::try_from(value).map_err(|_| {
+                StoreError::invalid(field, value.to_string(), "value cannot be negative")
+            })
+        })
+        .transpose()
+}
+
 const fn gap_kind_text(kind: GapKind) -> &'static str {
     match kind {
         GapKind::Startup => "startup",
@@ -2137,6 +2258,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::activity::{ActivityDurability, ActivityIdentity, ActivityItem};
     use crate::model::TopologyEntityId;
 
     const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -2613,6 +2735,42 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn i4_restore_retention_remains_anchored_to_first_terminal_time() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let now = unix_now_ms().unwrap();
+        let run_id = RunId::new();
+        let first_terminal_ms = now - 31 * DAY_MS;
+        store
+            .apply_batch(vec![run_op(
+                run_id,
+                1,
+                TaskState::Completed,
+                first_terminal_ms,
+                false,
+            )])
+            .unwrap();
+        store
+            .apply_batch(vec![run_op(run_id, 1, TaskState::Failed, now, false)])
+            .unwrap();
+        let persisted_first_terminal_ms: i64 = store
+            .connection
+            .query_row(
+                "SELECT finished_at_ms FROM task_runs WHERE run_id = ?1",
+                [run_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted_first_terminal_ms, first_terminal_ms);
+
+        let stats = store.cleanup_retention(now).unwrap();
+        let restored = store.load_restored_state().unwrap();
+
+        assert_eq!(stats.runs_pruned, 1);
+        assert!(restored.model.task_run(&run_id).is_none());
     }
 
     #[test]
@@ -3861,6 +4019,225 @@ mod tests {
         assert_eq!(count(&store.connection, "event_ledger"), 0);
     }
 
+    #[test]
+    fn i4_restore_activity_is_allowlisted_newest_first_and_bounded() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let mapped_run = RunId::new();
+        let transaction = store.connection.transaction().unwrap();
+        {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO events(\
+                         event_id, seen_at_ms, event_timestamp_ms, herdr_session, source, \
+                         normalized_kind, source_event_type, ingest_seq\
+                     ) VALUES (?1, ?2, ?3, 'session-a', 'test', 'activity', 'test.activity', ?4)",
+                )
+                .unwrap();
+            for index in 0..10_000_i64 {
+                insert
+                    .execute(params![
+                        format!("event-{index:05}"),
+                        20_000 + index,
+                        10_000 + index,
+                        index,
+                    ])
+                    .unwrap();
+            }
+        }
+        transaction
+            .execute(
+                "INSERT INTO events(\
+                     event_id, seen_at_ms, event_timestamp_ms, herdr_session, source, \
+                     normalized_kind, source_event_type, workspace_id, tab_id, pane_id, \
+                     terminal_id, provider, native_session_id, task_run_id, agent_node_id, \
+                     task_state, model_id, provider_event_kind, tool_name, item_count, \
+                     byte_count, gap_kind, ingest_seq, provider_agent_id, \
+                     provider_parent_agent_id, source_coverage\
+                 ) VALUES (\
+                     'mapped-event', 40_000, 30_000, 'session-a', 'provider', \
+                     'provider_activity', 'item.completed', 'workspace-a', 'tab-a', 'pane-a', \
+                     'terminal-a', 'codex', 'native-session-a', ?1, 'agent-node-a', 'blocked', \
+                     'gpt-test', 'response_item', 'test_tool', 7, 11, NULL, 10_000, \
+                     'provider-agent-a', 'provider-parent-a', 'PRIVATE_SOURCE_COVERAGE'\
+                 )",
+                [mapped_run.to_string()],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO events(\
+                     event_id, seen_at_ms, event_timestamp_ms, herdr_session, source, \
+                     normalized_kind, source_event_type, gap_kind\
+                 ) VALUES (\
+                     'newer-gap', 50_000, 50_000, 'session-a', 'collector', \
+                     'collector_gap', 'startup', 'startup'\
+                 )",
+                [],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let restored = store.load_restored_operator_state().unwrap();
+
+        assert_eq!(restored.activity.len(), 10_000);
+        assert_eq!(
+            restored.activity[0],
+            ActivityItem {
+                identity: ActivityIdentity {
+                    event_id: "mapped-event".to_owned(),
+                },
+                event_timestamp_ms: 30_000,
+                seen_at_ms: 40_000,
+                ingest_seq: Some(10_000),
+                source: "provider".to_owned(),
+                normalized_kind: "provider_activity".to_owned(),
+                source_event_type: "item.completed".to_owned(),
+                workspace_id: Some("workspace-a".to_owned()),
+                tab_id: Some("tab-a".to_owned()),
+                pane_id: Some("pane-a".to_owned()),
+                terminal_id: Some("terminal-a".to_owned()),
+                provider: Some(Provider::Codex),
+                native_session_id: Some("native-session-a".to_owned()),
+                task_run_id: Some(mapped_run),
+                agent_node_id: Some("agent-node-a".to_owned()),
+                task_state: Some(TaskState::Blocked),
+                model_id: Some("gpt-test".to_owned()),
+                provider_event_kind: Some("response_item".to_owned()),
+                tool_name: Some("test_tool".to_owned()),
+                item_count: Some(7),
+                byte_count: Some(11),
+                provider_agent_id: Some("provider-agent-a".to_owned()),
+                provider_parent_agent_id: Some("provider-parent-a".to_owned()),
+                controller_label: None,
+                controller_reason: None,
+                durability: ActivityDurability::Durable,
+            }
+        );
+        assert_eq!(
+            restored.activity.last().unwrap().identity.event_id,
+            "event-00001"
+        );
+        assert!(
+            restored
+                .activity
+                .iter()
+                .all(|item| item.durability == ActivityDurability::Durable)
+        );
+        assert!(
+            restored
+                .activity
+                .iter()
+                .all(|item| item.identity.event_id != "event-00000")
+        );
+        assert!(
+            restored
+                .activity
+                .iter()
+                .all(|item| item.identity.event_id != "newer-gap")
+        );
+    }
+
+    #[test]
+    fn i4_restore_activity_tie_break_is_deterministic() {
+        let (_directory, root) = test_root();
+        let store = open_writer(&root).unwrap();
+        for (event_id, event_timestamp_ms, seen_at_ms, ingest_seq) in [
+            ("no-seq-a", 100, 200, None),
+            ("ingest-2-a", 100, 200, Some(2)),
+            ("timestamp-newest", 200, 1, None),
+            ("ingest-10", 100, 200, Some(10)),
+            ("seen-newest", 100, 300, None),
+            ("no-seq-z", 100, 200, None),
+            ("ingest-2-z", 100, 200, Some(2)),
+        ] {
+            insert_test_activity_event(
+                &store.connection,
+                event_id,
+                event_timestamp_ms,
+                seen_at_ms,
+                ingest_seq,
+            );
+        }
+
+        let restored = store.load_restored_operator_state().unwrap();
+        let identities: Vec<_> = restored
+            .activity
+            .iter()
+            .map(|item| item.identity.event_id.as_str())
+            .collect();
+
+        assert_eq!(
+            identities,
+            [
+                "timestamp-newest",
+                "seen-newest",
+                "ingest-10",
+                "ingest-2-z",
+                "ingest-2-a",
+                "no-seq-z",
+                "no-seq-a",
+            ]
+        );
+    }
+
+    #[test]
+    fn i4_restore_controller_free_text_is_truthfully_unavailable() {
+        let (_directory, root) = test_root();
+        let store = open_writer(&root).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO events(\
+                     event_id, seen_at_ms, event_timestamp_ms, herdr_session, source, \
+                     normalized_kind, source_event_type, source_coverage\
+                 ) VALUES (\
+                     'controller-event', 20, 10, 'session-a', 'controller', \
+                     'task_started', 'task_started', 'PRIVATE_CONTROLLER_TEXT'\
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let restored = store.load_restored_operator_state().unwrap();
+
+        assert_eq!(restored.activity.len(), 1);
+        assert_eq!(restored.activity[0].controller_label, None);
+        assert_eq!(restored.activity[0].controller_reason, None);
+    }
+
+    #[test]
+    fn i4_restore_rejects_invalid_signed_counts() {
+        for column in ["ingest_seq", "item_count", "byte_count"] {
+            let (_directory, root) = test_root();
+            let store = open_writer(&root).unwrap();
+            store
+                .connection
+                .execute(
+                    &format!(
+                        "INSERT INTO events(\
+                             event_id, seen_at_ms, event_timestamp_ms, herdr_session, source, \
+                             normalized_kind, source_event_type, {column}\
+                         ) VALUES (\
+                             'invalid-count', 20, 10, 'session-a', 'test', \
+                             'activity', 'test.activity', -1\
+                         )"
+                    ),
+                    [],
+                )
+                .unwrap();
+
+            match store.load_restored_operator_state() {
+                Err(StoreError::InvalidData { field, value, .. }) => {
+                    assert_eq!(field, format!("events.{column}"));
+                    assert_eq!(value, "-1");
+                }
+                Err(error) => panic!("unexpected error for {column}: {error}"),
+                Ok(_) => panic!("negative durable {column} should be rejected"),
+            }
+        }
+    }
+
     fn test_root() -> (TempDir, StateRoot) {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
@@ -3985,6 +4362,24 @@ mod tests {
             },
             execution_id: "execution-1".to_owned(),
         }
+    }
+
+    fn insert_test_activity_event(
+        connection: &Connection,
+        event_id: &str,
+        event_timestamp_ms: i64,
+        seen_at_ms: i64,
+        ingest_seq: Option<i64>,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO events(\
+                     event_id, seen_at_ms, event_timestamp_ms, herdr_session, source, \
+                     normalized_kind, source_event_type, ingest_seq\
+                 ) VALUES (?1, ?2, ?3, 'session-a', 'test', 'activity', 'test.activity', ?4)",
+                params![event_id, seen_at_ms, event_timestamp_ms, ingest_seq],
+            )
+            .unwrap();
     }
 
     fn binding(connection: &Connection, run_id: RunId) -> (Option<String>, Option<String>) {

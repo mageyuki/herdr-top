@@ -7002,6 +7002,7 @@ mod provider_integration_tests {
         let root = StateRoot(directory.path().to_path_buf());
         let path = directory.path().join("provider/root.jsonl");
         let run_id = RunId::new();
+        let base_ms = unix_now_ms();
         let task_run = TaskRun {
             run_id,
             key: RunKey::NativePath {
@@ -7017,8 +7018,8 @@ mod provider_integration_tests {
             .apply_batch(vec![PersistOp::UpsertTaskRun(PersistTaskRun {
                 task_run,
                 native_session: None,
-                created_at_ms: 1,
-                updated_at_ms: 1,
+                created_at_ms: base_ms + 1,
+                updated_at_ms: base_ms + 1,
                 finished_at_ms: None,
             })])
             .unwrap();
@@ -7037,7 +7038,7 @@ mod provider_integration_tests {
                 model_id: Some("gpt-first".to_owned()),
                 depth: Some(0),
                 event_id: "prov:codex:meta:owner".to_owned(),
-                observed_at_ms: 100,
+                observed_at_ms: base_ms + 100,
                 position: SourcePosition {
                     path_id: 1,
                     generation: 0,
@@ -7062,7 +7063,7 @@ mod provider_integration_tests {
             },
             depth: Some(0),
             event_id: "prov:codex:act:same".to_owned(),
-            observed_at_ms: 200,
+            observed_at_ms: base_ms + 200,
             position: SourcePosition {
                 path_id: 1,
                 generation: 0,

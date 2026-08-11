@@ -2,6 +2,7 @@
 
 //! Library components for the `herdr-top` session monitor.
 
+pub mod activity;
 pub mod diagnostics;
 pub mod herdr;
 pub mod identity;
