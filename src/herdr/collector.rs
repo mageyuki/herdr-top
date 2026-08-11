@@ -17,6 +17,12 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::diagnostics::{
+    ControllerInputStatus, ControllerInputUnavailableReason, DiagnosticSource, InputAvailability,
+    OccurrenceLogStatus, OwnerFreshness, PersistenceCounters, PersistenceOccurrenceSink,
+    RuntimeDiagnosticsSnapshot, RuntimeWriteOutcome, SourceCoverageSnapshot,
+    controller_counter_snapshot, encode_persistence_occurrence,
+};
 use crate::lockfile::OwnerRecord;
 use crate::model::{
     AgentNodeObservation, AgentSessionReference, AgentSessionReferenceKind, DomainModel,
@@ -32,7 +38,10 @@ use crate::provider::{
     spawn_provider_thread_with_diagnostics,
 };
 use crate::reducer::{ApplyOutcome, Reducer, ReducerError};
-use crate::store::writer::{WriterClient, WriterError};
+use crate::store::writer::{
+    DurabilityDisposition, PendingEnqueue, PersistenceFailure, PersistenceStatus, WriterClient,
+    WriterError,
+};
 use crate::store::{CollectorGap, PersistBatch, PersistOp, RestoredState};
 
 use super::controller::{
@@ -184,6 +193,349 @@ impl Default for SourceCoverageRegistry {
     }
 }
 
+#[derive(Clone, Copy)]
+enum RuntimeCommandClass {
+    Batch,
+    OwnerLocation,
+}
+
+struct UnavailableOccurrenceSink;
+
+impl PersistenceOccurrenceSink for UnavailableOccurrenceSink {
+    fn append(&self, _record: &[u8]) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no process-owned occurrence log was supplied",
+        ))
+    }
+}
+
+pub(crate) struct RuntimePersistence {
+    writer: WriterClient,
+    snapshot: RuntimeDiagnosticsSnapshot,
+    publisher: watch::Sender<RuntimeDiagnosticsSnapshot>,
+    occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
+    occurrence_attempted: bool,
+}
+
+impl RuntimePersistence {
+    fn new(
+        writer: WriterClient,
+        model: &DomainModel,
+        coverage: &SourceCoverageRegistry,
+        occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
+    ) -> (Self, watch::Receiver<RuntimeDiagnosticsSnapshot>) {
+        let controller_input =
+            controller_input_from_coverage(coverage.state(CoverageSource::Controller));
+        let controller_counters = controller_counter_snapshot(model);
+        let snapshot = RuntimeDiagnosticsSnapshot {
+            persistence: writer.persistence_status(),
+            controller_input,
+            owner: OwnerFreshness::Current,
+            persistence_counters: PersistenceCounters::default(),
+            controller_counters,
+            source_coverage: diagnostic_source_coverage(coverage, controller_input),
+            dangling_announcement_components: controller_counters.dangling_announcement_components,
+            first_failure_log: OccurrenceLogStatus::NotAttempted,
+        };
+        let (publisher, diagnostics) = watch::channel(snapshot.clone());
+        (
+            Self {
+                writer,
+                snapshot,
+                publisher,
+                occurrence_sink,
+                occurrence_attempted: false,
+            },
+            diagnostics,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        writer: WriterClient,
+        occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
+    ) -> (Self, watch::Receiver<RuntimeDiagnosticsSnapshot>) {
+        Self::new(
+            writer,
+            &DomainModel::default(),
+            &SourceCoverageRegistry::new(SourceAvailability::Available),
+            occurrence_sink,
+        )
+    }
+
+    fn diagnostics(&self) -> watch::Receiver<RuntimeDiagnosticsSnapshot> {
+        self.publisher.subscribe()
+    }
+
+    pub(crate) fn is_duplicate(&self, event_id: &str) -> bool {
+        self.writer.is_duplicate(event_id)
+    }
+
+    pub(crate) fn reserve_enqueue(&mut self) -> Option<crate::store::EnqueuePermit> {
+        self.observe_writer_health();
+        if self.snapshot.persistence != PersistenceStatus::Healthy {
+            return None;
+        }
+        let permit = self.writer.reserve_enqueue();
+        self.observe_writer_health();
+        permit.filter(|_| self.snapshot.persistence == PersistenceStatus::Healthy)
+    }
+
+    pub(crate) async fn finish_pending(
+        &mut self,
+        pending: PendingEnqueue,
+    ) -> Result<RuntimeWriteOutcome, WriterError> {
+        self.classify_result(pending.wait().await.map(|_| ()), RuntimeCommandClass::Batch)
+    }
+
+    async fn apply(&mut self, batch: PersistBatch) -> Result<RuntimeWriteOutcome, WriterError> {
+        if self.skip_if_degraded(RuntimeCommandClass::Batch) {
+            return Ok(RuntimeWriteOutcome::Skipped);
+        }
+        self.classify_result(self.writer.apply(batch).await, RuntimeCommandClass::Batch)
+    }
+
+    async fn cleanup(&mut self, now_ms: i64) -> Result<RuntimeWriteOutcome, WriterError> {
+        if self.skip_if_degraded(RuntimeCommandClass::Batch) {
+            return Ok(RuntimeWriteOutcome::Skipped);
+        }
+        self.classify_result(
+            self.writer.cleanup(now_ms).await.map(|_| ()),
+            RuntimeCommandClass::Batch,
+        )
+    }
+
+    async fn update_owner_location(
+        &mut self,
+        terminal_id: &str,
+        pane_id: &str,
+    ) -> Result<RuntimeWriteOutcome, WriterError> {
+        if self.skip_if_degraded(RuntimeCommandClass::OwnerLocation) {
+            return Ok(RuntimeWriteOutcome::Skipped);
+        }
+        self.classify_result(
+            self.writer
+                .update_owner_location(terminal_id, pane_id)
+                .await,
+            RuntimeCommandClass::OwnerLocation,
+        )
+    }
+
+    fn classify_result(
+        &mut self,
+        result: Result<(), WriterError>,
+        class: RuntimeCommandClass,
+    ) -> Result<RuntimeWriteOutcome, WriterError> {
+        match result {
+            Ok(()) => Ok(RuntimeWriteOutcome::Durable),
+            Err(WriterError::Persistence(failure)) => Ok(self.record_failure(failure, class)),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn skip_if_degraded(&mut self, class: RuntimeCommandClass) -> bool {
+        self.observe_writer_health();
+        if self.snapshot.persistence == PersistenceStatus::Healthy {
+            return false;
+        }
+        match class {
+            RuntimeCommandClass::Batch => {
+                self.snapshot.persistence_counters.skipped_batches = self
+                    .snapshot
+                    .persistence_counters
+                    .skipped_batches
+                    .saturating_add(1);
+            }
+            RuntimeCommandClass::OwnerLocation => {
+                self.snapshot.owner = OwnerFreshness::Stale;
+                self.snapshot.persistence_counters.skipped_owner_updates = self
+                    .snapshot
+                    .persistence_counters
+                    .skipped_owner_updates
+                    .saturating_add(1);
+            }
+        }
+        self.publish();
+        true
+    }
+
+    fn observe_writer_health(&mut self) {
+        if self.snapshot.persistence != PersistenceStatus::Healthy {
+            return;
+        }
+        if let PersistenceStatus::Degraded { failure } = self.writer.persistence_status() {
+            let class = if failure.operation
+                == crate::store::writer::PersistenceOperation::UpdateOwnerLocation
+            {
+                RuntimeCommandClass::OwnerLocation
+            } else {
+                RuntimeCommandClass::Batch
+            };
+            let _ = self.record_failure(failure, class);
+        }
+    }
+
+    fn record_failure(
+        &mut self,
+        failure: PersistenceFailure,
+        class: RuntimeCommandClass,
+    ) -> RuntimeWriteOutcome {
+        let outcome = match failure.durability {
+            DurabilityDisposition::Committed => RuntimeWriteOutcome::CommittedButDegraded(failure),
+            DurabilityDisposition::Unknown => RuntimeWriteOutcome::DurabilityUnknown(failure),
+            DurabilityDisposition::NotCommitted | DurabilityDisposition::NotApplicable => {
+                RuntimeWriteOutcome::NotCommitted(failure)
+            }
+        };
+        if self.snapshot.persistence != PersistenceStatus::Healthy {
+            return outcome;
+        }
+
+        self.snapshot.persistence = PersistenceStatus::Degraded { failure };
+        self.snapshot.controller_input = ControllerInputStatus::Unavailable {
+            reason: ControllerInputUnavailableReason::PersistenceUnavailable,
+        };
+        set_controller_coverage_unavailable(&mut self.snapshot.source_coverage);
+        match class {
+            RuntimeCommandClass::OwnerLocation => {
+                self.snapshot.owner = OwnerFreshness::Stale;
+            }
+            RuntimeCommandClass::Batch => match outcome {
+                RuntimeWriteOutcome::CommittedButDegraded(_) => {
+                    self.snapshot
+                        .persistence_counters
+                        .committed_but_degraded_batches = self
+                        .snapshot
+                        .persistence_counters
+                        .committed_but_degraded_batches
+                        .saturating_add(1);
+                }
+                RuntimeWriteOutcome::NotCommitted(_) => {
+                    self.snapshot.persistence_counters.not_committed_batches = self
+                        .snapshot
+                        .persistence_counters
+                        .not_committed_batches
+                        .saturating_add(1);
+                }
+                RuntimeWriteOutcome::DurabilityUnknown(_) => {
+                    self.snapshot
+                        .persistence_counters
+                        .durability_unknown_batches = self
+                        .snapshot
+                        .persistence_counters
+                        .durability_unknown_batches
+                        .saturating_add(1);
+                }
+                RuntimeWriteOutcome::Durable | RuntimeWriteOutcome::Skipped => {}
+            },
+        }
+        if !self.occurrence_attempted {
+            self.occurrence_attempted = true;
+            let record = encode_persistence_occurrence(
+                unix_now_ms(),
+                failure,
+                self.snapshot.persistence_counters,
+            );
+            self.snapshot.first_failure_log = if self.occurrence_sink.append(&record).is_ok() {
+                OccurrenceLogStatus::Emitted
+            } else {
+                OccurrenceLogStatus::Failed
+            };
+        }
+        self.publish();
+        outcome
+    }
+
+    fn refresh_snapshot(&mut self, model: &DomainModel, coverage: &SourceCoverageRegistry) {
+        let controller_counters = controller_counter_snapshot(model);
+        self.snapshot.controller_counters = controller_counters;
+        self.snapshot.dangling_announcement_components =
+            controller_counters.dangling_announcement_components;
+        self.snapshot.source_coverage =
+            diagnostic_source_coverage(coverage, self.snapshot.controller_input);
+        self.publish();
+    }
+
+    fn mark_acceptor_stopped(&mut self) {
+        if self.snapshot.persistence == PersistenceStatus::Healthy {
+            self.snapshot.controller_input = ControllerInputStatus::Unavailable {
+                reason: ControllerInputUnavailableReason::AcceptorStopped,
+            };
+            set_controller_coverage_unavailable(&mut self.snapshot.source_coverage);
+            self.publish();
+        }
+    }
+
+    fn publish(&self) {
+        let snapshot = self.snapshot.clone();
+        self.publisher.send_if_modified(|current| {
+            if *current == snapshot {
+                false
+            } else {
+                *current = snapshot;
+                true
+            }
+        });
+    }
+}
+
+fn set_controller_coverage_unavailable(coverage: &mut [SourceCoverageSnapshot]) {
+    if let Some(controller) = coverage
+        .iter_mut()
+        .find(|snapshot| snapshot.source == DiagnosticSource::Controller)
+    {
+        controller.availability = InputAvailability::Unavailable;
+    }
+}
+
+fn controller_input_from_coverage(coverage: &SourceAvailability) -> ControllerInputStatus {
+    match coverage {
+        SourceAvailability::Available => ControllerInputStatus::Available,
+        SourceAvailability::NotApplicable => ControllerInputStatus::Unavailable {
+            reason: ControllerInputUnavailableReason::ListenerUnavailable,
+        },
+        SourceAvailability::Unavailable { detail }
+            if matches!(detail.as_str(), "not_bound" | "bind_failure") =>
+        {
+            ControllerInputStatus::Unavailable {
+                reason: ControllerInputUnavailableReason::ListenerUnavailable,
+            }
+        }
+        SourceAvailability::Unavailable { .. } => ControllerInputStatus::Unavailable {
+            reason: ControllerInputUnavailableReason::RuntimeUnsafe,
+        },
+    }
+}
+
+fn diagnostic_source_coverage(
+    coverage: &SourceCoverageRegistry,
+    controller_input: ControllerInputStatus,
+) -> Vec<SourceCoverageSnapshot> {
+    [
+        (DiagnosticSource::Herdr, CoverageSource::Herdr),
+        (DiagnosticSource::Controller, CoverageSource::Controller),
+        (DiagnosticSource::Claude, CoverageSource::Claude),
+        (DiagnosticSource::Codex, CoverageSource::Codex),
+    ]
+    .into_iter()
+    .map(|(source, coverage_source)| SourceCoverageSnapshot {
+        source,
+        availability: if source == DiagnosticSource::Controller
+            && !matches!(controller_input, ControllerInputStatus::Available)
+        {
+            InputAvailability::Unavailable
+        } else {
+            match coverage.state(coverage_source) {
+                SourceAvailability::Available => InputAvailability::Available,
+                SourceAvailability::Unavailable { .. } => InputAvailability::Unavailable,
+                SourceAvailability::NotApplicable => InputAvailability::Unavailable,
+            }
+        },
+    })
+    .collect()
+}
+
 /// Errors surfaced by collector startup or orderly shutdown.
 #[derive(Debug, Error)]
 pub enum CollectorError {
@@ -219,12 +571,14 @@ pub enum CollectorError {
     ProviderThread(#[from] ProviderThreadError),
 }
 
-/// Handle to the collector's coherent model, quality, and source-coverage streams.
+/// Handle to the collector's coherent model, quality, source-coverage, and diagnostics streams.
 pub struct CollectorHandle {
     /// Independently published Herdr observation quality.
     pub quality: watch::Receiver<ObservationQuality>,
     /// Dynamic four-source coverage published independently of model snapshots.
     pub source_coverage: watch::Receiver<SourceCoverageRegistry>,
+    /// Immutable runtime diagnostics; no command-capable writer leaves the collector.
+    pub diagnostics: watch::Receiver<RuntimeDiagnosticsSnapshot>,
     /// Coherent reducer-owned domain snapshots.
     pub model: SharedModel,
     cancellation: CancellationToken,
@@ -271,21 +625,27 @@ impl CollectorHandle {
             Ok(())
         };
         let provider_result = match self.provider_thread {
-            Some(provider) => provider.stop().await.map_err(CollectorError::from),
+            Some(provider) => provider.stop().await,
             None => Ok(()),
         };
         if let Err(error) = &provider_result
             && (collector_result.is_err() || controller_result.is_err())
         {
+            let provider_error_code = match error {
+                ProviderThreadError::ThreadPanicked => "provider_thread_panicked",
+                ProviderThreadError::DetachedTimeout => "provider_thread_detached_timeout",
+            };
             tracing::warn!(
-                error = %error,
+                warning_code = "provider_shutdown_failure_masked",
+                provider_error_code,
                 "provider shutdown error masked by earlier shutdown failure"
             );
         }
 
         collector_result?;
         controller_result?;
-        provider_result
+        provider_result?;
+        Ok(())
     }
 }
 
@@ -303,6 +663,7 @@ pub async fn spawn(
         writer,
         None,
         SourceAvailability::NotApplicable,
+        Arc::new(UnavailableOccurrenceSink),
     )
     .await
 }
@@ -329,6 +690,7 @@ pub async fn spawn_with_controller(
         writer,
         controller_listener,
         controller_coverage,
+        Arc::new(UnavailableOccurrenceSink),
     )
     .await
 }
@@ -349,6 +711,29 @@ pub async fn spawn_with_controller_coverage(
         writer,
         controller_listener,
         controller_coverage,
+        Arc::new(UnavailableOccurrenceSink),
+    )
+    .await
+}
+
+/// Launches the fully configured runtime with the process-owned occurrence sink.
+pub async fn spawn_with_controller_coverage_and_occurrence_sink(
+    sock: PathBuf,
+    session: String,
+    restored: RestoredState,
+    writer: WriterClient,
+    controller_listener: Option<StdUnixListener>,
+    controller_coverage: SourceAvailability,
+    occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
+) -> Result<CollectorHandle, CollectorError> {
+    spawn_configured(
+        sock,
+        session,
+        restored,
+        writer,
+        controller_listener,
+        controller_coverage,
+        occurrence_sink,
     )
     .await
 }
@@ -360,6 +745,7 @@ async fn spawn_configured(
     writer: WriterClient,
     controller_listener: Option<StdUnixListener>,
     controller_coverage: SourceAvailability,
+    occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
 ) -> Result<CollectorHandle, CollectorError> {
     let owner = OwnerTracker::from_environment();
     writer.replace_owner(owner.record()).await?;
@@ -368,6 +754,12 @@ async fn spawn_configured(
     let (quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
     let initial_coverage = SourceCoverageRegistry::new(controller_coverage.clone());
     let (coverage_sender, source_coverage) = watch::channel(initial_coverage);
+    let (persistence, diagnostics) = RuntimePersistence::new(
+        writer,
+        &model.borrow(),
+        &source_coverage.borrow(),
+        occurrence_sink,
+    );
     let cancellation = CancellationToken::new();
     let (controller_sender, controller_requests) =
         controller_listener.as_ref().map_or((None, None), |_| {
@@ -378,10 +770,11 @@ async fn spawn_configured(
             (Some(sender), Some(receiver))
         });
     let mut controller_acceptor = match (controller_listener, controller_sender) {
-        (Some(listener), Some(sender)) => Some(controller::spawn_acceptor(
+        (Some(listener), Some(sender)) => Some(controller::spawn_acceptor_with_diagnostics(
             listener,
             sender,
             cancellation.clone(),
+            persistence.diagnostics(),
         )?),
         _ => None,
     };
@@ -426,7 +819,7 @@ async fn spawn_configured(
         run_collector(
             sock,
             session,
-            writer,
+            persistence,
             reducer,
             task_model,
             task_cancellation,
@@ -440,6 +833,7 @@ async fn spawn_configured(
     Ok(CollectorHandle {
         quality,
         source_coverage,
+        diagnostics,
         model,
         cancellation,
         task,
@@ -472,7 +866,7 @@ fn standard_provider_roots() -> Vec<DiscoveryRoot> {
 async fn run_collector(
     sock: PathBuf,
     session: String,
-    writer: WriterClient,
+    mut persistence: RuntimePersistence,
     mut reducer: Reducer,
     shared: SharedModel,
     cancellation: CancellationToken,
@@ -496,11 +890,19 @@ async fn run_collector(
         let stream = match tokio::select! {
             () = cancellation.cancelled() => return Ok(()),
             _ = retention_cleanup.tick() => {
-                let _ = writer.cleanup(unix_now_ms()).await?;
+                let _ = persistence.cleanup(unix_now_ms()).await?;
                 continue;
             }
             request = receive_controller(&mut controller_requests) => {
-                service_controller(request, &mut controller_requests, &session, &mut reducer, &writer).await;
+                service_controller(
+                    request,
+                    &mut controller_requests,
+                    &session,
+                    &mut reducer,
+                    &mut persistence,
+                    &shared,
+                    &provider.coverage.registry,
+                ).await;
                 provider.publish_targets(&shared);
                 continue;
             }
@@ -508,14 +910,18 @@ async fn run_collector(
         } {
             Ok(stream) => stream,
             Err(_) => {
-                provider.set_herdr_quality(ObservationQuality::Disconnected);
+                provider.set_herdr_quality(
+                    ObservationQuality::Disconnected,
+                    &mut persistence,
+                    &shared,
+                );
                 if wait_or_service_controller(
                     &cancellation,
                     RECONNECT_DELAY,
                     &mut controller_requests,
                     &session,
                     &mut reducer,
-                    &writer,
+                    &mut persistence,
                     &shared,
                     &mut provider,
                 )
@@ -533,13 +939,13 @@ async fn run_collector(
         } else {
             GapKind::Reconnect
         };
-        provider.set_herdr_quality(ObservationQuality::Reconciling);
+        provider.set_herdr_quality(ObservationQuality::Reconciling, &mut persistence, &shared);
 
         let reader_cancellation = cancellation.child_token();
         let (events, overflowed, reader) = spawn_event_reader(stream, reader_cancellation.clone());
         let outcome = converge(
             &sock,
-            &writer,
+            &mut persistence,
             &mut reducer,
             &shared,
             &cancellation,
@@ -563,7 +969,7 @@ async fn run_collector(
             previous_socket = socket_identity;
         }
         if let Err(error) = reader_result {
-            provider.set_herdr_quality(ObservationQuality::Disconnected);
+            provider.set_herdr_quality(ObservationQuality::Disconnected, &mut persistence, &shared);
             if matches!(outcome.outcome, SubscriptionOutcome::Cancelled) {
                 return Ok(());
             }
@@ -572,7 +978,11 @@ async fn run_collector(
         match outcome.outcome {
             SubscriptionOutcome::Cancelled => return Ok(()),
             SubscriptionOutcome::Ended => {
-                provider.set_herdr_quality(ObservationQuality::Disconnected);
+                provider.set_herdr_quality(
+                    ObservationQuality::Disconnected,
+                    &mut persistence,
+                    &shared,
+                );
             }
         }
     }
@@ -581,7 +991,7 @@ async fn run_collector(
 #[allow(clippy::too_many_arguments)]
 async fn converge(
     sock: &Path,
-    writer: &WriterClient,
+    persistence: &mut RuntimePersistence,
     reducer: &mut Reducer,
     shared: &SharedModel,
     cancellation: &CancellationToken,
@@ -602,7 +1012,15 @@ async fn converge(
         let snapshot = tokio::select! {
             () = cancellation.cancelled() => return Ok(ConvergeOutcome::new(SubscriptionOutcome::Cancelled, !first_generation)),
             request = receive_controller(controller_requests) => {
-                service_controller(request, controller_requests, session, reducer, writer).await;
+                service_controller(
+                    request,
+                    controller_requests,
+                    session,
+                    reducer,
+                    persistence,
+                    shared,
+                    &provider.coverage.registry,
+                ).await;
                 provider.publish_targets(shared);
                 continue;
             }
@@ -628,14 +1046,15 @@ async fn converge(
         } else {
             apply_snapshot_in_place(reducer, shared, topology, session, &mut pending_closures)?
         };
-        writer.apply(std::mem::take(&mut batch)).await?;
+        let _ = persistence.apply(std::mem::take(&mut batch)).await?;
         provider.publish_targets(shared);
-        owner.refresh_from_snapshot(&snapshot, writer).await?;
+        owner.refresh_from_snapshot(&snapshot, persistence).await?;
+        persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
 
         let replay = replay_generation(
             reducer,
             shared,
-            writer,
+            persistence,
             owner,
             session,
             &snapshot,
@@ -661,11 +1080,11 @@ async fn converge(
                 ));
             }
             ReplayOutcome::Clean => {
-                provider.set_herdr_quality(ObservationQuality::Live);
+                provider.set_herdr_quality(ObservationQuality::Live, persistence, shared);
                 match monitor_live(
                     reducer,
                     shared,
-                    writer,
+                    persistence,
                     owner,
                     session,
                     &mut events,
@@ -678,7 +1097,11 @@ async fn converge(
                 .await?
                 {
                     ReplayOutcome::Dirty => {
-                        provider.set_herdr_quality(ObservationQuality::Reconciling);
+                        provider.set_herdr_quality(
+                            ObservationQuality::Reconciling,
+                            persistence,
+                            shared,
+                        );
                         resnapshot_attempts = 0;
                     }
                     ReplayOutcome::Ended => {
@@ -697,12 +1120,12 @@ async fn converge(
                 }
             }
             ReplayOutcome::Dirty => {
-                provider.set_herdr_quality(ObservationQuality::Reconciling);
+                provider.set_herdr_quality(ObservationQuality::Reconciling, persistence, shared);
                 if resnapshot_attempts == RESNAPSHOT_ATTEMPTS {
                     let outcome = monitor_reconciling(
                         reducer,
                         shared,
-                        writer,
+                        persistence,
                         owner,
                         session,
                         events,
@@ -724,7 +1147,7 @@ async fn converge(
 async fn replay_generation(
     reducer: &mut Reducer,
     shared: &SharedModel,
-    writer: &WriterClient,
+    persistence: &mut RuntimePersistence,
     owner: &mut OwnerTracker,
     session: &str,
     snapshot: &Snapshot,
@@ -758,7 +1181,7 @@ async fn replay_generation(
             apply_received_event(
                 reducer,
                 shared,
-                writer,
+                persistence,
                 owner,
                 session,
                 received,
@@ -775,7 +1198,15 @@ async fn replay_generation(
         let next_received = tokio::select! {
             () = cancellation.cancelled() => return Ok(ReplayOutcome::Cancelled),
             request = receive_controller(controller_requests) => {
-                service_controller(request, controller_requests, session, reducer, writer).await;
+                service_controller(
+                    request,
+                    controller_requests,
+                    session,
+                    reducer,
+                    persistence,
+                    shared,
+                    &provider.coverage.registry,
+                ).await;
                 provider.publish_targets(shared);
                 continue;
             }
@@ -808,7 +1239,7 @@ async fn replay_generation(
 async fn monitor_live(
     reducer: &mut Reducer,
     shared: &SharedModel,
-    writer: &WriterClient,
+    persistence: &mut RuntimePersistence,
     owner: &mut OwnerTracker,
     session: &str,
     events: &mut mpsc::Receiver<ReceivedEvent>,
@@ -825,12 +1256,27 @@ async fn monitor_live(
         let received = tokio::select! {
             () = cancellation.cancelled() => return Ok(ReplayOutcome::Cancelled),
             request = receive_controller(controller_requests) => {
-                service_controller(request, controller_requests, session, reducer, writer).await;
+                service_controller(
+                    request,
+                    controller_requests,
+                    session,
+                    reducer,
+                    persistence,
+                    shared,
+                    &provider.coverage.registry,
+                ).await;
                 provider.publish_targets(shared);
                 continue;
             }
             event = receive_provider(&mut provider.events) => {
-                service_provider_event(event, provider, session, reducer, shared, writer).await?;
+                service_provider_event(
+                    event,
+                    provider,
+                    session,
+                    reducer,
+                    shared,
+                    persistence,
+                ).await?;
                 provider.publish_targets(shared);
                 continue;
             }
@@ -849,10 +1295,11 @@ async fn monitor_live(
                 pending_closures,
             )?);
             if !persist.is_empty() {
-                writer.apply(persist).await?;
+                let _ = persistence.apply(persist).await?;
                 provider.publish_targets(shared);
             }
-            let _ = writer.cleanup(unix_now_ms()).await?;
+            let _ = persistence.cleanup(unix_now_ms()).await?;
+            persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
             continue;
         };
         let anomalous =
@@ -860,7 +1307,7 @@ async fn monitor_live(
         apply_received_event(
             reducer,
             shared,
-            writer,
+            persistence,
             owner,
             session,
             received,
@@ -878,7 +1325,7 @@ async fn monitor_live(
 async fn monitor_reconciling(
     reducer: &mut Reducer,
     shared: &SharedModel,
-    writer: &WriterClient,
+    persistence: &mut RuntimePersistence,
     owner: &mut OwnerTracker,
     session: &str,
     mut events: mpsc::Receiver<ReceivedEvent>,
@@ -894,12 +1341,27 @@ async fn monitor_reconciling(
         let received = tokio::select! {
             () = cancellation.cancelled() => return Ok(SubscriptionOutcome::Cancelled),
             request = receive_controller(controller_requests) => {
-                service_controller(request, controller_requests, session, reducer, writer).await;
+                service_controller(
+                    request,
+                    controller_requests,
+                    session,
+                    reducer,
+                    persistence,
+                    shared,
+                    &provider.coverage.registry,
+                ).await;
                 provider.publish_targets(shared);
                 continue;
             }
             event = receive_provider(&mut provider.events) => {
-                service_provider_event(event, provider, session, reducer, shared, writer).await?;
+                service_provider_event(
+                    event,
+                    provider,
+                    session,
+                    reducer,
+                    shared,
+                    persistence,
+                ).await?;
                 provider.publish_targets(shared);
                 continue;
             }
@@ -918,16 +1380,17 @@ async fn monitor_reconciling(
                 pending_closures,
             )?);
             if !persist.is_empty() {
-                writer.apply(persist).await?;
+                let _ = persistence.apply(persist).await?;
                 provider.publish_targets(shared);
             }
-            let _ = writer.cleanup(unix_now_ms()).await?;
+            let _ = persistence.cleanup(unix_now_ms()).await?;
+            persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
             continue;
         };
         apply_received_event(
             reducer,
             shared,
-            writer,
+            persistence,
             owner,
             session,
             received,
@@ -1910,8 +2373,14 @@ impl ProviderIntegration {
         }
     }
 
-    fn set_herdr_quality(&mut self, quality: ObservationQuality) {
+    fn set_herdr_quality(
+        &mut self,
+        quality: ObservationQuality,
+        persistence: &mut RuntimePersistence,
+        shared: &SharedModel,
+    ) {
         self.coverage.set_herdr_quality(quality);
+        persistence.refresh_snapshot(&shared.borrow(), &self.coverage.registry);
     }
 
     fn update_source_state(&mut self, provider: Provider, state: ProviderSourceState) {
@@ -2034,7 +2503,7 @@ fn drain_events(
 async fn apply_received_event(
     reducer: &mut Reducer,
     shared: &SharedModel,
-    writer: &WriterClient,
+    persistence: &mut RuntimePersistence,
     owner: &mut OwnerTracker,
     session: &str,
     received: ReceivedEvent,
@@ -2042,15 +2511,16 @@ async fn apply_received_event(
     provider: &mut ProviderIntegration,
 ) -> Result<(), CollectorError> {
     if received.event == "pane_moved" {
-        owner.refresh_from_move(&received.data, writer).await?;
+        owner.refresh_from_move(&received.data, persistence).await?;
     }
     let normalized = normalize_event(shared, session, &received)?;
     let Some(persist) = apply_collector_observation(reducer, normalized)? else {
         return Ok(());
     };
     if !persist.is_empty() {
-        writer.apply(persist).await?;
+        let _ = persistence.apply(persist).await?;
     }
+    persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
     provider.publish_targets(shared);
     cancel_pending_topology_closures(&received, pending_closures);
     Ok(())
@@ -2077,7 +2547,7 @@ async fn apply_provider_event(
     session: &str,
     reducer: &mut Reducer,
     shared: &SharedModel,
-    writer: &WriterClient,
+    persistence: &mut RuntimePersistence,
     coverage: &SourceCoverageRegistry,
 ) -> Result<(), CollectorError> {
     let normalized = normalize_provider_event(shared, session, event, coverage);
@@ -2085,7 +2555,7 @@ async fn apply_provider_event(
     let events = normalized
         .events
         .into_iter()
-        .filter(|event| !writer.is_duplicate(&normalized_metadata(event).event_id))
+        .filter(|event| !persistence.is_duplicate(&normalized_metadata(event).event_id))
         .collect::<Vec<_>>();
     if events.is_empty() {
         return Ok(());
@@ -2097,7 +2567,7 @@ async fn apply_provider_event(
     if let Some(persist) = apply_collector_observation(reducer, events)?
         && !persist.is_empty()
     {
-        writer.apply(persist).await?;
+        let _ = persistence.apply(persist).await?;
     }
     if disagreement_is_new {
         reducer.record_provider_identity_disagreement();
@@ -2343,7 +2813,7 @@ fn append_pane_upsert(
                     // An agent-less pane carries no liveness that could justify a
                     // replacement run, so conflicting latched evidence is dropped.
                     tracing::warn!(
-                        terminal_id = pane.terminal_id.as_str(),
+                        warning_code = "agentless_session_evidence_conflict",
                         "skipped conflicting agent-session evidence from an agent-less pane update"
                     );
                     continue;
@@ -3492,7 +3962,7 @@ impl OwnerTracker {
     async fn refresh_from_snapshot(
         &mut self,
         snapshot: &Snapshot,
-        writer: &WriterClient,
+        persistence: &mut RuntimePersistence,
     ) -> Result<(), WriterError> {
         let pane =
             self.terminal_id
@@ -3514,7 +3984,7 @@ impl OwnerTracker {
                     })
                 });
         if let Some(pane) = pane {
-            self.update(&pane.terminal_id, &pane.pane_id, writer)
+            self.update(&pane.terminal_id, &pane.pane_id, persistence)
                 .await?;
         }
         Ok(())
@@ -3523,7 +3993,7 @@ impl OwnerTracker {
     async fn refresh_from_move(
         &mut self,
         data: &Value,
-        writer: &WriterClient,
+        persistence: &mut RuntimePersistence,
     ) -> Result<(), WriterError> {
         let Some(pane) = data.get("pane") else {
             return Ok(());
@@ -3538,7 +4008,7 @@ impl OwnerTracker {
         if self.terminal_id.as_deref() == Some(terminal_id.as_str())
             || self.pane_id.as_deref() == previous_pane_id.as_deref()
         {
-            self.update(&terminal_id, &pane_id, writer).await?;
+            self.update(&terminal_id, &pane_id, persistence).await?;
         }
         Ok(())
     }
@@ -3547,12 +4017,16 @@ impl OwnerTracker {
         &mut self,
         terminal_id: &str,
         pane_id: &str,
-        writer: &WriterClient,
+        persistence: &mut RuntimePersistence,
     ) -> Result<(), WriterError> {
-        if self.terminal_id.as_deref() != Some(terminal_id)
-            || self.pane_id.as_deref() != Some(pane_id)
+        let location_changed = self.terminal_id.as_deref() != Some(terminal_id)
+            || self.pane_id.as_deref() != Some(pane_id);
+        if location_changed
+            && persistence
+                .update_owner_location(terminal_id, pane_id)
+                .await?
+                == RuntimeWriteOutcome::Durable
         {
-            writer.update_owner_location(terminal_id, pane_id).await?;
             self.terminal_id = Some(terminal_id.to_owned());
             self.pane_id = Some(pane_id.to_owned());
         }
@@ -3602,9 +4076,9 @@ async fn service_provider_event(
     session: &str,
     reducer: &mut Reducer,
     shared: &SharedModel,
-    writer: &WriterClient,
+    persistence: &mut RuntimePersistence,
 ) -> Result<(), CollectorError> {
-    match event {
+    let result = match event {
         Some(ProviderEvent::SourceState {
             provider: source,
             state,
@@ -3614,14 +4088,14 @@ async fn service_provider_event(
         }
         Some(ProviderEvent::Malformed {
             provider: source,
-            path_display,
+            path_display: _,
             generation: _,
             byte_offset,
             error_code,
         }) => {
             tracing::warn!(
+                warning_code = "provider_record_malformed",
                 provider = provider_name(source),
-                path = path_display,
                 byte_offset,
                 error_code,
                 "malformed provider record"
@@ -3630,14 +4104,16 @@ async fn service_provider_event(
         }
         Some(event) => {
             let coverage = provider.coverage.registry.clone();
-            apply_provider_event(event, session, reducer, shared, writer, &coverage).await
+            apply_provider_event(event, session, reducer, shared, persistence, &coverage).await
         }
         None => {
             provider.events = None;
             provider.coverage.mark_egress_closed();
             Ok(())
         }
-    }
+    };
+    persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
+    result
 }
 
 async fn service_controller(
@@ -3645,11 +4121,19 @@ async fn service_controller(
     receiver: &mut Option<ControllerRequestReceiver>,
     session: &str,
     reducer: &mut Reducer,
-    writer: &WriterClient,
+    persistence: &mut RuntimePersistence,
+    shared: &SharedModel,
+    coverage: &SourceCoverageRegistry,
 ) {
     match request {
-        Some(request) => controller::service_request(request, session, reducer, writer).await,
-        None => *receiver = None,
+        Some(request) => {
+            controller::service_request(request, session, reducer, persistence).await;
+            persistence.refresh_snapshot(&shared.borrow(), coverage);
+        }
+        None => {
+            *receiver = None;
+            persistence.mark_acceptor_stopped();
+        }
     }
 }
 
@@ -3660,7 +4144,7 @@ async fn wait_or_service_controller(
     receiver: &mut Option<ControllerRequestReceiver>,
     session: &str,
     reducer: &mut Reducer,
-    writer: &WriterClient,
+    persistence: &mut RuntimePersistence,
     shared: &SharedModel,
     provider: &mut ProviderIntegration,
 ) -> Result<bool, CollectorError> {
@@ -3671,7 +4155,15 @@ async fn wait_or_service_controller(
             () = cancellation.cancelled() => return Ok(true),
             () = &mut delay => return Ok(false),
             request = receive_controller(receiver) => {
-                service_controller(request, receiver, session, reducer, writer).await;
+                service_controller(
+                    request,
+                    receiver,
+                    session,
+                    reducer,
+                    persistence,
+                    shared,
+                    &provider.coverage.registry,
+                ).await;
                 provider.publish_targets(shared);
             }
             event = receive_provider(&mut provider.events) => {
@@ -3681,7 +4173,7 @@ async fn wait_or_service_controller(
                     session,
                     reducer,
                     shared,
-                    writer,
+                    persistence,
                 ).await?;
                 provider.publish_targets(shared);
             }
@@ -3694,6 +4186,366 @@ fn unix_now_ms() -> i64 {
         return 0;
     };
     duration.as_millis().min(i64::MAX as u128) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::diagnostics::{OccurrenceLogStatus, RuntimeWriteOutcome};
+    use crate::store::writer::{
+        DurabilityDisposition, PersistenceFailure, PersistenceFailureCode, PersistenceOperation,
+        PersistencePhase,
+    };
+    use crate::store::{open_writer, spawn_writer};
+
+    #[derive(Default)]
+    struct RecordingOccurrenceSink {
+        attempts: AtomicUsize,
+        bytes: Mutex<Vec<u8>>,
+        fail: bool,
+    }
+
+    impl PersistenceOccurrenceSink for RecordingOccurrenceSink {
+        fn append(&self, record: &[u8]) -> io::Result<()> {
+            self.attempts.fetch_add(1, Ordering::Relaxed);
+            if self.fail {
+                return Err(io::Error::other("injected append failure"));
+            }
+            self.bytes.lock().unwrap().extend_from_slice(record);
+            Ok(())
+        }
+    }
+
+    fn failure(
+        operation: PersistenceOperation,
+        phase: PersistencePhase,
+        code: PersistenceFailureCode,
+        durability: DurabilityDisposition,
+    ) -> PersistenceFailure {
+        PersistenceFailure {
+            operation,
+            phase,
+            code,
+            durability,
+        }
+    }
+
+    fn runtime_with_sink(
+        sink: Arc<RecordingOccurrenceSink>,
+    ) -> (
+        tempfile::TempDir,
+        crate::store::WriterLifecycle,
+        RuntimePersistence,
+        watch::Receiver<crate::diagnostics::RuntimeDiagnosticsSnapshot>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (runtime, diagnostics) = RuntimePersistence::new_for_test(writer, sink);
+        (directory, lifecycle, runtime, diagnostics)
+    }
+
+    async fn shutdown_writer(lifecycle: crate::store::WriterLifecycle) {
+        tokio::time::timeout(STOP_TIMEOUT, lifecycle.shutdown())
+            .await
+            .expect("writer shutdown timed out")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn i4_d3_owner_update_failure_marks_stale_and_skips_later_writes() {
+        let sink = Arc::new(RecordingOccurrenceSink::default());
+        let (_directory, lifecycle, mut runtime, diagnostics) = runtime_with_sink(sink);
+        let owner_failure = failure(
+            PersistenceOperation::UpdateOwnerLocation,
+            PersistencePhase::CommandExecution,
+            PersistenceFailureCode::OwnerAbsent,
+            DurabilityDisposition::NotCommitted,
+        );
+
+        assert_eq!(
+            runtime
+                .update_owner_location("terminal", "pane")
+                .await
+                .unwrap(),
+            RuntimeWriteOutcome::NotCommitted(owner_failure)
+        );
+        assert_eq!(
+            runtime.apply(Vec::new()).await.unwrap(),
+            RuntimeWriteOutcome::Skipped
+        );
+        assert_eq!(
+            runtime
+                .update_owner_location("terminal", "pane")
+                .await
+                .unwrap(),
+            RuntimeWriteOutcome::Skipped
+        );
+        let snapshot = diagnostics.borrow();
+        assert_eq!(snapshot.owner, crate::diagnostics::OwnerFreshness::Stale);
+        assert_eq!(snapshot.persistence_counters.not_committed_batches, 0);
+        assert_eq!(snapshot.persistence_counters.skipped_batches, 1);
+        assert_eq!(snapshot.persistence_counters.skipped_owner_updates, 1);
+        drop(snapshot);
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn i4_d3_accepted_not_committed_counts_without_rollback() {
+        let sink = Arc::new(RecordingOccurrenceSink::default());
+        let (_directory, lifecycle, mut runtime, diagnostics) = runtime_with_sink(sink);
+        let expected = failure(
+            PersistenceOperation::Apply,
+            PersistencePhase::CommandExecution,
+            PersistenceFailureCode::Sqlite,
+            DurabilityDisposition::NotCommitted,
+        );
+
+        assert_eq!(
+            runtime.record_failure(expected, RuntimeCommandClass::Batch),
+            RuntimeWriteOutcome::NotCommitted(expected)
+        );
+        assert_eq!(
+            diagnostics
+                .borrow()
+                .persistence_counters
+                .not_committed_batches,
+            1
+        );
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn i4_d3_post_commit_cleanup_failure_counts_committed() {
+        let sink = Arc::new(RecordingOccurrenceSink::default());
+        let (_directory, lifecycle, mut runtime, diagnostics) = runtime_with_sink(sink);
+        let expected = failure(
+            PersistenceOperation::Cleanup,
+            PersistencePhase::PostApplyCommit,
+            PersistenceFailureCode::Sqlite,
+            DurabilityDisposition::Committed,
+        );
+
+        assert_eq!(
+            runtime.record_failure(expected, RuntimeCommandClass::Batch),
+            RuntimeWriteOutcome::CommittedButDegraded(expected)
+        );
+        assert_eq!(
+            diagnostics
+                .borrow()
+                .persistence_counters
+                .committed_but_degraded_batches,
+            1
+        );
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn i4_d3_ack_drop_counts_durability_unknown() {
+        let sink = Arc::new(RecordingOccurrenceSink::default());
+        let (_directory, lifecycle, mut runtime, diagnostics) = runtime_with_sink(sink);
+        let expected = failure(
+            PersistenceOperation::Apply,
+            PersistencePhase::Acknowledgement,
+            PersistenceFailureCode::AcknowledgementDropped,
+            DurabilityDisposition::Unknown,
+        );
+
+        assert_eq!(
+            runtime.record_failure(expected, RuntimeCommandClass::Batch),
+            RuntimeWriteOutcome::DurabilityUnknown(expected)
+        );
+        assert_eq!(
+            diagnostics
+                .borrow()
+                .persistence_counters
+                .durability_unknown_batches,
+            1
+        );
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn i4_d3_first_failure_log_contains_codes_not_private_values() {
+        let sink = Arc::new(RecordingOccurrenceSink::default());
+        let (_directory, lifecycle, mut runtime, diagnostics) = runtime_with_sink(sink.clone());
+        let expected = failure(
+            PersistenceOperation::Apply,
+            PersistencePhase::CommandExecution,
+            PersistenceFailureCode::Sqlite,
+            DurabilityDisposition::NotCommitted,
+        );
+
+        runtime.record_failure(expected, RuntimeCommandClass::Batch);
+        let bytes = sink.bytes.lock().unwrap().clone();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("HERDR_TOP_PERSISTENCE_V1 "));
+        assert!(text.ends_with('\n'));
+        assert!(text.contains("\"operation\":\"apply\""));
+        assert!(text.contains("\"code\":\"sqlite\""));
+        assert!(!text.contains("PRIVATE_PATH_OR_EVENT_ID"));
+        assert_eq!(
+            diagnostics.borrow().first_failure_log,
+            OccurrenceLogStatus::Emitted
+        );
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn i4_d3_occurrence_append_failure_is_reported_and_attempted_once() {
+        let sink = Arc::new(RecordingOccurrenceSink {
+            fail: true,
+            ..RecordingOccurrenceSink::default()
+        });
+        let (_directory, lifecycle, mut runtime, diagnostics) = runtime_with_sink(sink.clone());
+        let first = failure(
+            PersistenceOperation::Cleanup,
+            PersistencePhase::CommandExecution,
+            PersistenceFailureCode::Io,
+            DurabilityDisposition::NotCommitted,
+        );
+        let later = failure(
+            PersistenceOperation::Apply,
+            PersistencePhase::Acknowledgement,
+            PersistenceFailureCode::AcknowledgementDropped,
+            DurabilityDisposition::Unknown,
+        );
+
+        runtime.record_failure(first, RuntimeCommandClass::Batch);
+        runtime.record_failure(later, RuntimeCommandClass::Batch);
+        assert_eq!(sink.attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            diagnostics.borrow().first_failure_log,
+            OccurrenceLogStatus::Failed
+        );
+        assert_eq!(
+            diagnostics.borrow().persistence,
+            crate::store::PersistenceStatus::Degraded { failure: first }
+        );
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn i4_d3_accepted_failure_log_excludes_raw_store_text() {
+        const RAW_STORE_TEXT: &str = "PRIVATE_SQLITE_ROW_AND_PATH_2A31";
+        let sink = Arc::new(RecordingOccurrenceSink::default());
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        rusqlite::Connection::open(crate::store::database_path(&root))
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TRIGGER i4_private_store_text BEFORE INSERT ON events \
+                 BEGIN SELECT RAISE(ABORT, '{RAW_STORE_TEXT}'); END;"
+            ))
+            .unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut runtime, _diagnostics) = RuntimePersistence::new_for_test(writer, sink.clone());
+
+        let outcome = runtime
+            .apply(vec![PersistOp::RecordCollectorGap(CollectorGap {
+                event_id: "private-event-id".to_owned(),
+                herdr_session: "private-session".to_owned(),
+                seen_at_ms: 0,
+                kind: GapKind::Startup,
+            })])
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RuntimeWriteOutcome::NotCommitted(_)));
+
+        let text = String::from_utf8(sink.bytes.lock().unwrap().clone()).unwrap();
+        assert!(!text.contains(RAW_STORE_TEXT));
+        assert!(!text.contains("private-event-id"));
+        assert!(!text.contains("private-session"));
+        assert!(!text.contains(directory.path().to_string_lossy().as_ref()));
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn i4_d3_herdr_disconnect_immediately_refreshes_diagnostics_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let restored = store.load_restored_state().unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (reducer, shared) = Reducer::new(restored);
+        let (quality_sender, _quality) = watch::channel(ObservationQuality::Reconciling);
+        let initial_coverage = SourceCoverageRegistry::new(SourceAvailability::NotApplicable);
+        let (coverage_sender, _source_coverage) = watch::channel(initial_coverage.clone());
+        let coverage = CoverageTracker::new(
+            SourceAvailability::NotApplicable,
+            coverage_sender,
+            quality_sender,
+        );
+        let (persistence, mut diagnostics) = RuntimePersistence::new(
+            writer,
+            &shared.borrow(),
+            &initial_coverage,
+            Arc::new(RecordingOccurrenceSink::default()),
+        );
+        diagnostics.borrow_and_update();
+
+        let provider_diagnostics = crate::provider::ProviderDiagnostics::default();
+        let (ignored_events, _ignored_receiver) = mpsc::channel(1);
+        let provider_thread = spawn_provider_thread_with_diagnostics(
+            AdapterProviderWorker::new(Vec::new(), provider_diagnostics.clone()),
+            ignored_events,
+            None,
+            provider_diagnostics,
+        )
+        .unwrap();
+        let (idle_events, provider_events) = mpsc::channel(1);
+        let provider = ProviderIntegration::new(
+            provider_events,
+            provider_thread.target_publisher(),
+            TargetSet::default(),
+            coverage,
+        );
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let missing_socket = directory.path().join("missing-herdr.sock");
+        let task = tokio::spawn(run_collector(
+            missing_socket,
+            "diagnostics-session".to_owned(),
+            persistence,
+            reducer,
+            shared,
+            task_cancellation,
+            OwnerTracker::from_environment(),
+            None,
+            provider,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), diagnostics.changed())
+            .await
+            .expect("Herdr disconnect did not refresh consolidated diagnostics")
+            .unwrap();
+        assert!(
+            diagnostics
+                .borrow_and_update()
+                .source_coverage
+                .iter()
+                .any(|source| source.source == DiagnosticSource::Herdr
+                    && source.availability == InputAvailability::Unavailable)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(180), diagnostics.changed())
+                .await
+                .is_err(),
+            "identical disconnect transitions must not publish spurious diagnostics versions"
+        );
+
+        cancellation.cancel();
+        drop(idle_events);
+        task.await.unwrap().unwrap();
+        provider_thread.stop().await.unwrap();
+        shutdown_writer(lifecycle).await;
+    }
 }
 
 #[cfg(test)]
@@ -3716,6 +4568,34 @@ mod provider_integration_tests {
     use crate::store::{
         NativeSessionBinding, PersistOp, PersistTaskRun, open_reader, open_writer, spawn_writer,
     };
+
+    struct TestOccurrenceSink;
+
+    impl PersistenceOccurrenceSink for TestOccurrenceSink {
+        fn append(&self, _record: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_runtime(writer: WriterClient) -> RuntimePersistence {
+        RuntimePersistence::new_for_test(writer, Arc::new(TestOccurrenceSink)).0
+    }
+
+    fn test_diagnostics() -> watch::Receiver<RuntimeDiagnosticsSnapshot> {
+        watch::channel(RuntimeDiagnosticsSnapshot {
+            persistence: PersistenceStatus::Healthy,
+            controller_input: ControllerInputStatus::Unavailable {
+                reason: ControllerInputUnavailableReason::ListenerUnavailable,
+            },
+            owner: OwnerFreshness::Current,
+            persistence_counters: PersistenceCounters::default(),
+            controller_counters: crate::diagnostics::ControllerCounterSnapshot::default(),
+            source_coverage: Vec::new(),
+            dangling_announcement_components: 0,
+            first_failure_log: OccurrenceLogStatus::NotAttempted,
+        })
+        .1
+    }
 
     async fn wait_for_provider_readiness(events: &mut mpsc::Receiver<ProviderEvent>) {
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -6050,6 +6930,7 @@ mod provider_integration_tests {
                 let handle = CollectorHandle {
                     quality,
                     source_coverage,
+                    diagnostics: test_diagnostics(),
                     model,
                     cancellation: CancellationToken::new(),
                     task: tokio::spawn(async {
@@ -6071,7 +6952,7 @@ mod provider_integration_tests {
         ));
         let contents = std::fs::read_to_string(log_path).unwrap();
         assert!(
-            contents.contains("provider I/O thread panicked or exited without acknowledgement"),
+            contents.contains("provider_thread_panicked"),
             "masked provider shutdown error was not logged: {contents}"
         );
     }
@@ -6097,6 +6978,7 @@ mod provider_integration_tests {
         let handle = CollectorHandle {
             quality,
             source_coverage,
+            diagnostics: test_diagnostics(),
             model,
             cancellation: CancellationToken::new(),
             task: tokio::spawn(async {
@@ -6142,6 +7024,7 @@ mod provider_integration_tests {
             .unwrap();
         let restored = store.load_restored_state().unwrap();
         let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut persistence = test_runtime(writer);
         let (mut reducer, shared) = Reducer::new(restored);
 
         apply_provider_event(
@@ -6164,7 +7047,7 @@ mod provider_integration_tests {
             "session",
             &mut reducer,
             &shared,
-            &writer,
+            &mut persistence,
             &SourceCoverageRegistry::new(SourceAvailability::Available),
         )
         .await
@@ -6191,7 +7074,7 @@ mod provider_integration_tests {
             "session",
             &mut reducer,
             &shared,
-            &writer,
+            &mut persistence,
             &SourceCoverageRegistry::new(SourceAvailability::Available),
         )
         .await
@@ -6201,7 +7084,7 @@ mod provider_integration_tests {
             "session",
             &mut reducer,
             &shared,
-            &writer,
+            &mut persistence,
             &SourceCoverageRegistry::new(SourceAvailability::Available),
         )
         .await
@@ -6303,6 +7186,7 @@ mod provider_integration_tests {
             .unwrap();
         let restored = store.load_restored_state().unwrap();
         let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut persistence = test_runtime(writer);
         let (mut reducer, shared) = Reducer::new(restored);
 
         apply_provider_event(
@@ -6325,7 +7209,7 @@ mod provider_integration_tests {
             "session",
             &mut reducer,
             &shared,
-            &writer,
+            &mut persistence,
             &SourceCoverageRegistry::new(SourceAvailability::Available),
         )
         .await
@@ -6413,6 +7297,7 @@ mod provider_integration_tests {
         };
         let store = open_writer(&root).unwrap();
         let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut persistence = test_runtime(writer);
         let (mut reducer, shared) = Reducer::new(restored);
 
         apply_provider_event(
@@ -6435,7 +7320,7 @@ mod provider_integration_tests {
             "session",
             &mut reducer,
             &shared,
-            &writer,
+            &mut persistence,
             &SourceCoverageRegistry::new(SourceAvailability::Available),
         )
         .await

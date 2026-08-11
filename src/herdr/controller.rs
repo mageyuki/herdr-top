@@ -11,16 +11,20 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
+use crate::diagnostics::{
+    ControllerInputStatus, ControllerInputUnavailableReason, DiagnosticSource, InputAvailability,
+    RuntimeDiagnosticsSnapshot, RuntimeWriteOutcome,
+};
+use crate::herdr::collector::RuntimePersistence;
 use crate::model::{
     ControllerDiagnosticsHandle, ControllerEvent, ControllerEventKind, EventMetadata,
     MinimalProviderMetadata, Provider, SourceCoverage, quantize_progress,
 };
 use crate::reducer::{CommitStagedError, Reducer, RejectReason};
-use crate::store::writer::WriterClient;
 
 /// Maximum JSON payload size, excluding the newline delimiter.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -144,6 +148,43 @@ pub enum RetryableReason {
     PersistenceUnavailable,
 }
 
+/// Exact closed request for the additive read-only status surface.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControllerStatusRequest {
+    pub request: StatusRequestKind,
+    pub schema_version: u64,
+}
+
+/// Supported status request kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusRequestKind {
+    Status,
+}
+
+/// Distinct closed response for Controller runtime status.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ControllerStatusResponse {
+    Ok {
+        schema_version: u64,
+        diagnostics: RuntimeDiagnosticsSnapshot,
+    },
+    Error {
+        schema_version: u64,
+        reason: ControllerStatusErrorReason,
+    },
+}
+
+/// Stable status-request error taxonomy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerStatusErrorReason {
+    InvalidRequest,
+    UnsupportedVersion,
+}
+
 /// Outcome observed by the best-effort emit client.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EmitOutcome {
@@ -221,10 +262,29 @@ pub fn spawn_acceptor(
     sender: ControllerRequestSender,
     cancellation: CancellationToken,
 ) -> Result<JoinHandle<Result<(), ControllerServerError>>, ControllerServerError> {
+    spawn_acceptor_configured(listener, sender, cancellation, None)
+}
+
+/// Starts an acceptor that can answer status directly from a read-only watch.
+pub fn spawn_acceptor_with_diagnostics(
+    listener: StdUnixListener,
+    sender: ControllerRequestSender,
+    cancellation: CancellationToken,
+    diagnostics: watch::Receiver<RuntimeDiagnosticsSnapshot>,
+) -> Result<JoinHandle<Result<(), ControllerServerError>>, ControllerServerError> {
+    spawn_acceptor_configured(listener, sender, cancellation, Some(diagnostics))
+}
+
+fn spawn_acceptor_configured(
+    listener: StdUnixListener,
+    sender: ControllerRequestSender,
+    cancellation: CancellationToken,
+    diagnostics: Option<watch::Receiver<RuntimeDiagnosticsSnapshot>>,
+) -> Result<JoinHandle<Result<(), ControllerServerError>>, ControllerServerError> {
     listener.set_nonblocking(true)?;
     let mut listener = UnixListener::from_std(listener)?;
     Ok(tokio::spawn(async move {
-        run_acceptor(&mut listener, sender, cancellation).await
+        run_acceptor(&mut listener, sender, cancellation, diagnostics).await
     }))
 }
 
@@ -244,6 +304,7 @@ async fn run_acceptor(
     source: &mut impl AcceptSource,
     sender: ControllerRequestSender,
     cancellation: CancellationToken,
+    diagnostics: Option<watch::Receiver<RuntimeDiagnosticsSnapshot>>,
 ) -> Result<(), ControllerServerError> {
     let mut connections = JoinSet::new();
     loop {
@@ -253,22 +314,40 @@ async fn run_acceptor(
                 match accepted {
                     Ok(stream) => {
                         let request_sender = sender.clone();
+                        let runtime_diagnostics = diagnostics.clone();
                         connections.spawn(async move {
-                            if let Err(error) = handle_connection(stream, request_sender).await {
-                                tracing::warn!(error = %error, "Controller connection ended without a response");
+                            if let Err(error) = handle_connection(
+                                stream,
+                                request_sender,
+                                runtime_diagnostics,
+                            ).await {
+                                tracing::warn!(
+                                    warning_code = "controller_connection_io",
+                                    io_kind = ?error.kind(),
+                                    "Controller connection ended without a response"
+                                );
                             }
                         });
                     }
                     Err(error) => {
                         sender.diagnostics.record_accept_failure();
-                        tracing::warn!(error = %error, "Controller accept failed; retrying");
+                        tracing::warn!(
+                            warning_code = "controller_accept_failed",
+                            io_kind = ?error.kind(),
+                            "Controller accept failed; retrying"
+                        );
                         tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
                     }
                 }
             }
             result = connections.join_next(), if !connections.is_empty() => {
                 if let Some(Err(error)) = result {
-                    tracing::warn!(error = %error, "Controller connection task failed");
+                    tracing::warn!(
+                        warning_code = "controller_connection_task_failed",
+                        cancelled = error.is_cancelled(),
+                        panicked = error.is_panic(),
+                        "Controller connection task failed"
+                    );
                 }
             }
         }
@@ -281,11 +360,23 @@ async fn run_acceptor(
 async fn handle_connection(
     mut stream: UnixStream,
     sender: ControllerRequestSender,
+    diagnostics: Option<watch::Receiver<RuntimeDiagnosticsSnapshot>>,
 ) -> io::Result<()> {
     let mut should_drain = false;
     let response = match tokio::time::timeout(CONTROLLER_IO_TIMEOUT, read_frame(&mut stream)).await
     {
         Ok(Ok(frame)) => {
+            if let Some(response) =
+                status_response(&frame, diagnostics.as_ref(), &sender.diagnostics)
+            {
+                write_response(&mut stream, &response).await?;
+                tokio::time::timeout(CONTROLLER_IO_TIMEOUT, stream.shutdown())
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "Controller shutdown timed out")
+                    })??;
+                return Ok(());
+            }
             let (responder, response) = oneshot::channel();
             let request = ControllerRequest {
                 frame,
@@ -324,11 +415,7 @@ async fn handle_connection(
             }
         }
     };
-    let mut bytes = serde_json::to_vec(&response).map_err(invalid_data)?;
-    bytes.push(b'\n');
-    tokio::time::timeout(CONTROLLER_IO_TIMEOUT, stream.write_all(&bytes))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Controller response timed out"))??;
+    write_response(&mut stream, &response).await?;
     if should_drain {
         tokio::time::timeout(CONTROLLER_IO_TIMEOUT, drain_inbound(&mut stream))
             .await
@@ -338,6 +425,66 @@ async fn handle_connection(
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Controller shutdown timed out"))??;
     Ok(())
+}
+
+async fn write_response(
+    mut stream: impl AsyncWriteExt + Unpin,
+    response: &impl Serialize,
+) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec(response).map_err(invalid_data)?;
+    bytes.push(b'\n');
+    tokio::time::timeout(CONTROLLER_IO_TIMEOUT, stream.write_all(&bytes))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Controller response timed out"))??;
+    Ok(())
+}
+
+fn status_response(
+    frame: &[u8],
+    diagnostics: Option<&watch::Receiver<RuntimeDiagnosticsSnapshot>>,
+    acceptor_diagnostics: &ControllerDiagnosticsHandle,
+) -> Option<ControllerStatusResponse> {
+    let diagnostics = diagnostics?;
+    let Value::Object(object) = serde_json::from_slice::<Value>(frame).ok()? else {
+        return None;
+    };
+    if object.contains_key("event_id") || !object.contains_key("request") {
+        return None;
+    }
+    let request = serde_json::from_value::<ControllerStatusRequest>(Value::Object(object));
+    Some(match request {
+        Ok(request) if request.schema_version == 1 => {
+            let diagnostics_closed = diagnostics.has_changed().is_err();
+            let mut snapshot = diagnostics.borrow().clone();
+            if diagnostics_closed {
+                snapshot.controller_input = ControllerInputStatus::Unavailable {
+                    reason: ControllerInputUnavailableReason::RuntimeUnsafe,
+                };
+                if let Some(controller) = snapshot
+                    .source_coverage
+                    .iter_mut()
+                    .find(|source| source.source == DiagnosticSource::Controller)
+                {
+                    controller.availability = InputAvailability::Unavailable;
+                }
+            }
+            snapshot.controller_counters.socket_saturations =
+                acceptor_diagnostics.socket_saturations();
+            snapshot.controller_counters.accept_failures = acceptor_diagnostics.accept_failures();
+            ControllerStatusResponse::Ok {
+                schema_version: 1,
+                diagnostics: snapshot,
+            }
+        }
+        Ok(_) => ControllerStatusResponse::Error {
+            schema_version: 1,
+            reason: ControllerStatusErrorReason::UnsupportedVersion,
+        },
+        Err(_) => ControllerStatusResponse::Error {
+            schema_version: 1,
+            reason: ControllerStatusErrorReason::InvalidRequest,
+        },
+    })
 }
 
 async fn drain_inbound(stream: &mut UnixStream) -> io::Result<()> {
@@ -386,7 +533,7 @@ pub(crate) async fn service_request(
     request: ControllerRequest,
     session: &str,
     reducer: &mut Reducer,
-    writer: &WriterClient,
+    persistence: &mut RuntimePersistence,
 ) {
     let decoded = decode_envelope(&request.frame);
     // Alias resolution for a merged-away key happens inside `validate_controller_event`
@@ -395,7 +542,7 @@ pub(crate) async fn service_request(
     if decoded
         .event_id
         .as_deref()
-        .is_some_and(|event_id| writer.is_duplicate(event_id))
+        .is_some_and(|event_id| persistence.is_duplicate(event_id))
     {
         let _ = request.responder.send(ControllerResponse::Duplicate);
         return;
@@ -418,7 +565,7 @@ pub(crate) async fn service_request(
             return;
         }
     };
-    let Some(permit) = writer.reserve_enqueue() else {
+    let Some(permit) = persistence.reserve_enqueue() else {
         let _ = request.responder.send(ControllerResponse::Retryable {
             reason: RetryableReason::PersistenceUnavailable,
         });
@@ -434,8 +581,43 @@ pub(crate) async fn service_request(
         }
     };
     let _ = request.responder.send(ControllerResponse::Accepted);
-    if let Err(error) = pending.wait().await {
-        tracing::warn!(error = %error, "accepted Controller event failed during persistence");
+    match persistence.finish_pending(pending).await {
+        Ok(RuntimeWriteOutcome::Durable) => {}
+        Ok(
+            RuntimeWriteOutcome::CommittedButDegraded(_)
+            | RuntimeWriteOutcome::NotCommitted(_)
+            | RuntimeWriteOutcome::DurabilityUnknown(_),
+        ) => {
+            tracing::warn!(
+                warning_code = "controller_persistence_degraded",
+                "accepted Controller event degraded persistence"
+            );
+        }
+        Ok(RuntimeWriteOutcome::Skipped) => {
+            tracing::warn!(
+                warning_code = "controller_persistence_skipped_after_admission",
+                "accepted Controller event persistence was skipped"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                warning_code = writer_error_code(&error),
+                "accepted Controller event persistence failed unexpectedly"
+            );
+        }
+    }
+}
+
+fn writer_error_code(error: &crate::store::writer::WriterError) -> &'static str {
+    match error {
+        crate::store::writer::WriterError::Store(_) => "controller_writer_startup_store_error",
+        crate::store::writer::WriterError::Persistence(_) => "controller_writer_persistence_error",
+        crate::store::writer::WriterError::Closed => "controller_writer_closed",
+        crate::store::writer::WriterError::AcknowledgementDropped => {
+            "controller_writer_acknowledgement_dropped"
+        }
+        crate::store::writer::WriterError::ThreadPanicked => "controller_writer_thread_panicked",
+        crate::store::writer::WriterError::ThreadSpawn(_) => "controller_writer_thread_spawn",
     }
 }
 
@@ -673,6 +855,44 @@ pub async fn emit_to_endpoint(path: &Path, envelope: &ControllerEnvelope) -> Emi
     }
 }
 
+/// Queries the additive read-only status surface without admitting a reducer request.
+pub async fn query_status(path: &Path) -> io::Result<Value> {
+    let mut stream = tokio::time::timeout(CONTROLLER_IO_TIMEOUT, UnixStream::connect(path))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Controller connect timed out"))??;
+    tokio::time::timeout(
+        CONTROLLER_IO_TIMEOUT,
+        stream.write_all(b"{\"request\":\"status\",\"schema_version\":1}\n"),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Controller write timed out"))??;
+    tokio::time::timeout(CONTROLLER_IO_TIMEOUT, stream.shutdown())
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Controller shutdown timed out"))??;
+    let mut response = Vec::new();
+    let read = async {
+        let mut limited = (&mut stream).take((MAX_FRAME_BYTES + 2) as u64);
+        limited.read_to_end(&mut response).await
+    };
+    tokio::time::timeout(CONTROLLER_IO_TIMEOUT, read)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Controller read timed out"))??;
+    if response.len() > MAX_FRAME_BYTES + 1 || response.last() != Some(&b'\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid Controller status response framing",
+        ));
+    }
+    response.pop();
+    if response.contains(&b'\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "multiple Controller status responses",
+        ));
+    }
+    serde_json::from_slice(&response).map_err(invalid_data)
+}
+
 fn invalid_data(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
@@ -688,6 +908,7 @@ fn unix_now_ms() -> i64 {
 mod tests {
     use std::collections::VecDeque;
     use std::future::pending;
+    use std::sync::Arc;
 
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -697,10 +918,54 @@ mod tests {
     use crate::model::{DomainModel, NormalizedEvent};
     use crate::store::{PersistOp, RestoredState, open_writer, spawn_writer};
 
+    struct TestOccurrenceSink;
+
+    impl crate::diagnostics::PersistenceOccurrenceSink for TestOccurrenceSink {
+        fn append(&self, _record: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_runtime_diagnostics() -> (
+        watch::Sender<RuntimeDiagnosticsSnapshot>,
+        watch::Receiver<RuntimeDiagnosticsSnapshot>,
+    ) {
+        use crate::diagnostics::{
+            ControllerCounterSnapshot, OccurrenceLogStatus, OwnerFreshness, PersistenceCounters,
+            SourceCoverageSnapshot,
+        };
+
+        watch::channel(RuntimeDiagnosticsSnapshot {
+            persistence: crate::store::writer::PersistenceStatus::Healthy,
+            controller_input: ControllerInputStatus::Available,
+            owner: OwnerFreshness::Current,
+            persistence_counters: PersistenceCounters::default(),
+            controller_counters: ControllerCounterSnapshot::default(),
+            source_coverage: [
+                DiagnosticSource::Herdr,
+                DiagnosticSource::Controller,
+                DiagnosticSource::Claude,
+                DiagnosticSource::Codex,
+            ]
+            .into_iter()
+            .map(|source| SourceCoverageSnapshot {
+                source,
+                availability: if source == DiagnosticSource::Controller {
+                    InputAvailability::Available
+                } else {
+                    InputAvailability::Unavailable
+                },
+            })
+            .collect(),
+            dangling_announcement_components: 0,
+            first_failure_log: OccurrenceLogStatus::NotAttempted,
+        })
+    }
+
     async fn service_frame(
         frame: Value,
         reducer: &mut Reducer,
-        writer: &WriterClient,
+        persistence: &mut RuntimePersistence,
     ) -> ControllerResponse {
         let (responder, response) = oneshot::channel();
         service_request(
@@ -711,7 +976,7 @@ mod tests {
             },
             "session",
             reducer,
-            writer,
+            persistence,
         )
         .await;
         response.await.unwrap()
@@ -747,6 +1012,7 @@ mod tests {
                 .unwrap();
         });
         let cancellation = CancellationToken::new();
+        let (_diagnostics_sender, runtime_diagnostics) = test_runtime_diagnostics();
         let cancel_after_response = cancellation.clone();
         let client_exchange = async move {
             let mut frame = serde_json::to_vec(&json!({
@@ -776,7 +1042,7 @@ mod tests {
         };
 
         let (acceptor, response) = tokio::join!(
-            run_acceptor(&mut source, sender, cancellation),
+            run_acceptor(&mut source, sender, cancellation, Some(runtime_diagnostics),),
             client_exchange
         );
 
@@ -791,7 +1057,8 @@ mod tests {
         let (mut client, server) = UnixStream::pair().unwrap();
         let diagnostics = ControllerDiagnosticsHandle::default();
         let (sender, _receiver) = request_channel(1, diagnostics);
-        let handle = tokio::spawn(handle_connection(server, sender));
+        let (_diagnostics_sender, runtime_diagnostics) = test_runtime_diagnostics();
+        let handle = tokio::spawn(handle_connection(server, sender, Some(runtime_diagnostics)));
 
         client.write_all(b"{").await.unwrap();
         let mut response = Vec::new();
@@ -830,6 +1097,8 @@ mod tests {
         let store = open_writer(&root).unwrap();
         let restored = store.load_restored_state().unwrap();
         let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut persistence, _diagnostics) =
+            RuntimePersistence::new_for_test(writer, Arc::new(TestOccurrenceSink));
         let (mut reducer, shared) = Reducer::new(restored);
         let started = json!({
             "schema_version": 1,
@@ -842,11 +1111,11 @@ mod tests {
         });
 
         assert_eq!(
-            service_frame(started.clone(), &mut reducer, &writer).await,
+            service_frame(started.clone(), &mut reducer, &mut persistence).await,
             ControllerResponse::Accepted
         );
         assert_eq!(
-            service_frame(started, &mut reducer, &writer).await,
+            service_frame(started, &mut reducer, &mut persistence).await,
             ControllerResponse::Duplicate
         );
         assert_eq!(
@@ -861,7 +1130,7 @@ mod tests {
                     "parent_task_run_id": "self"
                 }),
                 &mut reducer,
-                &writer,
+                &mut persistence,
             )
             .await,
             ControllerResponse::Rejected {
@@ -882,6 +1151,79 @@ mod tests {
         );
 
         lifecycle.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn i4_status_request_is_closed_and_event_wire_is_compatible() {
+        let (_diagnostics_sender, diagnostics) = test_runtime_diagnostics();
+        let acceptor_diagnostics = ControllerDiagnosticsHandle::default();
+        let valid = status_response(
+            br#"{"request":"status","schema_version":1}"#,
+            Some(&diagnostics),
+            &acceptor_diagnostics,
+        )
+        .unwrap();
+        assert!(matches!(
+            &valid,
+            ControllerStatusResponse::Ok {
+                schema_version: 1,
+                ..
+            }
+        ));
+        assert_eq!(
+            serde_json::to_vec(&valid).unwrap(),
+            br#"{"status":"ok","schema_version":1,"diagnostics":{"persistence":{"status":"healthy"},"controller_input":{"status":"available"},"owner":"current","persistence_counters":{"not_committed_batches":0,"durability_unknown_batches":0,"committed_but_degraded_batches":0,"skipped_batches":0,"skipped_owner_updates":0},"controller_counters":{"binding_conflicts":0,"terminal_blocked_progress_noops":0,"terminal_forward_reference_creations":0,"dangling_announcement_components":0,"ingest_sequence_exhaustions":0,"provider_parent_conflicts":0,"provider_identity_disagreements":0,"socket_saturations":0,"accept_failures":0},"source_coverage":[{"source":"herdr","availability":"unavailable"},{"source":"controller","availability":"available"},{"source":"claude","availability":"unavailable"},{"source":"codex","availability":"unavailable"}],"dangling_announcement_components":0,"first_failure_log":"not_attempted"}}"#,
+        );
+        let extra = status_response(
+            br#"{"request":"status","schema_version":1,"extra":true}"#,
+            Some(&diagnostics),
+            &acceptor_diagnostics,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&extra).unwrap(),
+            br#"{"status":"error","schema_version":1,"reason":"invalid_request"}"#
+        );
+        let unsupported = status_response(
+            br#"{"request":"status","schema_version":2}"#,
+            Some(&diagnostics),
+            &acceptor_diagnostics,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&unsupported).unwrap(),
+            br#"{"status":"error","schema_version":1,"reason":"unsupported_version"}"#
+        );
+        assert!(
+            status_response(
+                br#"{"schema_version":1}"#,
+                Some(&diagnostics),
+                &acceptor_diagnostics,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn i4_status_request_key_on_existing_event_remains_an_ignored_extension() {
+        let (_diagnostics_sender, diagnostics) = test_runtime_diagnostics();
+        let acceptor_diagnostics = ControllerDiagnosticsHandle::default();
+        assert!(
+            status_response(
+                br#"{"event_id":null,"request":"status","schema_version":1}"#,
+                Some(&diagnostics),
+                &acceptor_diagnostics,
+            )
+            .is_none()
+        );
+        assert!(
+            status_response(
+                br#"{"event_id":"event","request":"status","schema_version":1}"#,
+                Some(&diagnostics),
+                &acceptor_diagnostics,
+            )
+            .is_none()
+        );
     }
 
     #[test]

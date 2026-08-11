@@ -6,9 +6,11 @@ use std::io;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
+use herdr_top::diagnostics::{PersistenceOccurrenceSink, SharedFileOccurrenceSink};
 use herdr_top::herdr::collector::{self, CollectorError, SourceAvailability};
 use herdr_top::herdr::controller::{self, ControllerEnvelope, EmitOutcome};
 use herdr_top::herdr::wire;
@@ -194,7 +196,7 @@ fn emit_unavailable(strict: bool, reason: String) -> ExitCode {
 async fn run_monitor(cli: &Cli) -> Result<(), MainError> {
     let resolved = resolve_session(cli)?;
     let root = lockfile::state_root(resolved.session_key())?;
-    initialize_tracing(&root)?;
+    let occurrence_sink = initialize_tracing(&root)?;
     let owner_lock = lockfile::try_acquire(&root)?;
 
     let Some(owner_lock) = owner_lock else {
@@ -233,13 +235,14 @@ async fn run_monitor(cli: &Cli) -> Result<(), MainError> {
     let restored = store.load_restored_state()?;
     let (lifecycle, writer) = store::spawn_writer(store)?;
     let session_name = resolved.session_key().name().to_owned();
-    let collector = match collector::spawn_with_controller_coverage(
+    let collector = match collector::spawn_with_controller_coverage_and_occurrence_sink(
         socket,
         session_name.clone(),
         restored,
         writer,
         controller_listener,
         controller_coverage,
+        occurrence_sink,
     )
     .await
     {
@@ -291,7 +294,10 @@ fn tracing_log_path(root: &StateRoot) -> PathBuf {
 
 fn build_tracing_subscriber(
     root: &StateRoot,
-) -> io::Result<impl tracing::Subscriber + Send + Sync> {
+) -> io::Result<(
+    impl tracing::Subscriber + Send + Sync,
+    Arc<dyn PersistenceOccurrenceSink>,
+)> {
     let path = tracing_log_path(root);
     let file = OpenOptions::new()
         .create(true)
@@ -300,19 +306,24 @@ fn build_tracing_subscriber(
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
     file.set_permissions(Permissions::from_mode(LOG_FILE_MODE))?;
-    Ok(tracing_subscriber::fmt()
+    let file = Arc::new(Mutex::new(file));
+    let shared_log = SharedFileOccurrenceSink::new(Arc::clone(&file));
+    let occurrence_sink: Arc<dyn PersistenceOccurrenceSink> = Arc::new(shared_log.clone());
+    let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
         .with_max_level(tracing::Level::WARN)
-        .with_writer(file)
-        .finish())
+        .with_writer(shared_log)
+        .finish();
+    Ok((subscriber, occurrence_sink))
 }
 
-fn initialize_tracing(root: &StateRoot) -> Result<(), MainError> {
+fn initialize_tracing(root: &StateRoot) -> Result<Arc<dyn PersistenceOccurrenceSink>, MainError> {
     let path = tracing_log_path(root);
-    let subscriber =
+    let (subscriber, occurrence_sink) =
         build_tracing_subscriber(root).map_err(|source| MainError::TracingIo { path, source })?;
     tracing::subscriber::set_global_default(subscriber)
-        .map_err(|error| MainError::TracingInit(error.to_string()))
+        .map_err(|error| MainError::TracingInit(error.to_string()))?;
+    Ok(occurrence_sink)
 }
 
 async fn run_held_branch(cli: &Cli, root: &StateRoot) -> Result<(), MainError> {
@@ -428,19 +439,23 @@ mod tests {
     fn tracing_file_is_private_warn_filtered_and_content_free_for_malformed_records() {
         let directory = tempfile::tempdir().expect("temporary state root should exist");
         let root = StateRoot(directory.path().to_path_buf());
-        let subscriber = build_tracing_subscriber(&root).expect("subscriber should build");
+        let (subscriber, occurrence_sink) =
+            build_tracing_subscriber(&root).expect("subscriber should build");
         let raw_sentinel = "MALFORMED_RAW_SENTINEL_I2E_8D97";
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(secret = raw_sentinel, "filtered informational event");
             tracing::warn!(
+                warning_code = "provider_record_malformed",
                 provider = "codex",
-                path = "synthetic.jsonl",
                 byte_offset = 41_u64,
                 error_code = "codex_json",
                 "malformed provider record"
             );
         });
+        occurrence_sink
+            .append(b"HERDR_TOP_PERSISTENCE_V1 {\"schema_version\":1}\n")
+            .expect("occurrence append should share and flush the log handle");
 
         let path = tracing_log_path(&root);
         let metadata = std::fs::metadata(&path).expect("log metadata should read");
@@ -448,6 +463,7 @@ mod tests {
         let contents = std::fs::read_to_string(path).expect("log should be UTF-8");
         assert!(contents.contains("malformed provider record"));
         assert!(contents.contains("codex_json"));
+        assert!(contents.contains("HERDR_TOP_PERSISTENCE_V1"));
         assert!(!contents.contains(raw_sentinel));
     }
 }
