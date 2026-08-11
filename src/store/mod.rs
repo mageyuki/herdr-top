@@ -19,8 +19,9 @@ pub mod writer;
 
 pub use schema::{SchemaVerdict, database_path, preflight_schema};
 pub use writer::{
-    EnqueuePermit, EventLedgerCache, PendingEnqueue, WriterClient, WriterError, WriterLifecycle,
-    spawn_writer,
+    DurabilityDisposition, EnqueuePermit, EventLedgerCache, PendingEnqueue, PersistenceFailure,
+    PersistenceFailureCode, PersistenceOperation, PersistencePhase, PersistenceStatus,
+    WriterClient, WriterError, WriterLifecycle, spawn_writer,
 };
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
