@@ -9,6 +9,8 @@ use tracing_subscriber::fmt::MakeWriter;
 use crate::model::DomainModel;
 use crate::store::writer::{PersistenceFailure, PersistenceStatus};
 
+pub mod local;
+
 const PERSISTENCE_OCCURRENCE_PREFIX: &[u8] = b"HERDR_TOP_PERSISTENCE_V1 ";
 
 /// Whether the Controller input endpoint can admit event envelopes.

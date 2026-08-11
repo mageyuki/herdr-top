@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 use std::env;
+use std::ffi::OsStr;
 use std::fs::{OpenOptions, Permissions};
 use std::io;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -10,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
+use herdr_top::diagnostics::local::{self, BreadcrumbPublishError};
 use herdr_top::diagnostics::{PersistenceOccurrenceSink, SharedFileOccurrenceSink};
 use herdr_top::herdr::collector::{self, CollectorError, SourceAvailability};
 use herdr_top::herdr::controller::{self, ControllerEnvelope, EmitOutcome};
@@ -122,8 +124,11 @@ enum MainError {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    let configured_plugin_state_dir = env::var_os("HERDR_PLUGIN_STATE_DIR");
+    let plugin_state_dir =
+        plugin_state_dir_for_command(cli.command.as_ref(), configured_plugin_state_dir.as_deref());
     let result = match &cli.command {
-        None => run_monitor(&cli).await,
+        None => run_monitor(&cli, plugin_state_dir).await,
         Some(Command::Emit(args)) => return run_emit(&cli, args).await,
         Some(Command::Doctor) => run_doctor(&cli),
     };
@@ -193,11 +198,15 @@ fn emit_unavailable(strict: bool, reason: String) -> ExitCode {
     }
 }
 
-async fn run_monitor(cli: &Cli) -> Result<(), MainError> {
+async fn run_monitor(cli: &Cli, plugin_state_dir: Option<&OsStr>) -> Result<(), MainError> {
     let resolved = resolve_session(cli)?;
     let root = lockfile::state_root(resolved.session_key())?;
     let occurrence_sink = initialize_tracing(&root)?;
-    let owner_lock = lockfile::try_acquire(&root)?;
+    let (owner_lock, breadcrumb_status) =
+        acquire_monitor_lock_with_plugin_dir(&root, plugin_state_dir)?;
+    if let BreadcrumbLaunchStatus::Failed(error) = breadcrumb_status {
+        eprintln!("{error}");
+    }
 
     let Some(owner_lock) = owner_lock else {
         return run_held_branch(cli, &root).await;
@@ -423,20 +432,146 @@ fn herdr_socket(cli: &Cli) -> Result<PathBuf, MainError> {
         .ok_or(MainError::MissingSocket)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BreadcrumbLaunchStatus {
+    NotPlugin,
+    Published,
+    Failed(BreadcrumbPublishError),
+}
+
+fn plugin_state_dir_for_command<'a>(
+    command: Option<&Command>,
+    configured: Option<&'a OsStr>,
+) -> Option<&'a OsStr> {
+    if command.is_some() {
+        return None;
+    }
+    configured.filter(|path| !path.is_empty())
+}
+
+fn acquire_monitor_lock_with_plugin_dir(
+    root: &StateRoot,
+    plugin_state_dir: Option<&OsStr>,
+) -> Result<(Option<lockfile::OwnerLock>, BreadcrumbLaunchStatus), LockError> {
+    let breadcrumb = match plugin_state_dir {
+        Some(plugin_state_dir) => match local::publish_plugin_breadcrumb(plugin_state_dir, root) {
+            Ok(()) => BreadcrumbLaunchStatus::Published,
+            Err(error) => BreadcrumbLaunchStatus::Failed(error),
+        },
+        None => BreadcrumbLaunchStatus::NotPlugin,
+    };
+    let lock = lockfile::try_acquire(root)?;
+    Ok((lock, breadcrumb))
+}
+
 fn run_doctor(cli: &Cli) -> Result<(), MainError> {
     let resolved = resolve_session(cli)?;
-    let root = lockfile::state_root(resolved.session_key())?;
+    let xdg_state_home = env::var_os("XDG_STATE_HOME");
+    let home = env::var_os("HOME");
+    let state_base = lockfile::resolve_state_base(xdg_state_home.as_deref(), home.as_deref())?;
+    let root = lockfile::derive_state_root(&state_base, resolved.session_key());
     println!("resolver_source: {}", resolved.source());
-    println!("state_root: {}", root.0.display());
+    println!(
+        "state_root: {}",
+        local::format_operational_path(&root.0, home.as_deref())
+    );
     println!("controller_socket: implemented");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn i4_local_plugin_owner_and_held_launch_publish_breadcrumb() {
+        let directory = tempfile::tempdir().unwrap();
+        let plugin = directory.path().join("plugin-state");
+        std::fs::create_dir(&plugin).unwrap();
+        std::fs::set_permissions(&plugin, Permissions::from_mode(0o700)).unwrap();
+        let key = session_key::encode("plugin launch").unwrap();
+        let root = lockfile::state_root_in(directory.path(), &key).unwrap();
+
+        let (owner, first_status) =
+            acquire_monitor_lock_with_plugin_dir(&root, Some(plugin.as_os_str())).unwrap();
+        let owner = owner.expect("first launch should own the lock");
+        assert_eq!(first_status, BreadcrumbLaunchStatus::Published);
+        let breadcrumb = plugin.join("state-root.txt");
+        assert_eq!(
+            std::fs::read(&breadcrumb).unwrap(),
+            format!("{}\n", root.0.display()).as_bytes()
+        );
+
+        std::fs::remove_file(&breadcrumb).unwrap();
+        let (held, second_status) =
+            acquire_monitor_lock_with_plugin_dir(&root, Some(plugin.as_os_str())).unwrap();
+        assert!(held.is_none());
+        assert_eq!(second_status, BreadcrumbLaunchStatus::Published);
+        assert!(breadcrumb.exists());
+        drop(owner);
+    }
+
+    #[test]
+    fn i4_local_doctor_emit_and_nonplugin_launch_never_publish_breadcrumb() {
+        let directory = tempfile::tempdir().unwrap();
+        let plugin = directory.path().join("plugin-state");
+        std::fs::create_dir(&plugin).unwrap();
+        let key = session_key::encode("command gating").unwrap();
+        let root = lockfile::state_root_in(directory.path(), &key).unwrap();
+        let emit = Command::Emit(Box::new(EmitArgs {
+            strict: false,
+            schema_version: 1,
+            event_id: "event".to_owned(),
+            emitted_at_ms: 1,
+            source: "controller".to_owned(),
+            event_type: "task_started".to_owned(),
+            task_run_id: "run".to_owned(),
+            parent_task_run_id: None,
+            depends_on_id: None,
+            label: None,
+            reason: None,
+            progress: None,
+            provider: None,
+            native_session_id: None,
+            terminal_id: None,
+        }));
+
+        for command in [Some(&Command::Doctor), Some(&emit)] {
+            assert!(plugin_state_dir_for_command(command, Some(plugin.as_os_str())).is_none());
+        }
+        let (owner, status) = acquire_monitor_lock_with_plugin_dir(&root, None).unwrap();
+        assert!(owner.is_some());
+        assert_eq!(status, BreadcrumbLaunchStatus::NotPlugin);
+        assert!(!plugin.join("state-root.txt").exists());
+    }
+
+    #[test]
+    fn i4_local_breadcrumb_failure_is_safe_and_nonfatal() {
+        let directory = tempfile::tempdir().unwrap();
+        let private = "PRIVATE_PLUGIN_PATH_D4A6";
+        let missing_plugin = directory.path().join(private);
+        let key = session_key::encode("failure launch").unwrap();
+        let root = lockfile::state_root_in(directory.path(), &key).unwrap();
+
+        let (owner, status) =
+            acquire_monitor_lock_with_plugin_dir(&root, Some(missing_plugin.as_os_str())).unwrap();
+        assert!(
+            owner.is_some(),
+            "breadcrumb failure must not block ownership"
+        );
+        let BreadcrumbLaunchStatus::Failed(error) = status else {
+            panic!("missing plugin directory should fail publication");
+        };
+        assert_eq!(error.to_string(), "breadcrumb_publish_failed");
+        assert!(!format!("{error:?}").contains(private));
+        assert_eq!(
+            plugin_state_dir_for_command(None, Some(OsStr::new(""))),
+            None
+        );
+    }
 
     #[test]
     fn tracing_file_is_private_warn_filtered_and_content_free_for_malformed_records() {

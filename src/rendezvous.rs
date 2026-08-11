@@ -111,6 +111,39 @@ pub enum ControllerClientUnavailable {
     PathTooLong,
 }
 
+/// Purely derived paths for one Controller runtime rendezvous.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControllerRuntimePaths {
+    /// The private runtime directory below the selected runtime base.
+    pub directory: PathBuf,
+    /// The exact-session name sentinel.
+    pub sentinel: PathBuf,
+    /// The Controller Unix socket.
+    pub socket: PathBuf,
+}
+
+/// Platform socket-path length without retaining the operational path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketPathLength {
+    Fits { bytes: usize, limit: usize },
+    TooLong { bytes: usize, limit: usize },
+}
+
+/// Closed, read-only observation of one Controller rendezvous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllerRuntimeProbe {
+    Absent,
+    Live,
+    Stale,
+    NoLiveEndpoint,
+    OrphanSocket,
+    MalformedSentinel,
+    Collision,
+    MalformedSocket,
+    PathTooLong { bytes: usize, limit: usize },
+    Unreadable,
+}
+
 /// A persistent diagnostic reason why Controller-event input is unavailable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControllerInputUnavailable {
@@ -198,6 +231,29 @@ pub fn runtime_base(xdg: Option<&OsStr>, tmpdir: Option<&OsStr>, uid: u32) -> Pa
         .filter(|value| !value.is_empty())
         .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
     temporary.join(format!("herdr-top-{uid}"))
+}
+
+/// Derives the runtime directory, sentinel, and socket paths without I/O.
+#[must_use]
+pub fn controller_runtime_paths(base: &Path, key: &SessionKey) -> ControllerRuntimePaths {
+    let directory = base.join(RUNTIME_CHILD);
+    controller_runtime_paths_in(&directory, key)
+}
+
+fn controller_runtime_paths_in(directory: &Path, key: &SessionKey) -> ControllerRuntimePaths {
+    let (sentinel_name, socket_name) = controller_runtime_names(key);
+    ControllerRuntimePaths {
+        sentinel: directory.join(sentinel_name),
+        socket: directory.join(socket_name),
+        directory: directory.to_path_buf(),
+    }
+}
+
+fn controller_runtime_names(key: &SessionKey) -> (String, String) {
+    (
+        format!("{}.name", key.hash16()),
+        format!("{}.sock", key.hash16()),
+    )
 }
 
 /// Opens the process runtime directory using `XDG_RUNTIME_DIR`/`TMPDIR`.
@@ -290,15 +346,95 @@ fn open_existing_runtime_dir_at_for_uid(
 
 /// Checks that the full Unix-socket path and its NUL terminator fit `sun_path`.
 pub fn preflight_len(sock: &Path) -> Result<(), RvError> {
-    let length = sock.as_os_str().as_bytes().len().saturating_add(1);
-    if length > SOCKET_PATH_LIMIT {
-        Err(RvError::PathTooLong {
+    match socket_path_length(sock) {
+        SocketPathLength::Fits { .. } => Ok(()),
+        SocketPathLength::TooLong { bytes, limit } => Err(RvError::PathTooLong {
             path: sock.to_path_buf(),
-            length,
+            length: bytes,
+            limit,
+        }),
+    }
+}
+
+/// Returns the platform length verdict without retaining the path.
+#[must_use]
+pub fn socket_path_length(sock: &Path) -> SocketPathLength {
+    let bytes = sock.as_os_str().as_bytes().len().saturating_add(1);
+    if bytes > SOCKET_PATH_LIMIT {
+        SocketPathLength::TooLong {
+            bytes,
             limit: SOCKET_PATH_LIMIT,
-        })
+        }
     } else {
-        Ok(())
+        SocketPathLength::Fits {
+            bytes,
+            limit: SOCKET_PATH_LIMIT,
+        }
+    }
+}
+
+/// Probes an existing runtime rendezvous without publishing, removing, or
+/// binding any filesystem entry.
+#[must_use]
+pub fn probe_controller_runtime(base: &Path, key: &SessionKey) -> ControllerRuntimeProbe {
+    let paths = controller_runtime_paths(base, key);
+    if let SocketPathLength::TooLong { bytes, limit } = socket_path_length(&paths.socket) {
+        return ControllerRuntimeProbe::PathTooLong { bytes, limit };
+    }
+
+    let dir = match open_existing_runtime_dir_at_for_uid(base, effective_uid()) {
+        Ok(dir) => dir,
+        Err(RvError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            return ControllerRuntimeProbe::Absent;
+        }
+        Err(_) => return ControllerRuntimeProbe::Unreadable,
+    };
+    let (sentinel_name, socket_name) = controller_runtime_names(key);
+    let socket_stat = match stat_child(&dir, OsStr::new(&socket_name), &paths.socket) {
+        Ok(stat) => stat,
+        Err(_) => return ControllerRuntimeProbe::Unreadable,
+    };
+    let sentinel_stat = match stat_child(&dir, OsStr::new(&sentinel_name), &paths.sentinel) {
+        Ok(stat) => stat,
+        Err(_) => return ControllerRuntimeProbe::Unreadable,
+    };
+
+    match (&socket_stat, &sentinel_stat) {
+        (None, None) => return ControllerRuntimeProbe::Absent,
+        (Some(stat), None) if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK => {
+            return ControllerRuntimeProbe::MalformedSocket;
+        }
+        (Some(_), None) => return ControllerRuntimeProbe::OrphanSocket,
+        (_, Some(stat)) if !sentinel_stat_valid(stat, effective_uid()) => {
+            return ControllerRuntimeProbe::MalformedSentinel;
+        }
+        _ => {}
+    }
+
+    let found = match read_existing_sentinel(&dir, &sentinel_name, &paths.sentinel) {
+        Ok(SentinelRead::Contents(found)) => found,
+        Ok(SentinelRead::Malformed) => return ControllerRuntimeProbe::MalformedSentinel,
+        Err(_) => return ControllerRuntimeProbe::Unreadable,
+    };
+    if found != key.name().as_bytes() {
+        return ControllerRuntimeProbe::Collision;
+    }
+
+    let Some(socket_stat) = socket_stat else {
+        return ControllerRuntimeProbe::NoLiveEndpoint;
+    };
+    if socket_stat.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+        return ControllerRuntimeProbe::MalformedSocket;
+    }
+    match UnixStream::connect(&paths.socket) {
+        Ok(_) => ControllerRuntimeProbe::Live,
+        Err(source) if source.raw_os_error() == Some(libc::ECONNREFUSED) => {
+            ControllerRuntimeProbe::Stale
+        }
+        Err(source) if source.raw_os_error() == Some(libc::ENOENT) => {
+            ControllerRuntimeProbe::NoLiveEndpoint
+        }
+        Err(_) => ControllerRuntimeProbe::Unreadable,
     }
 }
 
@@ -312,9 +448,9 @@ pub fn prepare_controller_socket(
     _lock: &OwnerLock,
 ) -> Result<ControllerSocketStatus, RvError> {
     let directory_path = runtime_directory_path(dir)?;
-    let socket_name = format!("{}.sock", key.hash16());
-    let sentinel_name = format!("{}.name", key.hash16());
-    let socket_path = directory_path.join(&socket_name);
+    let paths = controller_runtime_paths_in(&directory_path, key);
+    let (sentinel_name, socket_name) = controller_runtime_names(key);
+    let socket_path = paths.socket;
 
     match preflight_len(&socket_path) {
         Ok(()) => {}
@@ -327,7 +463,7 @@ pub fn prepare_controller_socket(
     }
 
     let socket_stat = stat_child(dir, OsStr::new(&socket_name), &socket_path)?;
-    let sentinel_path = directory_path.join(&sentinel_name);
+    let sentinel_path = paths.sentinel;
     let sentinel_stat = stat_child(dir, OsStr::new(&sentinel_name), &sentinel_path)?;
     if socket_stat.is_some() && sentinel_stat.is_none() {
         return Ok(ControllerSocketStatus::Unavailable(
@@ -454,7 +590,8 @@ pub fn resolve_controller_socket(
     key: &SessionKey,
 ) -> Result<ControllerEndpointStatus, RvError> {
     let directory_path = runtime_directory_path(dir)?;
-    let socket_path = directory_path.join(format!("{}.sock", key.hash16()));
+    let paths = controller_runtime_paths_in(&directory_path, key);
+    let socket_path = paths.socket;
     if matches!(
         preflight_len(&socket_path),
         Err(RvError::PathTooLong { .. })
@@ -464,8 +601,8 @@ pub fn resolve_controller_socket(
         ));
     }
 
-    let sentinel_name = format!("{}.name", key.hash16());
-    let sentinel_path = directory_path.join(&sentinel_name);
+    let (sentinel_name, _) = controller_runtime_names(key);
+    let sentinel_path = paths.sentinel;
     let Some(stat) = stat_child(dir, OsStr::new(&sentinel_name), &sentinel_path)? else {
         return Ok(ControllerEndpointStatus::Unavailable(
             ControllerClientUnavailable::SentinelAbsent,
@@ -846,7 +983,7 @@ fn component_cstring(component: &OsStr) -> io::Result<CString> {
     })
 }
 
-fn effective_uid() -> u32 {
+pub(crate) fn effective_uid() -> u32 {
     // SAFETY: `geteuid` takes no arguments, accesses no Rust memory, and has no
     // failure mode.
     unsafe { libc::geteuid() }
