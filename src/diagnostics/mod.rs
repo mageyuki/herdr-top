@@ -10,6 +10,7 @@ use crate::model::DomainModel;
 use crate::store::writer::{PersistenceFailure, PersistenceStatus};
 
 pub mod local;
+pub mod remote;
 
 const PERSISTENCE_OCCURRENCE_PREFIX: &[u8] = b"HERDR_TOP_PERSISTENCE_V1 ";
 

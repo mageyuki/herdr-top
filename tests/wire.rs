@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use common::mock::{MockConfig, MockHerdr, fixture_payloads};
-use herdr_top::herdr::types::{Snapshot, Subscription};
-use herdr_top::herdr::wire::{WireError, request, subscribe};
+use herdr_top::herdr::types::{AgentManifestStatus, Pong, Snapshot, Subscription};
+use herdr_top::herdr::wire::{WireError, agent_manifests, ping, request, subscribe};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -198,6 +198,145 @@ async fn one_request_per_connection_close_honored() {
         client_requests
             .iter()
             .all(|request| request["params"] == json!({}))
+    );
+}
+
+#[tokio::test]
+async fn i4_remote_unknown_wire_fields_are_tolerated() {
+    let pong_result = json!({
+        "type": "pong",
+        "version": "0.8.0",
+        "protocol": 19,
+        "capabilities": {
+            "live_handoff": true,
+            "future_capability": {"nested": true}
+        },
+        "future_pong_field": [1, 2, 3]
+    });
+    let manifest_result = json!({
+        "type": "agent_manifest_status",
+        "manifests": [{
+            "agent": "claude",
+            "source": "/private/manifest-path",
+            "source_kind": "remote",
+            "local_override_shadowing_remote": false,
+            "active_version": "6",
+            "cached_remote_version": null,
+            "remote_last_checked_unix": 1,
+            "remote_update_error": null,
+            "remote_update_result": "current",
+            "warning": null,
+            "future_manifest_field": {"nested": true}
+        }],
+        "last_check_unix": 1,
+        "last_result": "current",
+        "future_status_field": true
+    });
+    let config = MockConfig::default()
+        .respond("ping", pong_result)
+        .respond("server.agent_manifests", manifest_result);
+    let mock = MockHerdr::start(config)
+        .await
+        .expect("mock server should bind");
+
+    let pong = ping(mock.socket_path()).await.expect("pong should decode");
+    assert_eq!(pong.version, "0.8.0");
+    assert_eq!(pong.protocol, 19);
+    let capabilities = pong.capabilities.expect("capabilities should decode");
+    assert!(capabilities.live_handoff);
+    assert!(!capabilities.detached_server_daemon);
+
+    let status = agent_manifests(mock.socket_path())
+        .await
+        .expect("manifest status should decode");
+    assert_eq!(status.manifests.len(), 1);
+    assert_eq!(status.manifests[0].agent, "claude");
+    assert_eq!(status.manifests[0].active_version.as_deref(), Some("6"));
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["method"], "ping");
+    assert_eq!(requests[0]["params"], json!({}));
+    assert_eq!(requests[1]["method"], "server.agent_manifests");
+    assert_eq!(requests[1]["params"], json!({}));
+
+    for invalid in [
+        json!({"type": "pong", "protocol": 19}),
+        json!({"type": "pong", "version": null, "protocol": 19}),
+        json!({"type": "pong", "version": 8, "protocol": 19}),
+        json!({"type": "pong", "version": "0.8.0", "protocol": -1}),
+        json!({"type": "pong", "version": "0.8.0", "protocol": 19, "capabilities": {}}),
+    ] {
+        assert!(serde_json::from_value::<Pong>(invalid).is_err());
+    }
+    for invalid in [
+        json!({"manifests": []}),
+        json!({"type": "agent_manifest_status"}),
+        json!({"type": "agent_manifest_status", "manifests": null}),
+        json!({"type": "agent_manifest_status", "manifests": [{
+            "source": "x", "source_kind": "remote", "local_override_shadowing_remote": false
+        }]}),
+    ] {
+        assert!(serde_json::from_value::<AgentManifestStatus>(invalid).is_err());
+    }
+}
+
+#[tokio::test]
+async fn i4_remote_wrong_result_type_fails_closed() {
+    let config = MockConfig::default()
+        .respond(
+            "ping",
+            json!({"type": "agent_manifest_status", "version": "0.8.0", "protocol": 19}),
+        )
+        .respond(
+            "server.agent_manifests",
+            json!({"type": "pong", "manifests": []}),
+        );
+    let mock = MockHerdr::start(config)
+        .await
+        .expect("mock server should bind");
+
+    assert!(matches!(
+        ping(mock.socket_path()).await,
+        Err(WireError::UnexpectedResponse(_))
+    ));
+    assert!(matches!(
+        agent_manifests(mock.socket_path()).await,
+        Err(WireError::UnexpectedResponse(_))
+    ));
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["method"], "ping");
+    assert_eq!(requests[0]["params"], json!({}));
+    assert_eq!(requests[1]["method"], "server.agent_manifests");
+    assert_eq!(requests[1]["params"], json!({}));
+}
+
+#[test]
+fn i4_remote_pong_protocol_uint32_boundary_fails_closed() {
+    assert!(
+        serde_json::from_value::<Pong>(json!({
+            "type": "pong",
+            "version": "0.8.0"
+        }))
+        .is_err(),
+        "protocol must remain required"
+    );
+
+    let maximum = serde_json::from_value::<Pong>(json!({
+        "type": "pong",
+        "version": "0.8.0",
+        "protocol": u32::MAX
+    }))
+    .expect("the schema-declared uint32 maximum should decode");
+    assert_eq!(u64::from(maximum.protocol), u64::from(u32::MAX));
+
+    let overflow =
+        serde_json::from_str::<Pong>(r#"{"type":"pong","version":"0.8.0","protocol":4294967296}"#);
+    assert!(
+        overflow.is_err(),
+        "a protocol above the schema uint32 range must fail typed decoding"
     );
 }
 

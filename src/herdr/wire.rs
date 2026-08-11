@@ -13,7 +13,7 @@ use tokio::net::UnixStream;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-use super::types::{ErrorBody, Snapshot, Subscription};
+use super::types::{AgentManifestStatus, ErrorBody, Pong, Snapshot, Subscription};
 
 /// Errors produced while exchanging herdr wire frames.
 #[derive(Debug, Error)]
@@ -131,6 +131,32 @@ pub async fn request(sock: &Path, method: &str, params: Value) -> Result<WireRes
         read_response(&mut reader, &id).await
     })
     .await?
+}
+
+/// Queries and decodes the schema-declared Herdr socket handshake.
+pub async fn ping(sock: &Path) -> Result<Pong, WireError> {
+    decode_typed_result(request(sock, "ping", json!({})).await?, "pong")
+}
+
+/// Queries and decodes the installed official provider manifests.
+pub async fn agent_manifests(sock: &Path) -> Result<AgentManifestStatus, WireError> {
+    decode_typed_result(
+        request(sock, "server.agent_manifests", json!({})).await?,
+        "agent_manifest_status",
+    )
+}
+
+fn decode_typed_result<T: DeserializeOwned>(
+    result: WireResult,
+    expected_type: &str,
+) -> Result<T, WireError> {
+    if result.result_type() != expected_type {
+        return Err(WireError::UnexpectedResponse(format!(
+            "expected {expected_type}, received {}",
+            result.result_type()
+        )));
+    }
+    result.decode()
 }
 
 /// Opens an event-only connection and validates its subscription acknowledgement.

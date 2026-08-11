@@ -841,7 +841,7 @@ async fn spawn_configured(
     let provider_diagnostics = crate::provider::ProviderDiagnostics::from_model_handle(
         reducer.provider_diagnostics_handle(),
     );
-    let standard_provider_roots = standard_provider_roots();
+    let standard_provider_roots = crate::provider::standard_discovery_roots_from_env();
     let provider_thread = match spawn_provider_thread_with_diagnostics(
         AdapterProviderWorker::new(standard_provider_roots, provider_diagnostics.clone()),
         provider_sender,
@@ -900,26 +900,6 @@ async fn spawn_configured(
         controller_acceptor,
         provider_thread: Some(provider_thread),
     })
-}
-
-fn standard_provider_roots() -> Vec<DiscoveryRoot> {
-    let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) else {
-        return Vec::new();
-    };
-    let home = PathBuf::from(home);
-    if !home.is_absolute() {
-        return Vec::new();
-    }
-    vec![
-        DiscoveryRoot {
-            provider: Provider::Claude,
-            path: home.join(".claude/projects"),
-        },
-        DiscoveryRoot {
-            provider: Provider::Codex,
-            path: home.join(".codex/sessions"),
-        },
-    ]
 }
 
 #[allow(clippy::too_many_arguments)]
