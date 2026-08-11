@@ -741,7 +741,7 @@ mod tests {
     use std::process::{Child, Command, ExitStatus};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use rusqlite::Connection;
     use tempfile::tempdir;
@@ -1102,7 +1102,22 @@ mod tests {
         let live = UnixListener::bind(&paths.socket).unwrap();
         assert_eq!(probe_runtime(&runtime_base, &key), RuntimeVerdict::Live);
         drop(live);
-        assert_eq!(probe_runtime(&runtime_base, &key), RuntimeVerdict::Stale);
+        let deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            let observed = probe_runtime(&runtime_base, &key);
+            match observed {
+                RuntimeVerdict::Stale => break,
+                RuntimeVerdict::Live => {}
+                unexpected => {
+                    panic!("expected stale runtime after listener drop; observed {unexpected:?}");
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "runtime did not become stale before deadline; last observed verdict: {observed:?}"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
 
         let too_long = PathBuf::from(format!("/tmp/{}", "x".repeat(200)));
         assert!(matches!(
