@@ -17,6 +17,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::activity::{OperatorSnapshot, RestoredOperatorState};
 use crate::diagnostics::{
     ControllerInputStatus, ControllerInputUnavailableReason, DiagnosticSource, InputAvailability,
     OccurrenceLogStatus, OwnerFreshness, PersistenceCounters, PersistenceOccurrenceSink,
@@ -25,10 +26,11 @@ use crate::diagnostics::{
 };
 use crate::lockfile::OwnerRecord;
 use crate::model::{
-    AgentNodeObservation, AgentSessionReference, AgentSessionReferenceKind, DomainModel,
-    EventMetadata, ExecState, Execution, GapKind, MinimalProviderMetadata, NormalizedEvent, Pane,
-    PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SharedModel, SnapshotAgent,
-    SourceCoverage, Tab, TopologyEntity, TopologyEntityId, TopologySnapshot, Workspace,
+    AgentNodeObservation, AgentSessionReference, AgentSessionReferenceKind,
+    ControllerDiagnosticsHandle, DomainModel, EventMetadata, ExecState, Execution, GapKind,
+    MinimalProviderMetadata, NormalizedEvent, Pane, PaneSnapshot, Provider, ReconcileBatch, RunId,
+    RunKey, SharedModel, SnapshotAgent, SourceCoverage, Tab, TopologyEntity, TopologyEntityId,
+    TopologySnapshot, Workspace,
 };
 use crate::provider::{
     BootstrapIdentity, BootstrapParser, DiscoveryIndex, DiscoveryRoot, FsReadBoundary,
@@ -45,7 +47,7 @@ use crate::store::writer::{
 use crate::store::{CollectorGap, PersistBatch, PersistOp, RestoredState};
 
 use super::controller::{
-    self, ControllerRequest, ControllerRequestReceiver, ControllerServerError,
+    self, ControllerRequestReceiver, ControllerRuntimeEvent, ControllerServerError,
 };
 use super::types::{AgentSessionKind, PaneInfo, Snapshot, Subscription, TabInfo, WorkspaceInfo};
 use super::wire::{self, EventStream, WireError};
@@ -216,6 +218,7 @@ pub(crate) struct RuntimePersistence {
     publisher: watch::Sender<RuntimeDiagnosticsSnapshot>,
     occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
     occurrence_attempted: bool,
+    acceptor_diagnostics: ControllerDiagnosticsHandle,
 }
 
 impl RuntimePersistence {
@@ -228,6 +231,7 @@ impl RuntimePersistence {
         let controller_input =
             controller_input_from_coverage(coverage.state(CoverageSource::Controller));
         let controller_counters = controller_counter_snapshot(model);
+        let acceptor_diagnostics = model.controller_diagnostics().acceptor_handle();
         let snapshot = RuntimeDiagnosticsSnapshot {
             persistence: writer.persistence_status(),
             controller_input,
@@ -246,6 +250,7 @@ impl RuntimePersistence {
                 publisher,
                 occurrence_sink,
                 occurrence_attempted: false,
+                acceptor_diagnostics,
             },
             diagnostics,
         )
@@ -467,7 +472,11 @@ impl RuntimePersistence {
         }
     }
 
-    fn publish(&self) {
+    fn publish(&mut self) {
+        self.snapshot.controller_counters.socket_saturations =
+            self.acceptor_diagnostics.socket_saturations();
+        self.snapshot.controller_counters.accept_failures =
+            self.acceptor_diagnostics.accept_failures();
         let snapshot = self.snapshot.clone();
         self.publisher.send_if_modified(|current| {
             if *current == snapshot {
@@ -478,6 +487,16 @@ impl RuntimePersistence {
             }
         });
     }
+}
+
+async fn persist_submission(
+    persistence: &mut RuntimePersistence,
+    reducer: &mut Reducer,
+    batch: PersistBatch,
+) -> Result<RuntimeWriteOutcome, WriterError> {
+    let outcome = persistence.apply(batch).await?;
+    reducer.complete_operator_submission(outcome);
+    Ok(outcome)
 }
 
 fn set_controller_coverage_unavailable(coverage: &mut [SourceCoverageSnapshot]) {
@@ -579,6 +598,8 @@ pub struct CollectorHandle {
     pub source_coverage: watch::Receiver<SourceCoverageRegistry>,
     /// Immutable runtime diagnostics; no command-capable writer leaves the collector.
     pub diagnostics: watch::Receiver<RuntimeDiagnosticsSnapshot>,
+    /// Immutable bounded operator activity and terminal-timing projection.
+    pub operator: watch::Receiver<OperatorSnapshot>,
     /// Coherent reducer-owned domain snapshots.
     pub model: SharedModel,
     cancellation: CancellationToken,
@@ -664,6 +685,7 @@ pub async fn spawn(
         None,
         SourceAvailability::NotApplicable,
         Arc::new(UnavailableOccurrenceSink),
+        empty_operator_seed(),
     )
     .await
 }
@@ -691,6 +713,7 @@ pub async fn spawn_with_controller(
         controller_listener,
         controller_coverage,
         Arc::new(UnavailableOccurrenceSink),
+        empty_operator_seed(),
     )
     .await
 }
@@ -712,6 +735,7 @@ pub async fn spawn_with_controller_coverage(
         controller_listener,
         controller_coverage,
         Arc::new(UnavailableOccurrenceSink),
+        empty_operator_seed(),
     )
     .await
 }
@@ -734,10 +758,44 @@ pub async fn spawn_with_controller_coverage_and_occurrence_sink(
         controller_listener,
         controller_coverage,
         occurrence_sink,
+        empty_operator_seed(),
     )
     .await
 }
 
+/// Launches the fully configured runtime with its restored operator seed.
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_with_controller_coverage_occurrence_sink_and_operator_seed(
+    sock: PathBuf,
+    session: String,
+    restored: RestoredState,
+    writer: WriterClient,
+    controller_listener: Option<StdUnixListener>,
+    controller_coverage: SourceAvailability,
+    occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
+    restored_operator: RestoredOperatorState,
+) -> Result<CollectorHandle, CollectorError> {
+    spawn_configured(
+        sock,
+        session,
+        restored,
+        writer,
+        controller_listener,
+        controller_coverage,
+        occurrence_sink,
+        restored_operator,
+    )
+    .await
+}
+
+fn empty_operator_seed() -> RestoredOperatorState {
+    RestoredOperatorState {
+        activity: Vec::new(),
+        terminal_times: HashMap::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn spawn_configured(
     sock: PathBuf,
     session: String,
@@ -746,11 +804,12 @@ async fn spawn_configured(
     controller_listener: Option<StdUnixListener>,
     controller_coverage: SourceAvailability,
     occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
+    restored_operator: RestoredOperatorState,
 ) -> Result<CollectorHandle, CollectorError> {
     let owner = OwnerTracker::from_environment();
     writer.replace_owner(owner.record()).await?;
 
-    let (reducer, model) = Reducer::new(restored);
+    let (reducer, model, operator) = Reducer::new_with_operator(restored, restored_operator);
     let (quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
     let initial_coverage = SourceCoverageRegistry::new(controller_coverage.clone());
     let (coverage_sender, source_coverage) = watch::channel(initial_coverage);
@@ -834,6 +893,7 @@ async fn spawn_configured(
         quality,
         source_coverage,
         diagnostics,
+        operator,
         model,
         cancellation,
         task,
@@ -1046,7 +1106,7 @@ async fn converge(
         } else {
             apply_snapshot_in_place(reducer, shared, topology, session, &mut pending_closures)?
         };
-        let _ = persistence.apply(std::mem::take(&mut batch)).await?;
+        let _ = persist_submission(persistence, reducer, std::mem::take(&mut batch)).await?;
         provider.publish_targets(shared);
         owner.refresh_from_snapshot(&snapshot, persistence).await?;
         persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
@@ -1295,7 +1355,7 @@ async fn monitor_live(
                 pending_closures,
             )?);
             if !persist.is_empty() {
-                let _ = persistence.apply(persist).await?;
+                let _ = persist_submission(persistence, reducer, persist).await?;
                 provider.publish_targets(shared);
             }
             let _ = persistence.cleanup(unix_now_ms()).await?;
@@ -1380,7 +1440,7 @@ async fn monitor_reconciling(
                 pending_closures,
             )?);
             if !persist.is_empty() {
-                let _ = persistence.apply(persist).await?;
+                let _ = persist_submission(persistence, reducer, persist).await?;
                 provider.publish_targets(shared);
             }
             let _ = persistence.cleanup(unix_now_ms()).await?;
@@ -2515,10 +2575,11 @@ async fn apply_received_event(
     }
     let normalized = normalize_event(shared, session, &received)?;
     let Some(persist) = apply_collector_observation(reducer, normalized)? else {
+        persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
         return Ok(());
     };
     if !persist.is_empty() {
-        let _ = persistence.apply(persist).await?;
+        let _ = persist_submission(persistence, reducer, persist).await?;
     }
     persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
     provider.publish_targets(shared);
@@ -2567,7 +2628,7 @@ async fn apply_provider_event(
     if let Some(persist) = apply_collector_observation(reducer, events)?
         && !persist.is_empty()
     {
-        let _ = persistence.apply(persist).await?;
+        let _ = persist_submission(persistence, reducer, persist).await?;
     }
     if disagreement_is_new {
         reducer.record_provider_identity_disagreement();
@@ -4054,9 +4115,9 @@ fn socket_identity(_path: &Path) -> Option<(u64, u64)> {
 
 async fn receive_controller(
     receiver: &mut Option<ControllerRequestReceiver>,
-) -> Option<ControllerRequest> {
+) -> ControllerRuntimeEvent {
     match receiver {
-        Some(receiver) => receiver.recv().await,
+        Some(receiver) => receiver.recv_runtime_event().await,
         None => pending().await,
     }
 }
@@ -4117,7 +4178,7 @@ async fn service_provider_event(
 }
 
 async fn service_controller(
-    request: Option<ControllerRequest>,
+    event: ControllerRuntimeEvent,
     receiver: &mut Option<ControllerRequestReceiver>,
     session: &str,
     reducer: &mut Reducer,
@@ -4125,15 +4186,16 @@ async fn service_controller(
     shared: &SharedModel,
     coverage: &SourceCoverageRegistry,
 ) {
-    match request {
-        Some(request) => {
+    match event {
+        ControllerRuntimeEvent::Request(Some(request)) => {
             controller::service_request(request, session, reducer, persistence).await;
             persistence.refresh_snapshot(&shared.borrow(), coverage);
         }
-        None => {
+        ControllerRuntimeEvent::Request(None) => {
             *receiver = None;
             persistence.mark_acceptor_stopped();
         }
+        ControllerRuntimeEvent::DiagnosticsChanged => persistence.publish(),
     }
 }
 
@@ -4255,6 +4317,50 @@ mod tests {
             .await
             .expect("writer shutdown timed out")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn i4_operator_acceptor_only_change_wakes_diagnostics() {
+        let sink = Arc::new(RecordingOccurrenceSink::default());
+        let (_directory, lifecycle, mut runtime, mut diagnostics) = runtime_with_sink(sink);
+        let (mut reducer, mut model) = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let coverage = SourceCoverageRegistry::default();
+        let (_sender, receiver) =
+            controller::request_channel(1, runtime.acceptor_diagnostics.clone());
+        let mut receiver = Some(receiver);
+        let _ = diagnostics.borrow_and_update();
+        let _ = model.borrow_and_update();
+
+        runtime.acceptor_diagnostics.record_socket_saturation();
+        service_controller(
+            ControllerRuntimeEvent::DiagnosticsChanged,
+            &mut receiver,
+            "operator-test",
+            &mut reducer,
+            &mut runtime,
+            &model,
+            &coverage,
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(1), diagnostics.changed())
+            .await
+            .expect("acceptor-only counter change must wake runtime diagnostics")
+            .unwrap();
+        assert_eq!(
+            diagnostics.borrow().controller_counters.socket_saturations,
+            1
+        );
+        assert!(!model.has_changed().unwrap());
+
+        drop(receiver);
+        drop(runtime);
+        shutdown_writer(lifecycle).await;
     }
 
     #[tokio::test]
@@ -6921,16 +7027,20 @@ mod provider_integration_tests {
                 let (_quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
                 let (_coverage_sender, source_coverage) =
                     watch::channel(SourceCoverageRegistry::default());
-                let (_reducer, model) = Reducer::new(RestoredState {
-                    model: DomainModel::default(),
-                    next_ordinal: 1,
-                    next_ingest_seq: Some(1),
-                    event_ledger: Vec::new(),
-                });
+                let (_reducer, model, operator) = Reducer::new_with_operator(
+                    RestoredState {
+                        model: DomainModel::default(),
+                        next_ordinal: 1,
+                        next_ingest_seq: Some(1),
+                        event_ledger: Vec::new(),
+                    },
+                    empty_operator_seed(),
+                );
                 let handle = CollectorHandle {
                     quality,
                     source_coverage,
                     diagnostics: test_diagnostics(),
+                    operator,
                     model,
                     cancellation: CancellationToken::new(),
                     task: tokio::spawn(async {
@@ -6969,16 +7079,20 @@ mod provider_integration_tests {
         .unwrap();
         let (_quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
         let (_coverage_sender, source_coverage) = watch::channel(SourceCoverageRegistry::default());
-        let (_reducer, model) = Reducer::new(RestoredState {
-            model: DomainModel::default(),
-            next_ordinal: 1,
-            next_ingest_seq: Some(1),
-            event_ledger: Vec::new(),
-        });
+        let (_reducer, model, operator) = Reducer::new_with_operator(
+            RestoredState {
+                model: DomainModel::default(),
+                next_ordinal: 1,
+                next_ingest_seq: Some(1),
+                event_ledger: Vec::new(),
+            },
+            empty_operator_seed(),
+        );
         let handle = CollectorHandle {
             quality,
             source_coverage,
             diagnostics: test_diagnostics(),
+            operator,
             model,
             cancellation: CancellationToken::new(),
             task: tokio::spawn(async {

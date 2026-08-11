@@ -233,30 +233,33 @@ async fn run_monitor(cli: &Cli) -> Result<(), MainError> {
     let _schema = store::preflight_schema(&root)?;
     let store = store::open_writer(&root)?;
     let restored = store.load_restored_state()?;
+    let restored_operator = store.load_restored_operator_state()?;
     let (lifecycle, writer) = store::spawn_writer(store)?;
     let session_name = resolved.session_key().name().to_owned();
-    let collector = match collector::spawn_with_controller_coverage_and_occurrence_sink(
-        socket,
-        session_name.clone(),
-        restored,
-        writer,
-        controller_listener,
-        controller_coverage,
-        occurrence_sink,
-    )
-    .await
-    {
-        Ok(collector) => collector,
-        Err(startup) => {
-            return match lifecycle.shutdown().await {
-                Ok(()) => Err(MainError::Collector(startup)),
-                Err(shutdown) => Err(MainError::StartupShutdown {
-                    startup: Box::new(startup),
-                    shutdown: Box::new(shutdown),
-                }),
-            };
-        }
-    };
+    let collector =
+        match collector::spawn_with_controller_coverage_occurrence_sink_and_operator_seed(
+            socket,
+            session_name.clone(),
+            restored,
+            writer,
+            controller_listener,
+            controller_coverage,
+            occurrence_sink,
+            restored_operator,
+        )
+        .await
+        {
+            Ok(collector) => collector,
+            Err(startup) => {
+                return match lifecycle.shutdown().await {
+                    Ok(()) => Err(MainError::Collector(startup)),
+                    Err(shutdown) => Err(MainError::StartupShutdown {
+                        startup: Box::new(startup),
+                        shutdown: Box::new(shutdown),
+                    }),
+                };
+            }
+        };
 
     let mut app = App::new(
         collector.model.clone(),

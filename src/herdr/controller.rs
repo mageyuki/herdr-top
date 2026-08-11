@@ -215,11 +215,18 @@ pub enum ControllerServerError {
 pub struct ControllerRequestSender {
     sender: mpsc::Sender<ControllerRequest>,
     diagnostics: ControllerDiagnosticsHandle,
+    diagnostic_changes: watch::Sender<u64>,
 }
 
 /// Unique consumer for the serialized-reducer request queue.
 pub struct ControllerRequestReceiver {
     receiver: mpsc::Receiver<ControllerRequest>,
+    diagnostic_changes: watch::Receiver<u64>,
+}
+
+pub(crate) enum ControllerRuntimeEvent {
+    Request(Option<ControllerRequest>),
+    DiagnosticsChanged,
 }
 
 pub(crate) struct ControllerRequest {
@@ -235,13 +242,36 @@ pub fn request_channel(
     diagnostics: ControllerDiagnosticsHandle,
 ) -> (ControllerRequestSender, ControllerRequestReceiver) {
     let (sender, receiver) = mpsc::channel(capacity);
+    let (diagnostic_changes, diagnostic_change_receiver) = watch::channel(0);
     (
         ControllerRequestSender {
             sender,
             diagnostics,
+            diagnostic_changes,
         },
-        ControllerRequestReceiver { receiver },
+        ControllerRequestReceiver {
+            receiver,
+            diagnostic_changes: diagnostic_change_receiver,
+        },
     )
+}
+
+impl ControllerRequestSender {
+    fn record_accept_failure(&self) {
+        self.diagnostics.record_accept_failure();
+        self.notify_diagnostic_change();
+    }
+
+    fn record_socket_saturation(&self) {
+        self.diagnostics.record_socket_saturation();
+        self.notify_diagnostic_change();
+    }
+
+    fn notify_diagnostic_change(&self) {
+        self.diagnostic_changes.send_modify(|version| {
+            *version = version.wrapping_add(1);
+        });
+    }
 }
 
 impl ControllerRequestReceiver {
@@ -251,8 +281,21 @@ impl ControllerRequestReceiver {
         self.receiver.len()
     }
 
-    pub(crate) async fn recv(&mut self) -> Option<ControllerRequest> {
+    #[cfg(test)]
+    async fn recv(&mut self) -> Option<ControllerRequest> {
         self.receiver.recv().await
+    }
+
+    pub(crate) async fn recv_runtime_event(&mut self) -> ControllerRuntimeEvent {
+        tokio::select! {
+            request = self.receiver.recv() => ControllerRuntimeEvent::Request(request),
+            changed = self.diagnostic_changes.changed() => {
+                match changed {
+                    Ok(()) => ControllerRuntimeEvent::DiagnosticsChanged,
+                    Err(_) => ControllerRuntimeEvent::Request(self.receiver.recv().await),
+                }
+            }
+        }
     }
 }
 
@@ -330,7 +373,7 @@ async fn run_acceptor(
                         });
                     }
                     Err(error) => {
-                        sender.diagnostics.record_accept_failure();
+                        sender.record_accept_failure();
                         tracing::warn!(
                             warning_code = "controller_accept_failed",
                             io_kind = ?error.kind(),
@@ -392,7 +435,7 @@ async fn handle_connection(
                     Err(_) => return Ok(()),
                 },
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    sender.diagnostics.record_socket_saturation();
+                    sender.record_socket_saturation();
                     ControllerResponse::Retryable {
                         reason: RetryableReason::Busy,
                     }
@@ -582,22 +625,24 @@ pub(crate) async fn service_request(
     };
     let _ = request.responder.send(ControllerResponse::Accepted);
     match persistence.finish_pending(pending).await {
-        Ok(RuntimeWriteOutcome::Durable) => {}
-        Ok(
-            RuntimeWriteOutcome::CommittedButDegraded(_)
-            | RuntimeWriteOutcome::NotCommitted(_)
-            | RuntimeWriteOutcome::DurabilityUnknown(_),
-        ) => {
-            tracing::warn!(
-                warning_code = "controller_persistence_degraded",
-                "accepted Controller event degraded persistence"
-            );
-        }
-        Ok(RuntimeWriteOutcome::Skipped) => {
-            tracing::warn!(
-                warning_code = "controller_persistence_skipped_after_admission",
-                "accepted Controller event persistence was skipped"
-            );
+        Ok(outcome) => {
+            reducer.complete_operator_submission(outcome);
+            if matches!(
+                outcome,
+                RuntimeWriteOutcome::CommittedButDegraded(_)
+                    | RuntimeWriteOutcome::NotCommitted(_)
+                    | RuntimeWriteOutcome::DurabilityUnknown(_)
+            ) {
+                tracing::warn!(
+                    warning_code = "controller_persistence_degraded",
+                    "accepted Controller event degraded persistence"
+                );
+            } else if outcome == RuntimeWriteOutcome::Skipped {
+                tracing::warn!(
+                    warning_code = "controller_persistence_skipped_after_admission",
+                    "accepted Controller event persistence was skipped"
+                );
+            }
         }
         Err(error) => {
             tracing::warn!(
@@ -994,6 +1039,49 @@ mod tests {
                 None => pending().await,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn acceptor_counter_change_notifies_runtime_owner() {
+        let acceptor_diagnostics = ControllerDiagnosticsHandle::default();
+        let (sender, mut receiver) = request_channel(1, acceptor_diagnostics.clone());
+        let keepalive = sender.clone();
+        let (queued_responder, _queued_response) = oneshot::channel();
+        sender
+            .sender
+            .try_send(ControllerRequest {
+                frame: b"queued".to_vec(),
+                receipt_time_ms: 1,
+                responder: queued_responder,
+            })
+            .unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let handler = tokio::spawn(handle_connection(server, sender, None));
+        client
+            .write_all(b"{\"schema_version\":1,\"event_id\":\"full\"}\n")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        BufReader::new(&mut client)
+            .read_until(b'\n', &mut response)
+            .await
+            .unwrap();
+
+        drop(receiver.recv().await.unwrap());
+        let wake = tokio::time::timeout(Duration::from_secs(1), receiver.recv_runtime_event())
+            .await
+            .expect("acceptor-only counter change must wake runtime diagnostics");
+        assert!(matches!(wake, ControllerRuntimeEvent::DiagnosticsChanged));
+        assert_eq!(acceptor_diagnostics.socket_saturations(), 1);
+        assert_eq!(
+            serde_json::from_slice::<ControllerResponse>(&response).unwrap(),
+            ControllerResponse::Retryable {
+                reason: RetryableReason::Busy,
+            }
+        );
+        handler.await.unwrap().unwrap();
+        drop(keepalive);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -7,6 +7,7 @@ use common::hardening_mock::{HardeningConfig, HardeningHerdr, SnapshotReply};
 use common::live_mock::{LiveConfig, LiveHerdr};
 use common::mock::{MockConfig, MockHerdr, fixture_payloads};
 use common::scripted_mock::{ScriptedConfig, ScriptedHerdr};
+use herdr_top::activity::ActivityDurability;
 use herdr_top::herdr::collector::{self, CollectorHandle, ObservationQuality};
 use herdr_top::identity::MergeConflict;
 use herdr_top::lockfile::{StateRoot, state_root_in};
@@ -30,6 +31,33 @@ use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 
 const WAIT: Duration = Duration::from_secs(3);
+
+#[tokio::test]
+async fn i4_operator_coverage_only_change_wakes_diagnostics() {
+    let herdr_directory = tempfile::tempdir().unwrap();
+    let absent_socket = herdr_directory.path().join("absent.sock");
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let handle = collector::spawn(absent_socket, test_session(), empty_restored(), writer)
+        .await
+        .unwrap();
+    let mut model = handle.model.clone();
+    let mut diagnostics = handle.diagnostics.clone();
+    let _ = model.borrow_and_update();
+    let _ = diagnostics.borrow_and_update();
+
+    wait_diagnostic_source(
+        &mut diagnostics,
+        herdr_top::diagnostics::DiagnosticSource::Herdr,
+        herdr_top::diagnostics::InputAvailability::Unavailable,
+    )
+    .await;
+    assert!(
+        !model.has_changed().unwrap(),
+        "coverage-only publication must not require a model event"
+    );
+
+    shutdown(handle, lifecycle).await;
+}
 
 #[tokio::test]
 async fn subscribe_buffer_snapshot_replay_order() {
@@ -774,7 +802,37 @@ async fn i4_d3_apply_failure_keeps_in_memory_model_advancing() {
     )
     .await
     .expect("collector should start");
+    let mut operator = handle.operator.clone();
+    let _ = operator.borrow_and_update();
     wait_model_pane(&handle.model, "w1:p3").await;
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let snapshot = operator.borrow();
+            let pane_created: Vec<_> = snapshot
+                .activity
+                .iter()
+                .filter(|item| {
+                    item.source == "herdr"
+                        && item.normalized_kind == "topology_upsert"
+                        && item.source_event_type == "pane_created"
+                })
+                .collect();
+            if pane_created.len() == 2
+                && pane_created
+                    .iter()
+                    .all(|item| item.durability == ActivityDurability::CurrentOnly)
+            {
+                break;
+            }
+            drop(snapshot);
+            operator
+                .changed()
+                .await
+                .expect("operator publisher must remain open");
+        }
+    })
+    .await
+    .expect("failure-causing and post-degradation activity must become current-only");
     let model = handle.model.borrow();
     assert!(model.pane("w1:p2").is_some());
     assert!(model.pane("w1:p3").is_some());
@@ -1099,6 +1157,8 @@ async fn binding_conflict_is_non_fatal_diagnostic() {
     .await
     .expect("collector should start");
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    let _ = handle.model.borrow_and_update();
+    let _ = handle.diagnostics.borrow_and_update();
 
     let (execution_id, run_id) = {
         let model = handle.model.borrow();
@@ -1138,6 +1198,34 @@ async fn binding_conflict_is_non_fatal_diagnostic() {
             == 1
     })
     .await;
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if handle
+                .diagnostics
+                .borrow()
+                .controller_counters
+                .binding_conflicts
+                == 1
+            {
+                break;
+            }
+            handle
+                .diagnostics
+                .changed()
+                .await
+                .expect("runtime diagnostics publisher must remain open");
+        }
+    })
+    .await
+    .expect("binding conflict must wake consolidated diagnostics");
+    assert_eq!(
+        handle
+            .diagnostics
+            .borrow()
+            .controller_counters
+            .binding_conflicts,
+        1
+    );
     assert_eq!(*handle.quality.borrow(), ObservationQuality::Live);
     let model = handle.model.borrow();
     let execution = model
