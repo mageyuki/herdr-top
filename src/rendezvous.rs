@@ -671,8 +671,12 @@ impl OwnedSocketPath {
                 return Err(io_error("stat owned socket", self.path.clone(), source));
             }
         };
+        #[cfg(target_os = "linux")]
+        let stat_device = stat.st_dev;
+        #[cfg(target_os = "macos")]
+        let stat_device = stat.st_dev as u64;
         if stat.st_mode & libc::S_IFMT == libc::S_IFSOCK
-            && stat.st_dev == self.device
+            && stat_device == self.device
             && stat.st_ino == self.inode
         {
             unlinkat_child(self.directory.as_raw_fd(), &self.name)
@@ -1019,7 +1023,7 @@ fn openat_owned(
     // SAFETY: `parent_fd` is a live directory descriptor, `name` is
     // NUL-terminated for the call, and the variadic mode argument is supplied
     // whenever creation flags can consume it. `openat` retains neither.
-    let result = unsafe { libc::openat(parent_fd, name.as_ptr(), flags, mode) };
+    let result = unsafe { libc::openat(parent_fd, name.as_ptr(), flags, mode as libc::c_uint) };
     owned_fd_result(result)
 }
 

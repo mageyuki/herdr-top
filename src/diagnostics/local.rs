@@ -734,7 +734,9 @@ struct NoticeMarker {
 mod tests {
     use std::ffi::{OsStr, OsString};
     use std::fs;
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    #[cfg(target_os = "linux")]
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
