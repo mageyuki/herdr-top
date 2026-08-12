@@ -13,6 +13,7 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 use herdr_top::diagnostics::local::{self, BreadcrumbPublishError};
 use herdr_top::diagnostics::{PersistenceOccurrenceSink, SharedFileOccurrenceSink};
+use herdr_top::doctor::{self, DoctorVersionRunner};
 use herdr_top::herdr::collector::{self, CollectorError, SourceAvailability};
 use herdr_top::herdr::controller::{self, ControllerEnvelope, EmitOutcome};
 use herdr_top::herdr::wire;
@@ -30,7 +31,7 @@ const LOG_FILE: &str = "herdr-top.log";
 const LOG_FILE_MODE: u32 = 0o600;
 
 #[derive(Debug, Parser)]
-#[command(name = "herdr-top")]
+#[command(name = "herdr-top", version)]
 struct Cli {
     /// Exact Herdr named session to monitor.
     #[arg(long, global = true)]
@@ -45,7 +46,14 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Emit(Box<EmitArgs>),
-    Doctor,
+    Doctor(DoctorArgs),
+}
+
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    /// Render the fixed Doctor JSON schema v1.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -130,7 +138,7 @@ async fn main() -> ExitCode {
     let result = match &cli.command {
         None => run_monitor(&cli, plugin_state_dir).await,
         Some(Command::Emit(args)) => return run_emit(&cli, args).await,
-        Some(Command::Doctor) => run_doctor(&cli),
+        Some(Command::Doctor(args)) => return run_doctor(&cli, args).await,
     };
 
     match result {
@@ -464,19 +472,16 @@ fn acquire_monitor_lock_with_plugin_dir(
     Ok((lock, breadcrumb))
 }
 
-fn run_doctor(cli: &Cli) -> Result<(), MainError> {
-    let resolved = resolve_session(cli)?;
-    let xdg_state_home = env::var_os("XDG_STATE_HOME");
-    let home = env::var_os("HOME");
-    let state_base = lockfile::resolve_state_base(xdg_state_home.as_deref(), home.as_deref())?;
-    let root = lockfile::derive_state_root(&state_base, resolved.session_key());
-    println!("resolver_source: {}", resolved.source());
-    println!(
-        "state_root: {}",
-        local::format_operational_path(&root.0, home.as_deref())
-    );
-    println!("controller_socket: implemented");
-    Ok(())
+async fn run_doctor(cli: &Cli, args: &DoctorArgs) -> ExitCode {
+    let runner = DoctorVersionRunner::from_environment();
+    let report =
+        doctor::collect_report(cli.session.as_deref(), cli.socket.as_deref(), &runner).await;
+    if args.json {
+        println!("{}", doctor::render_json(&report));
+    } else {
+        print!("{}", doctor::render_human(&report));
+    }
+    ExitCode::from(report.exit_code())
 }
 
 #[cfg(test)]
@@ -539,7 +544,8 @@ mod tests {
             terminal_id: None,
         }));
 
-        for command in [Some(&Command::Doctor), Some(&emit)] {
+        let doctor = Command::Doctor(DoctorArgs { json: false });
+        for command in [Some(&doctor), Some(&emit)] {
             assert!(plugin_state_dir_for_command(command, Some(plugin.as_os_str())).is_none());
         }
         let (owner, status) = acquire_monitor_lock_with_plugin_dir(&root, None).unwrap();

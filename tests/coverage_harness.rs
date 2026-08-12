@@ -6,6 +6,7 @@ use std::fs::{self, OpenOptions, Permissions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use common::mock::{MockConfig, MockHerdr, fixture_payloads};
@@ -32,6 +33,83 @@ const PROMPT_SENTINEL: &str = "PROMPT_FORBIDDEN_SENTINEL_I2E_4C21";
 const RESPONSE_SENTINEL: &str = "RESPONSE_FORBIDDEN_SENTINEL_I2E_5D32";
 const TOOL_ARGUMENT_SENTINEL: &str = "TOOL_ARGUMENT_FORBIDDEN_SENTINEL_I2E_6E43";
 const MALFORMED_RAW_SENTINEL: &str = "MALFORMED_RAW_FORBIDDEN_SENTINEL_I2E_7F54";
+const DOCTOR_PRIVATE_SENTINEL: &str = "DOCTOR_PRIVATE_SENTINEL_I4_T7_8A21";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn i4_doctor_output_excludes_private_values() {
+    let directory = tempfile::tempdir().expect("doctor privacy root should exist");
+    let private_home = directory.path().join(DOCTOR_PRIVATE_SENTINEL);
+    let mock = MockHerdr::start(
+        MockConfig::default()
+            .error("ping", "PRIVATE_CODE", DOCTOR_PRIVATE_SENTINEL)
+            .respond(
+                "server.agent_manifests",
+                json!({
+                    "type": "agent_manifest_status",
+                    "manifests": [{
+                        "agent": "claude",
+                        "source": DOCTOR_PRIVATE_SENTINEL,
+                        "source_kind": DOCTOR_PRIVATE_SENTINEL,
+                        "local_override_shadowing_remote": false,
+                        "active_version": null,
+                        "remote_update_error": DOCTOR_PRIVATE_SENTINEL
+                    }]
+                }),
+            )
+            .respond(
+                "session.snapshot",
+                json!({
+                    "type": "session_snapshot",
+                    "snapshot": {
+                        "version": "1",
+                        "protocol": 19,
+                        "focused_workspace_id": null,
+                        "focused_tab_id": null,
+                        "focused_pane_id": null,
+                        "workspaces": [], "tabs": [], "panes": [],
+                        "layouts": [], "agents": []
+                    }
+                }),
+            ),
+    )
+    .await
+    .expect("mock Herdr should bind");
+    let versions = format!(
+        r#"{{"standalone":{{"version":"{0}","stderr_present":true}},"claude":{{"version":"{0}","stderr_present":true}},"codex":{{"version":"{0}","stderr_present":true}}}}"#,
+        DOCTOR_PRIVATE_SENTINEL
+    );
+
+    for json_mode in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_herdr-top"));
+        command
+            .args(["--session", "privacy", "--socket"])
+            .arg(mock.socket_path())
+            .arg("doctor")
+            .env_clear()
+            .env("HOME", &private_home)
+            .env("XDG_STATE_HOME", private_home.join("state"))
+            .env("XDG_RUNTIME_DIR", private_home.join("runtime"))
+            .env("HERDR_PLUGIN_STATE_DIR", private_home.join("plugin"))
+            .env("HERDR_TOP_TEST_DOCTOR_VERSION_FIXTURES", &versions);
+        if json_mode {
+            command.arg("--json");
+        }
+        let output = command.output().expect("doctor privacy process should run");
+        assert_eq!(output.status.code(), Some(1));
+        if json_mode {
+            let parsed: Value = serde_json::from_slice(&output.stdout)
+                .expect("exit-one Doctor stdout must remain complete JSON");
+            assert_eq!(parsed["schema_version"], 1);
+        } else {
+            assert!(String::from_utf8_lossy(&output.stdout).contains("overall_status=error"));
+        }
+        for stream in [&output.stdout, &output.stderr] {
+            assert!(!String::from_utf8_lossy(stream).contains(DOCTOR_PRIVATE_SENTINEL));
+            assert!(!String::from_utf8_lossy(stream).contains("PRIVATE_CODE"));
+            assert!(!String::from_utf8_lossy(stream).contains("MainError"));
+        }
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn allowlist_scan_is_non_vacuous_across_every_artifact() {

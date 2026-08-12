@@ -4,6 +4,7 @@
 
 pub mod activity;
 pub mod diagnostics;
+pub mod doctor;
 pub mod herdr;
 pub mod identity;
 pub mod lockfile;
