@@ -2,6 +2,7 @@
 //! Provider discovery, coalescing, notification, and dedicated I/O-thread substrate.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::env;
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -174,6 +175,34 @@ pub fn valid_native_id(value: &str) -> bool {
 pub struct DiscoveryRoot {
     pub provider: Provider,
     pub path: PathBuf,
+}
+
+/// Derives the two standard provider roots without touching the filesystem.
+#[must_use]
+pub fn standard_discovery_roots(home: Option<&OsStr>) -> Vec<DiscoveryRoot> {
+    let Some(home) = home.filter(|value| !value.is_empty()) else {
+        return Vec::new();
+    };
+    let home = Path::new(home);
+    if !home.is_absolute() {
+        return Vec::new();
+    }
+    vec![
+        DiscoveryRoot {
+            provider: Provider::Claude,
+            path: home.join(".claude/projects"),
+        },
+        DiscoveryRoot {
+            provider: Provider::Codex,
+            path: home.join(".codex/sessions"),
+        },
+    ]
+}
+
+/// Derives standard provider roots from the process home-directory environment.
+#[must_use]
+pub fn standard_discovery_roots_from_env() -> Vec<DiscoveryRoot> {
+    standard_discovery_roots(env::var_os("HOME").as_deref())
 }
 
 /// Allowlisted identity returned by a bounded structural-bootstrap parser.

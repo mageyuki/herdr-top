@@ -189,6 +189,39 @@ pub(crate) fn build_rows(model: &DomainModel, order: &DagOrder) -> Vec<TreeRow> 
         .collect()
 }
 
+/// Retains direct DAG matches and every reverse-transitive prerequisite in stable order.
+pub(crate) fn retain_matches_with_prerequisites(
+    model: &DomainModel,
+    stable_order: &[RunId],
+    direct_matches: &HashSet<RunId>,
+) -> Vec<RunId> {
+    let mut reverse = HashMap::<RunId, Vec<RunId>>::new();
+    for edge in model.dependency_edges() {
+        if model.task_run(&edge.prerequisite_run_id).is_some()
+            && model.task_run(&edge.dependent_run_id).is_some()
+        {
+            reverse
+                .entry(edge.dependent_run_id)
+                .or_default()
+                .push(edge.prerequisite_run_id);
+        }
+    }
+    let mut retained = direct_matches.clone();
+    let mut pending = direct_matches.iter().copied().collect::<Vec<_>>();
+    while let Some(dependent) = pending.pop() {
+        for prerequisite in reverse.get(&dependent).into_iter().flatten() {
+            if retained.insert(*prerequisite) {
+                pending.push(*prerequisite);
+            }
+        }
+    }
+    stable_order
+        .iter()
+        .copied()
+        .filter(|run_id| retained.contains(run_id))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -508,5 +541,37 @@ mod tests {
             })
             .unwrap();
         assert_eq!(unlinked.label, "Task Run: U [queued] [unlinked]");
+    }
+
+    #[test]
+    fn i4_filtered_diamond_retains_every_prerequisite_path() {
+        let (model, ids) = model(
+            &[
+                ("root", 1),
+                ("left", 2),
+                ("right", 3),
+                ("match", 4),
+                ("other", 5),
+            ],
+            &[
+                ("root", "left"),
+                ("root", "right"),
+                ("left", "match"),
+                ("right", "match"),
+            ],
+        );
+        let mut order = DagOrder::default();
+        order.recompute(&model);
+
+        let retained = super::retain_matches_with_prerequisites(
+            &model,
+            order.run_ids(),
+            &std::collections::HashSet::from([ids["match"]]),
+        );
+
+        assert_eq!(
+            retained,
+            [ids["root"], ids["left"], ids["right"], ids["match"]]
+        );
     }
 }

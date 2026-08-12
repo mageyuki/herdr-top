@@ -1,13 +1,15 @@
 //! SQLite schema v4, read-only preflight, online backup, and migration support.
 
-use std::fs::{self, OpenOptions, Permissions};
+use std::ffi::OsString;
+use std::fs::{self, Metadata, OpenOptions, Permissions};
 use std::io;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, MAIN_DB, OpenFlags};
+use rusqlite::{Connection, MAIN_DB, OpenFlags, OptionalExtension, params};
 
 use super::StoreError;
 use crate::lockfile::StateRoot;
@@ -27,6 +29,25 @@ pub enum SchemaVerdict {
     Migratable,
 }
 
+/// Exact version found by a strictly read-only schema inspection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchemaVersionVerdict {
+    /// No database file exists.
+    Absent,
+    /// The database is at this binary's supported version.
+    Current { found: i64 },
+    /// The database is older than this binary and can be migrated by a writer.
+    Migratable { found: i64 },
+    /// The database was written by a newer binary.
+    Newer { found: i64 },
+}
+
+/// Returns the single authoritative schema version supported by this binary.
+#[must_use]
+pub const fn supported_schema_version() -> i64 {
+    CURRENT_SCHEMA_VERSION
+}
+
 /// Returns the path to the session's SQLite database.
 #[must_use]
 pub fn database_path(root: &StateRoot) -> PathBuf {
@@ -39,16 +60,83 @@ pub fn database_path(root: &StateRoot) -> PathBuf {
 /// newer than this binary is rejected before writer startup can create WAL,
 /// shared-memory, or backup files.
 pub fn preflight_schema(root: &StateRoot) -> Result<SchemaVerdict, StoreError> {
+    match inspect_schema_version(root)? {
+        SchemaVersionVerdict::Absent => Ok(SchemaVerdict::Absent),
+        SchemaVersionVerdict::Current { .. } => Ok(SchemaVerdict::Current),
+        SchemaVersionVerdict::Migratable { .. } => Ok(SchemaVerdict::Migratable),
+        SchemaVersionVerdict::Newer { found } => Err(StoreError::NewerSchema {
+            found,
+            supported: CURRENT_SCHEMA_VERSION,
+        }),
+    }
+}
+
+/// Inspects an existing database's schema without writing, migrating, or
+/// creating SQLite sidecars.
+pub fn inspect_schema_version(root: &StateRoot) -> Result<SchemaVersionVerdict, StoreError> {
     let path = database_path(root);
-    match fs::metadata(&path) {
-        Ok(_) => {}
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => {
+            return Err(StoreError::io(
+                path,
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "database entry is not a regular file",
+                ),
+            ));
+        }
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            return Ok(SchemaVerdict::Absent);
+            return Ok(SchemaVersionVerdict::Absent);
         }
         Err(source) => return Err(StoreError::io(path, source)),
-    }
+    };
 
-    let connection = open_read_only(&path)?;
+    let wal_path = sqlite_sidecar_path(&path, "-wal");
+    let shm_path = sqlite_sidecar_path(&path, "-shm");
+    let wal_present = regular_sidecar_present(&wal_path)?;
+    regular_sidecar_present(&shm_path)?;
+    let connection = open_schema_inspection(&path, wal_present)?;
+    let result = inspect_open_schema(&connection);
+    drop(connection);
+
+    if !wal_present {
+        let after =
+            fs::symlink_metadata(&path).map_err(|source| StoreError::io(path.clone(), source))?;
+        let wal_appeared = match fs::symlink_metadata(&wal_path) {
+            Ok(_) => true,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => false,
+            Err(source) => return Err(StoreError::io(wal_path, source)),
+        };
+        if !same_file_snapshot(&metadata, &after) || wal_appeared {
+            return Err(StoreError::io(
+                path,
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "database changed during immutable schema inspection",
+                ),
+            ));
+        }
+    }
+    result
+}
+
+fn regular_sidecar_present(path: &Path) -> Result<bool, StoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => Err(StoreError::io(
+            path.to_path_buf(),
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "database sidecar is not a regular file",
+            ),
+        )),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(StoreError::io(path.to_path_buf(), source)),
+    }
+}
+
+fn inspect_open_schema(connection: &Connection) -> Result<SchemaVersionVerdict, StoreError> {
     let has_migrations: bool = connection.query_row(
         "SELECT EXISTS(\
              SELECT 1 FROM sqlite_schema \
@@ -69,13 +157,101 @@ pub fn preflight_schema(root: &StateRoot) -> Result<SchemaVerdict, StoreError> {
     };
 
     match version {
-        CURRENT_SCHEMA_VERSION => Ok(SchemaVerdict::Current),
-        version if version > CURRENT_SCHEMA_VERSION => Err(StoreError::NewerSchema {
-            found: version,
-            supported: CURRENT_SCHEMA_VERSION,
-        }),
-        _ => Ok(SchemaVerdict::Migratable),
+        CURRENT_SCHEMA_VERSION => {
+            validate_current_schema(connection)?;
+            Ok(SchemaVersionVerdict::Current { found: version })
+        }
+        version if version > CURRENT_SCHEMA_VERSION => {
+            Ok(SchemaVersionVerdict::Newer { found: version })
+        }
+        _ => Ok(SchemaVersionVerdict::Migratable { found: version }),
     }
+}
+
+fn open_schema_inspection(path: &Path, wal_present: bool) -> Result<Connection, StoreError> {
+    let parameter = if wal_present {
+        "readonly_shm=1"
+    } else {
+        "immutable=1"
+    };
+    let uri = sqlite_file_uri(path, parameter);
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    Ok(Connection::open_with_flags(uri, flags)?)
+}
+
+fn sqlite_file_uri(path: &Path, parameter: &str) -> PathBuf {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut uri = b"file:".to_vec();
+    for byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            uri.push(*byte);
+        } else {
+            uri.extend_from_slice(&[b'%', HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]]);
+        }
+    }
+    uri.push(b'?');
+    uri.extend_from_slice(parameter.as_bytes());
+    PathBuf::from(OsString::from_vec(uri))
+}
+
+#[cfg(test)]
+pub(crate) fn schema_inspection_uri_for_test(path: &Path) -> PathBuf {
+    sqlite_file_uri(path, "immutable=1")
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
+
+fn same_file_snapshot(before: &Metadata, after: &Metadata) -> bool {
+    before.file_type().is_file()
+        && after.file_type().is_file()
+        && before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+}
+
+fn validate_current_schema(connection: &Connection) -> Result<(), StoreError> {
+    let mut expected = Connection::open_in_memory()?;
+    migrate(&mut expected, 0)?;
+    let mut statement = expected.prepare(
+        "SELECT type, name, sql FROM sqlite_schema \
+         WHERE name NOT LIKE 'sqlite_%' \
+           AND type IN ('table', 'index', 'view', 'trigger')",
+    )?;
+    let required = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for (object_type, name, expected_sql) in required {
+        let actual_sql = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = ?1 AND name = ?2",
+                params![object_type, name],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        if actual_sql != Some(expected_sql) {
+            return Err(rusqlite::Error::InvalidQuery.into());
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn open_read_only(path: &Path) -> Result<Connection, StoreError> {

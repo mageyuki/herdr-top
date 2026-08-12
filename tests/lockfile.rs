@@ -4,13 +4,42 @@ use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
-use herdr_top::lockfile::{LockError, state_root_in, try_acquire};
+use herdr_top::lockfile::{
+    LockError, derive_state_root, resolve_state_base, state_root_in, try_acquire,
+};
 use herdr_top::session_key::encode;
 use tempfile::tempdir;
 
 const HELPER_BASE_ENV: &str = "HERDR_TOP_T3_HELPER_BASE";
 const HELPER_NAME_ENV: &str = "HERDR_TOP_T3_HELPER_NAME";
 const TEST_SESSION_NAME: &str = "T3 lock test";
+
+#[test]
+fn i4_local_derive_paths_creates_nothing() {
+    let temp = tempdir().unwrap();
+    let xdg = temp.path().join("xdg-state");
+    let home = temp.path().join("home");
+    let key = encode("pure path derivation").unwrap();
+
+    let base = resolve_state_base(Some(xdg.as_os_str()), Some(home.as_os_str())).unwrap();
+    let root = derive_state_root(&base, &key);
+    assert_eq!(base, xdg);
+    assert_eq!(
+        root.0,
+        xdg.join("herdr-top").join("sessions").join(key.encoded())
+    );
+    assert!(!xdg.exists());
+    assert!(!home.exists());
+
+    let fallback = resolve_state_base(None, Some(home.as_os_str())).unwrap();
+    assert_eq!(fallback, home.join(".local/state"));
+    assert!(!fallback.exists());
+    assert!(matches!(
+        resolve_state_base(None, None),
+        Err(LockError::NoResolvableBase)
+    ));
+    assert!(fs::read_dir(temp.path()).unwrap().next().is_none());
+}
 
 #[test]
 fn helper_try_acquire() {

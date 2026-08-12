@@ -2,10 +2,11 @@
 //! Per-session state-root discovery, name sentinel, and advisory owner lock.
 
 use std::env;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -40,6 +41,21 @@ pub struct OwnerRecord {
     pub pane_id: Option<String>,
 }
 
+/// Read-only availability of an already-existing owner-lock file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExistingLockVerdict {
+    /// No lock file exists yet.
+    Missing,
+    /// Another open file description currently holds the lock.
+    Held,
+    /// The existing private lock file can be locked and released.
+    Available,
+    /// The entry is not a private, own-uid, single-link regular file.
+    MalformedOrUnsafe,
+    /// The existing entry cannot be safely opened, inspected, locked, or unlocked.
+    Unreadable,
+}
+
 /// Errors from state-root initialization and owner-lock acquisition.
 #[derive(Debug, Error)]
 pub enum LockError {
@@ -72,28 +88,89 @@ pub enum LockError {
 /// `XDG_STATE_HOME` wins when non-empty; otherwise this uses
 /// `$HOME/.local/state`.
 pub fn state_root(key: &SessionKey) -> Result<StateRoot, LockError> {
-    let base = if let Some(xdg_state_home) =
-        env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty())
-    {
-        PathBuf::from(xdg_state_home)
-    } else if let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) {
-        PathBuf::from(home).join(".local/state")
-    } else {
-        return Err(LockError::NoResolvableBase);
-    };
+    let xdg_state_home = env::var_os("XDG_STATE_HOME");
+    let home = env::var_os("HOME");
+    let base = resolve_state_base(xdg_state_home.as_deref(), home.as_deref())?;
 
     state_root_in(&base, key)
 }
 
+/// Resolves the state base without creating, changing, or resolving any path.
+///
+/// A non-empty `xdg_state_home` wins; otherwise this derives `.local/state`
+/// beneath a non-empty `home`.
+pub fn resolve_state_base(
+    xdg_state_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Result<PathBuf, LockError> {
+    if let Some(xdg_state_home) = xdg_state_home.filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(xdg_state_home));
+    }
+    home.filter(|value| !value.is_empty())
+        .map(|home| PathBuf::from(home).join(".local/state"))
+        .ok_or(LockError::NoResolvableBase)
+}
+
+/// Derives a session state root without inspecting or changing the filesystem.
+#[must_use]
+pub fn derive_state_root(base: &Path, key: &SessionKey) -> StateRoot {
+    StateRoot(base.join("herdr-top").join("sessions").join(key.encoded()))
+}
+
 /// Initializes a session state directory beneath an explicit, environment-free base.
 pub fn state_root_in(base: &Path, key: &SessionKey) -> Result<StateRoot, LockError> {
-    let root = base.join("herdr-top").join("sessions").join(key.encoded());
-    create_private_directory(&root)?;
+    let root = derive_state_root(base, key);
+    create_private_directory(&root.0)?;
 
-    let sentinel = root.join(SENTINEL_FILE);
+    let sentinel = root.0.join(SENTINEL_FILE);
     validate_or_create_sentinel(&sentinel, key)?;
 
-    Ok(StateRoot(root))
+    Ok(root)
+}
+
+/// Probes only an already-existing owner-lock file and never writes or creates.
+///
+/// An available lock is explicitly released before this function returns.
+#[must_use]
+pub fn probe_existing_lock(root: &StateRoot) -> ExistingLockVerdict {
+    let path = root.0.join(LOCK_FILE);
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return ExistingLockVerdict::Missing;
+        }
+        Err(source) if source.raw_os_error() == Some(libc::ELOOP) => {
+            return ExistingLockVerdict::MalformedOrUnsafe;
+        }
+        Err(_) => return ExistingLockVerdict::Unreadable,
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return ExistingLockVerdict::Unreadable,
+    };
+    if !metadata.file_type().is_file()
+        || metadata.mode() & 0o7777 != FILE_MODE
+        || metadata.uid() != effective_uid()
+        || metadata.nlink() != 1
+    {
+        return ExistingLockVerdict::MalformedOrUnsafe;
+    }
+
+    match flock_exclusive_nonblocking(&file) {
+        Ok(false) => ExistingLockVerdict::Held,
+        Ok(true) => {
+            if flock_unlock(&file).is_ok() {
+                ExistingLockVerdict::Available
+            } else {
+                ExistingLockVerdict::Unreadable
+            }
+        }
+        Err(_) => ExistingLockVerdict::Unreadable,
+    }
 }
 
 /// Attempts to acquire the session owner lock without blocking.
@@ -261,4 +338,21 @@ fn flock_exclusive_nonblocking(file: &File) -> io::Result<bool> {
     } else {
         Err(source)
     }
+}
+
+fn flock_unlock(file: &File) -> io::Result<()> {
+    // SAFETY: `file` owns a valid descriptor for this call, and `flock` neither
+    // retains the descriptor nor dereferences any Rust memory.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn effective_uid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments, accesses no Rust memory, and has no
+    // failure mode.
+    unsafe { libc::geteuid() }
 }

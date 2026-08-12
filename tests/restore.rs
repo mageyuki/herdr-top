@@ -11,13 +11,14 @@ use std::time::{Duration, Instant};
 use common::mock::{MockConfig, MockHerdr};
 use herdr_top::herdr::collector::{self, CollectorHandle, ObservationQuality};
 use herdr_top::lockfile::{OwnerRecord, StateRoot, state_root_in, try_acquire};
-use herdr_top::model::{ExecState, Provider, RunId, RunKey};
+use herdr_top::model::{DisplayOrdinal, ExecState, Provider, RunId, RunKey, TaskRun, TaskState};
 use herdr_top::rendezvous::{
     ControllerSocketStatus, open_runtime_dir_at, prepare_controller_socket,
 };
 use herdr_top::session_key;
 use herdr_top::store::{
-    SchemaVerdict, database_path, open_reader, open_writer, preflight_schema, spawn_writer,
+    PersistOp, PersistTaskRun, SchemaVerdict, database_path, open_reader, open_writer,
+    preflight_schema, spawn_writer,
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -173,6 +174,242 @@ async fn held_branch_focus_failure_reports_owner_info() {
             .expect("owner should read"),
         Some(owner)
     );
+}
+
+#[test]
+fn i4_restore_terminal_time_survives_cold_restart() {
+    let directory = tempfile::tempdir().expect("temporary state directory should exist");
+    let root = StateRoot(directory.path().to_path_buf());
+    let run_id = RunId::new();
+    let first_terminal_ms = 1_900_000_000_100;
+    {
+        let mut store = open_writer(&root).expect("writer should open");
+        store
+            .apply_batch(vec![i4_run_op(
+                run_id,
+                1,
+                TaskState::Completed,
+                1_900_000_000_200,
+                Some(first_terminal_ms),
+            )])
+            .expect("terminal run should persist");
+        store.checkpoint().expect("terminal run should checkpoint");
+    }
+
+    let restored = open_reader(&root)
+        .expect("reader should cold reopen")
+        .load_restored_operator_state()
+        .expect("operator state should restore");
+
+    assert_eq!(
+        restored.terminal_times.get(&run_id),
+        Some(&first_terminal_ms)
+    );
+}
+
+#[test]
+fn i4_restore_terminal_restatement_preserves_first_time() {
+    let directory = tempfile::tempdir().expect("temporary state directory should exist");
+    let root = StateRoot(directory.path().to_path_buf());
+    let run_id = RunId::new();
+    let first_terminal_ms = 1_900_000_000_100;
+    {
+        let mut store = open_writer(&root).expect("writer should open");
+        store
+            .apply_batch(vec![i4_run_op(
+                run_id,
+                1,
+                TaskState::Completed,
+                first_terminal_ms,
+                Some(first_terminal_ms),
+            )])
+            .expect("first terminal transition should persist");
+        store
+            .apply_batch(vec![i4_run_op(
+                run_id,
+                1,
+                TaskState::Failed,
+                1_900_000_000_200,
+                Some(1_900_000_000_200),
+            )])
+            .expect("terminal restatement should persist");
+        store
+            .checkpoint()
+            .expect("terminal restatement should checkpoint");
+    }
+
+    let restored = open_reader(&root)
+        .expect("reader should cold reopen")
+        .load_restored_operator_state()
+        .expect("operator state should restore");
+
+    assert_eq!(
+        restored.terminal_times.get(&run_id),
+        Some(&first_terminal_ms)
+    );
+}
+
+#[test]
+fn i4_restore_reopen_clears_and_reterminal_sets_new_time() {
+    let directory = tempfile::tempdir().expect("temporary state directory should exist");
+    let root = StateRoot(directory.path().to_path_buf());
+    let run_id = RunId::new();
+    {
+        let mut store = open_writer(&root).expect("writer should open");
+        store
+            .apply_batch(vec![i4_run_op(
+                run_id,
+                1,
+                TaskState::Completed,
+                1_900_000_000_100,
+                Some(1_900_000_000_100),
+            )])
+            .expect("first terminal transition should persist");
+        store
+            .apply_batch(vec![i4_run_op(
+                run_id,
+                1,
+                TaskState::Running,
+                1_900_000_000_200,
+                None,
+            )])
+            .expect("reopen should persist");
+        store.checkpoint().expect("reopen should checkpoint");
+    }
+    let reopened = open_reader(&root)
+        .expect("reader should cold reopen")
+        .load_restored_operator_state()
+        .expect("operator state should restore after reopen");
+    assert!(!reopened.terminal_times.contains_key(&run_id));
+
+    let second_terminal_ms = 1_900_000_000_300;
+    {
+        let mut store = open_writer(&root).expect("writer should reopen");
+        store
+            .apply_batch(vec![i4_run_op(
+                run_id,
+                1,
+                TaskState::Cancelled,
+                second_terminal_ms,
+                None,
+            )])
+            .expect("second terminal transition should persist");
+        store
+            .checkpoint()
+            .expect("second terminal transition should checkpoint");
+    }
+    let reterminated = open_reader(&root)
+        .expect("reader should cold reopen again")
+        .load_restored_operator_state()
+        .expect("operator state should restore after second terminal transition");
+    assert_eq!(
+        reterminated.terminal_times.get(&run_id),
+        Some(&second_terminal_ms)
+    );
+}
+
+#[test]
+fn i4_restore_merge_uses_earliest_terminal_time_and_excludes_alias() {
+    let directory = tempfile::tempdir().expect("temporary state directory should exist");
+    let root = StateRoot(directory.path().to_path_buf());
+    let terminal_survivor = RunId::new();
+    let terminal_absorbed = RunId::new();
+    let running_survivor = RunId::new();
+    let running_absorbed = RunId::new();
+    let fallback_survivor = RunId::new();
+    let fallback_absorbed = RunId::new();
+    let base = 1_900_000_000_000;
+    {
+        let mut store = open_writer(&root).expect("writer should open");
+        store
+            .apply_batch(vec![
+                i4_run_op(
+                    terminal_survivor,
+                    1,
+                    TaskState::Completed,
+                    base + 200,
+                    Some(base + 200),
+                ),
+                i4_run_op(
+                    terminal_absorbed,
+                    2,
+                    TaskState::Failed,
+                    base + 100,
+                    Some(base + 100),
+                ),
+                PersistOp::MergeTaskRuns {
+                    survivor: terminal_survivor,
+                    absorbed: terminal_absorbed,
+                },
+                i4_run_op(running_survivor, 3, TaskState::Running, base + 500, None),
+                i4_run_op(
+                    running_absorbed,
+                    4,
+                    TaskState::Completed,
+                    base + 400,
+                    Some(base + 400),
+                ),
+                PersistOp::MergeTaskRuns {
+                    survivor: running_survivor,
+                    absorbed: running_absorbed,
+                },
+                i4_run_op(
+                    fallback_survivor,
+                    5,
+                    TaskState::Completed,
+                    base + 600,
+                    Some(base + 600),
+                ),
+                i4_run_op(
+                    fallback_absorbed,
+                    6,
+                    TaskState::Failed,
+                    base + 700,
+                    Some(base + 700),
+                ),
+            ])
+            .expect("merge fixtures should persist");
+        store
+            .checkpoint()
+            .expect("merge fixtures should checkpoint");
+    }
+    {
+        let connection = Connection::open(database_path(&root)).expect("database should open");
+        connection
+            .execute(
+                "UPDATE task_runs SET finished_at_ms = NULL WHERE run_id IN (?1, ?2)",
+                [fallback_survivor.to_string(), fallback_absorbed.to_string()],
+            )
+            .expect("fallback fixture should remove both terminal times");
+    }
+    {
+        let mut store = open_writer(&root).expect("writer should reopen");
+        store
+            .apply_batch(vec![PersistOp::MergeTaskRuns {
+                survivor: fallback_survivor,
+                absorbed: fallback_absorbed,
+            }])
+            .expect("fallback merge should persist");
+        store.checkpoint().expect("merges should checkpoint");
+    }
+
+    let restored = open_reader(&root)
+        .expect("reader should cold reopen")
+        .load_restored_operator_state()
+        .expect("operator state should restore");
+
+    assert_eq!(
+        restored.terminal_times.get(&terminal_survivor),
+        Some(&(base + 100))
+    );
+    assert!(!restored.terminal_times.contains_key(&terminal_absorbed));
+    assert!(!restored.terminal_times.contains_key(&running_survivor));
+    assert!(!restored.terminal_times.contains_key(&running_absorbed));
+    assert_eq!(
+        restored.terminal_times.get(&fallback_survivor),
+        Some(&(base + 600))
+    );
+    assert!(!restored.terminal_times.contains_key(&fallback_absorbed));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -430,6 +667,28 @@ fn seed_owner(root: &StateRoot, owner: &OwnerRecord) {
     let mut store = open_writer(root).expect("writer store should open");
     store.replace_owner(owner).expect("owner should persist");
     store.checkpoint().expect("seed WAL should checkpoint");
+}
+
+fn i4_run_op(
+    run_id: RunId,
+    ordinal: i64,
+    state: TaskState,
+    updated_at_ms: i64,
+    finished_at_ms: Option<i64>,
+) -> PersistOp {
+    PersistOp::UpsertTaskRun(PersistTaskRun {
+        task_run: TaskRun {
+            run_id,
+            key: RunKey::Controller(format!("controller-{run_id}")),
+            display_ordinal: DisplayOrdinal::new(ordinal),
+            state,
+            has_controller_task_state_event: true,
+        },
+        native_session: None,
+        created_at_ms: updated_at_ms,
+        updated_at_ms,
+        finished_at_ms,
+    })
 }
 
 fn run_binary(state_base: &Path, socket: Option<&Path>, session: &str) -> Output {

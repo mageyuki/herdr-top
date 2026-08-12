@@ -3,6 +3,58 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Successful response returned by the schema-declared `ping` request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Pong {
+    #[serde(rename = "type")]
+    pub result_type: String,
+    pub version: String,
+    pub protocol: u32,
+    #[serde(default)]
+    pub capabilities: Option<PongCapabilities>,
+}
+
+/// Optional server capabilities embedded in a [`Pong`].
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PongCapabilities {
+    pub live_handoff: bool,
+    #[serde(default)]
+    pub detached_server_daemon: bool,
+}
+
+/// Successful response returned by `server.agent_manifests`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentManifestStatus {
+    #[serde(rename = "type")]
+    pub result_type: String,
+    pub manifests: Vec<AgentManifestInfo>,
+    #[serde(default)]
+    pub last_check_unix: Option<u64>,
+    #[serde(default)]
+    pub last_result: Option<String>,
+}
+
+/// One provider's installed Herdr integration manifest status.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentManifestInfo {
+    pub agent: String,
+    pub source: String,
+    pub source_kind: String,
+    pub local_override_shadowing_remote: bool,
+    #[serde(default)]
+    pub active_version: Option<String>,
+    #[serde(default)]
+    pub cached_remote_version: Option<String>,
+    #[serde(default)]
+    pub remote_last_checked_unix: Option<u64>,
+    #[serde(default)]
+    pub remote_update_error: Option<String>,
+    #[serde(default)]
+    pub remote_update_result: Option<String>,
+    #[serde(default)]
+    pub warning: Option<String>,
+}
+
 /// One event subscription sent to `events.subscribe`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Subscription {

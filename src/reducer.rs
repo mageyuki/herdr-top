@@ -1,11 +1,14 @@
 //! T7 reducer state machines, ordinal allocator, and gap reconciliation.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 use tokio::sync::watch;
 
+use crate::activity::{OperatorSnapshot, RestoredOperatorState};
+use crate::diagnostics::RuntimeWriteOutcome;
 use crate::identity::{
     BindingEvidence, MergeConflict, apply_binding_plan_at, plan_binding, preflight_dependency_edge,
     preflight_execution_edge,
@@ -17,6 +20,7 @@ use crate::model::{
     Pane, Provider, ProviderDiagnosticsHandle, ReconcileBatch, RunId, RunKey, SharedModel, TaskRun,
     TaskState, TopologyEntity, TopologyEntityId, sanitize_controller_text,
 };
+use crate::operator::OperatorProjection;
 use crate::store::{
     EnqueuePermit, NativeSessionBinding, PendingEnqueue, PersistBatch, PersistExecution, PersistOp,
     PersistTaskRun, RestoredState,
@@ -83,6 +87,7 @@ pub struct Reducer {
     next_ordinal: i64,
     next_ingest_seq: Option<i64>,
     publisher: watch::Sender<Arc<DomainModel>>,
+    operator: OperatorProjection,
     #[cfg(test)]
     publish_count: std::cell::Cell<u64>,
 }
@@ -91,22 +96,41 @@ impl Reducer {
     /// Restores reducer state and returns a receiver for coherent model snapshots.
     #[must_use]
     pub fn new(restored: RestoredState) -> (Self, SharedModel) {
+        let (reducer, shared, _operator) = Self::new_with_operator(
+            restored,
+            RestoredOperatorState {
+                activity: Vec::new(),
+                terminal_times: std::collections::HashMap::new(),
+            },
+        );
+        (reducer, shared)
+    }
+
+    /// Restores reducer and operator state and returns both immutable receivers.
+    #[must_use]
+    pub fn new_with_operator(
+        restored: RestoredState,
+        restored_operator: RestoredOperatorState,
+    ) -> (Self, SharedModel, watch::Receiver<OperatorSnapshot>) {
         let mut model = restored.model;
         let dangling_components = crate::model::graph::dangling_announcement_components(&model);
         model
             .controller_diagnostics_mut()
             .set_dangling_announcement_components(dangling_components);
         let (publisher, shared) = watch::channel(Arc::new(model.clone()));
+        let (operator, operator_receiver) = OperatorProjection::new(restored_operator);
         (
             Self {
                 model,
                 next_ordinal: restored.next_ordinal,
                 next_ingest_seq: restored.next_ingest_seq,
                 publisher,
+                operator,
                 #[cfg(test)]
                 publish_count: std::cell::Cell::new(0),
             },
             shared,
+            operator_receiver,
         )
     }
 
@@ -142,6 +166,8 @@ impl Reducer {
             }
         }
         self.recompute_dangling_announcement_components();
+        normalize_persist_batch_lineage(&mut persist);
+        self.operator.apply_submission(&persist);
         self.publish();
         Ok(ApplyOutcome::Applied(persist))
     }
@@ -372,11 +398,13 @@ impl Reducer {
         }
         let mut batch = vec![PersistOp::AdvanceIngestSequence { ingest_seq }];
         batch.extend(delta.batch);
+        normalize_persist_batch_lineage(&mut batch);
 
         self.model = delta.post_model;
         self.next_ordinal = delta.post_next_ordinal;
         self.next_ingest_seq = ingest_seq.checked_add(1);
         self.apply_controller_diagnostic_deltas(delta.diagnostic_deltas);
+        self.operator.apply_submission(&batch);
         self.publish();
         Ok(permit.enqueue(batch))
     }
@@ -413,13 +441,22 @@ impl Reducer {
         let original_model = self.model.clone();
         let original_next_ordinal = self.next_ordinal;
         match self.reconcile_gap_inner(batch) {
-            Ok(persist) => Ok(persist),
+            Ok(mut persist) => {
+                normalize_persist_batch_lineage(&mut persist);
+                self.operator.apply_submission(&persist);
+                Ok(persist)
+            }
             Err(error) => {
                 self.model = original_model;
                 self.next_ordinal = original_next_ordinal;
                 Err(error)
             }
         }
+    }
+
+    /// Applies the runtime durability truth to the preceding operator submission.
+    pub(crate) fn complete_operator_submission(&mut self, outcome: RuntimeWriteOutcome) {
+        self.operator.complete_submission(outcome);
     }
 
     fn reconcile_gap_inner(&mut self, batch: ReconcileBatch) -> Result<PersistBatch, ReducerError> {
@@ -1501,6 +1538,7 @@ impl Reducer {
             self.end_execution(&execution_id, now_ms, &mut persist);
         }
         self.recompute_dangling_announcement_components();
+        self.operator.apply_submission(&persist);
         self.publish();
         persist
     }
@@ -1640,6 +1678,31 @@ fn event_metadata_mut(event: &mut NormalizedEvent) -> &mut EventMetadata {
         | NormalizedEvent::AgentActivity { metadata, .. }
         | NormalizedEvent::ExecutionBegin { metadata, .. }
         | NormalizedEvent::ExecutionEnd { metadata, .. } => metadata,
+    }
+}
+
+fn normalize_persist_batch_lineage(batch: &mut PersistBatch) {
+    let mut merged_into = HashMap::new();
+    for operation in batch {
+        match operation {
+            PersistOp::MergeTaskRuns { survivor, absorbed } => {
+                merged_into.insert(*absorbed, *survivor);
+            }
+            PersistOp::RecordEvent { event, .. } => {
+                let metadata = event_metadata_mut(event);
+                let Some(mut run_id) = metadata.task_run_id else {
+                    continue;
+                };
+                for _ in 0..merged_into.len() {
+                    let Some(survivor) = merged_into.get(&run_id) else {
+                        break;
+                    };
+                    run_id = *survivor;
+                }
+                metadata.task_run_id = Some(run_id);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1862,6 +1925,7 @@ fn unix_now_ms() -> i64 {
 mod tests {
     use std::sync::Arc;
 
+    use crate::diagnostics::RuntimeWriteOutcome;
     use crate::lockfile::StateRoot;
     use crate::model::{
         AgentNode, AgentNodeObservation, AgentSessionReference, AgentSessionReferenceKind,
@@ -1872,11 +1936,204 @@ mod tests {
         Workspace,
     };
     use crate::store::{
-        PersistOp, RestoredState, WriterClient, database_path, open_reader, open_writer,
-        spawn_writer,
+        NativeSessionBinding, PersistOp, PersistTaskRun, RestoredState, WriterClient,
+        database_path, open_reader, open_writer, spawn_writer,
     };
 
     use super::{ApplyOutcome, CommitStagedError, Reducer, ReducerError, RejectReason};
+
+    #[test]
+    fn i4_operator_merge_triggering_record_round_trips_canonical_lineage() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let survivor = RunId::new();
+        let absorbed = RunId::new();
+        let now = super::unix_now_ms();
+        let survivor_run = run(
+            survivor,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "canonical-sid".to_owned(),
+            },
+            1,
+            TaskState::Queued,
+        );
+        let absorbed_run = run(
+            absorbed,
+            RunKey::NativePath {
+                provider: Provider::Codex,
+                path: "/tmp/merge-trigger.jsonl".to_owned(),
+            },
+            2,
+            TaskState::Queued,
+        );
+        store
+            .apply_batch(vec![
+                PersistOp::UpsertTaskRun(PersistTaskRun {
+                    task_run: survivor_run.clone(),
+                    native_session: Some(NativeSessionBinding {
+                        provider: Provider::Codex,
+                        native_session_id: "canonical-sid".to_owned(),
+                    }),
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                    finished_at_ms: None,
+                }),
+                PersistOp::UpsertTaskRun(PersistTaskRun {
+                    task_run: absorbed_run.clone(),
+                    native_session: None,
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                    finished_at_ms: None,
+                }),
+            ])
+            .unwrap();
+
+        let mut model = DomainModel::default();
+        model.insert_task_run(survivor_run);
+        model.insert_task_run(absorbed_run);
+        let (mut reducer, _shared, operator) = Reducer::new_with_operator(
+            restored(model, 3),
+            crate::activity::RestoredOperatorState {
+                activity: Vec::new(),
+                terminal_times: std::collections::HashMap::new(),
+            },
+        );
+        let mut event_metadata = metadata("merge-triggering-record", now);
+        event_metadata.source = "provider".to_owned();
+        event_metadata.source_event_type = "session_resolved".to_owned();
+        event_metadata.provider = Some(Provider::Codex);
+        event_metadata.native_session_id = Some("canonical-sid".to_owned());
+        event_metadata.task_run_id = Some(absorbed);
+        let outcome = reducer
+            .apply(NormalizedEvent::TopologyUpsert {
+                metadata: event_metadata,
+                entity: TopologyEntity::Workspace(Workspace {
+                    workspace_id: "merge-trigger-workspace".to_owned(),
+                }),
+            })
+            .unwrap();
+        let ApplyOutcome::Applied(batch) = outcome else {
+            panic!("legitimate native-path resolution must apply");
+        };
+        assert!(batch.iter().any(|operation| matches!(
+            operation,
+            PersistOp::MergeTaskRuns {
+                survivor: actual_survivor,
+                absorbed: actual_absorbed,
+            } if *actual_survivor == survivor && *actual_absorbed == absorbed
+        )));
+        store.apply_batch(batch).unwrap();
+        reducer.complete_operator_submission(RuntimeWriteOutcome::Durable);
+
+        let live = operator.borrow().activity.to_vec();
+        let cold = store.load_restored_operator_state().unwrap().activity;
+        assert_eq!(live, cold);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].task_run_id, Some(survivor));
+    }
+
+    #[test]
+    fn i4_operator_transitive_batch_lineage_normalization() {
+        let first = RunId::new();
+        let second = RunId::new();
+        let final_survivor = RunId::new();
+        let record = |event_id: &str, task_run_id: RunId| PersistOp::RecordEvent {
+            event: Box::new(NormalizedEvent::TopologyUpsert {
+                metadata: {
+                    let mut metadata = metadata(event_id, 1);
+                    metadata.task_run_id = Some(task_run_id);
+                    metadata
+                },
+                entity: TopologyEntity::Workspace(Workspace {
+                    workspace_id: format!("workspace-{event_id}"),
+                }),
+            }),
+            seen_at_ms: 1,
+        };
+        let mut batch = vec![
+            record("before-merge", first),
+            PersistOp::MergeTaskRuns {
+                survivor: second,
+                absorbed: first,
+            },
+            PersistOp::MergeTaskRuns {
+                survivor: final_survivor,
+                absorbed: second,
+            },
+            record("after-chain", first),
+        ];
+
+        super::normalize_persist_batch_lineage(&mut batch);
+
+        let recorded_lineage: Vec<_> = batch
+            .iter()
+            .filter_map(|operation| match operation {
+                PersistOp::RecordEvent { event, .. } => super::event_metadata(event).task_run_id,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(recorded_lineage, vec![first, final_survivor]);
+    }
+
+    #[test]
+    fn i4_operator_d4_updates_as_gauge_not_counter() {
+        let parent = RunId::new();
+        let child = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            parent,
+            RunKey::Controller("d4-parent".to_owned()),
+            1,
+            TaskState::Queued,
+        ));
+        model.insert_task_run(run(
+            child,
+            RunKey::Controller("d4-child".to_owned()),
+            2,
+            TaskState::Queued,
+        ));
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: parent,
+            child_run_id: child,
+        });
+        let (mut reducer, shared, _operator) = Reducer::new_with_operator(
+            restored(model, 3),
+            crate::activity::RestoredOperatorState {
+                activity: Vec::new(),
+                terminal_times: std::collections::HashMap::new(),
+            },
+        );
+
+        assert_eq!(
+            crate::diagnostics::controller_counter_snapshot(&shared.borrow())
+                .dangling_announcement_components,
+            1
+        );
+        reducer
+            .apply(topology_event(
+                metadata("d4-unrelated-a", 10),
+                "workspace-a",
+            ))
+            .unwrap();
+        reducer
+            .apply(topology_event(
+                metadata("d4-unrelated-b", 11),
+                "workspace-b",
+            ))
+            .unwrap();
+
+        let counters = crate::diagnostics::controller_counter_snapshot(&shared.borrow());
+        assert_eq!(counters.dangling_announcement_components, 1);
+        assert_eq!(
+            counters.dangling_announcement_components,
+            shared
+                .borrow()
+                .controller_diagnostics()
+                .dangling_announcement_components()
+        );
+    }
 
     fn metadata(event_id: &str, timestamp_ms: i64) -> EventMetadata {
         EventMetadata {

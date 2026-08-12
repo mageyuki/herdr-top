@@ -7,6 +7,7 @@ use common::hardening_mock::{HardeningConfig, HardeningHerdr, SnapshotReply};
 use common::live_mock::{LiveConfig, LiveHerdr};
 use common::mock::{MockConfig, MockHerdr, fixture_payloads};
 use common::scripted_mock::{ScriptedConfig, ScriptedHerdr};
+use herdr_top::activity::ActivityDurability;
 use herdr_top::herdr::collector::{self, CollectorHandle, ObservationQuality};
 use herdr_top::identity::MergeConflict;
 use herdr_top::lockfile::{StateRoot, state_root_in};
@@ -25,8 +26,38 @@ use herdr_top::store::{
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixListener;
+use tokio::task::JoinHandle;
 
 const WAIT: Duration = Duration::from_secs(3);
+
+#[tokio::test]
+async fn i4_operator_coverage_only_change_wakes_diagnostics() {
+    let herdr_directory = tempfile::tempdir().unwrap();
+    let absent_socket = herdr_directory.path().join("absent.sock");
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let handle = collector::spawn(absent_socket, test_session(), empty_restored(), writer)
+        .await
+        .unwrap();
+    let mut model = handle.model.clone();
+    let mut diagnostics = handle.diagnostics.clone();
+    let _ = model.borrow_and_update();
+    let _ = diagnostics.borrow_and_update();
+
+    wait_diagnostic_source(
+        &mut diagnostics,
+        herdr_top::diagnostics::DiagnosticSource::Herdr,
+        herdr_top::diagnostics::InputAvailability::Unavailable,
+    )
+    .await;
+    assert!(
+        !model.has_changed().unwrap(),
+        "coverage-only publication must not require a model event"
+    );
+
+    shutdown(handle, lifecycle).await;
+}
 
 #[tokio::test]
 async fn subscribe_buffer_snapshot_replay_order() {
@@ -641,6 +672,185 @@ async fn periodic_cleanup_after_ingestion() {
 }
 
 #[tokio::test]
+async fn i4_d3_cleanup_failure_keeps_collector_alive() {
+    let snapshot = p1_snapshot();
+    let later_pane = pane_value("w1:p2", "terminal-2", "w1", "w1:t1");
+    let mock = MockHerdr::start(
+        MockConfig::default()
+            .respond("session.snapshot", snapshot_result(snapshot))
+            .subscription_pushes(vec![push(
+                "pane_created",
+                json!({"type": "pane_created", "pane": later_pane}),
+            )]),
+    )
+    .await
+    .expect("mock server should bind");
+    let ancient = PersistOp::RecordCollectorGap(CollectorGap {
+        event_id: "i4-ancient-gap".to_owned(),
+        herdr_session: test_session(),
+        seen_at_ms: 0,
+        kind: GapKind::Startup,
+    });
+    let (_directory, root, lifecycle, writer) = test_writer_configured(vec![ancient], |root| {
+        Connection::open(database_path(root))
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER i4_fail_cleanup BEFORE DELETE ON events \
+                 BEGIN SELECT RAISE(ABORT, 'PRIVATE_CLEANUP_TEXT_701A'); END;",
+            )
+            .unwrap();
+    });
+
+    let handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer.clone(),
+    )
+    .await
+    .expect("collector should start");
+    wait_model_pane(&handle.model, "w1:p2").await;
+    assert!(matches!(
+        writer.persistence_status(),
+        herdr_top::store::PersistenceStatus::Degraded { .. }
+    ));
+    assert!(handle.model.borrow().pane("w1:p2").is_some());
+    handle
+        .stop()
+        .await
+        .expect("collector should remain stoppable");
+    tokio::time::timeout(Duration::from_secs(3), lifecycle.shutdown())
+        .await
+        .expect("writer shutdown timed out")
+        .expect("writer should checkpoint after cleanup degradation");
+    let reopened = open_reader(&root).unwrap().load_restored_state().unwrap();
+    assert!(
+        reopened.model.pane("w1:p1").is_some(),
+        "post-Apply cleanup failure must preserve the committed snapshot batch"
+    );
+    assert!(
+        reopened.model.pane("w1:p2").is_none(),
+        "the later in-memory event must be skipped by persistence"
+    );
+}
+
+#[tokio::test]
+async fn i4_d3_herdr_transitions_refresh_consolidated_diagnostics() {
+    let herdr_dir = tempfile::tempdir().unwrap();
+    let herdr_path = herdr_dir.path().join("herdr.sock");
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let handle = collector::spawn(herdr_path.clone(), test_session(), empty_restored(), writer)
+        .await
+        .expect("collector should start before Herdr is available");
+    let mut diagnostics = handle.diagnostics.clone();
+
+    wait_diagnostic_source(
+        &mut diagnostics,
+        herdr_top::diagnostics::DiagnosticSource::Herdr,
+        herdr_top::diagnostics::InputAvailability::Unavailable,
+    )
+    .await;
+
+    let herdr_task = spawn_static_herdr(&herdr_path, p1_snapshot());
+    wait_diagnostic_source(
+        &mut diagnostics,
+        herdr_top::diagnostics::DiagnosticSource::Herdr,
+        herdr_top::diagnostics::InputAvailability::Available,
+    )
+    .await;
+
+    shutdown(handle, lifecycle).await;
+    herdr_task.abort();
+}
+
+#[tokio::test]
+async fn i4_d3_apply_failure_keeps_in_memory_model_advancing() {
+    let snapshot = p1_snapshot();
+    let pushes = vec![
+        push(
+            "pane_created",
+            json!({"type": "pane_created", "pane": pane_value("w1:p2", "terminal-2", "w1", "w1:t1")}),
+        ),
+        push(
+            "pane_created",
+            json!({"type": "pane_created", "pane": pane_value("w1:p3", "terminal-3", "w1", "w1:t1")}),
+        ),
+    ];
+    let mock = MockHerdr::start(
+        MockConfig::default()
+            .respond("session.snapshot", snapshot_result(snapshot))
+            .subscription_pushes(pushes),
+    )
+    .await
+    .expect("mock server should bind");
+    let (_directory, root, lifecycle, writer) = test_writer_configured(Vec::new(), |root| {
+        Connection::open(database_path(root))
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER i4_fail_second_pane BEFORE INSERT ON panes \
+                 WHEN NEW.pane_id = 'w1:p2' \
+                 BEGIN SELECT RAISE(ABORT, 'PRIVATE_APPLY_TEXT_04E8'); END;",
+            )
+            .unwrap();
+    });
+
+    let handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer.clone(),
+    )
+    .await
+    .expect("collector should start");
+    let mut operator = handle.operator.clone();
+    let _ = operator.borrow_and_update();
+    wait_model_pane(&handle.model, "w1:p3").await;
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let snapshot = operator.borrow();
+            let pane_created: Vec<_> = snapshot
+                .activity
+                .iter()
+                .filter(|item| {
+                    item.source == "herdr"
+                        && item.normalized_kind == "topology_upsert"
+                        && item.source_event_type == "pane_created"
+                })
+                .collect();
+            if pane_created.len() == 2
+                && pane_created
+                    .iter()
+                    .all(|item| item.durability == ActivityDurability::CurrentOnly)
+            {
+                break;
+            }
+            drop(snapshot);
+            operator
+                .changed()
+                .await
+                .expect("operator publisher must remain open");
+        }
+    })
+    .await
+    .expect("failure-causing and post-degradation activity must become current-only");
+    let model = handle.model.borrow();
+    assert!(model.pane("w1:p2").is_some());
+    assert!(model.pane("w1:p3").is_some());
+    drop(model);
+    handle
+        .stop()
+        .await
+        .expect("collector should remain stoppable");
+    tokio::time::timeout(Duration::from_secs(3), lifecycle.shutdown())
+        .await
+        .expect("writer shutdown timed out")
+        .expect("writer should checkpoint after apply degradation");
+    let reopened = open_reader(&root).unwrap().load_restored_state().unwrap();
+    assert!(reopened.model.pane("w1:p2").is_none());
+    assert!(reopened.model.pane("w1:p3").is_none());
+}
+
+#[tokio::test]
 async fn fifty_pane_mock_smoke() {
     let mut snapshot = p1_snapshot();
     snapshot["panes"] = Value::Array(
@@ -947,6 +1157,8 @@ async fn binding_conflict_is_non_fatal_diagnostic() {
     .await
     .expect("collector should start");
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    let _ = handle.model.borrow_and_update();
+    let _ = handle.diagnostics.borrow_and_update();
 
     let (execution_id, run_id) = {
         let model = handle.model.borrow();
@@ -986,6 +1198,34 @@ async fn binding_conflict_is_non_fatal_diagnostic() {
             == 1
     })
     .await;
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if handle
+                .diagnostics
+                .borrow()
+                .controller_counters
+                .binding_conflicts
+                == 1
+            {
+                break;
+            }
+            handle
+                .diagnostics
+                .changed()
+                .await
+                .expect("runtime diagnostics publisher must remain open");
+        }
+    })
+    .await
+    .expect("binding conflict must wake consolidated diagnostics");
+    assert_eq!(
+        handle
+            .diagnostics
+            .borrow()
+            .controller_counters
+            .binding_conflicts,
+        1
+    );
     assert_eq!(*handle.quality.borrow(), ObservationQuality::Live);
     let model = handle.model.borrow();
     let execution = model
@@ -1807,6 +2047,13 @@ fn test_writer() -> (TempDir, StateRoot, WriterLifecycle, WriterClient) {
 }
 
 fn test_writer_seeded(seed: Vec<PersistOp>) -> (TempDir, StateRoot, WriterLifecycle, WriterClient) {
+    test_writer_configured(seed, |_| {})
+}
+
+fn test_writer_configured(
+    seed: Vec<PersistOp>,
+    setup: impl FnOnce(&StateRoot),
+) -> (TempDir, StateRoot, WriterLifecycle, WriterClient) {
     let directory = tempfile::tempdir().expect("temporary store directory should exist");
     let key = session_key::encode("convergence-test").expect("session key should encode");
     let root = state_root_in(directory.path(), &key).expect("state root should initialize");
@@ -1816,6 +2063,7 @@ fn test_writer_seeded(seed: Vec<PersistOp>) -> (TempDir, StateRoot, WriterLifecy
             .apply_batch(seed)
             .expect("restored seed should persist");
     }
+    setup(&root);
     let (lifecycle, writer) = spawn_writer(store).expect("writer thread should start");
     (directory, root, lifecycle, writer)
 }
@@ -2032,6 +2280,69 @@ fn push(event: &str, data: Value) -> Value {
     json!({"event": event, "data": data})
 }
 
+fn spawn_static_herdr(path: &std::path::Path, snapshot: Value) -> JoinHandle<()> {
+    let listener = UnixListener::bind(path).unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let snapshot = snapshot.clone();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let id = request["id"].clone();
+                let response = match request["method"].as_str() {
+                    Some("events.subscribe") => {
+                        json!({"id": id, "result": {"type": "subscription_started"}})
+                    }
+                    Some("session.snapshot") => json!({
+                        "id": id,
+                        "result": {"type": "session_snapshot", "snapshot": snapshot}
+                    }),
+                    _ => return,
+                };
+                let mut bytes = serde_json::to_vec(&response).unwrap();
+                bytes.push(b'\n');
+                if reader.get_mut().write_all(&bytes).await.is_err() {
+                    return;
+                }
+                if request["method"] == "events.subscribe" {
+                    let mut remaining = Vec::new();
+                    let _ = reader.read_to_end(&mut remaining).await;
+                }
+            });
+        }
+    })
+}
+
+async fn wait_diagnostic_source(
+    diagnostics: &mut tokio::sync::watch::Receiver<
+        herdr_top::diagnostics::RuntimeDiagnosticsSnapshot,
+    >,
+    expected_source: herdr_top::diagnostics::DiagnosticSource,
+    expected_availability: herdr_top::diagnostics::InputAvailability,
+) {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if diagnostics.borrow().source_coverage.iter().any(|source| {
+                source.source == expected_source && source.availability == expected_availability
+            }) {
+                return;
+            }
+            diagnostics
+                .changed()
+                .await
+                .expect("diagnostics publisher should remain available");
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("diagnostic source {expected_source:?} did not become {expected_availability:?}")
+    });
+}
+
 async fn wait_quality(
     quality: &mut tokio::sync::watch::Receiver<ObservationQuality>,
     expected: ObservationQuality,
@@ -2059,6 +2370,23 @@ async fn wait_until(mut predicate: impl FnMut() -> bool) {
     })
     .await
     .expect("condition should become true before timeout");
+}
+
+async fn wait_model_pane(model: &herdr_top::model::SharedModel, pane_id: &str) {
+    let mut updates = model.clone();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if updates.borrow().pane(pane_id).is_some() {
+                return;
+            }
+            updates
+                .changed()
+                .await
+                .expect("model publisher should remain available");
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("pane {pane_id:?} did not appear before timeout"));
 }
 
 async fn shutdown(handle: CollectorHandle, lifecycle: WriterLifecycle) {

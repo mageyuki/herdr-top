@@ -4,7 +4,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
-use herdr_top::herdr::collector::{self, CollectorHandle};
+use herdr_top::diagnostics::{
+    ControllerCounterSnapshot, ControllerInputStatus, DiagnosticSource, InputAvailability,
+    OccurrenceLogStatus, OwnerFreshness, PersistenceCounters, RuntimeDiagnosticsSnapshot,
+    SourceCoverageSnapshot,
+};
+use herdr_top::herdr::collector::{self, CollectorHandle, SourceAvailability};
 use herdr_top::herdr::controller::{
     self, ControllerResponse, RejectResponseReason, RetryableReason,
 };
@@ -23,7 +28,10 @@ use herdr_top::store::{self, PersistOp, PersistTaskRun, WriterClient, WriterLife
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 const SESSION: &str = "controller-test-session";
 
@@ -84,7 +92,10 @@ impl RendezvousController {
 
     async fn stop(self) {
         self.collector.stop().await.unwrap();
-        self.lifecycle.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), self.lifecycle.shutdown())
+            .await
+            .expect("writer shutdown timed out")
+            .unwrap();
         shutdown_controller_socket(self.socket_status, &self.owner_lock).unwrap();
         drop(self.runtime);
     }
@@ -92,6 +103,17 @@ impl RendezvousController {
 
 impl RunningController {
     async fn start() -> Self {
+        Self::start_with_store_setup(|_| {}).await
+    }
+
+    async fn start_with_store_setup(setup: impl FnOnce(&StateRoot)) -> Self {
+        Self::start_with_store_setup_and_coverage(setup, SourceAvailability::Available).await
+    }
+
+    async fn start_with_store_setup_and_coverage(
+        setup: impl FnOnce(&StateRoot),
+        controller_coverage: SourceAvailability,
+    ) -> Self {
         let state = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("controller.sock");
@@ -100,14 +122,16 @@ impl RunningController {
         let key = session_key::encode(SESSION).unwrap();
         let root = state_root_in(state.path(), &key).unwrap();
         let store = store::open_writer(&root).unwrap();
+        setup(&root);
         let restored = store.load_restored_state().unwrap();
         let (lifecycle, writer) = store::spawn_writer(store).unwrap();
-        let collector = collector::spawn_with_controller(
+        let collector = collector::spawn_with_controller_coverage(
             socket_dir.path().join("missing-herdr.sock"),
             SESSION.to_owned(),
             restored,
             writer.clone(),
             Some(listener),
+            controller_coverage,
         )
         .await
         .unwrap();
@@ -126,9 +150,18 @@ impl RunningController {
         send_raw(&self.socket_path, value).await
     }
 
+    async fn send_bounded(&self, value: &Value) -> ControllerResponse {
+        tokio::time::timeout(Duration::from_secs(8), self.send(value))
+            .await
+            .expect("Controller wire exchange timed out")
+    }
+
     async fn stop(self) {
         self.collector.stop().await.unwrap();
-        self.lifecycle.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), self.lifecycle.shutdown())
+            .await
+            .expect("writer shutdown timed out")
+            .unwrap();
     }
 }
 
@@ -214,12 +247,115 @@ async fn send_raw(path: &Path, value: &Value) -> ControllerResponse {
 }
 
 async fn send_bytes(path: &Path, bytes: &[u8]) -> ControllerResponse {
+    serde_json::from_slice(&send_wire_bytes(path, bytes).await).unwrap()
+}
+
+async fn send_wire_value(path: &Path, value: &Value) -> Value {
+    let mut bytes = serde_json::to_vec(value).unwrap();
+    bytes.push(b'\n');
+    serde_json::from_slice(&send_wire_bytes_bounded(path, &bytes).await).unwrap()
+}
+
+async fn send_wire_bytes(path: &Path, bytes: &[u8]) -> Vec<u8> {
     let mut stream = UnixStream::connect(path).await.unwrap();
     stream.write_all(bytes).await.unwrap();
     stream.shutdown().await.unwrap();
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await.unwrap();
-    serde_json::from_slice(&response).unwrap()
+    response
+}
+
+async fn send_wire_bytes_bounded(path: &Path, bytes: &[u8]) -> Vec<u8> {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        send_wire_bytes(path, bytes).await
+    })
+    .await
+    .expect("Controller wire exchange timed out")
+}
+
+fn controlled_diagnostics() -> (
+    watch::Sender<RuntimeDiagnosticsSnapshot>,
+    watch::Receiver<RuntimeDiagnosticsSnapshot>,
+) {
+    let controller_counters = ControllerCounterSnapshot::default();
+    watch::channel(RuntimeDiagnosticsSnapshot {
+        persistence: store::PersistenceStatus::Healthy,
+        controller_input: ControllerInputStatus::Available,
+        owner: OwnerFreshness::Current,
+        persistence_counters: PersistenceCounters::default(),
+        controller_counters,
+        source_coverage: [
+            DiagnosticSource::Herdr,
+            DiagnosticSource::Controller,
+            DiagnosticSource::Claude,
+            DiagnosticSource::Codex,
+        ]
+        .into_iter()
+        .map(|source| SourceCoverageSnapshot {
+            source,
+            availability: if source == DiagnosticSource::Controller {
+                InputAvailability::Available
+            } else {
+                InputAvailability::Unavailable
+            },
+        })
+        .collect(),
+        dangling_announcement_components: controller_counters.dangling_announcement_components,
+        first_failure_log: OccurrenceLogStatus::NotAttempted,
+    })
+}
+
+fn spawn_invalid_snapshot_herdr(path: &Path) -> JoinHandle<()> {
+    let listener = UnixListener::bind(path).unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let id = request["id"].clone();
+                let response = match request["method"].as_str() {
+                    Some("events.subscribe") => {
+                        json!({"id": id, "result": {"type": "subscription_started"}})
+                    }
+                    Some("session.snapshot") => json!({
+                        "id": id,
+                        "result": {
+                            "type": "session_snapshot",
+                            "snapshot": {
+                                "version": "0.8.0",
+                                "protocol": 19,
+                                "focused_workspace_id": null,
+                                "focused_tab_id": null,
+                                "focused_pane_id": null,
+                                "workspaces": [],
+                                "tabs": [],
+                                "panes": [{
+                                    "pane_id": "missing-tab-pane",
+                                    "terminal_id": "missing-tab-terminal",
+                                    "workspace_id": "missing-tab-workspace",
+                                    "tab_id": null
+                                }]
+                            }
+                        }
+                    }),
+                    _ => return,
+                };
+                let mut bytes = serde_json::to_vec(&response).unwrap();
+                bytes.push(b'\n');
+                if reader.get_mut().write_all(&bytes).await.is_err() {
+                    return;
+                }
+                if request["method"] == "events.subscribe" {
+                    let mut remaining = Vec::new();
+                    let _ = reader.read_to_end(&mut remaining).await;
+                }
+            });
+        }
+    })
 }
 
 fn rejected(reason: RejectResponseReason) -> ControllerResponse {
@@ -1586,4 +1722,494 @@ fn response_objects_have_closed_shape() {
         )
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn i4_d3_later_controller_event_is_retryable_without_change() {
+    const PRIVATE_SQLITE_TEXT: &str = "PRIVATE_SQLITE_TRIGGER_TEXT_6D52";
+    let running = RunningController::start_with_store_setup(|root| {
+        let connection = rusqlite::Connection::open(store::database_path(root)).unwrap();
+        connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER i4_fail_controller_event BEFORE INSERT ON events \
+                 WHEN NEW.event_id = 'i4-controller-fails' \
+                 BEGIN SELECT RAISE(ABORT, '{PRIVATE_SQLITE_TEXT}'); END;"
+            ))
+            .unwrap();
+    })
+    .await;
+
+    let first = envelope("i4-controller-fails", "task_started", "first-run");
+    assert_eq!(
+        running.send_bounded(&first).await,
+        ControllerResponse::Accepted
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if matches!(
+                running.writer.persistence_status(),
+                store::PersistenceStatus::Degraded { .. }
+            ) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the accepted failure must degrade writer health");
+
+    let diagnostics = send_wire_value(
+        &running.socket_path,
+        &json!({"request": "status", "schema_version": 1}),
+    )
+    .await;
+    assert_eq!(diagnostics["status"], "ok");
+    assert_eq!(
+        diagnostics["diagnostics"]["persistence_counters"]["not_committed_batches"],
+        1
+    );
+    assert_eq!(
+        diagnostics["diagnostics"]["controller_input"],
+        json!({"status": "unavailable", "reason": "persistence_unavailable"})
+    );
+    assert!(!diagnostics.to_string().contains(PRIVATE_SQLITE_TEXT));
+
+    assert_eq!(
+        running.send_bounded(&first).await,
+        ControllerResponse::Duplicate,
+        "the accepted event remains deduplicated after confirmed non-commit"
+    );
+
+    let later = envelope("i4-controller-later", "task_started", "later-run");
+    assert_eq!(
+        running.send_bounded(&later).await,
+        ControllerResponse::Retryable {
+            reason: RetryableReason::PersistenceUnavailable,
+        }
+    );
+    let model = running.collector.model.borrow();
+    assert!(
+        model
+            .task_run_by_key(&RunKey::Controller("first-run".to_owned()))
+            .is_some(),
+        "the accepted in-memory event must not roll back"
+    );
+    assert!(
+        model
+            .task_run_by_key(&RunKey::Controller("later-run".to_owned()))
+            .is_none(),
+        "the later retryable event must not mutate"
+    );
+    drop(model);
+    let database = store::database_path(&running.root);
+    let RunningController {
+        _state: state_guard,
+        collector,
+        lifecycle,
+        ..
+    } = running;
+    collector
+        .stop()
+        .await
+        .expect("collector should remain stoppable after persistence degradation");
+    tokio::time::timeout(Duration::from_secs(3), lifecycle.shutdown())
+        .await
+        .expect("writer shutdown timed out")
+        .expect("writer should checkpoint after confirmed non-commit");
+    let connection = rusqlite::Connection::open(database).unwrap();
+    let durable: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE event_id = 'i4-controller-fails'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(durable, 0, "the trigger proves confirmed non-commit");
+    drop(connection);
+    drop(state_guard);
+}
+
+#[tokio::test]
+async fn i4_status_request_bypasses_reducer_and_writer() {
+    let running = RunningController::start().await;
+    let before_model = {
+        let model = running.collector.model.borrow();
+        (
+            model.workspaces().count(),
+            model.tabs().count(),
+            model.panes().count(),
+            model.task_runs().count(),
+        )
+    };
+    let before_events: i64 = rusqlite::Connection::open(store::database_path(&running.root))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .unwrap();
+
+    let response = controller::query_status(&running.socket_path)
+        .await
+        .expect("the read-only status helper should receive one closed response");
+
+    assert_eq!(response["status"], "ok");
+    assert_eq!(response["schema_version"], 1);
+    let after_model = {
+        let model = running.collector.model.borrow();
+        (
+            model.workspaces().count(),
+            model.tabs().count(),
+            model.panes().count(),
+            model.task_runs().count(),
+        )
+    };
+    assert_eq!(after_model, before_model);
+    let after_events: i64 = rusqlite::Connection::open(store::database_path(&running.root))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(after_events, before_events);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn i4_status_request_bypasses_saturated_reducer_queue() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket_path = directory.path().join("saturated.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let (sender, receiver) = controller::request_channel(1, ControllerDiagnosticsHandle::default());
+    let cancellation = CancellationToken::new();
+    let (_diagnostics_sender, diagnostics) = controlled_diagnostics();
+    let acceptor = controller::spawn_acceptor_with_diagnostics(
+        listener,
+        sender,
+        cancellation.clone(),
+        diagnostics,
+    )
+    .unwrap();
+
+    let mut blocker = UnixStream::connect(&socket_path).await.unwrap();
+    let mut event = serde_json::to_vec(&envelope("queue-blocker", "task_started", "run")).unwrap();
+    event.push(b'\n');
+    blocker.write_all(&event).await.unwrap();
+    blocker.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while receiver.queued_requests() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the reducer queue must become saturated");
+
+    let status = send_wire_value(
+        &socket_path,
+        &json!({"request": "status", "schema_version": 1}),
+    )
+    .await;
+    assert_eq!(status["status"], "ok");
+    assert_eq!(receiver.queued_requests(), 1);
+
+    cancellation.cancel();
+    acceptor.await.unwrap().unwrap();
+    drop(blocker);
+}
+
+#[tokio::test]
+async fn i4_status_legacy_acceptor_keeps_status_shaped_input_on_event_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket_path = directory.path().join("legacy.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let (sender, receiver) = controller::request_channel(1, ControllerDiagnosticsHandle::default());
+    let cancellation = CancellationToken::new();
+    let acceptor = controller::spawn_acceptor(listener, sender, cancellation.clone()).unwrap();
+
+    let blocker_path = socket_path.clone();
+    let blocker = tokio::spawn(async move {
+        send_wire_bytes_bounded(&blocker_path, &{
+            let mut bytes = serde_json::to_vec(&envelope(
+                "legacy-queue-blocker",
+                "task_started",
+                "legacy-run",
+            ))
+            .unwrap();
+            bytes.push(b'\n');
+            bytes
+        })
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while receiver.queued_requests() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("legacy reducer queue must become saturated");
+
+    let response = send_wire_bytes_bounded(
+        &socket_path,
+        b"{\"request\":\"status\",\"schema_version\":1}\n",
+    )
+    .await;
+    assert_eq!(
+        response, b"{\"status\":\"retryable\",\"reason\":\"busy\"}\n",
+        "legacy acceptor must retain the pre-T2 event admission path"
+    );
+
+    blocker.abort();
+    cancellation.cancel();
+    acceptor.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn i4_status_request_is_closed_and_event_wire_is_compatible() {
+    let running = RunningController::start().await;
+    let success = send_wire_bytes_bounded(
+        &running.socket_path,
+        b"{\"request\":\"status\",\"schema_version\":1}\n",
+    )
+    .await;
+    assert_eq!(success.last(), Some(&b'\n'));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&success).unwrap()["status"],
+        "ok"
+    );
+
+    let extra = send_wire_bytes_bounded(
+        &running.socket_path,
+        b"{\"request\":\"status\",\"schema_version\":1,\"extra\":true}\n",
+    )
+    .await;
+    assert_eq!(
+        extra,
+        b"{\"status\":\"error\",\"schema_version\":1,\"reason\":\"invalid_request\"}\n"
+    );
+    let unsupported = send_wire_bytes_bounded(
+        &running.socket_path,
+        b"{\"request\":\"status\",\"schema_version\":2}\n",
+    )
+    .await;
+    assert_eq!(
+        unsupported,
+        b"{\"status\":\"error\",\"schema_version\":1,\"reason\":\"unsupported_version\"}\n"
+    );
+    let missing =
+        send_wire_bytes_bounded(&running.socket_path, b"{\"request\":\"status\"}\n").await;
+    assert_eq!(
+        missing,
+        b"{\"status\":\"error\",\"schema_version\":1,\"reason\":\"invalid_request\"}\n"
+    );
+
+    let accepted = send_wire_bytes_bounded(&running.socket_path, &{
+        let mut bytes = serde_json::to_vec(&envelope(
+            "wire-compatible",
+            "task_started",
+            "wire-compatible-run",
+        ))
+        .unwrap();
+        bytes.push(b'\n');
+        bytes
+    })
+    .await;
+    assert_eq!(accepted, b"{\"status\":\"accepted\"}\n");
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn i4_status_request_key_on_existing_event_remains_an_ignored_extension() {
+    let running = RunningController::start().await;
+    let mut event = envelope("status-extension", "task_started", "extension-run");
+    event["request"] = json!("status");
+    assert_eq!(
+        running.send_bounded(&event).await,
+        ControllerResponse::Accepted
+    );
+
+    let with_invalid_event_id = send_wire_value(
+        &running.socket_path,
+        &json!({
+            "event_id": null,
+            "request": "status",
+            "schema_version": 1
+        }),
+    )
+    .await;
+    assert_eq!(
+        with_invalid_event_id,
+        serde_json::to_value(ControllerResponse::Rejected {
+            reason: RejectResponseReason::Invalid,
+        })
+        .unwrap()
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn i4_status_unavailable_reason_excludes_raw_found_and_bind_text() {
+    const PRIVATE_BIND_TEXT: &str = "PRIVATE_BIND_PATH_AND_ERROR_F2D9";
+    let running = RunningController::start_with_store_setup_and_coverage(
+        |_| {},
+        SourceAvailability::Unavailable {
+            detail: PRIVATE_BIND_TEXT.to_owned(),
+        },
+    )
+    .await;
+
+    let response = send_wire_value(
+        &running.socket_path,
+        &json!({"request": "status", "schema_version": 1}),
+    )
+    .await;
+    assert_eq!(
+        response["diagnostics"]["controller_input"],
+        json!({"status": "unavailable", "reason": "runtime_unsafe"})
+    );
+    assert!(!response.to_string().contains(PRIVATE_BIND_TEXT));
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn i4_status_live_diagnostics_track_herdr_d4_and_source_order() {
+    let running = RunningController::start().await;
+    let mut diagnostics = running.collector.diagnostics.clone();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let disconnected = diagnostics
+                .borrow()
+                .source_coverage
+                .iter()
+                .find(|source| source.source == DiagnosticSource::Herdr)
+                .is_some_and(|source| source.availability == InputAvailability::Unavailable);
+            if disconnected {
+                break;
+            }
+            diagnostics.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("consolidated diagnostics did not observe disconnected Herdr");
+
+    let status = send_wire_value(
+        &running.socket_path,
+        &json!({"request": "status", "schema_version": 1}),
+    )
+    .await;
+    assert_eq!(
+        status["diagnostics"]["source_coverage"][0],
+        json!({"source": "herdr", "availability": "unavailable"})
+    );
+
+    assert_eq!(
+        running
+            .send_bounded(&dispatch("d4-dispatch", "d4-child", "d4-parent"))
+            .await,
+        ControllerResponse::Accepted
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if diagnostics
+                .borrow()
+                .controller_counters
+                .dangling_announcement_components
+                == 1
+            {
+                break;
+            }
+            diagnostics.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("live diagnostics did not observe the reducer D4 counter");
+    let snapshot = diagnostics.borrow();
+    assert_eq!(
+        snapshot.dangling_announcement_components,
+        snapshot
+            .controller_counters
+            .dangling_announcement_components
+    );
+    assert_eq!(snapshot.dangling_announcement_components, 1);
+    assert_eq!(
+        snapshot
+            .source_coverage
+            .iter()
+            .map(|source| source.source)
+            .collect::<Vec<_>>(),
+        vec![
+            DiagnosticSource::Herdr,
+            DiagnosticSource::Controller,
+            DiagnosticSource::Claude,
+            DiagnosticSource::Codex,
+        ]
+    );
+    drop(snapshot);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn i4_status_closed_real_diagnostics_downgrades_controller_only() {
+    let state = tempfile::tempdir().unwrap();
+    let socket_dir = tempfile::tempdir().unwrap();
+    let controller_path = socket_dir.path().join("controller.sock");
+    let controller_listener = std::os::unix::net::UnixListener::bind(&controller_path).unwrap();
+    let herdr_dir = tempfile::tempdir().unwrap();
+    let herdr_path = herdr_dir.path().join("herdr.sock");
+    let herdr_task = spawn_invalid_snapshot_herdr(&herdr_path);
+    let root = StateRoot(state.path().to_path_buf());
+    let store = store::open_writer(&root).unwrap();
+    let restored = store.load_restored_state().unwrap();
+    let (lifecycle, writer) = store::spawn_writer(store).unwrap();
+    let mut collector = collector::spawn_with_controller(
+        herdr_path,
+        SESSION.to_owned(),
+        restored,
+        writer,
+        Some(controller_listener),
+    )
+    .await
+    .unwrap();
+    collector.diagnostics.borrow_and_update();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Ok(()) = collector.diagnostics.changed().await {
+            collector.diagnostics.borrow_and_update();
+        }
+    })
+    .await
+    .expect("collector task did not close its diagnostics publisher");
+
+    assert_eq!(
+        serde_json::from_value::<ControllerResponse>(
+            send_wire_value(
+                &controller_path,
+                &envelope("closed-diagnostics-event", "task_started", "closed-run"),
+            )
+            .await,
+        )
+        .unwrap(),
+        ControllerResponse::Retryable {
+            reason: RetryableReason::PersistenceUnavailable,
+        }
+    );
+    let status = send_wire_value(
+        &controller_path,
+        &json!({"request": "status", "schema_version": 1}),
+    )
+    .await;
+    assert_eq!(status["status"], "ok");
+    assert_eq!(
+        status["diagnostics"]["persistence"],
+        json!({"status": "healthy"})
+    );
+    assert_eq!(status["diagnostics"]["owner"], "current");
+    assert_eq!(
+        status["diagnostics"]["controller_input"],
+        json!({"status": "unavailable", "reason": "runtime_unsafe"})
+    );
+    assert_eq!(
+        status["diagnostics"]["source_coverage"][1],
+        json!({"source": "controller", "availability": "unavailable"})
+    );
+
+    assert!(collector.stop().await.is_err());
+    tokio::time::timeout(Duration::from_secs(3), lifecycle.shutdown())
+        .await
+        .expect("writer shutdown timed out")
+        .unwrap();
+    herdr_task.abort();
 }
