@@ -10,9 +10,15 @@ use std::process::Command;
 use std::time::Duration;
 
 use common::mock::{MockConfig, MockHerdr, fixture_payloads};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use herdr_top::activity::OperatorSnapshot;
+use herdr_top::diagnostics::remote::{VersionCommand, VersionCommandRunner, VersionProbeResult};
 use herdr_top::herdr::collector::{self, CoverageSource, ObservationQuality, SourceAvailability};
 use herdr_top::lockfile::{StateRoot, state_root_in};
-use herdr_top::model::{DomainModel, MinimalProviderMetadata, Provider};
+use herdr_top::model::{
+    DisplayOrdinal, DomainModel, MinimalProviderMetadata, Provider, RunId, RunKey, TaskRun,
+    TaskState,
+};
 use herdr_top::provider::{
     FirstSeenBaseline, FsReadBoundary, MergeOutcome, ProviderCycle, ProviderEvent, ProviderTarget,
     ProviderWorker, RecommendedNotifyFactory, SourcePosition, TailFile, TargetSet,
@@ -20,7 +26,7 @@ use herdr_top::provider::{
 };
 use herdr_top::session_key;
 use herdr_top::store::{database_path, open_writer, spawn_writer};
-use herdr_top::tui::app::{App, HeaderInputs};
+use herdr_top::tui::app::{App, HeaderInputs, SystemClock, TuiSetup};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use rusqlite::{Connection, MAIN_DB};
@@ -34,6 +40,8 @@ const RESPONSE_SENTINEL: &str = "RESPONSE_FORBIDDEN_SENTINEL_I2E_5D32";
 const TOOL_ARGUMENT_SENTINEL: &str = "TOOL_ARGUMENT_FORBIDDEN_SENTINEL_I2E_6E43";
 const MALFORMED_RAW_SENTINEL: &str = "MALFORMED_RAW_FORBIDDEN_SENTINEL_I2E_7F54";
 const DOCTOR_PRIVATE_SENTINEL: &str = "DOCTOR_PRIVATE_SENTINEL_I4_T7_8A21";
+const ACTIVITY_IDENTITY_SENTINEL: &str = "ACTIVITY_IDENTITY_FORBIDDEN_I4_A1_HARNESS";
+const TUI_ROW_ONLY_MARKER: &str = "TUI_ROW_ONLY_MARKER_I4_C3";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn i4_doctor_output_excludes_private_values() {
@@ -165,6 +173,18 @@ async fn allowlist_scan_is_non_vacuous_across_every_artifact() {
             "rendered buffer omitted structural marker {marker}"
         );
     }
+    let tui_surfaces = render_new_tui_surfaces(&collector);
+    assert_eq!(
+        tui_surfaces.len(),
+        6,
+        "filter/help/detail/notice/runtime/identity-filter surfaces are all scanned"
+    );
+    for (surface, bytes) in &tui_surfaces {
+        assert!(
+            String::from_utf8_lossy(bytes).contains(ROOT_THREAD),
+            "TUI surface {surface} omitted its allowlisted negative control"
+        );
+    }
 
     // Force a checkpointed DB image, then a fresh uncheckpointed WAL write.
     let checkpoint = Connection::open(database_path(&root)).expect("checkpoint connection opens");
@@ -215,13 +235,18 @@ async fn allowlist_scan_is_non_vacuous_across_every_artifact() {
     );
     wait_for_file_text(&log_path, ROOT_THREAD).await;
 
-    let artifacts = vec![
+    let mut artifacts = vec![
         Artifact::file("database", &database),
         Artifact::file("wal", &wal),
         Artifact::file("backup", &backup),
         Artifact::file("log", &log_path),
         Artifact::bytes("rendered", rendered.into_bytes()),
     ];
+    artifacts.extend(
+        tui_surfaces
+            .into_iter()
+            .map(|(name, bytes)| Artifact::bytes(name, bytes)),
+    );
     scan_artifacts(
         &artifacts,
         &[
@@ -240,7 +265,19 @@ async fn allowlist_scan_is_non_vacuous_across_every_artifact() {
         hits.into_iter()
             .map(|hit| hit.artifact)
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from(["backup", "database", "log", "rendered", "wal"]),
+        BTreeSet::from([
+            "backup",
+            "database",
+            "log",
+            "rendered",
+            "tui-detail",
+            "tui-filter",
+            "tui-help",
+            "tui-identity-filter",
+            "tui-notice",
+            "tui-runtime",
+            "wal",
+        ]),
         "the negative control must prove every claimed artifact is scanned"
     );
 
@@ -423,6 +460,103 @@ fn render_collector(collector: &collector::CollectorHandle) -> String {
             source_coverage: collector.source_coverage.clone(),
         },
     );
+    render_app(&app)
+}
+
+struct MismatchedStandalone;
+
+impl VersionCommandRunner for MismatchedStandalone {
+    fn run(&self, command: VersionCommand) -> VersionProbeResult {
+        assert_eq!(command, VersionCommand::Standalone);
+        VersionProbeResult::Available {
+            version: "999.0.0".to_owned(),
+            stderr_present: false,
+        }
+    }
+}
+
+fn render_new_tui_surfaces(collector: &collector::CollectorHandle) -> Vec<(&'static str, Vec<u8>)> {
+    let state_base = tempfile::tempdir().expect("notice state base should exist");
+    let setup = TuiSetup::for_owner(state_base.path().to_path_buf(), None, &MismatchedStandalone);
+    let operator = collector.operator.borrow();
+    let mut activity = operator.activity.to_vec();
+    assert!(
+        !activity.is_empty(),
+        "activity identity privacy surface needs a real matching activity item"
+    );
+    for (index, item) in activity.iter_mut().enumerate() {
+        item.identity.event_id = format!("{ACTIVITY_IDENTITY_SENTINEL}-{index}");
+    }
+    let (_operator_sender, operator_receiver) = tokio::sync::watch::channel(OperatorSnapshot {
+        activity: std::sync::Arc::from(activity),
+        terminal_times: std::sync::Arc::clone(&operator.terminal_times),
+    });
+    drop(operator);
+    let mut tui_model = collector.model.borrow().as_ref().clone();
+    tui_model.insert_task_run(TaskRun {
+        run_id: RunId::parse("01ARZ3NDEKTSV4RRFFQ69G5FB9")
+            .expect("row-control Run ID should parse"),
+        key: RunKey::Controller(TUI_ROW_ONLY_MARKER.to_owned()),
+        display_ordinal: DisplayOrdinal::new(i64::MAX),
+        state: TaskState::Running,
+        has_controller_task_state_event: true,
+    });
+    let (_model_sender, model_receiver) =
+        tokio::sync::watch::channel(std::sync::Arc::new(tui_model));
+    let mut app = App::with_inputs(
+        model_receiver,
+        collector.quality.clone(),
+        HeaderInputs {
+            host: "test-host".to_owned(),
+            session: ROOT_THREAD.to_owned(),
+            event_lag: Duration::ZERO,
+            source_coverage: collector.source_coverage.clone(),
+        },
+        collector.diagnostics.clone(),
+        operator_receiver,
+        setup,
+        std::sync::Arc::new(SystemClock),
+    );
+    let mut surfaces = vec![("tui-notice", render_app(&app).into_bytes())];
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let runtime = render_app(&app);
+    assert!(
+        runtime.contains(TUI_ROW_ONLY_MARKER),
+        "the unfiltered TUI surface needs a distinctive semantic-row control"
+    );
+    surfaces.push(("tui-runtime", runtime.into_bytes()));
+    app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    for character in ROOT_THREAD.chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+    }
+    surfaces.push(("tui-filter", render_app(&app).into_bytes()));
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+    surfaces.push(("tui-help", render_app(&app).into_bytes()));
+    app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+    surfaces.push(("tui-detail", render_app(&app).into_bytes()));
+    app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    for character in ACTIVITY_IDENTITY_SENTINEL.chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let identity_filter = render_app(&app);
+    assert!(identity_filter.contains("Selected: none"));
+    assert!(!identity_filter.contains(TUI_ROW_ONLY_MARKER));
+    assert!(!identity_filter.contains(ACTIVITY_IDENTITY_SENTINEL));
+    surfaces.push(("tui-identity-filter", identity_filter.into_bytes()));
+    for (surface, bytes) in &surfaces {
+        assert!(
+            !String::from_utf8_lossy(bytes).contains(ACTIVITY_IDENTITY_SENTINEL),
+            "activity identity leaked through TUI surface {surface}"
+        );
+    }
+    surfaces
+}
+
+fn render_app(app: &App) -> String {
     let backend = TestBackend::new(220, 24);
     let mut terminal = Terminal::new(backend).expect("test terminal should construct");
     terminal

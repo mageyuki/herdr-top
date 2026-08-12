@@ -21,7 +21,7 @@ use herdr_top::lockfile::{self, LockError, OwnerRecord, StateRoot};
 use herdr_top::rendezvous::{self, RvError};
 use herdr_top::session_key::{self, ResolvedSession, SessionKeyError};
 use herdr_top::store::{self, StoreError, WriterError};
-use herdr_top::tui::app::{App, HeaderInputs};
+use herdr_top::tui::app::{App, HeaderInputs, SystemClock, TuiSetup};
 use serde_json::json;
 use thiserror::Error;
 
@@ -278,7 +278,13 @@ async fn run_monitor(cli: &Cli, plugin_state_dir: Option<&OsStr>) -> Result<(), 
             }
         };
 
-    let mut app = App::new(
+    let state_base = lockfile::resolve_state_base(
+        env::var_os("XDG_STATE_HOME").as_deref(),
+        env::var_os("HOME").as_deref(),
+    )?;
+    let version_runner = DoctorVersionRunner::from_environment();
+    let tui_setup = TuiSetup::for_owner(state_base, env::var_os("HOME"), &version_runner);
+    let mut app = App::with_inputs(
         collector.model.clone(),
         collector.quality.clone(),
         HeaderInputs {
@@ -287,6 +293,10 @@ async fn run_monitor(cli: &Cli, plugin_state_dir: Option<&OsStr>) -> Result<(), 
             event_lag: Duration::ZERO,
             source_coverage: collector.source_coverage.clone(),
         },
+        collector.diagnostics.clone(),
+        collector.operator.clone(),
+        tui_setup,
+        Arc::new(SystemClock),
     );
     let tui_result = tokio::task::spawn_blocking(move || app.run())
         .await

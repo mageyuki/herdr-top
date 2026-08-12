@@ -6,18 +6,28 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use unicode_segmentation::UnicodeSegmentation;
 
+use crate::diagnostics::{
+    ControllerInputStatus, ControllerInputUnavailableReason, DiagnosticSource, InputAvailability,
+    OccurrenceLogStatus, OwnerFreshness, RuntimeDiagnosticsSnapshot,
+};
 use crate::herdr::collector::ObservationQuality;
 use crate::model::{
     AgentNode, DisplayOrdinal, DomainModel, ExecState, Provider, RunId, RunKey, TaskRun, TaskState,
 };
+use crate::store::writer::{
+    DurabilityDisposition, PersistenceFailureCode, PersistenceOperation, PersistencePhase,
+    PersistenceStatus,
+};
 
-use super::app::{AppState, HeaderInputs, NodeKey, ViewMode};
+use super::app::{AppState, HeaderInputs, NodeKey, Overlay, TuiSetup, ViewMode};
 use super::dag;
+use super::projection::{self, RowProjection};
 
 const MIN_WIDTH: u16 = 48;
-const MIN_HEIGHT: u16 = 10;
+const MIN_HEIGHT: u16 = 14;
 type RunPlacement = (RunId, bool);
 type PaneRuns = HashMap<String, Vec<RunPlacement>>;
 
@@ -37,6 +47,8 @@ pub(super) fn render(
     quality: ObservationQuality,
     header: &HeaderInputs,
     state: &AppState,
+    diagnostics: &RuntimeDiagnosticsSnapshot,
+    setup: &TuiSetup,
 ) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
@@ -51,8 +63,8 @@ pub(super) fn render(
     let header_area = Rect::new(area.x, area.y, area.width, 3);
     let footer_y = area.y.saturating_add(area.height.saturating_sub(1));
     let footer_area = Rect::new(area.x, footer_y, area.width, 1);
-    let activity_y = footer_y.saturating_sub(4);
-    let activity_area = Rect::new(area.x, activity_y, area.width, 4);
+    let activity_y = footer_y.saturating_sub(6);
+    let activity_area = Rect::new(area.x, activity_y, area.width, 6);
     let tree_y = area.y.saturating_add(3);
     let tree_area = Rect::new(
         area.x,
@@ -61,17 +73,20 @@ pub(super) fn render(
         activity_y.saturating_sub(tree_y),
     );
 
-    render_header(frame, header_area, model, quality, header);
-    let rows = build_rows_named(model, state, Some(&header.session));
+    let strip = projection::runtime_strip(quality, diagnostics);
+    render_header(frame, header_area, model, strip.quality, header);
+    let projection = build_projection(model, state);
+    let rows = projection.rows;
     match state.view_mode() {
         ViewMode::ExecutionTree => render_tree(frame, tree_area, &rows, state),
         ViewMode::DependencyDag => render_dag(frame, tree_area, &rows, state),
     }
-    render_activity(frame, activity_area, &rows, state);
+    render_activity(frame, activity_area, model, &rows, state, diagnostics);
     frame.render_widget(
         Paragraph::new(footer_line(usize::from(footer_area.width))),
         footer_area,
     );
+    render_interaction_layer(frame, area, model, state, diagnostics, setup);
 }
 
 fn render_header(
@@ -211,7 +226,14 @@ fn pad_to_width(value: &str, width: usize) -> String {
     format!("{value}{}", " ".repeat(padding))
 }
 
-fn render_activity(frame: &mut Frame<'_>, area: Rect, rows: &[TreeRow], state: &AppState) {
+fn render_activity(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    model: &DomainModel,
+    rows: &[TreeRow],
+    state: &AppState,
+    diagnostics: &RuntimeDiagnosticsSnapshot,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Activity for selected item ");
@@ -222,12 +244,46 @@ fn render_activity(frame: &mut Frame<'_>, area: Rect, rows: &[TreeRow], state: &
         .map(|row| row.label.as_str())
         .unwrap_or("none");
     let selected = truncate_to_width(&format!("Selected: {selected_label}"), inner_width);
+    let strip = projection::runtime_strip(ObservationQuality::Live, diagnostics);
+    let runtime = truncate_to_width(
+        &format!(
+            "p:{} | ctl:{} | D4:{}",
+            strip.persistence, strip.controller, strip.d4
+        ),
+        inner_width,
+    );
     let status = state
-        .selection_reason()
-        .unwrap_or("No activity event feed is wired to this TUI slice; no events are fabricated.");
+        .selection_reason_text()
+        .or(state.safe_warning())
+        .unwrap_or("selection: stable");
     let status = truncate_to_width(status, inner_width);
+    let newest = state.selected().and_then(|selected_key| {
+        let operator = state.operator_snapshot();
+        let detail = projection::detail_projection(
+            model,
+            rows,
+            &operator,
+            selected_key,
+            state.view_mode(),
+            None,
+        );
+        detail.activity.items.first().map(projection::activity_line)
+    });
+    let newest = truncate_to_width(
+        &format!(
+            "Newest: {}",
+            newest.as_deref().unwrap_or("none in selected scope")
+        ),
+        inner_width,
+    );
     frame.render_widget(
-        Paragraph::new(vec![Line::raw(selected), Line::raw(status)]).block(block),
+        Paragraph::new(vec![
+            Line::raw(runtime),
+            Line::raw(selected),
+            Line::raw(status),
+            Line::raw(newest),
+        ])
+        .block(block),
         area,
     );
 }
@@ -239,6 +295,295 @@ fn footer_line(width: usize) -> String {
         truncate_to_width(full, width)
     } else {
         truncate_to_width(compact, width)
+    }
+}
+
+fn render_interaction_layer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    model: &DomainModel,
+    state: &AppState,
+    diagnostics: &RuntimeDiagnosticsSnapshot,
+    setup: &TuiSetup,
+) {
+    if let Some(draft) = state.filter_draft() {
+        let line = truncate_to_width(&format!("/ filter: {draft}"), usize::from(area.width));
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect::new(
+                area.x,
+                area.y.saturating_add(area.height.saturating_sub(1)),
+                area.width,
+                1,
+            ),
+        );
+    }
+    let Some(overlay) = state.overlay() else {
+        return;
+    };
+    let modal = Rect::new(
+        area.x.saturating_add(2),
+        area.y.saturating_add(2),
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(4),
+    );
+    if modal.width == 0 || modal.height == 0 {
+        return;
+    }
+    let (title, lines) = match overlay {
+        Overlay::Notice => (" Setup notice ", notice_lines(setup)),
+        Overlay::Help => (" Help ", help_lines(diagnostics, setup)),
+        Overlay::Detail => {
+            let displayed_rows = build_rows(model, state);
+            let detail = state.selected().map_or_else(
+                || projection::DetailProjection {
+                    entity: projection::DetailEntity::Missing,
+                    activity: projection::ActivityWindow {
+                        items: Vec::new(),
+                        retained_count: state.operator_snapshot().activity.len(),
+                        matching_count: 0,
+                        bound: projection::DETAIL_ACTIVITY_LIMIT,
+                        truncated: false,
+                    },
+                },
+                |selected| {
+                    projection::detail_projection(
+                        model,
+                        &displayed_rows,
+                        &state.operator_snapshot(),
+                        selected,
+                        state.view_mode(),
+                        setup.home(),
+                    )
+                },
+            );
+            (" Selected detail ", projection::detail_lines(&detail))
+        }
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(modal);
+    let width = usize::from(inner.width);
+    let scroll =
+        state.normalize_overlay_scroll(lines.len().saturating_sub(usize::from(inner.height)));
+    let visible = lines
+        .into_iter()
+        .skip(scroll)
+        .take(usize::from(inner.height))
+        .map(|line| Line::raw(truncate_to_width(&line, width)))
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, modal);
+    frame.render_widget(Paragraph::new(visible).block(block), modal);
+}
+
+fn notice_lines(setup: &TuiSetup) -> Vec<String> {
+    vec![
+        "Standalone herdr-top does not exactly match this package.".to_owned(),
+        format!("probe: {}", standalone_status(setup)),
+        "Controller integration is optional; monitoring continues.".to_owned(),
+        "Enter/Esc dismisses; marker publication is best effort.".to_owned(),
+    ]
+}
+
+fn help_lines(diagnostics: &RuntimeDiagnosticsSnapshot, setup: &TuiSetup) -> Vec<String> {
+    let mut lines = vec![
+        "q stop Top only; monitored agents continue; detach also leaves Top running".to_owned(),
+        "Up/Down select; f or End resumes follow; Tab toggles tree/DAG".to_owned(),
+        "/ edits a draft; Enter trims/commits; Esc cancels; empty clears".to_owned(),
+        "Filter: literal Unicode lowercase substring; interior whitespace is literal".to_owned(),
+        "Filter excludes paths, activity, Controller free text, content, and raw events".to_owned(),
+        "Tree: Left collapse/parent; Right expand/child; Enter toggles branch".to_owned(),
+        "Collapse is ignored while filtering and in DAG; stored state survives view toggles"
+            .to_owned(),
+        "i detail; ? help; Esc/opening key closes; Up/Down scrolls overlays".to_owned(),
+        "Follow pins selection and viewport to newest; manual navigation disables it".to_owned(),
+        "Recovery: ancestor, stable neighbor, first; reasons are typed".to_owned(),
+        "Controller input is optional capability; standalone setup is optional".to_owned(),
+    ];
+    lines.push(match diagnostics.persistence {
+        PersistenceStatus::Healthy => "persistence: healthy".to_owned(),
+        PersistenceStatus::Degraded { failure } => format!(
+            "persistence: degraded operation={} phase={} code={} durability={}",
+            persistence_operation(failure.operation),
+            persistence_phase(failure.phase),
+            persistence_code(failure.code),
+            durability(failure.durability),
+        ),
+    });
+    lines.push(match diagnostics.controller_input {
+        ControllerInputStatus::Available => "controller: available".to_owned(),
+        ControllerInputStatus::Unavailable { reason } => {
+            format!(
+                "controller: unavailable reason={}",
+                controller_reason(reason)
+            )
+        }
+    });
+    lines.push(format!(
+        "owner: {}",
+        match diagnostics.owner {
+            OwnerFreshness::Current => "current",
+            OwnerFreshness::Stale => "stale",
+        }
+    ));
+    let persistence = diagnostics.persistence_counters;
+    lines.push(format!(
+        "persistence counters: not_committed={} durability_unknown={} committed_but_degraded={} skipped={} skipped_owner_updates={}",
+        persistence.not_committed_batches,
+        persistence.durability_unknown_batches,
+        persistence.committed_but_degraded_batches,
+        persistence.skipped_batches,
+        persistence.skipped_owner_updates,
+    ));
+    let controller = diagnostics.controller_counters;
+    lines.push(format!(
+        "controller counters: binding_conflicts={} terminal_blocked_progress_noops={} terminal_forward_reference_creations={}",
+        controller.binding_conflicts,
+        controller.terminal_blocked_progress_noops,
+        controller.terminal_forward_reference_creations,
+    ));
+    lines.push(format!(
+        "controller counters continued: ingest_sequence_exhaustions={} provider_parent_conflicts={} provider_identity_disagreements={} socket_saturations={} accept_failures={}",
+        controller.ingest_sequence_exhaustions,
+        controller.provider_parent_conflicts,
+        controller.provider_identity_disagreements,
+        controller.socket_saturations,
+        controller.accept_failures,
+    ));
+    for source in [
+        DiagnosticSource::Herdr,
+        DiagnosticSource::Controller,
+        DiagnosticSource::Claude,
+        DiagnosticSource::Codex,
+    ] {
+        let availability = diagnostics
+            .source_coverage
+            .iter()
+            .find(|item| item.source == source)
+            .map_or(InputAvailability::Unavailable, |item| item.availability);
+        lines.push(format!(
+            "source {}: {}",
+            diagnostic_source(source),
+            input_availability(availability)
+        ));
+    }
+    lines.push(format!(
+        "occurrence log: {}",
+        match diagnostics.first_failure_log {
+            OccurrenceLogStatus::NotAttempted => "not_attempted",
+            OccurrenceLogStatus::Emitted => "emitted",
+            OccurrenceLogStatus::Failed => "failed",
+        }
+    ));
+    lines.push(format!(
+        "D4: {}",
+        diagnostics.dangling_announcement_components
+    ));
+    lines.push(format!("standalone probe: {}", standalone_status(setup)));
+    lines
+}
+
+fn standalone_status(setup: &TuiSetup) -> String {
+    match setup.standalone_status() {
+        Some(crate::diagnostics::remote::StandaloneVersionStatus::Compatible {
+            version,
+            stderr_present,
+        }) => {
+            format!("compatible {version} stderr_present={stderr_present}")
+        }
+        Some(crate::diagnostics::remote::StandaloneVersionStatus::Mismatch {
+            version,
+            stderr_present,
+        }) => {
+            format!("mismatch {version} stderr_present={stderr_present}")
+        }
+        Some(crate::diagnostics::remote::StandaloneVersionStatus::Unavailable { reason }) => {
+            format!("unavailable {}", version_probe_failure(*reason))
+        }
+        None => "not evaluated (non-owner/default)".to_owned(),
+    }
+}
+
+const fn persistence_operation(value: PersistenceOperation) -> &'static str {
+    match value {
+        PersistenceOperation::Apply => "apply",
+        PersistenceOperation::Cleanup => "cleanup",
+        PersistenceOperation::UpdateOwnerLocation => "update_owner_location",
+        PersistenceOperation::ReplaceOwner => "replace_owner",
+        PersistenceOperation::Barrier => "barrier",
+        PersistenceOperation::Checkpoint => "checkpoint",
+    }
+}
+
+const fn persistence_phase(value: PersistencePhase) -> &'static str {
+    match value {
+        PersistencePhase::QueueAdmission => "queue_admission",
+        PersistencePhase::CommandExecution => "command_execution",
+        PersistencePhase::PostApplyCommit => "post_apply_commit",
+        PersistencePhase::Acknowledgement => "acknowledgement",
+    }
+}
+
+const fn persistence_code(value: PersistenceFailureCode) -> &'static str {
+    match value {
+        PersistenceFailureCode::Sqlite => "sqlite",
+        PersistenceFailureCode::Io => "io",
+        PersistenceFailureCode::InvalidData => "invalid_data",
+        PersistenceFailureCode::Clock => "clock",
+        PersistenceFailureCode::OwnerAbsent => "owner_absent",
+        PersistenceFailureCode::CheckpointBusy => "checkpoint_busy",
+        PersistenceFailureCode::ChannelClosed => "channel_closed",
+        PersistenceFailureCode::AcknowledgementDropped => "acknowledgement_dropped",
+    }
+}
+
+const fn durability(value: DurabilityDisposition) -> &'static str {
+    match value {
+        DurabilityDisposition::NotApplicable => "not_applicable",
+        DurabilityDisposition::NotCommitted => "not_committed",
+        DurabilityDisposition::Committed => "committed",
+        DurabilityDisposition::Unknown => "unknown",
+    }
+}
+
+const fn controller_reason(value: ControllerInputUnavailableReason) -> &'static str {
+    match value {
+        ControllerInputUnavailableReason::ListenerUnavailable => "listener_unavailable",
+        ControllerInputUnavailableReason::RuntimeUnsafe => "runtime_unsafe",
+        ControllerInputUnavailableReason::PersistenceUnavailable => "persistence_unavailable",
+        ControllerInputUnavailableReason::AcceptorStopped => "acceptor_stopped",
+    }
+}
+
+const fn diagnostic_source(value: DiagnosticSource) -> &'static str {
+    match value {
+        DiagnosticSource::Herdr => "Herdr",
+        DiagnosticSource::Controller => "Controller",
+        DiagnosticSource::Claude => "Claude",
+        DiagnosticSource::Codex => "Codex",
+    }
+}
+
+const fn input_availability(value: InputAvailability) -> &'static str {
+    match value {
+        InputAvailability::Available => "available",
+        InputAvailability::Partial => "partial",
+        InputAvailability::Unavailable => "unavailable",
+    }
+}
+
+const fn version_probe_failure(
+    value: crate::diagnostics::remote::VersionProbeFailure,
+) -> &'static str {
+    use crate::diagnostics::remote::VersionProbeFailure;
+    match value {
+        VersionProbeFailure::NotFound => "not_found",
+        VersionProbeFailure::SpawnFailed => "spawn_failed",
+        VersionProbeFailure::TimedOut => "timed_out",
+        VersionProbeFailure::ExecutionFailed => "execution_failed",
+        VersionProbeFailure::UnsuccessfulExit => "unsuccessful_exit",
+        VersionProbeFailure::OutputReadFailed => "output_read_failed",
+        VersionProbeFailure::OutputTooLarge => "output_too_large",
+        VersionProbeFailure::InvalidOutput => "invalid_output",
     }
 }
 
@@ -389,36 +734,61 @@ fn quality_style(quality: ObservationQuality) -> Style {
     Style::default().fg(color).add_modifier(Modifier::BOLD)
 }
 
-#[cfg(test)]
 pub(crate) fn build_tree_rows(model: &DomainModel, state: &AppState) -> Vec<TreeRow> {
-    build_tree_rows_named(model, state, None)
+    let mut rows = vec![TreeRow {
+        key: NodeKey::Session,
+        depth: 0,
+        label: format!("Session: {}", state.session_display_name()),
+        prerequisites: Vec::new(),
+        dependents: Vec::new(),
+    }];
+    append_execution_tree_rows(&mut rows, model, state);
+    rows
 }
 
 pub(crate) fn build_rows(model: &DomainModel, state: &AppState) -> Vec<TreeRow> {
-    build_rows_named(model, state, None)
+    build_projection(model, state).rows
 }
 
-fn build_rows_named(model: &DomainModel, state: &AppState, session: Option<&str>) -> Vec<TreeRow> {
+pub(crate) fn build_projection(model: &DomainModel, state: &AppState) -> RowProjection {
+    #[cfg(test)]
+    state.record_projection_build();
+    let full_rows = build_full_rows(model, state);
+    projection::project_rows(
+        model,
+        &full_rows,
+        &state.operator_snapshot(),
+        state.filter_query(),
+        state.collapsed(),
+        state.view_mode(),
+        state.now_ms(),
+    )
+}
+
+pub(crate) fn build_uncollapsed_rows(model: &DomainModel, state: &AppState) -> Vec<TreeRow> {
+    #[cfg(test)]
+    state.record_projection_build();
+    let full_rows = build_full_rows(model, state);
+    projection::project_rows(
+        model,
+        &full_rows,
+        &state.operator_snapshot(),
+        state.filter_query(),
+        &HashSet::new(),
+        state.view_mode(),
+        state.now_ms(),
+    )
+    .rows
+}
+
+fn build_full_rows(model: &DomainModel, state: &AppState) -> Vec<TreeRow> {
     match state.view_mode() {
-        ViewMode::ExecutionTree => build_tree_rows_named(model, state, session),
+        ViewMode::ExecutionTree => build_tree_rows(model, state),
         ViewMode::DependencyDag => dag::build_rows(model, state.dag_order()),
     }
 }
 
-fn build_tree_rows_named(
-    model: &DomainModel,
-    state: &AppState,
-    session: Option<&str>,
-) -> Vec<TreeRow> {
-    let mut rows = vec![TreeRow {
-        key: NodeKey::Session,
-        depth: 0,
-        label: session
-            .map(|name| format!("Session: {}", safe_text(name)))
-            .unwrap_or_else(|| "Session".to_owned()),
-        prerequisites: Vec::new(),
-        dependents: Vec::new(),
-    }];
+fn append_execution_tree_rows(rows: &mut Vec<TreeRow>, model: &DomainModel, state: &AppState) {
     let (mut pane_runs, unattached) = place_runs(model, state);
 
     let mut workspaces = model.workspaces().collect::<Vec<_>>();
@@ -484,7 +854,7 @@ fn build_tree_rows_named(
                     dependents: Vec::new(),
                 });
                 if let Some(runs) = pane_runs.remove(&pane.pane_id) {
-                    append_run_rows(&mut rows, model, runs, Some(&pane.pane_id), 4);
+                    append_run_rows(rows, model, runs, Some(&pane.pane_id), 4);
                 }
             }
         }
@@ -502,9 +872,8 @@ fn build_tree_rows_named(
             .into_iter()
             .map(|run_id| (run_id, false))
             .collect();
-        append_run_rows(&mut rows, model, runs, None, 2);
+        append_run_rows(rows, model, runs, None, 2);
     }
-    rows
 }
 
 fn place_runs(model: &DomainModel, state: &AppState) -> (PaneRuns, Vec<RunId>) {
@@ -738,7 +1107,8 @@ fn run_name(run: &TaskRun) -> String {
             format!("{} {}", provider_label(*provider), safe_text(sid))
         }
         RunKey::NativePath { provider, path } => {
-            format!("{} {}", provider_label(*provider), safe_text(path))
+            let _ = path;
+            format!("{} {}", provider_label(*provider), run.run_id)
         }
         RunKey::Provisional {
             terminal_id,
@@ -752,7 +1122,9 @@ pub(crate) fn short_run_name(run: &TaskRun) -> String {
     match &run.key {
         RunKey::Controller(name) => safe_text(name),
         RunKey::Native { sid, .. } => safe_text(sid),
-        RunKey::NativePath { path, .. } => safe_text(path),
+        RunKey::NativePath { provider, .. } => {
+            format!("{} {}", provider_label(*provider), run.run_id)
+        }
         RunKey::Provisional { terminal_id, .. } => safe_text(terminal_id),
     }
 }
@@ -795,21 +1167,13 @@ fn exec_state_label(state: &ExecState) -> &'static str {
 }
 
 fn safe_text(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                '�'
-            } else {
-                character
-            }
-        })
-        .collect()
+    projection::escape_controls(value)
 }
 
 pub(crate) fn truncate_to_width(value: &str, max_width: usize) -> String {
-    if Span::raw(value).width() <= max_width {
-        return value.to_owned();
+    let value = projection::escape_controls(value);
+    if Span::raw(value.as_str()).width() <= max_width {
+        return value;
     }
     if max_width == 0 {
         return String::new();
@@ -822,13 +1186,13 @@ pub(crate) fn truncate_to_width(value: &str, max_width: usize) -> String {
     let content_width = max_width.saturating_sub(ellipsis_width);
     let mut output = String::new();
     let mut width = 0usize;
-    for character in value.chars() {
-        let character_width = Span::raw(character.to_string()).width();
-        if width.saturating_add(character_width) > content_width {
+    for grapheme in value.graphemes(true) {
+        let grapheme_width = Span::raw(grapheme).width();
+        if width.saturating_add(grapheme_width) > content_width {
             break;
         }
-        output.push(character);
-        width = width.saturating_add(character_width);
+        output.push_str(grapheme);
+        width = width.saturating_add(grapheme_width);
     }
     output.push_str(ellipsis);
     output
@@ -836,6 +1200,7 @@ pub(crate) fn truncate_to_width(value: &str, max_width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -847,12 +1212,18 @@ mod tests {
     use tokio::sync::watch;
 
     use super::*;
+    use crate::activity::{ActivityDurability, ActivityIdentity, ActivityItem, OperatorSnapshot};
+    use crate::diagnostics::{
+        ControllerCounterSnapshot, ControllerInputStatus, OccurrenceLogStatus, OwnerFreshness,
+        PersistenceCounters, RuntimeDiagnosticsSnapshot,
+    };
     use crate::herdr::collector::ObservationQuality;
     use crate::model::{
         AgentNode, DependencyEdge, DisplayOrdinal, DomainModel, ExecState, Execution,
         ExecutionEdge, Pane, Provider, RunId, RunKey, Tab, TaskRun, TaskState, Workspace,
     };
-    use crate::tui::app::{App, AppState, HeaderInputs};
+    use crate::store::writer::PersistenceStatus;
+    use crate::tui::app::{App, AppState, HeaderInputs, SystemClock, TuiSetup};
 
     fn run_id(value: &str) -> RunId {
         RunId::parse(value).unwrap()
@@ -1565,7 +1936,7 @@ mod tests {
         }
         let mut app = app(model, ObservationQuality::Live, "large-dag");
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        let rows = render(&app, 100, 14);
+        let rows = render(&app, 100, 16);
         let visible_run_names = |rows: &[String]| {
             rows[3..9]
                 .iter()
@@ -1593,10 +1964,163 @@ mod tests {
             })
         );
 
-        let rows = render(&app, 100, 14);
+        let rows = render(&app, 100, 16);
         let visible = visible_run_names(&rows);
         assert_eq!(visible, ["run-0498", "run-0499", "run-0500"]);
         assert!(!visible.iter().any(|name| name == "run-0497"));
         assert!(!visible.iter().any(|name| name == "run-0501"));
+    }
+
+    #[test]
+    fn i4_activity_identity_and_native_path_never_render() {
+        const IDENTITY_SENTINEL: &str = "ACTIVITY_IDENTITY_FORBIDDEN_I4_A1_VIEW";
+        let model = populated_model();
+        let run_id = model.task_runs().next().unwrap().run_id;
+        let activity = ActivityItem {
+            identity: ActivityIdentity {
+                event_id: IDENTITY_SENTINEL.to_owned(),
+            },
+            event_timestamp_ms: 10,
+            seen_at_ms: 10,
+            ingest_seq: Some(10),
+            source: "provider".to_owned(),
+            normalized_kind: "agent_activity".to_owned(),
+            source_event_type: "item".to_owned(),
+            workspace_id: Some("api".to_owned()),
+            tab_id: Some("implementation".to_owned()),
+            pane_id: Some("w1:p1".to_owned()),
+            terminal_id: Some("terminal-1".to_owned()),
+            provider: Some(Provider::Codex),
+            native_session_id: Some("investigate".to_owned()),
+            task_run_id: Some(run_id),
+            agent_node_id: Some("agent-1".to_owned()),
+            task_state: Some(TaskState::Running),
+            model_id: Some("gpt-test".to_owned()),
+            provider_event_kind: Some("assistant".to_owned()),
+            tool_name: Some("Read".to_owned()),
+            item_count: Some(1),
+            byte_count: Some(2),
+            provider_agent_id: Some("agent-1".to_owned()),
+            provider_parent_agent_id: None,
+            controller_label: None,
+            controller_reason: None,
+            durability: ActivityDurability::Durable,
+        };
+        let (_model_sender, model_receiver) = watch::channel(Arc::new(model));
+        let (_quality_sender, quality_receiver) = watch::channel(ObservationQuality::Live);
+        let (_diagnostics_sender, diagnostics_receiver) =
+            watch::channel(RuntimeDiagnosticsSnapshot {
+                persistence: PersistenceStatus::Healthy,
+                controller_input: ControllerInputStatus::Available,
+                owner: OwnerFreshness::Current,
+                persistence_counters: PersistenceCounters::default(),
+                controller_counters: ControllerCounterSnapshot::default(),
+                source_coverage: Vec::new(),
+                dangling_announcement_components: 0,
+                first_failure_log: OccurrenceLogStatus::NotAttempted,
+            });
+        let (_operator_sender, operator_receiver) = watch::channel(OperatorSnapshot {
+            activity: Arc::from(vec![activity]),
+            terminal_times: Arc::new(HashMap::new()),
+        });
+        let mut app = App::with_inputs(
+            model_receiver,
+            quality_receiver,
+            HeaderInputs {
+                session: "identity-private".to_owned(),
+                ..HeaderInputs::default()
+            },
+            diagnostics_receiver,
+            operator_receiver,
+            TuiSetup::default(),
+            Arc::new(SystemClock),
+        );
+
+        let lower = render(&app, 220, 18).join("\n");
+        assert!(!lower.contains(IDENTITY_SENTINEL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        let detail = render(&app, 220, 18).join("\n");
+        assert!(!detail.contains(IDENTITY_SENTINEL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for character in IDENTITY_SENTINEL.chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(build_rows(app.model(), app.state()).is_empty());
+    }
+
+    #[test]
+    fn i4_minimum_48x14_renders_tree_dag_and_runtime_strip() {
+        let mut app = app(populated_model(), ObservationQuality::Live, "min-geometry");
+        for mode in [ViewMode::ExecutionTree, ViewMode::DependencyDag] {
+            if app.state().view_mode() != mode {
+                app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            }
+            let rows = render(&app, 48, 14);
+            let screen = rows.join("\n");
+            assert!(screen.contains("session:min-geometry"));
+            assert!(screen.contains("LIVE"));
+            assert!(screen.contains("p:healthy"));
+            assert!(screen.contains("ctl:unavailable"));
+            assert!(screen.contains("D4:0"));
+            match mode {
+                ViewMode::ExecutionTree => {
+                    assert!(screen.contains("native agent") || screen.contains("Task Run:"));
+                    assert!(
+                        rows[4..=6]
+                            .iter()
+                            .any(|row| row.contains("Task Run: Codex controller")),
+                        "the 48x14 tree body must contain its known Task Run row"
+                    );
+                }
+                ViewMode::DependencyDag => {
+                    assert!(rows[4].contains("Task Run"));
+                    assert!(
+                        rows[5].contains("Task Run: Codex c"),
+                        "the 48x14 DAG data coordinate must contain its known Task Run"
+                    );
+                }
+            }
+            for row in rows {
+                assert!(Line::raw(row.as_str()).width() <= 48, "{row:?}");
+            }
+        }
+
+        let too_short = render(&app, 48, 13).join("\n");
+        assert!(too_short.contains("Terminal too small (minimum 48x14)"));
+        assert!(!too_short.contains("Dependency DAG"));
+    }
+
+    #[test]
+    fn i4_grapheme_combining_cjk_flag_skin_tone_zwj_at_48() {
+        let vectors = [
+            ("e\u{301}xy", 2, "e\u{301}…"),
+            ("界xy", 3, "界…"),
+            ("🇯🇵xy", 3, "🇯🇵…"),
+            ("👍🏽xy", 3, "👍🏽…"),
+            ("👩‍💻xy", 3, "👩‍💻…"),
+        ];
+        for (input, width, expected) in vectors {
+            let truncated = truncate_to_width(input, width);
+            assert_eq!(truncated, expected, "grapheme vector {input:?}");
+            assert!(Line::raw(truncated.as_str()).width() <= width);
+            assert!(!truncated.contains('\u{fffd}'));
+        }
+        assert_eq!(truncate_to_width("界x", 1), "…");
+        assert_eq!(truncate_to_width("界x", 0), "");
+        assert_eq!(truncate_to_width("control\ntext", 48), "control\\ntext");
+
+        let app = app(
+            populated_model(),
+            ObservationQuality::Live,
+            "e\u{301} 界 🇯🇵 👍🏽 👩‍💻 control\ntext",
+        );
+        let rows = render(&app, 48, 18);
+        for rendered in rows {
+            assert!(Line::raw(rendered.as_str()).width() <= 48, "{rendered:?}");
+            assert!(!rendered.contains('\u{fffd}'));
+            assert!(!rendered.contains('\n'));
+        }
     }
 }
