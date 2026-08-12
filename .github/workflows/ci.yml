@@ -47,6 +47,13 @@ jobs:
           persist-credentials: false
       - name: Install Rust stable
         run: rustup toolchain install stable --profile minimal
+      - name: Configure canonical macOS temporary directory
+        if: runner.os == 'macOS'
+        run: |
+          ci_tmp="$(mktemp -d "$(cd /tmp && pwd -P)/herdr-ci.XXXXXX")"
+          chmod 700 "$ci_tmp"
+          printf 'resolved TMPDIR=%s\n' "$ci_tmp"
+          printf 'TMPDIR=%s\n' "$ci_tmp" >> "$GITHUB_ENV"
       - name: Run tests
         run: cargo +stable test --locked --all-targets --all-features
 
