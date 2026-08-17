@@ -1817,6 +1817,24 @@ fn measured_child_and_observer_environment_ownership_is_exact() {
 }
 
 #[test]
+fn repeated_control_records_reuse_first_ambient_load() {
+    let mut first = valid_synthetic_result().document().host.clone();
+    first.ambient_load_milli = [1_780, 1_520, 2_240];
+    let mut later = first.clone();
+    later.ambient_load_milli = [1_320, 1_430, 2_190];
+
+    assert_eq!(
+        freeze_run_host_profile(later, Some(&first)).unwrap(),
+        first.clone()
+    );
+
+    let mut changed_machine = first.clone();
+    changed_machine.ambient_load_milli = [1_320, 1_430, 2_190];
+    changed_machine.governor = Some("performance-drifted".to_owned());
+    assert!(freeze_run_host_profile(changed_machine, Some(&first)).is_err());
+}
+
+#[test]
 fn trial_controls_reject_wrong_scenario_directory() {
     let mut wrong_scenario_directory = valid_synthetic_result();
     let trial = &mut wrong_scenario_directory.document_mut().trials[0];
@@ -6345,6 +6363,16 @@ fn source_fixture_executes_production_nested_orchestration_body() {
                 orchestrator_stderr, "",
                 "successful production orchestration emitted stderr"
             );
+            assert!(
+                trial_root.join("stdout").is_file(),
+                "measured stdout did not use the composer-owned basename"
+            );
+            assert!(
+                trial_root.join("stderr").is_file(),
+                "measured stderr did not use the composer-owned basename"
+            );
+            assert!(!trial_root.join("measured-stdout").exists());
+            assert!(!trial_root.join("measured-stderr").exists());
         }
         let runtime_bytes = std::fs::read_to_string(runtime_capture).unwrap();
         let mut runtime_lines = runtime_bytes.lines();

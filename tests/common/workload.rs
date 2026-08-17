@@ -1210,6 +1210,26 @@ fn validate_host_profile(host: &HostProfileV1) -> Result<(), ResultError> {
     Ok(())
 }
 
+// The run envelope's ambient_load_milli is anchored to the FIRST recorded
+// trial by design (design lines 202/426-427: ambient is recorded context,
+// never a gate); every non-ambient host field is freshly resampled per
+// trial and must stay byte-identical or the run fails closed.
+pub fn freeze_run_host_profile(
+    mut current: HostProfileV1,
+    first: Option<&HostProfileV1>,
+) -> Result<HostProfileV1, HarnessError> {
+    let Some(first) = first else {
+        return Ok(current);
+    };
+    current.ambient_load_milli = first.ambient_load_milli;
+    if current != *first {
+        return Err(HarnessError::Invalid(
+            "run host profile changed after the first recorded trial",
+        ));
+    }
+    Ok(first.clone())
+}
+
 fn validate_invalid_run(document: &InvalidRunV1) -> Result<(), ResultError> {
     if document.schema_version != 1
         || !is_lower_hex(&document.production_subject_sha, 40)
@@ -5422,7 +5442,37 @@ pub fn record_runner_control_evidence_from_environment() -> Result<(), HarnessEr
     let scratch_root_path = raw_root.join("scratch");
     let (storage_kind, storage_device) =
         linux_storage_profile(&findmnt.canonical_path, &scratch_root_path)?;
-    let host = linux_host_profile(storage_kind.clone(), storage_device.clone())?;
+    let current_host = linux_host_profile(storage_kind.clone(), storage_device.clone())?;
+    let first_control = if trial_index == 1 {
+        None
+    } else {
+        let scenario_root = raw_root.parent().ok_or(HarnessError::Invalid(
+            "recorded trial root had no scenario parent",
+        ))?;
+        let first_root = scenario_root.join("trial-0001").canonicalize()?;
+        let first: RunnerControlEvidenceV1 =
+            read_closed_json(&first_root.join("runner-control.json"))
+                .map_err(|_| HarnessError::Invalid("first recorded runner control was invalid"))?;
+        if first.schema_version != 1
+            || first.measurement_stage != stage
+            || first.scenario != scenario
+            || first.trial_index != 1
+            || first.canonical_raw_root != first_root.to_string_lossy()
+            || first.production_subject_sha != subject
+            || first.preflight_head != preflight_head
+            || first.harness_sha != preflight_head
+            || first.workload_schema_sha256 != WORKLOAD_SCHEMA_V1_SHA256
+        {
+            return Err(HarnessError::Invalid(
+                "first recorded runner control identity mismatched",
+            ));
+        }
+        Some(first)
+    };
+    let host = freeze_run_host_profile(
+        current_host,
+        first_control.as_ref().map(|control| &control.host),
+    )?;
     let baseline_root = match (
         stage,
         std::env::var_os("HERDR_PERF_CONTROL_BASELINE_RESULTS_ROOT"),

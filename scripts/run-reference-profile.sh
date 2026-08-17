@@ -698,7 +698,7 @@ run_orchestration_fixture() {
         >"$nested_runtime_capture" || return 20
       run_trial_process_tree \
         "$nested_trial_root/gnu-time.txt" \
-        "$nested_trial_root/measured-stdout" "$nested_trial_root/measured-stderr" \
+        "$nested_trial_root/stdout" "$nested_trial_root/stderr" \
         "$nested_trial_root/harness.json" "$nested_trial_root/observer-handshake" \
         "$active_runtime_socket" "$nested_trial_root/observer-control.json" \
         "$nested_trial_root/process-tree.json" "$nested_trial_root/observer-stdout" \
@@ -1826,7 +1826,7 @@ run_one_trial() {
   prepare_runtime_dir "$short_scenario" "$trial_code" || return 20
   if [[ $runner_stage != baseline ]]; then baseline_arg=$runner_baseline_root; fi
   run_trial_process_tree \
-    "$trial_root/gnu-time.txt" "$trial_root/measured-stdout" "$trial_root/measured-stderr" \
+    "$trial_root/gnu-time.txt" "$trial_root/stdout" "$trial_root/stderr" \
     "$trial_root/harness.json" "$trial_root/observer-handshake" "$active_runtime_socket" \
     "$trial_root/observer-control.json" "$trial_root/process-tree.json" \
     "$trial_root/observer-stdout" "$trial_root/observer-stderr" \
@@ -1847,7 +1847,7 @@ run_one_trial() {
     if [[ $last_trial_code -eq 0 ]]; then
       [[ $control_status -eq 0 ]] || return 20
       for artifact in harness.json runner-control.json process-tree.json observer-control.json \
-        gnu-time.txt measured-stdout measured-stderr observer-stdout observer-stderr \
+        gnu-time.txt stdout stderr observer-stdout observer-stderr \
         pidstat.json pidstat-stderr observer-handshake trial-status; do
         [[ -f $trial_root/$artifact && ! -L $trial_root/$artifact ]] || return 20
         "$auth_sha256sum_executable" -- "$trial_root/$artifact" >/dev/null || return 20
