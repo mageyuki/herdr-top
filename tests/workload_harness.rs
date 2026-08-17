@@ -1715,7 +1715,7 @@ fn measured_child_and_observer_environment_ownership_is_exact() {
         ("CARGO_HOME", "/home/mageyuki/.cargo"),
         (
             "HERDR_PERF_OBSERVER_CONTROL_SOCKET",
-            "/tmp/herdr-increment5/sustained/trial-0001/observer-control.sock",
+            "/tmp/herdr-i5.synthetic/sustained-trial-0001.sock",
         ),
         (
             "HERDR_PERF_OBSERVER_HANDSHAKE",
@@ -1728,7 +1728,7 @@ fn measured_child_and_observer_environment_ownership_is_exact() {
         ("HERDR_PERF_SCENARIO", "sustained"),
         (
             "HERDR_PERF_SCRATCH_ROOT",
-            "/tmp/herdr-increment5/sustained/trial-0001",
+            "/tmp/herdr-increment5/sustained/trial-0001/scratch",
         ),
         ("HERDR_PERF_STAGE", "baseline"),
         ("HERDR_PERF_SUBJECT", BASELINE_SUBJECT_SHA),
@@ -1756,7 +1756,7 @@ fn measured_child_and_observer_environment_ownership_is_exact() {
         ),
         (
             "HERDR_PERF_OBSERVER_CONTROL_SOCKET",
-            "/tmp/herdr-increment5/sustained/trial-0001/observer-control.sock",
+            "/tmp/herdr-i5.synthetic/sustained-trial-0001.sock",
         ),
         (
             "HERDR_PERF_PROCESS_TREE_OUTPUT",
@@ -1817,6 +1817,61 @@ fn measured_child_and_observer_environment_ownership_is_exact() {
 }
 
 #[test]
+fn trial_controls_reject_wrong_scenario_directory() {
+    let mut wrong_scenario_directory = valid_synthetic_result();
+    let trial = &mut wrong_scenario_directory.document_mut().trials[0];
+    trial.raw.child_controls.scratch_root =
+        "/tmp/herdr-increment5/idle/trial-0001/scratch".to_owned();
+    trial.raw.child_controls.measured_environment.insert(
+        "HERDR_PERF_OUTPUT".to_owned(),
+        "/tmp/herdr-increment5/idle/trial-0001/harness.json".to_owned(),
+    );
+    trial.raw.child_controls.measured_environment.insert(
+        "HERDR_PERF_OBSERVER_HANDSHAKE".to_owned(),
+        "/tmp/herdr-increment5/idle/trial-0001/observer-handshake".to_owned(),
+    );
+    trial.raw.child_controls.measured_environment.insert(
+        "HERDR_PERF_SCRATCH_ROOT".to_owned(),
+        "/tmp/herdr-increment5/idle/trial-0001/scratch".to_owned(),
+    );
+    trial.control_evidence.scratch_root =
+        "/tmp/herdr-increment5/idle/trial-0001/scratch".to_owned();
+    trial.control_evidence.observer_environment.insert(
+        "HERDR_PERF_OBSERVER_CONTROL_OUTPUT".to_owned(),
+        "/tmp/herdr-increment5/idle/trial-0001/observer-control.json".to_owned(),
+    );
+    trial.control_evidence.observer_environment.insert(
+        "HERDR_PERF_PROCESS_TREE_OUTPUT".to_owned(),
+        "/tmp/herdr-increment5/idle/trial-0001/process-tree.json".to_owned(),
+    );
+
+    assert_eq!(
+        wrong_scenario_directory.validate(),
+        Err(ResultError::InvalidArtifact)
+    );
+}
+
+#[test]
+fn trial_controls_reject_trial_local_control_socket() {
+    let mut trial_local_socket = valid_synthetic_result();
+    let socket = "/tmp/herdr-increment5/sustained/trial-0001/observer-control.sock".to_owned();
+    let trial = &mut trial_local_socket.document_mut().trials[0];
+    trial.raw.child_controls.measured_environment.insert(
+        "HERDR_PERF_OBSERVER_CONTROL_SOCKET".to_owned(),
+        socket.clone(),
+    );
+    trial
+        .control_evidence
+        .observer_environment
+        .insert("HERDR_PERF_OBSERVER_CONTROL_SOCKET".to_owned(), socket);
+
+    assert_eq!(
+        trial_local_socket.validate(),
+        Err(ResultError::InvalidArtifact)
+    );
+}
+
+#[test]
 fn control_ownership_accepts_distinct_trial_paths_and_rejects_drift() {
     let valid = valid_synthetic_result();
     assert_eq!(valid.document().trials.len(), 5);
@@ -1857,6 +1912,27 @@ fn control_ownership_accepts_distinct_trial_paths_and_rejects_drift() {
     let mut malformed_host = valid_synthetic_result();
     malformed_host.document_mut().host.operating_system.clear();
     assert_eq!(malformed_host.validate(), Err(ResultError::InvalidArtifact));
+}
+
+#[test]
+fn runner_control_identity_requires_isolated_scratch_root() {
+    let raw_root = PathBuf::from("/tmp/herdr-increment5/sustained/trial-0001");
+    let mut harness = valid_synthetic_result().document().trials[0].raw.clone();
+    harness.child_controls.scratch_root = raw_root.join("scratch").to_string_lossy().into_owned();
+    assert!(recorded_harness_identity_is_consistent(
+        &harness,
+        ScenarioV1::Sustained,
+        1,
+        &raw_root
+    ));
+
+    harness.child_controls.scratch_root = raw_root.to_string_lossy().into_owned();
+    assert!(!recorded_harness_identity_is_consistent(
+        &harness,
+        ScenarioV1::Sustained,
+        1,
+        &raw_root
+    ));
 }
 
 #[cfg(target_os = "linux")]
@@ -4493,8 +4569,35 @@ fn section15_predicate_matrix_is_exact_and_recomputed() {
     assert_eq!(changed.validate(), Err(ResultError::InvalidArtifact));
 }
 
+struct RawScenarioRoot {
+    _parent: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl RawScenarioRoot {
+    fn new(scenario: ScenarioV1) -> Self {
+        let parent = tempfile::tempdir().unwrap();
+        let directory = &workload_schema()
+            .scenarios
+            .iter()
+            .find(|spec| spec.scenario == scenario)
+            .unwrap()
+            .directory;
+        let path = parent.path().join(directory);
+        std::fs::create_dir(&path).unwrap();
+        Self {
+            _parent: parent,
+            path,
+        }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
 struct RawFixture {
-    root: tempfile::TempDir,
+    root: RawScenarioRoot,
 }
 
 impl RawFixture {
@@ -4503,8 +4606,9 @@ impl RawFixture {
     }
 
     fn from_outcome(mut outcome: ReferenceOutcomeV1) -> Self {
+        let scenario = outcome.document().scenario;
         let fixture = Self {
-            root: tempfile::tempdir().unwrap(),
+            root: RawScenarioRoot::new(scenario),
         };
         write_synthetic_raw_scenario_root(fixture.root.path(), &mut outcome).unwrap();
         fixture
@@ -4512,7 +4616,7 @@ impl RawFixture {
 
     fn empty() -> Self {
         Self {
-            root: tempfile::tempdir().unwrap(),
+            root: RawScenarioRoot::new(ScenarioV1::Sustained),
         }
     }
 
@@ -7697,6 +7801,14 @@ fn authoritative_reference_profile_runner_smoke() {
             .output()
             .unwrap_or_else(|_| std::process::exit(20));
     if !matches!(output.status.code(), Some(0 | 10)) {
+        eprintln!(
+            "authoritative runner stdout:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        eprintln!(
+            "authoritative runner stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         std::process::exit(20);
     }
 }

@@ -1505,22 +1505,37 @@ fn validate_trial_controls(
     trial: &TrialResultV1,
 ) -> Result<(), ResultError> {
     let scratch_root = &trial.raw.child_controls.scratch_root;
+    let raw_root = scratch_root
+        .strip_suffix("/scratch")
+        .ok_or(ResultError::InvalidArtifact)?;
+    let control_socket = trial
+        .raw
+        .child_controls
+        .measured_environment
+        .get("HERDR_PERF_OBSERVER_CONTROL_SOCKET")
+        .ok_or(ResultError::InvalidArtifact)?;
+    let control_socket_path = std::path::Path::new(control_socket);
     let baseline_root = document
         .controlled_environment
         .get("HERDR_PERF_BASELINE_RESULTS_ROOT")
         .map(std::path::Path::new);
     let expected_suffix = format!(
-        "/{}/trial-{:04}",
+        "/{}/trial-{:04}/scratch",
         scenario_spec(document.scenario).directory,
         trial.trial_index
     );
     if !scratch_root.ends_with(&expected_suffix)
+        || !control_socket_path.is_absolute()
+        || !control_socket.starts_with("/tmp/herdr-i5.")
+        || control_socket_path.starts_with(raw_root)
         || trial.raw.child_controls.effective_affinity_cpu_ids != document.controls.affinity_cpu_ids
         || trial.raw.child_controls.effective_address_space_limit_bytes
             != document.controls.address_space_limit_bytes
         || trial.raw.child_controls.measured_environment
             != measured_environment(
+                raw_root,
                 scratch_root,
+                control_socket,
                 document.measurement_stage,
                 document.scenario,
                 &document.production_subject_sha,
@@ -1531,7 +1546,12 @@ fn validate_trial_controls(
         || trial.control_evidence.scratch_storage_devices != [document.host.storage_device.clone()]
         || trial.control_evidence.orchestrator_environment != invariant_environment()
         || trial.control_evidence.observer_environment
-            != observer_environment(scratch_root, document.scenario, &trial.process_tree)
+            != observer_environment(
+                raw_root,
+                control_socket,
+                document.scenario,
+                &trial.process_tree,
+            )
         || trial.control_evidence.validator_environment_template != invariant_environment()
         || trial.control_evidence.revalidated_executables
             != document.controls.authoritative_executables
@@ -1549,7 +1569,8 @@ fn validate_trial_controls(
 }
 
 fn observer_environment(
-    scratch_root: &str,
+    raw_root: &str,
+    control_socket: &str,
     scenario: ScenarioV1,
     process_tree: &ProcessTreeEvidenceV1,
 ) -> std::collections::BTreeMap<String, String> {
@@ -1572,15 +1593,15 @@ fn observer_environment(
     );
     values.insert(
         "HERDR_PERF_OBSERVER_CONTROL_SOCKET".to_owned(),
-        format!("{scratch_root}/observer-control.sock"),
+        control_socket.to_owned(),
     );
     values.insert(
         "HERDR_PERF_OBSERVER_CONTROL_OUTPUT".to_owned(),
-        format!("{scratch_root}/observer-control.json"),
+        format!("{raw_root}/observer-control.json"),
     );
     values.insert(
         "HERDR_PERF_PROCESS_TREE_OUTPUT".to_owned(),
-        format!("{scratch_root}/process-tree.json"),
+        format!("{raw_root}/process-tree.json"),
     );
     values
 }
@@ -3894,8 +3915,13 @@ fn synthetic_trial(
         ScenarioV1::Target | ScenarioV1::Idle => Vec::new(),
     };
     let sequence_vector = (1..=spec.admission_count).collect::<Vec<_>>();
-    let scratch_root = format!(
+    let raw_root = format!(
         "/tmp/herdr-increment5/{}/trial-{trial_index:04}",
+        spec.directory
+    );
+    let scratch_root = format!("{raw_root}/scratch");
+    let control_socket = format!(
+        "/tmp/herdr-i5.synthetic/{}-trial-{trial_index:04}.sock",
         spec.directory
     );
     let idle_start = (scenario == ScenarioV1::Idle).then_some(observer_ready_ns + 5_000_000_000);
@@ -4008,7 +4034,9 @@ fn synthetic_trial(
             effective_affinity_cpu_ids: vec![0, 1, 2, 3],
             effective_address_space_limit_bytes: 16 * 1024 * 1024 * 1024,
             measured_environment: measured_environment(
+                &raw_root,
                 &scratch_root,
+                &control_socket,
                 measurement_stage,
                 scenario,
                 production_subject_sha,
@@ -4018,7 +4046,13 @@ fn synthetic_trial(
             scratch_root: scratch_root.clone(),
         },
     };
-    let control_evidence = synthetic_trial_control(&scratch_root, scenario, &process_tree);
+    let control_evidence = synthetic_trial_control(
+        &raw_root,
+        &scratch_root,
+        &control_socket,
+        scenario,
+        &process_tree,
+    );
     TrialResultV1 {
         trial_index,
         raw,
@@ -4256,7 +4290,9 @@ fn run_environment(
 }
 
 fn measured_environment(
+    raw_root: &str,
     scratch_root: &str,
+    control_socket: &str,
     measurement_stage: MeasurementStageV1,
     scenario: ScenarioV1,
     production_subject_sha: &str,
@@ -4281,15 +4317,15 @@ fn measured_environment(
     );
     values.insert(
         "HERDR_PERF_OUTPUT".to_owned(),
-        format!("{scratch_root}/harness.json"),
+        format!("{raw_root}/harness.json"),
     );
     values.insert(
         "HERDR_PERF_OBSERVER_HANDSHAKE".to_owned(),
-        format!("{scratch_root}/observer-handshake"),
+        format!("{raw_root}/observer-handshake"),
     );
     values.insert(
         "HERDR_PERF_OBSERVER_CONTROL_SOCKET".to_owned(),
-        format!("{scratch_root}/observer-control.sock"),
+        control_socket.to_owned(),
     );
     values.insert(
         "HERDR_PERF_SCRATCH_ROOT".to_owned(),
@@ -4305,7 +4341,9 @@ fn measured_environment(
 }
 
 fn synthetic_trial_control(
+    raw_root: &str,
     scratch_root: &str,
+    control_socket: &str,
     scenario: ScenarioV1,
     process_tree: &ProcessTreeEvidenceV1,
 ) -> TrialControlEvidenceV1 {
@@ -4315,7 +4353,12 @@ fn synthetic_trial_control(
         scratch_storage_kind: "nvme".to_owned(),
         scratch_storage_devices: vec!["nvme0n1".to_owned()],
         orchestrator_environment: invariant_environment(),
-        observer_environment: observer_environment(scratch_root, scenario, process_tree),
+        observer_environment: observer_environment(
+            raw_root,
+            control_socket,
+            scenario,
+            process_tree,
+        ),
         validator_environment_template: invariant_environment(),
         revalidated_executables: controls.authoritative_executables.clone(),
         revalidated_runner_script: controls.runner_script.clone(),
@@ -5153,6 +5196,17 @@ pub fn validate_reference_outcome_from_environment() -> Result<i32, HarnessError
     })
 }
 
+pub fn recorded_harness_identity_is_consistent(
+    harness: &HarnessTrialV1,
+    scenario: ScenarioV1,
+    trial_index: usize,
+    raw_root: &std::path::Path,
+) -> bool {
+    harness.scenario == scenario
+        && harness.trial_index == trial_index
+        && harness.child_controls.scratch_root == raw_root.join("scratch").to_string_lossy()
+}
+
 pub fn record_runner_control_evidence_from_environment() -> Result<(), HarnessError> {
     require_exact_environment(&[
         "CARGO_HOME",
@@ -5356,10 +5410,7 @@ pub fn record_runner_control_evidence_from_environment() -> Result<(), HarnessEr
         .map_err(|_| HarnessError::Invalid("recorded harness was invalid"))?;
     let process_tree: ProcessTreeEvidenceV1 = read_closed_json(&raw_root.join("process-tree.json"))
         .map_err(|_| HarnessError::Invalid("recorded process tree was invalid"))?;
-    if harness.scenario != scenario
-        || harness.trial_index != trial_index
-        || harness.child_controls.scratch_root != raw_root.to_string_lossy()
-    {
+    if !recorded_harness_identity_is_consistent(&harness, scenario, trial_index, &raw_root) {
         return Err(HarnessError::Invalid(
             "recorded harness identity mismatched",
         ));
@@ -5368,7 +5419,9 @@ pub fn record_runner_control_evidence_from_environment() -> Result<(), HarnessEr
         .iter()
         .find(|identity| identity.requested_path == "/usr/bin/findmnt")
         .ok_or(HarnessError::Invalid("findmnt identity was absent"))?;
-    let (storage_kind, storage_device) = linux_storage_profile(&findmnt.canonical_path, &raw_root)?;
+    let scratch_root_path = raw_root.join("scratch");
+    let (storage_kind, storage_device) =
+        linux_storage_profile(&findmnt.canonical_path, &scratch_root_path)?;
     let host = linux_host_profile(storage_kind.clone(), storage_device.clone())?;
     let baseline_root = match (
         stage,
@@ -5411,13 +5464,23 @@ pub fn record_runner_control_evidence_from_environment() -> Result<(), HarnessEr
     };
     validate_run_controls(&controls)
         .map_err(|_| HarnessError::Invalid("recorded run controls were invalid"))?;
-    let scratch_root = raw_root.to_string_lossy().into_owned();
+    let canonical_raw_root = raw_root.to_string_lossy().into_owned();
+    let scratch_root = scratch_root_path.to_string_lossy().into_owned();
+    let control_socket = harness
+        .child_controls
+        .measured_environment
+        .get("HERDR_PERF_OBSERVER_CONTROL_SOCKET")
+        .ok_or(HarnessError::Invalid(
+            "measured child control socket was absent",
+        ))?;
     if harness.child_controls.effective_affinity_cpu_ids != controls.affinity_cpu_ids
         || harness.child_controls.effective_address_space_limit_bytes
             != controls.address_space_limit_bytes
         || harness.child_controls.measured_environment
             != measured_environment(
+                &canonical_raw_root,
                 &scratch_root,
+                control_socket,
                 stage,
                 scenario,
                 &subject,
@@ -5431,7 +5494,7 @@ pub fn record_runner_control_evidence_from_environment() -> Result<(), HarnessEr
         measurement_stage: stage,
         scenario,
         trial_index,
-        canonical_raw_root: scratch_root.clone(),
+        canonical_raw_root: canonical_raw_root.clone(),
         production_subject_sha: subject,
         preflight_head: preflight_head.clone(),
         harness_sha: preflight_head,
@@ -5451,7 +5514,12 @@ pub fn record_runner_control_evidence_from_environment() -> Result<(), HarnessEr
             scratch_storage_kind: storage_kind,
             scratch_storage_devices: vec![storage_device],
             orchestrator_environment: invariant_environment(),
-            observer_environment: observer_environment(&scratch_root, scenario, &process_tree),
+            observer_environment: observer_environment(
+                &canonical_raw_root,
+                control_socket,
+                scenario,
+                &process_tree,
+            ),
             validator_environment_template: invariant_environment(),
             revalidated_executables: authoritative,
             revalidated_runner_script: runner_script,
@@ -5808,6 +5876,13 @@ pub fn validate_with_raw_root(
             || tree != trial.process_tree
             || control != trial.observer_control
             || runner != runner_control_for(document, trial, &directory)
+            || !recorded_harness_identity_is_consistent(
+                &harness,
+                document.scenario,
+                trial.trial_index,
+                &directory,
+            )
+            || runner.trial.scratch_root != directory.join("scratch").to_string_lossy()
             || handshake
                 != (
                     tree.observed_root_pid,
@@ -5960,9 +6035,47 @@ pub fn write_synthetic_raw_scenario_root(
 ) -> Result<(), HarnessError> {
     let document = outcome.document_mut();
     std::fs::create_dir_all(raw_root)?;
-    for trial in &document.trials {
+    let measurement_stage = document.measurement_stage;
+    let scenario = document.scenario;
+    let production_subject_sha = document.production_subject_sha.clone();
+    let baseline_root = document
+        .controlled_environment
+        .get("HERDR_PERF_BASELINE_RESULTS_ROOT")
+        .map(std::path::PathBuf::from);
+    for trial in &mut document.trials {
         let directory = raw_root.join(format!("trial-{:04}", trial.trial_index));
         std::fs::create_dir_all(&directory)?;
+        let canonical_raw_root = directory.canonicalize()?;
+        let scratch_root = canonical_raw_root.join("scratch");
+        std::fs::create_dir(&scratch_root)?;
+        let canonical_raw_root = canonical_raw_root.to_string_lossy().into_owned();
+        let scratch_root = scratch_root.to_string_lossy().into_owned();
+        let control_socket = trial
+            .raw
+            .child_controls
+            .measured_environment
+            .get("HERDR_PERF_OBSERVER_CONTROL_SOCKET")
+            .cloned()
+            .ok_or(HarnessError::Invalid(
+                "synthetic measured control socket was absent",
+            ))?;
+        trial.raw.child_controls.measured_environment = measured_environment(
+            &canonical_raw_root,
+            &scratch_root,
+            &control_socket,
+            measurement_stage,
+            scenario,
+            &production_subject_sha,
+            baseline_root.as_deref(),
+        );
+        trial.raw.child_controls.scratch_root = scratch_root.clone();
+        trial.control_evidence.scratch_root = scratch_root;
+        trial.control_evidence.observer_environment = observer_environment(
+            &canonical_raw_root,
+            &control_socket,
+            scenario,
+            &trial.process_tree,
+        );
     }
     let runners = document
         .trials
@@ -6145,8 +6258,13 @@ fn compose_reference_run(request: &ComposeRequestV1) -> Result<ReferenceRunV1, R
             || runner.production_subject_sha != request.production_subject_sha
             || runner.preflight_head != request.preflight_head
             || runner.harness_sha != request.preflight_head
-            || harness.trial_index != trial_index
-            || harness.scenario != request.scenario
+            || !recorded_harness_identity_is_consistent(
+                &harness,
+                request.scenario,
+                trial_index,
+                &directory,
+            )
+            || runner.trial.scratch_root != directory.join("scratch").to_string_lossy()
             || tree.observed_root_pid != observer_control.observed_root_pid
             || handshake
                 != (
