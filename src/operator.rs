@@ -16,6 +16,11 @@ use crate::store::{PersistOp, PersistTaskRun};
 
 const ACTIVITY_LIMIT: usize = 10_000;
 
+// increment5-workload-harness: begin operator activity limit alias
+#[cfg(feature = "workload-harness")]
+#[doc(hidden)]
+pub const WORKLOAD_OPERATOR_ACTIVITY_LIMIT: usize = ACTIVITY_LIMIT;
+// increment5-workload-harness: end operator activity limit alias
 /// Reducer-owned, closed projection of live operator-safe state.
 pub(crate) struct OperatorProjection {
     activity: Vec<ActivityItem>,

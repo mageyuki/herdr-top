@@ -673,6 +673,23 @@ fn cargo_configuration_and_executable_provenance_fail_closed() {
     assert_eq!(digest.validate(), Err(ResultError::InvalidArtifact));
 }
 
+#[cfg(feature = "workload-harness")]
+#[test]
+fn workload_retention_aliases_match_manifest() {
+    let manifest_limit = workload_schema().operator_activity_limit;
+    assert_eq!(manifest_limit, 10_000);
+    assert_eq!(
+        u64::try_from(herdr_top::store::WORKLOAD_RESTORE_ACTIVITY_LIMIT)
+            .expect("restore activity limit must fit in u64"),
+        manifest_limit
+    );
+    assert_eq!(
+        u64::try_from(herdr_top::operator::WORKLOAD_OPERATOR_ACTIVITY_LIMIT)
+            .expect("operator activity limit must fit in u64"),
+        manifest_limit
+    );
+}
+
 #[test]
 fn startup_counts_are_serialized_exactly_and_rss_is_diagnostic() {
     let startup = valid_startup_result();
