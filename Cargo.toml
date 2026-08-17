@@ -7,6 +7,13 @@ rust-version = "1.97.1"
 [features]
 workload-harness = []
 
+[[bin]]
+name = "increment5-reference-controller"
+path = "tests/support/reference_profile_controller.rs"
+required-features = ["workload-harness"]
+test = false
+bench = false
+
 [dependencies]
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }

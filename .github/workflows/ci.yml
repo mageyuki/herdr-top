@@ -56,6 +56,8 @@ jobs:
           printf 'TMPDIR=%s\n' "$ci_tmp" >> "$GITHUB_ENV"
       - name: Run tests
         run: cargo +stable test --locked --all-targets --all-features
+      - name: Run doctests
+        run: cargo +stable test --locked --doc
 
   msrv:
     name: msrv (1.97.1)
@@ -69,3 +71,5 @@ jobs:
         run: rustup toolchain install 1.97.1 --profile minimal
       - name: Compile all targets at MSRV
         run: cargo +1.97.1 test --locked --all-targets --all-features --no-run
+      - name: Run doctests at MSRV
+        run: cargo +1.97.1 test --locked --doc

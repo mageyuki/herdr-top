@@ -30,6 +30,11 @@ const EVENT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 const RUN_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 const EVENT_RING_LIMIT: i64 = 100_000;
 const OPERATOR_ACTIVITY_LIMIT: i64 = 10_000;
+// increment5-workload-harness: begin restore activity limit alias
+#[cfg(feature = "workload-harness")]
+#[doc(hidden)]
+pub const WORKLOAD_RESTORE_ACTIVITY_LIMIT: i64 = OPERATOR_ACTIVITY_LIMIT;
+// increment5-workload-harness: end restore activity limit alias
 const DISPLAY_ORDINAL_BASE: i64 = 1;
 
 /// Errors produced by the SQLite store.

@@ -25,6 +25,185 @@ use crate::store::{
     EnqueuePermit, NativeSessionBinding, PendingEnqueue, PersistBatch, PersistExecution, PersistOp,
     PersistTaskRun, RestoredState,
 };
+// increment5-workload-harness: begin reducer timing callback ABI
+#[cfg(feature = "workload-harness")]
+use std::cell::RefCell;
+#[cfg(feature = "workload-harness")]
+use std::time::Instant;
+
+/// Closed workload timing scopes emitted by the real reducer paths.
+#[cfg(feature = "workload-harness")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkloadTimingKind {
+    ControllerEvent,
+    StartupRestore,
+    FallbackNotification,
+    FallbackRescan,
+}
+
+/// Aggregate timing collected from one real reducer scope.
+#[cfg(feature = "workload-harness")]
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkloadTimingObservation {
+    pub kind: WorkloadTimingKind,
+    pub sequence: u64,
+    pub d4_segment_count: u32,
+    pub d4_analysis_ns: u64,
+    pub reducer_plus_publish_ns: u64,
+    pub model_clone_publish_segment_count: u32,
+    pub model_clone_publish_ns: u64,
+}
+
+/// Feature-only callback receiving one successful real reducer scope.
+#[cfg(feature = "workload-harness")]
+#[doc(hidden)]
+pub type WorkloadTimingObserver = Arc<dyn Fn(WorkloadTimingObservation) + Send + Sync>;
+
+#[cfg(feature = "workload-harness")]
+struct WorkloadTimingState {
+    kind: WorkloadTimingKind,
+    sequence: u64,
+    started: Instant,
+    d4_segment_count: u32,
+    d4_analysis_ns: u64,
+    model_clone_publish_segment_count: u32,
+    model_clone_publish_ns: u64,
+    observer: WorkloadTimingObserver,
+}
+
+#[cfg(feature = "workload-harness")]
+thread_local! {
+    static WORKLOAD_TIMING_STATE: RefCell<Option<WorkloadTimingState>> = const { RefCell::new(None) };
+}
+
+#[cfg(feature = "workload-harness")]
+enum WorkloadTimingSegment {
+    D4,
+    ModelClonePublish,
+}
+
+#[cfg(feature = "workload-harness")]
+pub(crate) struct WorkloadTimingScope {
+    active: bool,
+}
+
+#[cfg(feature = "workload-harness")]
+pub(crate) fn workload_timing_scope(
+    kind: WorkloadTimingKind,
+    sequence: u64,
+    observer: WorkloadTimingObserver,
+) -> WorkloadTimingScope {
+    WORKLOAD_TIMING_STATE.with(|slot| {
+        let previous = slot.replace(Some(WorkloadTimingState {
+            kind,
+            sequence,
+            started: Instant::now(),
+            d4_segment_count: 0,
+            d4_analysis_ns: 0,
+            model_clone_publish_segment_count: 0,
+            model_clone_publish_ns: 0,
+            observer,
+        }));
+        assert!(
+            previous.is_none(),
+            "workload timing scopes must not overlap"
+        );
+    });
+    WorkloadTimingScope { active: true }
+}
+
+#[cfg(feature = "workload-harness")]
+impl WorkloadTimingScope {
+    pub(crate) fn finish(mut self) {
+        let state = WORKLOAD_TIMING_STATE.with(|slot| slot.borrow_mut().take());
+        let state = state.expect("workload timing scope must remain installed until finish");
+        // ControllerEvent's 2/2 counts are one D4 + clone/publish pair from the
+        // validate_controller_event scratch Self::new, then the post-transition
+        // D4 analysis and committed model publication.
+        let expected_segments = match state.kind {
+            WorkloadTimingKind::ControllerEvent => 2,
+            WorkloadTimingKind::StartupRestore
+            | WorkloadTimingKind::FallbackNotification
+            | WorkloadTimingKind::FallbackRescan => 1,
+        };
+        assert_eq!(
+            state.d4_segment_count, expected_segments,
+            "workload timing scope observed a missing or duplicate D4 segment"
+        );
+        assert_eq!(
+            state.model_clone_publish_segment_count, expected_segments,
+            "workload timing scope observed a missing or duplicate clone/publication segment"
+        );
+        let reducer_plus_publish_ns = u64::try_from(state.started.elapsed().as_nanos())
+            .expect("workload reducer timing exceeded u64 nanoseconds");
+        (state.observer)(WorkloadTimingObservation {
+            kind: state.kind,
+            sequence: state.sequence,
+            d4_segment_count: state.d4_segment_count,
+            d4_analysis_ns: state.d4_analysis_ns,
+            reducer_plus_publish_ns,
+            model_clone_publish_segment_count: state.model_clone_publish_segment_count,
+            model_clone_publish_ns: state.model_clone_publish_ns,
+        });
+        self.active = false;
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+impl Drop for WorkloadTimingScope {
+    fn drop(&mut self) {
+        if self.active {
+            WORKLOAD_TIMING_STATE.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+fn record_workload_timing_segment(segment: WorkloadTimingSegment, elapsed: std::time::Duration) {
+    let elapsed_ns = u64::try_from(elapsed.as_nanos())
+        .expect("workload timing segment exceeded u64 nanoseconds");
+    WORKLOAD_TIMING_STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let Some(state) = state.as_mut() else {
+            return;
+        };
+        match segment {
+            WorkloadTimingSegment::D4 => {
+                state.d4_segment_count = state
+                    .d4_segment_count
+                    .checked_add(1)
+                    .expect("workload D4 segment count overflowed");
+                state.d4_analysis_ns = state
+                    .d4_analysis_ns
+                    .checked_add(elapsed_ns)
+                    .expect("workload D4 timing overflowed");
+            }
+            WorkloadTimingSegment::ModelClonePublish => {
+                state.model_clone_publish_segment_count = state
+                    .model_clone_publish_segment_count
+                    .checked_add(1)
+                    .expect("workload clone/publication segment count overflowed");
+                state.model_clone_publish_ns = state
+                    .model_clone_publish_ns
+                    .checked_add(elapsed_ns)
+                    .expect("workload clone/publication timing overflowed");
+            }
+        }
+    });
+}
+
+#[cfg(feature = "workload-harness")]
+struct WorkloadObservationTiming {
+    kind: WorkloadTimingKind,
+    next_sequence: u64,
+    setup_observations_to_skip: u32,
+    observer: WorkloadTimingObserver,
+}
+// increment5-workload-harness: end reducer timing callback ABI
 
 const STALE_GRACE_MS: i64 = 30_000;
 
@@ -90,6 +269,10 @@ pub struct Reducer {
     operator: OperatorProjection,
     #[cfg(test)]
     publish_count: std::cell::Cell<u64>,
+    // increment5-workload-harness: begin reducer timing configuration field
+    #[cfg(feature = "workload-harness")]
+    workload_observation_timing: Option<WorkloadObservationTiming>,
+    // increment5-workload-harness: end reducer timing configuration field
 }
 
 impl Reducer {
@@ -113,11 +296,30 @@ impl Reducer {
         restored_operator: RestoredOperatorState,
     ) -> (Self, SharedModel, watch::Receiver<OperatorSnapshot>) {
         let mut model = restored.model;
+        // increment5-workload-harness: begin startup D4 timing start
+        #[cfg(feature = "workload-harness")]
+        let workload_d4_started = Instant::now();
+        // increment5-workload-harness: end startup D4 timing start
         let dangling_components = crate::model::graph::dangling_announcement_components(&model);
+        // increment5-workload-harness: begin startup D4 timing finish
+        #[cfg(feature = "workload-harness")]
+        record_workload_timing_segment(WorkloadTimingSegment::D4, workload_d4_started.elapsed());
+        // increment5-workload-harness: end startup D4 timing finish
         model
             .controller_diagnostics_mut()
             .set_dangling_announcement_components(dangling_components);
+        // increment5-workload-harness: begin startup clone publication timing start
+        #[cfg(feature = "workload-harness")]
+        let workload_publish_started = Instant::now();
+        // increment5-workload-harness: end startup clone publication timing start
         let (publisher, shared) = watch::channel(Arc::new(model.clone()));
+        // increment5-workload-harness: begin startup clone publication timing finish
+        #[cfg(feature = "workload-harness")]
+        record_workload_timing_segment(
+            WorkloadTimingSegment::ModelClonePublish,
+            workload_publish_started.elapsed(),
+        );
+        // increment5-workload-harness: end startup clone publication timing finish
         let (operator, operator_receiver) = OperatorProjection::new(restored_operator);
         (
             Self {
@@ -128,12 +330,58 @@ impl Reducer {
                 operator,
                 #[cfg(test)]
                 publish_count: std::cell::Cell::new(0),
+                // increment5-workload-harness: begin reducer timing configuration initialization
+                #[cfg(feature = "workload-harness")]
+                workload_observation_timing: None,
+                // increment5-workload-harness: end reducer timing configuration initialization
             },
             shared,
             operator_receiver,
         )
     }
 
+    // increment5-workload-harness: begin observed reducer adapters
+    /// Restores through the production constructor while observing its real D4 and clone spans.
+    #[cfg(feature = "workload-harness")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new_with_operator_observed(
+        restored: RestoredState,
+        restored_operator: RestoredOperatorState,
+        sequence: u64,
+        observer: WorkloadTimingObserver,
+    ) -> (Self, SharedModel, watch::Receiver<OperatorSnapshot>) {
+        let timing = workload_timing_scope(WorkloadTimingKind::StartupRestore, sequence, observer);
+        let restored = Self::new_with_operator(restored, restored_operator);
+        timing.finish();
+        restored
+    }
+
+    /// Arms each successful production `apply_observation` call for one fallback timing sample.
+    #[cfg(feature = "workload-harness")]
+    #[doc(hidden)]
+    pub fn configure_workload_observation_timing(
+        &mut self,
+        kind: WorkloadTimingKind,
+        first_sequence: u64,
+        observer: WorkloadTimingObserver,
+    ) {
+        assert!(
+            matches!(
+                kind,
+                WorkloadTimingKind::FallbackNotification | WorkloadTimingKind::FallbackRescan
+            ),
+            "automatic observation timing is reserved for fallback arms"
+        );
+        self.workload_observation_timing = Some(WorkloadObservationTiming {
+            kind,
+            next_sequence: first_sequence,
+            setup_observations_to_skip: 1,
+            observer,
+        });
+    }
+
+    // increment5-workload-harness: end observed reducer adapters
     /// Applies one normalized event and publishes exactly one resulting snapshot.
     pub fn apply(&mut self, event: NormalizedEvent) -> Result<ApplyOutcome, ReducerError> {
         self.apply_observation(vec![event])
@@ -147,6 +395,28 @@ impl Reducer {
         if events.is_empty() {
             return Ok(ApplyOutcome::Applied(Vec::new()));
         }
+        // increment5-workload-harness: begin observed apply scope start
+        #[cfg(feature = "workload-harness")]
+        let workload_timing = self
+            .workload_observation_timing
+            .as_mut()
+            .and_then(|timing| {
+                if timing.setup_observations_to_skip > 0 {
+                    timing.setup_observations_to_skip -= 1;
+                    return None;
+                }
+                let sequence = timing.next_sequence;
+                timing.next_sequence = timing
+                    .next_sequence
+                    .checked_add(1)
+                    .expect("workload fallback sequence overflowed");
+                Some(workload_timing_scope(
+                    timing.kind,
+                    sequence,
+                    Arc::clone(&timing.observer),
+                ))
+            });
+        // increment5-workload-harness: end observed apply scope start
         let original_model = self.model.clone();
         let original_next_ordinal = self.next_ordinal;
         let mut persist = Vec::new();
@@ -169,6 +439,12 @@ impl Reducer {
         normalize_persist_batch_lineage(&mut persist);
         self.operator.apply_submission(&persist);
         self.publish();
+        // increment5-workload-harness: begin observed apply scope finish
+        #[cfg(feature = "workload-harness")]
+        if let Some(timing) = workload_timing {
+            timing.finish();
+        }
+        // increment5-workload-harness: end observed apply scope finish
         Ok(ApplyOutcome::Applied(persist))
     }
 
@@ -360,8 +636,16 @@ impl Reducer {
             event: Box::new(normalized),
             seen_at_ms: metadata.receipt_time_ms,
         });
+        // increment5-workload-harness: begin controller D4 timing start
+        #[cfg(feature = "workload-harness")]
+        let workload_d4_started = Instant::now();
+        // increment5-workload-harness: end controller D4 timing start
         diagnostic_deltas.post_dangling_announcement_components =
             crate::model::graph::dangling_announcement_components(&scratch.model);
+        // increment5-workload-harness: begin controller D4 timing finish
+        #[cfg(feature = "workload-harness")]
+        record_workload_timing_segment(WorkloadTimingSegment::D4, workload_d4_started.elapsed());
+        // increment5-workload-harness: end controller D4 timing finish
 
         Ok(MaterializedDelta {
             post_model: scratch.model,
@@ -1544,7 +1828,15 @@ impl Reducer {
     }
 
     fn recompute_dangling_announcement_components(&mut self) {
+        // increment5-workload-harness: begin reducer D4 timing start
+        #[cfg(feature = "workload-harness")]
+        let workload_d4_started = Instant::now();
+        // increment5-workload-harness: end reducer D4 timing start
         let count = crate::model::graph::dangling_announcement_components(&self.model);
+        // increment5-workload-harness: begin reducer D4 timing finish
+        #[cfg(feature = "workload-harness")]
+        record_workload_timing_segment(WorkloadTimingSegment::D4, workload_d4_started.elapsed());
+        // increment5-workload-harness: end reducer D4 timing finish
         self.model
             .controller_diagnostics_mut()
             .set_dangling_announcement_components(count);
@@ -1553,7 +1845,18 @@ impl Reducer {
     fn publish(&self) {
         #[cfg(test)]
         self.publish_count.set(self.publish_count.get() + 1);
+        // increment5-workload-harness: begin reducer clone publication timing start
+        #[cfg(feature = "workload-harness")]
+        let workload_publish_started = Instant::now();
+        // increment5-workload-harness: end reducer clone publication timing start
         self.publisher.send_replace(Arc::new(self.model.clone()));
+        // increment5-workload-harness: begin reducer clone publication timing finish
+        #[cfg(feature = "workload-harness")]
+        record_workload_timing_segment(
+            WorkloadTimingSegment::ModelClonePublish,
+            workload_publish_started.elapsed(),
+        );
+        // increment5-workload-harness: end reducer clone publication timing finish
     }
 }
 
