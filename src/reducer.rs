@@ -119,6 +119,9 @@ impl WorkloadTimingScope {
     pub(crate) fn finish(mut self) {
         let state = WORKLOAD_TIMING_STATE.with(|slot| slot.borrow_mut().take());
         let state = state.expect("workload timing scope must remain installed until finish");
+        // ControllerEvent's 2/2 counts are one D4 + clone/publish pair from the
+        // validate_controller_event scratch Self::new, then the post-transition
+        // D4 analysis and committed model publication.
         let expected_segments = match state.kind {
             WorkloadTimingKind::ControllerEvent => 2,
             WorkloadTimingKind::StartupRestore

@@ -1846,6 +1846,53 @@ fn repeated_control_records_reuse_first_ambient_load() {
 }
 
 #[test]
+fn trial_controls_reject_relative_roots() {
+    let rewrite_roots = |outcome: &mut ReferenceOutcomeV1, raw_root: &str| {
+        let scratch_root = format!("{raw_root}/scratch");
+        let trial = &mut outcome.document_mut().trials[0];
+        trial.raw.child_controls.scratch_root = scratch_root.clone();
+        trial.raw.child_controls.measured_environment.insert(
+            "HERDR_PERF_OUTPUT".to_owned(),
+            format!("{raw_root}/harness.json"),
+        );
+        trial.raw.child_controls.measured_environment.insert(
+            "HERDR_PERF_OBSERVER_HANDSHAKE".to_owned(),
+            format!("{raw_root}/observer-handshake"),
+        );
+        trial
+            .raw
+            .child_controls
+            .measured_environment
+            .insert("HERDR_PERF_SCRATCH_ROOT".to_owned(), scratch_root.clone());
+        trial.control_evidence.scratch_root = scratch_root;
+        trial.control_evidence.observer_environment.insert(
+            "HERDR_PERF_OBSERVER_CONTROL_OUTPUT".to_owned(),
+            format!("{raw_root}/observer-control.json"),
+        );
+        trial.control_evidence.observer_environment.insert(
+            "HERDR_PERF_PROCESS_TREE_OUTPUT".to_owned(),
+            format!("{raw_root}/process-tree.json"),
+        );
+    };
+
+    let mut relative = valid_synthetic_result();
+    rewrite_roots(&mut relative, "relative/sustained/trial-0001");
+    let mut noncanonical_absolute = valid_synthetic_result();
+    rewrite_roots(
+        &mut noncanonical_absolute,
+        "/a/../tmp/herdr-increment5/sustained/trial-0001",
+    );
+
+    assert_eq!(
+        [relative.validate(), noncanonical_absolute.validate()],
+        [
+            Err(ResultError::InvalidArtifact),
+            Err(ResultError::InvalidArtifact),
+        ]
+    );
+}
+
+#[test]
 fn trial_controls_reject_wrong_scenario_directory() {
     let mut wrong_scenario_directory = valid_synthetic_result();
     let trial = &mut wrong_scenario_directory.document_mut().trials[0];

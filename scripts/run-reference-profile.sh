@@ -1133,6 +1133,8 @@ probe_pidstat_mode() {
       ;;
     source)
       revalidate_source_fixture_bootstrap || return 20
+      # The attested pidstat shim is deliberately dual-interface: jq's --exit-status
+      # argv dispatches it to the Rust JSON validator helper; source has no jq role.
       jq_executable=$source_pidstat_executable
       ;;
     *) return 20 ;;

@@ -1528,6 +1528,8 @@ fn validate_trial_controls(
     let raw_root = scratch_root
         .strip_suffix("/scratch")
         .ok_or(ResultError::InvalidArtifact)?;
+    let scratch_root_path = std::path::Path::new(scratch_root.as_str());
+    let raw_root_path = std::path::Path::new(raw_root);
     let control_socket = trial
         .raw
         .child_controls
@@ -1544,7 +1546,15 @@ fn validate_trial_controls(
         scenario_spec(document.scenario).directory,
         trial.trial_index
     );
-    if !scratch_root.ends_with(&expected_suffix)
+    if !scratch_root_path.is_absolute()
+        || !raw_root_path.is_absolute()
+        || scratch_root_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+        || !scratch_root.ends_with(&expected_suffix)
         || !control_socket_path.is_absolute()
         || !control_socket.starts_with("/tmp/herdr-i5.")
         || control_socket_path.starts_with(raw_root)
