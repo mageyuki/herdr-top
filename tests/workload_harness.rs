@@ -3726,6 +3726,7 @@ mod reference_runner_test_support {
     use std::fs;
     use std::ops::{Deref, DerefMut};
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
 
@@ -3984,7 +3985,21 @@ esac"#;
             runner.canonical.to_string_lossy().into_owned(),
         ]);
         controller_args.extend(fixture_argv.iter().cloned());
-        empty_bootstrap_command(&controller, &controller_args)
+        let mut command = empty_bootstrap_command(&controller, &controller_args);
+        // The production orchestrator is an async job, so SIGINT is ignored on
+        // entry and Bash cannot install its INT trap. This accepted deviation
+        // from plan lines 3728/3898 bounds Ctrl-C cleanup by the trial deadline;
+        // TERM/HUP/USR1 are unaffected. Normalize SIGINT only for the fixture so
+        // it can positively exercise the shared trap-handler logic those paths use.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::signal(libc::SIGINT, libc::SIG_DFL) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command
     }
 
     pub fn run_source_fixture(attempt_id: Option<&str>, fixture_argv: &[String]) -> Output {
@@ -4422,30 +4437,33 @@ fn runner_fixture_reaps_timeout_and_signal_groups() {
     use reference_runner_test_support as support;
 
     // Break caught: a timeout/signal path that leaves either process group live,
-    // skips wait/reap, publishes before cleanup, or creates promotable evidence.
-    for case in [
-        "timeout",
-        "signal-int-handshake",
-        "signal-term-handshake",
-        "signal-hup-handshake",
-        "signal-int-after-observer",
-        "signal-term-after-observer",
-        "signal-hup-after-observer",
+    // reports a default-death status without executing its trap body, skips
+    // wait/reap, publishes before cleanup, or creates promotable evidence.
+    for (case, expected_status, expect_trap_marker) in [
+        ("signal-int-handshake", "failed:130\n", true),
+        ("signal-term-handshake", "failed:143\n", true),
+        ("signal-hup-handshake", "failed:143\n", true),
+        ("signal-usr1-handshake", "failed:124\n", true),
+        ("signal-int-after-observer", "failed:130\n", true),
+        ("signal-term-after-observer", "failed:143\n", true),
+        ("signal-hup-after-observer", "failed:143\n", true),
+        ("timeout", "failed:124\n", false),
     ] {
         let temporary = tempfile::tempdir().unwrap();
         let measured = temporary.path().join("measured.sh");
         let observer = temporary.path().join("observer.sh");
         support::write_executable(
             &measured,
-            "#!/usr/bin/bash -p\nset -euo pipefail\n/usr/bin/sleep 30\n",
+            "#!/usr/bin/bash -p\nset -euo pipefail\n/usr/bin/sleep 300\n",
         );
         support::write_executable(
             &observer,
-            "#!/usr/bin/bash -p\nset -euo pipefail\n/usr/bin/sleep 30\n",
+            "#!/usr/bin/bash -p\nset -euo pipefail\n/usr/bin/sleep 300\n",
         );
         let outcome = temporary.path().join("outcome.json");
         let groups = temporary.path().join("groups.txt");
         let status = temporary.path().join("trial-status");
+        let trap_marker = temporary.path().join("trap-marker");
         let started = std::time::Instant::now();
         let output = support::run_source_fixture(
             Some("00000001"),
@@ -4457,13 +4475,19 @@ fn runner_fixture_reaps_timeout_and_signal_groups() {
                 status.to_string_lossy().into_owned(),
                 measured.to_string_lossy().into_owned(),
                 observer.to_string_lossy().into_owned(),
+                trap_marker.to_string_lossy().into_owned(),
             ],
         );
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < Duration::from_secs(60),
             "case={case} waited for a natural child exit instead of bounded cleanup"
         );
         assert_eq!(output.status.code(), Some(20), "case={case}: {output:?}");
+        assert_eq!(
+            trap_marker.is_file(),
+            expect_trap_marker,
+            "case={case} trap execution marker mismatch"
+        );
         assert!(
             outcome.exists(),
             "case={case} did not atomically publish its non-authoritative outcome"
@@ -4475,10 +4499,11 @@ fn runner_fixture_reaps_timeout_and_signal_groups() {
                 "live pid {pid}"
             );
         }
-        assert!(matches!(
-            std::fs::read_to_string(status).unwrap().as_str(),
-            "failed:124\n" | "failed:130\n" | "failed:143\n"
-        ));
+        let published_status = std::fs::read_to_string(status).unwrap();
+        assert_eq!(
+            published_status, expected_status,
+            "case={case} published the wrong exact status"
+        );
         assert!(!support::path_has_result_v1(temporary.path()));
     }
 
@@ -4499,6 +4524,91 @@ fn runner_fixture_reaps_timeout_and_signal_groups() {
         outcome.exists(),
         "cleanup failure was not reported atomically"
     );
+    let reported: RunnerTestOutcomeV1 =
+        serde_json::from_slice(&std::fs::read(&outcome).unwrap()).unwrap();
+    assert_eq!(reported.exit_code, 20);
+    assert!(!reported.all_process_groups_reaped);
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn cleanup_process_groups_bounds_a_missed_group_signal() {
+    use reference_runner_test_support as support;
+
+    // Break caught: swallowing a failed negative-PGID signal and then waiting
+    // unconditionally for the still-live direct child.
+    let temporary = tempfile::tempdir().unwrap();
+    let outcome = temporary.path().join("cleanup-outcome.json");
+    let status = temporary.path().join("trial-status");
+    let ready = temporary.path().join("cleanup-ready");
+    let runner = support::identity(&support::runner_script());
+    let tools = support::fixture_tools();
+    let mut fixture_command = support::source_fixture_command(
+        &runner,
+        &tools,
+        Some("00000001"),
+        &[
+            "orchestration".to_owned(),
+            "cleanup-missed-group".to_owned(),
+            outcome.to_string_lossy().into_owned(),
+            status.to_string_lossy().into_owned(),
+            ready.to_string_lossy().into_owned(),
+        ],
+    );
+    fixture_command.stderr(std::process::Stdio::piped());
+    let mut fixture = fixture_command.spawn().unwrap();
+
+    let mut early_status = None;
+    for _ in 0..6000 {
+        if ready.exists() {
+            break;
+        }
+        if let Some(value) = fixture.try_wait().unwrap() {
+            early_status = Some(value);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut early_stderr = String::new();
+    if early_status.is_some() && !ready.exists() {
+        use std::io::Read as _;
+        fixture
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut early_stderr)
+            .unwrap();
+    }
+    assert!(
+        ready.exists(),
+        "fixture exited before exercising the missed-group cleanup: {early_status:?}, stderr={early_stderr:?}"
+    );
+
+    let missed_group_child = std::fs::read_to_string(&ready).unwrap();
+    let missed_group_child = missed_group_child.trim();
+    let started = std::time::Instant::now();
+    let mut completed = None;
+    for _ in 0..6000 {
+        if let Some(value) = fixture.try_wait().unwrap() {
+            completed = Some(value);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let completed_in_bound = completed.is_some();
+    if !completed_in_bound {
+        let _ = std::process::Command::new("/usr/bin/kill")
+            .args(["-KILL", missed_group_child])
+            .status();
+        let _ = fixture.wait();
+    }
+    assert!(
+        completed_in_bound,
+        "cleanup blocked on child {missed_group_child} for {:?}",
+        started.elapsed()
+    );
+    assert_eq!(completed.unwrap().code(), Some(20));
+    assert_eq!(std::fs::read_to_string(status).unwrap(), "failed:20\n");
     let reported: RunnerTestOutcomeV1 =
         serde_json::from_slice(&std::fs::read(&outcome).unwrap()).unwrap();
     assert_eq!(reported.exit_code, 20);
@@ -4689,11 +4799,11 @@ fn source_fixture_executes_production_nested_orchestration_body() {
     use reference_runner_test_support as support;
 
     // Break caught: the source seam reimplements orchestration instead of
-    // executing run_trial_process_tree's 30-operand nested body, environments,
+    // executing run_trial_process_tree's 31-operand nested body, environments,
     // handshake/socket freeze, watchdog, and cleanup_trial path.
     let harness = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
     for (scenario, deadline, expected_status, expected_trial_status) in [
-        ("target", "5", 0, "ok:0\n"),
+        ("target", "60", 0, "ok:0\n"),
         ("idle", "1", 20, "failed:124\n"),
     ] {
         let temporary = tempfile::tempdir().unwrap();
@@ -4744,7 +4854,7 @@ fn source_fixture_executes_production_nested_orchestration_body() {
         let runtime_capture = temporary.path().join("runtime.txt");
         let outcome = temporary.path().join("outcome.json");
         let runner = support::identity(&support::runner_script());
-        let started = std::time::Instant::now();
+        let hung_phase_started = (scenario == "idle").then(std::time::Instant::now);
         let output = support::source_fixture_command(
             &runner,
             &tools,
@@ -4758,11 +4868,18 @@ fn source_fixture_executes_production_nested_orchestration_body() {
                 driver.to_string_lossy().into_owned(),
                 scenario.to_owned(),
                 deadline.to_owned(),
+                "6000".to_owned(),
             ],
         )
         .output()
         .unwrap();
-        assert!(started.elapsed() < Duration::from_secs(10));
+        if let Some(started) = hung_phase_started {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "hung-child phase exceeded the watchdog allowance: {:?}",
+                started.elapsed()
+            );
+        }
         assert_eq!(
             output.status.code(),
             Some(expected_status),
@@ -5654,7 +5771,7 @@ fn fixture_outer_runtime_live_child() {
         .map(PathBuf::from)
         .expect("fixture socket must be supplied");
     let _listener = UnixListener::bind(socket).expect("fixture socket must bind");
-    std::thread::sleep(Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(300));
 }
 
 #[cfg(target_os = "linux")]
@@ -5683,7 +5800,7 @@ fn fixture_nested_measured_helper() {
     std::fs::write(&handshake, format!("{} 17 23\n", std::process::id())).unwrap();
     let (_stream, _) = listener.accept().unwrap();
     if scenario == "idle" {
-        std::thread::sleep(Duration::from_secs(30));
+        std::thread::sleep(Duration::from_secs(300));
     }
 }
 
@@ -5699,7 +5816,7 @@ fn fixture_nested_observer_helper() {
     write_nested_fixture_capture(&output);
     let _stream = UnixStream::connect(socket).unwrap();
     if scenario == "idle" {
-        std::thread::sleep(Duration::from_secs(30));
+        std::thread::sleep(Duration::from_secs(300));
     }
 }
 

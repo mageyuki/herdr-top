@@ -201,24 +201,59 @@ select_process_status() {
 }
 
 wait_process_pair() {
-  [[ $# -eq 2 ]] || return 20
+  [[ $# -eq 4 ]] || return 20
   local measured_pid=$1
   local observer_pid=$2
-  local measured_status observer_status
+  local supervisor_pid=$3
+  local supervisor_status=$4
+  local completed_pid completed_status measured_status= observer_status=
+  local pending_pid found
+  local -a pending_pids=("$measured_pid" "$observer_pid" "$supervisor_pid")
+  local -a next_pending_pids=()
   [[ $measured_pid =~ ^[1-9][0-9]*$ && $observer_pid =~ ^[1-9][0-9]*$ ]] || return 20
-  set +e
-  wait "$measured_pid"
-  measured_status=$?
-  wait "$observer_pid"
-  observer_status=$?
-  set -e
+  [[ $supervisor_pid =~ ^[1-9][0-9]*$ ]] || return 20
+  [[ $supervisor_status =~ ^[1-9][0-9]{0,2}$ && $supervisor_status -le 255 ]] || return 20
+  [[ $measured_pid != "$observer_pid" && $measured_pid != "$supervisor_pid" ]] || return 20
+  [[ $observer_pid != "$supervisor_pid" ]] || return 20
+  # A supervisor-first tie-break requires callers to spawn the supervisor before
+  # the workers so Bash records its completion first in the job table.
+  supervisor_completed_first=false
+  while [[ -z $measured_status || -z $observer_status ]]; do
+    completed_pid=
+    set +e
+    wait -n -p completed_pid "${pending_pids[@]}"
+    completed_status=$?
+    set -e
+    [[ $completed_pid =~ ^[1-9][0-9]*$ ]] || return 20
+    found=false
+    next_pending_pids=()
+    for pending_pid in "${pending_pids[@]}"; do
+      if [[ $pending_pid == "$completed_pid" ]]; then
+        found=true
+      else
+        next_pending_pids+=("$pending_pid")
+      fi
+    done
+    [[ $found == true ]] || return 20
+    pending_pids=("${next_pending_pids[@]}")
+    case "$completed_pid" in
+      "$measured_pid") measured_status=$completed_status ;;
+      "$observer_pid") observer_status=$completed_status ;;
+      "$supervisor_pid")
+        supervisor_completed_first=true
+        selected_process_status=$supervisor_status
+        return 0
+        ;;
+      *) return 20 ;;
+    esac
+  done
   select_process_status "$measured_status" "$observer_status" || return 20
 }
 
 install_orchestration_signal_traps() {
-  trap 'exit 130' INT
-  trap 'exit 143' TERM HUP
-  trap 'exit 124' USR1
+  trap 'if [[ ${HERDR_PERF_RUNNER_TEST_TRAP_MARKER+x} == x ]]; then : 2>/dev/null >"$HERDR_PERF_RUNNER_TEST_TRAP_MARKER" || :; fi; exit 130' INT
+  trap 'if [[ ${HERDR_PERF_RUNNER_TEST_TRAP_MARKER+x} == x ]]; then : 2>/dev/null >"$HERDR_PERF_RUNNER_TEST_TRAP_MARKER" || :; fi; exit 143' TERM HUP
+  trap 'if [[ ${HERDR_PERF_RUNNER_TEST_TRAP_MARKER+x} == x ]]; then : 2>/dev/null >"$HERDR_PERF_RUNNER_TEST_TRAP_MARKER" || :; fi; exit 124' USR1
 }
 
 run_orchestration_signal_probe() {
@@ -268,6 +303,10 @@ validate_pidstat_status_pair() {
   esac
 }
 
+fixture_no_sleep() {
+  return 1
+}
+
 cleanup_process_groups() {
   [[ $# -eq 3 ]] || return 20
   local sleep_executable=$1
@@ -277,7 +316,9 @@ cleanup_process_groups() {
   process_groups_reaped=false
   for group in "$measured_pid" "$observer_pid"; do
     [[ -n $group ]] || continue
-    builtin kill -TERM -- "-$group" 2>/dev/null || true
+    if ! builtin kill -TERM -- "-$group" 2>/dev/null; then
+      ! builtin kill -0 -- "-$group" 2>/dev/null || cleanup_status=20
+    fi
   done
   for ((attempt=0; attempt<100; attempt++)); do
     any_live=false
@@ -290,22 +331,32 @@ cleanup_process_groups() {
   done
   for group in "$measured_pid" "$observer_pid"; do
     [[ -n $group ]] || continue
-    builtin kill -KILL -- "-$group" 2>/dev/null || true
+    if ! builtin kill -KILL -- "-$group" 2>/dev/null; then
+      ! builtin kill -0 -- "-$group" 2>/dev/null || cleanup_status=20
+    fi
   done
-  for child in "$measured_pid" "$observer_pid"; do
-    [[ -n $child ]] || continue
-    set +e
-    wait "$child" 2>/dev/null
-    set -e
-  done
-  for ((attempt=0; attempt<100; attempt++)); do
+  for ((attempt=0; attempt<6000; attempt++)); do
     any_live=false
+    for child in "$measured_pid" "$observer_pid"; do
+      [[ -n $child ]] || continue
+      if builtin kill -0 "$child" 2>/dev/null; then any_live=true; fi
+    done
     for group in "$measured_pid" "$observer_pid"; do
       [[ -n $group ]] || continue
       if builtin kill -0 -- "-$group" 2>/dev/null; then any_live=true; fi
     done
     [[ $any_live == false ]] && break
     "$sleep_executable" 0.01 || cleanup_status=20
+  done
+  for child in "$measured_pid" "$observer_pid"; do
+    [[ -n $child ]] || continue
+    if builtin kill -0 "$child" 2>/dev/null; then
+      cleanup_status=20
+      continue
+    fi
+    set +e
+    wait "$child" 2>/dev/null
+    set -e
   done
   for group in "$measured_pid" "$observer_pid"; do
     [[ -n $group ]] || continue
@@ -322,7 +373,7 @@ wait_fixture_group_ready() {
   [[ $# -eq 1 ]] || return 20
   local group=$1
   local attempt
-  for ((attempt=0; attempt<100; attempt++)); do
+  for ((attempt=0; attempt<6000; attempt++)); do
     if builtin kill -0 -- "-$group" 2>/dev/null; then return 0; fi
     builtin kill -0 "$group" 2>/dev/null || return 20
     "$source_sleep_executable" 0.01 || return 20
@@ -376,18 +427,28 @@ launch_fixture_handshake_phase() {
 }
 
 run_fixture_process_case() {
-  [[ $# -eq 7 ]] || return 20
+  [[ $# -eq 8 ]] || return 20
   local mode=$1
   local outcome=$2
   local groups_output=$3
   local trial_status_output=$4
   local measured_callback=$5
   local observer_callback=$6
-  local requested_status=$7
-  local measured_status observer_status watchdog_pid orchestrator_pid cleanup_status=0
+  local trap_marker_path=$7
+  local requested_status=$8
+  local measured_status observer_status watchdog_pid cleanup_status=0
+  local wait_attempt
   local cleanup_measured_pid cleanup_observer_pid
   fixture_measured_pid=
   fixture_observer_pid=
+  case "$mode" in
+    timeout|signal-*)
+      [[ $trap_marker_path != - ]] || return 20
+      validate_fixture_output_path "$trap_marker_path" || return 20
+      ;;
+    precedence) [[ $trap_marker_path == - ]] || return 20 ;;
+    *) return 20 ;;
+  esac
   case "$mode" in
     signal-*-handshake)
       launch_fixture_handshake_phase "$groups_output" "$measured_callback" || return 20
@@ -404,33 +465,57 @@ run_fixture_process_case() {
   cleanup_observer_pid=${fixture_observer_pid-}
   case "$mode" in
     precedence)
-      wait_process_pair "$fixture_measured_pid" "$fixture_observer_pid" || return 20
-      requested_status=$selected_process_status
+      "$source_sleep_executable" 300 &
+      watchdog_pid=$!
+      if wait_process_pair \
+        "$fixture_measured_pid" "$fixture_observer_pid" "$watchdog_pid" 124; then
+        requested_status=$selected_process_status
+        [[ $supervisor_completed_first == false ]] || requested_status=20
+      else
+        requested_status=20
+      fi
+      builtin kill "$watchdog_pid" 2>/dev/null || true
+      wait "$watchdog_pid" 2>/dev/null || true
+      watchdog_pid=
       ;;
     timeout)
-      set +e
-      (
-        "$source_sleep_executable" 1 || exit 20
-        run_orchestration_signal_probe USR1
-      )
-      requested_status=$?
-      set -e
+      "$source_sleep_executable" 0.01 &
+      watchdog_pid=$!
+      for ((wait_attempt=0; wait_attempt<6000; wait_attempt++)); do
+        builtin kill -0 "$watchdog_pid" 2>/dev/null || break
+        "$source_sleep_executable" 0.01 || requested_status=20
+      done
+      if builtin kill -0 "$watchdog_pid" 2>/dev/null; then
+        requested_status=20
+      elif wait_process_pair \
+        "$fixture_measured_pid" "$fixture_observer_pid" "$watchdog_pid" 124; then
+        requested_status=$selected_process_status
+        [[ $supervisor_completed_first == true ]] || requested_status=20
+      else
+        requested_status=20
+      fi
       ;;
     signal-int-handshake|signal-int-after-observer)
       set +e
-      ( run_orchestration_signal_probe INT )
+      ( HERDR_PERF_RUNNER_TEST_TRAP_MARKER=$trap_marker_path run_orchestration_signal_probe INT )
       requested_status=$?
       set -e
       ;;
     signal-term-handshake|signal-term-after-observer)
       set +e
-      ( run_orchestration_signal_probe TERM )
+      ( HERDR_PERF_RUNNER_TEST_TRAP_MARKER=$trap_marker_path run_orchestration_signal_probe TERM )
       requested_status=$?
       set -e
       ;;
     signal-hup-handshake|signal-hup-after-observer)
       set +e
-      ( run_orchestration_signal_probe HUP )
+      ( HERDR_PERF_RUNNER_TEST_TRAP_MARKER=$trap_marker_path run_orchestration_signal_probe HUP )
+      requested_status=$?
+      set -e
+      ;;
+    signal-usr1-handshake)
+      set +e
+      ( HERDR_PERF_RUNNER_TEST_TRAP_MARKER=$trap_marker_path run_orchestration_signal_probe USR1 )
       requested_status=$?
       set -e
       ;;
@@ -453,6 +538,7 @@ run_orchestration_fixture() {
   contain_attempt_id || return 20
   revalidate_source_fixture_bootstrap || return 20
   [[ ${HERDR_INCREMENT5_ATTEMPT_ID+x} != x ]] || return 20
+  [[ ${HERDR_PERF_RUNNER_TEST_TRAP_MARKER+x} != x ]] || return 20
   local mode=${1-}
   shift || return 20
   case "$mode" in
@@ -537,7 +623,7 @@ run_orchestration_fixture() {
         "$runtime_callback" fixture_outer_runtime_live_child --exact --ignored \
           --test-threads=1 &
       active_measured_pid=$!
-      for ((runtime_attempt=0; runtime_attempt<500; runtime_attempt++)); do
+      for ((runtime_attempt=0; runtime_attempt<6000; runtime_attempt++)); do
         [[ -S $active_runtime_socket ]] && break
         builtin kill -0 "$active_measured_pid" 2>/dev/null || return 20
         "$source_sleep_executable" 0.01 || return 20
@@ -556,13 +642,14 @@ run_orchestration_fixture() {
       return 20
       ;;
     nested-trial)
-      [[ $# -eq 6 ]] || return 20
+      [[ $# -eq 7 ]] || return 20
       local nested_outcome=$1
       local nested_trial_root=$2
       local nested_runtime_capture=$3
       local nested_test_binary=$4
       local nested_scenario=$5
       local nested_deadline=$6
+      local nested_handshake_attempt_limit=$7
       local nested_status
       validate_fixture_output_path "$nested_outcome" || return 20
       validate_fixture_output_path "$nested_runtime_capture" || return 20
@@ -570,6 +657,7 @@ run_orchestration_fixture() {
       [[ $nested_test_binary == /* && -f $nested_test_binary && -x $nested_test_binary ]] || return 20
       case "$nested_scenario" in target|idle) ;; *) return 20 ;; esac
       [[ $nested_deadline =~ ^[1-9][0-9]*$ ]] || return 20
+      [[ $nested_handshake_attempt_limit =~ ^[1-9][0-9]*$ ]] || return 20
       bind_source_trial_tools || return 20
       test_binary=$nested_test_binary
       pidstat_child_status_mode=propagates_child_status
@@ -586,7 +674,8 @@ run_orchestration_fixture() {
         "$nested_trial_root/observer-stderr" "$nested_trial_root/pidstat.json" \
         "$nested_trial_root/pidstat-stderr" "$nested_trial_root/trial-status" \
         "$trial_scratch_root" "$active_runtime_dir" "$nested_scenario" baseline \
-        0123456789abcdef0123456789abcdef01234567 - "$nested_deadline" || return 20
+        0123456789abcdef0123456789abcdef01234567 - "$nested_deadline" \
+        "$nested_handshake_attempt_limit" || return 20
       safe_outer_runtime_state_cleanup || return 20
       safe_outer_runtime_cleanup || return 20
       clear_outer_runtime_traps || return 20
@@ -600,13 +689,37 @@ run_orchestration_fixture() {
       local cleanup_outcome=$1
       local cleanup_status_path=$2
       "$source_setsid_executable" "$source_bash_executable" -p -c \
-        'trap "" HUP TERM; "$1" 30 </dev/null >/dev/null 2>&1' \
+        'trap "" HUP TERM; "$1" 300 </dev/null >/dev/null 2>&1' \
         herdr-i5-cleanup-failure "$source_sleep_executable" &
       local cleanup_fixture_pid=$!
       wait_fixture_group_ready "$cleanup_fixture_pid" || return 20
-      cleanup_process_groups "$source_pidstat_executable" "$cleanup_fixture_pid" '' && return 20
+      cleanup_process_groups fixture_no_sleep "$cleanup_fixture_pid" '' && return 20
       publish_trial_status "$cleanup_status_path" 20 || return 20
       publish_runner_test_outcome "$cleanup_outcome" 20 "$process_groups_reaped" || return 20
+      return 20
+      ;;
+    cleanup-missed-group)
+      [[ $# -eq 3 ]] || return 20
+      local missed_group_outcome=$1
+      local missed_group_status_path=$2
+      local missed_group_ready=$3
+      local missed_group_pid missed_group_cleanup_status
+      validate_fixture_output_path "$missed_group_outcome" || return 20
+      validate_fixture_output_path "$missed_group_status_path" || return 20
+      validate_fixture_output_path "$missed_group_ready" || return 20
+      "$source_sleep_executable" 300 &
+      missed_group_pid=$!
+      builtin printf '%s\n' "$missed_group_pid" >"$missed_group_ready" || return 20
+      set +e
+      cleanup_process_groups fixture_no_sleep "$missed_group_pid" ''
+      missed_group_cleanup_status=$?
+      set -e
+      builtin kill -KILL "$missed_group_pid" 2>/dev/null || true
+      wait "$missed_group_pid" 2>/dev/null || true
+      [[ $missed_group_cleanup_status -eq 20 ]] || return 20
+      publish_trial_status "$missed_group_status_path" 20 || return 20
+      publish_runner_test_outcome \
+        "$missed_group_outcome" 20 "$process_groups_reaped" || return 20
       return 20
       ;;
     baseline-set)
@@ -651,10 +764,14 @@ run_orchestration_fixture() {
       "$source_mv_executable" -T -- "$temporary" "$pidstat_mode_output" || return 20
       publish_runner_test_outcome "$pidstat_outcome" 0 true || return 20
       ;;
-    timeout|signal-int-handshake|signal-term-handshake|signal-hup-handshake|\
-      signal-int-after-observer|signal-term-after-observer|signal-hup-after-observer|precedence)
+    timeout|signal-int-handshake|signal-term-handshake|signal-hup-handshake|signal-usr1-handshake|\
+      signal-int-after-observer|signal-term-after-observer|signal-hup-after-observer)
+      [[ $# -eq 6 ]] || return 20
+      run_fixture_process_case "$mode" "$1" "$2" "$3" "$4" "$5" "$6" 0 || return 20
+      ;;
+    precedence)
       [[ $# -eq 5 ]] || return 20
-      run_fixture_process_case "$mode" "$1" "$2" "$3" "$4" "$5" 0
+      run_fixture_process_case "$mode" "$1" "$2" "$3" "$4" "$5" - 0 || return 20
       ;;
     *) return 20 ;;
   esac
@@ -1376,7 +1493,7 @@ read_trial_status() {
 }
 
 run_trial_process_tree() {
-  [[ $# -eq 20 ]] || return 20
+  [[ $# -eq 21 ]] || return 20
   local time_output=$1
   local child_stdout=$2
   local child_stderr=$3
@@ -1397,7 +1514,9 @@ run_trial_process_tree() {
   local subject=${18}
   local baseline_results_root=${19}
   local deadline=${20}
+  local handshake_attempt_limit=${21}
   local pidstat_status shared_orchestration_functions
+  [[ $handshake_attempt_limit =~ ^[1-9][0-9]*$ ]] || return 20
 
   shared_orchestration_functions="$(
     declare -f publish_trial_status publish_outer_runtime_state cleanup_process_groups \
@@ -1411,6 +1530,7 @@ run_trial_process_tree() {
     "$auth_pidstat_executable" -u -r -T ALL -o JSON 1 -e \
     "$auth_bash_executable" -p -c "$shared_orchestration_functions"$'\n''
       set -euo pipefail
+      [[ $# -eq 31 ]] || exit 20
       time_output=$1
       test_binary=$2
       child_stdout=$3
@@ -1441,6 +1561,7 @@ run_trial_process_tree() {
       time_executable=${28}
       id_executable=${29}
       mv_executable=${30}
+      handshake_attempt_limit=${31}
       readonly time_output test_binary child_stdout child_stderr scenario subject
       readonly harness_output stage baseline_results_root_arg observer_handshake
       readonly observer_control_socket observer_control_output process_tree_output
@@ -1448,6 +1569,8 @@ run_trial_process_tree() {
       readonly trial_runtime_dir trial_status_output stat_executable unlink_executable rmdir_executable
       readonly sleep_executable setsid_executable env_executable taskset_executable
       readonly prlimit_executable time_executable id_executable mv_executable
+      readonly handshake_attempt_limit
+      [[ $handshake_attempt_limit =~ ^[1-9][0-9]*$ ]] || exit 20
       safe_cleanup_runtime_socket() {
         local current
         if [[ ! -e $observer_control_socket && ! -L $observer_control_socket ]]; then return 0; fi
@@ -1492,11 +1615,11 @@ run_trial_process_tree() {
       }
       trap cleanup_trial EXIT
       install_orchestration_signal_traps || exit 20
-      orchestrator_pid=$BASHPID
+      # Launch the watchdog before either worker; wait_process_pair relies on
+      # that job-table order when deadline and worker completions tie.
       (
         trap - EXIT INT TERM HUP USR1
         "$sleep_executable" "$trial_deadline_seconds"
-        builtin kill -USR1 "$orchestrator_pid" 2>/dev/null || true
       ) &
       watchdog_pid=$!
       measured_environment=(
@@ -1519,7 +1642,7 @@ run_trial_process_tree() {
       measured_wrapper_pid=$!
       publish_outer_runtime_state \
         "$outer_runtime_state" "$mv_executable" "$measured_wrapper_pid" - - || exit 20
-      for ((attempt=0; attempt<500; attempt++)); do
+      for ((attempt=0; attempt<handshake_attempt_limit; attempt++)); do
         [[ -s $observer_handshake ]] && break
         builtin kill -0 "$measured_wrapper_pid" 2>/dev/null || break
         "$sleep_executable" 0.01
@@ -1548,7 +1671,11 @@ run_trial_process_tree() {
       observer_pid=$!
       publish_outer_runtime_state "$outer_runtime_state" "$mv_executable" \
         "$measured_wrapper_pid" "$observer_pid" "$frozen_socket_identity" || exit 20
-      wait_process_pair "$measured_wrapper_pid" "$observer_pid" || exit 20
+      wait_process_pair \
+        "$measured_wrapper_pid" "$observer_pid" "$watchdog_pid" 124 || exit 20
+      if [[ $supervisor_completed_first == true ]]; then
+        exit "$selected_process_status"
+      fi
       measured_wrapper_pid=
       observer_pid=
       builtin kill "$watchdog_pid" 2>/dev/null || true
@@ -1563,7 +1690,7 @@ run_trial_process_tree() {
       "$auth_stat_executable" "$auth_unlink_executable" "$auth_rmdir_executable" \
       "$auth_sleep_executable" "$auth_setsid_executable" "$auth_env_executable" \
       "$auth_taskset_executable" "$auth_prlimit_executable" "$auth_time_executable" \
-    "$auth_id_executable" "$auth_mv_executable" \
+      "$auth_id_executable" "$auth_mv_executable" "$handshake_attempt_limit" \
       >"$pidstat_output" 2>"$pidstat_stderr" &
   active_orchestration_pid=$!
   wait "$active_orchestration_pid"
@@ -1668,7 +1795,7 @@ run_one_trial() {
     "$trial_root/observer-stdout" "$trial_root/observer-stderr" \
     "$trial_root/pidstat.json" "$trial_root/pidstat-stderr" "$trial_root/trial-status" \
     "$trial_scratch_root" "$active_runtime_dir" "$scenario" "$runner_stage" "$runner_subject" \
-    "$baseline_arg" "$trial_deadline_seconds" || return 20
+    "$baseline_arg" "$trial_deadline_seconds" 500 || return 20
   if ! safe_outer_runtime_cleanup; then
     clear_outer_runtime_traps
     return 20
