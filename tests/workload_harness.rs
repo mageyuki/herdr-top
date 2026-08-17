@@ -6234,6 +6234,14 @@ fn source_fixture_executes_production_nested_orchestration_body() {
             std::fs::read_to_string(trial_root.join("trial-status")).unwrap(),
             expected_trial_status
         );
+        if expected_status == 0 {
+            let orchestrator_stderr =
+                std::fs::read_to_string(trial_root.join("pidstat-stderr")).unwrap();
+            assert_eq!(
+                orchestrator_stderr, "",
+                "successful production orchestration emitted stderr"
+            );
+        }
         let runtime_bytes = std::fs::read_to_string(runtime_capture).unwrap();
         let mut runtime_lines = runtime_bytes.lines();
         let runtime = PathBuf::from(runtime_lines.next().unwrap());

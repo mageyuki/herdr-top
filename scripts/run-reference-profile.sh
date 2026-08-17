@@ -147,54 +147,57 @@ publish_runner_test_outcome() {
 
 publish_trial_status() {
   [[ $# -eq 2 || $# -eq 3 ]] || return 20
-  local output=$1
-  local status=$2
-  local mv_executable=${3-${source_mv_executable-}}
-  local token temporary
-  [[ $mv_executable == /* ]] || return 20
-  case "$status" in
-    0) token=ok:0 ;;
+  local herdr_i5_injected_output=$1
+  local herdr_i5_injected_status=$2
+  local herdr_i5_injected_mv_executable=${3-${source_mv_executable-}}
+  local herdr_i5_injected_token herdr_i5_injected_temporary
+  [[ $herdr_i5_injected_mv_executable == /* ]] || return 20
+  case "$herdr_i5_injected_status" in
+    0) herdr_i5_injected_token=ok:0 ;;
     ''|*[!0-9]*) return 20 ;;
-    *) [[ $status -ge 1 && $status -le 255 ]] || return 20
-       [[ $status == "${status#0}" ]] || return 20
-       token="failed:$status" ;;
+    *) [[ $herdr_i5_injected_status -ge 1 && $herdr_i5_injected_status -le 255 ]] || return 20
+       [[ $herdr_i5_injected_status == "${herdr_i5_injected_status#0}" ]] || return 20
+       herdr_i5_injected_token="failed:$herdr_i5_injected_status" ;;
   esac
-  [[ $output == /* && ${output##*/} != result-v1.json ]] || return 20
-  [[ ! -e $output && ! -L $output ]] || return 20
-  temporary="${output}.tmp.${BASHPID}"
-  [[ ! -e $temporary && ! -L $temporary ]] || return 20
-  builtin printf '%s\n' "$token" >"$temporary" || return 20
-  "$mv_executable" -T -- "$temporary" "$output"
+  [[ $herdr_i5_injected_output == /* && ${herdr_i5_injected_output##*/} != result-v1.json ]] || return 20
+  [[ ! -e $herdr_i5_injected_output && ! -L $herdr_i5_injected_output ]] || return 20
+  herdr_i5_injected_temporary="${herdr_i5_injected_output}.tmp.${BASHPID}"
+  [[ ! -e $herdr_i5_injected_temporary && ! -L $herdr_i5_injected_temporary ]] || return 20
+  builtin printf '%s\n' "$herdr_i5_injected_token" >"$herdr_i5_injected_temporary" || return 20
+  "$herdr_i5_injected_mv_executable" -T -- \
+    "$herdr_i5_injected_temporary" "$herdr_i5_injected_output"
 }
 
 publish_outer_runtime_state() {
   [[ $# -eq 5 ]] || return 20
-  local output=$1
-  local mv_executable=$2
-  local measured=$3
-  local observer=$4
-  local socket_identity=$5
-  local temporary="${output}.tmp.${BASHPID}"
-  [[ $output == /* && $mv_executable == /* ]] || return 20
-  [[ $measured == - || $measured =~ ^[1-9][0-9]*$ ]] || return 20
-  [[ $observer == - || $observer =~ ^[1-9][0-9]*$ ]] || return 20
-  [[ $socket_identity == - || $socket_identity == *:*:*:*:* ]] || return 20
-  [[ ! -L $output && ! -e $temporary && ! -L $temporary ]] || return 20
-  builtin printf '%s %s %s\n' "$measured" "$observer" "$socket_identity" \
-    >"$temporary" || return 20
-  "$mv_executable" -T -- "$temporary" "$output"
+  local herdr_i5_injected_output=$1
+  local herdr_i5_injected_mv_executable=$2
+  local herdr_i5_injected_measured=$3
+  local herdr_i5_injected_observer=$4
+  local herdr_i5_injected_socket_identity=$5
+  local herdr_i5_injected_temporary="${herdr_i5_injected_output}.tmp.${BASHPID}"
+  [[ $herdr_i5_injected_output == /* && $herdr_i5_injected_mv_executable == /* ]] || return 20
+  [[ $herdr_i5_injected_measured == - || $herdr_i5_injected_measured =~ ^[1-9][0-9]*$ ]] || return 20
+  [[ $herdr_i5_injected_observer == - || $herdr_i5_injected_observer =~ ^[1-9][0-9]*$ ]] || return 20
+  [[ $herdr_i5_injected_socket_identity == - || $herdr_i5_injected_socket_identity == *:*:*:*:* ]] || return 20
+  [[ ! -L $herdr_i5_injected_output && ! -e $herdr_i5_injected_temporary && ! -L $herdr_i5_injected_temporary ]] || return 20
+  builtin printf '%s %s %s\n' "$herdr_i5_injected_measured" \
+    "$herdr_i5_injected_observer" "$herdr_i5_injected_socket_identity" \
+    >"$herdr_i5_injected_temporary" || return 20
+  "$herdr_i5_injected_mv_executable" -T -- \
+    "$herdr_i5_injected_temporary" "$herdr_i5_injected_output"
 }
 
 select_process_status() {
   [[ $# -eq 2 ]] || return 20
-  local measured_status=$1
-  local observer_status=$2
-  [[ $measured_status =~ ^(0|[1-9][0-9]{0,2})$ && $measured_status -le 255 ]] || return 20
-  [[ $observer_status =~ ^(0|[1-9][0-9]{0,2})$ && $observer_status -le 255 ]] || return 20
-  if [[ $measured_status -ne 0 ]]; then
-    selected_process_status=$measured_status
-  elif [[ $observer_status -ne 0 ]]; then
-    selected_process_status=$observer_status
+  local herdr_i5_injected_measured_status=$1
+  local herdr_i5_injected_observer_status=$2
+  [[ $herdr_i5_injected_measured_status =~ ^(0|[1-9][0-9]{0,2})$ && $herdr_i5_injected_measured_status -le 255 ]] || return 20
+  [[ $herdr_i5_injected_observer_status =~ ^(0|[1-9][0-9]{0,2})$ && $herdr_i5_injected_observer_status -le 255 ]] || return 20
+  if [[ $herdr_i5_injected_measured_status -ne 0 ]]; then
+    selected_process_status=$herdr_i5_injected_measured_status
+  elif [[ $herdr_i5_injected_observer_status -ne 0 ]]; then
+    selected_process_status=$herdr_i5_injected_observer_status
   else
     selected_process_status=0
   fi
@@ -202,52 +205,63 @@ select_process_status() {
 
 wait_process_pair() {
   [[ $# -eq 4 ]] || return 20
-  local measured_pid=$1
-  local observer_pid=$2
-  local supervisor_pid=$3
-  local supervisor_status=$4
-  local completed_pid completed_status measured_status= observer_status=
-  local pending_pid found
-  local -a pending_pids=("$measured_pid" "$observer_pid" "$supervisor_pid")
-  local -a next_pending_pids=()
-  [[ $measured_pid =~ ^[1-9][0-9]*$ && $observer_pid =~ ^[1-9][0-9]*$ ]] || return 20
-  [[ $supervisor_pid =~ ^[1-9][0-9]*$ ]] || return 20
-  [[ $supervisor_status =~ ^[1-9][0-9]{0,2}$ && $supervisor_status -le 255 ]] || return 20
-  [[ $measured_pid != "$observer_pid" && $measured_pid != "$supervisor_pid" ]] || return 20
-  [[ $observer_pid != "$supervisor_pid" ]] || return 20
+  local herdr_i5_injected_measured_pid=$1
+  local herdr_i5_injected_observer_pid=$2
+  local herdr_i5_injected_supervisor_pid=$3
+  local herdr_i5_injected_supervisor_status=$4
+  local herdr_i5_injected_completed_pid herdr_i5_injected_completed_status
+  local herdr_i5_injected_measured_status= herdr_i5_injected_observer_status=
+  local herdr_i5_injected_pending_pid herdr_i5_injected_found
+  local -a herdr_i5_injected_pending_pids=(
+    "$herdr_i5_injected_measured_pid"
+    "$herdr_i5_injected_observer_pid"
+    "$herdr_i5_injected_supervisor_pid"
+  )
+  local -a herdr_i5_injected_next_pending_pids=()
+  [[ $herdr_i5_injected_measured_pid =~ ^[1-9][0-9]*$ && $herdr_i5_injected_observer_pid =~ ^[1-9][0-9]*$ ]] || return 20
+  [[ $herdr_i5_injected_supervisor_pid =~ ^[1-9][0-9]*$ ]] || return 20
+  [[ $herdr_i5_injected_supervisor_status =~ ^[1-9][0-9]{0,2}$ && $herdr_i5_injected_supervisor_status -le 255 ]] || return 20
+  [[ $herdr_i5_injected_measured_pid != "$herdr_i5_injected_observer_pid" && $herdr_i5_injected_measured_pid != "$herdr_i5_injected_supervisor_pid" ]] || return 20
+  [[ $herdr_i5_injected_observer_pid != "$herdr_i5_injected_supervisor_pid" ]] || return 20
   # A supervisor-first tie-break requires callers to spawn the supervisor before
   # the workers so Bash records its completion first in the job table.
   supervisor_completed_first=false
-  while [[ -z $measured_status || -z $observer_status ]]; do
-    completed_pid=
+  while [[ -z $herdr_i5_injected_measured_status || -z $herdr_i5_injected_observer_status ]]; do
+    herdr_i5_injected_completed_pid=
     set +e
-    wait -n -p completed_pid "${pending_pids[@]}"
-    completed_status=$?
+    wait -n -p herdr_i5_injected_completed_pid \
+      "${herdr_i5_injected_pending_pids[@]}"
+    herdr_i5_injected_completed_status=$?
     set -e
-    [[ $completed_pid =~ ^[1-9][0-9]*$ ]] || return 20
-    found=false
-    next_pending_pids=()
-    for pending_pid in "${pending_pids[@]}"; do
-      if [[ $pending_pid == "$completed_pid" ]]; then
-        found=true
+    [[ $herdr_i5_injected_completed_pid =~ ^[1-9][0-9]*$ ]] || return 20
+    herdr_i5_injected_found=false
+    herdr_i5_injected_next_pending_pids=()
+    for herdr_i5_injected_pending_pid in "${herdr_i5_injected_pending_pids[@]}"; do
+      if [[ $herdr_i5_injected_pending_pid == "$herdr_i5_injected_completed_pid" ]]; then
+        herdr_i5_injected_found=true
       else
-        next_pending_pids+=("$pending_pid")
+        herdr_i5_injected_next_pending_pids+=("$herdr_i5_injected_pending_pid")
       fi
     done
-    [[ $found == true ]] || return 20
-    pending_pids=("${next_pending_pids[@]}")
-    case "$completed_pid" in
-      "$measured_pid") measured_status=$completed_status ;;
-      "$observer_pid") observer_status=$completed_status ;;
-      "$supervisor_pid")
+    [[ $herdr_i5_injected_found == true ]] || return 20
+    herdr_i5_injected_pending_pids=("${herdr_i5_injected_next_pending_pids[@]}")
+    case "$herdr_i5_injected_completed_pid" in
+      "$herdr_i5_injected_measured_pid")
+        herdr_i5_injected_measured_status=$herdr_i5_injected_completed_status
+        ;;
+      "$herdr_i5_injected_observer_pid")
+        herdr_i5_injected_observer_status=$herdr_i5_injected_completed_status
+        ;;
+      "$herdr_i5_injected_supervisor_pid")
         supervisor_completed_first=true
-        selected_process_status=$supervisor_status
+        selected_process_status=$herdr_i5_injected_supervisor_status
         return 0
         ;;
       *) return 20 ;;
     esac
   done
-  select_process_status "$measured_status" "$observer_status" || return 20
+  select_process_status \
+    "$herdr_i5_injected_measured_status" "$herdr_i5_injected_observer_status" || return 20
 }
 
 install_orchestration_signal_traps() {
@@ -309,60 +323,77 @@ fixture_no_sleep() {
 
 cleanup_process_groups() {
   [[ $# -eq 3 ]] || return 20
-  local sleep_executable=$1
-  local measured_pid=$2
-  local observer_pid=$3
-  local group child any_live attempt cleanup_status=0
+  local herdr_i5_injected_sleep_executable=$1
+  local herdr_i5_injected_measured_pid=$2
+  local herdr_i5_injected_observer_pid=$3
+  local herdr_i5_injected_group herdr_i5_injected_child herdr_i5_injected_any_live
+  local herdr_i5_injected_attempt herdr_i5_injected_cleanup_status=0
   process_groups_reaped=false
-  for group in "$measured_pid" "$observer_pid"; do
-    [[ -n $group ]] || continue
-    if ! builtin kill -TERM -- "-$group" 2>/dev/null; then
-      ! builtin kill -0 -- "-$group" 2>/dev/null || cleanup_status=20
+  for herdr_i5_injected_group in \
+    "$herdr_i5_injected_measured_pid" "$herdr_i5_injected_observer_pid"; do
+    [[ -n $herdr_i5_injected_group ]] || continue
+    if ! builtin kill -TERM -- "-$herdr_i5_injected_group" 2>/dev/null; then
+      ! builtin kill -0 -- "-$herdr_i5_injected_group" 2>/dev/null || \
+        herdr_i5_injected_cleanup_status=20
     fi
   done
-  for ((attempt=0; attempt<100; attempt++)); do
-    any_live=false
-    for group in "$measured_pid" "$observer_pid"; do
-      [[ -n $group ]] || continue
-      if builtin kill -0 -- "-$group" 2>/dev/null; then any_live=true; fi
+  for ((herdr_i5_injected_attempt=0; herdr_i5_injected_attempt<100; herdr_i5_injected_attempt++)); do
+    herdr_i5_injected_any_live=false
+    for herdr_i5_injected_group in \
+      "$herdr_i5_injected_measured_pid" "$herdr_i5_injected_observer_pid"; do
+      [[ -n $herdr_i5_injected_group ]] || continue
+      if builtin kill -0 -- "-$herdr_i5_injected_group" 2>/dev/null; then
+        herdr_i5_injected_any_live=true
+      fi
     done
-    [[ $any_live == false ]] && break
-    "$sleep_executable" 0.01 || cleanup_status=20
+    [[ $herdr_i5_injected_any_live == false ]] && break
+    "$herdr_i5_injected_sleep_executable" 0.01 || herdr_i5_injected_cleanup_status=20
   done
-  for group in "$measured_pid" "$observer_pid"; do
-    [[ -n $group ]] || continue
-    if ! builtin kill -KILL -- "-$group" 2>/dev/null; then
-      ! builtin kill -0 -- "-$group" 2>/dev/null || cleanup_status=20
+  for herdr_i5_injected_group in \
+    "$herdr_i5_injected_measured_pid" "$herdr_i5_injected_observer_pid"; do
+    [[ -n $herdr_i5_injected_group ]] || continue
+    if ! builtin kill -KILL -- "-$herdr_i5_injected_group" 2>/dev/null; then
+      ! builtin kill -0 -- "-$herdr_i5_injected_group" 2>/dev/null || \
+        herdr_i5_injected_cleanup_status=20
     fi
   done
-  for ((attempt=0; attempt<6000; attempt++)); do
-    any_live=false
-    for child in "$measured_pid" "$observer_pid"; do
-      [[ -n $child ]] || continue
-      if builtin kill -0 "$child" 2>/dev/null; then any_live=true; fi
+  for ((herdr_i5_injected_attempt=0; herdr_i5_injected_attempt<6000; herdr_i5_injected_attempt++)); do
+    herdr_i5_injected_any_live=false
+    for herdr_i5_injected_child in \
+      "$herdr_i5_injected_measured_pid" "$herdr_i5_injected_observer_pid"; do
+      [[ -n $herdr_i5_injected_child ]] || continue
+      if builtin kill -0 "$herdr_i5_injected_child" 2>/dev/null; then
+        herdr_i5_injected_any_live=true
+      fi
     done
-    for group in "$measured_pid" "$observer_pid"; do
-      [[ -n $group ]] || continue
-      if builtin kill -0 -- "-$group" 2>/dev/null; then any_live=true; fi
+    for herdr_i5_injected_group in \
+      "$herdr_i5_injected_measured_pid" "$herdr_i5_injected_observer_pid"; do
+      [[ -n $herdr_i5_injected_group ]] || continue
+      if builtin kill -0 -- "-$herdr_i5_injected_group" 2>/dev/null; then
+        herdr_i5_injected_any_live=true
+      fi
     done
-    [[ $any_live == false ]] && break
-    "$sleep_executable" 0.01 || cleanup_status=20
+    [[ $herdr_i5_injected_any_live == false ]] && break
+    "$herdr_i5_injected_sleep_executable" 0.01 || herdr_i5_injected_cleanup_status=20
   done
-  for child in "$measured_pid" "$observer_pid"; do
-    [[ -n $child ]] || continue
-    if builtin kill -0 "$child" 2>/dev/null; then
-      cleanup_status=20
+  for herdr_i5_injected_child in \
+    "$herdr_i5_injected_measured_pid" "$herdr_i5_injected_observer_pid"; do
+    [[ -n $herdr_i5_injected_child ]] || continue
+    if builtin kill -0 "$herdr_i5_injected_child" 2>/dev/null; then
+      herdr_i5_injected_cleanup_status=20
       continue
     fi
     set +e
-    wait "$child" 2>/dev/null
+    wait "$herdr_i5_injected_child" 2>/dev/null
     set -e
   done
-  for group in "$measured_pid" "$observer_pid"; do
-    [[ -n $group ]] || continue
-    ! builtin kill -0 -- "-$group" 2>/dev/null || cleanup_status=20
+  for herdr_i5_injected_group in \
+    "$herdr_i5_injected_measured_pid" "$herdr_i5_injected_observer_pid"; do
+    [[ -n $herdr_i5_injected_group ]] || continue
+    ! builtin kill -0 -- "-$herdr_i5_injected_group" 2>/dev/null || \
+      herdr_i5_injected_cleanup_status=20
   done
-  if [[ $cleanup_status -eq 0 ]]; then
+  if [[ $herdr_i5_injected_cleanup_status -eq 0 ]]; then
     process_groups_reaped=true
     return 0
   fi
@@ -1375,6 +1406,12 @@ bind_source_trial_tools() {
   auth_time_executable=$source_time_executable
   auth_unlink_executable=$source_unlink_executable
   auth_bash_executable=$source_bash_executable
+  readonly auth_env_executable auth_id_executable auth_mkdir_executable || return 20
+  readonly auth_mktemp_executable auth_mv_executable auth_pidstat_executable || return 20
+  readonly auth_prlimit_executable auth_readlink_executable auth_rmdir_executable || return 20
+  readonly auth_setsid_executable auth_sleep_executable auth_stat_executable || return 20
+  readonly auth_taskset_executable auth_time_executable auth_unlink_executable || return 20
+  readonly auth_bash_executable || return 20
 }
 
 load_outer_runtime_state() {
