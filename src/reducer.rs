@@ -659,7 +659,7 @@ impl Reducer {
     pub fn commit_staged(
         &mut self,
         mut delta: MaterializedDelta,
-        permit: EnqueuePermit,
+        permit: EnqueuePermit<'_>,
     ) -> Result<PendingEnqueue, CommitStagedError> {
         let Some(ingest_seq) = self.next_ingest_seq.filter(|value| *value > 0) else {
             self.model
@@ -2509,12 +2509,8 @@ mod tests {
     ) {
         let delta = reducer.validate_controller_event(&event).unwrap();
         let permit = writer.reserve_enqueue().unwrap();
-        reducer
-            .commit_staged(delta, permit)
-            .unwrap()
-            .wait()
-            .await
-            .unwrap();
+        let pending = reducer.commit_staged(delta, permit).unwrap();
+        writer.finish_pending(pending).await.unwrap();
     }
 
     fn dangling_gauge(shared: &SharedModel) -> u64 {
@@ -3788,12 +3784,10 @@ mod tests {
             event.metadata.receipt_time_ms = super::unix_now_ms();
             let delta = reducer.validate_controller_event(&event).unwrap();
             let permit = writer.reserve_enqueue().expect("writer must have capacity");
-            reducer
+            let pending = reducer
                 .commit_staged(delta, permit)
-                .expect("sequence must be available")
-                .wait()
-                .await
-                .unwrap();
+                .expect("sequence must be available");
+            writer.finish_pending(pending).await.unwrap();
         }
         lifecycle.shutdown().await.unwrap();
 
@@ -3954,12 +3948,8 @@ mod tests {
                 .validate_controller_event(&controller_event(event_id, raw, kind))
                 .unwrap();
             let permit = writer.reserve_enqueue().unwrap();
-            reducer
-                .commit_staged(delta, permit)
-                .unwrap()
-                .wait()
-                .await
-                .unwrap();
+            let pending = reducer.commit_staged(delta, permit).unwrap();
+            writer.finish_pending(pending).await.unwrap();
         }
 
         let snapshot = shared.borrow();
@@ -4382,12 +4372,8 @@ mod tests {
             .unwrap();
         let permit = writer.reserve_enqueue().unwrap();
 
-        reducer
-            .commit_staged(delta, permit)
-            .unwrap()
-            .wait()
-            .await
-            .unwrap();
+        let pending = reducer.commit_staged(delta, permit).unwrap();
+        writer.finish_pending(pending).await.unwrap();
         assert!(
             shared
                 .borrow()
@@ -4456,12 +4442,8 @@ mod tests {
             ))
             .unwrap();
         let permit = writer.reserve_enqueue().unwrap();
-        reducer
-            .commit_staged(delta, permit)
-            .unwrap()
-            .wait()
-            .await
-            .unwrap();
+        let pending = reducer.commit_staged(delta, permit).unwrap();
+        writer.finish_pending(pending).await.unwrap();
         let original = shared
             .borrow()
             .task_run_by_key(&RunKey::Controller(raw.to_owned()))

@@ -4587,18 +4587,14 @@ mod tests {
             let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
             let store = open_writer(&root).unwrap();
             let (lifecycle, writer) = spawn_writer(store).unwrap();
-            let mut held_permits = Vec::new();
-            while let Some(permit) = writer.reserve_enqueue() {
-                held_permits.push(permit);
-            }
-            assert!(!held_permits.is_empty());
+            let capacity_guard = lifecycle.hold_queue_capacity_for_test().await;
             let (mut runtime, diagnostics) = RuntimePersistence::new_for_test(writer, sink.clone());
 
             assert!(runtime.reserve_enqueue().is_none());
             assert_eq!(diagnostics.borrow().persistence, PersistenceStatus::Healthy);
             assert_eq!(sink.attempts.load(Ordering::Relaxed), 0);
 
-            drop(held_permits);
+            drop(capacity_guard);
             shutdown_writer(lifecycle).await;
         }
     }
