@@ -6911,8 +6911,8 @@ fn verify_subject_diff_is_harness_only_impl(
     if !current_cargo.contains(feature)
         || !current_cargo.contains(controller)
         || current_cargo
-            .replacen(feature, "\n", 1)
-            .replacen(controller, "\n", 1)
+            .replacen(feature, "", 1)
+            .replacen(controller, "", 1)
             != baseline_cargo
     {
         return Err("Cargo.toml changed outside the exact feature/bin stanzas".to_owned());
