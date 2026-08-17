@@ -211,11 +211,17 @@ wait_process_pair() {
   local herdr_i5_injected_supervisor_status=$4
   local herdr_i5_injected_completed_pid herdr_i5_injected_completed_status
   local herdr_i5_injected_measured_status= herdr_i5_injected_observer_status=
-  local herdr_i5_injected_pending_pid herdr_i5_injected_found
+  local herdr_i5_injected_pending_pid herdr_i5_injected_sweep_pid
+  local herdr_i5_injected_found
   local -a herdr_i5_injected_pending_pids=(
     "$herdr_i5_injected_measured_pid"
     "$herdr_i5_injected_observer_pid"
     "$herdr_i5_injected_supervisor_pid"
+  )
+  local -a herdr_i5_injected_sweep_pids=(
+    "$herdr_i5_injected_supervisor_pid"
+    "$herdr_i5_injected_measured_pid"
+    "$herdr_i5_injected_observer_pid"
   )
   local -a herdr_i5_injected_next_pending_pids=()
   [[ $herdr_i5_injected_measured_pid =~ ^[1-9][0-9]*$ && $herdr_i5_injected_observer_pid =~ ^[1-9][0-9]*$ ]] || return 20
@@ -223,16 +229,37 @@ wait_process_pair() {
   [[ $herdr_i5_injected_supervisor_status =~ ^[1-9][0-9]{0,2}$ && $herdr_i5_injected_supervisor_status -le 255 ]] || return 20
   [[ $herdr_i5_injected_measured_pid != "$herdr_i5_injected_observer_pid" && $herdr_i5_injected_measured_pid != "$herdr_i5_injected_supervisor_pid" ]] || return 20
   [[ $herdr_i5_injected_observer_pid != "$herdr_i5_injected_supervisor_pid" ]] || return 20
-  # A supervisor-first tie-break requires callers to spawn the supervisor before
-  # the workers so Bash records its completion first in the job table.
+  # Bash <= 5.2 wait -n ignores children that terminated before the call. Sweep
+  # the supervisor first to preserve its tie-break, then block only if all
+  # pending children were alive at the sweep.
   supervisor_completed_first=false
   while [[ -z $herdr_i5_injected_measured_status || -z $herdr_i5_injected_observer_status ]]; do
     herdr_i5_injected_completed_pid=
-    set +e
-    wait -n -p herdr_i5_injected_completed_pid \
-      "${herdr_i5_injected_pending_pids[@]}"
-    herdr_i5_injected_completed_status=$?
-    set -e
+    for herdr_i5_injected_sweep_pid in "${herdr_i5_injected_sweep_pids[@]}"; do
+      herdr_i5_injected_found=false
+      for herdr_i5_injected_pending_pid in "${herdr_i5_injected_pending_pids[@]}"; do
+        if [[ $herdr_i5_injected_pending_pid == "$herdr_i5_injected_sweep_pid" ]]; then
+          herdr_i5_injected_found=true
+          break
+        fi
+      done
+      if [[ $herdr_i5_injected_found == true ]] \
+        && ! builtin kill -0 "$herdr_i5_injected_sweep_pid" 2>/dev/null; then
+        set +e
+        wait "$herdr_i5_injected_sweep_pid"
+        herdr_i5_injected_completed_status=$?
+        set -e
+        herdr_i5_injected_completed_pid=$herdr_i5_injected_sweep_pid
+        break
+      fi
+    done
+    if [[ -z $herdr_i5_injected_completed_pid ]]; then
+      set +e
+      wait -n -p herdr_i5_injected_completed_pid \
+        "${herdr_i5_injected_pending_pids[@]}"
+      herdr_i5_injected_completed_status=$?
+      set -e
+    fi
     [[ $herdr_i5_injected_completed_pid =~ ^[1-9][0-9]*$ ]] || return 20
     herdr_i5_injected_found=false
     herdr_i5_injected_next_pending_pids=()
@@ -1652,8 +1679,8 @@ run_trial_process_tree() {
       }
       trap cleanup_trial EXIT
       install_orchestration_signal_traps || exit 20
-      # Launch the watchdog before either worker; wait_process_pair relies on
-      # that job-table order when deadline and worker completions tie.
+      # Launch the watchdog before either worker so wait_process_pair preserves
+      # supervisor priority in both its pre-wait sweep and blocking wait ties.
       (
         trap - EXIT INT TERM HUP USR1
         "$sleep_executable" "$trial_deadline_seconds"

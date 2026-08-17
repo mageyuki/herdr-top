@@ -266,6 +266,17 @@ async fn wait_for_sequence_count(values: &Arc<Mutex<Vec<u64>>>, expected: usize)
 }
 
 #[cfg(feature = "workload-harness")]
+#[tokio::test]
+async fn reference_epoch_wait_uses_an_injected_portable_clock() {
+    let now = AtomicU64::new(100);
+    let clock = || now.fetch_add(5, Ordering::SeqCst);
+
+    wait_for_reference_epoch(&clock, 110).await.unwrap();
+
+    assert_eq!(now.load(Ordering::SeqCst), 115);
+}
+
+#[cfg(feature = "workload-harness")]
 async fn run_schedule_through_real_queue_at(
     profile: WorkloadProfile,
     trial_origin_ns: u64,
@@ -368,7 +379,7 @@ async fn run_schedule_through_real_queue_at(
             .expect("reference workload origin must follow its priming frame")
     });
     if uses_realtime_clock {
-        wait_for_reference_epoch(workload_origin_ns)
+        wait_for_reference_epoch(clock.as_ref(), workload_origin_ns)
             .await
             .expect("reference workload epoch must be reachable");
     }
@@ -397,7 +408,7 @@ async fn run_schedule_through_real_queue_at(
             .checked_add(duration_ns(offset))
             .expect("virtual scheduled timestamp must fit u64");
         if uses_realtime_clock {
-            wait_for_reference_epoch(scheduled_ns)
+            wait_for_reference_epoch(clock.as_ref(), scheduled_ns)
                 .await
                 .expect("reference admission deadline must be reachable");
         } else {
@@ -5899,6 +5910,62 @@ fn runner_fixture_rejects_uncontained_attempt_id() {
 
 #[cfg(all(target_os = "linux", feature = "workload-harness"))]
 #[test]
+fn wait_process_pair_reaps_a_preexited_supervisor_before_blocking() {
+    use reference_runner_test_support as support;
+
+    // Break caught: Bash <= 5.2 `wait -n` skips children that exited before
+    // the call, so the live workers used to outrun an already-dead watchdog.
+    let temporary = tempfile::tempdir().unwrap();
+    let measured = temporary.path().join("measured.sh");
+    let observer = temporary.path().join("observer.sh");
+    let measured_natural_exit = temporary.path().join("measured-natural-exit");
+    let observer_natural_exit = temporary.path().join("observer-natural-exit");
+    support::write_executable(
+        &measured,
+        &format!(
+            "#!/usr/bin/bash -p\nset -euo pipefail\n/usr/bin/sleep 2\n: >'{}'\n",
+            measured_natural_exit.display()
+        ),
+    );
+    support::write_executable(
+        &observer,
+        &format!(
+            "#!/usr/bin/bash -p\nset -euo pipefail\n/usr/bin/sleep 2\n: >'{}'\n",
+            observer_natural_exit.display()
+        ),
+    );
+    let outcome = temporary.path().join("outcome.json");
+    let groups = temporary.path().join("groups.txt");
+    let status = temporary.path().join("trial-status");
+    let trap_marker = temporary.path().join("trap-marker");
+    let output = support::run_source_fixture(
+        Some("00000001"),
+        &[
+            "orchestration".to_owned(),
+            "timeout".to_owned(),
+            outcome.to_string_lossy().into_owned(),
+            groups.to_string_lossy().into_owned(),
+            status.to_string_lossy().into_owned(),
+            measured.to_string_lossy().into_owned(),
+            observer.to_string_lossy().into_owned(),
+            trap_marker.to_string_lossy().into_owned(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(20), "{output:?}");
+    assert_eq!(
+        std::fs::read_to_string(status)
+            .unwrap_or_else(|error| panic!("trial status was absent: {error}: {output:?}")),
+        "failed:124\n"
+    );
+    assert!(!measured_natural_exit.exists());
+    assert!(!observer_natural_exit.exists());
+    for pid in std::fs::read_to_string(groups).unwrap().split_whitespace() {
+        assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
 fn runner_fixture_reaps_timeout_and_signal_groups() {
     use reference_runner_test_support as support;
 
@@ -7144,10 +7211,13 @@ fn reference_monotonic_ns() -> Result<u64, HarnessError> {
         .ok_or(HarnessError::Invalid("monotonic timestamp overflowed"))
 }
 
-#[cfg(all(target_os = "linux", feature = "workload-harness"))]
-async fn wait_for_reference_epoch(target_ns: u64) -> Result<(), HarnessError> {
+#[cfg(feature = "workload-harness")]
+async fn wait_for_reference_epoch(
+    clock: &(dyn Fn() -> u64 + Send + Sync),
+    target_ns: u64,
+) -> Result<(), HarnessError> {
     loop {
-        let now = reference_monotonic_ns()?;
+        let now = clock();
         let Some(remaining) = target_ns.checked_sub(now) else {
             return Ok(());
         };
@@ -7342,10 +7412,12 @@ async fn run_reference_input_trial(
                 .ok_or(HarnessError::Invalid("input phase exceeded frame interval"))?,
         )
         .ok_or(HarnessError::Invalid("input workload origin overflowed"))?;
+    let wait_clock =
+        || reference_monotonic_ns().expect("reference monotonic clock must remain readable");
     let mut scheduled_ns = workload_origin_ns;
     let mut observations = Vec::with_capacity(200);
     for _ in 0..200 {
-        wait_for_reference_epoch(scheduled_ns).await?;
+        wait_for_reference_epoch(&wait_clock, scheduled_ns).await?;
         let injected_ns = reference_monotonic_ns()?;
         let frame = driver.handle_key_and_wait(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('?'),
