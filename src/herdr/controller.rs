@@ -25,6 +25,10 @@ use crate::model::{
     MinimalProviderMetadata, Provider, SourceCoverage, quantize_progress,
 };
 use crate::reducer::{CommitStagedError, Reducer, RejectReason};
+// increment5-workload-harness: begin controller timing imports
+#[cfg(feature = "workload-harness")]
+use crate::reducer::{WorkloadTimingKind, WorkloadTimingObserver, workload_timing_scope};
+// increment5-workload-harness: end controller timing imports
 
 /// Maximum JSON payload size, excluding the newline delimiter.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -37,6 +41,55 @@ pub const CONTROLLER_IO_TIMEOUT: Duration = Duration::from_secs(5);
 pub const CONTROLLER_REQUEST_QUEUE_CAPACITY: usize = 64;
 
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(250);
+// increment5-workload-harness: begin controller workload observation ABI
+/// Successful reservation of one synthetic workload request in the real bounded queue.
+#[cfg(feature = "workload-harness")]
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkloadAdmissionObservation {
+    pub sequence: u64,
+    pub scheduled_ns: u64,
+    pub admitted_ns: u64,
+}
+
+/// Terminal reducer and model-publication timestamps for one admitted workload request.
+#[cfg(feature = "workload-harness")]
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkloadTerminalObservation {
+    pub sequence: u64,
+    pub terminal_ns: u64,
+    pub published_ns: u64,
+}
+
+/// Durable acknowledgement for one admitted workload request.
+#[cfg(feature = "workload-harness")]
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkloadPersistenceObservation {
+    pub sequence: u64,
+    pub persisted_ns: u64,
+}
+
+/// Feature-only clocks and callbacks attached to the real bounded Controller channel.
+#[cfg(feature = "workload-harness")]
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct WorkloadControllerHooks {
+    pub clock: std::sync::Arc<dyn Fn() -> u64 + Send + Sync>,
+    pub admission_observer: std::sync::Arc<dyn Fn(WorkloadAdmissionObservation) + Send + Sync>,
+    pub terminal_observer: std::sync::Arc<dyn Fn(WorkloadTerminalObservation) + Send + Sync>,
+    pub persistence_observer: std::sync::Arc<dyn Fn(WorkloadPersistenceObservation) + Send + Sync>,
+    pub timing_observer: WorkloadTimingObserver,
+}
+
+#[cfg(feature = "workload-harness")]
+#[derive(Clone)]
+struct WorkloadRequestContext {
+    sequence: u64,
+    hooks: WorkloadControllerHooks,
+}
+// increment5-workload-harness: end controller workload observation ABI
 
 /// One Controller request as emitted by the standalone client.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -216,6 +269,10 @@ pub struct ControllerRequestSender {
     sender: mpsc::Sender<ControllerRequest>,
     diagnostics: ControllerDiagnosticsHandle,
     diagnostic_changes: watch::Sender<u64>,
+    // increment5-workload-harness: begin controller sender workload hooks
+    #[cfg(feature = "workload-harness")]
+    workload_hooks: Option<WorkloadControllerHooks>,
+    // increment5-workload-harness: end controller sender workload hooks
 }
 
 /// Unique consumer for the serialized-reducer request queue.
@@ -233,6 +290,10 @@ pub(crate) struct ControllerRequest {
     frame: Vec<u8>,
     receipt_time_ms: i64,
     responder: oneshot::Sender<ControllerResponse>,
+    // increment5-workload-harness: begin controller request workload context
+    #[cfg(feature = "workload-harness")]
+    workload: Option<WorkloadRequestContext>,
+    // increment5-workload-harness: end controller request workload context
 }
 
 /// Builds a bounded Controller request channel.
@@ -248,6 +309,10 @@ pub fn request_channel(
             sender,
             diagnostics,
             diagnostic_changes,
+            // increment5-workload-harness: begin controller sender default hooks
+            #[cfg(feature = "workload-harness")]
+            workload_hooks: None,
+            // increment5-workload-harness: end controller sender default hooks
         },
         ControllerRequestReceiver {
             receiver,
@@ -255,8 +320,74 @@ pub fn request_channel(
         },
     )
 }
+// increment5-workload-harness: begin observed controller channel adapter
+/// Builds the production bounded request channel with feature-only workload callbacks.
+#[cfg(feature = "workload-harness")]
+#[doc(hidden)]
+#[must_use]
+pub fn request_channel_with_workload_harness(
+    capacity: usize,
+    diagnostics: ControllerDiagnosticsHandle,
+    hooks: WorkloadControllerHooks,
+) -> (ControllerRequestSender, ControllerRequestReceiver) {
+    let (mut sender, receiver) = request_channel(capacity, diagnostics);
+    sender.workload_hooks = Some(hooks);
+    (sender, receiver)
+}
+// increment5-workload-harness: end observed controller channel adapter
 
 impl ControllerRequestSender {
+    // increment5-workload-harness: begin bounded workload admission adapter
+    /// Reserves real bounded capacity, observes admission, then consumes that exact permit.
+    #[cfg(feature = "workload-harness")]
+    #[doc(hidden)]
+    pub async fn submit_workload_frame(
+        &self,
+        frame: Vec<u8>,
+        receipt_time_ms: i64,
+        sequence: u64,
+        scheduled_ns: u64,
+    ) -> ControllerResponse {
+        let Some(hooks) = self.workload_hooks.clone() else {
+            return ControllerResponse::Retryable {
+                reason: RetryableReason::PersistenceUnavailable,
+            };
+        };
+        let permit = match self.sender.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.record_socket_saturation();
+                return ControllerResponse::Retryable {
+                    reason: RetryableReason::Busy,
+                };
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return ControllerResponse::Retryable {
+                    reason: RetryableReason::PersistenceUnavailable,
+                };
+            }
+        };
+        let (responder, response) = oneshot::channel();
+        (hooks.admission_observer)(WorkloadAdmissionObservation {
+            sequence,
+            scheduled_ns,
+            admitted_ns: (hooks.clock)(),
+        });
+        permit.send(ControllerRequest {
+            frame,
+            receipt_time_ms,
+            responder,
+            workload: Some(WorkloadRequestContext { sequence, hooks }),
+        });
+        match tokio::time::timeout(CONTROLLER_IO_TIMEOUT, response).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) | Err(_) => ControllerResponse::Retryable {
+                reason: RetryableReason::PersistenceUnavailable,
+            },
+        }
+    }
+
+    // increment5-workload-harness: end bounded workload admission adapter
     fn record_accept_failure(&self) {
         self.diagnostics.record_accept_failure();
         self.notify_diagnostic_change();
@@ -425,6 +556,10 @@ async fn handle_connection(
                 frame,
                 receipt_time_ms: unix_now_ms(),
                 responder,
+                // increment5-workload-harness: begin socket request default workload context
+                #[cfg(feature = "workload-harness")]
+                workload: None,
+                // increment5-workload-harness: end socket request default workload context
             };
             match sender.sender.try_send(request) {
                 Ok(()) => match tokio::time::timeout(CONTROLLER_IO_TIMEOUT, response).await {
@@ -599,6 +734,16 @@ pub(crate) async fn service_request(
             return;
         }
     };
+    // increment5-workload-harness: begin controller reducer timing scope
+    #[cfg(feature = "workload-harness")]
+    let workload_timing = request.workload.as_ref().map(|workload| {
+        workload_timing_scope(
+            WorkloadTimingKind::ControllerEvent,
+            workload.sequence,
+            std::sync::Arc::clone(&workload.hooks.timing_observer),
+        )
+    });
+    // increment5-workload-harness: end controller reducer timing scope
     let delta = match reducer.validate_controller_event(&event) {
         Ok(delta) => delta,
         Err(reason) => {
@@ -608,6 +753,13 @@ pub(crate) async fn service_request(
             return;
         }
     };
+    // increment5-workload-harness: begin controller terminal timestamp
+    #[cfg(feature = "workload-harness")]
+    let workload_terminal_ns = request
+        .workload
+        .as_ref()
+        .map(|workload| (workload.hooks.clock)());
+    // increment5-workload-harness: end controller terminal timestamp
     let Some(permit) = persistence.reserve_enqueue() else {
         let _ = request.responder.send(ControllerResponse::Retryable {
             reason: RetryableReason::PersistenceUnavailable,
@@ -623,9 +775,37 @@ pub(crate) async fn service_request(
             return;
         }
     };
+    // increment5-workload-harness: begin controller publication observation
+    #[cfg(feature = "workload-harness")]
+    if let Some(workload_timing) = workload_timing {
+        workload_timing.finish();
+    }
+    #[cfg(feature = "workload-harness")]
+    if let Some(workload) = request.workload.as_ref() {
+        (workload.hooks.terminal_observer)(WorkloadTerminalObservation {
+            sequence: workload.sequence,
+            terminal_ns: workload_terminal_ns
+                .expect("workload terminal timestamp must accompany its context"),
+            published_ns: (workload.hooks.clock)(),
+        });
+    }
+    // increment5-workload-harness: end controller publication observation
     let _ = request.responder.send(ControllerResponse::Accepted);
     match persistence.finish_pending(pending).await {
         Ok(outcome) => {
+            // increment5-workload-harness: begin controller persistence observation
+            #[cfg(feature = "workload-harness")]
+            if matches!(
+                outcome,
+                RuntimeWriteOutcome::Durable | RuntimeWriteOutcome::CommittedButDegraded(_)
+            ) && let Some(workload) = request.workload.as_ref()
+            {
+                (workload.hooks.persistence_observer)(WorkloadPersistenceObservation {
+                    sequence: workload.sequence,
+                    persisted_ns: (workload.hooks.clock)(),
+                });
+            }
+            // increment5-workload-harness: end controller persistence observation
             reducer.complete_operator_submission(outcome);
             if matches!(
                 outcome,
@@ -1018,6 +1198,10 @@ mod tests {
                 frame: serde_json::to_vec(&frame).unwrap(),
                 receipt_time_ms: unix_now_ms(),
                 responder,
+                // increment5-workload-harness: begin unit request default workload context
+                #[cfg(feature = "workload-harness")]
+                workload: None,
+                // increment5-workload-harness: end unit request default workload context
             },
             "session",
             reducer,
@@ -1053,6 +1237,10 @@ mod tests {
                 frame: b"queued".to_vec(),
                 receipt_time_ms: 1,
                 responder: queued_responder,
+                // increment5-workload-harness: begin queued unit request default workload context
+                #[cfg(feature = "workload-harness")]
+                workload: None,
+                // increment5-workload-harness: end queued unit request default workload context
             })
             .unwrap();
         let (mut client, server) = UnixStream::pair().unwrap();

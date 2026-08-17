@@ -669,6 +669,119 @@ impl CollectorHandle {
         Ok(())
     }
 }
+// increment5-workload-harness: begin collector workload spawn adapter
+/// Feature-only inputs for real-path workload execution.
+#[cfg(feature = "workload-harness")]
+#[doc(hidden)]
+pub struct WorkloadCollectorConfig {
+    pub controller_hooks: controller::WorkloadControllerHooks,
+    pub provider_roots: Vec<crate::provider::DiscoveryRoot>,
+    pub notify_factory: Option<Box<dyn crate::provider::NotifyFactory>>,
+    pub rescan_interval: Option<Duration>,
+    pub fallback_timing: Option<(
+        crate::reducer::WorkloadTimingKind,
+        u64,
+        crate::reducer::WorkloadTimingObserver,
+    )>,
+}
+
+/// Real collector handle plus its feature-only bounded Controller producer.
+#[cfg(feature = "workload-harness")]
+#[doc(hidden)]
+pub struct WorkloadCollectorHandle {
+    pub collector: CollectorHandle,
+    pub controller: controller::ControllerRequestSender,
+}
+
+/// Launches workload controls while delegating all event handling to `run_collector`.
+#[cfg(feature = "workload-harness")]
+#[doc(hidden)]
+pub async fn spawn_workload_collector(
+    sock: PathBuf,
+    session: String,
+    restored: RestoredState,
+    writer: WriterClient,
+    config: WorkloadCollectorConfig,
+) -> Result<WorkloadCollectorHandle, CollectorError> {
+    let owner = OwnerTracker::from_environment();
+    writer.replace_owner(owner.record()).await?;
+    let (mut reducer, model, operator) =
+        Reducer::new_with_operator(restored, empty_operator_seed());
+    if let Some((kind, first_sequence, observer)) = config.fallback_timing {
+        reducer.configure_workload_observation_timing(kind, first_sequence, observer);
+    }
+    let (quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
+    let controller_coverage = SourceAvailability::Available;
+    let initial_coverage = SourceCoverageRegistry::new(controller_coverage.clone());
+    let (coverage_sender, source_coverage) = watch::channel(initial_coverage);
+    let (persistence, diagnostics) = RuntimePersistence::new(
+        writer,
+        &model.borrow(),
+        &source_coverage.borrow(),
+        Arc::new(UnavailableOccurrenceSink),
+    );
+    let cancellation = CancellationToken::new();
+    let (controller_sender, controller_requests) =
+        controller::request_channel_with_workload_harness(
+            controller::CONTROLLER_REQUEST_QUEUE_CAPACITY,
+            reducer.controller_diagnostics_handle(),
+            config.controller_hooks,
+        );
+    let (provider_sender, provider_events) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+    let provider_diagnostics = crate::provider::ProviderDiagnostics::from_model_handle(
+        reducer.provider_diagnostics_handle(),
+    );
+    let provider_thread = crate::provider::spawn_provider_thread_with_rescan_interval(
+        AdapterProviderWorker::new(config.provider_roots, provider_diagnostics),
+        provider_sender,
+        config.notify_factory,
+        config
+            .rescan_interval
+            .unwrap_or(crate::provider::RESCAN_INTERVAL),
+    )?;
+    let provider_publisher = provider_thread.target_publisher();
+    let restored_targets = derive_provider_targets(&model.borrow());
+    provider_publisher.update_targets(restored_targets.clone());
+    let coverage = CoverageTracker::new(controller_coverage, coverage_sender, quality_sender);
+    let provider_integration = ProviderIntegration::new(
+        provider_events,
+        provider_publisher,
+        restored_targets,
+        coverage,
+    );
+    let task_cancellation = cancellation.clone();
+    let task_model = model.clone();
+    let task = tokio::spawn(async move {
+        run_collector(
+            sock,
+            session,
+            persistence,
+            reducer,
+            task_model,
+            task_cancellation,
+            owner,
+            Some(controller_requests),
+            provider_integration,
+        )
+        .await
+    });
+    let collector = CollectorHandle {
+        quality,
+        source_coverage,
+        diagnostics,
+        operator,
+        model,
+        cancellation,
+        task,
+        controller_acceptor: None,
+        provider_thread: Some(provider_thread),
+    };
+    Ok(WorkloadCollectorHandle {
+        collector,
+        controller: controller_sender,
+    })
+}
+// increment5-workload-harness: end collector workload spawn adapter
 
 /// Commits the new owner record, then launches subscribe-first convergence.
 pub async fn spawn(

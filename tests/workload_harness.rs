@@ -21,6 +21,27 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
 #[cfg(feature = "workload-harness")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "workload-harness")]
+use std::sync::{Arc, Mutex};
+
+#[cfg(feature = "workload-harness")]
+use herdr_top::activity::{ActivityItem, RestoredOperatorState};
+#[cfg(feature = "workload-harness")]
+use herdr_top::herdr::collector::{WorkloadCollectorConfig, spawn_workload_collector};
+#[cfg(feature = "workload-harness")]
+use herdr_top::herdr::controller::{
+    ControllerResponse, WorkloadAdmissionObservation, WorkloadControllerHooks,
+    WorkloadPersistenceObservation, WorkloadTerminalObservation,
+};
+#[cfg(feature = "workload-harness")]
+use herdr_top::provider::{DiscoveryRoot, NotifyFactory, NotifySink, NotifyWatcher};
+#[cfg(feature = "workload-harness")]
+use herdr_top::reducer::{WorkloadTimingKind, WorkloadTimingObservation, WorkloadTimingObserver};
+#[cfg(feature = "workload-harness")]
+use herdr_top::store::spawn_writer;
+
+#[cfg(feature = "workload-harness")]
 fn frame_driver_for_times(
     millis: &[u64],
 ) -> (
@@ -117,6 +138,1175 @@ fn workload_frame_driver_draw_ordinals_are_contiguous_only_for_draws() {
         .collect::<Vec<_>>();
 
     assert_eq!(draw_ordinals, vec![0, 1, 2]);
+}
+
+#[cfg(feature = "workload-harness")]
+#[derive(Clone, Debug)]
+struct RealQueueFrame {
+    new_probe_count: usize,
+}
+
+#[cfg(feature = "workload-harness")]
+#[derive(Clone, Debug)]
+struct RealQueueResult {
+    profile: WorkloadProfile,
+    trial_origin_ns: u64,
+    observer_ready_ns: u64,
+    priming_frame_recorded_ns: u64,
+    workload_origin_ns: u64,
+    admission_observations: Vec<AdmissionObservationV1>,
+    screen_observations: Vec<LatencyObservationV1>,
+    scoped_observations: Vec<ScopedTimingObservationV1>,
+    submitted_sequences: Vec<u64>,
+    admitted_sequences: Vec<u64>,
+    completed_sequences: Vec<u64>,
+    persisted_sequences: Vec<u64>,
+    rendered_sequences: Vec<u64>,
+    final_identities: workload::StructuralIdentities,
+    frames: Vec<RealQueueFrame>,
+}
+
+#[cfg(feature = "workload-harness")]
+fn lock_workload<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    value
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(feature = "workload-harness")]
+fn duration_ns(value: Duration) -> u64 {
+    u64::try_from(value.as_nanos()).expect("frozen workload duration must fit u64")
+}
+
+#[cfg(feature = "workload-harness")]
+fn structural_identities(model: &DomainModel) -> workload::StructuralIdentities {
+    workload::StructuralIdentities {
+        pane_ids: model.panes().map(|pane| pane.pane_id.clone()).collect(),
+        task_run_ids: model
+            .task_runs()
+            .filter_map(|run| match &run.key {
+                RunKey::Controller(key) => Some(key.clone()),
+                RunKey::Native { .. } | RunKey::NativePath { .. } | RunKey::Provisional { .. } => {
+                    None
+                }
+            })
+            .collect(),
+        dependency_edges: model
+            .dependency_edges()
+            .map(|edge| format!("{}->{}", edge.prerequisite_run_id, edge.dependent_run_id))
+            .collect(),
+        execution_edges: model
+            .execution_edges()
+            .map(|edge| format!("{}->{}", edge.parent_run_id, edge.child_run_id))
+            .collect(),
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+fn structural_identities_v1(identities: &workload::StructuralIdentities) -> StructuralIdentitiesV1 {
+    StructuralIdentitiesV1 {
+        pane_ids: identities.pane_ids.iter().cloned().collect(),
+        task_run_ids: identities.task_run_ids.iter().cloned().collect(),
+        dependency_edges: identities.dependency_edges.iter().cloned().collect(),
+        execution_edges: identities.execution_edges.iter().cloned().collect(),
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+fn convert_workload_timing(sample: WorkloadTimingObservation) -> ScopedTimingObservationV1 {
+    let kind = match sample.kind {
+        WorkloadTimingKind::ControllerEvent => ScopedTimingKindV1::ControllerEvent,
+        WorkloadTimingKind::StartupRestore => ScopedTimingKindV1::StartupRestore,
+        WorkloadTimingKind::FallbackNotification => ScopedTimingKindV1::FallbackNotification,
+        WorkloadTimingKind::FallbackRescan => ScopedTimingKindV1::FallbackRescan,
+    };
+    ScopedTimingObservationV1 {
+        kind,
+        sequence: sample.sequence,
+        d4_segment_count: sample.d4_segment_count,
+        d4_analysis_ns: sample.d4_analysis_ns,
+        reducer_plus_publish_ns: sample.reducer_plus_publish_ns,
+        model_clone_publish_segment_count: sample.model_clone_publish_segment_count,
+        model_clone_publish_ns: sample.model_clone_publish_ns,
+        render_ns: 0,
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+fn workload_timing_collector(
+    observations: Arc<Mutex<Vec<ScopedTimingObservationV1>>>,
+) -> WorkloadTimingObserver {
+    Arc::new(move |sample| {
+        lock_workload(&observations).push(convert_workload_timing(sample));
+    })
+}
+
+#[cfg(feature = "workload-harness")]
+fn empty_restored(model: DomainModel) -> RestoredState {
+    RestoredState {
+        model,
+        next_ordinal: 201,
+        next_ingest_seq: Some(1),
+        event_ledger: Vec::new(),
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+async fn wait_for_sequence_count(values: &Arc<Mutex<Vec<u64>>>, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if lock_workload(values).len() == expected {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("real workload sequence acknowledgements must complete");
+}
+
+#[cfg(feature = "workload-harness")]
+async fn run_schedule_through_real_queue_at(
+    profile: WorkloadProfile,
+    trial_origin_ns: u64,
+    observer_ready_ns: u64,
+    requested_workload_origin_ns: Option<u64>,
+    frame_phase_offset_ns: u64,
+    stall: Option<Duration>,
+    clock_override: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+) -> RealQueueResult {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = StateRoot(temporary.path().join("state"));
+    std::fs::create_dir_all(&root.0).unwrap();
+    let store = open_writer(&root).unwrap();
+    let (lifecycle, writer) = spawn_writer(store).unwrap();
+    let clock_ns = Arc::new(AtomicU64::new(
+        requested_workload_origin_ns.unwrap_or_default(),
+    ));
+    let uses_realtime_clock = clock_override.is_some();
+    let clock: Arc<dyn Fn() -> u64 + Send + Sync> = clock_override.unwrap_or_else(|| {
+        let clock_ns = Arc::clone(&clock_ns);
+        Arc::new(move || clock_ns.load(Ordering::SeqCst))
+    });
+    let admissions = Arc::new(Mutex::new(Vec::new()));
+    let terminals = Arc::new(Mutex::new(Vec::new()));
+    let persisted = Arc::new(Mutex::new(Vec::new()));
+    let timings = Arc::new(Mutex::new(Vec::new()));
+
+    let hooks = WorkloadControllerHooks {
+        clock: {
+            let clock = Arc::clone(&clock);
+            Arc::new(move || clock())
+        },
+        admission_observer: {
+            let admissions = Arc::clone(&admissions);
+            Arc::new(move |sample: WorkloadAdmissionObservation| {
+                lock_workload(&admissions).push(AdmissionObservationV1 {
+                    sequence: sample.sequence,
+                    scheduled_ns: sample.scheduled_ns,
+                    admitted_ns: sample.admitted_ns,
+                });
+            })
+        },
+        terminal_observer: {
+            let terminals = Arc::clone(&terminals);
+            Arc::new(move |sample: WorkloadTerminalObservation| {
+                lock_workload(&terminals).push(sample);
+            })
+        },
+        persistence_observer: {
+            let persisted = Arc::clone(&persisted);
+            Arc::new(move |sample: WorkloadPersistenceObservation| {
+                lock_workload(&persisted).push(sample.sequence);
+            })
+        },
+        timing_observer: workload_timing_collector(Arc::clone(&timings)),
+    };
+    let config = WorkloadCollectorConfig {
+        controller_hooks: hooks,
+        provider_roots: Vec::new(),
+        notify_factory: None,
+        rescan_interval: Some(Duration::from_secs(2)),
+        fallback_timing: None,
+    };
+    let handle = spawn_workload_collector(
+        temporary.path().join("missing-herdr.sock"),
+        "increment5-workload".to_owned(),
+        empty_restored(workload::target_model()),
+        writer,
+        config,
+    )
+    .await
+    .unwrap();
+    let model_receiver = handle.collector.model.clone();
+    let quality_receiver = handle.collector.quality.clone();
+    let app = App::new(model_receiver, quality_receiver, HeaderInputs::default());
+    let terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let driver_clock = Arc::clone(&clock);
+    let mut driver =
+        WorkloadFrameDriver::new(app, terminal, move || Duration::from_nanos(driver_clock()));
+
+    let priming_ns = match requested_workload_origin_ns {
+        Some(workload_origin_ns) => {
+            let priming_ns = workload_origin_ns
+                .checked_sub(100_000_000 - frame_phase_offset_ns)
+                .expect("virtual workload origin must follow its priming frame");
+            clock_ns.store(priming_ns, Ordering::SeqCst);
+            priming_ns
+        }
+        None => clock(),
+    };
+    assert_eq!(driver.step(true).unwrap().draw_ordinal, Some(0));
+    let priming_frame_recorded_ns = if uses_realtime_clock {
+        clock()
+    } else {
+        priming_ns
+    };
+    let workload_origin_ns = requested_workload_origin_ns.unwrap_or_else(|| {
+        priming_frame_recorded_ns
+            .checked_add(100_000_000 - frame_phase_offset_ns)
+            .expect("reference workload origin must follow its priming frame")
+    });
+    if uses_realtime_clock {
+        wait_for_reference_epoch(workload_origin_ns)
+            .await
+            .expect("reference workload epoch must be reachable");
+    }
+
+    let probes = workload::screen_probe_sequences(profile)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let stall_deadline = stall.map(|duration| {
+        workload_origin_ns
+            .checked_add(duration_ns(duration))
+            .expect("virtual stall deadline must fit u64")
+    });
+    let mut submitted_sequences = Vec::new();
+    let mut rendered_sequences = Vec::new();
+    let mut screen_observations = Vec::new();
+    let mut pending_probes = Vec::new();
+    let mut frames = Vec::new();
+
+    for (index, (wire, offset)) in workload::frozen_controller_events(profile)
+        .into_iter()
+        .zip(workload::admission_offsets(profile))
+        .enumerate()
+    {
+        let sequence = index as u64 + 1;
+        let scheduled_ns = workload_origin_ns
+            .checked_add(duration_ns(offset))
+            .expect("virtual scheduled timestamp must fit u64");
+        if uses_realtime_clock {
+            wait_for_reference_epoch(scheduled_ns)
+                .await
+                .expect("reference admission deadline must be reachable");
+        } else {
+            clock_ns.store(scheduled_ns, Ordering::SeqCst);
+        }
+        submitted_sequences.push(sequence);
+        let response = handle
+            .controller
+            .submit_workload_frame(
+                serde_json::to_vec(&wire).unwrap(),
+                i64::try_from(scheduled_ns / 1_000_000).unwrap(),
+                sequence,
+                scheduled_ns,
+            )
+            .await;
+        assert_eq!(response, ControllerResponse::Accepted);
+        if probes.contains(&sequence) {
+            pending_probes.push(sequence);
+        }
+        let stall_holds = stall_deadline.is_some_and(|deadline| scheduled_ns < deadline);
+        if !pending_probes.is_empty()
+            && (!stall_holds || stall.is_none())
+            && probes.contains(&sequence)
+        {
+            let rendered_ns = if uses_realtime_clock {
+                loop {
+                    let frame = driver.step(false).unwrap();
+                    if frame.draw_ordinal.is_some() {
+                        break clock();
+                    }
+                    tokio::time::sleep(frame.poll_duration).await;
+                }
+            } else {
+                let rendered_ns = scheduled_ns
+                    .checked_add(frame_phase_offset_ns)
+                    .expect("virtual rendered timestamp must fit u64");
+                clock_ns.store(rendered_ns, Ordering::SeqCst);
+                let frame = driver.step(true).unwrap();
+                assert!(frame.draw_ordinal.is_some());
+                rendered_ns
+            };
+            let new_probe_count = pending_probes.len();
+            for rendered_sequence in pending_probes.drain(..) {
+                let terminal = lock_workload(&terminals)
+                    .iter()
+                    .find(|sample| sample.sequence == rendered_sequence)
+                    .cloned()
+                    .expect("every rendered probe must have a terminal observation");
+                let admission = lock_workload(&admissions)
+                    .iter()
+                    .find(|sample| sample.sequence == rendered_sequence)
+                    .cloned()
+                    .expect("every rendered probe must have an admission observation");
+                rendered_sequences.push(rendered_sequence);
+                screen_observations.push(LatencyObservationV1 {
+                    sequence: rendered_sequence,
+                    admitted_ns: admission.admitted_ns,
+                    terminal_ns: terminal.terminal_ns,
+                    published_ns: terminal.published_ns,
+                    rendered_ns,
+                    observed_frame_phase_ns: rendered_ns
+                        .checked_sub(admission.admitted_ns)
+                        .unwrap()
+                        % 100_000_000,
+                });
+            }
+            frames.push(RealQueueFrame { new_probe_count });
+        }
+    }
+    if !pending_probes.is_empty() {
+        let rendered_ns = if uses_realtime_clock {
+            loop {
+                let frame = driver.step(false).unwrap();
+                if frame.draw_ordinal.is_some() {
+                    break clock();
+                }
+                tokio::time::sleep(frame.poll_duration).await;
+            }
+        } else {
+            let rendered_ns = clock_ns
+                .load(Ordering::SeqCst)
+                .checked_add(100_000_000)
+                .unwrap();
+            clock_ns.store(rendered_ns, Ordering::SeqCst);
+            assert!(driver.step(true).unwrap().draw_ordinal.is_some());
+            rendered_ns
+        };
+        let new_probe_count = pending_probes.len();
+        for rendered_sequence in pending_probes.drain(..) {
+            let terminal = lock_workload(&terminals)
+                .iter()
+                .find(|sample| sample.sequence == rendered_sequence)
+                .cloned()
+                .unwrap();
+            let admission = lock_workload(&admissions)
+                .iter()
+                .find(|sample| sample.sequence == rendered_sequence)
+                .cloned()
+                .unwrap();
+            rendered_sequences.push(rendered_sequence);
+            screen_observations.push(LatencyObservationV1 {
+                sequence: rendered_sequence,
+                admitted_ns: admission.admitted_ns,
+                terminal_ns: terminal.terminal_ns,
+                published_ns: terminal.published_ns,
+                rendered_ns,
+                observed_frame_phase_ns: rendered_ns.checked_sub(admission.admitted_ns).unwrap()
+                    % 100_000_000,
+            });
+        }
+        frames.push(RealQueueFrame { new_probe_count });
+    }
+
+    wait_for_sequence_count(&persisted, submitted_sequences.len()).await;
+    let final_identities = structural_identities(&handle.collector.model.borrow());
+    let admission_observations = lock_workload(&admissions).clone();
+    let admitted_sequences = admission_observations
+        .iter()
+        .map(|sample| sample.sequence)
+        .collect();
+    let completed_sequences = lock_workload(&terminals)
+        .iter()
+        .map(|sample| sample.sequence)
+        .collect();
+    let persisted_sequences = lock_workload(&persisted).clone();
+    let scoped_observations = lock_workload(&timings).clone();
+    handle.collector.stop().await.unwrap();
+    lifecycle.shutdown().await.unwrap();
+
+    RealQueueResult {
+        profile,
+        trial_origin_ns,
+        observer_ready_ns,
+        priming_frame_recorded_ns,
+        workload_origin_ns,
+        admission_observations,
+        screen_observations,
+        scoped_observations,
+        submitted_sequences,
+        admitted_sequences,
+        completed_sequences,
+        persisted_sequences,
+        rendered_sequences,
+        final_identities,
+        frames,
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+async fn run_virtual_schedule_through_real_queue_at(
+    profile: WorkloadProfile,
+    trial_origin_ns: u64,
+    observer_ready_ns: u64,
+    workload_origin_ns: u64,
+    stall: Option<Duration>,
+) -> RealQueueResult {
+    run_schedule_through_real_queue_at(
+        profile,
+        trial_origin_ns,
+        observer_ready_ns,
+        Some(workload_origin_ns),
+        30_000_000,
+        stall,
+        None,
+    )
+    .await
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+async fn run_reference_schedule_through_real_queue(
+    profile: WorkloadProfile,
+    trial_origin_ns: u64,
+    observer_ready_ns: u64,
+    desired_phase_ns: u64,
+) -> RealQueueResult {
+    let clock: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| {
+        reference_monotonic_ns().expect("reference monotonic clock must remain readable")
+    });
+    run_schedule_through_real_queue_at(
+        profile,
+        trial_origin_ns,
+        observer_ready_ns,
+        None,
+        desired_phase_ns,
+        None,
+        Some(clock),
+    )
+    .await
+}
+
+#[cfg(feature = "workload-harness")]
+async fn run_virtual_schedule_through_real_queue(profile: WorkloadProfile) -> RealQueueResult {
+    run_virtual_schedule_through_real_queue_at(
+        profile,
+        1_000_000_000,
+        1_100_000_000,
+        2_000_000_000,
+        None,
+    )
+    .await
+}
+
+#[cfg(feature = "workload-harness")]
+async fn run_real_queue_with_frame_stall(
+    profile: WorkloadProfile,
+    stall: Duration,
+) -> RealQueueResult {
+    run_virtual_schedule_through_real_queue_at(
+        profile,
+        1_000_000_000,
+        1_100_000_000,
+        2_000_000_000,
+        Some(stall),
+    )
+    .await
+}
+
+#[cfg(feature = "workload-harness")]
+async fn run_virtual_schedule_after_delayed_ready_and_setup() -> RealQueueResult {
+    run_virtual_schedule_through_real_queue_at(
+        WorkloadProfile::SustainedTarget,
+        1_000_000_000,
+        3_000_000_000,
+        7_000_000_000,
+        None,
+    )
+    .await
+}
+
+#[cfg(feature = "workload-harness")]
+fn admission_schedule_attained(
+    profile: WorkloadProfile,
+    workload_origin_ns: u64,
+    observations: &[AdmissionObservationV1],
+) -> bool {
+    observations.len() == workload::admission_offsets(profile).len()
+        && observations
+            .iter()
+            .zip(workload::admission_offsets(profile))
+            .enumerate()
+            .all(|(index, (sample, offset))| {
+                sample.sequence == index as u64 + 1
+                    && sample.scheduled_ns
+                        == workload_origin_ns.checked_add(duration_ns(offset)).unwrap()
+                    && sample.admitted_ns == sample.scheduled_ns
+            })
+}
+
+#[cfg(feature = "workload-harness")]
+#[tokio::test]
+async fn real_controller_queue_profiles_are_lossless() {
+    for profile in [
+        WorkloadProfile::SustainedTarget,
+        WorkloadProfile::TargetBurst,
+        WorkloadProfile::TwiceTarget,
+    ] {
+        let result = run_virtual_schedule_through_real_queue(profile).await;
+        assert_eq!(result.submitted_sequences, result.admitted_sequences);
+        assert_eq!(result.admitted_sequences, result.completed_sequences);
+        assert_eq!(result.completed_sequences, result.persisted_sequences);
+        assert_eq!(
+            result.rendered_sequences,
+            workload::screen_probe_sequences(profile)
+        );
+        assert!(admission_schedule_attained(
+            profile,
+            result.workload_origin_ns,
+            &result.admission_observations
+        ));
+        assert!(result.screen_observations.iter().all(|sample| {
+            sample
+                .rendered_ns
+                .checked_sub(sample.admitted_ns)
+                .map(|elapsed| elapsed % 100_000_000)
+                == Some(sample.observed_frame_phase_ns)
+        }));
+        assert_eq!(
+            result.final_identities,
+            workload::oracle(profile).final_identities
+        );
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+#[tokio::test]
+async fn stalled_production_frame_recovers_all_cumulative_probe_acknowledgements() {
+    let result = run_real_queue_with_frame_stall(
+        WorkloadProfile::SustainedTarget,
+        Duration::from_millis(450),
+    )
+    .await;
+    assert!(result.frames.iter().any(|frame| frame.new_probe_count >= 2));
+    assert_eq!(
+        result.rendered_sequences,
+        workload::screen_probe_sequences(WorkloadProfile::SustainedTarget)
+    );
+    assert_eq!(result.submitted_sequences, (1..=1_200).collect::<Vec<_>>());
+    assert_eq!(result.submitted_sequences, result.persisted_sequences);
+}
+
+#[cfg(feature = "workload-harness")]
+#[tokio::test]
+async fn delayed_ready_and_setup_do_not_shift_the_workload_schedule() {
+    let result = run_virtual_schedule_after_delayed_ready_and_setup().await;
+    assert!(result.trial_origin_ns < result.observer_ready_ns);
+    assert!(result.observer_ready_ns < result.workload_origin_ns);
+    assert!(admission_schedule_attained(
+        result.profile,
+        result.workload_origin_ns,
+        &result.admission_observations
+    ));
+}
+
+#[cfg(feature = "workload-harness")]
+#[derive(Clone, Debug)]
+struct PhaseTrial {
+    priming_frame_count: u32,
+    priming_frame_recorded_ns: Option<u64>,
+    workload_origin_ns: Option<u64>,
+    frame_phase_offset_ns: Option<u64>,
+    admission_observations: Vec<AdmissionObservationV1>,
+    screen_observations: Vec<LatencyObservationV1>,
+}
+
+#[cfg(feature = "workload-harness")]
+fn valid_five_phase_trials() -> Vec<PhaseTrial> {
+    [10_000_000, 30_000_000, 50_000_000, 70_000_000, 90_000_000]
+        .into_iter()
+        .map(|phase| {
+            let priming_ns = 1_000_000_000;
+            let workload_origin_ns = priming_ns + 100_000_000 - phase;
+            let rendered_ns = workload_origin_ns + phase;
+            let clock = Arc::new(AtomicU64::new(priming_ns));
+            let (model_sender, model_receiver) =
+                tokio::sync::watch::channel(Arc::new(workload::target_model()));
+            let (_quality_sender, quality_receiver) =
+                tokio::sync::watch::channel(herdr_top::herdr::collector::ObservationQuality::Live);
+            let app = App::new(model_receiver, quality_receiver, HeaderInputs::default());
+            let terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let driver_clock = Arc::clone(&clock);
+            let mut driver = WorkloadFrameDriver::new(app, terminal, move || {
+                Duration::from_nanos(driver_clock.load(Ordering::SeqCst))
+            });
+            assert_eq!(driver.step(true).unwrap().draw_ordinal, Some(0));
+            model_sender.send_replace(Arc::new(workload::target_model()));
+            clock.store(rendered_ns, Ordering::SeqCst);
+            assert_eq!(driver.step(true).unwrap().draw_ordinal, Some(1));
+            PhaseTrial {
+                priming_frame_count: 1,
+                priming_frame_recorded_ns: Some(priming_ns),
+                workload_origin_ns: Some(workload_origin_ns),
+                frame_phase_offset_ns: Some(phase),
+                admission_observations: vec![AdmissionObservationV1 {
+                    sequence: 1,
+                    scheduled_ns: workload_origin_ns,
+                    admitted_ns: workload_origin_ns,
+                }],
+                screen_observations: vec![LatencyObservationV1 {
+                    sequence: 1,
+                    admitted_ns: workload_origin_ns,
+                    terminal_ns: workload_origin_ns,
+                    published_ns: workload_origin_ns,
+                    rendered_ns,
+                    observed_frame_phase_ns: phase,
+                }],
+            }
+        })
+        .collect()
+}
+
+#[cfg(feature = "workload-harness")]
+#[test]
+fn virtual_zero_overshoot_phase_rotation_is_complete_and_primed() {
+    let trials = valid_five_phase_trials();
+    assert_eq!(
+        trials
+            .iter()
+            .map(|trial| trial.frame_phase_offset_ns.unwrap())
+            .collect::<Vec<_>>(),
+        vec![10_000_000, 30_000_000, 50_000_000, 70_000_000, 90_000_000]
+    );
+    assert!(trials.iter().all(|trial| trial.priming_frame_count == 1));
+    assert!(trials.iter().all(|trial| {
+        trial.priming_frame_recorded_ns.unwrap().checked_add(
+            100_000_000_u64
+                .checked_sub(trial.frame_phase_offset_ns.unwrap())
+                .unwrap(),
+        ) == trial.workload_origin_ns
+    }));
+    assert!(
+        trials
+            .iter()
+            .all(|trial| trial.screen_observations.iter().all(|sample| {
+                let Some(admission) = trial
+                    .admission_observations
+                    .iter()
+                    .find(|admission| admission.sequence == sample.sequence)
+                else {
+                    return false;
+                };
+                sample
+                    .rendered_ns
+                    .checked_sub(admission.scheduled_ns)
+                    .map(|elapsed| elapsed % 100_000_000)
+                    == trial.frame_phase_offset_ns
+            }))
+    );
+}
+
+#[cfg(feature = "workload-harness")]
+struct DriverObservationResult {
+    frame_phase_offset_ns: u64,
+    screen_observation: LatencyObservationV1,
+    input_observation: InputLatencyObservationV1,
+    screen_latency_ns: u64,
+    input_latency_ns: u64,
+}
+
+#[cfg(feature = "workload-harness")]
+impl DriverObservationResult {
+    fn validates(&self) -> bool {
+        self.screen_latency_ns
+            == self
+                .screen_observation
+                .rendered_ns
+                .checked_sub(self.screen_observation.admitted_ns)
+                .unwrap()
+            && self.input_latency_ns
+                == self
+                    .input_observation
+                    .rendered_ns
+                    .checked_sub(self.input_observation.injected_ns)
+                    .unwrap()
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+async fn run_screen_and_input_through_driver_at(
+    priming_ns: u64,
+    desired_phase_ns: u64,
+    scheduled_ns: u64,
+    rendered_ns: u64,
+) -> DriverObservationResult {
+    let screen_clock = Arc::new(AtomicU64::new(priming_ns));
+    let (screen_model_sender, screen_model_receiver) =
+        tokio::sync::watch::channel(Arc::new(workload::target_model()));
+    let (_screen_quality_sender, screen_quality_receiver) =
+        tokio::sync::watch::channel(herdr_top::herdr::collector::ObservationQuality::Live);
+    let screen_app = App::new(
+        screen_model_receiver,
+        screen_quality_receiver,
+        HeaderInputs::default(),
+    );
+    let screen_terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let screen_driver_clock = Arc::clone(&screen_clock);
+    let mut screen_driver = WorkloadFrameDriver::new(screen_app, screen_terminal, move || {
+        Duration::from_nanos(screen_driver_clock.load(Ordering::SeqCst))
+    });
+    assert_eq!(screen_driver.step(true).unwrap().draw_ordinal, Some(0));
+    screen_model_sender.send_replace(Arc::new(workload::target_model()));
+    screen_clock.store(rendered_ns, Ordering::SeqCst);
+    assert_eq!(screen_driver.step(true).unwrap().draw_ordinal, Some(1));
+
+    let input_clock = Arc::new(AtomicU64::new(priming_ns));
+    let (_input_model_sender, input_model_receiver) =
+        tokio::sync::watch::channel(Arc::new(workload::target_model()));
+    let (_input_quality_sender, input_quality_receiver) =
+        tokio::sync::watch::channel(herdr_top::herdr::collector::ObservationQuality::Live);
+    let input_app = App::new(
+        input_model_receiver,
+        input_quality_receiver,
+        HeaderInputs::default(),
+    );
+    let input_terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let input_driver_clock = Arc::clone(&input_clock);
+    let mut input_driver = WorkloadFrameDriver::new(input_app, input_terminal, move || {
+        Duration::from_nanos(input_driver_clock.load(Ordering::SeqCst))
+    });
+    assert_eq!(input_driver.step(true).unwrap().draw_ordinal, Some(0));
+    input_clock.store(rendered_ns, Ordering::SeqCst);
+    assert!(
+        input_driver
+            .handle_key_and_wait(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('?'),
+                crossterm::event::KeyModifiers::NONE,
+            ))
+            .unwrap()
+            .draw_ordinal
+            .is_some()
+    );
+    let observed_phase_ns = rendered_ns.checked_sub(scheduled_ns).unwrap() % 100_000_000;
+    DriverObservationResult {
+        frame_phase_offset_ns: desired_phase_ns,
+        screen_observation: LatencyObservationV1 {
+            sequence: 1,
+            admitted_ns: scheduled_ns,
+            terminal_ns: scheduled_ns,
+            published_ns: scheduled_ns,
+            rendered_ns,
+            observed_frame_phase_ns: observed_phase_ns,
+        },
+        input_observation: InputLatencyObservationV1 {
+            scheduled_ns,
+            injected_ns: scheduled_ns,
+            rendered_ns,
+            observed_frame_phase_ns: observed_phase_ns,
+        },
+        screen_latency_ns: rendered_ns.checked_sub(scheduled_ns).unwrap(),
+        input_latency_ns: rendered_ns.checked_sub(scheduled_ns).unwrap(),
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+#[tokio::test]
+async fn reference_observations_record_nonzero_limiter_overshoot_without_synthesis() {
+    let priming_ns = 1_000_000_000;
+    let desired_phase_ns = 30_000_000;
+    let scheduled_ns = priming_ns + 70_000_000;
+    let rendered_ns = priming_ns + 107_000_000;
+    let result = run_screen_and_input_through_driver_at(
+        priming_ns,
+        desired_phase_ns,
+        scheduled_ns,
+        rendered_ns,
+    )
+    .await;
+    assert_eq!(result.frame_phase_offset_ns, desired_phase_ns);
+    assert_eq!(result.screen_observation.admitted_ns, scheduled_ns);
+    assert_eq!(result.input_observation.injected_ns, scheduled_ns);
+    assert_eq!(result.screen_observation.rendered_ns, rendered_ns);
+    assert_eq!(result.input_observation.rendered_ns, rendered_ns);
+    assert_eq!(
+        result.screen_observation.observed_frame_phase_ns,
+        37_000_000
+    );
+    assert_eq!(result.input_observation.observed_frame_phase_ns, 37_000_000);
+    assert_eq!(result.screen_latency_ns, 37_000_000);
+    assert_eq!(result.input_latency_ns, 37_000_000);
+    assert!(result.validates());
+    assert_ne!(
+        result.screen_observation.rendered_ns,
+        priming_ns + 100_000_000
+    );
+}
+
+#[cfg(feature = "workload-harness")]
+#[derive(Clone, Debug)]
+struct FallbackArmResult {
+    sequence: u64,
+    elapsed: Duration,
+    final_identities: workload::StructuralIdentities,
+    scoped_observations: Vec<ScopedTimingObservationV1>,
+}
+
+#[cfg(feature = "workload-harness")]
+struct FallbackPairResult {
+    notification: FallbackArmResult,
+    rescan: FallbackArmResult,
+}
+
+#[cfg(feature = "workload-harness")]
+#[derive(Default)]
+struct HarnessNotifyWatcher;
+
+#[cfg(feature = "workload-harness")]
+impl NotifyWatcher for HarnessNotifyWatcher {
+    fn watch(&mut self, _path: &std::path::Path) -> notify::Result<()> {
+        Ok(())
+    }
+
+    fn unwatch(&mut self, _path: &std::path::Path) -> notify::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+struct CapturingNotifyFactory {
+    sink: Arc<Mutex<Option<NotifySink>>>,
+}
+
+#[cfg(feature = "workload-harness")]
+impl NotifyFactory for CapturingNotifyFactory {
+    fn create(self: Box<Self>, sink: NotifySink) -> notify::Result<Box<dyn NotifyWatcher>> {
+        *lock_workload(&self.sink) = Some(sink);
+        Ok(Box::new(HarnessNotifyWatcher))
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+struct FailingNotifyFactory;
+
+#[cfg(feature = "workload-harness")]
+impl NotifyFactory for FailingNotifyFactory {
+    fn create(self: Box<Self>, _sink: NotifySink) -> notify::Result<Box<dyn NotifyWatcher>> {
+        Err(notify::Error::generic(
+            "forced workload notify creation failure",
+        ))
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+fn fallback_model(session_file: &std::path::Path) -> DomainModel {
+    let mut model = workload::target_model();
+    let run_id = model
+        .task_run_by_key(&RunKey::Controller("run-0200".to_owned()))
+        .unwrap()
+        .run_id;
+    model.insert_agent_node(AgentNode {
+        agent_node_id: "agent:codex:fallback-owner".to_owned(),
+        provider: Provider::Codex,
+        native_session_id: Some("fallback-owner".to_owned()),
+        task_run_id: run_id,
+        display_ordinal: DisplayOrdinal::new(201),
+        parent_agent_node_id: None,
+        state: None,
+        model_id: Some("gpt-test".to_owned()),
+        last_event_kind: None,
+        last_tool_name: None,
+        last_item_count: None,
+        last_byte_count: None,
+        last_activity_at_ms: None,
+        session_file: Some(session_file.to_string_lossy().into_owned()),
+    });
+    model
+}
+
+#[cfg(feature = "workload-harness")]
+async fn run_fallback_arm(poll: Duration, notification: bool, sequence: u64) -> FallbackArmResult {
+    use std::io::Write as _;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let sessions = temporary.path().join("home/.codex/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let session_file = sessions.join("fallback-owner.jsonl");
+    std::fs::write(
+        &session_file,
+        b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"fallback-owner\",\"session_id\":\"fallback-owner\",\"model\":\"gpt-test\"}}\n",
+    )
+    .unwrap();
+    let root = StateRoot(temporary.path().join("state"));
+    std::fs::create_dir_all(&root.0).unwrap();
+    let store = open_writer(&root).unwrap();
+    let (lifecycle, writer) = spawn_writer(store).unwrap();
+    let sink = Arc::new(Mutex::new(None));
+    let timings = Arc::new(Mutex::new(Vec::new()));
+    let clock = Arc::new(AtomicU64::new(1));
+    let no_admissions = Arc::new(Mutex::new(Vec::new()));
+    let no_terminals = Arc::new(Mutex::new(Vec::new()));
+    let no_persistence = Arc::new(Mutex::new(Vec::new()));
+    let notify_factory: Option<Box<dyn NotifyFactory>> = if notification {
+        Some(Box::new(CapturingNotifyFactory {
+            sink: Arc::clone(&sink),
+        }))
+    } else {
+        Some(Box::new(FailingNotifyFactory))
+    };
+    let kind = if notification {
+        WorkloadTimingKind::FallbackNotification
+    } else {
+        WorkloadTimingKind::FallbackRescan
+    };
+    let config = WorkloadCollectorConfig {
+        controller_hooks: WorkloadControllerHooks {
+            clock: {
+                let clock = Arc::clone(&clock);
+                Arc::new(move || clock.load(Ordering::SeqCst))
+            },
+            admission_observer: Arc::new(move |sample| lock_workload(&no_admissions).push(sample)),
+            terminal_observer: Arc::new(move |sample| lock_workload(&no_terminals).push(sample)),
+            persistence_observer: Arc::new(move |sample| {
+                lock_workload(&no_persistence).push(sample)
+            }),
+            timing_observer: workload_timing_collector(Arc::clone(&timings)),
+        },
+        provider_roots: vec![DiscoveryRoot {
+            provider: Provider::Codex,
+            path: sessions,
+        }],
+        notify_factory,
+        rescan_interval: Some(if notification {
+            herdr_top::provider::RESCAN_INTERVAL
+        } else {
+            poll
+        }),
+        fallback_timing: Some((
+            kind,
+            sequence,
+            workload_timing_collector(Arc::clone(&timings)),
+        )),
+    };
+    let mut handle = spawn_workload_collector(
+        temporary.path().join("missing-herdr.sock"),
+        "increment5-fallback".to_owned(),
+        empty_restored(fallback_model(&session_file)),
+        writer,
+        config,
+    )
+    .await
+    .unwrap();
+    let frame_epoch = std::time::Instant::now();
+    let app = App::new(
+        handle.collector.model.clone(),
+        handle.collector.quality.clone(),
+        HeaderInputs::default(),
+    );
+    let terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let mut driver = WorkloadFrameDriver::new(app, terminal, move || frame_epoch.elapsed());
+    assert_eq!(driver.step(true).unwrap().draw_ordinal, Some(0));
+    tokio::time::sleep(Duration::from_millis(110)).await;
+    let started = std::time::Instant::now();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&session_file)
+        .unwrap();
+    file.write_all(
+        b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"sub_agent_activity\",\"event_id\":\"fallback-activity\",\"occurred_at_ms\":2,\"agent_thread_id\":\"fallback-owner\",\"agent_path\":\"/root\",\"kind\":\"interacted\"}}\n",
+    )
+    .unwrap();
+    file.flush().unwrap();
+    if notification {
+        let notify_sink = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(sink) = lock_workload(&sink).clone() {
+                    break sink;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        notify_sink.hint(session_file.clone());
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if handle
+                .collector
+                .model
+                .borrow()
+                .agent_node("agent:codex:fallback-owner")
+                .is_some_and(|node| node.last_event_kind.as_deref() == Some("interacted"))
+            {
+                break;
+            }
+            handle.collector.model.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("fallback provider event must reach the model watch");
+    loop {
+        let frame = driver.step(true).unwrap();
+        if frame.draw_ordinal.is_some() {
+            break;
+        }
+        tokio::time::sleep(frame.poll_duration).await;
+    }
+    let elapsed = started.elapsed();
+    let final_identities = structural_identities(&handle.collector.model.borrow());
+    handle.collector.stop().await.unwrap();
+    lifecycle.shutdown().await.unwrap();
+    FallbackArmResult {
+        sequence,
+        elapsed,
+        final_identities,
+        scoped_observations: lock_workload(&timings).clone(),
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+async fn run_notification_and_forced_rescan_pair_at(
+    poll: Duration,
+    sequence: u64,
+) -> FallbackPairResult {
+    let (notification, rescan) = tokio::join!(
+        run_fallback_arm(poll, true, sequence),
+        run_fallback_arm(poll, false, sequence),
+    );
+    FallbackPairResult {
+        notification,
+        rescan,
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+async fn run_notification_and_forced_rescan_pair(poll: Duration) -> FallbackPairResult {
+    run_notification_and_forced_rescan_pair_at(poll, 1).await
+}
+
+#[cfg(feature = "workload-harness")]
+#[tokio::test]
+async fn fallback_rescan_uses_injected_polling_interval_without_loss() {
+    let poll = Duration::from_millis(20);
+    let scheduler_slack = Duration::from_millis(250);
+    let paired = run_notification_and_forced_rescan_pair(poll).await;
+    assert_eq!(paired.notification.sequence, paired.rescan.sequence);
+    let rescan_upper_bound = paired
+        .notification
+        .elapsed
+        .saturating_add(poll + scheduler_slack);
+    assert!(paired.rescan.elapsed <= rescan_upper_bound);
+    let expected = workload::oracle(WorkloadProfile::FallbackRescan).final_identities;
+    assert_eq!(paired.notification.final_identities, expected);
+    assert_eq!(paired.rescan.final_identities, expected);
+}
+
+#[cfg(feature = "workload-harness")]
+fn assert_exact_internal_segment_counts(
+    observations: &[ScopedTimingObservationV1],
+    expected: &[(ScopedTimingKindV1, u32, u32)],
+) {
+    for sample in observations {
+        let (_, d4_count, clone_publish_count) = expected
+            .iter()
+            .find(|(kind, _, _)| *kind == sample.kind)
+            .expect("every scoped kind must have a frozen segment count");
+        assert_eq!(sample.d4_segment_count, *d4_count);
+        assert_eq!(
+            sample.model_clone_publish_segment_count,
+            *clone_publish_count
+        );
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+fn assert_exact_kind_sequence_counts(
+    observations: &[ScopedTimingObservationV1],
+    expected: Vec<(ScopedTimingKindV1, Vec<u64>)>,
+) {
+    for (kind, sequences) in &expected {
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|sample| sample.kind == *kind)
+                .map(|sample| sample.sequence)
+                .collect::<Vec<_>>(),
+            *sequences,
+            "unexpected timing sequence coverage for {kind:?}"
+        );
+    }
+    assert_eq!(
+        observations.len(),
+        expected
+            .iter()
+            .map(|(_, sequences)| sequences.len())
+            .sum::<usize>()
+    );
+}
+
+#[cfg(feature = "workload-harness")]
+fn expected_controller_startup_and_fallback_kind_sequences() -> Vec<(ScopedTimingKindV1, Vec<u64>)>
+{
+    vec![
+        (ScopedTimingKindV1::ControllerEvent, (1..=1_200).collect()),
+        (ScopedTimingKindV1::StartupRestore, vec![1]),
+        (ScopedTimingKindV1::FallbackNotification, vec![1]),
+        (ScopedTimingKindV1::FallbackRescan, vec![1]),
+    ]
+}
+
+#[cfg(feature = "workload-harness")]
+async fn run_controller_startup_and_both_fallback_arms_with_hooks() -> Vec<ScopedTimingObservationV1>
+{
+    let mut observations =
+        run_virtual_schedule_through_real_queue(WorkloadProfile::SustainedTarget)
+            .await
+            .scoped_observations;
+    let startup = Arc::new(Mutex::new(Vec::new()));
+    let (_reducer, _model, _operator) = Reducer::new_with_operator_observed(
+        empty_restored(workload::target_model()),
+        RestoredOperatorState {
+            activity: Vec::new(),
+            terminal_times: std::collections::HashMap::new(),
+        },
+        1,
+        workload_timing_collector(Arc::clone(&startup)),
+    );
+    observations.extend(lock_workload(&startup).clone());
+    let fallback = run_notification_and_forced_rescan_pair(Duration::from_millis(20)).await;
+    observations.extend(fallback.notification.scoped_observations);
+    observations.extend(fallback.rescan.scoped_observations);
+    let kind_ordinal = |kind| match kind {
+        ScopedTimingKindV1::ControllerEvent => 0,
+        ScopedTimingKindV1::StartupRestore => 1,
+        ScopedTimingKindV1::FallbackNotification => 2,
+        ScopedTimingKindV1::FallbackRescan => 3,
+    };
+    observations.sort_by_key(|sample| (kind_ordinal(sample.kind), sample.sequence));
+    observations
+}
+
+#[cfg(feature = "workload-harness")]
+#[tokio::test]
+async fn reducer_scoped_hooks_record_actual_paths_exactly_once() {
+    let observations = run_controller_startup_and_both_fallback_arms_with_hooks().await;
+    assert_exact_kind_sequence_counts(
+        &observations,
+        expected_controller_startup_and_fallback_kind_sequences(),
+    );
+    assert_exact_internal_segment_counts(
+        &observations,
+        &[
+            (ScopedTimingKindV1::ControllerEvent, 2, 2),
+            (ScopedTimingKindV1::StartupRestore, 1, 1),
+            (ScopedTimingKindV1::FallbackNotification, 1, 1),
+            (ScopedTimingKindV1::FallbackRescan, 1, 1),
+        ],
+    );
+    assert!(observations.iter().all(|sample| sample.d4_analysis_ns
+        <= sample.reducer_plus_publish_ns
+        && sample.model_clone_publish_ns <= sample.reducer_plus_publish_ns));
 }
 
 #[test]
@@ -1033,6 +2223,29 @@ fn measure_input_response(model: DomainModel) -> Vec<InputLatencyObservationV1> 
         .clone()
 }
 
+fn startup_store_counts(root: &StateRoot) -> Result<(u64, u64), HarnessError> {
+    let connection = rusqlite::Connection::open(herdr_top::store::database_path(root))
+        .map_err(|_| HarnessError::Invalid("startup count database did not open"))?;
+    let non_gap_events = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE gap_kind IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|_| HarnessError::Invalid("startup event count did not query"))?;
+    let ledger_rows = connection
+        .query_row("SELECT COUNT(*) FROM event_ledger", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|_| HarnessError::Invalid("startup ledger count did not query"))?;
+    Ok((
+        u64::try_from(non_gap_events)
+            .map_err(|_| HarnessError::Invalid("startup event count was negative"))?,
+        u64::try_from(ledger_rows)
+            .map_err(|_| HarnessError::Invalid("startup ledger count was negative"))?,
+    ))
+}
+
 fn prepare_startup_store(root: &StateRoot, retained_events: usize) -> Result<(), HarnessError> {
     std::fs::create_dir_all(&root.0)?;
     let mut store = open_writer(root)?;
@@ -1073,6 +2286,15 @@ fn prepare_startup_store(root: &StateRoot, retained_events: usize) -> Result<(),
         });
     }
     store.apply_batch(batch)?;
+    drop(store);
+    let (non_gap_events, ledger_rows) = startup_store_counts(root)?;
+    let expected = u64::try_from(retained_events)
+        .map_err(|_| HarnessError::Invalid("startup retained event count exceeded u64"))?;
+    if non_gap_events != expected || ledger_rows != expected {
+        return Err(HarnessError::Invalid(
+            "startup events and ledger rows were not exact",
+        ));
+    }
     Ok(())
 }
 
@@ -5760,6 +6982,627 @@ fn validate_reference_baseline_set_from_environment() -> Result<(), HarnessError
         }
     }
     Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+fn reference_monotonic_ns() -> Result<u64, HarnessError> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    u64::try_from(value.tv_sec)
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000_000_000))
+        .and_then(|seconds| {
+            u64::try_from(value.tv_nsec)
+                .ok()
+                .and_then(|nanos| seconds.checked_add(nanos))
+        })
+        .ok_or(HarnessError::Invalid("monotonic timestamp overflowed"))
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+async fn wait_for_reference_epoch(target_ns: u64) -> Result<(), HarnessError> {
+    loop {
+        let now = reference_monotonic_ns()?;
+        let Some(remaining) = target_ns.checked_sub(now) else {
+            return Ok(());
+        };
+        if remaining == 0 {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_nanos(remaining.min(5_000_000))).await;
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+fn reference_affinity() -> Result<Vec<u32>, HarnessError> {
+    let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+    if unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) } != 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok((0..libc::CPU_SETSIZE as usize)
+        .filter(|cpu| unsafe { libc::CPU_ISSET(*cpu, &set) })
+        .map(|cpu| cpu as u32)
+        .collect())
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+fn reference_address_space_limit() -> Result<u64, HarnessError> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(limit.rlim_cur)
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+fn atomic_write_reference_bytes(path: &std::path::Path, bytes: &[u8]) -> Result<(), HarnessError> {
+    use std::io::Write as _;
+
+    let parent = path
+        .parent()
+        .ok_or(HarnessError::Invalid("reference output had no parent"))?;
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or(HarnessError::Invalid("reference output name was not UTF-8"))?;
+    let temporary = parent.join(format!(".{name}.{}.tmp", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok::<_, HarnessError>(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+fn atomic_write_reference_json<T: serde::Serialize>(
+    path: &std::path::Path,
+    value: &T,
+) -> Result<(), HarnessError> {
+    let mut bytes = serde_json::to_vec(value)?;
+    bytes.push(b'\n');
+    atomic_write_reference_bytes(path, &bytes)
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+fn read_reference_control_frame(
+    reader: &mut impl std::io::BufRead,
+) -> Result<ObserverControlFrameV1, HarnessError> {
+    let mut bytes = Vec::new();
+    reader.read_until(b'\n', &mut bytes)?;
+    if bytes.last() != Some(&b'\n') {
+        return Err(HarnessError::Invalid(
+            "observer control frame was incomplete",
+        ));
+    }
+    let frame: ObserverControlFrameV1 = serde_json::from_slice(&bytes[..bytes.len() - 1])?;
+    let mut canonical = serde_json::to_vec(&frame)?;
+    canonical.push(b'\n');
+    if bytes != canonical {
+        return Err(HarnessError::Invalid(
+            "observer control frame was not canonical",
+        ));
+    }
+    Ok(frame)
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+fn write_reference_control_command(
+    stream: &mut std::os::unix::net::UnixStream,
+    command: &ObserverCommandV1,
+) -> Result<(), HarnessError> {
+    use std::io::Write as _;
+
+    serde_json::to_writer(&mut *stream, command)?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+fn reference_scenario(value: &str) -> Result<(ScenarioV1, WorkloadProfile), HarnessError> {
+    match value {
+        "target" => Ok((ScenarioV1::Target, WorkloadProfile::TargetTopology)),
+        "sustained" => Ok((ScenarioV1::Sustained, WorkloadProfile::SustainedTarget)),
+        "burst" => Ok((ScenarioV1::Burst, WorkloadProfile::TargetBurst)),
+        "startup" => Ok((ScenarioV1::Startup, WorkloadProfile::Startup)),
+        "idle" => Ok((ScenarioV1::Idle, WorkloadProfile::Idle)),
+        "fallback-rescan" => Ok((ScenarioV1::FallbackRescan, WorkloadProfile::FallbackRescan)),
+        "twice-target" => Ok((ScenarioV1::TwiceTarget, WorkloadProfile::TwiceTarget)),
+        _ => Err(HarnessError::Invalid("unknown reference scenario")),
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+fn reference_stage(value: &str) -> Result<MeasurementStageV1, HarnessError> {
+    match value {
+        "baseline" => Ok(MeasurementStageV1::Baseline),
+        "post-reliability" => Ok(MeasurementStageV1::PostReliability),
+        "final" => Ok(MeasurementStageV1::Final),
+        _ => Err(HarnessError::Invalid("unknown reference stage")),
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+fn reference_trial_index(scratch_root: &std::path::Path) -> Result<usize, HarnessError> {
+    let trial = scratch_root
+        .parent()
+        .and_then(std::path::Path::file_name)
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or(HarnessError::Invalid(
+            "scratch root omitted its trial directory",
+        ))?;
+    if trial == "warm-up-0001" {
+        return Ok(0);
+    }
+    trial
+        .strip_prefix("trial-")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0 && format!("trial-{value:04}") == trial)
+        .ok_or(HarnessError::Invalid("trial directory was not canonical"))
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+fn reference_phase(scenario: ScenarioV1, trial_index: usize) -> Option<u64> {
+    let spec = workload_schema()
+        .scenarios
+        .iter()
+        .find(|spec| spec.scenario == scenario)
+        .expect("closed reference scenario must have a manifest row");
+    if trial_index == 0 {
+        spec.warm_up_frame_phase_offset_ns
+    } else {
+        spec.frame_phase_offsets_ns.get(trial_index - 1).copied()
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+async fn run_reference_input_trial(
+    desired_phase_ns: u64,
+) -> Result<(u64, u64, Vec<InputLatencyObservationV1>), HarnessError> {
+    let (_model_sender, model_receiver) =
+        tokio::sync::watch::channel(Arc::new(workload::target_model()));
+    let (_quality_sender, quality_receiver) =
+        tokio::sync::watch::channel(herdr_top::herdr::collector::ObservationQuality::Live);
+    let app = App::new(model_receiver, quality_receiver, HeaderInputs::default());
+    let terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let mut driver = WorkloadFrameDriver::new(app, terminal, || {
+        Duration::from_nanos(
+            reference_monotonic_ns().expect("monotonic clock must remain readable"),
+        )
+    });
+    let priming_frame_recorded_ns = reference_monotonic_ns()?;
+    if driver.step(true)?.draw_ordinal.is_none() {
+        return Err(HarnessError::Invalid(
+            "reference input priming frame was skipped",
+        ));
+    }
+    let workload_origin_ns = priming_frame_recorded_ns
+        .checked_add(
+            100_000_000_u64
+                .checked_sub(desired_phase_ns)
+                .ok_or(HarnessError::Invalid("input phase exceeded frame interval"))?,
+        )
+        .ok_or(HarnessError::Invalid("input workload origin overflowed"))?;
+    let mut scheduled_ns = workload_origin_ns;
+    let mut observations = Vec::with_capacity(200);
+    for _ in 0..200 {
+        wait_for_reference_epoch(scheduled_ns).await?;
+        let injected_ns = reference_monotonic_ns()?;
+        let frame = driver.handle_key_and_wait(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('?'),
+            crossterm::event::KeyModifiers::NONE,
+        ))?;
+        if frame.draw_ordinal.is_none() {
+            return Err(HarnessError::Invalid("reference input frame was skipped"));
+        }
+        let rendered_ns = reference_monotonic_ns()?;
+        observations.push(InputLatencyObservationV1 {
+            scheduled_ns,
+            injected_ns,
+            rendered_ns,
+            observed_frame_phase_ns: rendered_ns
+                .checked_sub(injected_ns)
+                .ok_or(HarnessError::Invalid("input clock regressed"))?
+                % 100_000_000,
+        });
+        scheduled_ns = rendered_ns
+            .checked_add(100_000_000 - desired_phase_ns)
+            .ok_or(HarnessError::Invalid("next input schedule overflowed"))?;
+    }
+    Ok((priming_frame_recorded_ns, workload_origin_ns, observations))
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ReferenceStartupHelperV1 {
+    startup_ns: u64,
+    restored_activity_count: u64,
+    scoped: ScopedTimingObservationV1,
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+fn compare_reference_activity(left: &ActivityItem, right: &ActivityItem) -> std::cmp::Ordering {
+    right
+        .event_timestamp_ms
+        .cmp(&left.event_timestamp_ms)
+        .then_with(|| right.seen_at_ms.cmp(&left.seen_at_ms))
+        .then_with(|| right.ingest_seq.is_some().cmp(&left.ingest_seq.is_some()))
+        .then_with(|| right.ingest_seq.cmp(&left.ingest_seq))
+        .then_with(|| right.identity.event_id.cmp(&left.identity.event_id))
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+fn run_reference_startup_helper(
+    root: &StateRoot,
+    output: &std::path::Path,
+) -> Result<ReferenceStartupHelperV1, HarnessError> {
+    let status = std::process::Command::new(std::env::current_exe()?)
+        .env("HERDR_PERF_STARTUP_STATE_ROOT", &root.0)
+        .env("HERDR_PERF_STARTUP_HELPER_OUTPUT", output)
+        .args([
+            "reference_profile_startup_restore_helper",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .status()?;
+    if !status.success() {
+        return Err(HarnessError::Invalid("startup restore helper failed"));
+    }
+    let bytes = std::fs::read(output)?;
+    let helper: ReferenceStartupHelperV1 = serde_json::from_slice(&bytes)?;
+    let mut canonical = serde_json::to_vec(&helper)?;
+    canonical.push(b'\n');
+    if bytes != canonical {
+        return Err(HarnessError::Invalid(
+            "startup helper output was not canonical",
+        ));
+    }
+    Ok(helper)
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+#[ignore = "fresh startup restore helper for the authoritative reference entrypoint"]
+fn reference_profile_startup_restore_helper() {
+    let root = StateRoot(PathBuf::from(
+        std::env::var_os("HERDR_PERF_STARTUP_STATE_ROOT").expect("startup root must be supplied"),
+    ));
+    let output = PathBuf::from(
+        std::env::var_os("HERDR_PERF_STARTUP_HELPER_OUTPUT")
+            .expect("startup helper output must be supplied"),
+    );
+    assert_eq!(
+        u64::try_from(herdr_top::store::WORKLOAD_RESTORE_ACTIVITY_LIMIT).unwrap(),
+        workload_schema().operator_activity_limit
+    );
+    assert_eq!(
+        u64::try_from(herdr_top::operator::WORKLOAD_OPERATOR_ACTIVITY_LIMIT).unwrap(),
+        workload_schema().operator_activity_limit
+    );
+    let restore_started = std::time::Instant::now();
+    let reader = open_reader(&root).unwrap();
+    let restored = reader.load_restored_state().unwrap();
+    let operator = reader.load_restored_operator_state().unwrap();
+    let restore_elapsed = restore_started.elapsed();
+    let expected_activity_count =
+        usize::try_from(workload_schema().operator_activity_limit).unwrap();
+    assert_eq!(operator.activity.len(), expected_activity_count);
+    assert!(
+        operator
+            .activity
+            .windows(2)
+            .all(|pair| compare_reference_activity(&pair[0], &pair[1]) == std::cmp::Ordering::Less)
+    );
+    assert_eq!(
+        operator
+            .activity
+            .iter()
+            .map(|item| item.identity.event_id.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        expected_activity_count
+    );
+    let first = operator.activity.first().unwrap();
+    assert_eq!(
+        (
+            first.identity.event_id.as_str(),
+            first.event_timestamp_ms,
+            first.seen_at_ms,
+        ),
+        ("startup-retained-099999", 99_999, 99_999)
+    );
+    let last = operator.activity.last().unwrap();
+    assert_eq!(
+        (
+            last.identity.event_id.as_str(),
+            last.event_timestamp_ms,
+            last.seen_at_ms,
+        ),
+        ("startup-retained-090000", 90_000, 90_000)
+    );
+    let restored_activity_count = u64::try_from(operator.activity.len()).unwrap();
+    let scoped = Arc::new(Mutex::new(Vec::new()));
+    let constructor_started = std::time::Instant::now();
+    let (_reducer, _model, _operator) = Reducer::new_with_operator_observed(
+        restored,
+        operator,
+        1,
+        workload_timing_collector(Arc::clone(&scoped)),
+    );
+    let helper = ReferenceStartupHelperV1 {
+        startup_ns: duration_ns(
+            restore_elapsed
+                .checked_add(constructor_started.elapsed())
+                .expect("startup duration must fit Duration"),
+        ),
+        restored_activity_count,
+        scoped: lock_workload(&scoped).first().cloned().unwrap(),
+    };
+    atomic_write_reference_json(&output, &helper).unwrap();
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+async fn reference_profile_entrypoint_impl() -> Result<(), HarnessError> {
+    use std::os::unix::net::UnixListener;
+
+    let output = PathBuf::from(
+        std::env::var_os("HERDR_PERF_OUTPUT")
+            .ok_or(HarnessError::Invalid("reference output was missing"))?,
+    );
+    let handshake = PathBuf::from(
+        std::env::var_os("HERDR_PERF_OBSERVER_HANDSHAKE")
+            .ok_or(HarnessError::Invalid("observer handshake was missing"))?,
+    );
+    let control_socket = PathBuf::from(
+        std::env::var_os("HERDR_PERF_OBSERVER_CONTROL_SOCKET")
+            .ok_or(HarnessError::Invalid("observer socket was missing"))?,
+    );
+    let scratch_root = PathBuf::from(
+        std::env::var_os("HERDR_PERF_SCRATCH_ROOT")
+            .ok_or(HarnessError::Invalid("scratch root was missing"))?,
+    );
+    let scenario_raw = std::env::var("HERDR_PERF_SCENARIO")
+        .map_err(|_| HarnessError::Invalid("reference scenario was missing"))?;
+    let (scenario, profile) = reference_scenario(&scenario_raw)?;
+    let _stage = reference_stage(
+        &std::env::var("HERDR_PERF_STAGE")
+            .map_err(|_| HarnessError::Invalid("reference stage was missing"))?,
+    )?;
+    let trial_index = reference_trial_index(&scratch_root)?;
+    let listener = UnixListener::bind(&control_socket)?;
+    let pid = std::process::id();
+    let start_time_ticks = workload::linux_process_start_time_ticks(pid)?;
+    let trial_origin_ns = reference_monotonic_ns()?;
+    atomic_write_reference_bytes(
+        &handshake,
+        format!("{pid} {start_time_ticks} {trial_origin_ns}\n").as_bytes(),
+    )?;
+    let (stream, _) = listener.accept()?;
+    stream.set_read_timeout(Some(Duration::from_secs(40)))?;
+    let mut control_writer = stream.try_clone()?;
+    let mut control_reader = std::io::BufReader::new(stream);
+    let observer_ready_ns = match read_reference_control_frame(&mut control_reader)? {
+        ObserverControlFrameV1::Ready { observer_ready_ns }
+            if observer_ready_ns > trial_origin_ns =>
+        {
+            observer_ready_ns
+        }
+        _ => {
+            return Err(HarnessError::Invalid(
+                "observer did not send the first Ready frame",
+            ));
+        }
+    };
+    let identities = workload::target_identities_v1();
+    let mut priming_frame_recorded_ns = None;
+    let mut workload_origin_ns = None;
+    let mut frame_phase_offset_ns = None;
+    let mut priming_frame_count = 0;
+    let mut admission_observations = Vec::new();
+    let mut screen_observations = Vec::new();
+    let mut input_observations = Vec::new();
+    let mut startup_observations_ns = Vec::new();
+    let mut fallback_pairs = Vec::new();
+    let mut scoped_observations = Vec::new();
+    let mut submitted_sequences = Vec::new();
+    let mut admitted_sequences = Vec::new();
+    let mut completed_sequences = Vec::new();
+    let mut persisted_sequences = Vec::new();
+    let mut rendered_sequences = Vec::new();
+    let mut prepared_non_gap_event_count = None;
+    let mut prepared_ledger_row_count = None;
+    let mut restored_activity_count = None;
+    let mut idle_window_start_ns = None;
+    let mut idle_window_end_ns = None;
+
+    match scenario {
+        ScenarioV1::Target => {
+            let phase = reference_phase(scenario, trial_index)
+                .ok_or(HarnessError::Invalid("target trial omitted its phase"))?;
+            let (priming, origin, observations) = run_reference_input_trial(phase).await?;
+            priming_frame_recorded_ns = Some(priming);
+            workload_origin_ns = Some(origin);
+            frame_phase_offset_ns = Some(phase);
+            priming_frame_count = 1;
+            input_observations = observations;
+        }
+        ScenarioV1::Sustained | ScenarioV1::Burst | ScenarioV1::TwiceTarget => {
+            let phase = reference_phase(scenario, trial_index)
+                .ok_or(HarnessError::Invalid("queue trial omitted its phase"))?;
+            let result = run_reference_schedule_through_real_queue(
+                profile,
+                trial_origin_ns,
+                observer_ready_ns,
+                phase,
+            )
+            .await;
+            if result.final_identities != workload::oracle(profile).final_identities {
+                return Err(HarnessError::Invalid(
+                    "queue final identities differed from the oracle",
+                ));
+            }
+            priming_frame_recorded_ns = Some(result.priming_frame_recorded_ns);
+            workload_origin_ns = Some(result.workload_origin_ns);
+            frame_phase_offset_ns = Some(phase);
+            priming_frame_count = 1;
+            admission_observations = result.admission_observations;
+            screen_observations = result.screen_observations;
+            scoped_observations = result.scoped_observations;
+            submitted_sequences = result.submitted_sequences;
+            admitted_sequences = result.admitted_sequences;
+            completed_sequences = result.completed_sequences;
+            persisted_sequences = result.persisted_sequences;
+            rendered_sequences = result.rendered_sequences;
+        }
+        ScenarioV1::Startup => {
+            let state = StateRoot(scratch_root.join("startup-state"));
+            prepare_startup_store(&state, 100_000)?;
+            let (non_gap_events, ledger_rows) = startup_store_counts(&state)?;
+            let helper = run_reference_startup_helper(&state, &scratch_root.join("startup.json"))?;
+            startup_observations_ns.push(helper.startup_ns);
+            scoped_observations.push(helper.scoped);
+            prepared_non_gap_event_count = Some(non_gap_events);
+            prepared_ledger_row_count = Some(ledger_rows);
+            restored_activity_count = Some(helper.restored_activity_count);
+        }
+        ScenarioV1::Idle => {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            write_reference_control_command(
+                &mut control_writer,
+                &ObserverCommandV1::StartIdleWindow {},
+            )?;
+            idle_window_start_ns = match read_reference_control_frame(&mut control_reader)? {
+                ObserverControlFrameV1::IdleWindowStarted {
+                    request_received_ns,
+                    start_ns,
+                } if request_received_ns <= start_ns => Some(start_ns),
+                _ => {
+                    return Err(HarnessError::Invalid(
+                        "idle start acknowledgement was invalid",
+                    ));
+                }
+            };
+            idle_window_end_ns = match read_reference_control_frame(&mut control_reader)? {
+                ObserverControlFrameV1::IdleWindowEnded { end_ns }
+                    if idle_window_start_ns.is_some_and(|start| end_ns > start) =>
+                {
+                    Some(end_ns)
+                }
+                _ => {
+                    return Err(HarnessError::Invalid(
+                        "idle end acknowledgement was invalid",
+                    ));
+                }
+            };
+        }
+        ScenarioV1::FallbackRescan => {
+            for sequence in 1..=5 {
+                let paired = run_notification_and_forced_rescan_pair_at(
+                    herdr_top::provider::RESCAN_INTERVAL,
+                    sequence,
+                )
+                .await;
+                let notification = paired.notification;
+                let rescan = paired.rescan;
+                let notification_ns = duration_ns(notification.elapsed);
+                let rescan_ns = duration_ns(rescan.elapsed);
+                let notification_final_identities =
+                    structural_identities_v1(&notification.final_identities);
+                let rescan_final_identities = structural_identities_v1(&rescan.final_identities);
+                if notification_final_identities != identities
+                    || rescan_final_identities != identities
+                {
+                    return Err(HarnessError::Invalid(
+                        "fallback final identities differed from the oracle",
+                    ));
+                }
+                // This ordering relies on the production two-second rescan interval dwarfing
+                // notification latency; revisit it if that interval approaches the CI poll.
+                if rescan_ns < notification_ns {
+                    return Err(HarnessError::Invalid(
+                        "fallback rescan preceded notification",
+                    ));
+                }
+                fallback_pairs.push(FallbackPairObservationV1 {
+                    sequence,
+                    notification_ns,
+                    rescan_ns,
+                    notification_final_identities,
+                    rescan_final_identities,
+                });
+                scoped_observations.extend(notification.scoped_observations);
+                scoped_observations.extend(rescan.scoped_observations);
+            }
+        }
+    }
+
+    let child_controls = ChildControlsV1 {
+        effective_affinity_cpu_ids: reference_affinity()?,
+        effective_address_space_limit_bytes: reference_address_space_limit()?,
+        measured_environment: std::env::vars().collect(),
+        scratch_root: scratch_root.to_string_lossy().into_owned(),
+    };
+    let trial = HarnessTrialV1 {
+        scenario,
+        trial_index,
+        trial_origin_ns,
+        priming_frame_recorded_ns,
+        workload_origin_ns,
+        frame_phase_offset_ns,
+        priming_frame_count,
+        admission_observations,
+        screen_observations,
+        input_observations,
+        startup_observations_ns,
+        fallback_pairs,
+        scoped_observations,
+        submitted_sequences,
+        admitted_sequences,
+        completed_sequences,
+        persisted_sequences,
+        rendered_sequences,
+        pane_ids: identities.pane_ids,
+        task_run_ids: identities.task_run_ids,
+        dependency_edges: identities.dependency_edges,
+        execution_edges: identities.execution_edges,
+        prepared_non_gap_event_count,
+        prepared_ledger_row_count,
+        restored_activity_count,
+        performance_evidence_stream: None,
+        idle_window_start_ns,
+        idle_window_end_ns,
+        child_controls,
+    };
+    atomic_write_reference_json(&output, &trial)
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[tokio::test]
+#[ignore = "native runner supplies the closed authoritative reference protocol"]
+async fn reference_profile_entrypoint() {
+    reference_profile_entrypoint_impl()
+        .await
+        .expect("reference profile entrypoint must complete");
 }
 
 #[cfg(target_os = "linux")]
