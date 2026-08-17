@@ -49,3 +49,9 @@ The provider staging sanitization retains:
 - In all provider files: home-directory values replaced with `/home/user`.
 
 Fixtures deeper than the locally evidenced topology, such as a Codex depth-3 `agent_path`, must be authored synthetically and marked unevidenced.
+
+## Workload family
+
+`workload-schema-v1.json` is a wholly synthetic, versioned protocol fixture authored from the approved Increment 5 design. It is not a captured transcript. Its canonical compact JSON freezes the seven ordered scenario/directory mappings; structural and admission schedules; warm-up and recorded-trial counts; observation applicability; threshold inclusivity and nearest-rank percentiles; admission, probe, reducer-lag, publish-to-render, fallback-arm, baseline-transfer, idle-window, measurement-stage, and performance-stream policies; the exact ordered Section 15 distribution/predicate row matrix, including statistic order, sample-count ownership, repetition, and ordinal policy; the ordered performance reason labels; the fixed render surface and phase rotation; and the closed failure/D4 policy matrix.
+
+The fixture contains no provider payload and no private raw diagnostic. `workload_schema_manifest_has_golden_digest` pins the SHA-256 of its exact UTF-8 bytes and verifies compact serialization with exactly one trailing LF.

@@ -5,6 +5,9 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
+#[allow(dead_code)]
+pub mod workload;
+
 /// Loads one flat provider JSONL fixture as `(byte_offset, record_bytes)` pairs.
 #[allow(dead_code)]
 pub fn flat_jsonl_fixture(file_name: &str) -> Vec<(u64, Vec<u8>)> {
