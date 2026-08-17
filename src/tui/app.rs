@@ -1143,6 +1143,103 @@ impl FrameLimiter {
         })
     }
 }
+// increment5-workload-harness: begin production frame limiter driver
+#[cfg(feature = "workload-harness")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkloadFrameObservation {
+    /// Ordinal assigned to this draw, or `None` when the limiter skipped it.
+    pub draw_ordinal: Option<u64>,
+    /// The production poll duration computed after this iteration.
+    pub poll_duration: Duration,
+}
+
+/// Feature-only driver for workload measurements through the production frame limiter.
+#[cfg(feature = "workload-harness")]
+#[doc(hidden)]
+pub struct WorkloadFrameDriver {
+    app: App,
+    terminal: Terminal<ratatui::backend::TestBackend>,
+    limiter: FrameLimiter,
+    clock: Box<dyn FnMut() -> Duration>,
+    dirty: bool,
+    next_draw_ordinal: u64,
+}
+
+#[cfg(feature = "workload-harness")]
+impl WorkloadFrameDriver {
+    /// Creates a driver with the same initially-dirty state as [`App::run`].
+    #[must_use]
+    pub fn new(
+        app: App,
+        terminal: Terminal<ratatui::backend::TestBackend>,
+        clock: impl FnMut() -> Duration + 'static,
+    ) -> Self {
+        Self {
+            app,
+            terminal,
+            limiter: FrameLimiter::default(),
+            clock: Box::new(clock),
+            dirty: true,
+            next_draw_ordinal: 0,
+        }
+    }
+
+    /// Runs one production-ordered refresh, limiter, draw, record, and poll iteration.
+    pub fn step(&mut self, dirty: bool) -> io::Result<WorkloadFrameObservation> {
+        self.dirty |= dirty;
+        self.dirty |= self.app.refresh_if_changed()?;
+        let now = (self.clock)();
+        let draw_ordinal = if self.limiter.ready(self.dirty, now) {
+            let draw_ordinal = self.next_draw_ordinal;
+            let next_draw_ordinal = draw_ordinal
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("workload frame draw ordinal exceeded u64"))?;
+            match self.terminal.draw(|frame| self.app.render(frame)) {
+                Ok(_) => {}
+                Err(never) => match never {},
+            }
+            self.limiter.record(now);
+            self.dirty = false;
+            self.next_draw_ordinal = next_draw_ordinal;
+            Some(draw_ordinal)
+        } else {
+            None
+        };
+        let poll_duration = self
+            .app
+            .poll_duration(&self.limiter, self.dirty, (self.clock)());
+        Ok(WorkloadFrameObservation {
+            draw_ordinal,
+            poll_duration,
+        })
+    }
+
+    /// Applies one key and waits for the first limiter-eligible frame that reflects it.
+    pub fn handle_key_and_wait(&mut self, key: KeyEvent) -> io::Result<WorkloadFrameObservation> {
+        if self.app.handle_key(key) == LoopControl::Exit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "exit keys do not produce a workload response frame",
+            ));
+        }
+        self.dirty = true;
+        loop {
+            let observation = self.step(false)?;
+            if observation.draw_ordinal.is_some() {
+                return Ok(observation);
+            }
+            std::thread::sleep(observation.poll_duration);
+        }
+    }
+
+    /// Returns the test terminal containing the most recently drawn frame.
+    #[must_use]
+    pub const fn terminal(&self) -> &Terminal<ratatui::backend::TestBackend> {
+        &self.terminal
+    }
+}
+// increment5-workload-harness: end production frame limiter driver
 
 fn preferred_run_row<'a>(
     rows: &'a [TreeRow],

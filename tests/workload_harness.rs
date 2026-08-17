@@ -13,6 +13,111 @@ use herdr_top::model::{
 };
 use herdr_top::reducer::{ApplyOutcome, Reducer};
 use herdr_top::store::{PersistOp, RestoredState, open_reader, open_writer};
+#[cfg(feature = "workload-harness")]
+use herdr_top::tui::app::{App, HeaderInputs, WorkloadFrameDriver};
+#[cfg(feature = "workload-harness")]
+use ratatui::Terminal;
+#[cfg(feature = "workload-harness")]
+use ratatui::backend::TestBackend;
+
+#[cfg(feature = "workload-harness")]
+fn frame_driver_for_times(
+    millis: &[u64],
+) -> (
+    WorkloadFrameDriver,
+    tokio::sync::watch::Sender<std::sync::Arc<DomainModel>>,
+    tokio::sync::watch::Sender<herdr_top::herdr::collector::ObservationQuality>,
+) {
+    let clock_values = millis
+        .iter()
+        .flat_map(|millis| [Duration::from_millis(*millis); 2])
+        .collect::<Vec<_>>();
+    let mut clock_values = clock_values.into_iter();
+    let (model_sender, model_receiver) =
+        tokio::sync::watch::channel(std::sync::Arc::new(DomainModel::default()));
+    let (quality_sender, quality_receiver) =
+        tokio::sync::watch::channel(herdr_top::herdr::collector::ObservationQuality::Live);
+    let app = App::new(model_receiver, quality_receiver, HeaderInputs::default());
+    let terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let driver = WorkloadFrameDriver::new(app, terminal, move || {
+        clock_values
+            .next()
+            .expect("fixed workload clock must cover every limiter read")
+    });
+    (driver, model_sender, quality_sender)
+}
+
+#[cfg(feature = "workload-harness")]
+#[test]
+fn workload_frame_driver_matches_production_limiter_decisions() {
+    let (mut driver, _model_sender, _quality_sender) =
+        frame_driver_for_times(&[0, 50, 99, 100, 200]);
+
+    let observations = [false, false, true, false, true]
+        .into_iter()
+        .map(|dirty| driver.step(dirty).unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        observations
+            .iter()
+            .map(|observation| observation.draw_ordinal)
+            .collect::<Vec<_>>(),
+        vec![Some(0), None, None, Some(1), Some(2)]
+    );
+    assert_eq!(
+        observations
+            .iter()
+            .map(|observation| observation.poll_duration)
+            .collect::<Vec<_>>(),
+        vec![
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        ]
+    );
+}
+
+#[cfg(feature = "workload-harness")]
+#[test]
+fn workload_frame_driver_waits_for_first_eligible_response_frame() {
+    let (mut driver, _model_sender, _quality_sender) = frame_driver_for_times(&[0, 10, 99, 100]);
+    assert_eq!(driver.step(false).unwrap().draw_ordinal, Some(0));
+
+    let response = driver
+        .handle_key_and_wait(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('?'),
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .unwrap();
+
+    assert_eq!(response.draw_ordinal, Some(1));
+    let rendered = driver
+        .terminal()
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(rendered.contains(" Help "));
+}
+
+#[cfg(feature = "workload-harness")]
+#[test]
+fn workload_frame_driver_draw_ordinals_are_contiguous_only_for_draws() {
+    let (mut driver, _model_sender, _quality_sender) =
+        frame_driver_for_times(&[0, 10, 20, 99, 100, 101, 199, 200]);
+
+    let draw_ordinals = [false, false, true, false, false, true, true, true]
+        .into_iter()
+        .filter_map(|dirty| driver.step(dirty).unwrap().draw_ordinal)
+        .collect::<Vec<_>>();
+
+    assert_eq!(draw_ordinals, vec![0, 1, 2]);
+}
 
 #[test]
 fn target_workload_oracle_is_exact_and_deterministic() {
