@@ -5298,6 +5298,10 @@ esac"#;
     }
 
     pub fn fixture_tools() -> FixtureTools {
+        fixture_tools_with_forced_shims(&[])
+    }
+
+    pub fn fixture_tools_with_forced_shims(forced_shims: &[&str]) -> FixtureTools {
         let root = tempfile::tempdir().unwrap();
         let entries = SOURCE_FIXTURE_ROLES
             .iter()
@@ -5305,6 +5309,7 @@ esac"#;
                 let installed = PathBuf::from(format!("/usr/bin/{role}"));
                 let metadata = fs::metadata(&installed);
                 let use_shim = *role == "pidstat"
+                    || forced_shims.contains(role)
                     || !metadata.as_ref().is_ok_and(|value| {
                         value.is_file() && value.permissions().mode() & 0o111 != 0
                     });
@@ -6617,27 +6622,6 @@ fn source_fixture_inventory_is_portable_and_role_closed() {
 
     // Break caught: missing/extra/reordered roles, workstation tool paths, or
     // role lookup through PATH reaching Bash.
-    let portable_tools = support::fixture_tools();
-    for tool in portable_tools.iter() {
-        let metadata = std::fs::metadata(&tool.requested);
-        assert!(
-            metadata
-                .as_ref()
-                .is_ok_and(|value| value.is_file() && value.permissions().mode() & 0o111 != 0),
-            "portable fixture role {} has no executable or shim at {}",
-            tool.role,
-            tool.requested.display()
-        );
-    }
-    assert_ne!(
-        portable_tools
-            .iter()
-            .find(|tool| tool.role == "pidstat")
-            .unwrap()
-            .requested,
-        PathBuf::from("/usr/bin/pidstat"),
-        "pidstat must be a test-owned shim so calibration is portable and deterministic"
-    );
     let temporary = tempfile::tempdir().unwrap();
     let safe_output = temporary.path().join("safe-output");
     let worktree = std::fs::canonicalize(support::manifest_root()).unwrap();
@@ -6649,42 +6633,76 @@ fn source_fixture_inventory_is_portable_and_role_closed() {
         safe_output.to_string_lossy().into_owned(),
     ];
     let runner = support::identity(&support::runner_script());
-    let valid = support::source_fixture_command(&runner, &portable_tools, Some("00000001"), &argv)
-        .output()
-        .unwrap();
-    assert_eq!(valid.status.code(), Some(0), "{valid:?}");
-    assert!(!safe_output.exists());
-
-    let mut mutations = Vec::new();
-    let mut missing = support::fixture_tools();
-    missing.pop();
-    mutations.push(missing);
-    let mut reordered = support::fixture_tools();
-    reordered.swap(0, 1);
-    mutations.push(reordered);
-    let mut extra = support::fixture_tools();
-    extra.push(support::FixtureTool {
-        role: "true".to_owned(),
-        requested: PathBuf::from("/usr/bin/true"),
-    });
-    mutations.push(extra);
-    let mut workstation = support::fixture_tools();
-    workstation[0].requested = support::runner_script();
-    mutations.push(workstation);
-
-    for (index, tools) in mutations.iter().enumerate() {
-        let marker = temporary.path().join(format!("mutation-{index}.json"));
-        let mutation_argv = vec![
-            "orchestration".to_owned(),
-            "attempt-check".to_owned(),
-            marker.to_string_lossy().into_owned(),
-        ];
-        let rejected =
-            support::source_fixture_command(&runner, tools, Some("00000001"), &mutation_argv)
+    for (case, forced_shims) in [("normal", &[][..]), ("shimmed-env", &["env"][..])] {
+        let portable_tools = support::fixture_tools_with_forced_shims(forced_shims);
+        for tool in portable_tools.iter() {
+            let metadata = std::fs::metadata(&tool.requested);
+            assert!(
+                metadata.as_ref().is_ok_and(|value| {
+                    value.is_file() && value.permissions().mode() & 0o111 != 0
+                }),
+                "{case} fixture role {} has no executable or shim at {}",
+                tool.role,
+                tool.requested.display()
+            );
+        }
+        assert_ne!(
+            portable_tools
+                .iter()
+                .find(|tool| tool.role == "pidstat")
+                .unwrap()
+                .requested,
+            PathBuf::from("/usr/bin/pidstat"),
+            "pidstat must be a test-owned shim so calibration is portable and deterministic"
+        );
+        if case == "shimmed-env" {
+            assert_ne!(
+                portable_tools[0].requested,
+                PathBuf::from("/usr/bin/env"),
+                "forced env role must exercise the portable shim path"
+            );
+        }
+        let valid =
+            support::source_fixture_command(&runner, &portable_tools, Some("00000001"), &argv)
                 .output()
                 .unwrap();
-        assert_eq!(rejected.status.code(), Some(20), "mutation {index}");
-        assert!(!marker.exists());
+        assert_eq!(valid.status.code(), Some(0), "{case}: {valid:?}");
+        assert!(!safe_output.exists());
+
+        let make_tools = || support::fixture_tools_with_forced_shims(forced_shims);
+        let mut mutations = Vec::new();
+        let mut missing = make_tools();
+        missing.pop();
+        mutations.push(missing);
+        let mut reordered = make_tools();
+        reordered.swap(0, 1);
+        mutations.push(reordered);
+        let mut extra = make_tools();
+        extra.push(support::FixtureTool {
+            role: "true".to_owned(),
+            requested: PathBuf::from("/usr/bin/true"),
+        });
+        mutations.push(extra);
+        let mut workstation = make_tools();
+        workstation[0].requested = PathBuf::from("/home/mageyuki/.cargo/bin/rustup");
+        mutations.push(workstation);
+
+        for (index, tools) in mutations.iter().enumerate() {
+            let marker = temporary
+                .path()
+                .join(format!("{case}-mutation-{index}.json"));
+            let mutation_argv = vec![
+                "orchestration".to_owned(),
+                "attempt-check".to_owned(),
+                marker.to_string_lossy().into_owned(),
+            ];
+            let rejected =
+                support::source_fixture_command(&runner, tools, Some("00000001"), &mutation_argv)
+                    .output()
+                    .unwrap();
+            assert_eq!(rejected.status.code(), Some(20), "{case} mutation {index}");
+            assert!(!marker.exists());
+        }
     }
 }
 
