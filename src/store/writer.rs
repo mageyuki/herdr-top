@@ -105,6 +105,8 @@ pub struct WriterClient {
     sender: mpsc::Sender<WriterCommand>,
     ledger: Arc<Mutex<EventLedgerCache>>,
     health: PersistenceHealth,
+    #[cfg(test)]
+    after_second_reserve_health_check: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[derive(Clone)]
@@ -300,6 +302,17 @@ impl WriterClient {
         self.health.subscribe()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_after_second_reserve_health_check_failure(
+        &mut self,
+        failure: PersistenceFailure,
+    ) {
+        let health = self.health.clone();
+        self.after_second_reserve_health_check = Some(Arc::new(move || {
+            health.publish_failure(failure);
+        }));
+    }
+
     /// Atomically commits one reducer persistence batch.
     pub async fn apply(&self, batch: PersistBatch) -> Result<(), WriterError> {
         let operation = PersistenceOperation::Apply;
@@ -326,6 +339,10 @@ impl WriterClient {
 
         match self.sender.clone().try_reserve_owned() {
             Ok(permit) if self.persistence_status() == PersistenceStatus::Healthy => {
+                #[cfg(test)]
+                if let Some(hook) = &self.after_second_reserve_health_check {
+                    hook();
+                }
                 Some(EnqueuePermit {
                     permit,
                     ledger: Arc::clone(&self.ledger),
@@ -340,6 +357,14 @@ impl WriterClient {
                 None
             }
         }
+    }
+
+    /// Waits for an already-admitted batch and applies its cleanup result.
+    pub async fn finish_pending(
+        &mut self,
+        pending: PendingEnqueue,
+    ) -> Result<CleanupStats, WriterError> {
+        pending.wait().await
     }
 
     /// Returns whether the durable-ledger mirror already contains `event_id`.
@@ -382,7 +407,7 @@ impl WriterClient {
     }
 
     /// Atomically replaces the owner row and acknowledges after commit.
-    pub async fn replace_owner(&self, rec: OwnerRecord) -> Result<(), WriterError> {
+    pub async fn replace_owner(&mut self, rec: OwnerRecord) -> Result<(), WriterError> {
         self.request_mutating(PersistenceOperation::ReplaceOwner, |acknowledgement| {
             WriterCommand::ReplaceOwner {
                 record: rec,
@@ -536,6 +561,8 @@ fn spawn_writer_inner(
         sender: sender.clone(),
         ledger,
         health: health.clone(),
+        #[cfg(test)]
+        after_second_reserve_health_check: None,
     };
     let lifecycle = WriterLifecycle {
         sender,
@@ -1199,6 +1226,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writer_client_finish_pending_preserves_pending_wait_behavior() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let pending = writer.reserve_enqueue().unwrap().enqueue(Vec::new());
+
+        assert_eq!(
+            writer.finish_pending(pending).await.unwrap(),
+            CleanupStats::default()
+        );
+        assert_eq!(writer.persistence_status(), PersistenceStatus::Healthy);
+
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn i4_writer_late_drop_of_buffered_apply_receipt_publishes_unknown_once() {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
@@ -1596,7 +1640,7 @@ mod tests {
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
         install_temp_failure_trigger(&store, "fail_replace", "INSERT", "owner");
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
         let expected = expected_failure(
             PersistenceOperation::ReplaceOwner,
             PersistencePhase::CommandExecution,

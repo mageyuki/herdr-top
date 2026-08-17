@@ -214,6 +214,7 @@ impl PersistenceOccurrenceSink for UnavailableOccurrenceSink {
 
 pub(crate) struct RuntimePersistence {
     writer: WriterClient,
+    writer_health: watch::Receiver<PersistenceStatus>,
     snapshot: RuntimeDiagnosticsSnapshot,
     publisher: watch::Sender<RuntimeDiagnosticsSnapshot>,
     occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
@@ -228,6 +229,7 @@ impl RuntimePersistence {
         coverage: &SourceCoverageRegistry,
         occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
     ) -> (Self, watch::Receiver<RuntimeDiagnosticsSnapshot>) {
+        let writer_health = writer.subscribe_persistence();
         let controller_input =
             controller_input_from_coverage(coverage.state(CoverageSource::Controller));
         let controller_counters = controller_counter_snapshot(model);
@@ -246,6 +248,7 @@ impl RuntimePersistence {
         (
             Self {
                 writer,
+                writer_health,
                 snapshot,
                 publisher,
                 occurrence_sink,
@@ -277,38 +280,69 @@ impl RuntimePersistence {
         self.writer.is_duplicate(event_id)
     }
 
+    #[allow(
+        mismatched_lifetime_syntaxes,
+        reason = "removed by Task 2B.2b after EnqueuePermit becomes borrowing"
+    )]
     pub(crate) fn reserve_enqueue(&mut self) -> Option<crate::store::EnqueuePermit> {
         self.observe_writer_health();
         if self.snapshot.persistence != PersistenceStatus::Healthy {
             return None;
         }
-        let permit = self.writer.reserve_enqueue();
-        self.observe_writer_health();
-        permit.filter(|_| self.snapshot.persistence == PersistenceStatus::Healthy)
+
+        let Self {
+            writer,
+            writer_health,
+            snapshot,
+            publisher,
+            occurrence_sink,
+            occurrence_attempted,
+            acceptor_diagnostics,
+        } = self;
+        let permit = writer.reserve_enqueue();
+        let status = {
+            let status = writer_health.borrow();
+            *status
+        };
+        Self::ingest_writer_status(
+            status,
+            snapshot,
+            publisher,
+            occurrence_sink.as_ref(),
+            occurrence_attempted,
+            acceptor_diagnostics,
+        );
+        match status {
+            PersistenceStatus::Healthy => permit,
+            PersistenceStatus::Degraded { .. } => {
+                drop(permit);
+                None
+            }
+        }
     }
 
     pub(crate) async fn finish_pending(
         &mut self,
         pending: PendingEnqueue,
     ) -> Result<RuntimeWriteOutcome, WriterError> {
-        self.classify_result(pending.wait().await.map(|_| ()), RuntimeCommandClass::Batch)
+        let result = self.writer.finish_pending(pending).await.map(|_| ());
+        self.classify_result(result, RuntimeCommandClass::Batch)
     }
 
     async fn apply(&mut self, batch: PersistBatch) -> Result<RuntimeWriteOutcome, WriterError> {
         if self.skip_if_degraded(RuntimeCommandClass::Batch) {
             return Ok(RuntimeWriteOutcome::Skipped);
         }
-        self.classify_result(self.writer.apply(batch).await, RuntimeCommandClass::Batch)
+        let result = self.writer.apply(batch).await;
+        self.classify_result(result, RuntimeCommandClass::Batch)
     }
 
     async fn cleanup(&mut self, now_ms: i64) -> Result<RuntimeWriteOutcome, WriterError> {
         if self.skip_if_degraded(RuntimeCommandClass::Batch) {
             return Ok(RuntimeWriteOutcome::Skipped);
         }
-        self.classify_result(
-            self.writer.cleanup(now_ms).await.map(|_| ()),
-            RuntimeCommandClass::Batch,
-        )
+        let result = self.writer.cleanup(now_ms).await.map(|_| ());
+        self.classify_result(result, RuntimeCommandClass::Batch)
     }
 
     async fn update_owner_location(
@@ -319,12 +353,11 @@ impl RuntimePersistence {
         if self.skip_if_degraded(RuntimeCommandClass::OwnerLocation) {
             return Ok(RuntimeWriteOutcome::Skipped);
         }
-        self.classify_result(
-            self.writer
-                .update_owner_location(terminal_id, pane_id)
-                .await,
-            RuntimeCommandClass::OwnerLocation,
-        )
+        let result = self
+            .writer
+            .update_owner_location(terminal_id, pane_id)
+            .await;
+        self.classify_result(result, RuntimeCommandClass::OwnerLocation)
     }
 
     fn classify_result(
@@ -366,10 +399,40 @@ impl RuntimePersistence {
     }
 
     fn observe_writer_health(&mut self) {
-        if self.snapshot.persistence != PersistenceStatus::Healthy {
+        let status = {
+            let status = self.writer_health.borrow();
+            *status
+        };
+        let Self {
+            snapshot,
+            publisher,
+            occurrence_sink,
+            occurrence_attempted,
+            acceptor_diagnostics,
+            ..
+        } = self;
+        Self::ingest_writer_status(
+            status,
+            snapshot,
+            publisher,
+            occurrence_sink.as_ref(),
+            occurrence_attempted,
+            acceptor_diagnostics,
+        );
+    }
+
+    fn ingest_writer_status(
+        status: PersistenceStatus,
+        snapshot: &mut RuntimeDiagnosticsSnapshot,
+        publisher: &watch::Sender<RuntimeDiagnosticsSnapshot>,
+        occurrence_sink: &dyn PersistenceOccurrenceSink,
+        occurrence_attempted: &mut bool,
+        acceptor_diagnostics: &ControllerDiagnosticsHandle,
+    ) {
+        if snapshot.persistence != PersistenceStatus::Healthy {
             return;
         }
-        if let PersistenceStatus::Degraded { failure } = self.writer.persistence_status() {
+        if let PersistenceStatus::Degraded { failure } = status {
             let class = if failure.operation
                 == crate::store::writer::PersistenceOperation::UpdateOwnerLocation
             {
@@ -377,7 +440,15 @@ impl RuntimePersistence {
             } else {
                 RuntimeCommandClass::Batch
             };
-            let _ = self.record_failure(failure, class);
+            let _ = Self::record_facade_failure(
+                failure,
+                class,
+                snapshot,
+                publisher,
+                occurrence_sink,
+                occurrence_attempted,
+                acceptor_diagnostics,
+            );
         }
     }
 
@@ -386,6 +457,26 @@ impl RuntimePersistence {
         failure: PersistenceFailure,
         class: RuntimeCommandClass,
     ) -> RuntimeWriteOutcome {
+        Self::record_facade_failure(
+            failure,
+            class,
+            &mut self.snapshot,
+            &self.publisher,
+            self.occurrence_sink.as_ref(),
+            &mut self.occurrence_attempted,
+            &self.acceptor_diagnostics,
+        )
+    }
+
+    fn record_facade_failure(
+        failure: PersistenceFailure,
+        class: RuntimeCommandClass,
+        snapshot: &mut RuntimeDiagnosticsSnapshot,
+        publisher: &watch::Sender<RuntimeDiagnosticsSnapshot>,
+        occurrence_sink: &dyn PersistenceOccurrenceSink,
+        occurrence_attempted: &mut bool,
+        acceptor_diagnostics: &ControllerDiagnosticsHandle,
+    ) -> RuntimeWriteOutcome {
         let outcome = match failure.durability {
             DurabilityDisposition::Committed => RuntimeWriteOutcome::CommittedButDegraded(failure),
             DurabilityDisposition::Unknown => RuntimeWriteOutcome::DurabilityUnknown(failure),
@@ -393,41 +484,34 @@ impl RuntimePersistence {
                 RuntimeWriteOutcome::NotCommitted(failure)
             }
         };
-        if self.snapshot.persistence != PersistenceStatus::Healthy {
+        if snapshot.persistence != PersistenceStatus::Healthy {
             return outcome;
         }
 
-        self.snapshot.persistence = PersistenceStatus::Degraded { failure };
-        self.snapshot.controller_input = ControllerInputStatus::Unavailable {
+        snapshot.persistence = PersistenceStatus::Degraded { failure };
+        snapshot.controller_input = ControllerInputStatus::Unavailable {
             reason: ControllerInputUnavailableReason::PersistenceUnavailable,
         };
-        set_controller_coverage_unavailable(&mut self.snapshot.source_coverage);
+        set_controller_coverage_unavailable(&mut snapshot.source_coverage);
         match class {
             RuntimeCommandClass::OwnerLocation => {
-                self.snapshot.owner = OwnerFreshness::Stale;
+                snapshot.owner = OwnerFreshness::Stale;
             }
             RuntimeCommandClass::Batch => match outcome {
                 RuntimeWriteOutcome::CommittedButDegraded(_) => {
-                    self.snapshot
-                        .persistence_counters
-                        .committed_but_degraded_batches = self
-                        .snapshot
+                    snapshot.persistence_counters.committed_but_degraded_batches = snapshot
                         .persistence_counters
                         .committed_but_degraded_batches
                         .saturating_add(1);
                 }
                 RuntimeWriteOutcome::NotCommitted(_) => {
-                    self.snapshot.persistence_counters.not_committed_batches = self
-                        .snapshot
+                    snapshot.persistence_counters.not_committed_batches = snapshot
                         .persistence_counters
                         .not_committed_batches
                         .saturating_add(1);
                 }
                 RuntimeWriteOutcome::DurabilityUnknown(_) => {
-                    self.snapshot
-                        .persistence_counters
-                        .durability_unknown_batches = self
-                        .snapshot
+                    snapshot.persistence_counters.durability_unknown_batches = snapshot
                         .persistence_counters
                         .durability_unknown_batches
                         .saturating_add(1);
@@ -435,20 +519,20 @@ impl RuntimePersistence {
                 RuntimeWriteOutcome::Durable | RuntimeWriteOutcome::Skipped => {}
             },
         }
-        if !self.occurrence_attempted {
-            self.occurrence_attempted = true;
+        if !*occurrence_attempted {
+            *occurrence_attempted = true;
             let record = encode_persistence_occurrence(
                 unix_now_ms(),
                 failure,
-                self.snapshot.persistence_counters,
+                snapshot.persistence_counters,
             );
-            self.snapshot.first_failure_log = if self.occurrence_sink.append(&record).is_ok() {
+            snapshot.first_failure_log = if occurrence_sink.append(&record).is_ok() {
                 OccurrenceLogStatus::Emitted
             } else {
                 OccurrenceLogStatus::Failed
             };
         }
-        self.publish();
+        Self::publish_facade(snapshot, publisher, acceptor_diagnostics);
         outcome
     }
 
@@ -473,16 +557,26 @@ impl RuntimePersistence {
     }
 
     fn publish(&mut self) {
-        self.snapshot.controller_counters.socket_saturations =
-            self.acceptor_diagnostics.socket_saturations();
-        self.snapshot.controller_counters.accept_failures =
-            self.acceptor_diagnostics.accept_failures();
-        let snapshot = self.snapshot.clone();
-        self.publisher.send_if_modified(|current| {
-            if *current == snapshot {
+        Self::publish_facade(
+            &mut self.snapshot,
+            &self.publisher,
+            &self.acceptor_diagnostics,
+        );
+    }
+
+    fn publish_facade(
+        snapshot: &mut RuntimeDiagnosticsSnapshot,
+        publisher: &watch::Sender<RuntimeDiagnosticsSnapshot>,
+        acceptor_diagnostics: &ControllerDiagnosticsHandle,
+    ) {
+        snapshot.controller_counters.socket_saturations = acceptor_diagnostics.socket_saturations();
+        snapshot.controller_counters.accept_failures = acceptor_diagnostics.accept_failures();
+        let publication = snapshot.clone();
+        publisher.send_if_modified(|current| {
+            if *current == publication {
                 false
             } else {
-                *current = snapshot;
+                *current = publication;
                 true
             }
         });
@@ -700,7 +794,7 @@ pub async fn spawn_workload_collector(
     sock: PathBuf,
     session: String,
     restored: RestoredState,
-    writer: WriterClient,
+    mut writer: WriterClient,
     config: WorkloadCollectorConfig,
 ) -> Result<WorkloadCollectorHandle, CollectorError> {
     let owner = OwnerTracker::from_environment();
@@ -913,7 +1007,7 @@ async fn spawn_configured(
     sock: PathBuf,
     session: String,
     restored: RestoredState,
-    writer: WriterClient,
+    mut writer: WriterClient,
     controller_listener: Option<StdUnixListener>,
     controller_coverage: SourceAvailability,
     occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
@@ -4410,6 +4504,103 @@ mod tests {
             .await
             .expect("writer shutdown timed out")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn runtime_persistence_reserve_enqueue_preserves_late_health_observation() {
+        let expected = failure(
+            PersistenceOperation::Apply,
+            PersistencePhase::QueueAdmission,
+            PersistenceFailureCode::ChannelClosed,
+            DurabilityDisposition::NotCommitted,
+        );
+
+        {
+            let sink = Arc::new(RecordingOccurrenceSink::default());
+            let directory = tempfile::tempdir().unwrap();
+            let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+            let store = open_writer(&root).unwrap();
+            let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+            writer.set_after_second_reserve_health_check_failure(expected);
+            let (mut runtime, diagnostics) = RuntimePersistence::new_for_test(writer, sink.clone());
+
+            assert!(runtime.reserve_enqueue().is_none());
+            let snapshot = diagnostics.borrow();
+            assert_eq!(
+                snapshot.persistence,
+                PersistenceStatus::Degraded { failure: expected }
+            );
+            assert_eq!(
+                snapshot.controller_input,
+                ControllerInputStatus::Unavailable {
+                    reason: ControllerInputUnavailableReason::PersistenceUnavailable,
+                }
+            );
+            assert_eq!(sink.attempts.load(Ordering::Relaxed), 1);
+            drop(snapshot);
+
+            shutdown_writer(lifecycle).await;
+        }
+
+        {
+            let sink = Arc::new(RecordingOccurrenceSink::default());
+            let directory = tempfile::tempdir().unwrap();
+            let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+            let store = open_writer(&root).unwrap();
+            let (lifecycle, writer) = spawn_writer(store).unwrap();
+            let (mut runtime, diagnostics) = RuntimePersistence::new_for_test(writer, sink.clone());
+            shutdown_writer(lifecycle).await;
+
+            assert!(runtime.reserve_enqueue().is_none());
+            assert_eq!(
+                diagnostics.borrow().persistence,
+                PersistenceStatus::Degraded { failure: expected }
+            );
+            assert_eq!(sink.attempts.load(Ordering::Relaxed), 1);
+        }
+
+        {
+            let sink = Arc::new(RecordingOccurrenceSink::default());
+            let directory = tempfile::tempdir().unwrap();
+            let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+            let store = open_writer(&root).unwrap();
+            let (lifecycle, writer) = spawn_writer(store).unwrap();
+            let (mut runtime, diagnostics) = RuntimePersistence::new_for_test(writer, sink.clone());
+
+            let pending = runtime
+                .reserve_enqueue()
+                .expect("healthy writer must return a usable permit")
+                .enqueue(Vec::new());
+            assert_eq!(
+                runtime.finish_pending(pending).await.unwrap(),
+                RuntimeWriteOutcome::Durable
+            );
+            assert_eq!(diagnostics.borrow().persistence, PersistenceStatus::Healthy);
+            assert_eq!(sink.attempts.load(Ordering::Relaxed), 0);
+
+            shutdown_writer(lifecycle).await;
+        }
+
+        {
+            let sink = Arc::new(RecordingOccurrenceSink::default());
+            let directory = tempfile::tempdir().unwrap();
+            let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+            let store = open_writer(&root).unwrap();
+            let (lifecycle, writer) = spawn_writer(store).unwrap();
+            let mut held_permits = Vec::new();
+            while let Some(permit) = writer.reserve_enqueue() {
+                held_permits.push(permit);
+            }
+            assert!(!held_permits.is_empty());
+            let (mut runtime, diagnostics) = RuntimePersistence::new_for_test(writer, sink.clone());
+
+            assert!(runtime.reserve_enqueue().is_none());
+            assert_eq!(diagnostics.borrow().persistence, PersistenceStatus::Healthy);
+            assert_eq!(sink.attempts.load(Ordering::Relaxed), 0);
+
+            drop(held_permits);
+            shutdown_writer(lifecycle).await;
+        }
     }
 
     #[tokio::test]
