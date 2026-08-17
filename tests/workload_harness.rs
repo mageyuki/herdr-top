@@ -7,6 +7,8 @@ use std::time::Duration;
 use common::workload::{self, *};
 use herdr_top::herdr::controller::ControllerEnvelope;
 use herdr_top::lockfile::StateRoot;
+#[cfg(feature = "workload-harness")]
+use herdr_top::model::Workspace;
 use herdr_top::model::{
     AgentNode, ControllerEventKind, DisplayOrdinal, DomainModel, EventMetadata,
     MinimalProviderMetadata, NormalizedEvent, Provider, RunKey, TaskState,
@@ -274,6 +276,117 @@ async fn reference_epoch_wait_uses_an_injected_portable_clock() {
     wait_for_reference_epoch(&clock, 110).await.unwrap();
 
     assert_eq!(now.load(Ordering::SeqCst), 115);
+}
+
+#[cfg(feature = "workload-harness")]
+#[tokio::test]
+async fn workload_harness_writer_access_uses_owned_client() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = StateRoot(temporary.path().join("state"));
+    std::fs::create_dir_all(&root.0).unwrap();
+    let store = open_writer(&root).unwrap();
+    let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+    let writer_access = &mut writer;
+    writer_access
+        .apply(vec![PersistOp::UpsertWorkspace {
+            workspace: Workspace {
+                workspace_id: "owned-client-seed".to_owned(),
+            },
+            display_ordinal: DisplayOrdinal::new(1),
+        }])
+        .await
+        .unwrap();
+    let persistence = writer_access.subscribe_persistence();
+    let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+    assert!(restored.model.workspace("owned-client-seed").is_some());
+
+    let config = WorkloadCollectorConfig {
+        controller_hooks: WorkloadControllerHooks {
+            clock: Arc::new(|| 1),
+            admission_observer: Arc::new(|_| {}),
+            terminal_observer: Arc::new(|_| {}),
+            persistence_observer: Arc::new(|_| {}),
+            timing_observer: Arc::new(|_| {}),
+        },
+        provider_roots: Vec::new(),
+        notify_factory: None,
+        rescan_interval: Some(Duration::from_secs(2)),
+        fallback_timing: None,
+    };
+    let handle = spawn_workload_collector(
+        temporary.path().join("missing-herdr.sock"),
+        "owned-client-workload".to_owned(),
+        restored,
+        writer,
+        config,
+    )
+    .await
+    .unwrap();
+    let receipt_time_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let response = handle
+        .controller
+        .submit_workload_frame(
+            serde_json::to_vec(&ControllerEnvelope {
+                schema_version: 1,
+                event_id: "owned-client-later".to_owned(),
+                emitted_at_ms: 2,
+                source: "owned-client-test".to_owned(),
+                event_type: "task_started".to_owned(),
+                task_run_id: "owned-client-run".to_owned(),
+                parent_task_run_id: None,
+                depends_on_id: None,
+                label: None,
+                reason: None,
+                progress: None,
+                provider: None,
+                native_session_id: None,
+                terminal_id: None,
+            })
+            .unwrap(),
+            receipt_time_ms,
+            1,
+            1,
+        )
+        .await;
+    assert_eq!(response, ControllerResponse::Accepted);
+
+    let diagnostics = handle.collector.diagnostics.clone();
+    // This durable-row poll is a liveness wait, not a barrier: rows commit before cleanup/failure publication, so the health guard cannot catch a post-commit failure.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            assert_eq!(
+                *persistence.borrow(),
+                herdr_top::store::PersistenceStatus::Healthy
+            );
+            assert_eq!(
+                diagnostics.borrow().persistence,
+                herdr_top::store::PersistenceStatus::Healthy
+            );
+            let durable_rows: i64 =
+                rusqlite::Connection::open(herdr_top::store::database_path(&root))
+                    .unwrap()
+                    .query_row(
+                        "SELECT COUNT(*) FROM events WHERE event_id = 'owned-client-later'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+            if durable_rows == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("owned writer persistence must become visible through durable rows");
+    handle.collector.stop().await.unwrap();
+    lifecycle.shutdown().await.unwrap();
 }
 
 #[cfg(feature = "workload-harness")]

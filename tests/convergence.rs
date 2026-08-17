@@ -618,7 +618,8 @@ async fn snapshot_maps_to_topology() {
 
 #[tokio::test]
 async fn writer_barrier_orders_assertions() {
-    let (_directory, root, lifecycle, writer) = test_writer();
+    let (_directory, root, lifecycle, mut writer) = test_writer();
+    let writer = &mut writer;
     writer
         .apply(vec![PersistOp::UpsertWorkspace {
             workspace: herdr_top::model::Workspace {
@@ -645,7 +646,8 @@ async fn writer_barrier_orders_assertions() {
 
 #[tokio::test]
 async fn periodic_cleanup_after_ingestion() {
-    let (_directory, root, lifecycle, writer) = test_writer();
+    let (_directory, root, lifecycle, mut writer) = test_writer();
+    let writer = &mut writer;
     writer
         .apply(vec![PersistOp::RecordCollectorGap(CollectorGap {
             event_id: "ancient-gap".to_owned(),
@@ -700,20 +702,19 @@ async fn i4_d3_cleanup_failure_keeps_collector_alive() {
             )
             .unwrap();
     });
+    let mut persistence = writer.subscribe_persistence();
 
     let handle = collector::spawn(
         mock.socket_path().to_path_buf(),
         test_session(),
         empty_restored(),
-        writer.clone(),
+        writer,
     )
     .await
     .expect("collector should start");
+    let mut diagnostics = handle.diagnostics.clone();
     wait_model_pane(&handle.model, "w1:p2").await;
-    assert!(matches!(
-        writer.persistence_status(),
-        herdr_top::store::PersistenceStatus::Degraded { .. }
-    ));
+    wait_for_persistence_degradation(&mut persistence, &mut diagnostics).await;
     assert!(handle.model.borrow().pane("w1:p2").is_some());
     handle
         .stop()
@@ -793,15 +794,17 @@ async fn i4_d3_apply_failure_keeps_in_memory_model_advancing() {
             )
             .unwrap();
     });
+    let mut persistence = writer.subscribe_persistence();
 
     let handle = collector::spawn(
         mock.socket_path().to_path_buf(),
         test_session(),
         empty_restored(),
-        writer.clone(),
+        writer,
     )
     .await
     .expect("collector should start");
+    let mut diagnostics = handle.diagnostics.clone();
     let mut operator = handle.operator.clone();
     let _ = operator.borrow_and_update();
     wait_model_pane(&handle.model, "w1:p3").await;
@@ -833,6 +836,7 @@ async fn i4_d3_apply_failure_keeps_in_memory_model_advancing() {
     })
     .await
     .expect("failure-causing and post-degradation activity must become current-only");
+    wait_for_persistence_degradation(&mut persistence, &mut diagnostics).await;
     let model = handle.model.borrow();
     assert!(model.pane("w1:p2").is_some());
     assert!(model.pane("w1:p3").is_some());
@@ -2315,6 +2319,42 @@ fn spawn_static_herdr(path: &std::path::Path, snapshot: Value) -> JoinHandle<()>
             });
         }
     })
+}
+
+async fn wait_for_persistence_degradation(
+    persistence: &mut tokio::sync::watch::Receiver<herdr_top::store::PersistenceStatus>,
+    diagnostics: &mut tokio::sync::watch::Receiver<
+        herdr_top::diagnostics::RuntimeDiagnosticsSnapshot,
+    >,
+) -> herdr_top::store::PersistenceFailure {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let writer_status = *persistence.borrow();
+            let diagnostic_status = diagnostics.borrow().persistence;
+            if let (
+                herdr_top::store::PersistenceStatus::Degraded {
+                    failure: writer_failure,
+                },
+                herdr_top::store::PersistenceStatus::Degraded {
+                    failure: diagnostic_failure,
+                },
+            ) = (writer_status, diagnostic_status)
+            {
+                assert_eq!(writer_failure, diagnostic_failure);
+                return writer_failure;
+            }
+            tokio::select! {
+                result = persistence.changed() => {
+                    result.expect("persistence publisher should remain available");
+                }
+                result = diagnostics.changed() => {
+                    result.expect("diagnostics publisher should remain available");
+                }
+            }
+        }
+    })
+    .await
+    .expect("writer health and runtime diagnostics must report degradation")
 }
 
 async fn wait_diagnostic_source(

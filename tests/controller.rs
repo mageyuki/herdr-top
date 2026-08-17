@@ -16,15 +16,15 @@ use herdr_top::herdr::controller::{
 use herdr_top::lockfile::{OwnerLock, StateRoot, state_root_in, try_acquire};
 use herdr_top::model::{
     ControllerDiagnosticsHandle, ControllerEventKind, DisplayOrdinal, EventMetadata,
-    MinimalProviderMetadata, NormalizedEvent, Provider, RunId, RunKey, SourceCoverage, Tab,
-    TaskRun, TaskState,
+    MinimalProviderMetadata, NormalizedEvent, Provider, RunId, RunKey, SourceCoverage, TaskRun,
+    TaskState,
 };
 use herdr_top::rendezvous::{
     ControllerSocketStatus, ValidatedRuntimeDir, open_runtime_dir_at, prepare_controller_socket,
     shutdown_controller_socket,
 };
 use herdr_top::session_key;
-use herdr_top::store::{self, PersistOp, PersistTaskRun, WriterClient, WriterLifecycle};
+use herdr_top::store::{self, PersistOp, PersistTaskRun, WriterLifecycle};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -34,6 +34,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 const SESSION: &str = "controller-test-session";
+const PERSISTENCE_FAILURE_EVENT_ID: &str = "test-persistence-failure";
 
 struct RunningController {
     _state: TempDir,
@@ -42,7 +43,7 @@ struct RunningController {
     socket_path: PathBuf,
     collector: CollectorHandle,
     lifecycle: WriterLifecycle,
-    writer: WriterClient,
+    persistence: watch::Receiver<store::PersistenceStatus>,
 }
 
 struct RendezvousController {
@@ -106,11 +107,27 @@ impl RunningController {
         Self::start_with_store_setup(|_| {}).await
     }
 
+    async fn start_seeded(seed: Vec<PersistOp>) -> Self {
+        Self::start_with_store_seed_and_setup(seed, |_| {}, SourceAvailability::Available).await
+    }
+
+    async fn start_with_persistence_failure() -> Self {
+        Self::start_with_store_setup(install_persistence_failure_trigger).await
+    }
+
     async fn start_with_store_setup(setup: impl FnOnce(&StateRoot)) -> Self {
         Self::start_with_store_setup_and_coverage(setup, SourceAvailability::Available).await
     }
 
     async fn start_with_store_setup_and_coverage(
+        setup: impl FnOnce(&StateRoot),
+        controller_coverage: SourceAvailability,
+    ) -> Self {
+        Self::start_with_store_seed_and_setup(Vec::new(), setup, controller_coverage).await
+    }
+
+    async fn start_with_store_seed_and_setup(
+        seed: Vec<PersistOp>,
         setup: impl FnOnce(&StateRoot),
         controller_coverage: SourceAvailability,
     ) -> Self {
@@ -121,15 +138,19 @@ impl RunningController {
         listener.set_nonblocking(true).unwrap();
         let key = session_key::encode(SESSION).unwrap();
         let root = state_root_in(state.path(), &key).unwrap();
-        let store = store::open_writer(&root).unwrap();
+        let mut store = store::open_writer(&root).unwrap();
+        if !seed.is_empty() {
+            store.apply_batch(seed).unwrap();
+        }
         setup(&root);
         let restored = store.load_restored_state().unwrap();
         let (lifecycle, writer) = store::spawn_writer(store).unwrap();
+        let persistence = writer.subscribe_persistence();
         let collector = collector::spawn_with_controller_coverage(
             socket_dir.path().join("missing-herdr.sock"),
             SESSION.to_owned(),
             restored,
-            writer.clone(),
+            writer,
             Some(listener),
             controller_coverage,
         )
@@ -142,7 +163,7 @@ impl RunningController {
             socket_path,
             collector,
             lifecycle,
-            writer,
+            persistence,
         }
     }
 
@@ -162,6 +183,77 @@ impl RunningController {
             .await
             .expect("writer shutdown timed out")
             .unwrap();
+    }
+
+    async fn stop_and_reopen(self) -> (TempDir, store::Store) {
+        let Self {
+            _state,
+            root,
+            collector,
+            lifecycle,
+            ..
+        } = self;
+        collector.stop().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), lifecycle.shutdown())
+            .await
+            .expect("writer shutdown timed out")
+            .unwrap();
+        let reopened = store::open_writer(&root).unwrap();
+        (_state, reopened)
+    }
+
+    async fn wait_for_persistence_degradation(&self) -> store::PersistenceFailure {
+        let mut persistence = self.persistence.clone();
+        let mut diagnostics = self.collector.diagnostics.clone();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let writer_status = *persistence.borrow();
+                let diagnostic_status = diagnostics.borrow().persistence;
+                if let (
+                    store::PersistenceStatus::Degraded {
+                        failure: writer_failure,
+                    },
+                    store::PersistenceStatus::Degraded {
+                        failure: diagnostic_failure,
+                    },
+                ) = (writer_status, diagnostic_status)
+                {
+                    assert_eq!(writer_failure, diagnostic_failure);
+                    break writer_failure;
+                }
+                tokio::select! {
+                    result = persistence.changed() => {
+                        result.expect("persistence publisher should remain available");
+                    }
+                    result = diagnostics.changed() => {
+                        result.expect("diagnostics publisher should remain available");
+                    }
+                }
+            }
+        })
+        .await
+        .expect("writer health and runtime diagnostics must report degradation")
+    }
+
+    async fn induce_persistence_failure(&self) {
+        assert_eq!(
+            *self.persistence.borrow(),
+            store::PersistenceStatus::Healthy
+        );
+        assert_eq!(
+            self.collector.diagnostics.borrow().persistence,
+            store::PersistenceStatus::Healthy
+        );
+        assert_eq!(
+            self.send(&envelope(
+                PERSISTENCE_FAILURE_EVENT_ID,
+                "task_started",
+                "persistence-failure-run",
+            ))
+            .await,
+            ControllerResponse::Accepted
+        );
+        self.wait_for_persistence_degradation().await;
     }
 }
 
@@ -238,6 +330,88 @@ fn provider_record(event_id: &str, event_kind: &str) -> PersistOp {
         }),
         seen_at_ms: unix_now_ms(),
     }
+}
+
+fn expired_controller_record(event_id: &str) -> PersistOp {
+    PersistOp::RecordEvent {
+        event: Box::new(NormalizedEvent::ControllerEvent {
+            metadata: EventMetadata {
+                event_id: event_id.to_owned(),
+                timestamp_ms: 0,
+                receipt_time_ms: 0,
+                source: "seed".to_owned(),
+                source_event_type: "task_started".to_owned(),
+                herdr_session: SESSION.to_owned(),
+                workspace_id: None,
+                tab_id: None,
+                pane_id: None,
+                terminal_id: None,
+                provider: None,
+                native_session_id: None,
+                task_run_id: None,
+                agent_node_id: None,
+                task_state: None,
+                execution_parent: None,
+                dependency: None,
+                source_coverage: Vec::new(),
+                provider_metadata: None,
+                label: None,
+                reason: None,
+                progress: None,
+                ingest_seq: None,
+            },
+            event: ControllerEventKind::TaskStarted,
+        }),
+        seen_at_ms: 0,
+    }
+}
+
+fn install_persistence_failure_trigger(root: &StateRoot) {
+    rusqlite::Connection::open(store::database_path(root))
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_test_persistence BEFORE INSERT ON events \
+             WHEN NEW.event_id = '{PERSISTENCE_FAILURE_EVENT_ID}' \
+             BEGIN SELECT RAISE(ABORT, 'test persistence failure'); END;"
+        ))
+        .unwrap();
+}
+
+async fn wait_for_durable_row_count(running: &RunningController, query: &str, expected: i64) {
+    wait_for_durable_row_count_with_timeout(running, query, expected, Duration::from_secs(3)).await;
+}
+
+async fn wait_for_durable_row_count_with_timeout(
+    running: &RunningController,
+    query: &str,
+    expected: i64,
+    timeout: Duration,
+) {
+    // This durable-row poll is a liveness wait, not a barrier: rows commit before cleanup/failure publication, so the health guard cannot catch a post-commit failure.
+    tokio::time::timeout(timeout, async {
+        loop {
+            assert_eq!(
+                *running.persistence.borrow(),
+                store::PersistenceStatus::Healthy,
+                "persistence degraded while waiting for durable rows"
+            );
+            assert_eq!(
+                running.collector.diagnostics.borrow().persistence,
+                store::PersistenceStatus::Healthy,
+                "runtime diagnostics degraded while waiting for durable rows"
+            );
+            let rows: i64 = rusqlite::Connection::open(store::database_path(&running.root))
+                .unwrap()
+                .query_row(query, [], |row| row.get(0))
+                .unwrap();
+            if rows == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("durable row count did not reach {expected}: {query}"));
 }
 
 async fn send_raw(path: &Path, value: &Value) -> ControllerResponse {
@@ -488,26 +662,32 @@ async fn controller_first_reserved_provider_id_is_invalid_and_never_reserves_led
             .await,
         rejected(RejectResponseReason::Invalid)
     );
-    assert!(!running.writer.is_duplicate(event_id));
-
-    running
-        .writer
-        .apply(vec![provider_record(event_id, "provider-wins")])
-        .await
+    let (_state_guard, mut reopened) = running.stop_and_reopen().await;
+    assert!(
+        reopened
+            .load_restored_state()
+            .unwrap()
+            .event_ledger
+            .iter()
+            .all(|entry| entry.event_id != event_id)
+    );
+    reopened
+        .apply_batch(vec![provider_record(event_id, "provider-wins")])
         .unwrap();
-    assert!(running.writer.is_duplicate(event_id));
-    running.stop().await;
+    assert!(
+        reopened
+            .load_restored_state()
+            .unwrap()
+            .event_ledger
+            .iter()
+            .any(|entry| entry.event_id == event_id)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn provider_first_reserved_provider_id_keeps_duplicate_precedence() {
-    let running = RunningController::start().await;
     let event_id = "prov:codex:act:provider-first";
-    running
-        .writer
-        .apply(vec![provider_record(event_id, "first")])
-        .await
-        .unwrap();
+    let running = RunningController::start_seeded(vec![provider_record(event_id, "first")]).await;
 
     assert_eq!(
         running
@@ -878,20 +1058,9 @@ async fn progress_out_of_range_rejected() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retryable_on_unhealthy_writer() {
-    let running = RunningController::start().await;
-    assert!(
-        running
-            .writer
-            .apply(vec![herdr_top::store::PersistOp::UpsertTab {
-                tab: Tab {
-                    tab_id: "orphan".to_owned(),
-                    workspace_id: "missing".to_owned(),
-                },
-                display_ordinal: DisplayOrdinal::new(1),
-            }])
-            .await
-            .is_err()
-    );
+    let running = RunningController::start_with_persistence_failure().await;
+    running.induce_persistence_failure().await;
+    let before_retryable = running.collector.model.borrow().task_runs().count();
     assert_eq!(
         running
             .send(&envelope("event-1", "task_started", "run"))
@@ -900,34 +1069,21 @@ async fn retryable_on_unhealthy_writer() {
             reason: RetryableReason::PersistenceUnavailable
         }
     );
+    let model = running.collector.model.borrow();
+    assert_eq!(model.task_runs().count(), before_retryable);
     assert!(
-        running
-            .collector
-            .model
-            .borrow()
-            .task_runs()
-            .next()
+        model
+            .task_run_by_key(&RunKey::Controller("run".to_owned()))
             .is_none()
     );
+    drop(model);
     running.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn conflict_vs_unhealthy_precedence() {
-    let running = RunningController::start().await;
-    assert!(
-        running
-            .writer
-            .apply(vec![herdr_top::store::PersistOp::UpsertTab {
-                tab: Tab {
-                    tab_id: "orphan".to_owned(),
-                    workspace_id: "missing".to_owned(),
-                },
-                display_ordinal: DisplayOrdinal::new(1),
-            }])
-            .await
-            .is_err()
-    );
+    let running = RunningController::start_with_persistence_failure().await;
+    running.induce_persistence_failure().await;
     assert_eq!(
         running.send(&dispatch("event-1", "same", "same")).await,
         rejected(RejectResponseReason::Cycle)
@@ -937,7 +1093,7 @@ async fn conflict_vs_unhealthy_precedence() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn response_precedence_full() {
-    let running = RunningController::start().await;
+    let running = RunningController::start_with_persistence_failure().await;
     let accepted = envelope("duplicate", "task_started", "run");
     assert_eq!(running.send(&accepted).await, ControllerResponse::Accepted);
     let mut invalid_duplicate = dispatch("duplicate", "same", "same");
@@ -946,19 +1102,7 @@ async fn response_precedence_full() {
         running.send(&invalid_duplicate).await,
         ControllerResponse::Duplicate
     );
-    assert!(
-        running
-            .writer
-            .apply(vec![herdr_top::store::PersistOp::UpsertTab {
-                tab: Tab {
-                    tab_id: "orphan".to_owned(),
-                    workspace_id: "missing".to_owned(),
-                },
-                display_ordinal: DisplayOrdinal::new(1),
-            }])
-            .await
-            .is_err()
-    );
+    running.induce_persistence_failure().await;
     assert_eq!(
         running.send(&dispatch("cycle", "same", "same")).await,
         rejected(RejectResponseReason::Cycle)
@@ -1128,7 +1272,7 @@ async fn default_and_strict_response_matrix() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn staged_discard_for_every_reject_and_retryable() {
-    let running = RunningController::start().await;
+    let running = RunningController::start_with_persistence_failure().await;
     assert_eq!(
         running.send(&dispatch("cycle", "unknown", "unknown")).await,
         rejected(RejectResponseReason::Cycle)
@@ -1142,19 +1286,8 @@ async fn staged_discard_for_every_reject_and_retryable() {
             .next()
             .is_none()
     );
-    assert!(
-        running
-            .writer
-            .apply(vec![herdr_top::store::PersistOp::UpsertTab {
-                tab: Tab {
-                    tab_id: "orphan".to_owned(),
-                    workspace_id: "missing".to_owned(),
-                },
-                display_ordinal: DisplayOrdinal::new(1),
-            }])
-            .await
-            .is_err()
-    );
+    running.induce_persistence_failure().await;
+    let before_retryable = running.collector.model.borrow().task_runs().count();
     assert_eq!(
         running
             .send(&envelope("retry", "task_started", "still-unknown"))
@@ -1163,15 +1296,14 @@ async fn staged_discard_for_every_reject_and_retryable() {
             reason: RetryableReason::PersistenceUnavailable
         }
     );
+    let model = running.collector.model.borrow();
+    assert_eq!(model.task_runs().count(), before_retryable);
     assert!(
-        running
-            .collector
-            .model
-            .borrow()
-            .task_runs()
-            .next()
+        model
+            .task_run_by_key(&RunKey::Controller("still-unknown".to_owned()))
             .is_none()
     );
+    drop(model);
     running.stop().await;
 }
 
@@ -1324,7 +1456,12 @@ async fn monotonic_ingest_under_concurrent_connections() {
     for request in requests {
         assert_eq!(request.await.unwrap(), ControllerResponse::Accepted);
     }
-    running.writer.barrier().await.unwrap();
+    wait_for_durable_row_count(
+        &running,
+        "SELECT COUNT(*) FROM events WHERE normalized_kind = 'controller_event'",
+        24,
+    )
+    .await;
     let connection = rusqlite::Connection::open(store::database_path(&running.root)).unwrap();
     let mut statement = connection
         .prepare("SELECT ingest_seq FROM events WHERE normalized_kind = 'controller_event' ORDER BY ingest_seq")
@@ -1349,7 +1486,12 @@ async fn envelope_timestamp_is_not_ordering() {
     past["emitted_at_ms"] = json!(i64::MIN);
     assert_eq!(running.send(&future).await, ControllerResponse::Accepted);
     assert_eq!(running.send(&past).await, ControllerResponse::Accepted);
-    running.writer.barrier().await.unwrap();
+    wait_for_durable_row_count(
+        &running,
+        "SELECT COUNT(*) FROM events WHERE event_id IN ('future', 'past')",
+        2,
+    )
+    .await;
     let connection = rusqlite::Connection::open(store::database_path(&running.root)).unwrap();
     let rows: Vec<(String, i64, i64)> = connection
         .prepare("SELECT event_id, event_timestamp_ms, ingest_seq FROM events WHERE event_id IN ('future', 'past') ORDER BY ingest_seq")
@@ -1473,8 +1615,12 @@ async fn enqueue_closure_after_health_gate_is_impossible() {
             .await,
         ControllerResponse::Accepted
     );
-    running.writer.barrier().await.unwrap();
-    assert!(running.writer.is_duplicate("event-1"));
+    wait_for_durable_row_count(
+        &running,
+        "SELECT COUNT(*) FROM event_ledger WHERE event_id = 'event-1'",
+        1,
+    )
+    .await;
     running.stop().await;
 }
 
@@ -1495,7 +1641,12 @@ async fn receipt_time_persisted_for_task_run_and_both_edge_rows() {
         ControllerResponse::Accepted
     );
     let after = unix_now_ms();
-    running.writer.barrier().await.unwrap();
+    wait_for_durable_row_count(
+        &running,
+        "SELECT COUNT(*) FROM events WHERE event_id IN ('dispatch', 'dependency')",
+        2,
+    )
+    .await;
     let connection = rusqlite::Connection::open(store::database_path(&running.root)).unwrap();
     for query in [
         "SELECT created_at_ms FROM task_runs",
@@ -1522,16 +1673,25 @@ async fn receipt_time_persisted_for_task_run_and_both_edge_rows() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reused_event_id_after_seven_idle_days_is_not_suppressed() {
-    const EIGHT_DAYS_MS: i64 = 8 * 24 * 60 * 60 * 1_000;
-    let running = RunningController::start().await;
+    let running = RunningController::start_seeded(vec![expired_controller_record("reused")]).await;
     let event = envelope("reused", "task_started", "run");
-    assert_eq!(running.send(&event).await, ControllerResponse::Accepted);
-    let cleanup = running
-        .writer
-        .cleanup(unix_now_ms() + EIGHT_DAYS_MS)
-        .await
-        .unwrap();
-    assert_eq!(cleanup.ledger_pruned, 1);
+    assert_eq!(running.send(&event).await, ControllerResponse::Duplicate);
+    assert_eq!(
+        running
+            .send(&envelope(
+                "cleanup-driver",
+                "task_started",
+                "cleanup-driver-run",
+            ))
+            .await,
+        ControllerResponse::Accepted
+    );
+    wait_for_durable_row_count(
+        &running,
+        "SELECT COUNT(*) FROM event_ledger WHERE event_id = 'reused'",
+        0,
+    )
+    .await;
     assert_eq!(running.send(&event).await, ControllerResponse::Accepted);
     running.stop().await;
 }
@@ -1579,75 +1739,19 @@ fn startup_failure_after_bind_cleans_up() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn idle_cleanup_tick_evicts_conditionally() {
-    const EIGHT_DAYS_MS: i64 = 8 * 24 * 60 * 60 * 1_000;
-    let state = tempfile::tempdir().unwrap();
-    let socket_dir = tempfile::tempdir().unwrap();
-    let socket_path = socket_dir.path().join("controller.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let key = session_key::encode(SESSION).unwrap();
-    let root = state_root_in(state.path(), &key).unwrap();
-    let mut store = store::open_writer(&root).unwrap();
-    let old = unix_now_ms() - EIGHT_DAYS_MS;
-    store
-        .apply_batch(vec![PersistOp::RecordEvent {
-            event: Box::new(NormalizedEvent::ControllerEvent {
-                metadata: EventMetadata {
-                    event_id: "idle-reuse".to_owned(),
-                    timestamp_ms: old,
-                    receipt_time_ms: old,
-                    source: "seed".to_owned(),
-                    source_event_type: "task_started".to_owned(),
-                    herdr_session: SESSION.to_owned(),
-                    workspace_id: None,
-                    tab_id: None,
-                    pane_id: None,
-                    terminal_id: None,
-                    provider: None,
-                    native_session_id: None,
-                    task_run_id: None,
-                    agent_node_id: None,
-                    task_state: None,
-                    execution_parent: None,
-                    dependency: None,
-                    source_coverage: Vec::new(),
-                    provider_metadata: None,
-                    label: None,
-                    reason: None,
-                    progress: None,
-                    ingest_seq: None,
-                },
-                event: ControllerEventKind::TaskStarted,
-            }),
-            seen_at_ms: old,
-        }])
-        .unwrap();
-    let restored = store.load_restored_state().unwrap();
-    let (lifecycle, writer) = store::spawn_writer(store).unwrap();
-    assert!(writer.is_duplicate("idle-reuse"));
-    let collector = collector::spawn_with_controller(
-        socket_dir.path().join("missing-herdr.sock"),
-        SESSION.to_owned(),
-        restored,
-        writer.clone(),
-        Some(listener),
+    let running =
+        RunningController::start_seeded(vec![expired_controller_record("idle-reuse")]).await;
+    let reused = envelope("idle-reuse", "task_started", "reused-run");
+    assert_eq!(running.send(&reused).await, ControllerResponse::Duplicate);
+    wait_for_durable_row_count_with_timeout(
+        &running,
+        "SELECT COUNT(*) FROM event_ledger WHERE event_id = 'idle-reuse'",
+        0,
+        Duration::from_secs(10),
     )
-    .await
-    .unwrap();
-
-    tokio::time::timeout(Duration::from_secs(7), async {
-        while writer.is_duplicate("idle-reuse") {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(
-        send_raw(&socket_path, &envelope("idle-reuse", "task_started", "run")).await,
-        ControllerResponse::Accepted
-    );
-    collector.stop().await.unwrap();
-    lifecycle.shutdown().await.unwrap();
+    .await;
+    assert_eq!(running.send(&reused).await, ControllerResponse::Accepted);
+    running.stop().await;
 }
 
 fn unix_now_ms() -> i64 {
@@ -1744,19 +1848,7 @@ async fn i4_d3_later_controller_event_is_retryable_without_change() {
         running.send_bounded(&first).await,
         ControllerResponse::Accepted
     );
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if matches!(
-                running.writer.persistence_status(),
-                store::PersistenceStatus::Degraded { .. }
-            ) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the accepted failure must degrade writer health");
+    running.wait_for_persistence_degradation().await;
 
     let diagnostics = send_wire_value(
         &running.socket_path,

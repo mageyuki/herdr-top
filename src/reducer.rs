@@ -2504,7 +2504,7 @@ mod tests {
 
     async fn commit_controller(
         reducer: &mut Reducer,
-        writer: &WriterClient,
+        writer: &mut WriterClient,
         event: ControllerEvent,
     ) {
         let delta = reducer.validate_controller_event(&event).unwrap();
@@ -3779,7 +3779,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let writer = &mut writer;
         let (mut reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
 
         for (event_id, raw) in [("sequence-1", "raw-1"), ("sequence-2", "raw-2")] {
@@ -3821,7 +3822,8 @@ mod tests {
                 seen_at_ms: 20,
             }])
             .unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let writer = &mut writer;
         let (reducer, mut shared) = Reducer::new(restored(DomainModel::default(), 1));
         let initial = Arc::clone(&shared.borrow_and_update());
 
@@ -3837,7 +3839,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let writer = &mut writer;
         let (reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
         let event_id = "reusable";
 
@@ -3869,7 +3872,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let writer = &mut writer;
         assert!(
             writer
                 .apply(vec![PersistOp::UpsertTab {
@@ -3927,7 +3931,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let writer = &mut writer;
         let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
 
         for (event_id, kind) in [
@@ -3984,18 +3989,18 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
         let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
 
         commit_controller(
             &mut reducer,
-            &writer,
+            &mut writer,
             controller_event("parent-started", "parent", ControllerEventKind::TaskStarted),
         )
         .await;
         commit_controller(
             &mut reducer,
-            &writer,
+            &mut writer,
             controller_event(
                 "child-dispatched",
                 "child",
@@ -4015,12 +4020,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
         let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
 
         commit_controller(
             &mut reducer,
-            &writer,
+            &mut writer,
             controller_event(
                 "island",
                 "child",
@@ -4034,7 +4039,7 @@ mod tests {
 
         commit_controller(
             &mut reducer,
-            &writer,
+            &mut writer,
             controller_event("child-started", "child", ControllerEventKind::TaskStarted),
         )
         .await;
@@ -4048,12 +4053,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
         let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
 
         commit_controller(
             &mut reducer,
-            &writer,
+            &mut writer,
             controller_event(
                 "island",
                 "child",
@@ -4090,12 +4095,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
         let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
 
         commit_controller(
             &mut reducer,
-            &writer,
+            &mut writer,
             controller_event(
                 "first-island",
                 "child-1",
@@ -4107,7 +4112,7 @@ mod tests {
         .await;
         commit_controller(
             &mut reducer,
-            &writer,
+            &mut writer,
             controller_event(
                 "first-resolved",
                 "child-1",
@@ -4117,7 +4122,7 @@ mod tests {
         .await;
         commit_controller(
             &mut reducer,
-            &writer,
+            &mut writer,
             controller_event(
                 "second-island",
                 "child-2",
@@ -4279,7 +4284,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
         let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
 
         for (event_id, child, parent) in [
@@ -4288,7 +4293,7 @@ mod tests {
         ] {
             commit_controller(
                 &mut reducer,
-                &writer,
+                &mut writer,
                 controller_event(
                     event_id,
                     child,
@@ -4309,12 +4314,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
         let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
 
         commit_controller(
             &mut reducer,
-            &writer,
+            &mut writer,
             controller_event(
                 "dependency-island",
                 "dependent",
@@ -4334,12 +4339,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
         let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
 
         commit_controller(
             &mut reducer,
-            &writer,
+            &mut writer,
             controller_event(
                 "island",
                 "child",
@@ -4351,7 +4356,7 @@ mod tests {
         .await;
         commit_controller(
             &mut reducer,
-            &writer,
+            &mut writer,
             controller_event("parent-complete", "parent", ControllerEventKind::Complete),
         )
         .await;
@@ -4365,7 +4370,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let writer = &mut writer;
         let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
         let delta = reducer
             .validate_controller_event(&controller_event(
@@ -4396,7 +4402,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let writer = &mut writer;
         let (mut reducer, shared) = Reducer::new(RestoredState {
             model: DomainModel::default(),
             next_ordinal: 1,
@@ -4437,7 +4444,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let writer = &mut writer;
         let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
         let raw = "not a ULID / task #1";
         let delta = reducer
