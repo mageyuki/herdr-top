@@ -1302,10 +1302,7 @@ fn run_environment_is_valid(
     );
     expected.insert(
         "HERDR_PERF_STAGE".to_owned(),
-        serde_json::to_value(measurement_stage)
-            .ok()
-            .and_then(|value| value.as_str().map(str::to_owned))
-            .unwrap_or_default(),
+        stage_cli_token(measurement_stage).to_owned(),
     );
     expected.insert(
         "HERDR_PERF_SUBJECT".to_owned(),
@@ -4300,11 +4297,7 @@ fn run_environment(
     );
     values.insert(
         "HERDR_PERF_STAGE".to_owned(),
-        serde_json::to_value(measurement_stage)
-            .expect("stage must serialize")
-            .as_str()
-            .expect("stage must serialize as a string")
-            .to_owned(),
+        stage_cli_token(measurement_stage).to_owned(),
     );
     values.insert(
         "HERDR_PERF_SUBJECT".to_owned(),
@@ -4319,7 +4312,7 @@ fn run_environment(
     values
 }
 
-fn measured_environment(
+pub(crate) fn measured_environment(
     raw_root: &str,
     scratch_root: &str,
     control_socket: &str,
@@ -4335,11 +4328,7 @@ fn measured_environment(
     );
     values.insert(
         "HERDR_PERF_STAGE".to_owned(),
-        serde_json::to_value(measurement_stage)
-            .expect("stage must serialize")
-            .as_str()
-            .expect("stage must serialize as a string")
-            .to_owned(),
+        stage_cli_token(measurement_stage).to_owned(),
     );
     values.insert(
         "HERDR_PERF_SUBJECT".to_owned(),
@@ -5613,11 +5602,7 @@ fn run_environment_with_baseline(
     );
     values.insert(
         "HERDR_PERF_STAGE".to_owned(),
-        serde_json::to_value(measurement_stage)
-            .expect("stage must serialize")
-            .as_str()
-            .expect("stage must serialize as string")
-            .to_owned(),
+        stage_cli_token(measurement_stage).to_owned(),
     );
     values.insert(
         "HERDR_PERF_SUBJECT".to_owned(),
@@ -7302,12 +7287,20 @@ fn required_environment_path(name: &'static str) -> Result<std::path::PathBuf, H
         .ok_or(HarnessError::Invalid(name))
 }
 
-fn parse_stage_token(value: &str) -> Result<MeasurementStageV1, HarnessError> {
+pub(crate) fn parse_stage_token(value: &str) -> Result<MeasurementStageV1, HarnessError> {
     match value {
         "baseline" => Ok(MeasurementStageV1::Baseline),
         "post-reliability" => Ok(MeasurementStageV1::PostReliability),
         "final" => Ok(MeasurementStageV1::Final),
         _ => Err(HarnessError::Invalid("unknown measurement stage")),
+    }
+}
+
+pub(crate) fn stage_cli_token(stage: MeasurementStageV1) -> &'static str {
+    match stage {
+        MeasurementStageV1::Baseline => "baseline",
+        MeasurementStageV1::PostReliability => "post-reliability",
+        MeasurementStageV1::Final => "final",
     }
 }
 

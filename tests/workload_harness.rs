@@ -1941,6 +1941,44 @@ fn measured_child_and_observer_environment_ownership_is_exact() {
 }
 
 #[test]
+fn post_reliability_measured_environment_uses_cli_stage_token_and_baseline_root() {
+    // Break caught: deriving the measured child's stage environment value from
+    // snake_case document serialization instead of the runner's CLI grammar.
+    let baseline_root = PathBuf::from("/tmp/herdr-increment5/supplied-baseline");
+    let environment = measured_environment(
+        "/tmp/herdr-increment5/sustained/trial-0001",
+        "/tmp/herdr-increment5/sustained/trial-0001/scratch",
+        "/tmp/herdr-i5.synthetic/sustained-trial-0001.sock",
+        MeasurementStageV1::PostReliability,
+        ScenarioV1::Sustained,
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        Some(&baseline_root),
+    );
+
+    assert_eq!(environment["HERDR_PERF_STAGE"], "post-reliability");
+    assert_eq!(
+        environment["HERDR_PERF_BASELINE_RESULTS_ROOT"],
+        baseline_root.to_string_lossy()
+    );
+}
+
+#[test]
+fn stage_cli_tokens_roundtrip_through_parser() {
+    // Break caught: adding or changing a stage in only one side of the closed
+    // CLI token mapping makes environment construction and parsing diverge.
+    for stage in [
+        MeasurementStageV1::Baseline,
+        MeasurementStageV1::PostReliability,
+        MeasurementStageV1::Final,
+    ] {
+        assert!(
+            matches!(parse_stage_token(stage_cli_token(stage)), Ok(parsed) if parsed == stage),
+            "stage {stage:?} did not roundtrip"
+        );
+    }
+}
+
+#[test]
 fn repeated_control_records_reuse_first_ambient_load() {
     let mut first = valid_synthetic_result().document().host.clone();
     first.ambient_load_milli = [1_780, 1_520, 2_240];
