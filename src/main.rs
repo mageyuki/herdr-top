@@ -224,7 +224,6 @@ async fn run_monitor(cli: &Cli, plugin_state_dir: Option<&OsStr>) -> Result<(), 
     let runtime = rendezvous::open_runtime_dir()?;
     let controller_status =
         rendezvous::prepare_controller_socket(&runtime, resolved.session_key(), &owner_lock)?;
-    eprintln!("controller_socket: {controller_status:?}");
     let controller_listener = controller_status
         .try_clone_listener()
         .map_err(MainError::ControllerListener)?;

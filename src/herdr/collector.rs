@@ -1482,7 +1482,12 @@ async fn run_collector(
             result = wire::subscribe(&sock, &subscriptions) => result,
         } {
             Ok(stream) => stream,
-            Err(_) => {
+            Err(error) => {
+                tracing::warn!(
+                    warning_code = "herdr_subscription_failed",
+                    error = %error,
+                    "Herdr event subscription failed; retrying"
+                );
                 provider.set_herdr_quality(
                     ObservationQuality::Disconnected,
                     &mut persistence,
@@ -3927,7 +3932,9 @@ fn subscriptions() -> Vec<Subscription> {
         "pane.moved",
         "pane.exited",
         "pane.agent_detected",
-        "pane.agent_status_changed",
+        // Herdr 0.8.0 requires pane.agent_status_changed to carry a non-null pane_id;
+        // requesting it unscoped rejects the whole subscription. Agent status still flows
+        // through full pane.updated payloads; pane-scoped subscriptions are a follow-up.
         "layout.updated",
     ]
     .into_iter()
@@ -4854,6 +4861,9 @@ mod tests {
     use std::sync::Barrier;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tracing::instrument::WithSubscriber;
 
     use super::*;
     use crate::activity::OperatorSnapshot;
@@ -5814,8 +5824,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unscoped_subscriptions_omit_pane_scoped_agent_status_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let response = json!({
+                "id": request["id"],
+                "result": {"type": "subscription_started"},
+            });
+            let mut bytes = serde_json::to_vec(&response).unwrap();
+            bytes.push(b'\n');
+            reader.get_mut().write_all(&bytes).await.unwrap();
+            request
+        });
+
+        let stream = wire::subscribe(&socket, &subscriptions()).await.unwrap();
+        drop(stream);
+        let request = server.await.unwrap();
+        let requested = request["params"]["subscriptions"].as_array().unwrap();
+
+        assert!(
+            requested.iter().all(|subscription| {
+                subscription["type"].as_str() != Some("pane.agent_status_changed")
+            }),
+            "pane.agent_status_changed requires pane_id and must not be requested unscoped: {requested:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn i4_d3_herdr_disconnect_immediately_refreshes_diagnostics_once() {
         let directory = tempfile::tempdir().unwrap();
+        let log_path = directory.path().join("collector-subscribe.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(log)
+            .finish();
         let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
         let restored = store.load_restored_state().unwrap();
@@ -5858,18 +5909,21 @@ mod tests {
         let (performance, _sampler) =
             performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
         let missing_socket = directory.path().join("missing-herdr.sock");
-        let task = tokio::spawn(run_collector(
-            missing_socket,
-            "diagnostics-session".to_owned(),
-            persistence,
-            reducer,
-            shared,
-            performance,
-            task_cancellation,
-            OwnerTracker::from_environment(),
-            None,
-            provider,
-        ));
+        let task = tokio::spawn(
+            run_collector(
+                missing_socket,
+                "diagnostics-session".to_owned(),
+                persistence,
+                reducer,
+                shared,
+                performance,
+                task_cancellation,
+                OwnerTracker::from_environment(),
+                None,
+                provider,
+            )
+            .with_subscriber(subscriber),
+        );
 
         tokio::time::timeout(Duration::from_secs(1), diagnostics.changed())
             .await
@@ -5895,6 +5949,16 @@ mod tests {
         task.await.unwrap().unwrap();
         provider_thread.stop().await.unwrap();
         shutdown_writer(lifecycle).await;
+
+        let contents = std::fs::read_to_string(log_path).unwrap();
+        assert!(
+            contents.contains("warning_code=\"herdr_subscription_failed\""),
+            "subscribe failure warning code was not logged: {contents}"
+        );
+        assert!(
+            contents.contains("herdr wire I/O failed:"),
+            "subscribe WireError display was not logged: {contents}"
+        );
     }
 }
 
