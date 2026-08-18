@@ -1073,6 +1073,18 @@ impl From<RejectReason> for RejectResponseReason {
     }
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_CLIENT_SHUTDOWN_BARRIER: std::sync::Arc<tokio::sync::Notify>;
+}
+
+#[cfg(test)]
+async fn wait_for_test_peer_close_before_shutdown() {
+    if let Ok(barrier) = TEST_CLIENT_SHUTDOWN_BARRIER.try_with(std::sync::Arc::clone) {
+        barrier.notified().await;
+    }
+}
+
 /// Sends one envelope and validates the single closed-shape response.
 pub async fn emit_to_endpoint(path: &Path, envelope: &ControllerEnvelope) -> EmitOutcome {
     let mut stream =
@@ -1091,8 +1103,13 @@ pub async fn emit_to_endpoint(path: &Path, envelope: &ControllerEnvelope) -> Emi
         Ok(Err(error)) => return EmitOutcome::Unresolved(error.to_string()),
         Err(_) => return EmitOutcome::Unresolved("write timeout".to_owned()),
     }
-    if let Err(error) = stream.shutdown().await {
-        return EmitOutcome::Unresolved(error.to_string());
+    #[cfg(test)]
+    wait_for_test_peer_close_before_shutdown().await;
+    match stream.shutdown().await {
+        Ok(()) => {}
+        // Darwin may report ENOTCONN after the peer closes; Linux accepts the same shutdown(2).
+        Err(error) if error.kind() == io::ErrorKind::NotConnected => {}
+        Err(error) => return EmitOutcome::Unresolved(error.to_string()),
     }
     let mut response = Vec::new();
     let read = async {
@@ -1128,9 +1145,17 @@ pub async fn query_status(path: &Path) -> io::Result<Value> {
     )
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Controller write timed out"))??;
-    tokio::time::timeout(CONTROLLER_IO_TIMEOUT, stream.shutdown())
+    #[cfg(test)]
+    wait_for_test_peer_close_before_shutdown().await;
+    match tokio::time::timeout(CONTROLLER_IO_TIMEOUT, stream.shutdown())
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Controller shutdown timed out"))??;
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Controller shutdown timed out"))?
+    {
+        Ok(()) => {}
+        // Darwin may report ENOTCONN after the peer closes; Linux accepts the same shutdown(2).
+        Err(error) if error.kind() == io::ErrorKind::NotConnected => {}
+        Err(error) => return Err(error),
+    }
     let mut response = Vec::new();
     let read = async {
         let mut limited = (&mut stream).take((MAX_FRAME_BYTES + 2) as u64);
@@ -1273,6 +1298,112 @@ mod tests {
         )
         .await;
         response.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn emit_to_endpoint_reads_accepted_response_after_peer_closes() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("emit.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let envelope = ControllerEnvelope {
+            schema_version: 1,
+            event_id: "event".to_owned(),
+            emitted_at_ms: 1,
+            source: "test".to_owned(),
+            event_type: "task_started".to_owned(),
+            task_run_id: "run".to_owned(),
+            parent_task_run_id: None,
+            depends_on_id: None,
+            label: None,
+            reason: None,
+            progress: None,
+            provider: None,
+            native_session_id: None,
+            terminal_id: None,
+        };
+        let expected_envelope = envelope.clone();
+        let barrier = Arc::new(tokio::sync::Notify::new());
+        let server_barrier = Arc::clone(&barrier);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            BufReader::new(&mut stream)
+                .read_until(b'\n', &mut request)
+                .await
+                .unwrap();
+            assert_eq!(request.pop(), Some(b'\n'));
+            assert_eq!(
+                serde_json::from_slice::<ControllerEnvelope>(&request).unwrap(),
+                expected_envelope
+            );
+            stream
+                .write_all(b"{\"status\":\"accepted\"}\n")
+                .await
+                .unwrap();
+            drop(stream);
+            server_barrier.notify_one();
+        });
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            TEST_CLIENT_SHUTDOWN_BARRIER.scope(barrier, emit_to_endpoint(&socket_path, &envelope)),
+        )
+        .await
+        .expect("emit must complete even if the server task panics before the barrier");
+        server.await.unwrap();
+        assert_eq!(outcome, EmitOutcome::Response(ControllerResponse::Accepted));
+
+        let dead_path = directory.path().join("dead-emit.sock");
+        let dead_listener = UnixListener::bind(&dead_path).unwrap();
+        drop(dead_listener);
+        assert!(matches!(
+            emit_to_endpoint(&dead_path, &envelope).await,
+            EmitOutcome::Unresolved(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn query_status_reads_response_after_peer_closes() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("status.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let expected = json!({
+            "status": "ok",
+            "schema_version": 1,
+            "diagnostics": {"source": "test"}
+        });
+        let server_response = expected.clone();
+        let barrier = Arc::new(tokio::sync::Notify::new());
+        let server_barrier = Arc::clone(&barrier);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            BufReader::new(&mut stream)
+                .read_until(b'\n', &mut request)
+                .await
+                .unwrap();
+            assert_eq!(request, b"{\"request\":\"status\",\"schema_version\":1}\n");
+            let mut response = serde_json::to_vec(&server_response).unwrap();
+            response.push(b'\n');
+            stream.write_all(&response).await.unwrap();
+            drop(stream);
+            server_barrier.notify_one();
+        });
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            TEST_CLIENT_SHUTDOWN_BARRIER.scope(barrier, query_status(&socket_path)),
+        )
+        .await
+        .expect("query_status must complete even if the server task panics before the barrier")
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(response, expected);
+
+        let dead_path = directory.path().join("dead-status.sock");
+        let dead_listener = UnixListener::bind(&dead_path).unwrap();
+        drop(dead_listener);
+        assert!(query_status(&dead_path).await.is_err());
     }
 
     #[tokio::test]
