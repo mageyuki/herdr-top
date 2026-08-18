@@ -7258,6 +7258,56 @@ fn runner_library_guard_is_source_clean() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn runner_scenario_loop_continues_after_failed_status_under_nested_errexit() {
+    use reference_runner_test_support as support;
+
+    // Break caught: replacing the conditional status capture with set +e/set -e
+    // lets the scenario's set -e terminate the runner before the next scenario.
+    let temporary = tempfile::tempdir().unwrap();
+    let calls = temporary.path().join("calls");
+    let output = support::run_source_fixture(
+        Some("00000001"),
+        &[
+            "orchestration".to_owned(),
+            "scenario-loop".to_owned(),
+            "10".to_owned(),
+            calls.to_string_lossy().into_owned(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(10), "{output:?}");
+    assert_eq!(
+        std::fs::read_to_string(calls).unwrap(),
+        "target\nsustained\nburst\nstartup\nidle\nfallback-rescan\ntwice-target\n"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn runner_scenario_loop_aborts_immediately_after_invalid_status_under_nested_errexit() {
+    use reference_runner_test_support as support;
+
+    // Break caught: treating InvalidArtifact as an aggregate-only status and
+    // continuing into scenarios whose evidence cannot be authoritative.
+    let temporary = tempfile::tempdir().unwrap();
+    let calls = temporary.path().join("calls");
+    let output = support::run_source_fixture(
+        Some("00000001"),
+        &[
+            "orchestration".to_owned(),
+            "scenario-loop".to_owned(),
+            "20".to_owned(),
+            calls.to_string_lossy().into_owned(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(20), "{output:?}");
+    assert_eq!(
+        std::fs::read_to_string(calls).unwrap(),
+        "target\nsustained\nburst\nstartup\n"
+    );
+}
+
 #[cfg(all(target_os = "linux", feature = "workload-harness"))]
 #[test]
 fn runner_preflight_guards_abort_before_output_creation() {

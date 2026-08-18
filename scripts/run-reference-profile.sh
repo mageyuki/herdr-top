@@ -613,6 +613,25 @@ run_orchestration_fixture() {
       fi
       publish_runner_test_outcome "$attempt_outcome" 0 true || return 20
       ;;
+    scenario-loop)
+      [[ $# -eq 2 ]] || return 20
+      local scenario_status=$1
+      local scenario_calls_path=$2
+      case "$scenario_status" in 10|20) ;; *) return 20 ;; esac
+      validate_fixture_output_path "$scenario_calls_path" || return 20
+      runner_scenario=all
+      validate_baseline_layout_up_front() { return 0; }
+      run_single_reference_scenario() {
+        local scenario=$1
+        builtin printf '%s\n' "$scenario" >>"$scenario_calls_path" || return 20
+        if [[ $scenario == startup ]]; then
+          set -e
+          return "$scenario_status"
+        fi
+        return 0
+      }
+      run_reference_scenarios
+      ;;
     aggregate)
       [[ $# -ge 2 ]] || return 20
       local aggregate_outcome=$1
@@ -768,10 +787,11 @@ run_orchestration_fixture() {
       "$source_sleep_executable" 300 &
       missed_group_pid=$!
       builtin printf '%s\n' "$missed_group_pid" >"$missed_group_ready" || return 20
-      set +e
-      cleanup_process_groups fixture_no_sleep "$missed_group_pid" ''
-      missed_group_cleanup_status=$?
-      set -e
+      if cleanup_process_groups fixture_no_sleep "$missed_group_pid" ''; then
+        missed_group_cleanup_status=0
+      else
+        missed_group_cleanup_status=$?
+      fi
       builtin kill -KILL "$missed_group_pid" 2>/dev/null || true
       wait "$missed_group_pid" 2>/dev/null || true
       [[ $missed_group_cleanup_status -eq 20 ]] || return 20
@@ -2001,10 +2021,11 @@ run_reference_scenarios() {
     scenarios=("$runner_scenario")
   fi
   for scenario in "${scenarios[@]}"; do
-    set +e
-    run_single_reference_scenario "$scenario"
-    status=$?
-    set -e
+    if run_single_reference_scenario "$scenario"; then
+      status=0
+    else
+      status=$?
+    fi
     statuses+=("$status")
     aggregate_closed_statuses "${statuses[@]}" || return 20
     [[ $status -ne 20 ]] || return 20
