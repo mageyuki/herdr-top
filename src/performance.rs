@@ -1,4 +1,7 @@
-#![allow(unsafe_code)]
+#![cfg_attr(
+    all(target_os = "linux", feature = "workload-harness"),
+    allow(unsafe_code)
+)]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -339,6 +342,12 @@ impl PerformanceSampler {
         operator: &crate::activity::OperatorSnapshot,
         now_ms: i64,
     ) -> PerformanceSnapshot {
+        let live_panes = model.panes().count();
+        let default_visible_task_runs =
+            crate::activity::default_visible_task_run_count(model, operator, now_ms);
+        let dependency_edges = model.dependency_edges().count();
+        let execution_edges = model.execution_edges().count();
+
         let mut state = self
             .shared
             .state
@@ -352,11 +361,6 @@ impl PerformanceSampler {
         let events_one_second = state.count_window(now, Duration::from_secs(1));
         let events_ten_seconds = state.count_window(now, Duration::from_secs(10));
         let events_sixty_seconds = state.count_window(now, Duration::from_secs(60));
-        let live_panes = model.panes().count();
-        let default_visible_task_runs =
-            crate::activity::default_visible_task_run_count(model, operator, now_ms);
-        let dependency_edges = model.dependency_edges().count();
-        let execution_edges = model.execution_edges().count();
 
         let mut reasons = BTreeSet::new();
         if live_panes > 50 {
