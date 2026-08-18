@@ -5,7 +5,10 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::Path;
 
-use crate::activity::{ActivityDurability, ActivityItem, OperatorSnapshot};
+use crate::activity::{
+    ActivityDurability, ActivityItem, DEFAULT_TERMINAL_VISIBILITY_MS, OperatorSnapshot,
+    is_default_visible_task_run,
+};
 use crate::diagnostics::{ControllerInputStatus, RuntimeDiagnosticsSnapshot};
 use crate::herdr::collector::ObservationQuality;
 use crate::model::{DomainModel, ExecState, Provider, RunId, RunKey, TaskState};
@@ -15,7 +18,6 @@ use super::app::{NodeKey, ViewMode};
 use super::dag;
 use super::view::TreeRow;
 
-pub(crate) const TERMINAL_VISIBILITY_MS: i64 = 60 * 60 * 1_000;
 pub(crate) const DETAIL_ACTIVITY_LIMIT: usize = 100;
 
 #[derive(Debug)]
@@ -141,17 +143,13 @@ pub(crate) fn project_rows(
         let Some(run) = model.task_run(&run_id) else {
             continue;
         };
-        if !run.state.is_terminal() {
-            visible.push(row.clone());
-            continue;
-        }
-        let Some(first_terminal_ms) = operator.terminal_times.get(&run_id).copied() else {
-            visible.push(row.clone());
-            continue;
-        };
-        let expiry = first_terminal_ms.saturating_add(TERMINAL_VISIBILITY_MS);
-        if now_ms < expiry {
-            next_expiry_ms = Some(next_expiry_ms.map_or(expiry, |current| current.min(expiry)));
+        if is_default_visible_task_run(run, operator, now_ms) {
+            if run.state.is_terminal()
+                && let Some(first_terminal_ms) = operator.terminal_times.get(&run_id).copied()
+            {
+                let expiry = first_terminal_ms.saturating_add(DEFAULT_TERMINAL_VISIBILITY_MS);
+                next_expiry_ms = Some(next_expiry_ms.map_or(expiry, |current| current.min(expiry)));
+            }
             visible.push(row.clone());
         } else if mode == ViewMode::ExecutionTree {
             hidden_subtree_depth = Some(row.depth);

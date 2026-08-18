@@ -17,7 +17,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::{Frame, Terminal};
 
-use crate::activity::{ActivityItem, OperatorSnapshot};
+use crate::activity::{self, ActivityItem, OperatorSnapshot};
 use crate::diagnostics::local::{self, NoticeVerdict};
 use crate::diagnostics::remote::{self, StandaloneVersionStatus, VersionCommandRunner};
 use crate::diagnostics::{
@@ -1069,7 +1069,7 @@ impl App {
                 .is_some_and(|run| run.state.is_terminal())
                 && self.state.terminal_times.get(&run_id).is_some_and(|time| {
                     self.state.now_ms
-                        >= time.saturating_add(super::projection::TERMINAL_VISIBILITY_MS)
+                        >= time.saturating_add(activity::DEFAULT_TERMINAL_VISIBILITY_MS)
                 })
         }) {
             return Some(SelectionReason::AgedOut);
@@ -1990,7 +1990,7 @@ mod tests {
         );
         assert_eq!(closed.state().selection_reason(), Some("closed"));
 
-        let clock = TestClock::at(crate::tui::projection::TERMINAL_VISIBILITY_MS - 1);
+        let clock = TestClock::at(activity::DEFAULT_TERMINAL_VISIBILITY_MS - 1);
         let (mut aged, _aged_senders) = app_with_runtime(
             shared_occurrence_model(shared, sibling, TaskState::Completed, true),
             empty_operator(HashMap::from([(shared, 0)])),
@@ -1999,7 +1999,7 @@ mod tests {
         );
         aged.state.follow = false;
         aged.set_selection(Some(selected_pane_one.clone()));
-        clock.set(crate::tui::projection::TERMINAL_VISIBILITY_MS);
+        clock.set(activity::DEFAULT_TERMINAL_VISIBILITY_MS);
         assert!(aged.refresh_if_changed().unwrap());
         assert_eq!(
             aged.state().selected(),
@@ -2518,7 +2518,7 @@ mod tests {
     fn i4_idle_deadline_cache_avoids_projection_rebuilds() {
         let terminal = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let live = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
-        let deadline = crate::tui::projection::TERMINAL_VISIBILITY_MS + 1_000;
+        let deadline = activity::DEFAULT_TERMINAL_VISIBILITY_MS + 1_000;
         let clock = TestClock::at(1_000);
         let (mut app, _senders) = app_with_runtime(
             model_with_runs(&[
@@ -2561,7 +2561,7 @@ mod tests {
         let old = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let terminal = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
         let terminal_at_ms = 100;
-        let deadline = terminal_at_ms + crate::tui::projection::TERMINAL_VISIBILITY_MS;
+        let deadline = terminal_at_ms + activity::DEFAULT_TERMINAL_VISIBILITY_MS;
         let clock = TestClock::at(terminal_at_ms);
         let (model_sender, model_receiver) = watch::channel(Arc::new(model_with_runs(&[(
             old,
