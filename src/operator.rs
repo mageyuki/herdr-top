@@ -614,7 +614,8 @@ mod tests {
             )
             .unwrap();
         let seed = store.load_restored_operator_state().unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let writer = &mut writer;
         let (mut projection, operator) = OperatorProjection::new(seed);
         let now = unix_now_ms();
         let batch = vec![event("committed", now, now, None, None, "provider")];
@@ -776,7 +777,8 @@ mod tests {
             ])
             .unwrap();
         let seed = store.load_restored_operator_state().unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let writer = &mut writer;
         let (mut projection, operator) = OperatorProjection::new(seed);
         let batch = merge_batch(survivor, absorbed, TaskState::Running, now + 1);
 

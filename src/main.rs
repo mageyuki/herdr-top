@@ -286,12 +286,11 @@ async fn run_monitor(cli: &Cli, plugin_state_dir: Option<&OsStr>) -> Result<(), 
     let tui_setup = TuiSetup::for_owner(state_base, env::var_os("HOME"), &version_runner);
     let mut app = App::with_inputs(
         collector.model.clone(),
-        collector.quality.clone(),
         HeaderInputs {
             host: resolve_hostname(),
             session: session_name,
-            event_lag: Duration::ZERO,
             source_coverage: collector.source_coverage.clone(),
+            performance: collector.performance.clone(),
         },
         collector.diagnostics.clone(),
         collector.operator.clone(),

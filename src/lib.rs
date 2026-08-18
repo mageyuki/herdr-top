@@ -10,6 +10,7 @@ pub mod identity;
 pub mod lockfile;
 pub mod model;
 pub mod operator;
+pub mod performance;
 pub mod provider;
 pub mod reducer;
 pub mod rendezvous;

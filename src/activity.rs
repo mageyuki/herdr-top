@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use crate::model::{Provider, RunId, TaskState};
 
+pub const DEFAULT_TERMINAL_VISIBILITY_MS: i64 = 60 * 60 * 1_000;
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ActivityIdentity {
     pub event_id: String,
@@ -55,4 +57,77 @@ pub struct RestoredOperatorState {
 pub struct OperatorSnapshot {
     pub activity: Arc<[ActivityItem]>,
     pub terminal_times: Arc<HashMap<RunId, i64>>,
+}
+
+#[must_use]
+pub fn is_default_visible_task_run(
+    run: &crate::model::TaskRun,
+    operator: &OperatorSnapshot,
+    now_ms: i64,
+) -> bool {
+    !run.state.is_terminal()
+        || operator
+            .terminal_times
+            .get(&run.run_id)
+            .is_none_or(|first_terminal_ms| {
+                now_ms < first_terminal_ms.saturating_add(DEFAULT_TERMINAL_VISIBILITY_MS)
+            })
+}
+
+#[must_use]
+pub fn default_visible_task_run_count(
+    model: &crate::model::DomainModel,
+    operator: &OperatorSnapshot,
+    now_ms: i64,
+) -> usize {
+    model
+        .task_runs()
+        .filter(|run| is_default_visible_task_run(run, operator, now_ms))
+        .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{DisplayOrdinal, DomainModel, RunKey, TaskRun};
+
+    fn visibility_fixture(now_ms: i64) -> (DomainModel, OperatorSnapshot) {
+        let run_ids = [
+            RunId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+            RunId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAW").unwrap(),
+            RunId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAX").unwrap(),
+            RunId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAY").unwrap(),
+        ];
+        let states = [
+            TaskState::Running,
+            TaskState::Completed,
+            TaskState::Failed,
+            TaskState::Cancelled,
+        ];
+        let mut model = DomainModel::default();
+        for (index, (run_id, state)) in run_ids.into_iter().zip(states).enumerate() {
+            model.insert_task_run(TaskRun {
+                run_id,
+                key: RunKey::Controller(format!("visibility-{index}")),
+                display_ordinal: DisplayOrdinal::new(index as i64 + 1),
+                state,
+                has_controller_task_state_event: true,
+            });
+        }
+        let operator = OperatorSnapshot {
+            activity: Arc::from(Vec::new()),
+            terminal_times: Arc::new(HashMap::from([
+                (run_ids[1], now_ms - 3_599_999),
+                (run_ids[2], now_ms - 3_600_000),
+            ])),
+        };
+        (model, operator)
+    }
+
+    #[test]
+    fn default_visible_count_matches_live_and_one_hour_terminal_policy() {
+        let now_ms = 7_200_000;
+        let (model, operator) = visibility_fixture(now_ms);
+        assert_eq!(default_visible_task_run_count(&model, &operator, now_ms), 3);
+    }
 }

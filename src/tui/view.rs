@@ -13,10 +13,11 @@ use crate::diagnostics::{
     ControllerInputStatus, ControllerInputUnavailableReason, DiagnosticSource, InputAvailability,
     OccurrenceLogStatus, OwnerFreshness, RuntimeDiagnosticsSnapshot,
 };
-use crate::herdr::collector::ObservationQuality;
+use crate::herdr::collector::{ObservationQuality, PerformancePublication};
 use crate::model::{
     AgentNode, DisplayOrdinal, DomainModel, ExecState, Provider, RunId, RunKey, TaskRun, TaskState,
 };
+use crate::performance::PerformanceDegradationReason;
 use crate::store::writer::{
     DurabilityDisposition, PersistenceFailureCode, PersistenceOperation, PersistencePhase,
     PersistenceStatus,
@@ -44,7 +45,7 @@ pub(crate) struct TreeRow {
 pub(super) fn render(
     frame: &mut Frame<'_>,
     model: &DomainModel,
-    quality: ObservationQuality,
+    performance: &PerformancePublication,
     header: &HeaderInputs,
     state: &AppState,
     diagnostics: &RuntimeDiagnosticsSnapshot,
@@ -73,8 +74,15 @@ pub(super) fn render(
         activity_y.saturating_sub(tree_y),
     );
 
-    let strip = projection::runtime_strip(quality, diagnostics);
-    render_header(frame, header_area, model, strip.quality, header);
+    let strip = projection::runtime_strip(performance.effective_quality, diagnostics);
+    render_header(
+        frame,
+        header_area,
+        model,
+        strip.quality,
+        performance,
+        header,
+    );
     let projection = build_projection(model, state);
     let rows = projection.rows;
     match state.view_mode() {
@@ -89,16 +97,53 @@ pub(super) fn render(
     render_interaction_layer(frame, area, model, state, diagnostics, setup);
 }
 
+// increment5-workload-header-projection-begin
+#[cfg(feature = "workload-harness")]
+/// Feature-only header projection used to exercise measured missing-label failures.
+pub(super) mod workload_header_projection {
+    use super::*;
+
+    /// Explicit test-only selection of the single permitted header omission.
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub(in crate::tui) struct WorkloadHeaderProjection {
+        pub(in crate::tui) omit_performance_label: bool,
+    }
+
+    /// Delegates to the ordinary renderer after projecting only the visible reason label.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::tui) fn render_with_workload_projection(
+        frame: &mut Frame<'_>,
+        model: &DomainModel,
+        performance: &PerformancePublication,
+        header: &HeaderInputs,
+        state: &AppState,
+        diagnostics: &RuntimeDiagnosticsSnapshot,
+        setup: &TuiSetup,
+        projection: WorkloadHeaderProjection,
+    ) {
+        let mut projected = performance.clone();
+        if projection.omit_performance_label {
+            projected
+                .snapshot
+                .reasons
+                .remove(&PerformanceDegradationReason::EventsSixtySeconds);
+        }
+        super::render(frame, model, &projected, header, state, diagnostics, setup);
+    }
+}
+// increment5-workload-header-projection-end
+
 fn render_header(
     frame: &mut Frame<'_>,
     area: Rect,
     model: &DomainModel,
     quality: ObservationQuality,
+    performance: &PerformancePublication,
     inputs: &HeaderInputs,
 ) {
     let block = Block::default().borders(Borders::ALL).title(" Herdr Top ");
     let inner_width = usize::from(area.width.saturating_sub(2));
-    let line = header_line(area.width, inner_width, model, quality, inputs);
+    let line = header_line(area.width, inner_width, model, quality, performance, inputs);
     frame.render_widget(Paragraph::new(line).block(block), area);
 }
 
@@ -609,6 +654,7 @@ fn header_line(
     available_width: usize,
     model: &DomainModel,
     quality: ObservationQuality,
+    performance: &PerformancePublication,
     inputs: &HeaderInputs,
 ) -> Line<'static> {
     let mut fields = Vec::new();
@@ -639,7 +685,21 @@ fn header_line(
     if screen_width >= 88 {
         fields.push(HeaderField {
             prefix: "lag:",
-            value: format!("{}ms", inputs.event_lag.as_millis()),
+            value: format!("{}ms", performance.snapshot.event_lag.as_millis()),
+            shrinkable: true,
+        });
+    }
+    if !performance.snapshot.reasons.is_empty() {
+        fields.push(HeaderField {
+            prefix: "perf:",
+            value: performance
+                .snapshot
+                .reasons
+                .iter()
+                .copied()
+                .map(performance_reason_label)
+                .collect::<Vec<_>>()
+                .join("+"),
             shrinkable: true,
         });
     }
@@ -676,7 +736,14 @@ fn header_line(
 }
 
 fn shrink_header_fields(fields: &mut [HeaderField], available_width: usize) {
-    let priorities = ["sources:", "lag:", "workspaces:", "host:", "session:"];
+    let priorities = [
+        "sources:",
+        "lag:",
+        "workspaces:",
+        "host:",
+        "session:",
+        "perf:",
+    ];
     loop {
         let current = fields_width(fields);
         if current <= available_width {
@@ -704,6 +771,18 @@ fn shrink_header_fields(fields: &mut [HeaderField], available_width: usize) {
         if !changed {
             return;
         }
+    }
+}
+
+fn performance_reason_label(reason: PerformanceDegradationReason) -> &'static str {
+    match reason {
+        PerformanceDegradationReason::LivePanes => "panes",
+        PerformanceDegradationReason::DefaultVisibleTaskRuns => "visible_runs",
+        PerformanceDegradationReason::DependencyEdges => "dependency_edges",
+        PerformanceDegradationReason::EventsOneSecond => "events_1s",
+        PerformanceDegradationReason::EventsTenSeconds => "events_10s",
+        PerformanceDegradationReason::EventsSixtySeconds => "events_60s",
+        PerformanceDegradationReason::EventLag => "event_lag",
     }
 }
 
@@ -1217,11 +1296,14 @@ mod tests {
         ControllerCounterSnapshot, ControllerInputStatus, OccurrenceLogStatus, OwnerFreshness,
         PersistenceCounters, RuntimeDiagnosticsSnapshot,
     };
-    use crate::herdr::collector::ObservationQuality;
+    use crate::herdr::collector::{
+        ObservationQuality, PerformancePublication, SourceCoverageRegistry,
+    };
     use crate::model::{
         AgentNode, DependencyEdge, DisplayOrdinal, DomainModel, ExecState, Execution,
         ExecutionEdge, Pane, Provider, RunId, RunKey, Tab, TaskRun, TaskState, Workspace,
     };
+    use crate::performance::{PerformanceDegradationReason, PerformanceSnapshot};
     use crate::store::writer::PersistenceStatus;
     use crate::tui::app::{App, AppState, HeaderInputs, SystemClock, TuiSetup};
 
@@ -1283,7 +1365,15 @@ mod tests {
 
     fn app(model: DomainModel, quality: ObservationQuality, session: &str) -> App {
         let (_model_sender, model_receiver) = watch::channel(Arc::new(model));
-        let (_quality_sender, quality_receiver) = watch::channel(quality);
+        let (_performance_sender, performance) = watch::channel(PerformancePublication {
+            snapshot: PerformanceSnapshot {
+                event_lag: Duration::from_millis(23),
+                ..PerformanceSnapshot::default()
+            },
+            effective_quality: quality,
+            #[cfg(feature = "workload-harness")]
+            workload_sample_stamp: None,
+        });
         let mut coverage = crate::herdr::collector::SourceCoverageRegistry::new(
             crate::herdr::collector::SourceAvailability::NotApplicable,
         );
@@ -1294,12 +1384,11 @@ mod tests {
         let (_coverage_sender, source_coverage) = watch::channel(coverage);
         App::new(
             model_receiver,
-            quality_receiver,
             HeaderInputs {
                 host: "build-host".to_owned(),
                 session: session.to_owned(),
-                event_lag: Duration::from_millis(23),
                 source_coverage,
+                performance,
             },
         )
     }
@@ -1335,6 +1424,107 @@ mod tests {
             .find(|row| row.contains("session:"))
             .map(String::as_str)
             .unwrap()
+    }
+
+    fn performance_snapshot(
+        lag: Duration,
+        reasons: impl IntoIterator<Item = PerformanceDegradationReason>,
+    ) -> PerformanceSnapshot {
+        PerformanceSnapshot {
+            event_lag: lag,
+            reasons: reasons.into_iter().collect(),
+            ..PerformanceSnapshot::default()
+        }
+    }
+
+    fn rendered_header(snapshot: PerformanceSnapshot, width: u16) -> String {
+        let (_model_sender, model_receiver) = watch::channel(Arc::new(DomainModel::default()));
+        let (_coverage_sender, source_coverage) = watch::channel(SourceCoverageRegistry::default());
+        let (_performance_sender, performance) = watch::channel(PerformancePublication {
+            snapshot,
+            effective_quality: ObservationQuality::Degraded,
+            #[cfg(feature = "workload-harness")]
+            workload_sample_stamp: None,
+        });
+        let app = App::new(
+            model_receiver,
+            HeaderInputs {
+                host: "build-host".to_owned(),
+                session: "dynamic-performance".to_owned(),
+                source_coverage,
+                performance,
+            },
+        );
+        let rows = render(&app, width, 18);
+        let matching = rows
+            .into_iter()
+            .filter(|row| row.contains("session:"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.len(),
+            1,
+            "one bordered header body row is required"
+        );
+        matching.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn wide_header_renders_live_lag_and_stable_performance_reasons() {
+        let snapshot = performance_snapshot(
+            Duration::from_millis(1_234),
+            [
+                PerformanceDegradationReason::EventsSixtySeconds,
+                PerformanceDegradationReason::DependencyEdges,
+            ],
+        );
+        let line = rendered_header(snapshot, 140);
+        assert!(line.contains("lag:1234ms"));
+        assert!(line.contains("perf:dependency_edges+events_60s"));
+    }
+
+    #[test]
+    fn performance_reason_labels_match_workload_schema_v1() {
+        let fixture = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/workload-schema-v1.json"),
+        )
+        .unwrap();
+        let fixture: serde_json::Value = serde_json::from_slice(&fixture).unwrap();
+        let variants = [
+            PerformanceDegradationReason::LivePanes,
+            PerformanceDegradationReason::DefaultVisibleTaskRuns,
+            PerformanceDegradationReason::DependencyEdges,
+            PerformanceDegradationReason::EventsOneSecond,
+            PerformanceDegradationReason::EventsTenSeconds,
+            PerformanceDegradationReason::EventsSixtySeconds,
+            PerformanceDegradationReason::EventLag,
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        let actual = variants
+            .into_iter()
+            .map(|variant| {
+                let reason = match variant {
+                    PerformanceDegradationReason::LivePanes => "live_panes",
+                    PerformanceDegradationReason::DefaultVisibleTaskRuns => {
+                        "default_visible_task_runs"
+                    }
+                    PerformanceDegradationReason::DependencyEdges => "dependency_edges",
+                    PerformanceDegradationReason::EventsOneSecond => "events_one_second",
+                    PerformanceDegradationReason::EventsTenSeconds => "events_ten_seconds",
+                    PerformanceDegradationReason::EventsSixtySeconds => "events_sixty_seconds",
+                    PerformanceDegradationReason::EventLag => "event_lag",
+                };
+                serde_json::json!({
+                    "reason": reason,
+                    "label": performance_reason_label(variant),
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            serde_json::to_vec(&actual).unwrap(),
+            serde_json::to_vec(&fixture["performance_reason_labels"]).unwrap()
+        );
     }
 
     #[test]
@@ -1530,8 +1720,7 @@ mod tests {
         let ordinal_first = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
         let initial = ordinal_model(lexical_first, ordinal_first, TaskState::Running);
         let (model_sender, model_receiver) = watch::channel(Arc::new(initial));
-        let (_quality_sender, quality_receiver) = watch::channel(ObservationQuality::Live);
-        let mut app = App::new(model_receiver, quality_receiver, HeaderInputs::default());
+        let mut app = App::new(model_receiver, HeaderInputs::default());
 
         let before = render(&app, 100, 18);
         model_sender
@@ -1644,8 +1833,7 @@ mod tests {
             state: ExecState::Ended,
         });
         let (model_sender, model_receiver) = watch::channel(Arc::new(initial));
-        let (_quality_sender, quality_receiver) = watch::channel(ObservationQuality::Live);
-        let mut app = App::new(model_receiver, quality_receiver, HeaderInputs::default());
+        let mut app = App::new(model_receiver, HeaderInputs::default());
 
         model_sender.send(Arc::new(refreshed)).unwrap();
         app.refresh();
@@ -2007,7 +2195,6 @@ mod tests {
             durability: ActivityDurability::Durable,
         };
         let (_model_sender, model_receiver) = watch::channel(Arc::new(model));
-        let (_quality_sender, quality_receiver) = watch::channel(ObservationQuality::Live);
         let (_diagnostics_sender, diagnostics_receiver) =
             watch::channel(RuntimeDiagnosticsSnapshot {
                 persistence: PersistenceStatus::Healthy,
@@ -2025,7 +2212,6 @@ mod tests {
         });
         let mut app = App::with_inputs(
             model_receiver,
-            quality_receiver,
             HeaderInputs {
                 session: "identity-private".to_owned(),
                 ..HeaderInputs::default()

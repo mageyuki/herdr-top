@@ -1,7 +1,8 @@
 //! T9 dedicated writer thread, `WriterClient`, and `WriterLifecycle`.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use thiserror::Error;
@@ -99,12 +100,25 @@ pub enum WriterError {
     ThreadSpawn(#[source] std::io::Error),
 }
 
-/// Cloneable, bounded command channel for the single SQLite writer.
-#[derive(Clone)]
+/// Bounded command channel for the single SQLite writer.
+///
+/// ```
+/// # fn consumes(_: herdr_top::store::WriterClient) {}
+/// ```
+/// ```compile_fail
+/// # fn duplicate(client: herdr_top::store::WriterClient) {
+/// let second = client.clone();
+/// # drop(second);
+/// # }
+/// ```
 pub struct WriterClient {
     sender: mpsc::Sender<WriterCommand>,
-    ledger: Arc<Mutex<EventLedgerCache>>,
+    ledger: EventLedgerCache,
     health: PersistenceHealth,
+    #[cfg(test)]
+    after_second_reserve_health_check: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    acknowledgement_test_control: Option<AcknowledgementTestControl>,
 }
 
 #[derive(Clone)]
@@ -142,6 +156,218 @@ impl PersistenceHealth {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcknowledgementTestEvent {
+    WaiterConstructed(PersistenceOperation),
+    CommandAdmitted(PersistenceOperation),
+    WaiterResolved(PersistenceOperation, PersistenceFailure),
+    BeforeStore(PersistenceOperation),
+    BeforeAcknowledgement(PersistenceOperation),
+    FailurePublished(PersistenceOperation),
+    AcknowledgementAttempted(PersistenceOperation),
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcknowledgementTestMode {
+    Observe,
+    BlockBeforeStore,
+    BlockBeforeAcknowledgement,
+    DropAcknowledgement,
+    PauseAfterFailurePublication,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct AcknowledgementTestControl {
+    operation: PersistenceOperation,
+    mode: AcknowledgementTestMode,
+    events: tokio::sync::mpsc::UnboundedSender<AcknowledgementTestEvent>,
+    release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+}
+
+#[cfg(test)]
+impl AcknowledgementTestControl {
+    fn record(&self, event: AcknowledgementTestEvent) {
+        let _ = self.events.send(event);
+    }
+
+    fn waiter_constructed(&self, operation: PersistenceOperation) {
+        self.record(AcknowledgementTestEvent::WaiterConstructed(operation));
+    }
+
+    fn command_admitted(&self, operation: PersistenceOperation) {
+        self.record(AcknowledgementTestEvent::CommandAdmitted(operation));
+        if self.operation == operation && self.mode == AcknowledgementTestMode::BlockBeforeStore {
+            self.record(AcknowledgementTestEvent::BeforeStore(operation));
+            self.wait_for_release();
+        }
+    }
+
+    fn before_acknowledgement(
+        &self,
+        operation: PersistenceOperation,
+        failure_was_published: bool,
+    ) -> bool {
+        if self.operation != operation {
+            return false;
+        }
+        match self.mode {
+            AcknowledgementTestMode::BlockBeforeAcknowledgement => {
+                self.record(AcknowledgementTestEvent::BeforeAcknowledgement(operation));
+                self.wait_for_release();
+                false
+            }
+            AcknowledgementTestMode::DropAcknowledgement => true,
+            AcknowledgementTestMode::PauseAfterFailurePublication => {
+                assert!(
+                    failure_was_published,
+                    "failure-publication pause requires a failing operation"
+                );
+                self.record(AcknowledgementTestEvent::FailurePublished(operation));
+                self.wait_for_release();
+                false
+            }
+            AcknowledgementTestMode::Observe | AcknowledgementTestMode::BlockBeforeStore => false,
+        }
+    }
+
+    fn acknowledgement_attempted(&self, operation: PersistenceOperation) {
+        self.record(AcknowledgementTestEvent::AcknowledgementAttempted(
+            operation,
+        ));
+    }
+
+    fn acknowledgement_dropped(&self, operation: PersistenceOperation) {
+        if self.operation == operation && self.mode == AcknowledgementTestMode::DropAcknowledgement
+        {
+            self.wait_for_release();
+        }
+    }
+
+    fn wait_for_release(&self) {
+        let (released, condition) = self.release.as_ref();
+        let mut released = released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*released {
+            released = condition
+                .wait(released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+#[cfg(test)]
+struct AcknowledgementTestHandle {
+    events: tokio::sync::mpsc::UnboundedReceiver<AcknowledgementTestEvent>,
+    release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    health: PersistenceHealth,
+}
+
+#[cfg(test)]
+impl AcknowledgementTestHandle {
+    async fn next_event(&mut self) -> AcknowledgementTestEvent {
+        tokio::time::timeout(std::time::Duration::from_secs(1), self.events.recv())
+            .await
+            .expect("test-control event must arrive within one second")
+            .expect("test-control event channel must remain open")
+    }
+
+    async fn wait_for(&mut self, expected: AcknowledgementTestEvent) {
+        loop {
+            if self.next_event().await == expected {
+                return;
+            }
+        }
+    }
+
+    fn publish_failure(&self, failure: PersistenceFailure) {
+        self.health.publish_failure(failure);
+    }
+
+    fn release(&self) {
+        let (released, condition) = self.release.as_ref();
+        *released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        condition.notify_all();
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct RawCommandInjector {
+    sender: mpsc::Sender<WriterCommand>,
+    health: PersistenceHealth,
+    acknowledgement_test_control: Option<AcknowledgementTestControl>,
+}
+
+#[cfg(test)]
+impl RawCommandInjector {
+    async fn apply(&self, batch: PersistBatch) -> AcknowledgementWaiter<WriterDelta> {
+        let (acknowledgement, response) = oneshot::channel();
+        let mut waiter = AcknowledgementWaiter::new(
+            response,
+            self.health.clone(),
+            PersistenceOperation::Apply,
+            self.acknowledgement_test_control.clone(),
+        );
+        self.sender
+            .send(WriterCommand::Apply {
+                batch,
+                acknowledgement,
+            })
+            .await
+            .expect("raw test Apply command must be admitted");
+        waiter.arm();
+        waiter
+    }
+
+    async fn barrier(&self) -> AcknowledgementWaiter<()> {
+        let (acknowledgement, response) = oneshot::channel();
+        let waiter = AcknowledgementWaiter::new(
+            response,
+            self.health.clone(),
+            PersistenceOperation::Barrier,
+            self.acknowledgement_test_control.clone(),
+        );
+        self.sender
+            .send(WriterCommand::Barrier { acknowledgement })
+            .await
+            .expect("raw test Barrier command must be admitted");
+        waiter
+    }
+
+    async fn cleanup(&self, now_ms: i64) -> AcknowledgementWaiter<WriterDelta> {
+        let (acknowledgement, response) = oneshot::channel();
+        let mut waiter = AcknowledgementWaiter::new(
+            response,
+            self.health.clone(),
+            PersistenceOperation::Cleanup,
+            self.acknowledgement_test_control.clone(),
+        );
+        self.sender
+            .send(WriterCommand::Cleanup {
+                now_ms,
+                acknowledgement,
+            })
+            .await
+            .expect("raw test Cleanup command must be admitted");
+        waiter.arm();
+        waiter
+    }
+
+    async fn closed(&self) {
+        self.sender.closed().await;
+    }
+
+    fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+}
+
 struct AcknowledgementObservationGuard {
     health: PersistenceHealth,
     operation: PersistenceOperation,
@@ -175,7 +401,40 @@ impl AcknowledgementObservationGuard {
 
 impl Drop for AcknowledgementObservationGuard {
     fn drop(&mut self) {
-        if self.armed && !std::thread::panicking() {
+        if self.armed {
+            self.health
+                .publish_failure(acknowledgement_failure(self.operation));
+        }
+    }
+}
+
+struct WriterOperationGuard {
+    health: PersistenceHealth,
+    operation: PersistenceOperation,
+    armed: bool,
+}
+
+impl WriterOperationGuard {
+    fn new(health: PersistenceHealth, operation: PersistenceOperation) -> Self {
+        Self {
+            health,
+            operation,
+            armed: false,
+        }
+    }
+
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WriterOperationGuard {
+    fn drop(&mut self) {
+        if self.armed {
             self.health
                 .publish_failure(acknowledgement_failure(self.operation));
         }
@@ -225,65 +484,183 @@ impl EventLedgerCache {
     }
 }
 
-/// Owned capacity in the bounded writer command channel.
-pub struct EnqueuePermit {
-    permit: mpsc::OwnedPermit<WriterCommand>,
-    ledger: Arc<Mutex<EventLedgerCache>>,
+#[derive(Debug)]
+struct WriterDelta {
+    cleanup: CleanupStats,
+}
+
+/// Affine capacity in the bounded writer command channel.
+pub struct EnqueuePermit<'a> {
+    permit: mpsc::Permit<'a, WriterCommand>,
+    ledger: &'a mut EventLedgerCache,
     health: PersistenceHealth,
+    #[cfg(test)]
+    acknowledgement_test_control: Option<AcknowledgementTestControl>,
 }
 
 /// An already-enqueued write whose queue admission can no longer fail.
 pub struct PendingEnqueue {
-    response: oneshot::Receiver<Result<CleanupStats, PersistenceFailure>>,
-    ledger: Arc<Mutex<EventLedgerCache>>,
-    acknowledgement_observation: AcknowledgementObservationGuard,
+    waiter: AcknowledgementWaiter<WriterDelta>,
 }
 
-impl PendingEnqueue {
-    /// Waits for commit and applies the exact cleanup response to the dedup mirror.
-    pub async fn wait(mut self) -> Result<CleanupStats, WriterError> {
-        let response_result = (&mut self.response).await;
-        self.acknowledgement_observation.disarm();
-        let cleanup = match response_result {
-            Ok(Ok(cleanup)) => cleanup,
-            Ok(Err(failure)) => return Err(WriterError::Persistence(failure)),
-            Err(_) => {
-                return Err(self
-                    .acknowledgement_observation
-                    .health
-                    .runtime_error(acknowledgement_failure(PersistenceOperation::Apply)));
+struct AcknowledgementWaiter<T> {
+    response: oneshot::Receiver<Result<T, PersistenceFailure>>,
+    health_publisher: PersistenceHealth,
+    health: watch::Receiver<PersistenceStatus>,
+    operation: PersistenceOperation,
+    acknowledgement_observation: Option<AcknowledgementObservationGuard>,
+    #[cfg(test)]
+    acknowledgement_test_control: Option<AcknowledgementTestControl>,
+}
+
+impl<T> AcknowledgementWaiter<T> {
+    fn new(
+        response: oneshot::Receiver<Result<T, PersistenceFailure>>,
+        health_publisher: PersistenceHealth,
+        operation: PersistenceOperation,
+        #[cfg(test)] acknowledgement_test_control: Option<AcknowledgementTestControl>,
+    ) -> Self {
+        let health = health_publisher.subscribe();
+        #[cfg(test)]
+        if let Some(control) = &acknowledgement_test_control {
+            control.waiter_constructed(operation);
+        }
+        let acknowledgement_observation = matches!(
+            operation,
+            PersistenceOperation::Apply
+                | PersistenceOperation::Cleanup
+                | PersistenceOperation::UpdateOwnerLocation
+                | PersistenceOperation::ReplaceOwner
+        )
+        .then(|| AcknowledgementObservationGuard::new(health_publisher.clone(), operation));
+        Self {
+            response,
+            health_publisher,
+            health,
+            operation,
+            acknowledgement_observation,
+            #[cfg(test)]
+            acknowledgement_test_control,
+        }
+    }
+
+    fn arm(&mut self) {
+        if let Some(guard) = &mut self.acknowledgement_observation {
+            guard.arm();
+        }
+    }
+
+    fn disarm(&mut self) {
+        if let Some(guard) = &mut self.acknowledgement_observation {
+            guard.disarm();
+        }
+    }
+
+    fn resolved_failure(&self, _failure: PersistenceFailure) {
+        #[cfg(test)]
+        if let Some(control) = &self.acknowledgement_test_control {
+            control.record(AcknowledgementTestEvent::WaiterResolved(
+                self.operation,
+                _failure,
+            ));
+        }
+    }
+
+    fn classify_result(&mut self, result: Result<T, PersistenceFailure>) -> Result<T, WriterError> {
+        self.disarm();
+        match result {
+            Ok(value) => Ok(value),
+            Err(failure) => {
+                self.resolved_failure(failure);
+                Err(WriterError::Persistence(failure))
             }
+        }
+    }
+
+    fn classify_failure(&mut self, failure: PersistenceFailure) -> Result<T, WriterError> {
+        self.disarm();
+        self.resolved_failure(failure);
+        Err(WriterError::Persistence(failure))
+    }
+
+    fn classify_closed(&mut self) -> Result<T, WriterError> {
+        self.disarm();
+        self.health_publisher
+            .publish_failure(acknowledgement_failure(self.operation));
+        let failure = match *self.health.borrow() {
+            PersistenceStatus::Healthy => acknowledgement_failure(self.operation),
+            PersistenceStatus::Degraded { failure } => failure,
         };
-        let mut ledger = lock_ledger(&self.ledger);
-        ledger.apply_cleanup(&cleanup.deleted_ledger_entries);
-        Ok(cleanup)
+        self.resolved_failure(failure);
+        Err(WriterError::Persistence(failure))
+    }
+
+    async fn wait(mut self) -> Result<T, WriterError> {
+        loop {
+            match self.response.try_recv() {
+                Ok(result) => return self.classify_result(result),
+                Err(oneshot::error::TryRecvError::Closed) => return self.classify_closed(),
+                Err(oneshot::error::TryRecvError::Empty) => {}
+            }
+
+            let status = *self.health.borrow();
+            if let PersistenceStatus::Degraded { failure } = status {
+                return self.classify_failure(failure);
+            }
+
+            tokio::select! {
+                biased;
+                response = &mut self.response => {
+                    return match response {
+                        Ok(result) => self.classify_result(result),
+                        Err(_) => self.classify_closed(),
+                    };
+                }
+                changed = self.health.changed() => {
+                    if changed.is_err() {
+                        return self.classify_closed();
+                    }
+                }
+            }
+        }
+    }
+
+    async fn wait_response_only(mut self) -> Result<T, WriterError> {
+        debug_assert_eq!(self.operation, PersistenceOperation::Checkpoint);
+        match (&mut self.response).await {
+            Ok(result) => self.classify_result(result),
+            Err(_) => {
+                self.disarm();
+                let failure = acknowledgement_failure(self.operation);
+                self.health_publisher.publish_failure(failure);
+                self.resolved_failure(failure);
+                Err(WriterError::Persistence(failure))
+            }
+        }
     }
 }
 
-impl EnqueuePermit {
+impl EnqueuePermit<'_> {
     /// Consumes the permit and enqueues a batch without another fallible channel operation.
     #[must_use]
     pub fn enqueue(self, batch: PersistBatch) -> PendingEnqueue {
-        let inserted = ledger_entries(&batch);
-        {
-            let mut ledger = lock_ledger(&self.ledger);
-            for entry in inserted {
-                let _ = ledger.reserve(entry.event_id, entry.seen_at_ms);
-            }
+        for entry in ledger_entries(&batch) {
+            let _ = self.ledger.reserve(entry.event_id, entry.seen_at_ms);
         }
         let (acknowledgement, response) = oneshot::channel();
-        let mut acknowledgement_observation =
-            AcknowledgementObservationGuard::new(self.health, PersistenceOperation::Apply);
+        let mut waiter = AcknowledgementWaiter::new(
+            response,
+            self.health,
+            PersistenceOperation::Apply,
+            #[cfg(test)]
+            self.acknowledgement_test_control,
+        );
         self.permit.send(WriterCommand::Apply {
             batch,
             acknowledgement,
         });
-        acknowledgement_observation.arm();
-        PendingEnqueue {
-            response,
-            ledger: self.ledger,
-            acknowledgement_observation,
-        }
+        waiter.arm();
+        PendingEnqueue { waiter }
     }
 }
 
@@ -300,36 +677,71 @@ impl WriterClient {
         self.health.subscribe()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_after_second_reserve_health_check_failure(
+        &mut self,
+        failure: PersistenceFailure,
+    ) {
+        let health = self.health.clone();
+        self.after_second_reserve_health_check = Some(Arc::new(move || {
+            health.publish_failure(failure);
+        }));
+    }
+
     /// Atomically commits one reducer persistence batch.
-    pub async fn apply(&self, batch: PersistBatch) -> Result<(), WriterError> {
+    pub async fn apply(&mut self, batch: PersistBatch) -> Result<(), WriterError> {
         let operation = PersistenceOperation::Apply;
+        for entry in ledger_entries(&batch) {
+            let _ = self.ledger.reserve(entry.event_id, entry.seen_at_ms);
+        }
         let (acknowledgement, response) = oneshot::channel();
-        self.sender
+        let mut waiter = self.waiter(response, operation);
+        if self
+            .sender
             .send(WriterCommand::Apply {
                 batch,
                 acknowledgement,
             })
             .await
-            .map_err(|_| self.health.runtime_error(queue_failure(operation)))?;
-        let cleanup = self.receive_mutating(response, operation).await?;
-        let mut ledger = lock_ledger(&self.ledger);
-        ledger.apply_cleanup(&cleanup.deleted_ledger_entries);
+            .is_err()
+        {
+            return Err(self.health.runtime_error(queue_failure(operation)));
+        }
+        waiter.arm();
+        let delta = waiter.wait().await?;
+        self.ledger
+            .apply_cleanup(&delta.cleanup.deleted_ledger_entries);
         Ok(())
     }
 
     /// Non-blockingly reserves one slot in the bounded writer command channel.
     #[must_use]
-    pub fn reserve_enqueue(&self) -> Option<EnqueuePermit> {
+    pub fn reserve_enqueue(&mut self) -> Option<EnqueuePermit<'_>> {
         if self.persistence_status() != PersistenceStatus::Healthy {
             return None;
         }
 
-        match self.sender.clone().try_reserve_owned() {
-            Ok(permit) if self.persistence_status() == PersistenceStatus::Healthy => {
+        let Self {
+            sender,
+            ledger,
+            health,
+            #[cfg(test)]
+            after_second_reserve_health_check,
+            #[cfg(test)]
+            acknowledgement_test_control,
+        } = self;
+        match sender.try_reserve() {
+            Ok(permit) if health.status() == PersistenceStatus::Healthy => {
+                #[cfg(test)]
+                if let Some(hook) = after_second_reserve_health_check {
+                    hook();
+                }
                 Some(EnqueuePermit {
                     permit,
-                    ledger: Arc::clone(&self.ledger),
-                    health: self.health.clone(),
+                    ledger,
+                    health: health.clone(),
+                    #[cfg(test)]
+                    acknowledgement_test_control: acknowledgement_test_control.clone(),
                 })
             }
             Ok(_permit) => None,
@@ -342,26 +754,44 @@ impl WriterClient {
         }
     }
 
+    /// Waits for an already-admitted batch and applies its cleanup result.
+    pub async fn finish_pending(
+        &mut self,
+        pending: PendingEnqueue,
+    ) -> Result<CleanupStats, WriterError> {
+        let delta = pending.waiter.wait().await?;
+        self.ledger
+            .apply_cleanup(&delta.cleanup.deleted_ledger_entries);
+        Ok(delta.cleanup)
+    }
+
     /// Returns whether the durable-ledger mirror already contains `event_id`.
     #[must_use]
     pub fn is_duplicate(&self, event_id: &str) -> bool {
-        lock_ledger(&self.ledger).contains(event_id)
+        self.ledger.contains(event_id)
     }
 
     /// Drives a periodic retention pass and conditionally evicts its exact deleted rows.
-    pub async fn cleanup(&self, now_ms: i64) -> Result<CleanupStats, WriterError> {
+    pub async fn cleanup(&mut self, now_ms: i64) -> Result<CleanupStats, WriterError> {
         let operation = PersistenceOperation::Cleanup;
         let (acknowledgement, response) = oneshot::channel();
-        self.sender
+        let mut waiter = self.waiter(response, operation);
+        if self
+            .sender
             .send(WriterCommand::Cleanup {
                 now_ms,
                 acknowledgement,
             })
             .await
-            .map_err(|_| self.health.runtime_error(queue_failure(operation)))?;
-        let cleanup = self.receive_mutating(response, operation).await?;
-        lock_ledger(&self.ledger).apply_cleanup(&cleanup.deleted_ledger_entries);
-        Ok(cleanup)
+            .is_err()
+        {
+            return Err(self.health.runtime_error(queue_failure(operation)));
+        }
+        waiter.arm();
+        let delta = waiter.wait().await?;
+        self.ledger
+            .apply_cleanup(&delta.cleanup.deleted_ledger_entries);
+        Ok(delta.cleanup)
     }
 
     /// Commits the owner's current terminal and public-pane location.
@@ -382,7 +812,7 @@ impl WriterClient {
     }
 
     /// Atomically replaces the owner row and acknowledges after commit.
-    pub async fn replace_owner(&self, rec: OwnerRecord) -> Result<(), WriterError> {
+    pub async fn replace_owner(&mut self, rec: OwnerRecord) -> Result<(), WriterError> {
         self.request_mutating(PersistenceOperation::ReplaceOwner, |acknowledgement| {
             WriterCommand::ReplaceOwner {
                 record: rec,
@@ -406,11 +836,11 @@ impl WriterClient {
         command: impl FnOnce(oneshot::Sender<Result<(), PersistenceFailure>>) -> WriterCommand,
     ) -> Result<(), WriterError> {
         let (acknowledgement, response) = oneshot::channel();
-        self.sender
-            .send(command(acknowledgement))
-            .await
-            .map_err(|_| self.health.runtime_error(queue_failure(operation)))?;
-        self.receive(response, operation).await
+        let waiter = self.waiter(response, operation);
+        if self.sender.send(command(acknowledgement)).await.is_err() {
+            return Err(self.health.runtime_error(queue_failure(operation)));
+        }
+        waiter.wait().await
     }
 
     async fn request_mutating(
@@ -419,47 +849,26 @@ impl WriterClient {
         command: impl FnOnce(oneshot::Sender<Result<(), PersistenceFailure>>) -> WriterCommand,
     ) -> Result<(), WriterError> {
         let (acknowledgement, response) = oneshot::channel();
-        self.sender
-            .send(command(acknowledgement))
-            .await
-            .map_err(|_| self.health.runtime_error(queue_failure(operation)))?;
-        self.receive_mutating(response, operation).await
-    }
-
-    async fn receive<T>(
-        &self,
-        response: oneshot::Receiver<Result<T, PersistenceFailure>>,
-        operation: PersistenceOperation,
-    ) -> Result<T, WriterError> {
-        let response_result = response.await;
-        self.classify_response(response_result, operation)
-    }
-
-    async fn receive_mutating<T>(
-        &self,
-        response: oneshot::Receiver<Result<T, PersistenceFailure>>,
-        operation: PersistenceOperation,
-    ) -> Result<T, WriterError> {
-        let mut acknowledgement_observation =
-            AcknowledgementObservationGuard::new(self.health.clone(), operation);
-        acknowledgement_observation.arm();
-        let response_result = response.await;
-        acknowledgement_observation.disarm();
-        self.classify_response(response_result, operation)
-    }
-
-    fn classify_response<T>(
-        &self,
-        response_result: Result<Result<T, PersistenceFailure>, oneshot::error::RecvError>,
-        operation: PersistenceOperation,
-    ) -> Result<T, WriterError> {
-        match response_result {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(failure)) => Err(WriterError::Persistence(failure)),
-            Err(_) => Err(self
-                .health
-                .runtime_error(acknowledgement_failure(operation))),
+        let mut waiter = self.waiter(response, operation);
+        if self.sender.send(command(acknowledgement)).await.is_err() {
+            return Err(self.health.runtime_error(queue_failure(operation)));
         }
+        waiter.arm();
+        waiter.wait().await
+    }
+
+    fn waiter<T>(
+        &self,
+        response: oneshot::Receiver<Result<T, PersistenceFailure>>,
+        operation: PersistenceOperation,
+    ) -> AcknowledgementWaiter<T> {
+        AcknowledgementWaiter::new(
+            response,
+            self.health.clone(),
+            operation,
+            #[cfg(test)]
+            self.acknowledgement_test_control.clone(),
+        )
     }
 }
 
@@ -468,12 +877,41 @@ pub struct WriterLifecycle {
     sender: mpsc::Sender<WriterCommand>,
     thread: Option<JoinHandle<()>>,
     health: PersistenceHealth,
+    #[cfg(test)]
+    acknowledgement_test_control: Option<AcknowledgementTestControl>,
+}
+
+#[cfg(test)]
+#[must_use]
+pub(crate) struct WriterCapacityGuard<'a> {
+    _permits: Vec<mpsc::Permit<'a, WriterCommand>>,
 }
 
 impl WriterLifecycle {
+    #[cfg(test)]
+    pub(crate) async fn hold_queue_capacity_for_test(&self) -> WriterCapacityGuard<'_> {
+        let mut permits = Vec::with_capacity(WRITER_QUEUE_CAPACITY);
+        for _ in 0..WRITER_QUEUE_CAPACITY {
+            permits.push(
+                self.sender
+                    .reserve()
+                    .await
+                    .expect("test capacity guard requires a live writer queue"),
+            );
+        }
+        WriterCapacityGuard { _permits: permits }
+    }
+
     /// Drains queued commands, checkpoints the WAL, and joins the OS thread.
     pub async fn shutdown(mut self) -> Result<(), WriterError> {
         let (acknowledgement, response) = oneshot::channel();
+        let waiter = AcknowledgementWaiter::new(
+            response,
+            self.health.clone(),
+            PersistenceOperation::Checkpoint,
+            #[cfg(test)]
+            self.acknowledgement_test_control.clone(),
+        );
         let send_result = self
             .sender
             .send(WriterCommand::Shutdown { acknowledgement })
@@ -481,16 +919,12 @@ impl WriterLifecycle {
         drop(self.sender);
 
         let operation_result = match send_result {
-            Ok(()) => match response.await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(failure)) => Err(WriterError::Persistence(failure)),
-                Err(_) => Err(self
-                    .health
-                    .runtime_error(acknowledgement_failure(PersistenceOperation::Checkpoint))),
-            },
-            Err(_) => Err(self
-                .health
-                .runtime_error(queue_failure(PersistenceOperation::Checkpoint))),
+            Ok(()) => waiter.wait_response_only().await,
+            Err(_) => {
+                let failure = queue_failure(PersistenceOperation::Checkpoint);
+                self.health.publish_failure(failure);
+                Err(WriterError::Persistence(failure))
+            }
         };
         let join_result = self
             .thread
@@ -499,14 +933,19 @@ impl WriterLifecycle {
             .join()
             .map_err(|_| WriterError::ThreadPanicked);
 
-        operation_result?;
-        join_result
+        join_result?;
+        operation_result
     }
 }
 
 /// Starts one dedicated OS thread that exclusively owns the supplied store.
 pub fn spawn_writer(store: Store) -> Result<(WriterLifecycle, WriterClient), WriterError> {
-    spawn_writer_inner(store, super::unix_now_ms)
+    spawn_writer_inner(
+        store,
+        super::unix_now_ms,
+        #[cfg(test)]
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -514,33 +953,82 @@ fn spawn_writer_with_clock(
     store: Store,
     clock: fn() -> Result<i64, StoreError>,
 ) -> Result<(WriterLifecycle, WriterClient), WriterError> {
-    spawn_writer_inner(store, clock)
+    spawn_writer_inner(store, clock, None)
+}
+
+#[cfg(test)]
+fn spawn_writer_with_test_control(
+    store: Store,
+    clock: fn() -> Result<i64, StoreError>,
+    operation: PersistenceOperation,
+    mode: AcknowledgementTestMode,
+) -> Result<
+    (
+        WriterLifecycle,
+        WriterClient,
+        AcknowledgementTestHandle,
+        RawCommandInjector,
+    ),
+    WriterError,
+> {
+    let (events, event_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let control = AcknowledgementTestControl {
+        operation,
+        mode,
+        events,
+        release: Arc::clone(&release),
+    };
+    let (lifecycle, writer) = spawn_writer_inner(store, clock, Some(control))?;
+    let handle = AcknowledgementTestHandle {
+        events: event_receiver,
+        release,
+        health: writer.health.clone(),
+    };
+    let injector = RawCommandInjector {
+        sender: writer.sender.clone(),
+        health: writer.health.clone(),
+        acknowledgement_test_control: writer.acknowledgement_test_control.clone(),
+    };
+    Ok((lifecycle, writer, handle, injector))
 }
 
 fn spawn_writer_inner(
     store: Store,
     clock: fn() -> Result<i64, StoreError>,
+    #[cfg(test)] acknowledgement_test_control: Option<AcknowledgementTestControl>,
 ) -> Result<(WriterLifecycle, WriterClient), WriterError> {
-    let ledger = Arc::new(Mutex::new(EventLedgerCache::from_entries(
-        store.load_event_ledger()?,
-    )));
+    let ledger = EventLedgerCache::from_entries(store.load_event_ledger()?);
     let (sender, receiver) = mpsc::channel(WRITER_QUEUE_CAPACITY);
     let health = PersistenceHealth::new();
     let writer_health = health.clone();
-    let writer_ledger = Arc::clone(&ledger);
+    #[cfg(test)]
+    let worker_control = acknowledgement_test_control.clone();
+    #[cfg(test)]
+    let worker = move || {
+        writer_main(store, receiver, writer_health, clock, worker_control);
+    };
+    #[cfg(not(test))]
+    let worker = move || writer_main(store, receiver, writer_health, clock);
     let thread = thread::Builder::new()
         .name("herdr-top-sqlite-writer".to_owned())
-        .spawn(move || writer_main(store, receiver, writer_health, writer_ledger, clock))
+        .spawn(worker)
         .map_err(WriterError::ThreadSpawn)?;
     let client = WriterClient {
         sender: sender.clone(),
         ledger,
         health: health.clone(),
+        #[cfg(test)]
+        after_second_reserve_health_check: None,
+        #[cfg(test)]
+        acknowledgement_test_control: acknowledgement_test_control.clone(),
     };
     let lifecycle = WriterLifecycle {
         sender,
         thread: Some(thread),
         health,
+        #[cfg(test)]
+        acknowledgement_test_control,
     };
     Ok((lifecycle, client))
 }
@@ -548,11 +1036,11 @@ fn spawn_writer_inner(
 enum WriterCommand {
     Apply {
         batch: PersistBatch,
-        acknowledgement: oneshot::Sender<Result<CleanupStats, PersistenceFailure>>,
+        acknowledgement: oneshot::Sender<Result<WriterDelta, PersistenceFailure>>,
     },
     Cleanup {
         now_ms: i64,
-        acknowledgement: oneshot::Sender<Result<CleanupStats, PersistenceFailure>>,
+        acknowledgement: oneshot::Sender<Result<WriterDelta, PersistenceFailure>>,
     },
     UpdateOwnerLocation {
         terminal_id: String,
@@ -575,8 +1063,8 @@ fn writer_main(
     mut store: Store,
     mut receiver: mpsc::Receiver<WriterCommand>,
     health: PersistenceHealth,
-    ledger: Arc<Mutex<EventLedgerCache>>,
     clock: fn() -> Result<i64, StoreError>,
+    #[cfg(test)] acknowledgement_test_control: Option<AcknowledgementTestControl>,
 ) {
     while let Some(command) = receiver.blocking_recv() {
         match command {
@@ -584,25 +1072,25 @@ fn writer_main(
                 batch,
                 acknowledgement,
             } => {
-                let inserted = ledger_entries(&batch);
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control {
+                    control.command_admitted(PersistenceOperation::Apply);
+                }
+                let mut operation_guard =
+                    WriterOperationGuard::new(health.clone(), PersistenceOperation::Apply);
+                operation_guard.arm();
                 let result = match store.apply_batch(batch) {
-                    Ok(()) => {
-                        let mut cache = lock_ledger(&ledger);
-                        for entry in inserted {
-                            let _ = cache.reserve(entry.event_id, entry.seen_at_ms);
-                        }
-                        drop(cache);
-                        clock()
-                            .and_then(|now_ms| store.cleanup_retention(now_ms))
-                            .map_err(|error| {
-                                store_failure(
-                                    PersistenceOperation::Cleanup,
-                                    PersistencePhase::PostApplyCommit,
-                                    DurabilityDisposition::Committed,
-                                    &error,
-                                )
-                            })
-                    }
+                    Ok(()) => clock()
+                        .and_then(|now_ms| store.cleanup_retention(now_ms))
+                        .map(|cleanup| WriterDelta { cleanup })
+                        .map_err(|error| {
+                            store_failure(
+                                PersistenceOperation::Cleanup,
+                                PersistencePhase::PostApplyCommit,
+                                DurabilityDisposition::Committed,
+                                &error,
+                            )
+                        }),
                     Err(error) => Err(store_failure(
                         PersistenceOperation::Apply,
                         PersistencePhase::CommandExecution,
@@ -611,28 +1099,76 @@ fn writer_main(
                     )),
                 };
                 publish_result_failure(&result, &health);
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control
+                    && control.before_acknowledgement(PersistenceOperation::Apply, result.is_err())
+                {
+                    drop(acknowledgement);
+                    control.acknowledgement_dropped(PersistenceOperation::Apply);
+                    operation_guard.disarm();
+                    continue;
+                }
                 let _ = acknowledgement.send(result);
+                operation_guard.disarm();
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control {
+                    control.acknowledgement_attempted(PersistenceOperation::Apply);
+                }
             }
             WriterCommand::Cleanup {
                 now_ms,
                 acknowledgement,
             } => {
-                let result = store.cleanup_retention(now_ms).map_err(|error| {
-                    store_failure(
-                        PersistenceOperation::Cleanup,
-                        PersistencePhase::CommandExecution,
-                        DurabilityDisposition::NotCommitted,
-                        &error,
-                    )
-                });
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control {
+                    control.command_admitted(PersistenceOperation::Cleanup);
+                }
+                let mut operation_guard =
+                    WriterOperationGuard::new(health.clone(), PersistenceOperation::Cleanup);
+                operation_guard.arm();
+                let result = store
+                    .cleanup_retention(now_ms)
+                    .map(|cleanup| WriterDelta { cleanup })
+                    .map_err(|error| {
+                        store_failure(
+                            PersistenceOperation::Cleanup,
+                            PersistencePhase::CommandExecution,
+                            DurabilityDisposition::NotCommitted,
+                            &error,
+                        )
+                    });
                 publish_result_failure(&result, &health);
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control
+                    && control
+                        .before_acknowledgement(PersistenceOperation::Cleanup, result.is_err())
+                {
+                    drop(acknowledgement);
+                    control.acknowledgement_dropped(PersistenceOperation::Cleanup);
+                    operation_guard.disarm();
+                    continue;
+                }
                 let _ = acknowledgement.send(result);
+                operation_guard.disarm();
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control {
+                    control.acknowledgement_attempted(PersistenceOperation::Cleanup);
+                }
             }
             WriterCommand::UpdateOwnerLocation {
                 terminal_id,
                 pane_id,
                 acknowledgement,
             } => {
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control {
+                    control.command_admitted(PersistenceOperation::UpdateOwnerLocation);
+                }
+                let mut operation_guard = WriterOperationGuard::new(
+                    health.clone(),
+                    PersistenceOperation::UpdateOwnerLocation,
+                );
+                operation_guard.arm();
                 let result = store
                     .update_owner_location(&terminal_id, &pane_id)
                     .map_err(|error| {
@@ -644,12 +1180,36 @@ fn writer_main(
                         )
                     });
                 publish_result_failure(&result, &health);
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control
+                    && control.before_acknowledgement(
+                        PersistenceOperation::UpdateOwnerLocation,
+                        result.is_err(),
+                    )
+                {
+                    drop(acknowledgement);
+                    control.acknowledgement_dropped(PersistenceOperation::UpdateOwnerLocation);
+                    operation_guard.disarm();
+                    continue;
+                }
                 let _ = acknowledgement.send(result);
+                operation_guard.disarm();
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control {
+                    control.acknowledgement_attempted(PersistenceOperation::UpdateOwnerLocation);
+                }
             }
             WriterCommand::ReplaceOwner {
                 record,
                 acknowledgement,
             } => {
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control {
+                    control.command_admitted(PersistenceOperation::ReplaceOwner);
+                }
+                let mut operation_guard =
+                    WriterOperationGuard::new(health.clone(), PersistenceOperation::ReplaceOwner);
+                operation_guard.arm();
                 let result = store.replace_owner(&record).map_err(|error| {
                     store_failure(
                         PersistenceOperation::ReplaceOwner,
@@ -659,12 +1219,47 @@ fn writer_main(
                     )
                 });
                 publish_result_failure(&result, &health);
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control
+                    && control
+                        .before_acknowledgement(PersistenceOperation::ReplaceOwner, result.is_err())
+                {
+                    drop(acknowledgement);
+                    control.acknowledgement_dropped(PersistenceOperation::ReplaceOwner);
+                    operation_guard.disarm();
+                    continue;
+                }
                 let _ = acknowledgement.send(result);
+                operation_guard.disarm();
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control {
+                    control.acknowledgement_attempted(PersistenceOperation::ReplaceOwner);
+                }
             }
             WriterCommand::Barrier { acknowledgement } => {
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control {
+                    control.command_admitted(PersistenceOperation::Barrier);
+                    if control.before_acknowledgement(PersistenceOperation::Barrier, false) {
+                        drop(acknowledgement);
+                        control.acknowledgement_dropped(PersistenceOperation::Barrier);
+                        continue;
+                    }
+                }
                 let _ = acknowledgement.send(Ok(()));
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control {
+                    control.acknowledgement_attempted(PersistenceOperation::Barrier);
+                }
             }
             WriterCommand::Shutdown { acknowledgement } => {
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control {
+                    control.command_admitted(PersistenceOperation::Checkpoint);
+                }
+                let mut operation_guard =
+                    WriterOperationGuard::new(health.clone(), PersistenceOperation::Checkpoint);
+                operation_guard.arm();
                 let result = store.checkpoint().map_err(|error| {
                     store_failure(
                         PersistenceOperation::Checkpoint,
@@ -674,7 +1269,22 @@ fn writer_main(
                     )
                 });
                 publish_result_failure(&result, &health);
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control
+                    && control
+                        .before_acknowledgement(PersistenceOperation::Checkpoint, result.is_err())
+                {
+                    drop(acknowledgement);
+                    control.acknowledgement_dropped(PersistenceOperation::Checkpoint);
+                    operation_guard.disarm();
+                    break;
+                }
                 let _ = acknowledgement.send(result);
+                operation_guard.disarm();
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control {
+                    control.acknowledgement_attempted(PersistenceOperation::Checkpoint);
+                }
                 break;
             }
         }
@@ -765,13 +1375,6 @@ fn classify_store_error(error: &StoreError) -> PersistenceFailureCode {
     }
 }
 
-fn lock_ledger(ledger: &Arc<Mutex<EventLedgerCache>>) -> MutexGuard<'_, EventLedgerCache> {
-    match ledger.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
 fn ledger_entries(batch: &PersistBatch) -> Vec<LedgerEntry> {
     batch
         .iter()
@@ -808,8 +1411,6 @@ fn normalized_event_id(event: &crate::model::NormalizedEvent) -> &str {
 mod tests {
     use std::future::Future;
     use std::path::PathBuf;
-    use std::sync::OnceLock;
-    use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
@@ -824,30 +1425,6 @@ mod tests {
 
     const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
     const TEST_RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(1);
-
-    struct PanicReceiptClockRendezvous {
-        reached: SyncSender<()>,
-        release: Mutex<Receiver<()>>,
-    }
-
-    static PANIC_RECEIPT_CLOCK_RENDEZVOUS: OnceLock<PanicReceiptClockRendezvous> = OnceLock::new();
-
-    fn panic_receipt_gated_clock() -> Result<i64, StoreError> {
-        let rendezvous = PANIC_RECEIPT_CLOCK_RENDEZVOUS
-            .get()
-            .expect("panic receipt clock rendezvous must be initialized");
-        rendezvous
-            .reached
-            .try_send(())
-            .expect("panic receipt clock must be called exactly once");
-        rendezvous
-            .release
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .recv_timeout(TEST_RENDEZVOUS_TIMEOUT)
-            .expect("panic receipt clock release must arrive within one second");
-        super::super::unix_now_ms()
-    }
 
     fn provider_event(event_id: &str, seen_at_ms: i64) -> PersistOp {
         PersistOp::RecordEvent {
@@ -947,6 +1524,47 @@ mod tests {
         };
         metadata.ingest_seq = Some(ingest_seq);
         operation
+    }
+
+    fn open_operation_store(root: &StateRoot) -> Store {
+        let mut store = open_writer(root).unwrap();
+        store.replace_owner(&owner_record()).unwrap();
+        store
+    }
+
+    async fn execute_operation(
+        mut writer: WriterClient,
+        operation: PersistenceOperation,
+    ) -> (WriterClient, Result<(), WriterError>) {
+        let result = match operation {
+            PersistenceOperation::Apply => writer.apply(Vec::new()).await,
+            PersistenceOperation::Cleanup => writer.cleanup(i64::MAX).await.map(|_| ()),
+            PersistenceOperation::UpdateOwnerLocation => {
+                writer
+                    .update_owner_location("updated-terminal", "updated-pane")
+                    .await
+            }
+            PersistenceOperation::ReplaceOwner => writer.replace_owner(owner_record()).await,
+            PersistenceOperation::Barrier => writer.barrier().await,
+            PersistenceOperation::Checkpoint => {
+                unreachable!("Checkpoint is owned by WriterLifecycle")
+            }
+        };
+        (writer, result)
+    }
+
+    async fn assert_waiter_constructed_before_admission(
+        handle: &mut AcknowledgementTestHandle,
+        operation: PersistenceOperation,
+    ) {
+        assert_eq!(
+            handle.next_event().await,
+            AcknowledgementTestEvent::WaiterConstructed(operation)
+        );
+        assert_eq!(
+            handle.next_event().await,
+            AcknowledgementTestEvent::CommandAdmitted(operation)
+        );
     }
 
     #[tokio::test]
@@ -1064,7 +1682,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
         let mut subscription = writer.subscribe_persistence();
         let first = expected_failure(
             PersistenceOperation::UpdateOwnerLocation,
@@ -1109,7 +1727,7 @@ mod tests {
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
         install_temp_failure_trigger(&store, "fail_apply", "INSERT", "workspaces");
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
         let expected = expected_failure(
             PersistenceOperation::Apply,
             PersistencePhase::CommandExecution,
@@ -1148,7 +1766,7 @@ mod tests {
             .apply_batch(vec![provider_event("old-event", now - 8 * DAY_MS)])
             .unwrap();
         install_temp_failure_trigger(&store, "fail_auto_cleanup", "DELETE", "events");
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
         let expected = expected_failure(
             PersistenceOperation::Cleanup,
             PersistencePhase::PostApplyCommit,
@@ -1178,7 +1796,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer_with_clock(store, || {
+        let (lifecycle, mut writer) = spawn_writer_with_clock(store, || {
             panic!("drop the active PendingEnqueue response sender")
         })
         .unwrap();
@@ -1190,7 +1808,7 @@ mod tests {
         );
         let pending = writer.reserve_enqueue().unwrap().enqueue(Vec::new());
 
-        assert_persistence_error(pending.wait().await, expected);
+        assert_persistence_error(writer.finish_pending(pending).await, expected);
         assert_eq!(
             writer.persistence_status(),
             PersistenceStatus::Degraded { failure: expected }
@@ -1199,11 +1817,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writer_client_finish_pending_preserves_pending_wait_behavior() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let now = super::super::unix_now_ms().unwrap();
+        store
+            .apply_batch(vec![provider_event("finish-old", now - 8 * DAY_MS)])
+            .unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let pending = writer
+            .reserve_enqueue()
+            .unwrap()
+            .enqueue(vec![provider_event("finish-new", now)]);
+
+        let cleanup = writer.finish_pending(pending).await.unwrap();
+        assert_eq!(cleanup.ledger_pruned, 1);
+        assert_eq!(
+            cleanup.deleted_ledger_entries,
+            [LedgerEntry {
+                event_id: "finish-old".to_owned(),
+                seen_at_ms: now - 8 * DAY_MS,
+            }]
+        );
+        assert!(!writer.is_duplicate("finish-old"));
+        assert!(writer.is_duplicate("finish-new"));
+        assert_eq!(writer.persistence_status(), PersistenceStatus::Healthy);
+        lifecycle.shutdown().await.unwrap();
+
+        let error_directory = tempfile::tempdir().unwrap();
+        let error_root = StateRoot(error_directory.path().to_path_buf());
+        let error_store = open_writer(&error_root).unwrap();
+        install_temp_failure_trigger(&error_store, "fail_pending", "INSERT", "events");
+        let (error_lifecycle, mut error_writer) = spawn_writer(error_store).unwrap();
+        let error_pending = error_writer
+            .reserve_enqueue()
+            .unwrap()
+            .enqueue(vec![provider_event("finish-error", now)]);
+        let expected = expected_failure(
+            PersistenceOperation::Apply,
+            PersistencePhase::CommandExecution,
+            PersistenceFailureCode::Sqlite,
+            DurabilityDisposition::NotCommitted,
+        );
+
+        assert_persistence_error(error_writer.finish_pending(error_pending).await, expected);
+        assert!(error_writer.is_duplicate("finish-error"));
+        error_lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn i4_writer_late_drop_of_buffered_apply_receipt_publishes_unknown_once() {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
         let mut subscription = writer.subscribe_persistence();
         let now = super::super::unix_now_ms().unwrap();
         let pending = writer
@@ -1248,95 +1916,556 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
-        let ledger_guard = lock_ledger(&writer.ledger);
-        let (apply_acknowledgement, apply_response) = oneshot::channel();
-        writer
-            .sender
-            .try_send(WriterCommand::Apply {
-                batch: Vec::new(),
-                acknowledgement: apply_acknowledgement,
-            })
-            .unwrap();
-        let (barrier_acknowledgement, barrier_response) = oneshot::channel();
-        writer
-            .sender
-            .try_send(WriterCommand::Barrier {
-                acknowledgement: barrier_acknowledgement,
-            })
-            .unwrap();
-        drop(barrier_response);
-        drop(ledger_guard);
+        let (lifecycle, writer, mut handle, injector) = spawn_writer_with_test_control(
+            store,
+            super::super::unix_now_ms,
+            PersistenceOperation::Apply,
+            AcknowledgementTestMode::BlockBeforeStore,
+        )
+        .unwrap();
+        let apply_waiter = injector.apply(Vec::new()).await;
+        handle
+            .wait_for(AcknowledgementTestEvent::BeforeStore(
+                PersistenceOperation::Apply,
+            ))
+            .await;
+        let abandoned_barrier = injector.barrier().await;
+        drop(abandoned_barrier);
+        handle.release();
 
-        apply_response.await.unwrap().unwrap();
+        apply_waiter.wait().await.unwrap();
         writer.barrier().await.unwrap();
         assert_eq!(writer.persistence_status(), PersistenceStatus::Healthy);
         lifecycle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn i4_writer_panicking_owner_of_armed_apply_receipt_keeps_health_healthy() {
-        let probe_directory = tempfile::tempdir().unwrap();
-        let probe_root = StateRoot(probe_directory.path().to_path_buf());
-        let probe_store = open_writer(&probe_root).unwrap();
-        let (probe_lifecycle, probe_writer) = spawn_writer(probe_store).unwrap();
-        let probe_pending = probe_writer.reserve_enqueue().unwrap().enqueue(Vec::new());
-        probe_writer.barrier().await.unwrap();
-        drop(probe_pending);
-        assert_eq!(
-            probe_writer.persistence_status(),
-            PersistenceStatus::Degraded {
-                failure: expected_failure(
-                    PersistenceOperation::Apply,
-                    PersistencePhase::Acknowledgement,
-                    PersistenceFailureCode::AcknowledgementDropped,
-                    DurabilityDisposition::Unknown,
-                ),
-            },
-            "normal drop proves the same returned receipt path is armed"
-        );
-        probe_lifecycle.shutdown().await.unwrap();
-
+    async fn unread_pending_receipt_dropped_during_owner_unwind_degrades_once() {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (clock_reached, reached) = sync_channel(1);
-        let (release, clock_release) = sync_channel(1);
-        assert!(
-            PANIC_RECEIPT_CLOCK_RENDEZVOUS
-                .set(PanicReceiptClockRendezvous {
-                    reached: clock_reached,
-                    release: Mutex::new(clock_release),
-                })
-                .is_ok(),
-            "panic receipt clock rendezvous must be initialized exactly once"
-        );
-        let (lifecycle, writer) =
-            spawn_writer_with_clock(store, panic_receipt_gated_clock).unwrap();
-        let task_writer = writer.clone();
-        let (owned_sender, owned_receiver) = oneshot::channel();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let mut health = writer.subscribe_persistence();
+        let health_keepalive = lifecycle.health.clone();
         let now = super::super::unix_now_ms().unwrap();
+        let expected = expected_failure(
+            PersistenceOperation::Apply,
+            PersistencePhase::Acknowledgement,
+            PersistenceFailureCode::AcknowledgementDropped,
+            DurabilityDisposition::Unknown,
+        );
         let task = tokio::spawn(async move {
-            let _armed_pending = task_writer
+            let _armed_pending = writer
                 .reserve_enqueue()
                 .unwrap()
                 .enqueue(vec![provider_event("panic-unwind", now)]);
-            owned_sender.send(()).unwrap();
             panic!("exercise armed receipt unwind");
         });
 
-        owned_receiver.await.unwrap();
         let join_error = task.await.unwrap_err();
         assert!(join_error.is_panic());
-        reached
-            .recv_timeout(TEST_RENDEZVOUS_TIMEOUT)
-            .expect("writer clock must be reached within one second");
-        release
-            .try_send(())
-            .expect("writer clock must still be waiting for its single release");
-        writer.barrier().await.unwrap();
-        assert_eq!(writer.persistence_status(), PersistenceStatus::Healthy);
+        let observed = tokio::time::timeout(TEST_RENDEZVOUS_TIMEOUT, health.changed()).await;
         lifecycle.shutdown().await.unwrap();
+
+        observed
+            .expect("owner unwind must publish acknowledgement failure")
+            .unwrap();
+        assert_eq!(
+            *health.borrow_and_update(),
+            PersistenceStatus::Degraded { failure: expected }
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), health.changed())
+                .await
+                .is_err(),
+            "first-wins health must change exactly once"
+        );
+        drop(health_keepalive);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn acknowledgement_waiter_covers_all_six_operations() {
+        let operations = [
+            PersistenceOperation::Apply,
+            PersistenceOperation::Cleanup,
+            PersistenceOperation::UpdateOwnerLocation,
+            PersistenceOperation::ReplaceOwner,
+            PersistenceOperation::Barrier,
+        ];
+        let published = expected_failure(
+            PersistenceOperation::Apply,
+            PersistencePhase::Acknowledgement,
+            PersistenceFailureCode::AcknowledgementDropped,
+            DurabilityDisposition::Unknown,
+        );
+
+        for operation in operations {
+            let directory = tempfile::tempdir().unwrap();
+            let root = StateRoot(directory.path().to_path_buf());
+            let store = open_operation_store(&root);
+            let (lifecycle, writer, mut handle, _injector) = spawn_writer_with_test_control(
+                store,
+                super::super::unix_now_ms,
+                operation,
+                AcknowledgementTestMode::BlockBeforeAcknowledgement,
+            )
+            .unwrap();
+            let mut request = tokio::spawn(execute_operation(writer, operation));
+
+            assert_waiter_constructed_before_admission(&mut handle, operation).await;
+            handle
+                .wait_for(AcknowledgementTestEvent::BeforeAcknowledgement(operation))
+                .await;
+            handle.publish_failure(published);
+            let early = tokio::time::timeout(TEST_RENDEZVOUS_TIMEOUT, &mut request).await;
+            handle.release();
+            let (writer, result, returned_before_release) = match early {
+                Ok(joined) => {
+                    let (writer, result) = joined.unwrap();
+                    (writer, result, true)
+                }
+                Err(_) => {
+                    let (writer, result) = request.await.unwrap();
+                    (writer, result, false)
+                }
+            };
+            lifecycle.shutdown().await.unwrap();
+            drop(writer);
+
+            assert!(
+                returned_before_release,
+                "{operation:?} waiter must resolve from health while its sender is live"
+            );
+            assert_persistence_error(result, published);
+            assert_eq!(
+                handle.health.status(),
+                PersistenceStatus::Degraded { failure: published }
+            );
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_operation_store(&root);
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        writer.health.publish_failure(published);
+        let (acknowledgement, response) = oneshot::channel();
+        let waiter = AcknowledgementWaiter::new(
+            response,
+            writer.health.clone(),
+            PersistenceOperation::Checkpoint,
+            None,
+        );
+        let mut response_only = Box::pin(waiter.wait_response_only());
+        let mut context = Context::from_waker(Waker::noop());
+        let initial_poll = response_only.as_mut().poll(&mut context);
+        let _ = acknowledgement.send(Ok(()));
+
+        assert!(
+            matches!(initial_poll, Poll::Pending),
+            "Checkpoint waiter must ignore sticky health while its response is empty"
+        );
+        response_only.await.unwrap();
+        assert_eq!(
+            writer.persistence_status(),
+            PersistenceStatus::Degraded { failure: published }
+        );
+        lifecycle.shutdown().await.unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_operation_store(&root);
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        assert_eq!(writer.persistence_status(), PersistenceStatus::Healthy);
+        let (acknowledgement, response) = oneshot::channel();
+        let waiter = AcknowledgementWaiter::new(
+            response,
+            writer.health.clone(),
+            PersistenceOperation::Checkpoint,
+            None,
+        );
+        writer.health.publish_failure(published);
+        let mut response_only = Box::pin(waiter.wait_response_only());
+        let mut context = Context::from_waker(Waker::noop());
+        let health_change_poll = response_only.as_mut().poll(&mut context);
+        let _ = acknowledgement.send(Ok(()));
+
+        assert!(
+            matches!(health_change_poll, Poll::Pending),
+            "Checkpoint waiter must ignore health published after subscription"
+        );
+        response_only.await.unwrap();
+        assert_eq!(
+            writer.persistence_status(),
+            PersistenceStatus::Degraded { failure: published }
+        );
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sender_drop_publishes_acknowledgement_failure_for_all_six_operations() {
+        let operations = [
+            PersistenceOperation::Apply,
+            PersistenceOperation::Cleanup,
+            PersistenceOperation::UpdateOwnerLocation,
+            PersistenceOperation::ReplaceOwner,
+            PersistenceOperation::Barrier,
+        ];
+
+        for operation in operations {
+            let directory = tempfile::tempdir().unwrap();
+            let root = StateRoot(directory.path().to_path_buf());
+            let store = open_operation_store(&root);
+            let (lifecycle, writer, mut handle, _injector) = spawn_writer_with_test_control(
+                store,
+                super::super::unix_now_ms,
+                operation,
+                AcknowledgementTestMode::DropAcknowledgement,
+            )
+            .unwrap();
+            assert_eq!(handle.health.status(), PersistenceStatus::Healthy);
+            let request = tokio::spawn(execute_operation(writer, operation));
+
+            assert_waiter_constructed_before_admission(&mut handle, operation).await;
+            let (writer, result) = request.await.unwrap();
+            let expected = acknowledgement_failure(operation);
+            assert_persistence_error(result, expected);
+            handle
+                .wait_for(AcknowledgementTestEvent::WaiterResolved(
+                    operation, expected,
+                ))
+                .await;
+            assert_eq!(
+                handle.health.status(),
+                PersistenceStatus::Degraded { failure: expected }
+            );
+            handle.release();
+            lifecycle.shutdown().await.unwrap();
+            drop(writer);
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_operation_store(&root);
+        let (lifecycle, writer, mut handle, _injector) = spawn_writer_with_test_control(
+            store,
+            super::super::unix_now_ms,
+            PersistenceOperation::Checkpoint,
+            AcknowledgementTestMode::DropAcknowledgement,
+        )
+        .unwrap();
+        assert_eq!(handle.health.status(), PersistenceStatus::Healthy);
+        drop(writer);
+        let shutdown = tokio::spawn(lifecycle.shutdown());
+
+        assert_waiter_constructed_before_admission(&mut handle, PersistenceOperation::Checkpoint)
+            .await;
+        let expected = acknowledgement_failure(PersistenceOperation::Checkpoint);
+        handle
+            .wait_for(AcknowledgementTestEvent::WaiterResolved(
+                PersistenceOperation::Checkpoint,
+                expected,
+            ))
+            .await;
+        handle.release();
+        let result = shutdown.await.unwrap();
+        assert_persistence_error(result, expected);
+        assert_eq!(
+            handle.health.status(),
+            PersistenceStatus::Degraded { failure: expected }
+        );
+    }
+
+    #[tokio::test]
+    async fn precise_acknowledgement_wins_when_response_and_health_are_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_operation_store(&root);
+        let (lifecycle, _writer, mut handle, injector) = spawn_writer_with_test_control(
+            store,
+            super::super::unix_now_ms,
+            PersistenceOperation::Apply,
+            AcknowledgementTestMode::BlockBeforeAcknowledgement,
+        )
+        .unwrap();
+        let waiter = injector.apply(Vec::new()).await;
+
+        assert_waiter_constructed_before_admission(&mut handle, PersistenceOperation::Apply).await;
+        handle
+            .wait_for(AcknowledgementTestEvent::BeforeAcknowledgement(
+                PersistenceOperation::Apply,
+            ))
+            .await;
+        let competing_health = expected_failure(
+            PersistenceOperation::Barrier,
+            PersistencePhase::Acknowledgement,
+            PersistenceFailureCode::AcknowledgementDropped,
+            DurabilityDisposition::NotApplicable,
+        );
+        handle.publish_failure(competing_health);
+        handle.release();
+        handle
+            .wait_for(AcknowledgementTestEvent::AcknowledgementAttempted(
+                PersistenceOperation::Apply,
+            ))
+            .await;
+
+        assert_eq!(
+            waiter.wait().await.unwrap().cleanup,
+            CleanupStats::default()
+        );
+        assert_eq!(
+            handle.health.status(),
+            PersistenceStatus::Degraded {
+                failure: competing_health
+            }
+        );
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn normal_failure_published_before_ack_returns_precise_durability() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        install_temp_failure_trigger(&store, "fail_precise_apply", "INSERT", "workspaces");
+        let (lifecycle, mut writer, mut handle, _injector) = spawn_writer_with_test_control(
+            store,
+            super::super::unix_now_ms,
+            PersistenceOperation::Apply,
+            AcknowledgementTestMode::PauseAfterFailurePublication,
+        )
+        .unwrap();
+        let request = tokio::spawn(async move {
+            let result = writer.apply(vec![workspace_op("precise-failure")]).await;
+            (writer, result)
+        });
+
+        assert_waiter_constructed_before_admission(&mut handle, PersistenceOperation::Apply).await;
+        handle
+            .wait_for(AcknowledgementTestEvent::FailurePublished(
+                PersistenceOperation::Apply,
+            ))
+            .await;
+        let expected = expected_failure(
+            PersistenceOperation::Apply,
+            PersistencePhase::CommandExecution,
+            PersistenceFailureCode::Sqlite,
+            DurabilityDisposition::NotCommitted,
+        );
+        assert_eq!(
+            handle.health.status(),
+            PersistenceStatus::Degraded { failure: expected },
+            "precise durability must be visible while acknowledgement remains live and unsent"
+        );
+        handle.release();
+        let (writer, result) = request.await.unwrap();
+
+        assert_persistence_error(result, expected);
+        handle.publish_failure(acknowledgement_failure(PersistenceOperation::Apply));
+        assert_eq!(
+            handle.health.status(),
+            PersistenceStatus::Degraded { failure: expected },
+            "later acknowledgement state cannot replace the first precise failure"
+        );
+        lifecycle.shutdown().await.unwrap();
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn writer_thread_never_mutates_the_collector_ledger_mirror() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let now = super::super::unix_now_ms().unwrap();
+        let old = LedgerEntry {
+            event_id: "d1-old".to_owned(),
+            seen_at_ms: now - 8 * DAY_MS,
+        };
+        store
+            .apply_batch(vec![provider_event(&old.event_id, old.seen_at_ms)])
+            .unwrap();
+        let (lifecycle, mut writer, mut handle, injector) = spawn_writer_with_test_control(
+            store,
+            super::super::unix_now_ms,
+            PersistenceOperation::Apply,
+            AcknowledgementTestMode::BlockBeforeStore,
+        )
+        .unwrap();
+        let waiter = injector
+            .apply(vec![provider_event("d1-writer-only", now)])
+            .await;
+
+        assert_waiter_constructed_before_admission(&mut handle, PersistenceOperation::Apply).await;
+        handle
+            .wait_for(AcknowledgementTestEvent::BeforeStore(
+                PersistenceOperation::Apply,
+            ))
+            .await;
+        let before_writer_execution = writer.ledger.clone();
+        handle.release();
+        handle
+            .wait_for(AcknowledgementTestEvent::AcknowledgementAttempted(
+                PersistenceOperation::Apply,
+            ))
+            .await;
+        let after_delta_before_finish = writer.ledger.clone();
+        let pending = PendingEnqueue { waiter };
+        let cleanup = writer.finish_pending(pending).await.unwrap();
+        let after_finish = writer.ledger.clone();
+
+        assert_eq!(
+            before_writer_execution,
+            EventLedgerCache::from_entries([old.clone()])
+        );
+        assert_eq!(
+            after_delta_before_finish, before_writer_execution,
+            "writer thread must return deltas without mutating the collector cache"
+        );
+        assert_eq!(cleanup.deleted_ledger_entries, [old]);
+        assert_eq!(after_finish, EventLedgerCache::default());
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_panic_after_issued_permit_degrades_and_unblocks_waiter() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer, _handle, injector) = spawn_writer_with_test_control(
+            store,
+            || panic!("injected writer clock panic"),
+            PersistenceOperation::Apply,
+            AcknowledgementTestMode::Observe,
+        )
+        .unwrap();
+        let mut health = writer.subscribe_persistence();
+        let permit = writer
+            .reserve_enqueue()
+            .expect("permit must be issued while health is healthy");
+        let panic_waiter = injector.apply(Vec::new()).await;
+
+        let health_before_response =
+            tokio::time::timeout(TEST_RENDEZVOUS_TIMEOUT, health.changed()).await;
+        tokio::time::timeout(TEST_RENDEZVOUS_TIMEOUT, injector.closed())
+            .await
+            .expect("writer receiver must close after panic");
+        assert!(injector.is_closed());
+        let pending = permit.enqueue(Vec::new());
+        let pending_result =
+            tokio::time::timeout(TEST_RENDEZVOUS_TIMEOUT, writer.finish_pending(pending))
+                .await
+                .expect("issued permit waiter must not hang after writer panic");
+        let panic_response = panic_waiter.wait().await;
+        let later_reservation = writer.reserve_enqueue();
+        let shutdown_result = lifecycle.shutdown().await;
+
+        health_before_response
+            .expect("writer unwind must publish health before response inspection")
+            .unwrap();
+        let expected = acknowledgement_failure(PersistenceOperation::Apply);
+        assert_eq!(
+            *health.borrow_and_update(),
+            PersistenceStatus::Degraded { failure: expected }
+        );
+        assert_persistence_error(pending_result, expected);
+        assert_persistence_error(panic_response, expected);
+        assert!(later_reservation.is_none());
+        assert!(matches!(shutdown_result, Err(WriterError::ThreadPanicked)));
+    }
+
+    #[tokio::test]
+    async fn queued_sibling_waiter_observes_writer_panic_without_acknowledgement() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer, mut handle, injector) = spawn_writer_with_test_control(
+            store,
+            || panic!("panic ahead of queued sibling"),
+            PersistenceOperation::Apply,
+            AcknowledgementTestMode::BlockBeforeStore,
+        )
+        .unwrap();
+        let mut health = writer.subscribe_persistence();
+        let _panic_response = injector.apply(Vec::new()).await;
+        handle
+            .wait_for(AcknowledgementTestEvent::CommandAdmitted(
+                PersistenceOperation::Apply,
+            ))
+            .await;
+        handle
+            .wait_for(AcknowledgementTestEvent::BeforeStore(
+                PersistenceOperation::Apply,
+            ))
+            .await;
+        let barrier_waiter = injector.barrier().await;
+        handle.release();
+        tokio::time::timeout(TEST_RENDEZVOUS_TIMEOUT, health.changed())
+            .await
+            .expect("writer panic must publish health")
+            .unwrap();
+
+        let result = barrier_waiter.wait().await;
+        let expected = acknowledgement_failure(PersistenceOperation::Apply);
+        assert_persistence_error(result, expected);
+        assert_eq!(
+            *health.borrow_and_update(),
+            PersistenceStatus::Degraded { failure: expected }
+        );
+        assert!(matches!(
+            lifecycle.shutdown().await,
+            Err(WriterError::ThreadPanicked)
+        ));
+    }
+
+    #[tokio::test]
+    async fn queued_sibling_health_and_closed_interleavings_return_first_published_failure() {
+        let operations = [
+            PersistenceOperation::Apply,
+            PersistenceOperation::Cleanup,
+            PersistenceOperation::UpdateOwnerLocation,
+            PersistenceOperation::ReplaceOwner,
+            PersistenceOperation::Barrier,
+        ];
+        let first = acknowledgement_failure(PersistenceOperation::Apply);
+
+        for operation in operations {
+            let empty_directory = tempfile::tempdir().unwrap();
+            let empty_root = StateRoot(empty_directory.path().to_path_buf());
+            let empty_store = open_writer(&empty_root).unwrap();
+            let (empty_lifecycle, empty_writer) = spawn_writer(empty_store).unwrap();
+            let (response_sender, response) = oneshot::channel();
+            let mut waiter =
+                AcknowledgementWaiter::new(response, empty_writer.health.clone(), operation, None);
+            waiter.arm();
+            empty_writer.health.publish_failure(first);
+            let mut wait = Box::pin(waiter.wait());
+            let early = tokio::time::timeout(Duration::from_millis(100), &mut wait).await;
+            let _ = response_sender.send(Ok(()));
+            let result = match early {
+                Ok(result) => result,
+                Err(_) => wait.await,
+            };
+            assert_persistence_error(result, first);
+            empty_lifecycle.shutdown().await.unwrap();
+
+            let closed_directory = tempfile::tempdir().unwrap();
+            let closed_root = StateRoot(closed_directory.path().to_path_buf());
+            let closed_store = open_writer(&closed_root).unwrap();
+            let (closed_lifecycle, closed_writer) = spawn_writer(closed_store).unwrap();
+            let (response_sender, response) = oneshot::channel::<Result<(), PersistenceFailure>>();
+            let mut waiter =
+                AcknowledgementWaiter::new(response, closed_writer.health.clone(), operation, None);
+            waiter.arm();
+            drop(response_sender);
+            closed_writer.health.publish_failure(first);
+            let result = waiter.wait().await;
+            assert_persistence_error(result, first);
+            assert_eq!(
+                closed_writer.persistence_status(),
+                PersistenceStatus::Degraded { failure: first }
+            );
+            closed_lifecycle.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1344,7 +2473,7 @@ mod tests {
         let apply_directory = tempfile::tempdir().unwrap();
         let apply_root = StateRoot(apply_directory.path().to_path_buf());
         let apply_store = open_writer(&apply_root).unwrap();
-        let (apply_lifecycle, apply_writer) = spawn_writer_with_clock(apply_store, || {
+        let (apply_lifecycle, mut apply_writer) = spawn_writer_with_clock(apply_store, || {
             panic!("drop the active Apply response sender")
         })
         .unwrap();
@@ -1362,44 +2491,42 @@ mod tests {
         let barrier_directory = tempfile::tempdir().unwrap();
         let barrier_root = StateRoot(barrier_directory.path().to_path_buf());
         let barrier_store = open_writer(&barrier_root).unwrap();
-        let (barrier_lifecycle, barrier_writer) =
-            spawn_writer_with_clock(barrier_store, || panic!("drop queued Barrier sender"))
-                .unwrap();
-        let ledger_guard = lock_ledger(&barrier_writer.ledger);
-        let (apply_acknowledgement, _apply_response) = oneshot::channel();
-        barrier_writer
-            .sender
-            .try_send(WriterCommand::Apply {
-                batch: Vec::new(),
-                acknowledgement: apply_acknowledgement,
-            })
+        let (barrier_lifecycle, _barrier_writer, mut handle, injector) =
+            spawn_writer_with_test_control(
+                barrier_store,
+                || panic!("drop queued Barrier sender"),
+                PersistenceOperation::Apply,
+                AcknowledgementTestMode::BlockBeforeStore,
+            )
             .unwrap();
-        let (barrier_acknowledgement, barrier_response) = oneshot::channel();
-        barrier_writer
-            .sender
-            .try_send(WriterCommand::Barrier {
-                acknowledgement: barrier_acknowledgement,
-            })
-            .unwrap();
-        let mut barrier_wait =
-            Box::pin(barrier_writer.receive(barrier_response, PersistenceOperation::Barrier));
+        let _apply_waiter = injector.apply(Vec::new()).await;
+        handle
+            .wait_for(AcknowledgementTestEvent::BeforeStore(
+                PersistenceOperation::Apply,
+            ))
+            .await;
+        let barrier_waiter = injector.barrier().await;
+        let mut barrier_wait = Box::pin(barrier_waiter.wait());
         let mut context = Context::from_waker(Waker::noop());
         assert!(matches!(
             barrier_wait.as_mut().poll(&mut context),
             Poll::Pending
         ));
-        drop(ledger_guard);
+        handle.release();
 
         assert_persistence_error(
             barrier_wait.await,
             expected_failure(
-                PersistenceOperation::Barrier,
+                PersistenceOperation::Apply,
                 PersistencePhase::Acknowledgement,
                 PersistenceFailureCode::AcknowledgementDropped,
-                DurabilityDisposition::NotApplicable,
+                DurabilityDisposition::Unknown,
             ),
         );
-        drop(barrier_lifecycle);
+        assert!(matches!(
+            barrier_lifecycle.shutdown().await,
+            Err(WriterError::ThreadPanicked)
+        ));
     }
 
     #[tokio::test]
@@ -1412,7 +2539,7 @@ mod tests {
             .apply_batch(vec![provider_event("retained", now - 8 * DAY_MS)])
             .unwrap();
         install_temp_failure_trigger(&store, "fail_cleanup", "DELETE", "events");
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
         let expected = expected_failure(
             PersistenceOperation::Cleanup,
             PersistencePhase::CommandExecution,
@@ -1438,7 +2565,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
         let invalid = expected_failure(
             PersistenceOperation::Apply,
             PersistencePhase::CommandExecution,
@@ -1457,7 +2584,7 @@ mod tests {
         let second_directory = tempfile::tempdir().unwrap();
         let second_root = StateRoot(second_directory.path().to_path_buf());
         let second_store = open_writer(&second_root).unwrap();
-        let (second_lifecycle, second_writer) = spawn_writer(second_store).unwrap();
+        let (second_lifecycle, mut second_writer) = spawn_writer(second_store).unwrap();
         assert_persistence_error(
             second_writer
                 .apply(vec![event_with_ingest_sequence("too-large", 1, u64::MAX)])
@@ -1472,7 +2599,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer_with_clock(store, || {
+        let (lifecycle, mut writer) = spawn_writer_with_clock(store, || {
             Err(StoreError::Clock("injected test clock failure".to_owned()))
         })
         .unwrap();
@@ -1557,7 +2684,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
         lifecycle.shutdown().await.unwrap();
         let expected = expected_failure(
             PersistenceOperation::Apply,
@@ -1596,7 +2723,7 @@ mod tests {
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
         install_temp_failure_trigger(&store, "fail_replace", "INSERT", "owner");
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
         let expected = expected_failure(
             PersistenceOperation::ReplaceOwner,
             PersistencePhase::CommandExecution,
@@ -1677,7 +2804,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
         let now = super::super::unix_now_ms().unwrap();
 
         writer
@@ -1708,21 +2835,20 @@ mod tests {
         store
             .apply_batch(vec![provider_event("old-id", now - 8 * DAY_MS)])
             .unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer, _handle, injector) = spawn_writer_with_test_control(
+            store,
+            super::super::unix_now_ms,
+            PersistenceOperation::Cleanup,
+            AcknowledgementTestMode::Observe,
+        )
+        .unwrap();
         assert!(writer.is_duplicate("old-id"));
 
-        let (acknowledgement, response) = oneshot::channel();
-        writer
-            .sender
-            .send(WriterCommand::Cleanup {
-                now_ms: now,
-                acknowledgement,
-            })
-            .await
-            .unwrap();
-        let report = response.await.unwrap().unwrap();
+        let report = injector.cleanup(now).await.wait().await.unwrap();
         assert!(writer.is_duplicate("old-id"));
-        lock_ledger(&writer.ledger).apply_cleanup(&report.deleted_ledger_entries);
+        writer
+            .ledger
+            .apply_cleanup(&report.cleanup.deleted_ledger_entries);
         assert!(!writer.is_duplicate("old-id"));
         lifecycle.shutdown().await.unwrap();
     }
@@ -1736,19 +2862,21 @@ mod tests {
         store
             .apply_batch(vec![provider_event("lost-report", now - 8 * DAY_MS)])
             .unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, writer, mut handle, injector) = spawn_writer_with_test_control(
+            store,
+            super::super::unix_now_ms,
+            PersistenceOperation::Cleanup,
+            AcknowledgementTestMode::Observe,
+        )
+        .unwrap();
 
-        let (acknowledgement, response) = oneshot::channel();
-        writer
-            .sender
-            .send(WriterCommand::Cleanup {
-                now_ms: now,
-                acknowledgement,
-            })
-            .await
-            .unwrap();
-        drop(response);
-        writer.barrier().await.unwrap();
+        let waiter = injector.cleanup(now).await;
+        handle
+            .wait_for(AcknowledgementTestEvent::AcknowledgementAttempted(
+                PersistenceOperation::Cleanup,
+            ))
+            .await;
+        drop(waiter);
         assert!(writer.is_duplicate("lost-report"));
         lifecycle.shutdown().await.unwrap();
 
@@ -1763,7 +2891,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
-        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
         lifecycle.shutdown().await.unwrap();
 
         assert!(writer.reserve_enqueue().is_none());

@@ -1302,10 +1302,7 @@ fn run_environment_is_valid(
     );
     expected.insert(
         "HERDR_PERF_STAGE".to_owned(),
-        serde_json::to_value(measurement_stage)
-            .ok()
-            .and_then(|value| value.as_str().map(str::to_owned))
-            .unwrap_or_default(),
+        stage_cli_token(measurement_stage).to_owned(),
     );
     expected.insert(
         "HERDR_PERF_SUBJECT".to_owned(),
@@ -2400,20 +2397,26 @@ fn validate_performance_stream(
         {
             return Err(ResultError::InvalidArtifact);
         }
-        let reasons = expected_performance_reasons(sample);
-        let effective = if reasons.is_empty() {
+        let instantaneous_reasons = expected_performance_reasons(sample);
+        // EventLag is generation-latched until the breached admission generation drains. The
+        // remaining reasons are instantaneous and must still match exactly in canonical order.
+        let reasons_are_valid = sample.reasons == instantaneous_reasons
+            || sample.event_lag_ns <= 1_000_000_000
+                && sample.reasons.last() == Some(&PerformanceReasonV1::EventLag)
+                && sample.reasons[..sample.reasons.len() - 1] == instantaneous_reasons;
+        let effective = if sample.reasons.is_empty() {
             sample.source_quality
         } else {
             EffectiveQualityV1::Degraded
         };
-        if sample.reasons != reasons || sample.effective_quality != effective {
+        if !reasons_are_valid || sample.effective_quality != effective {
             return Err(ResultError::InvalidArtifact);
         }
         if prior_sample.is_none_or(|prior| performance_payload_changed(prior, sample)) {
             publication_ordinals.insert(sample.sample_ordinal);
         }
         prior_sample = Some(sample);
-        degraded_samples += usize::from(!reasons.is_empty());
+        degraded_samples += usize::from(!sample.reasons.is_empty());
     }
     for frame in &stream.frames {
         let sample = sample_map
@@ -4300,11 +4303,7 @@ fn run_environment(
     );
     values.insert(
         "HERDR_PERF_STAGE".to_owned(),
-        serde_json::to_value(measurement_stage)
-            .expect("stage must serialize")
-            .as_str()
-            .expect("stage must serialize as a string")
-            .to_owned(),
+        stage_cli_token(measurement_stage).to_owned(),
     );
     values.insert(
         "HERDR_PERF_SUBJECT".to_owned(),
@@ -4319,7 +4318,7 @@ fn run_environment(
     values
 }
 
-fn measured_environment(
+pub(crate) fn measured_environment(
     raw_root: &str,
     scratch_root: &str,
     control_socket: &str,
@@ -4335,11 +4334,7 @@ fn measured_environment(
     );
     values.insert(
         "HERDR_PERF_STAGE".to_owned(),
-        serde_json::to_value(measurement_stage)
-            .expect("stage must serialize")
-            .as_str()
-            .expect("stage must serialize as a string")
-            .to_owned(),
+        stage_cli_token(measurement_stage).to_owned(),
     );
     values.insert(
         "HERDR_PERF_SUBJECT".to_owned(),
@@ -5613,11 +5608,7 @@ fn run_environment_with_baseline(
     );
     values.insert(
         "HERDR_PERF_STAGE".to_owned(),
-        serde_json::to_value(measurement_stage)
-            .expect("stage must serialize")
-            .as_str()
-            .expect("stage must serialize as string")
-            .to_owned(),
+        stage_cli_token(measurement_stage).to_owned(),
     );
     values.insert(
         "HERDR_PERF_SUBJECT".to_owned(),
@@ -7302,12 +7293,20 @@ fn required_environment_path(name: &'static str) -> Result<std::path::PathBuf, H
         .ok_or(HarnessError::Invalid(name))
 }
 
-fn parse_stage_token(value: &str) -> Result<MeasurementStageV1, HarnessError> {
+pub(crate) fn parse_stage_token(value: &str) -> Result<MeasurementStageV1, HarnessError> {
     match value {
         "baseline" => Ok(MeasurementStageV1::Baseline),
         "post-reliability" => Ok(MeasurementStageV1::PostReliability),
         "final" => Ok(MeasurementStageV1::Final),
         _ => Err(HarnessError::Invalid("unknown measurement stage")),
+    }
+}
+
+pub(crate) fn stage_cli_token(stage: MeasurementStageV1) -> &'static str {
+    match stage {
+        MeasurementStageV1::Baseline => "baseline",
+        MeasurementStageV1::PostReliability => "post-reliability",
+        MeasurementStageV1::Final => "final",
     }
 }
 
@@ -7865,7 +7864,7 @@ fn section15_predicate_rows(
                     stream
                         .samples
                         .iter()
-                        .filter(|sample| !expected_performance_reasons(sample).is_empty())
+                        .filter(|sample| !sample.reasons.is_empty())
                         .count() as u128
                 };
                 push(
