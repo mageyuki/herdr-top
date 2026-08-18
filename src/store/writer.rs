@@ -2070,6 +2070,35 @@ mod tests {
             PersistenceStatus::Degraded { failure: published }
         );
         lifecycle.shutdown().await.unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_operation_store(&root);
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        assert_eq!(writer.persistence_status(), PersistenceStatus::Healthy);
+        let (acknowledgement, response) = oneshot::channel();
+        let waiter = AcknowledgementWaiter::new(
+            response,
+            writer.health.clone(),
+            PersistenceOperation::Checkpoint,
+            None,
+        );
+        writer.health.publish_failure(published);
+        let mut response_only = Box::pin(waiter.wait_response_only());
+        let mut context = Context::from_waker(Waker::noop());
+        let health_change_poll = response_only.as_mut().poll(&mut context);
+        let _ = acknowledgement.send(Ok(()));
+
+        assert!(
+            matches!(health_change_poll, Poll::Pending),
+            "Checkpoint waiter must ignore health published after subscription"
+        );
+        response_only.await.unwrap();
+        assert_eq!(
+            writer.persistence_status(),
+            PersistenceStatus::Degraded { failure: published }
+        );
+        lifecycle.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2396,7 +2425,6 @@ mod tests {
             PersistenceOperation::UpdateOwnerLocation,
             PersistenceOperation::ReplaceOwner,
             PersistenceOperation::Barrier,
-            PersistenceOperation::Checkpoint,
         ];
         let first = acknowledgement_failure(PersistenceOperation::Apply);
 
