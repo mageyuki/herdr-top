@@ -2,6 +2,7 @@ use std::fs::{self, Permissions};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::Arc;
 use std::time::Duration;
 
 use herdr_top::diagnostics::{
@@ -19,6 +20,7 @@ use herdr_top::model::{
     MinimalProviderMetadata, NormalizedEvent, Provider, RunId, RunKey, SourceCoverage, TaskRun,
     TaskState,
 };
+use herdr_top::performance::{PerformanceIngress, SystemPerformanceClock, performance_tracker};
 use herdr_top::rendezvous::{
     ControllerSocketStatus, ValidatedRuntimeDir, open_runtime_dir_at, prepare_controller_socket,
     shutdown_controller_socket,
@@ -1593,6 +1595,63 @@ async fn controller_accepted_while_herdr_disconnected() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collector_handle_publishes_coherent_performance_generation() {
+    let running = RunningController::start().await;
+    let mut performance = running.collector.performance.clone();
+    let _ = performance.borrow_and_update();
+
+    assert_eq!(
+        running
+            .send(&envelope(
+                "performance-generation",
+                "task_started",
+                "performance-run",
+            ))
+            .await,
+        ControllerResponse::Accepted
+    );
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let current = performance.borrow();
+            if current.snapshot.admission_high_water >= 1
+                && current.snapshot.completion_high_water >= 1
+                && current.snapshot.pending_events == 0
+            {
+                break;
+            }
+            drop(current);
+            performance
+                .changed()
+                .await
+                .expect("performance publisher should remain available");
+        }
+    })
+    .await
+    .expect("Controller admission must publish a performance generation");
+
+    let publication = performance.borrow().clone();
+    assert_eq!(publication.snapshot.admission_high_water, 1);
+    assert_eq!(publication.snapshot.completion_high_water, 1);
+    assert_eq!(publication.snapshot.pending_events, 0);
+    assert!(publication.snapshot.reasons.is_empty());
+    assert_eq!(
+        publication.effective_quality,
+        collector::ObservationQuality::Disconnected
+    );
+    assert!(
+        running
+            .collector
+            .model
+            .borrow()
+            .task_run_by_key(&RunKey::Controller("performance-run".to_owned()))
+            .is_some()
+    );
+
+    running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn acceptor_survives_a_rejected_then_accepts() {
     let running = RunningController::start().await;
     assert_eq!(
@@ -1762,6 +1821,10 @@ fn unix_now_ms() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
+fn request_performance_ingress() -> PerformanceIngress {
+    performance_tracker(Arc::new(SystemPerformanceClock::new())).0
+}
+
 #[tokio::test]
 async fn busy_on_saturation() {
     let socket_dir = tempfile::tempdir().unwrap();
@@ -1769,7 +1832,8 @@ async fn busy_on_saturation() {
     let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
     listener.set_nonblocking(true).unwrap();
     let diagnostics = ControllerDiagnosticsHandle::default();
-    let (sender, receiver) = controller::request_channel(1, diagnostics.clone());
+    let (sender, receiver) =
+        controller::request_channel(1, diagnostics.clone(), request_performance_ingress());
     let cancellation = tokio_util::sync::CancellationToken::new();
     let acceptor = controller::spawn_acceptor(listener, sender, cancellation.clone()).unwrap();
 
@@ -1967,7 +2031,11 @@ async fn i4_status_request_bypasses_saturated_reducer_queue() {
     let directory = tempfile::tempdir().unwrap();
     let socket_path = directory.path().join("saturated.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-    let (sender, receiver) = controller::request_channel(1, ControllerDiagnosticsHandle::default());
+    let (sender, receiver) = controller::request_channel(
+        1,
+        ControllerDiagnosticsHandle::default(),
+        request_performance_ingress(),
+    );
     let cancellation = CancellationToken::new();
     let (_diagnostics_sender, diagnostics) = controlled_diagnostics();
     let acceptor = controller::spawn_acceptor_with_diagnostics(
@@ -2009,7 +2077,11 @@ async fn i4_status_legacy_acceptor_keeps_status_shaped_input_on_event_path() {
     let directory = tempfile::tempdir().unwrap();
     let socket_path = directory.path().join("legacy.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-    let (sender, receiver) = controller::request_channel(1, ControllerDiagnosticsHandle::default());
+    let (sender, receiver) = controller::request_channel(
+        1,
+        ControllerDiagnosticsHandle::default(),
+        request_performance_ingress(),
+    );
     let cancellation = CancellationToken::new();
     let acceptor = controller::spawn_acceptor(listener, sender, cancellation.clone()).unwrap();
 

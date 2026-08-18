@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
+#[cfg(feature = "workload-harness")]
+use common::mock::{MockConfig, MockHerdr};
 use common::workload::{self, *};
 use herdr_top::herdr::controller::ControllerEnvelope;
 use herdr_top::lockfile::StateRoot;
@@ -30,11 +32,19 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "workload-harness")]
 use herdr_top::activity::{ActivityItem, RestoredOperatorState};
 #[cfg(feature = "workload-harness")]
-use herdr_top::herdr::collector::{WorkloadCollectorConfig, spawn_workload_collector};
+use herdr_top::herdr::collector::{
+    ObservationQuality, PerformancePublication, WorkloadCollectorConfig, WorkloadPerformanceSample,
+    spawn_workload_collector,
+};
 #[cfg(feature = "workload-harness")]
 use herdr_top::herdr::controller::{
     ControllerResponse, WorkloadAdmissionObservation, WorkloadControllerHooks,
     WorkloadPersistenceObservation, WorkloadTerminalObservation,
+};
+#[cfg(feature = "workload-harness")]
+use herdr_top::performance::{
+    AbsoluteMonotonicPerformanceClock, PerformanceClock, PerformanceDegradationReason,
+    TestPerformanceClock,
 };
 #[cfg(feature = "workload-harness")]
 use herdr_top::provider::{DiscoveryRoot, NotifyFactory, NotifySink, NotifyWatcher};
@@ -166,6 +176,9 @@ struct RealQueueResult {
     rendered_sequences: Vec<u64>,
     final_identities: workload::StructuralIdentities,
     frames: Vec<RealQueueFrame>,
+    performance_samples: Vec<WorkloadPerformanceSample>,
+    final_performance: PerformancePublication,
+    final_compatibility_quality: ObservationQuality,
 }
 
 #[cfg(feature = "workload-harness")]
@@ -178,6 +191,18 @@ fn lock_workload<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(feature = "workload-harness")]
 fn duration_ns(value: Duration) -> u64 {
     u64::try_from(value.as_nanos()).expect("frozen workload duration must fit u64")
+}
+
+#[cfg(feature = "workload-harness")]
+struct AtomicPerformanceClock {
+    nanoseconds: Arc<AtomicU64>,
+}
+
+#[cfg(feature = "workload-harness")]
+impl PerformanceClock for AtomicPerformanceClock {
+    fn monotonic_now(&self) -> Duration {
+        Duration::from_nanos(self.nanoseconds.load(Ordering::SeqCst))
+    }
 }
 
 #[cfg(feature = "workload-harness")]
@@ -308,6 +333,8 @@ async fn workload_harness_writer_access_uses_owned_client() {
             persistence_observer: Arc::new(|_| {}),
             timing_observer: Arc::new(|_| {}),
         },
+        performance_clock: Arc::new(TestPerformanceClock::new(Duration::from_nanos(1))),
+        performance_observer: Arc::new(|_| {}),
         provider_roots: Vec::new(),
         notify_factory: None,
         rescan_interval: Some(Duration::from_secs(2)),
@@ -404,6 +431,11 @@ async fn run_schedule_through_real_queue_at(
     std::fs::create_dir_all(&root.0).unwrap();
     let store = open_writer(&root).unwrap();
     let (lifecycle, writer) = spawn_writer(store).unwrap();
+    let herdr = MockHerdr::start(
+        MockConfig::default().respond("session.snapshot", target_snapshot_result()),
+    )
+    .await
+    .unwrap();
     let clock_ns = Arc::new(AtomicU64::new(
         requested_workload_origin_ns.unwrap_or_default(),
     ));
@@ -412,10 +444,18 @@ async fn run_schedule_through_real_queue_at(
         let clock_ns = Arc::clone(&clock_ns);
         Arc::new(move || clock_ns.load(Ordering::SeqCst))
     });
+    let performance_clock: Arc<dyn PerformanceClock> = if uses_realtime_clock {
+        Arc::new(AbsoluteMonotonicPerformanceClock)
+    } else {
+        Arc::new(AtomicPerformanceClock {
+            nanoseconds: Arc::clone(&clock_ns),
+        })
+    };
     let admissions = Arc::new(Mutex::new(Vec::new()));
     let terminals = Arc::new(Mutex::new(Vec::new()));
     let persisted = Arc::new(Mutex::new(Vec::new()));
     let timings = Arc::new(Mutex::new(Vec::new()));
+    let performance_samples = Arc::new(Mutex::new(Vec::new()));
 
     let hooks = WorkloadControllerHooks {
         clock: {
@@ -448,13 +488,18 @@ async fn run_schedule_through_real_queue_at(
     };
     let config = WorkloadCollectorConfig {
         controller_hooks: hooks,
+        performance_clock,
+        performance_observer: {
+            let performance_samples = Arc::clone(&performance_samples);
+            Arc::new(move |sample| lock_workload(&performance_samples).push(sample.clone()))
+        },
         provider_roots: Vec::new(),
         notify_factory: None,
         rescan_interval: Some(Duration::from_secs(2)),
         fallback_timing: None,
     };
     let handle = spawn_workload_collector(
-        temporary.path().join("missing-herdr.sock"),
+        herdr.socket_path().to_path_buf(),
         "increment5-workload".to_owned(),
         empty_restored(workload::target_model()),
         writer,
@@ -462,6 +507,20 @@ async fn run_schedule_through_real_queue_at(
     )
     .await
     .unwrap();
+    let mut ready_quality = handle.collector.quality.clone();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if *ready_quality.borrow() == ObservationQuality::Live {
+                break;
+            }
+            ready_quality
+                .changed()
+                .await
+                .expect("workload performance monitor should remain available");
+        }
+    })
+    .await
+    .expect("workload Herdr source should become live before scheduling");
     let model_receiver = handle.collector.model.clone();
     let quality_receiver = handle.collector.quality.clone();
     let app = App::new(model_receiver, quality_receiver, HeaderInputs::default());
@@ -636,6 +695,43 @@ async fn run_schedule_through_real_queue_at(
     }
 
     wait_for_sequence_count(&persisted, submitted_sequences.len()).await;
+    let expected_high_water = u64::try_from(submitted_sequences.len()).unwrap();
+    let mut performance = handle.collector.performance.clone();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let final_generation_is_published = {
+                let publication = performance.borrow();
+                let snapshot = &publication.snapshot;
+                let has_final_admission_state = snapshot.admission_high_water
+                    == expected_high_water
+                    && snapshot.completion_high_water == expected_high_water
+                    && snapshot.pending_events == 0;
+                let has_expected_terminal_quality = match profile {
+                    WorkloadProfile::SustainedTarget | WorkloadProfile::TargetBurst => {
+                        snapshot.reasons.is_empty()
+                            && publication.effective_quality == ObservationQuality::Live
+                    }
+                    WorkloadProfile::TwiceTarget => {
+                        snapshot
+                            .reasons
+                            .contains(&PerformanceDegradationReason::EventsSixtySeconds)
+                            && publication.effective_quality == ObservationQuality::Degraded
+                    }
+                    _ => panic!("real queue performance fixture requires a scheduled profile"),
+                };
+                has_final_admission_state && has_expected_terminal_quality
+            };
+            if final_generation_is_published {
+                break;
+            }
+            performance
+                .changed()
+                .await
+                .expect("performance monitor should remain available");
+        }
+    })
+    .await
+    .expect("final real-queue performance generation must publish after persistence completion");
     let final_identities = structural_identities(&handle.collector.model.borrow());
     let admission_observations = lock_workload(&admissions).clone();
     let admitted_sequences = admission_observations
@@ -648,6 +744,9 @@ async fn run_schedule_through_real_queue_at(
         .collect();
     let persisted_sequences = lock_workload(&persisted).clone();
     let scoped_observations = lock_workload(&timings).clone();
+    let performance_samples = lock_workload(&performance_samples).clone();
+    let final_performance = handle.collector.performance.borrow().clone();
+    let final_compatibility_quality = *handle.collector.quality.borrow();
     handle.collector.stop().await.unwrap();
     lifecycle.shutdown().await.unwrap();
 
@@ -667,7 +766,59 @@ async fn run_schedule_through_real_queue_at(
         rendered_sequences,
         final_identities,
         frames,
+        performance_samples,
+        final_performance,
+        final_compatibility_quality,
     }
+}
+
+#[cfg(feature = "workload-harness")]
+fn target_snapshot_result() -> serde_json::Value {
+    let panes = (1..=50)
+        .map(|index| {
+            serde_json::json!({
+                "pane_id": format!("pane-{index:04}"),
+                "terminal_id": format!("terminal-{index:04}"),
+                "workspace_id": "workspace-0001",
+                "tab_id": "tab-0001",
+                "focused": false,
+                "agent_status": "unknown",
+                "revision": 1,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "type": "session_snapshot",
+        "snapshot": {
+            "version": "1",
+            "protocol": 1,
+            "focused_workspace_id": null,
+            "focused_tab_id": null,
+            "focused_pane_id": null,
+            "workspaces": [{
+                "workspace_id": "workspace-0001",
+                "number": 1,
+                "label": "workload",
+                "focused": false,
+                "pane_count": 50,
+                "tab_count": 1,
+                "active_tab_id": "tab-0001",
+                "agent_status": "unknown",
+            }],
+            "tabs": [{
+                "tab_id": "tab-0001",
+                "workspace_id": "workspace-0001",
+                "number": 1,
+                "label": "workload",
+                "focused": false,
+                "pane_count": 50,
+                "agent_status": "unknown",
+            }],
+            "panes": panes,
+            "layouts": [],
+            "agents": [],
+        }
+    })
 }
 
 #[cfg(feature = "workload-harness")]
@@ -806,6 +957,104 @@ async fn real_controller_queue_profiles_are_lossless() {
 }
 
 #[cfg(feature = "workload-harness")]
+fn assert_real_queue_outcome_is_exact(result: &RealQueueResult, profile: WorkloadProfile) {
+    let expected = workload::oracle(profile);
+    assert_eq!(result.submitted_sequences, expected.admitted_sequences);
+    assert_eq!(result.submitted_sequences, result.admitted_sequences);
+    assert_eq!(result.admitted_sequences, result.completed_sequences);
+    assert_eq!(result.completed_sequences, result.persisted_sequences);
+    assert_eq!(result.final_identities, expected.final_identities);
+    assert!(!result.performance_samples.is_empty());
+    assert!(
+        result
+            .performance_samples
+            .iter()
+            .all(
+                |sample| sample.publication.snapshot.live_panes == expected.live_panes
+                    && sample.publication.snapshot.default_visible_task_runs
+                        == expected.visible_runs
+                    && sample.publication.snapshot.dependency_edges == expected.dependency_edges
+                    && sample.publication.snapshot.execution_edges == expected.execution_edges
+            )
+    );
+}
+
+#[cfg(feature = "workload-harness")]
+#[tokio::test]
+async fn sustained_target_real_queues_remain_lossless_and_nondegraded() {
+    let result = run_virtual_schedule_through_real_queue(WorkloadProfile::SustainedTarget).await;
+    assert_real_queue_outcome_is_exact(&result, WorkloadProfile::SustainedTarget);
+    assert!(
+        result.performance_samples.iter().all(|sample| sample
+            .publication
+            .snapshot
+            .reasons
+            .is_empty())
+    );
+    assert!(result.final_performance.snapshot.reasons.is_empty());
+    assert_eq!(
+        result.final_performance.effective_quality,
+        ObservationQuality::Live
+    );
+    assert_eq!(result.final_compatibility_quality, ObservationQuality::Live);
+}
+
+#[cfg(feature = "workload-harness")]
+#[tokio::test]
+async fn target_burst_real_queues_remain_lossless_and_nondegraded() {
+    let result = run_virtual_schedule_through_real_queue(WorkloadProfile::TargetBurst).await;
+    assert_real_queue_outcome_is_exact(&result, WorkloadProfile::TargetBurst);
+    assert!(
+        result.performance_samples.iter().all(|sample| sample
+            .publication
+            .snapshot
+            .reasons
+            .is_empty())
+    );
+    assert!(result.final_performance.snapshot.reasons.is_empty());
+    assert_eq!(
+        result.final_performance.effective_quality,
+        ObservationQuality::Live
+    );
+    assert_eq!(result.final_compatibility_quality, ObservationQuality::Live);
+}
+
+#[cfg(feature = "workload-harness")]
+#[tokio::test]
+async fn twice_target_real_queues_publish_sixty_second_degradation_without_loss() {
+    let result = run_virtual_schedule_through_real_queue(WorkloadProfile::TwiceTarget).await;
+    assert_real_queue_outcome_is_exact(&result, WorkloadProfile::TwiceTarget);
+    assert!(result.performance_samples.iter().any(|sample| {
+        sample
+            .publication
+            .snapshot
+            .reasons
+            .contains(&PerformanceDegradationReason::EventsSixtySeconds)
+            && sample
+                .publication
+                .workload_sample_stamp
+                .is_some_and(|stamp| {
+                    stamp.sampled_at_ns <= result.workload_origin_ns + 60_000_000_000
+                })
+    }));
+    assert!(
+        result
+            .final_performance
+            .snapshot
+            .reasons
+            .contains(&PerformanceDegradationReason::EventsSixtySeconds)
+    );
+    assert_eq!(
+        result.final_performance.effective_quality,
+        ObservationQuality::Degraded
+    );
+    assert_eq!(
+        result.final_compatibility_quality,
+        ObservationQuality::Degraded
+    );
+}
+
+#[cfg(feature = "workload-harness")]
 #[tokio::test]
 async fn stalled_production_frame_recovers_all_cumulative_probe_acknowledgements() {
     let result = run_real_queue_with_frame_stall(
@@ -833,6 +1082,53 @@ async fn delayed_ready_and_setup_do_not_shift_the_workload_schedule() {
         result.workload_origin_ns,
         &result.admission_observations
     ));
+}
+
+#[cfg(feature = "workload-harness")]
+#[tokio::test]
+async fn controller_admission_migration_retains_one_absolute_monotonic_domain() {
+    let result = run_virtual_schedule_through_real_queue_at(
+        WorkloadProfile::SustainedTarget,
+        9_000_000_000_000,
+        9_000_100_000_000,
+        9_001_000_000_000,
+        None,
+    )
+    .await;
+    assert!(result.trial_origin_ns > 1_000_000_000_000);
+    assert!(result.trial_origin_ns < result.observer_ready_ns);
+    assert!(result.observer_ready_ns < result.priming_frame_recorded_ns);
+    assert!(result.priming_frame_recorded_ns < result.workload_origin_ns);
+    assert_eq!(
+        workload::admission_schedule_attained(
+            WorkloadProfile::SustainedTarget,
+            result.workload_origin_ns,
+            &result.admission_observations,
+        ),
+        Ok(true)
+    );
+    assert!(result.screen_observations.iter().all(|sample| {
+        sample.admitted_ns >= result.workload_origin_ns
+            && sample.terminal_ns >= sample.admitted_ns
+            && sample.published_ns >= sample.terminal_ns
+            && sample.rendered_ns >= sample.published_ns
+    }));
+
+    let mut process_relative = result.admission_observations.clone();
+    for sample in &mut process_relative {
+        sample.admitted_ns = sample
+            .admitted_ns
+            .checked_sub(result.workload_origin_ns)
+            .unwrap();
+    }
+    assert_eq!(
+        workload::admission_schedule_attained(
+            WorkloadProfile::SustainedTarget,
+            result.workload_origin_ns,
+            &process_relative,
+        ),
+        Err(ResultError::InvalidArtifact)
+    );
 }
 
 #[cfg(feature = "workload-harness")]
@@ -1196,6 +1492,10 @@ async fn run_fallback_arm(poll: Duration, notification: bool, sequence: u64) -> 
             }),
             timing_observer: workload_timing_collector(Arc::clone(&timings)),
         },
+        performance_clock: Arc::new(AtomicPerformanceClock {
+            nanoseconds: Arc::clone(&clock),
+        }),
+        performance_observer: Arc::new(|_| {}),
         provider_roots: vec![DiscoveryRoot {
             provider: Provider::Codex,
             path: sessions,

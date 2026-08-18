@@ -24,6 +24,11 @@ use crate::model::{
     ControllerDiagnosticsHandle, ControllerEvent, ControllerEventKind, EventMetadata,
     MinimalProviderMetadata, Provider, SourceCoverage, quantize_progress,
 };
+#[cfg(feature = "workload-harness")]
+use crate::performance::AdmissionStamp;
+use crate::performance::{
+    AdmissionObserver, Admitted, AdmittingSender, PerformanceIngress, admitted_channel_observed,
+};
 use crate::reducer::{CommitStagedError, Reducer, RejectReason};
 // increment5-workload-harness: begin controller timing imports
 #[cfg(feature = "workload-harness")]
@@ -87,6 +92,7 @@ pub struct WorkloadControllerHooks {
 #[derive(Clone)]
 struct WorkloadRequestContext {
     sequence: u64,
+    scheduled_ns: u64,
     hooks: WorkloadControllerHooks,
 }
 // increment5-workload-harness: end controller workload observation ABI
@@ -266,7 +272,7 @@ pub enum ControllerServerError {
 /// Cloneable producer for the bounded serialized-reducer request queue.
 #[derive(Clone)]
 pub struct ControllerRequestSender {
-    sender: mpsc::Sender<ControllerRequest>,
+    sender: AdmittingSender<ControllerRequest>,
     diagnostics: ControllerDiagnosticsHandle,
     diagnostic_changes: watch::Sender<u64>,
     // increment5-workload-harness: begin controller sender workload hooks
@@ -277,12 +283,12 @@ pub struct ControllerRequestSender {
 
 /// Unique consumer for the serialized-reducer request queue.
 pub struct ControllerRequestReceiver {
-    receiver: mpsc::Receiver<ControllerRequest>,
+    receiver: mpsc::Receiver<Admitted<ControllerRequest>>,
     diagnostic_changes: watch::Receiver<u64>,
 }
 
 pub(crate) enum ControllerRuntimeEvent {
-    Request(Option<ControllerRequest>),
+    Request(Option<Admitted<ControllerRequest>>),
     DiagnosticsChanged,
 }
 
@@ -301,8 +307,18 @@ pub(crate) struct ControllerRequest {
 pub fn request_channel(
     capacity: usize,
     diagnostics: ControllerDiagnosticsHandle,
+    performance: PerformanceIngress,
 ) -> (ControllerRequestSender, ControllerRequestReceiver) {
-    let (sender, receiver) = mpsc::channel(capacity);
+    request_channel_inner(capacity, diagnostics, performance, None)
+}
+
+fn request_channel_inner(
+    capacity: usize,
+    diagnostics: ControllerDiagnosticsHandle,
+    performance: PerformanceIngress,
+    observer: Option<AdmissionObserver<ControllerRequest>>,
+) -> (ControllerRequestSender, ControllerRequestReceiver) {
+    let (sender, receiver) = admitted_channel_observed(capacity, performance, observer);
     let (diagnostic_changes, diagnostic_change_receiver) = watch::channel(0);
     (
         ControllerRequestSender {
@@ -328,9 +344,24 @@ pub fn request_channel(
 pub fn request_channel_with_workload_harness(
     capacity: usize,
     diagnostics: ControllerDiagnosticsHandle,
+    performance: PerformanceIngress,
     hooks: WorkloadControllerHooks,
 ) -> (ControllerRequestSender, ControllerRequestReceiver) {
-    let (mut sender, receiver) = request_channel(capacity, diagnostics);
+    let observer: AdmissionObserver<ControllerRequest> =
+        std::sync::Arc::new(|stamp: AdmissionStamp, request: &ControllerRequest| {
+            let workload = request
+                .workload
+                .as_ref()
+                .expect("observed workload request must carry its context");
+            (workload.hooks.admission_observer)(WorkloadAdmissionObservation {
+                sequence: workload.sequence,
+                scheduled_ns: workload.scheduled_ns,
+                admitted_ns: u64::try_from(stamp.admitted_at.as_nanos())
+                    .expect("performance admission timestamp must fit u64 nanoseconds"),
+            });
+        });
+    let (mut sender, receiver) =
+        request_channel_inner(capacity, diagnostics, performance, Some(observer));
     sender.workload_hooks = Some(hooks);
     (sender, receiver)
 }
@@ -353,8 +384,19 @@ impl ControllerRequestSender {
                 reason: RetryableReason::PersistenceUnavailable,
             };
         };
-        let permit = match self.sender.try_reserve() {
-            Ok(permit) => permit,
+        let (responder, response) = oneshot::channel();
+        let request = ControllerRequest {
+            frame,
+            receipt_time_ms,
+            responder,
+            workload: Some(WorkloadRequestContext {
+                sequence,
+                scheduled_ns,
+                hooks,
+            }),
+        };
+        match self.sender.try_send(request) {
+            Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.record_socket_saturation();
                 return ControllerResponse::Retryable {
@@ -366,19 +408,7 @@ impl ControllerRequestSender {
                     reason: RetryableReason::PersistenceUnavailable,
                 };
             }
-        };
-        let (responder, response) = oneshot::channel();
-        (hooks.admission_observer)(WorkloadAdmissionObservation {
-            sequence,
-            scheduled_ns,
-            admitted_ns: (hooks.clock)(),
-        });
-        permit.send(ControllerRequest {
-            frame,
-            receipt_time_ms,
-            responder,
-            workload: Some(WorkloadRequestContext { sequence, hooks }),
-        });
+        }
         match tokio::time::timeout(CONTROLLER_IO_TIMEOUT, response).await {
             Ok(Ok(response)) => response,
             Ok(Err(_)) | Err(_) => ControllerResponse::Retryable {
@@ -413,7 +443,7 @@ impl ControllerRequestReceiver {
     }
 
     #[cfg(test)]
-    async fn recv(&mut self) -> Option<ControllerRequest> {
+    async fn recv(&mut self) -> Option<Admitted<ControllerRequest>> {
         self.receiver.recv().await
     }
 
@@ -708,11 +738,12 @@ async fn read_frame(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
 
 /// Runs the fixed-precedence pipeline at the reducer's serialized boundary.
 pub(crate) async fn service_request(
-    request: ControllerRequest,
+    request: Admitted<ControllerRequest>,
     session: &str,
     reducer: &mut Reducer,
     persistence: &mut RuntimePersistence,
 ) {
+    let (request, admission) = request.into_parts();
     let decoded = decode_envelope(&request.frame);
     // Alias resolution for a merged-away key happens inside `validate_controller_event`
     // against current reducer state before any placeholder is staged. Event-id deduplication
@@ -723,6 +754,7 @@ pub(crate) async fn service_request(
         .is_some_and(|event_id| persistence.is_duplicate(event_id))
     {
         let _ = request.responder.send(ControllerResponse::Duplicate);
+        admission.complete();
         return;
     }
     let event = match decoded.decode_event(request.receipt_time_ms, session) {
@@ -731,6 +763,7 @@ pub(crate) async fn service_request(
             let _ = request.responder.send(ControllerResponse::Rejected {
                 reason: reason.into(),
             });
+            admission.complete();
             return;
         }
     };
@@ -750,6 +783,7 @@ pub(crate) async fn service_request(
             let _ = request.responder.send(ControllerResponse::Rejected {
                 reason: reason.into(),
             });
+            admission.complete();
             return;
         }
     };
@@ -764,6 +798,7 @@ pub(crate) async fn service_request(
         let _ = request.responder.send(ControllerResponse::Retryable {
             reason: RetryableReason::PersistenceUnavailable,
         });
+        admission.complete();
         return;
     };
     let pending = match reducer.commit_staged(delta, permit) {
@@ -772,9 +807,11 @@ pub(crate) async fn service_request(
             let _ = request.responder.send(ControllerResponse::Retryable {
                 reason: RetryableReason::PersistenceUnavailable,
             });
+            admission.complete();
             return;
         }
     };
+    admission.complete();
     // increment5-workload-harness: begin controller publication observation
     #[cfg(feature = "workload-harness")]
     if let Some(workload_timing) = workload_timing {
@@ -1131,7 +1168,7 @@ fn unix_now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::future::pending;
     use std::sync::Arc;
 
@@ -1139,8 +1176,14 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     use super::*;
+    use crate::activity::OperatorSnapshot;
     use crate::lockfile::StateRoot;
     use crate::model::{DomainModel, NormalizedEvent};
+    #[cfg(feature = "workload-harness")]
+    use crate::performance::PerformanceClock;
+    use crate::performance::{
+        PerformanceIngress, TestPerformanceClock, admitted_channel, performance_tracker,
+    };
     use crate::store::{PersistOp, RestoredState, open_writer, spawn_writer};
 
     struct TestOccurrenceSink;
@@ -1187,28 +1230,189 @@ mod tests {
         })
     }
 
+    fn test_performance_ingress() -> PerformanceIngress {
+        performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO))).0
+    }
+
     async fn service_frame(
         frame: Value,
         reducer: &mut Reducer,
         persistence: &mut RuntimePersistence,
     ) -> ControllerResponse {
+        let (sender, mut receiver) = admitted_channel(1, test_performance_ingress());
         let (responder, response) = oneshot::channel();
+        assert!(
+            sender
+                .try_send(ControllerRequest {
+                    frame: serde_json::to_vec(&frame).unwrap(),
+                    receipt_time_ms: unix_now_ms(),
+                    responder,
+                    // increment5-workload-harness: begin unit request default workload context
+                    #[cfg(feature = "workload-harness")]
+                    workload: None,
+                    // increment5-workload-harness: end unit request default workload context
+                })
+                .is_ok()
+        );
         service_request(
-            ControllerRequest {
-                frame: serde_json::to_vec(&frame).unwrap(),
-                receipt_time_ms: unix_now_ms(),
-                responder,
-                // increment5-workload-harness: begin unit request default workload context
-                #[cfg(feature = "workload-harness")]
-                workload: None,
-                // increment5-workload-harness: end unit request default workload context
-            },
+            receiver.recv().await.unwrap(),
             "session",
             reducer,
             persistence,
         )
         .await;
         response.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn invalid_but_admitted_frame_completes_after_typed_rejection() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let restored = store.load_restored_state().unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut persistence, _diagnostics) =
+            RuntimePersistence::new_for_test(writer, Arc::new(TestOccurrenceSink));
+        let (mut reducer, shared) = Reducer::new(restored);
+        let operator = OperatorSnapshot {
+            activity: Arc::from(Vec::new()),
+            terminal_times: Arc::new(HashMap::new()),
+        };
+        let clock = Arc::new(TestPerformanceClock::new(Duration::ZERO));
+        let (ingress, mut sampler) = performance_tracker(clock);
+        let (sender, mut receiver) = admitted_channel(1, ingress);
+        let (responder, response) = oneshot::channel();
+        assert!(
+            sender
+                .try_send(ControllerRequest {
+                    frame: b"{".to_vec(),
+                    receipt_time_ms: 1,
+                    responder,
+                    #[cfg(feature = "workload-harness")]
+                    workload: None,
+                })
+                .is_ok()
+        );
+        let before = sampler.sample(&shared.borrow(), &operator, 0);
+        let admitted = receiver.recv().await.unwrap();
+
+        service_request(admitted, "session", &mut reducer, &mut persistence).await;
+        let observed_response = response.await.unwrap();
+        let after = sampler.sample(&shared.borrow(), &operator, 0);
+
+        drop(persistence);
+        lifecycle.shutdown().await.unwrap();
+        assert_eq!(before.pending_events, 1);
+        assert_eq!(
+            observed_response,
+            ControllerResponse::Rejected {
+                reason: RejectResponseReason::Invalid,
+            }
+        );
+        assert_eq!(after.pending_events, 0);
+    }
+
+    #[cfg(feature = "workload-harness")]
+    #[tokio::test]
+    async fn workload_observer_and_received_request_share_the_exact_admission_stamp() {
+        let origin = Duration::from_secs(123_456) + Duration::from_nanos(789);
+        let origin_ns = u64::try_from(origin.as_nanos()).unwrap();
+        let clock = Arc::new(TestPerformanceClock::new(origin));
+        let (performance, mut sampler) = performance_tracker(clock.clone());
+        let admissions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let terminals = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let persisted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hooks = WorkloadControllerHooks {
+            clock: {
+                let clock = Arc::clone(&clock);
+                Arc::new(move || u64::try_from(clock.monotonic_now().as_nanos()).unwrap())
+            },
+            admission_observer: {
+                let admissions = Arc::clone(&admissions);
+                Arc::new(move |sample| admissions.lock().unwrap().push(sample))
+            },
+            terminal_observer: {
+                let terminals = Arc::clone(&terminals);
+                Arc::new(move |sample| terminals.lock().unwrap().push(sample))
+            },
+            persistence_observer: {
+                let persisted = Arc::clone(&persisted);
+                Arc::new(move |sample| persisted.lock().unwrap().push(sample))
+            },
+            timing_observer: Arc::new(|_| {}),
+        };
+        let (sender, mut receiver) = request_channel_with_workload_harness(
+            1,
+            ControllerDiagnosticsHandle::default(),
+            performance,
+            hooks,
+        );
+        let submit = tokio::spawn(async move {
+            sender
+                .submit_workload_frame(
+                    serde_json::to_vec(&json!({
+                        "schema_version": 1,
+                        "event_id": "absolute-admission",
+                        "emitted_at_ms": 1,
+                        "source": "workload-test",
+                        "event_type": "task_started",
+                        "task_run_id": "absolute-run",
+                    }))
+                    .unwrap(),
+                    1,
+                    77,
+                    origin_ns,
+                )
+                .await
+        });
+        let admitted = receiver.recv().await.unwrap();
+        let workload_stamp = admitted.workload_stamp();
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let restored = store.load_restored_state().unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut persistence, _diagnostics) =
+            RuntimePersistence::new_for_test(writer, Arc::new(TestOccurrenceSink));
+        let (mut reducer, shared) = Reducer::new(restored);
+        service_request(admitted, "session", &mut reducer, &mut persistence).await;
+        assert_eq!(submit.await.unwrap(), ControllerResponse::Accepted);
+
+        let observed_admissions = admissions.lock().unwrap().clone();
+        assert_eq!(observed_admissions.len(), 1);
+        assert_eq!(observed_admissions[0].sequence, 77);
+        assert_eq!(observed_admissions[0].scheduled_ns, origin_ns);
+        assert_eq!(observed_admissions[0].admitted_ns, origin_ns);
+        assert_eq!(workload_stamp, (1, origin));
+        let observed_terminals = terminals.lock().unwrap().clone();
+        assert_eq!(observed_terminals.len(), 1);
+        assert_eq!(observed_terminals[0].sequence, 77);
+        assert_eq!(observed_terminals[0].terminal_ns, origin_ns);
+        assert_eq!(observed_terminals[0].published_ns, origin_ns);
+        let observed_persistence = persisted.lock().unwrap().clone();
+        assert_eq!(observed_persistence.len(), 1);
+        assert_eq!(observed_persistence[0].sequence, 77);
+        assert_eq!(observed_persistence[0].persisted_ns, origin_ns);
+        let snapshot = sampler.sample(
+            &shared.borrow(),
+            &OperatorSnapshot {
+                activity: Arc::from(Vec::new()),
+                terminal_times: Arc::new(HashMap::new()),
+            },
+            0,
+        );
+        assert_eq!(
+            (
+                snapshot.pending_events,
+                snapshot.admission_high_water,
+                snapshot.completion_high_water,
+            ),
+            (0, 1, 1)
+        );
+
+        drop(persistence);
+        lifecycle.shutdown().await.unwrap();
     }
 
     struct ScriptedAcceptSource {
@@ -1228,7 +1432,8 @@ mod tests {
     #[tokio::test]
     async fn acceptor_counter_change_notifies_runtime_owner() {
         let acceptor_diagnostics = ControllerDiagnosticsHandle::default();
-        let (sender, mut receiver) = request_channel(1, acceptor_diagnostics.clone());
+        let (sender, mut receiver) =
+            request_channel(1, acceptor_diagnostics.clone(), test_performance_ingress());
         let keepalive = sender.clone();
         let (queued_responder, _queued_response) = oneshot::channel();
         sender
@@ -1279,13 +1484,16 @@ mod tests {
             accepts: VecDeque::from([Err(io::Error::from_raw_os_error(libc::EMFILE)), Ok(server)]),
         };
         let diagnostics = ControllerDiagnosticsHandle::default();
-        let (sender, mut receiver) = request_channel(1, diagnostics.clone());
+        let (sender, mut receiver) =
+            request_channel(1, diagnostics.clone(), test_performance_ingress());
         let responder = tokio::spawn(async move {
-            let request = receiver.recv().await.unwrap();
+            let admitted = receiver.recv().await.unwrap();
+            let (request, admission) = admitted.into_parts();
             request
                 .responder
                 .send(ControllerResponse::Accepted)
                 .unwrap();
+            admission.complete();
         });
         let cancellation = CancellationToken::new();
         let (_diagnostics_sender, runtime_diagnostics) = test_runtime_diagnostics();
@@ -1332,7 +1540,7 @@ mod tests {
     async fn read_timeout_drains_before_handler_completion() {
         let (mut client, server) = UnixStream::pair().unwrap();
         let diagnostics = ControllerDiagnosticsHandle::default();
-        let (sender, _receiver) = request_channel(1, diagnostics);
+        let (sender, _receiver) = request_channel(1, diagnostics, test_performance_ingress());
         let (_diagnostics_sender, runtime_diagnostics) = test_runtime_diagnostics();
         let handle = tokio::spawn(handle_connection(server, sender, Some(runtime_diagnostics)));
 

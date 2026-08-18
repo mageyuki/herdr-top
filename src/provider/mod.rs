@@ -163,14 +163,12 @@ impl ProviderEvent {
 
 enum ProviderEventSender {
     Raw(tokio::sync::mpsc::Sender<ProviderEvent>),
-    #[allow(dead_code)] // removed by Task 6 when the tracked production caller lands
     Tracked {
         sender: tokio::sync::mpsc::Sender<ProviderIngressEvent>,
         ingress: crate::performance::PerformanceIngress,
     },
 }
 
-#[allow(dead_code)] // removed by Task 6 when the tracked production caller lands
 pub(crate) struct ProviderIngressEvent {
     pub event: ProviderEvent,
     pub admission: Option<crate::performance::Admission>,
@@ -1486,6 +1484,7 @@ pub fn spawn_provider_thread_with_rescan_interval(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn spawn_provider_thread_with_diagnostics(
     worker: impl ProviderWorker,
     egress: tokio_mpsc::Sender<ProviderEvent>,
@@ -1498,6 +1497,46 @@ pub(crate) fn spawn_provider_thread_with_diagnostics(
         notify_factory,
         diagnostics,
         RESCAN_INTERVAL,
+    )
+}
+
+pub(crate) fn spawn_provider_thread_with_diagnostics_and_performance(
+    worker: impl ProviderWorker,
+    egress: tokio_mpsc::Sender<ProviderIngressEvent>,
+    notify_factory: Option<Box<dyn NotifyFactory>>,
+    diagnostics: ProviderDiagnostics,
+    performance: crate::performance::PerformanceIngress,
+) -> Result<ProviderThreadHandle, ProviderSpawnError> {
+    spawn_provider_thread_configured(
+        worker,
+        ProviderEventSender::Tracked {
+            sender: egress,
+            ingress: performance,
+        },
+        notify_factory,
+        diagnostics,
+        RESCAN_INTERVAL,
+    )
+}
+
+#[cfg(feature = "workload-harness")]
+pub(crate) fn spawn_provider_thread_with_diagnostics_performance_and_rescan_interval(
+    worker: impl ProviderWorker,
+    egress: tokio_mpsc::Sender<ProviderIngressEvent>,
+    notify_factory: Option<Box<dyn NotifyFactory>>,
+    diagnostics: ProviderDiagnostics,
+    performance: crate::performance::PerformanceIngress,
+    rescan_interval: Duration,
+) -> Result<ProviderThreadHandle, ProviderSpawnError> {
+    spawn_provider_thread_configured(
+        worker,
+        ProviderEventSender::Tracked {
+            sender: egress,
+            ingress: performance,
+        },
+        notify_factory,
+        diagnostics,
+        rescan_interval,
     )
 }
 

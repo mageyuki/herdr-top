@@ -114,6 +114,86 @@ async fn subscribe_buffer_snapshot_replay_order() {
 }
 
 #[tokio::test]
+async fn replay_drains_admitted_events_before_closed_end() {
+    let final_sid = "replay-drain-final";
+    let generation = ["replay-drain-first", "replay-drain-second", final_sid]
+        .into_iter()
+        .map(|sid| {
+            push(
+                "pane_updated",
+                json!({
+                    "type": "pane_updated",
+                    "pane": agent_pane_value(
+                        "w1:p1",
+                        "term_6583d08d791e41",
+                        "w1",
+                        "w1:t1",
+                        sid,
+                    ),
+                }),
+            )
+        })
+        .collect();
+    let mock = ScriptedHerdr::start(
+        ScriptedConfig::default()
+            .snapshots(vec![p1_snapshot()])
+            .generations(vec![generation])
+            .close_after_snapshots(vec![0]),
+    )
+    .await
+    .expect("scripted mock should bind");
+    let (_directory, root, lifecycle, writer) = test_writer();
+    let handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .expect("collector should start");
+
+    let mut performance = handle.performance.clone();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let snapshot = performance.borrow().snapshot.clone();
+            if snapshot.admission_high_water == 3
+                && snapshot.completion_high_water == 3
+                && snapshot.pending_events == 0
+            {
+                break;
+            }
+            performance
+                .changed()
+                .await
+                .expect("performance monitor should remain available");
+        }
+    })
+    .await
+    .expect("all admitted replay events should complete");
+    let expected_key = RunKey::Native {
+        provider: Provider::Codex,
+        sid: final_sid.to_owned(),
+    };
+    let in_memory = handle
+        .model
+        .borrow()
+        .task_run_by_key(&expected_key)
+        .is_some();
+
+    shutdown(handle, lifecycle).await;
+    let restored = open_reader(&root)
+        .expect("reader should reopen after shutdown")
+        .load_restored_state()
+        .expect("persisted state should restore");
+    let persisted = restored.model.task_run_by_key(&expected_key).is_some();
+
+    assert!(
+        in_memory && persisted,
+        "every event admitted before channel closure must reach the final model and store"
+    );
+}
+
+#[tokio::test]
 async fn anomaly_triggers_fresh_generation_resnapshot() {
     let snapshot = p1_snapshot();
     let anomaly = push(

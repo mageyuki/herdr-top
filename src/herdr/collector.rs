@@ -32,12 +32,18 @@ use crate::model::{
     RunKey, SharedModel, SnapshotAgent, SourceCoverage, Tab, TopologyEntity, TopologyEntityId,
     TopologySnapshot, Workspace,
 };
+use crate::performance::{
+    Admission, Admitted, PerformanceClock, PerformanceIngress, PerformanceSampler,
+    PerformanceSnapshot, SystemPerformanceClock, admitted_channel, performance_tracker,
+};
+#[cfg(test)]
+use crate::provider::spawn_provider_thread_with_diagnostics;
 use crate::provider::{
     BootstrapIdentity, BootstrapParser, DiscoveryIndex, DiscoveryRoot, FsReadBoundary,
-    MergeOutcome, PathInterner, PendingEvents, ProviderCycle, ProviderEvent, ProviderSourceState,
-    ProviderSpawnError, ProviderTarget, ProviderTargetPublisher, ProviderThreadError,
-    ProviderThreadHandle, ProviderWorker, RecommendedNotifyFactory, TailFile, TargetSet,
-    spawn_provider_thread_with_diagnostics,
+    MergeOutcome, PathInterner, PendingEvents, ProviderCycle, ProviderEvent, ProviderIngressEvent,
+    ProviderSourceState, ProviderSpawnError, ProviderTarget, ProviderTargetPublisher,
+    ProviderThreadError, ProviderThreadHandle, ProviderWorker, RecommendedNotifyFactory, TailFile,
+    TargetSet, spawn_provider_thread_with_diagnostics_and_performance,
 };
 use crate::reducer::{ApplyOutcome, Reducer, ReducerError};
 use crate::store::writer::{
@@ -58,6 +64,7 @@ const RECONNECT_DELAY: Duration = Duration::from_millis(50);
 const DRAIN_QUIET_PERIOD: Duration = Duration::from_millis(5);
 const STALE_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const PERFORMANCE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Current quality of the Herdr physical-state observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,6 +77,209 @@ pub enum ObservationQuality {
     Disconnected,
     /// Physical state is available but another source or target is unavailable.
     Degraded,
+}
+
+/// One coherent performance snapshot and the quality derived from the same generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PerformancePublication {
+    pub snapshot: PerformanceSnapshot,
+    pub effective_quality: ObservationQuality,
+    #[cfg(feature = "workload-harness")]
+    #[doc(hidden)]
+    pub workload_sample_stamp: Option<WorkloadSampleStamp>,
+}
+
+/// Feature-only identity and monotonic timestamp for one raw monitor sample.
+#[cfg(feature = "workload-harness")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct WorkloadSampleStamp {
+    pub sample_ordinal: u64,
+    pub sampled_at_ns: u64,
+}
+
+/// Feature-only raw monitor observation retained before watch coalescing.
+#[cfg(feature = "workload-harness")]
+#[derive(Clone, Debug)]
+#[doc(hidden)]
+pub struct WorkloadPerformanceSample {
+    pub source_quality: ObservationQuality,
+    pub publication: PerformancePublication,
+}
+
+/// Feature-only observer for every raw performance-monitor generation.
+#[cfg(feature = "workload-harness")]
+#[doc(hidden)]
+pub type WorkloadPerformanceObserver =
+    Arc<dyn Fn(&WorkloadPerformanceSample) + Send + Sync + 'static>;
+
+fn initial_performance_publication() -> PerformancePublication {
+    PerformancePublication {
+        snapshot: PerformanceSnapshot::default(),
+        effective_quality: ObservationQuality::Reconciling,
+        #[cfg(feature = "workload-harness")]
+        workload_sample_stamp: None,
+    }
+}
+
+fn compose_quality(
+    source_quality: ObservationQuality,
+    snapshot: &PerformanceSnapshot,
+) -> ObservationQuality {
+    match source_quality {
+        ObservationQuality::Disconnected => ObservationQuality::Disconnected,
+        ObservationQuality::Reconciling => ObservationQuality::Reconciling,
+        ObservationQuality::Degraded => ObservationQuality::Degraded,
+        ObservationQuality::Live if snapshot.reasons.is_empty() => ObservationQuality::Live,
+        ObservationQuality::Live => ObservationQuality::Degraded,
+    }
+}
+
+fn same_render_payload(left: &PerformancePublication, right: &PerformancePublication) -> bool {
+    left.snapshot == right.snapshot && left.effective_quality == right.effective_quality
+}
+
+#[cfg(feature = "workload-harness")]
+fn publish_performance_generation(
+    performance_sender: &watch::Sender<PerformancePublication>,
+    quality_sender: &watch::Sender<ObservationQuality>,
+    source_quality: ObservationQuality,
+    publication: PerformancePublication,
+    observer: Option<&WorkloadPerformanceObserver>,
+    #[cfg(test)] after_performance_publication: Option<&(dyn Fn() + Send + Sync)>,
+) {
+    assert!(
+        publication.workload_sample_stamp.is_some(),
+        "workload observer samples must carry their exact monitor stamp"
+    );
+    if let Some(observer) = observer {
+        observer(&WorkloadPerformanceSample {
+            source_quality,
+            publication: publication.clone(),
+        });
+    }
+    performance_sender.send_if_modified(|current| {
+        if current.workload_sample_stamp.is_none() || !same_render_payload(current, &publication) {
+            *current = publication.clone();
+            true
+        } else {
+            false
+        }
+    });
+    #[cfg(test)]
+    if let Some(after_performance_publication) = after_performance_publication {
+        after_performance_publication();
+    }
+    quality_sender.send_if_modified(|current| {
+        if *current == publication.effective_quality {
+            false
+        } else {
+            *current = publication.effective_quality;
+            true
+        }
+    });
+}
+
+#[cfg(feature = "workload-harness")]
+fn record_monitor_control_failure() {
+    tracing::warn!(
+        warning_code = "performance_monitor_control_failure",
+        "performance monitor stopped after an internal control value overflowed"
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_performance_monitor(
+    mut sampler: PerformanceSampler,
+    model: SharedModel,
+    operator: watch::Receiver<OperatorSnapshot>,
+    mut source_quality: watch::Receiver<ObservationQuality>,
+    performance_sender: watch::Sender<PerformancePublication>,
+    quality_sender: watch::Sender<ObservationQuality>,
+    cancellation: CancellationToken,
+    #[cfg(feature = "workload-harness")] performance_observer: Option<WorkloadPerformanceObserver>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(PERFORMANCE_SAMPLE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        #[cfg(feature = "workload-harness")]
+        let mut sample_ordinal = 0_u64;
+        loop {
+            tokio::select! {
+                () = cancellation.cancelled() => break,
+                _ = interval.tick() => {}
+                changed = source_quality.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+            }
+
+            let snapshot = sampler.sample(&model.borrow(), &operator.borrow(), unix_now_ms());
+            let source_quality = *source_quality.borrow();
+            let effective_quality = compose_quality(source_quality, &snapshot);
+
+            #[cfg(feature = "workload-harness")]
+            {
+                let sampled_at_ns = match u64::try_from(sampler.workload_sampled_at().as_nanos()) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        record_monitor_control_failure();
+                        break;
+                    }
+                };
+                let current_ordinal = sample_ordinal;
+                sample_ordinal = match sample_ordinal.checked_add(1) {
+                    Some(next) => next,
+                    None => {
+                        record_monitor_control_failure();
+                        break;
+                    }
+                };
+                let publication = PerformancePublication {
+                    snapshot,
+                    effective_quality,
+                    workload_sample_stamp: Some(WorkloadSampleStamp {
+                        sample_ordinal: current_ordinal,
+                        sampled_at_ns,
+                    }),
+                };
+                publish_performance_generation(
+                    &performance_sender,
+                    &quality_sender,
+                    source_quality,
+                    publication,
+                    performance_observer.as_ref(),
+                    #[cfg(test)]
+                    None,
+                );
+            }
+
+            #[cfg(not(feature = "workload-harness"))]
+            {
+                let publication = PerformancePublication {
+                    snapshot,
+                    effective_quality,
+                };
+                performance_sender.send_if_modified(|current| {
+                    if same_render_payload(current, &publication) {
+                        false
+                    } else {
+                        *current = publication.clone();
+                        true
+                    }
+                });
+                quality_sender.send_if_modified(|current| {
+                    if *current == effective_quality {
+                        false
+                    } else {
+                        *current = effective_quality;
+                        true
+                    }
+                });
+            }
+        }
+    })
 }
 
 /// One of the four fixed observation and input sources shown in coverage.
@@ -682,7 +892,9 @@ pub enum CollectorError {
 
 /// Handle to the collector's coherent model, quality, source-coverage, and diagnostics streams.
 pub struct CollectorHandle {
-    /// Independently published Herdr observation quality.
+    /// Coherent performance snapshot and effective-quality generations.
+    pub performance: watch::Receiver<PerformancePublication>,
+    /// Compatibility projection of [`Self::performance`]'s effective quality.
     pub quality: watch::Receiver<ObservationQuality>,
     /// Dynamic four-source coverage published independently of model snapshots.
     pub source_coverage: watch::Receiver<SourceCoverageRegistry>,
@@ -694,6 +906,7 @@ pub struct CollectorHandle {
     pub model: SharedModel,
     cancellation: CancellationToken,
     task: JoinHandle<Result<(), CollectorError>>,
+    performance_monitor: JoinHandle<()>,
     controller_acceptor: Option<JoinHandle<Result<(), ControllerServerError>>>,
     provider_thread: Option<ProviderThreadHandle>,
 }
@@ -719,6 +932,10 @@ impl CollectorHandle {
                 })
             }
         };
+        let performance_result = self
+            .performance_monitor
+            .await
+            .map_err(|error| CollectorError::Task(error.to_string()));
         let controller_result = if let Some(mut acceptor) = self.controller_acceptor {
             match tokio::time::timeout(timeout, &mut acceptor).await {
                 Ok(result) => result
@@ -740,7 +957,9 @@ impl CollectorHandle {
             None => Ok(()),
         };
         if let Err(error) = &provider_result
-            && (collector_result.is_err() || controller_result.is_err())
+            && (collector_result.is_err()
+                || performance_result.is_err()
+                || controller_result.is_err())
         {
             let provider_error_code = match error {
                 ProviderThreadError::ThreadPanicked => "provider_thread_panicked",
@@ -754,6 +973,7 @@ impl CollectorHandle {
         }
 
         collector_result?;
+        performance_result?;
         controller_result?;
         provider_result?;
         Ok(())
@@ -765,6 +985,8 @@ impl CollectorHandle {
 #[doc(hidden)]
 pub struct WorkloadCollectorConfig {
     pub controller_hooks: controller::WorkloadControllerHooks,
+    pub performance_clock: Arc<dyn PerformanceClock>,
+    pub performance_observer: WorkloadPerformanceObserver,
     pub provider_roots: Vec<crate::provider::DiscoveryRoot>,
     pub notify_factory: Option<Box<dyn crate::provider::NotifyFactory>>,
     pub rescan_interval: Option<Duration>,
@@ -800,7 +1022,9 @@ pub async fn spawn_workload_collector(
     if let Some((kind, first_sequence, observer)) = config.fallback_timing {
         reducer.configure_workload_observation_timing(kind, first_sequence, observer);
     }
+    let (performance_sender, performance) = watch::channel(initial_performance_publication());
     let (quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
+    let (source_quality_sender, source_quality) = watch::channel(ObservationQuality::Reconciling);
     let controller_coverage = SourceAvailability::Available;
     let initial_coverage = SourceCoverageRegistry::new(controller_coverage.clone());
     let (coverage_sender, source_coverage) = watch::channel(initial_coverage);
@@ -811,28 +1035,35 @@ pub async fn spawn_workload_collector(
         Arc::new(UnavailableOccurrenceSink),
     );
     let cancellation = CancellationToken::new();
+    let (performance_ingress, performance_sampler) =
+        performance_tracker(Arc::clone(&config.performance_clock));
     let (controller_sender, controller_requests) =
         controller::request_channel_with_workload_harness(
             controller::CONTROLLER_REQUEST_QUEUE_CAPACITY,
             reducer.controller_diagnostics_handle(),
+            performance_ingress.clone(),
             config.controller_hooks,
         );
     let (provider_sender, provider_events) = mpsc::channel(EVENT_QUEUE_CAPACITY);
     let provider_diagnostics = crate::provider::ProviderDiagnostics::from_model_handle(
         reducer.provider_diagnostics_handle(),
     );
-    let provider_thread = crate::provider::spawn_provider_thread_with_rescan_interval(
-        AdapterProviderWorker::new(config.provider_roots, provider_diagnostics),
-        provider_sender,
-        config.notify_factory,
-        config
-            .rescan_interval
-            .unwrap_or(crate::provider::RESCAN_INTERVAL),
-    )?;
+    let provider_thread =
+        crate::provider::spawn_provider_thread_with_diagnostics_performance_and_rescan_interval(
+            AdapterProviderWorker::new(config.provider_roots, provider_diagnostics.clone()),
+            provider_sender,
+            config.notify_factory,
+            provider_diagnostics,
+            performance_ingress.clone(),
+            config
+                .rescan_interval
+                .unwrap_or(crate::provider::RESCAN_INTERVAL),
+        )?;
     let provider_publisher = provider_thread.target_publisher();
     let restored_targets = derive_provider_targets(&model.borrow());
     provider_publisher.update_targets(restored_targets.clone());
-    let coverage = CoverageTracker::new(controller_coverage, coverage_sender, quality_sender);
+    let coverage =
+        CoverageTracker::new(controller_coverage, coverage_sender, source_quality_sender);
     let provider_integration = ProviderIntegration::new(
         provider_events,
         provider_publisher,
@@ -841,6 +1072,17 @@ pub async fn spawn_workload_collector(
     );
     let task_cancellation = cancellation.clone();
     let task_model = model.clone();
+    let performance_observer = config.performance_observer;
+    let performance_monitor = spawn_performance_monitor(
+        performance_sampler,
+        model.clone(),
+        operator.clone(),
+        source_quality,
+        performance_sender,
+        quality_sender,
+        cancellation.clone(),
+        Some(performance_observer),
+    );
     let task = tokio::spawn(async move {
         run_collector(
             sock,
@@ -848,6 +1090,7 @@ pub async fn spawn_workload_collector(
             persistence,
             reducer,
             task_model,
+            performance_ingress,
             task_cancellation,
             owner,
             Some(controller_requests),
@@ -856,6 +1099,7 @@ pub async fn spawn_workload_collector(
         .await
     });
     let collector = CollectorHandle {
+        performance,
         quality,
         source_coverage,
         diagnostics,
@@ -863,6 +1107,7 @@ pub async fn spawn_workload_collector(
         model,
         cancellation,
         task,
+        performance_monitor,
         controller_acceptor: None,
         provider_thread: Some(provider_thread),
     };
@@ -917,6 +1162,41 @@ pub async fn spawn_with_controller(
         controller_coverage,
         Arc::new(UnavailableOccurrenceSink),
         empty_operator_seed(),
+    )
+    .await
+}
+
+/// Launches the Controller-enabled runtime with an injected performance clock and raw observer.
+#[cfg(feature = "workload-harness")]
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_with_controller_and_performance_clock(
+    sock: PathBuf,
+    session: String,
+    restored: RestoredState,
+    writer: WriterClient,
+    controller_listener: Option<StdUnixListener>,
+    performance_clock: Arc<dyn PerformanceClock>,
+    performance_observer: WorkloadPerformanceObserver,
+) -> Result<CollectorHandle, CollectorError> {
+    let controller_coverage = if controller_listener.is_some() {
+        SourceAvailability::Available
+    } else {
+        SourceAvailability::Unavailable {
+            detail: "not_bound".to_owned(),
+        }
+    };
+    spawn_configured_inner(
+        sock,
+        session,
+        restored,
+        writer,
+        controller_listener,
+        controller_coverage,
+        Arc::new(UnavailableOccurrenceSink),
+        empty_operator_seed(),
+        performance_clock,
+        Some(performance_observer),
     )
     .await
 }
@@ -1003,17 +1283,48 @@ async fn spawn_configured(
     sock: PathBuf,
     session: String,
     restored: RestoredState,
-    mut writer: WriterClient,
+    writer: WriterClient,
     controller_listener: Option<StdUnixListener>,
     controller_coverage: SourceAvailability,
     occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
     restored_operator: RestoredOperatorState,
 ) -> Result<CollectorHandle, CollectorError> {
+    spawn_configured_inner(
+        sock,
+        session,
+        restored,
+        writer,
+        controller_listener,
+        controller_coverage,
+        occurrence_sink,
+        restored_operator,
+        Arc::new(SystemPerformanceClock::new()),
+        #[cfg(feature = "workload-harness")]
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_configured_inner(
+    sock: PathBuf,
+    session: String,
+    restored: RestoredState,
+    mut writer: WriterClient,
+    controller_listener: Option<StdUnixListener>,
+    controller_coverage: SourceAvailability,
+    occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
+    restored_operator: RestoredOperatorState,
+    performance_clock: Arc<dyn PerformanceClock>,
+    #[cfg(feature = "workload-harness")] performance_observer: Option<WorkloadPerformanceObserver>,
+) -> Result<CollectorHandle, CollectorError> {
     let owner = OwnerTracker::from_environment();
     writer.replace_owner(owner.record()).await?;
 
     let (reducer, model, operator) = Reducer::new_with_operator(restored, restored_operator);
+    let (performance_sender, performance) = watch::channel(initial_performance_publication());
     let (quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
+    let (source_quality_sender, source_quality) = watch::channel(ObservationQuality::Reconciling);
     let initial_coverage = SourceCoverageRegistry::new(controller_coverage.clone());
     let (coverage_sender, source_coverage) = watch::channel(initial_coverage);
     let (persistence, diagnostics) = RuntimePersistence::new(
@@ -1023,11 +1334,13 @@ async fn spawn_configured(
         occurrence_sink,
     );
     let cancellation = CancellationToken::new();
+    let (performance_ingress, performance_sampler) = performance_tracker(performance_clock);
     let (controller_sender, controller_requests) =
         controller_listener.as_ref().map_or((None, None), |_| {
             let (sender, receiver) = controller::request_channel(
                 controller::CONTROLLER_REQUEST_QUEUE_CAPACITY,
                 reducer.controller_diagnostics_handle(),
+                performance_ingress.clone(),
             );
             (Some(sender), Some(receiver))
         });
@@ -1045,11 +1358,12 @@ async fn spawn_configured(
         reducer.provider_diagnostics_handle(),
     );
     let standard_provider_roots = crate::provider::standard_discovery_roots_from_env();
-    let provider_thread = match spawn_provider_thread_with_diagnostics(
+    let provider_thread = match spawn_provider_thread_with_diagnostics_and_performance(
         AdapterProviderWorker::new(standard_provider_roots, provider_diagnostics.clone()),
         provider_sender,
         Some(Box::new(RecommendedNotifyFactory)),
         provider_diagnostics,
+        performance_ingress.clone(),
     ) {
         Ok(handle) => handle,
         Err(error) => {
@@ -1068,7 +1382,8 @@ async fn spawn_configured(
     let provider_publisher = provider_thread.target_publisher();
     let restored_targets = derive_provider_targets(&model.borrow());
     provider_publisher.update_targets(restored_targets.clone());
-    let coverage = CoverageTracker::new(controller_coverage, coverage_sender, quality_sender);
+    let coverage =
+        CoverageTracker::new(controller_coverage, coverage_sender, source_quality_sender);
     let provider_integration = ProviderIntegration::new(
         provider_events,
         provider_publisher,
@@ -1077,6 +1392,17 @@ async fn spawn_configured(
     );
     let task_cancellation = cancellation.clone();
     let task_model = model.clone();
+    let performance_monitor = spawn_performance_monitor(
+        performance_sampler,
+        model.clone(),
+        operator.clone(),
+        source_quality,
+        performance_sender,
+        quality_sender,
+        cancellation.clone(),
+        #[cfg(feature = "workload-harness")]
+        performance_observer,
+    );
     let task = tokio::spawn(async move {
         run_collector(
             sock,
@@ -1084,6 +1410,7 @@ async fn spawn_configured(
             persistence,
             reducer,
             task_model,
+            performance_ingress,
             task_cancellation,
             owner,
             controller_requests,
@@ -1093,6 +1420,7 @@ async fn spawn_configured(
     });
 
     Ok(CollectorHandle {
+        performance,
         quality,
         source_coverage,
         diagnostics,
@@ -1100,6 +1428,7 @@ async fn spawn_configured(
         model,
         cancellation,
         task,
+        performance_monitor,
         controller_acceptor,
         provider_thread: Some(provider_thread),
     })
@@ -1112,6 +1441,7 @@ async fn run_collector(
     mut persistence: RuntimePersistence,
     mut reducer: Reducer,
     shared: SharedModel,
+    performance: PerformanceIngress,
     cancellation: CancellationToken,
     mut owner: OwnerTracker,
     mut controller_requests: Option<ControllerRequestReceiver>,
@@ -1185,7 +1515,8 @@ async fn run_collector(
         provider.set_herdr_quality(ObservationQuality::Reconciling, &mut persistence, &shared);
 
         let reader_cancellation = cancellation.child_token();
-        let (events, overflowed, reader) = spawn_event_reader(stream, reader_cancellation.clone());
+        let (events, overflowed, reader) =
+            spawn_event_reader(stream, reader_cancellation.clone(), performance.clone());
         let outcome = converge(
             &sock,
             &mut persistence,
@@ -1241,7 +1572,7 @@ async fn converge(
     owner: &mut OwnerTracker,
     session: &str,
     gap_kind: GapKind,
-    mut events: mpsc::Receiver<ReceivedEvent>,
+    mut events: mpsc::Receiver<Admitted<ReceivedEvent>>,
     overflowed: Arc<AtomicBool>,
     controller_requests: &mut Option<ControllerRequestReceiver>,
     provider: &mut ProviderIntegration,
@@ -1394,7 +1725,7 @@ async fn replay_generation(
     owner: &mut OwnerTracker,
     session: &str,
     snapshot: &Snapshot,
-    events: &mut mpsc::Receiver<ReceivedEvent>,
+    events: &mut mpsc::Receiver<Admitted<ReceivedEvent>>,
     overflowed: &AtomicBool,
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
@@ -1402,18 +1733,16 @@ async fn replay_generation(
     provider: &mut ProviderIntegration,
 ) -> Result<ReplayOutcome, CollectorError> {
     let snapshot_entities = snapshot_entity_keys(snapshot);
-    let mut buffered = Vec::new();
+    let mut buffered = VecDeque::new();
     let mut created = HashSet::new();
     let mut closures: HashMap<EntityKey, Vec<usize>> = HashMap::new();
     let mut candidates = Vec::new();
     let mut next = 0;
-    if drain_events(events, &mut buffered).is_err() {
-        return Ok(ReplayOutcome::Ended);
-    }
+    let mut channel_state = drain_events(events, &mut buffered);
 
     loop {
-        while next < buffered.len() {
-            let received = buffered[next].clone();
+        while let Some(admitted) = buffered.pop_front() {
+            let (received, admission) = admitted.into_parts();
             record_replay_facts(
                 next,
                 &received,
@@ -1428,14 +1757,16 @@ async fn replay_generation(
                 owner,
                 session,
                 received,
+                admission,
                 pending_closures,
                 provider,
             )
             .await?;
             next += 1;
-            if drain_events(events, &mut buffered).is_err() {
-                return Ok(ReplayOutcome::Ended);
-            }
+            channel_state = drain_events(events, &mut buffered);
+        }
+        if channel_state == EventChannelState::Closed {
+            return Ok(ReplayOutcome::Ended);
         }
 
         let next_received = tokio::select! {
@@ -1456,8 +1787,11 @@ async fn replay_generation(
             result = tokio::time::timeout(DRAIN_QUIET_PERIOD, events.recv()) => result,
         };
         match next_received {
-            Ok(Some(received)) => buffered.push(received),
-            Ok(None) => return Ok(ReplayOutcome::Ended),
+            Ok(Some(received)) => buffered.push_back(received),
+            Ok(None) => {
+                channel_state = drain_events(events, &mut buffered);
+                debug_assert_eq!(channel_state, EventChannelState::Closed);
+            }
             Err(_) => break,
         }
     }
@@ -1485,7 +1819,7 @@ async fn monitor_live(
     persistence: &mut RuntimePersistence,
     owner: &mut OwnerTracker,
     session: &str,
-    events: &mut mpsc::Receiver<ReceivedEvent>,
+    events: &mut mpsc::Receiver<Admitted<ReceivedEvent>>,
     overflowed: &AtomicBool,
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
@@ -1545,6 +1879,7 @@ async fn monitor_live(
             persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
             continue;
         };
+        let (received, admission) = received.into_parts();
         let anomalous =
             updated_entity(&received).is_some_and(|entity| !entity_exists(shared, &entity));
         apply_received_event(
@@ -1554,6 +1889,7 @@ async fn monitor_live(
             owner,
             session,
             received,
+            admission,
             pending_closures,
             provider,
         )
@@ -1571,7 +1907,7 @@ async fn monitor_reconciling(
     persistence: &mut RuntimePersistence,
     owner: &mut OwnerTracker,
     session: &str,
-    mut events: mpsc::Receiver<ReceivedEvent>,
+    mut events: mpsc::Receiver<Admitted<ReceivedEvent>>,
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
     controller_requests: &mut Option<ControllerRequestReceiver>,
@@ -1630,6 +1966,7 @@ async fn monitor_reconciling(
             persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
             continue;
         };
+        let (received, admission) = received.into_parts();
         apply_received_event(
             reducer,
             shared,
@@ -1637,6 +1974,7 @@ async fn monitor_reconciling(
             owner,
             session,
             received,
+            admission,
             pending_closures,
             provider,
         )
@@ -1644,15 +1982,18 @@ async fn monitor_reconciling(
     }
 }
 
+type EventReader = (
+    mpsc::Receiver<Admitted<ReceivedEvent>>,
+    Arc<AtomicBool>,
+    JoinHandle<Result<(), WireError>>,
+);
+
 fn spawn_event_reader(
     mut stream: EventStream,
     cancellation: CancellationToken,
-) -> (
-    mpsc::Receiver<ReceivedEvent>,
-    Arc<AtomicBool>,
-    JoinHandle<Result<(), WireError>>,
-) {
-    let (sender, receiver) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+    performance: PerformanceIngress,
+) -> EventReader {
+    let (sender, receiver) = admitted_channel(EVENT_QUEUE_CAPACITY, performance);
     let overflowed = Arc::new(AtomicBool::new(false));
     let reader_overflowed = Arc::clone(&overflowed);
     let task = tokio::spawn(async move {
@@ -1685,7 +2026,6 @@ fn spawn_event_reader(
     (receiver, overflowed, task)
 }
 
-#[derive(Clone)]
 struct ReceivedEvent {
     event: String,
     data: Value,
@@ -2520,7 +2860,7 @@ const fn integration_provider_rank(provider: Provider) -> u8 {
 }
 
 struct ProviderIntegration {
-    events: Option<mpsc::Receiver<ProviderEvent>>,
+    events: Option<mpsc::Receiver<ProviderIngressEvent>>,
     target_publisher: ProviderTargetPublisher,
     published_targets: TargetSet,
     coverage: CoverageTracker,
@@ -2530,20 +2870,20 @@ struct CoverageTracker {
     registry: SourceCoverageRegistry,
     herdr_quality: ObservationQuality,
     coverage_sender: watch::Sender<SourceCoverageRegistry>,
-    quality_sender: watch::Sender<ObservationQuality>,
+    source_quality_sender: watch::Sender<ObservationQuality>,
 }
 
 impl CoverageTracker {
     fn new(
         controller: SourceAvailability,
         coverage_sender: watch::Sender<SourceCoverageRegistry>,
-        quality_sender: watch::Sender<ObservationQuality>,
+        source_quality_sender: watch::Sender<ObservationQuality>,
     ) -> Self {
         Self {
             registry: SourceCoverageRegistry::new(controller),
             herdr_quality: ObservationQuality::Reconciling,
             coverage_sender,
-            quality_sender,
+            source_quality_sender,
         }
     }
 
@@ -2596,14 +2936,14 @@ impl CoverageTracker {
 
     fn publish(&self) {
         self.coverage_sender.send_replace(self.registry.clone());
-        self.quality_sender
+        self.source_quality_sender
             .send_replace(self.registry.effective_quality(self.herdr_quality));
     }
 }
 
 impl ProviderIntegration {
     fn new(
-        events: mpsc::Receiver<ProviderEvent>,
+        events: mpsc::Receiver<ProviderIngressEvent>,
         target_publisher: ProviderTargetPublisher,
         published_targets: TargetSet,
         coverage: CoverageTracker,
@@ -2725,19 +3065,23 @@ impl ConvergeOutcome {
     }
 }
 
-enum DrainError {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventChannelState {
+    Open,
     Closed,
 }
 
 fn drain_events(
-    events: &mut mpsc::Receiver<ReceivedEvent>,
-    buffered: &mut Vec<ReceivedEvent>,
-) -> Result<(), DrainError> {
+    events: &mut mpsc::Receiver<Admitted<ReceivedEvent>>,
+    buffered: &mut VecDeque<Admitted<ReceivedEvent>>,
+) -> EventChannelState {
     loop {
         match events.try_recv() {
-            Ok(received) => buffered.push(received),
-            Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
-            Err(mpsc::error::TryRecvError::Disconnected) => return Err(DrainError::Closed),
+            Ok(received) => buffered.push_back(received),
+            Err(mpsc::error::TryRecvError::Empty) => return EventChannelState::Open,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                return EventChannelState::Closed;
+            }
         }
     }
 }
@@ -2750,14 +3094,26 @@ async fn apply_received_event(
     owner: &mut OwnerTracker,
     session: &str,
     received: ReceivedEvent,
+    admission: Admission,
     pending_closures: &mut PendingTopologyClosures,
     provider: &mut ProviderIntegration,
 ) -> Result<(), CollectorError> {
-    if received.event == "pane_moved" {
-        owner.refresh_from_move(&received.data, persistence).await?;
+    if received.event == "pane_moved"
+        && let Err(error) = owner.refresh_from_move(&received.data, persistence).await
+    {
+        admission.complete();
+        return Err(error.into());
     }
-    let normalized = normalize_event(shared, session, &received)?;
-    let Some(persist) = apply_collector_observation(reducer, normalized)? else {
+    let normalized = match normalize_event(shared, session, &received) {
+        Ok(normalized) => normalized,
+        Err(error) => {
+            admission.complete();
+            return Err(error);
+        }
+    };
+    let outcome = apply_collector_observation(reducer, normalized);
+    admission.complete();
+    let Some(persist) = outcome? else {
         persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
         return Ok(());
     };
@@ -2786,8 +3142,31 @@ fn apply_collector_observation(
     Ok(collector_apply_outcome(reducer, outcome))
 }
 
+#[cfg(test)]
 async fn apply_provider_event(
     event: ProviderEvent,
+    session: &str,
+    reducer: &mut Reducer,
+    shared: &SharedModel,
+    persistence: &mut RuntimePersistence,
+    coverage: &SourceCoverageRegistry,
+) -> Result<(), CollectorError> {
+    apply_provider_event_with_admission(
+        event,
+        None,
+        session,
+        reducer,
+        shared,
+        persistence,
+        coverage,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_provider_event_with_admission(
+    event: ProviderEvent,
+    mut admission: Option<Admission>,
     session: &str,
     reducer: &mut Reducer,
     shared: &SharedModel,
@@ -2802,13 +3181,20 @@ async fn apply_provider_event(
         .filter(|event| !persistence.is_duplicate(&normalized_metadata(event).event_id))
         .collect::<Vec<_>>();
     if events.is_empty() {
+        if let Some(admission) = admission.take() {
+            admission.complete();
+        }
         return Ok(());
     }
     let disagreement_is_new = identity_disagreement
         && events
             .iter()
             .any(|event| normalized_metadata(event).source_event_type == "session_resolved");
-    if let Some(persist) = apply_collector_observation(reducer, events)?
+    let outcome = apply_collector_observation(reducer, events);
+    if let Some(admission) = admission.take() {
+        admission.complete();
+    }
+    if let Some(persist) = outcome?
         && !persist.is_empty()
     {
         let _ = persist_submission(persistence, reducer, persist).await?;
@@ -4306,8 +4692,8 @@ async fn receive_controller(
 }
 
 async fn receive_provider(
-    receiver: &mut Option<mpsc::Receiver<ProviderEvent>>,
-) -> Option<ProviderEvent> {
+    receiver: &mut Option<mpsc::Receiver<ProviderIngressEvent>>,
+) -> Option<ProviderIngressEvent> {
     match receiver {
         Some(receiver) => receiver.recv().await,
         None => pending().await,
@@ -4315,7 +4701,7 @@ async fn receive_provider(
 }
 
 async fn service_provider_event(
-    event: Option<ProviderEvent>,
+    event: Option<ProviderIngressEvent>,
     provider: &mut ProviderIntegration,
     session: &str,
     reducer: &mut Reducer,
@@ -4323,20 +4709,36 @@ async fn service_provider_event(
     persistence: &mut RuntimePersistence,
 ) -> Result<(), CollectorError> {
     let result = match event {
-        Some(ProviderEvent::SourceState {
-            provider: source,
-            state,
+        Some(ProviderIngressEvent {
+            event:
+                ProviderEvent::SourceState {
+                    provider: source,
+                    state,
+                },
+            admission,
         }) => {
+            assert!(
+                admission.is_none(),
+                "provider source-state controls must not carry performance admissions"
+            );
             provider.update_source_state(source, state);
             Ok(())
         }
-        Some(ProviderEvent::Malformed {
-            provider: source,
-            path_display: _,
-            generation: _,
-            byte_offset,
-            error_code,
+        Some(ProviderIngressEvent {
+            event:
+                ProviderEvent::Malformed {
+                    provider: source,
+                    path_display: _,
+                    generation: _,
+                    byte_offset,
+                    error_code,
+                },
+            admission,
         }) => {
+            assert!(
+                admission.is_none(),
+                "provider malformed controls must not carry performance admissions"
+            );
             tracing::warn!(
                 warning_code = "provider_record_malformed",
                 provider = provider_name(source),
@@ -4346,9 +4748,20 @@ async fn service_provider_event(
             );
             Ok(())
         }
-        Some(event) => {
+        Some(ProviderIngressEvent { event, admission }) => {
+            let admission = admission
+                .expect("reducer-bound provider events must carry a performance admission");
             let coverage = provider.coverage.registry.clone();
-            apply_provider_event(event, session, reducer, shared, persistence, &coverage).await
+            apply_provider_event_with_admission(
+                event,
+                Some(admission),
+                session,
+                reducer,
+                shared,
+                persistence,
+                &coverage,
+            )
+            .await
         }
         None => {
             provider.events = None;
@@ -4435,12 +4848,23 @@ fn unix_now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeSet, HashMap};
     use std::io;
+    #[cfg(feature = "workload-harness")]
+    use std::sync::Barrier;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::activity::OperatorSnapshot;
     use crate::diagnostics::{OccurrenceLogStatus, RuntimeWriteOutcome};
+    use crate::model::{
+        DependencyEdge, DisplayOrdinal, ExecutionEdge, TaskRun, TaskState, Workspace,
+    };
+    use crate::performance::{
+        PerformanceDegradationReason, PerformanceSnapshot, TestPerformanceClock,
+        performance_tracker,
+    };
     use crate::store::writer::{
         DurabilityDisposition, PersistenceFailure, PersistenceFailureCode, PersistenceOperation,
         PersistencePhase,
@@ -4500,6 +4924,545 @@ mod tests {
             .await
             .expect("writer shutdown timed out")
             .unwrap();
+    }
+
+    fn target_performance_inputs() -> (DomainModel, OperatorSnapshot, usize) {
+        let mut model = DomainModel::default();
+        model.insert_workspace(Workspace {
+            workspace_id: "workspace-0001".to_owned(),
+        });
+        model.insert_tab(Tab {
+            tab_id: "tab-0001".to_owned(),
+            workspace_id: "workspace-0001".to_owned(),
+        });
+        for index in 1..=50 {
+            model.insert_pane(Pane {
+                pane_id: format!("pane-{index:04}"),
+                workspace_id: "workspace-0001".to_owned(),
+                tab_id: "tab-0001".to_owned(),
+                terminal_id: format!("terminal-{index:04}"),
+            });
+        }
+
+        let run_ids = (1..=200)
+            .map(|index| RunId::parse(&format!("{index:026}")).unwrap())
+            .collect::<Vec<_>>();
+        for (index, run_id) in run_ids.iter().copied().enumerate() {
+            model.insert_task_run(TaskRun {
+                run_id,
+                key: RunKey::Controller(format!("run-{:04}", index + 1)),
+                display_ordinal: DisplayOrdinal::new(index as i64 + 1),
+                state: TaskState::Running,
+                has_controller_task_state_event: true,
+            });
+        }
+
+        let expected_execution_edges = run_ids.windows(2).count();
+        for pair in run_ids.windows(2) {
+            assert!(model.insert_execution_edge(ExecutionEdge {
+                parent_run_id: pair[0],
+                child_run_id: pair[1],
+            }));
+        }
+        let mut inserted_dependencies = 0;
+        'pairs: for dependent in 1..run_ids.len() {
+            for prerequisite in 0..dependent {
+                assert!(model.insert_dependency_edge(DependencyEdge {
+                    prerequisite_run_id: run_ids[prerequisite],
+                    dependent_run_id: run_ids[dependent],
+                }));
+                inserted_dependencies += 1;
+                if inserted_dependencies == 1_000 {
+                    break 'pairs;
+                }
+            }
+        }
+        assert_eq!(inserted_dependencies, 1_000);
+        assert_eq!(model.execution_edges().count(), expected_execution_edges);
+
+        (
+            model,
+            OperatorSnapshot {
+                activity: Arc::from(Vec::new()),
+                terminal_times: Arc::new(HashMap::new()),
+            },
+            expected_execution_edges,
+        )
+    }
+
+    #[cfg(feature = "workload-harness")]
+    fn test_performance_publication(
+        snapshot: PerformanceSnapshot,
+        effective_quality: ObservationQuality,
+        stamp: Option<(u64, u64)>,
+    ) -> PerformancePublication {
+        PerformancePublication {
+            snapshot,
+            effective_quality,
+            workload_sample_stamp: stamp.map(|(sample_ordinal, sampled_at_ns)| {
+                WorkloadSampleStamp {
+                    sample_ordinal,
+                    sampled_at_ns,
+                }
+            }),
+        }
+    }
+
+    #[test]
+    fn performance_quality_composition_preserves_stronger_source_states() {
+        let degraded = PerformanceSnapshot {
+            reasons: BTreeSet::from([PerformanceDegradationReason::EventsSixtySeconds]),
+            ..PerformanceSnapshot::default()
+        };
+        assert_eq!(
+            compose_quality(ObservationQuality::Disconnected, &degraded),
+            ObservationQuality::Disconnected
+        );
+        assert_eq!(
+            compose_quality(ObservationQuality::Reconciling, &degraded),
+            ObservationQuality::Reconciling
+        );
+        assert_eq!(
+            compose_quality(ObservationQuality::Live, &degraded),
+            ObservationQuality::Degraded
+        );
+    }
+
+    #[tokio::test]
+    async fn twice_target_becomes_degraded_by_sixty_seconds_without_loss() {
+        let clock = Arc::new(TestPerformanceClock::new(Duration::ZERO));
+        let (ingress, mut sampler) = performance_tracker(clock.clone());
+        let (model, operator, expected_execution_edges) = target_performance_inputs();
+        for index in 0_u64..1_201 {
+            clock.set(Duration::from_millis((index + 1) * 25));
+            ingress.admit().complete();
+        }
+        clock.set(Duration::from_millis(30_025));
+        let threshold_snapshot = sampler.sample(&model, &operator, 30_025);
+        assert_eq!(
+            (
+                threshold_snapshot.live_panes,
+                threshold_snapshot.default_visible_task_runs,
+                threshold_snapshot.dependency_edges,
+                threshold_snapshot.execution_edges
+            ),
+            (50, 200, 1_000, expected_execution_edges)
+        );
+        assert!(
+            threshold_snapshot
+                .reasons
+                .contains(&PerformanceDegradationReason::EventsSixtySeconds)
+        );
+        for index in 1_201_u64..2_400 {
+            clock.set(Duration::from_millis((index + 1) * 25));
+            ingress.admit().complete();
+        }
+        clock.set(Duration::from_secs(60));
+        let snapshot = sampler.sample(&model, &operator, 60_000);
+        assert_eq!(snapshot.pending_events, 0);
+        assert_eq!(snapshot.admission_high_water, 2_400);
+        assert_eq!(snapshot.completion_high_water, 2_400);
+        assert_eq!(
+            (
+                snapshot.live_panes,
+                snapshot.default_visible_task_runs,
+                snapshot.dependency_edges,
+                snapshot.execution_edges
+            ),
+            (50, 200, 1_000, expected_execution_edges)
+        );
+        assert!(
+            snapshot
+                .reasons
+                .contains(&PerformanceDegradationReason::EventsSixtySeconds)
+        );
+        assert_eq!(
+            compose_quality(ObservationQuality::Live, &snapshot),
+            ObservationQuality::Degraded
+        );
+    }
+
+    #[cfg(feature = "workload-harness")]
+    #[test]
+    fn composed_quality_recovers_only_after_all_windows_lag_and_source_clear() {
+        let clock = Arc::new(TestPerformanceClock::new(Duration::ZERO));
+        let (ingress, mut sampler) = performance_tracker(clock.clone());
+        let (model, operator, _expected_execution_edges) = target_performance_inputs();
+        let (performance_sender, performance) = watch::channel(initial_performance_publication());
+        let (quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
+        let publish = |snapshot: PerformanceSnapshot,
+                       source_quality: ObservationQuality,
+                       sample_ordinal: u64,
+                       sampled_at: Duration| {
+            let effective_quality = compose_quality(source_quality, &snapshot);
+            publish_performance_generation(
+                &performance_sender,
+                &quality_sender,
+                source_quality,
+                test_performance_publication(
+                    snapshot,
+                    effective_quality,
+                    Some((
+                        sample_ordinal,
+                        u64::try_from(sampled_at.as_nanos()).unwrap(),
+                    )),
+                ),
+                None,
+                None,
+            );
+        };
+
+        let lagging_admission = ingress.admit();
+        clock.set(Duration::from_millis(1_500));
+        for _ in 0..1_201 {
+            ingress.admit().complete();
+        }
+
+        clock.set(Duration::from_secs(2));
+        let all_reasons = sampler.sample(&model, &operator, 2_000);
+        assert_eq!(
+            all_reasons.reasons,
+            BTreeSet::from([
+                PerformanceDegradationReason::EventsOneSecond,
+                PerformanceDegradationReason::EventsTenSeconds,
+                PerformanceDegradationReason::EventsSixtySeconds,
+                PerformanceDegradationReason::EventLag,
+            ])
+        );
+        publish(
+            all_reasons,
+            ObservationQuality::Live,
+            0,
+            Duration::from_secs(2),
+        );
+        assert_eq!(
+            performance.borrow().effective_quality,
+            ObservationQuality::Degraded
+        );
+        assert_eq!(*quality.borrow(), ObservationQuality::Degraded);
+
+        clock.set(Duration::from_millis(2_501));
+        let after_one_second = sampler.sample(&model, &operator, 2_501);
+        assert_eq!(
+            after_one_second.reasons,
+            BTreeSet::from([
+                PerformanceDegradationReason::EventsTenSeconds,
+                PerformanceDegradationReason::EventsSixtySeconds,
+                PerformanceDegradationReason::EventLag,
+            ])
+        );
+        publish(
+            after_one_second,
+            ObservationQuality::Live,
+            1,
+            Duration::from_millis(2_501),
+        );
+        assert_eq!(
+            performance.borrow().effective_quality,
+            ObservationQuality::Degraded
+        );
+
+        clock.set(Duration::from_millis(11_501));
+        let after_ten_seconds = sampler.sample(&model, &operator, 11_501);
+        assert_eq!(
+            after_ten_seconds.reasons,
+            BTreeSet::from([
+                PerformanceDegradationReason::EventsSixtySeconds,
+                PerformanceDegradationReason::EventLag,
+            ])
+        );
+        publish(
+            after_ten_seconds,
+            ObservationQuality::Live,
+            2,
+            Duration::from_millis(11_501),
+        );
+        assert_eq!(
+            performance.borrow().effective_quality,
+            ObservationQuality::Degraded
+        );
+
+        clock.set(Duration::from_millis(61_501));
+        let after_sixty_seconds = sampler.sample(&model, &operator, 61_501);
+        assert_eq!(
+            after_sixty_seconds.reasons,
+            BTreeSet::from([PerformanceDegradationReason::EventLag])
+        );
+        publish(
+            after_sixty_seconds,
+            ObservationQuality::Live,
+            3,
+            Duration::from_millis(61_501),
+        );
+        assert_eq!(
+            performance.borrow().effective_quality,
+            ObservationQuality::Degraded
+        );
+
+        lagging_admission.complete();
+        let clean = sampler.sample(&model, &operator, 61_501);
+        assert!(clean.reasons.is_empty());
+        publish(
+            clean.clone(),
+            ObservationQuality::Degraded,
+            4,
+            Duration::from_millis(61_501),
+        );
+        assert!(performance.borrow().snapshot.reasons.is_empty());
+        assert_eq!(
+            performance.borrow().effective_quality,
+            ObservationQuality::Degraded
+        );
+        assert_eq!(*quality.borrow(), ObservationQuality::Degraded);
+
+        publish(
+            clean,
+            ObservationQuality::Live,
+            5,
+            Duration::from_millis(61_501),
+        );
+        assert!(performance.borrow().snapshot.reasons.is_empty());
+        assert_eq!(
+            performance.borrow().effective_quality,
+            ObservationQuality::Live
+        );
+        assert_eq!(*quality.borrow(), ObservationQuality::Live);
+    }
+
+    #[cfg(feature = "workload-harness")]
+    #[test]
+    fn performance_publication_remains_coherent_while_quality_projection_is_paused() {
+        let initial = test_performance_publication(
+            PerformanceSnapshot::default(),
+            ObservationQuality::Live,
+            None,
+        );
+        let (performance_sender, performance) = watch::channel(initial);
+        let (quality_sender, quality) = watch::channel(ObservationQuality::Live);
+        let observed = Arc::new(Mutex::new(Vec::<WorkloadPerformanceSample>::new()));
+        let observer: WorkloadPerformanceObserver = {
+            let observed = Arc::clone(&observed);
+            Arc::new(move |sample| observed.lock().unwrap().push(sample.clone()))
+        };
+        let published = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let pause: Arc<dyn Fn() + Send + Sync> = {
+            let published = Arc::clone(&published);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                published.wait();
+                release.wait();
+            })
+        };
+        let degraded = PerformanceSnapshot {
+            reasons: BTreeSet::from([PerformanceDegradationReason::EventsSixtySeconds]),
+            ..PerformanceSnapshot::default()
+        };
+        let publication = test_performance_publication(
+            degraded.clone(),
+            ObservationQuality::Degraded,
+            Some((1, 30_025_000_000)),
+        );
+
+        let thread = std::thread::spawn(move || {
+            publish_performance_generation(
+                &performance_sender,
+                &quality_sender,
+                ObservationQuality::Live,
+                publication,
+                Some(&observer),
+                Some(pause.as_ref()),
+            );
+        });
+        published.wait();
+
+        let current = performance.borrow();
+        assert_eq!(current.snapshot, degraded);
+        assert_eq!(current.effective_quality, ObservationQuality::Degraded);
+        assert_eq!(*quality.borrow(), ObservationQuality::Live);
+        drop(current);
+
+        release.wait();
+        thread.join().unwrap();
+        assert_eq!(*quality.borrow(), ObservationQuality::Degraded);
+    }
+
+    #[cfg(feature = "workload-harness")]
+    #[test]
+    fn performance_generation_observer_records_every_sample_before_watch_coalescing() {
+        let initial = test_performance_publication(
+            PerformanceSnapshot::default(),
+            ObservationQuality::Live,
+            None,
+        );
+        let (performance_sender, mut performance) = watch::channel(initial);
+        let (quality_sender, _quality) = watch::channel(ObservationQuality::Live);
+        let observed = Arc::new(Mutex::new(Vec::<WorkloadPerformanceSample>::new()));
+        let observer: WorkloadPerformanceObserver = {
+            let observed = Arc::clone(&observed);
+            Arc::new(move |sample| observed.lock().unwrap().push(sample.clone()))
+        };
+        let first = test_performance_publication(
+            PerformanceSnapshot::default(),
+            ObservationQuality::Live,
+            Some((10, 2_000_000_000)),
+        );
+        publish_performance_generation(
+            &performance_sender,
+            &quality_sender,
+            ObservationQuality::Live,
+            first.clone(),
+            Some(&observer),
+            None,
+        );
+        assert!(performance.has_changed().unwrap());
+        assert_eq!(*performance.borrow_and_update(), first);
+
+        let second = test_performance_publication(
+            PerformanceSnapshot::default(),
+            ObservationQuality::Live,
+            Some((11, 2_050_000_000)),
+        );
+        publish_performance_generation(
+            &performance_sender,
+            &quality_sender,
+            ObservationQuality::Live,
+            second.clone(),
+            Some(&observer),
+            None,
+        );
+        assert!(!performance.has_changed().unwrap());
+        assert_eq!(*performance.borrow(), first);
+
+        let changed_snapshot = PerformanceSnapshot {
+            admission_high_water: 1,
+            completion_high_water: 1,
+            events_one_second: 1,
+            events_ten_seconds: 1,
+            events_sixty_seconds: 1,
+            ..PerformanceSnapshot::default()
+        };
+        let third = test_performance_publication(
+            changed_snapshot,
+            ObservationQuality::Live,
+            Some((12, 2_100_000_000)),
+        );
+        publish_performance_generation(
+            &performance_sender,
+            &quality_sender,
+            ObservationQuality::Live,
+            third.clone(),
+            Some(&observer),
+            None,
+        );
+        assert!(performance.has_changed().unwrap());
+        assert_eq!(*performance.borrow_and_update(), third);
+        assert!(!performance.has_changed().unwrap());
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 3);
+        assert_eq!(
+            observed
+                .iter()
+                .map(|sample| {
+                    let stamp = sample.publication.workload_sample_stamp.unwrap();
+                    (stamp.sample_ordinal, stamp.sampled_at_ns)
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (10, 2_000_000_000),
+                (11, 2_050_000_000),
+                (12, 2_100_000_000),
+            ]
+        );
+        assert!(observed.windows(2).all(|pair| {
+            pair[0]
+                .publication
+                .workload_sample_stamp
+                .unwrap()
+                .sampled_at_ns
+                <= pair[1]
+                    .publication
+                    .workload_sample_stamp
+                    .unwrap()
+                    .sampled_at_ns
+        }));
+        assert!(
+            observed
+                .iter()
+                .all(|sample| sample.source_quality == ObservationQuality::Live)
+        );
+        assert_eq!(observed[0].publication, first);
+        assert_eq!(observed[1].publication, second);
+        assert_eq!(observed[2].publication, third);
+    }
+
+    #[cfg(feature = "workload-harness")]
+    #[test]
+    fn equal_performance_sample_does_not_silently_advance_watch_stamp() {
+        let initial = test_performance_publication(
+            PerformanceSnapshot::default(),
+            ObservationQuality::Live,
+            Some((7, 1_000)),
+        );
+        let (performance_sender, mut performance) = watch::channel(initial.clone());
+        let (quality_sender, _quality) = watch::channel(ObservationQuality::Live);
+        let observer: WorkloadPerformanceObserver = Arc::new(|_| {});
+        let _ = performance.borrow_and_update();
+        let equal = test_performance_publication(
+            PerformanceSnapshot::default(),
+            ObservationQuality::Live,
+            Some((8, 2_000)),
+        );
+
+        publish_performance_generation(
+            &performance_sender,
+            &quality_sender,
+            ObservationQuality::Live,
+            equal,
+            Some(&observer),
+            None,
+        );
+
+        assert_eq!(*performance.borrow(), initial);
+        assert!(!performance.has_changed().unwrap());
+    }
+
+    #[cfg(feature = "workload-harness")]
+    #[test]
+    fn changed_performance_sample_publishes_stamp_snapshot_and_quality_atomically() {
+        let initial = test_performance_publication(
+            PerformanceSnapshot::default(),
+            ObservationQuality::Live,
+            Some((7, 1_000)),
+        );
+        let (performance_sender, mut performance) = watch::channel(initial);
+        let (quality_sender, _quality) = watch::channel(ObservationQuality::Live);
+        let observer: WorkloadPerformanceObserver = Arc::new(|_| {});
+        let _ = performance.borrow_and_update();
+        let next = test_performance_publication(
+            PerformanceSnapshot {
+                pending_events: 1,
+                admission_high_water: 1,
+                reasons: BTreeSet::from([PerformanceDegradationReason::EventLag]),
+                ..PerformanceSnapshot::default()
+            },
+            ObservationQuality::Degraded,
+            Some((8, 2_000)),
+        );
+
+        publish_performance_generation(
+            &performance_sender,
+            &quality_sender,
+            ObservationQuality::Live,
+            next.clone(),
+            Some(&observer),
+            None,
+        );
+
+        assert!(performance.has_changed().unwrap());
+        assert_eq!(*performance.borrow_and_update(), next);
+        assert!(!performance.has_changed().unwrap());
     }
 
     #[tokio::test]
@@ -4606,8 +5569,10 @@ mod tests {
             event_ledger: Vec::new(),
         });
         let coverage = SourceCoverageRegistry::default();
+        let (performance, _sampler) =
+            performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
         let (_sender, receiver) =
-            controller::request_channel(1, runtime.acceptor_diagnostics.clone());
+            controller::request_channel(1, runtime.acceptor_diagnostics.clone(), performance);
         let mut receiver = Some(receiver);
         let _ = diagnostics.borrow_and_update();
         let _ = model.borrow_and_update();
@@ -4890,6 +5855,8 @@ mod tests {
         );
         let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
+        let (performance, _sampler) =
+            performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
         let missing_socket = directory.path().join("missing-herdr.sock");
         let task = tokio::spawn(run_collector(
             missing_socket,
@@ -4897,6 +5864,7 @@ mod tests {
             persistence,
             reducer,
             shared,
+            performance,
             task_cancellation,
             OwnerTracker::from_environment(),
             None,
@@ -7301,6 +8269,8 @@ mod provider_integration_tests {
                 )
                 .unwrap();
                 let (_quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
+                let (_performance_sender, performance) =
+                    watch::channel(initial_performance_publication());
                 let (_coverage_sender, source_coverage) =
                     watch::channel(SourceCoverageRegistry::default());
                 let (_reducer, model, operator) = Reducer::new_with_operator(
@@ -7313,6 +8283,7 @@ mod provider_integration_tests {
                     empty_operator_seed(),
                 );
                 let handle = CollectorHandle {
+                    performance,
                     quality,
                     source_coverage,
                     diagnostics: test_diagnostics(),
@@ -7324,6 +8295,7 @@ mod provider_integration_tests {
                             "synthetic collector failure".to_owned(),
                         ))
                     }),
+                    performance_monitor: tokio::spawn(async {}),
                     controller_acceptor: None,
                     provider_thread: Some(provider_thread),
                 };
@@ -7354,6 +8326,7 @@ mod provider_integration_tests {
         )
         .unwrap();
         let (_quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
+        let (_performance_sender, performance) = watch::channel(initial_performance_publication());
         let (_coverage_sender, source_coverage) = watch::channel(SourceCoverageRegistry::default());
         let (_reducer, model, operator) = Reducer::new_with_operator(
             RestoredState {
@@ -7365,6 +8338,7 @@ mod provider_integration_tests {
             empty_operator_seed(),
         );
         let handle = CollectorHandle {
+            performance,
             quality,
             source_coverage,
             diagnostics: test_diagnostics(),
@@ -7375,6 +8349,7 @@ mod provider_integration_tests {
                 std::future::pending::<()>().await;
                 Ok(())
             }),
+            performance_monitor: tokio::spawn(async {}),
             controller_acceptor: None,
             provider_thread: Some(provider_thread),
         };
