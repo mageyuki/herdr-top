@@ -13,12 +13,16 @@ use common::mock::{MockConfig, MockHerdr, fixture_payloads};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use herdr_top::activity::OperatorSnapshot;
 use herdr_top::diagnostics::remote::{VersionCommand, VersionCommandRunner, VersionProbeResult};
-use herdr_top::herdr::collector::{self, CoverageSource, ObservationQuality, SourceAvailability};
+use herdr_top::herdr::collector::{
+    self, CoverageSource, ObservationQuality, PerformancePublication, SourceAvailability,
+    SourceCoverageRegistry,
+};
 use herdr_top::lockfile::{StateRoot, state_root_in};
 use herdr_top::model::{
     DisplayOrdinal, DomainModel, MinimalProviderMetadata, Provider, RunId, RunKey, TaskRun,
     TaskState,
 };
+use herdr_top::performance::{PerformanceDegradationReason, PerformanceSnapshot};
 use herdr_top::provider::{
     FirstSeenBaseline, FsReadBoundary, MergeOutcome, ProviderCycle, ProviderEvent, ProviderTarget,
     ProviderWorker, RecommendedNotifyFactory, SourcePosition, TailFile, TargetSet,
@@ -42,6 +46,129 @@ const MALFORMED_RAW_SENTINEL: &str = "MALFORMED_RAW_FORBIDDEN_SENTINEL_I2E_7F54"
 const DOCTOR_PRIVATE_SENTINEL: &str = "DOCTOR_PRIVATE_SENTINEL_I4_T7_8A21";
 const ACTIVITY_IDENTITY_SENTINEL: &str = "ACTIVITY_IDENTITY_FORBIDDEN_I4_A1_HARNESS";
 const TUI_ROW_ONLY_MARKER: &str = "TUI_ROW_ONLY_MARKER_I4_C3";
+
+#[test]
+fn workload_header_projection_seam_is_default_build_source_clean() {
+    const BEGIN: &str = "// increment5-workload-header-projection-begin";
+    const END: &str = "// increment5-workload-header-projection-end";
+    const TOKENS: [&str; 4] = [
+        "workload_header_projection",
+        "WorkloadHeaderProjection",
+        "render_with_workload_projection",
+        "omit_performance_label",
+    ];
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tui/view.rs");
+    let source = fs::read_to_string(path).expect("view source should be readable");
+    let begins = source.match_indices(BEGIN).collect::<Vec<_>>();
+    let ends = source.match_indices(END).collect::<Vec<_>>();
+
+    let stripped = match (begins.as_slice(), ends.as_slice()) {
+        ([], []) => source.clone(),
+        ([(begin, _)], [(end, _)]) => {
+            assert!(begin < end, "projection markers must be ordered");
+            let region_end = end + END.len();
+            let region = &source[*begin..region_end];
+            assert_eq!(region.matches(BEGIN).count(), 1);
+            assert_eq!(region.matches(END).count(), 1);
+            assert_eq!(
+                region
+                    .matches("#[cfg(feature = \"workload-harness\")]")
+                    .count(),
+                1,
+                "the seam module must have exactly one feature gate"
+            );
+            assert!(
+                region.contains("///")
+                    && region.contains("mod workload_header_projection")
+                    && region.contains("WorkloadHeaderProjection")
+                    && region.contains("render_with_workload_projection")
+                    && region.contains("omit_performance_label"),
+                "the gated seam must remain documented and contain its closed API"
+            );
+            let mut without = String::with_capacity(source.len() - region.len());
+            without.push_str(&source[..*begin]);
+            without.push_str(&source[region_end..]);
+            without
+        }
+        _ => panic!("projection markers must be absent or form exactly one ordered pair"),
+    };
+
+    for token in TOKENS {
+        assert_eq!(
+            stripped.matches(token).count(),
+            0,
+            "{token} must not escape the feature-gated marker region"
+        );
+    }
+    assert_eq!(stripped.matches("pub(super) fn render(").count(), 1);
+    let render_start = stripped
+        .find("pub(super) fn render(")
+        .expect("ordinary render declaration should exist");
+    let render_signature = stripped[render_start..]
+        .split_once('{')
+        .map(|(signature, _)| signature)
+        .expect("ordinary render signature should have an opening brace");
+    assert!(!render_signature.contains("workload"));
+    assert!(!render_signature.contains("projection"));
+    assert!(!render_signature.contains("omit_performance_label"));
+}
+
+#[test]
+fn coherent_performance_publication_changes_rendered_header() {
+    let (_model_sender, model_receiver) =
+        tokio::sync::watch::channel(std::sync::Arc::new(DomainModel::default()));
+    let (_coverage_sender, source_coverage) =
+        tokio::sync::watch::channel(SourceCoverageRegistry::default());
+    let (performance_sender, performance) = tokio::sync::watch::channel(PerformancePublication {
+        snapshot: PerformanceSnapshot::default(),
+        effective_quality: ObservationQuality::Live,
+        #[cfg(feature = "workload-harness")]
+        workload_sample_stamp: None,
+    });
+    let mut app = App::new(
+        model_receiver,
+        HeaderInputs {
+            host: "coverage-host".to_owned(),
+            session: "coverage-session".to_owned(),
+            source_coverage,
+            performance,
+        },
+    );
+    let before = render_app(&app);
+    performance_sender
+        .send(PerformancePublication {
+            snapshot: PerformanceSnapshot {
+                event_lag: Duration::from_millis(1_234),
+                reasons: [PerformanceDegradationReason::DependencyEdges]
+                    .into_iter()
+                    .collect(),
+                ..PerformanceSnapshot::default()
+            },
+            effective_quality: ObservationQuality::Degraded,
+            #[cfg(feature = "workload-harness")]
+            workload_sample_stamp: None,
+        })
+        .unwrap();
+    app.refresh();
+    let after = render_app(&app);
+
+    assert_ne!(before, after);
+    assert!(after.contains("lag:1234ms"));
+    assert!(after.contains("perf:dependency_edges"));
+    scan_artifacts(
+        &[
+            Artifact::bytes("performance-before", before.into_bytes()),
+            Artifact::bytes("performance-after", after.into_bytes()),
+        ],
+        &[
+            PROMPT_SENTINEL,
+            RESPONSE_SENTINEL,
+            TOOL_ARGUMENT_SENTINEL,
+            MALFORMED_RAW_SENTINEL,
+        ],
+    )
+    .expect("coherent header refresh must retain the TUI allowlist boundary");
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn i4_doctor_output_excludes_private_values() {
@@ -452,12 +579,11 @@ fn persisted_thread_count(connection: &Connection, threads: &[&str]) -> i64 {
 fn render_collector(collector: &collector::CollectorHandle) -> String {
     let app = App::new(
         collector.model.clone(),
-        collector.quality.clone(),
         HeaderInputs {
             host: "test-host".to_owned(),
             session: "allowlist-harness".to_owned(),
-            event_lag: Duration::ZERO,
             source_coverage: collector.source_coverage.clone(),
+            performance: collector.performance.clone(),
         },
     );
     render_app(&app)
@@ -505,12 +631,11 @@ fn render_new_tui_surfaces(collector: &collector::CollectorHandle) -> Vec<(&'sta
         tokio::sync::watch::channel(std::sync::Arc::new(tui_model));
     let mut app = App::with_inputs(
         model_receiver,
-        collector.quality.clone(),
         HeaderInputs {
             host: "test-host".to_owned(),
             session: ROOT_THREAD.to_owned(),
-            event_lag: Duration::ZERO,
             source_coverage: collector.source_coverage.clone(),
+            performance: collector.performance.clone(),
         },
         collector.diagnostics.clone(),
         operator_receiver,

@@ -18,7 +18,7 @@ use herdr_top::model::{
 use herdr_top::reducer::{ApplyOutcome, Reducer};
 use herdr_top::store::{PersistOp, RestoredState, open_reader, open_writer};
 #[cfg(feature = "workload-harness")]
-use herdr_top::tui::app::{App, HeaderInputs, WorkloadFrameDriver};
+use herdr_top::tui::app::{App, HeaderInputs, WorkloadFrameDriver, WorkloadFrameObservation};
 #[cfg(feature = "workload-harness")]
 use ratatui::Terminal;
 #[cfg(feature = "workload-harness")]
@@ -59,7 +59,7 @@ fn frame_driver_for_times(
 ) -> (
     WorkloadFrameDriver,
     tokio::sync::watch::Sender<std::sync::Arc<DomainModel>>,
-    tokio::sync::watch::Sender<herdr_top::herdr::collector::ObservationQuality>,
+    tokio::sync::watch::Sender<PerformancePublication>,
 ) {
     let clock_values = millis
         .iter()
@@ -68,16 +68,22 @@ fn frame_driver_for_times(
     let mut clock_values = clock_values.into_iter();
     let (model_sender, model_receiver) =
         tokio::sync::watch::channel(std::sync::Arc::new(DomainModel::default()));
-    let (quality_sender, quality_receiver) =
-        tokio::sync::watch::channel(herdr_top::herdr::collector::ObservationQuality::Live);
-    let app = App::new(model_receiver, quality_receiver, HeaderInputs::default());
+    let (performance_sender, performance) =
+        tokio::sync::watch::channel(stamped_publication(0, 0, ObservationQuality::Live, []));
+    let app = App::new(
+        model_receiver,
+        HeaderInputs {
+            performance,
+            ..HeaderInputs::default()
+        },
+    );
     let terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     let driver = WorkloadFrameDriver::new(app, terminal, move || {
         clock_values
             .next()
             .expect("fixed workload clock must cover every limiter read")
     });
-    (driver, model_sender, quality_sender)
+    (driver, model_sender, performance_sender)
 }
 
 #[cfg(feature = "workload-harness")]
@@ -156,6 +162,7 @@ fn workload_frame_driver_draw_ordinals_are_contiguous_only_for_draws() {
 #[derive(Clone, Debug)]
 struct RealQueueFrame {
     new_probe_count: usize,
+    observation: WorkloadFrameObservation,
 }
 
 #[cfg(feature = "workload-harness")]
@@ -167,6 +174,7 @@ struct RealQueueResult {
     priming_frame_recorded_ns: u64,
     workload_origin_ns: u64,
     admission_observations: Vec<AdmissionObservationV1>,
+    terminal_observations: Vec<WorkloadTerminalObservation>,
     screen_observations: Vec<LatencyObservationV1>,
     scoped_observations: Vec<ScopedTimingObservationV1>,
     submitted_sequences: Vec<u64>,
@@ -176,6 +184,9 @@ struct RealQueueResult {
     rendered_sequences: Vec<u64>,
     final_identities: workload::StructuralIdentities,
     frames: Vec<RealQueueFrame>,
+    carry_in_sample_ordinal: u64,
+    next_sample_ordinal: u64,
+    next_draw_ordinal: u64,
     performance_samples: Vec<WorkloadPerformanceSample>,
     final_performance: PerformancePublication,
     final_compatibility_quality: ObservationQuality,
@@ -191,6 +202,26 @@ fn lock_workload<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(feature = "workload-harness")]
 fn duration_ns(value: Duration) -> u64 {
     u64::try_from(value.as_nanos()).expect("frozen workload duration must fit u64")
+}
+
+#[cfg(feature = "workload-harness")]
+fn stamped_publication(
+    sample_ordinal: u64,
+    sampled_at_ns: u64,
+    quality: ObservationQuality,
+    reasons: impl IntoIterator<Item = PerformanceDegradationReason>,
+) -> PerformancePublication {
+    PerformancePublication {
+        snapshot: herdr_top::performance::PerformanceSnapshot {
+            reasons: reasons.into_iter().collect(),
+            ..herdr_top::performance::PerformanceSnapshot::default()
+        },
+        effective_quality: quality,
+        workload_sample_stamp: Some(herdr_top::herdr::collector::WorkloadSampleStamp {
+            sample_ordinal,
+            sampled_at_ns,
+        }),
+    }
 }
 
 #[cfg(feature = "workload-harness")]
@@ -290,6 +321,56 @@ async fn wait_for_sequence_count(values: &Arc<Mutex<Vec<u64>>>, expected: usize)
     })
     .await
     .expect("real workload sequence acknowledgements must complete");
+}
+
+#[cfg(feature = "workload-harness")]
+async fn wait_for_performance_sample(
+    samples: &Arc<Mutex<Vec<WorkloadPerformanceSample>>>,
+    notification: &tokio::sync::Notify,
+    predicate: impl Fn(&[WorkloadPerformanceSample]) -> bool,
+    message: &'static str,
+) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let notified = notification.notified();
+            if predicate(&lock_workload(samples)) {
+                break;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .expect(message);
+}
+
+#[cfg(feature = "workload-harness")]
+fn freeze_performance_samples_at_close(
+    samples: &[WorkloadPerformanceSample],
+    carry_in_sample_ordinal: u64,
+    workload_close_ns: u64,
+) -> (Vec<WorkloadPerformanceSample>, u64) {
+    let suffix = samples
+        .iter()
+        .filter(|sample| {
+            sample
+                .publication
+                .workload_sample_stamp
+                .is_some_and(|stamp| stamp.sample_ordinal >= carry_in_sample_ordinal)
+        })
+        .take_while(|sample| {
+            sample
+                .publication
+                .workload_sample_stamp
+                .is_some_and(|stamp| stamp.sampled_at_ns <= workload_close_ns)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let next_sample_ordinal = suffix
+        .last()
+        .and_then(|sample| sample.publication.workload_sample_stamp)
+        .and_then(|stamp| stamp.sample_ordinal.checked_add(1))
+        .expect("close-bounded performance sample watermark must fit u64");
+    (suffix, next_sample_ordinal)
 }
 
 #[cfg(feature = "workload-harness")]
@@ -417,6 +498,7 @@ async fn workload_harness_writer_access_uses_owned_client() {
 }
 
 #[cfg(feature = "workload-harness")]
+#[allow(clippy::too_many_arguments)]
 async fn run_schedule_through_real_queue_at(
     profile: WorkloadProfile,
     trial_origin_ns: u64,
@@ -424,6 +506,7 @@ async fn run_schedule_through_real_queue_at(
     requested_workload_origin_ns: Option<u64>,
     frame_phase_offset_ns: u64,
     stall: Option<Duration>,
+    injection: PerformanceTrialInjection,
     clock_override: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
 ) -> RealQueueResult {
     let temporary = tempfile::tempdir().unwrap();
@@ -436,14 +519,26 @@ async fn run_schedule_through_real_queue_at(
     )
     .await
     .unwrap();
-    let clock_ns = Arc::new(AtomicU64::new(
-        requested_workload_origin_ns.unwrap_or_default(),
-    ));
+    let clock_ns = Arc::new(AtomicU64::new(trial_origin_ns));
     let uses_realtime_clock = clock_override.is_some();
     let clock: Arc<dyn Fn() -> u64 + Send + Sync> = clock_override.unwrap_or_else(|| {
         let clock_ns = Arc::clone(&clock_ns);
         Arc::new(move || clock_ns.load(Ordering::SeqCst))
     });
+    let workload_hook_clock: Arc<dyn Fn() -> u64 + Send + Sync> = if uses_realtime_clock {
+        Arc::clone(&clock)
+    } else {
+        let clock_ns = Arc::clone(&clock_ns);
+        // Give reducer lifecycle callbacks strict causal order without a wall-clock wait.
+        Arc::new(move || {
+            clock_ns
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    current.checked_add(1)
+                })
+                .expect("virtual workload hook timestamp must fit u64")
+                + 1
+        })
+    };
     let performance_clock: Arc<dyn PerformanceClock> = if uses_realtime_clock {
         Arc::new(AbsoluteMonotonicPerformanceClock)
     } else {
@@ -456,12 +551,10 @@ async fn run_schedule_through_real_queue_at(
     let persisted = Arc::new(Mutex::new(Vec::new()));
     let timings = Arc::new(Mutex::new(Vec::new()));
     let performance_samples = Arc::new(Mutex::new(Vec::new()));
+    let performance_notification = Arc::new(tokio::sync::Notify::new());
 
     let hooks = WorkloadControllerHooks {
-        clock: {
-            let clock = Arc::clone(&clock);
-            Arc::new(move || clock())
-        },
+        clock: workload_hook_clock,
         admission_observer: {
             let admissions = Arc::clone(&admissions);
             Arc::new(move |sample: WorkloadAdmissionObservation| {
@@ -491,7 +584,11 @@ async fn run_schedule_through_real_queue_at(
         performance_clock,
         performance_observer: {
             let performance_samples = Arc::clone(&performance_samples);
-            Arc::new(move |sample| lock_workload(&performance_samples).push(sample.clone()))
+            let performance_notification = Arc::clone(&performance_notification);
+            Arc::new(move |sample| {
+                lock_workload(&performance_samples).push(sample.clone());
+                performance_notification.notify_waiters();
+            })
         },
         provider_roots: Vec::new(),
         notify_factory: None,
@@ -521,13 +618,40 @@ async fn run_schedule_through_real_queue_at(
     })
     .await
     .expect("workload Herdr source should become live before scheduling");
+    let mut performance_watch = handle.collector.performance.clone();
     let model_receiver = handle.collector.model.clone();
-    let quality_receiver = handle.collector.quality.clone();
-    let app = App::new(model_receiver, quality_receiver, HeaderInputs::default());
-    let terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let app = App::new(
+        model_receiver,
+        HeaderInputs {
+            performance: handle.collector.performance.clone(),
+            ..HeaderInputs::default()
+        },
+    );
+    let terminal = Terminal::new(TestBackend::new(160, 48)).unwrap();
     let driver_clock = Arc::clone(&clock);
-    let mut driver =
-        WorkloadFrameDriver::new(app, terminal, move || Duration::from_nanos(driver_clock()));
+    let mut driver = WorkloadFrameDriver::new_with_header_projection(
+        app,
+        terminal,
+        move || Duration::from_nanos(driver_clock()),
+        injection == PerformanceTrialInjection::OmitRequiredRenderedReason,
+    );
+    let carry_in_sample_ordinal = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let _ = driver.refresh_app_if_changed().unwrap();
+            if let Some(stamp) = driver
+                .cached_performance_publication()
+                .workload_sample_stamp
+            {
+                break stamp.sample_ordinal;
+            }
+            performance_watch
+                .changed()
+                .await
+                .expect("performance monitor should publish the carry-in generation");
+        }
+    })
+    .await
+    .expect("the first stamped publication must reach the ordinary App cache");
 
     let priming_ns = match requested_workload_origin_ns {
         Some(workload_origin_ns) => {
@@ -559,6 +683,9 @@ async fn run_schedule_through_real_queue_at(
     let probes = workload::screen_probe_sequences(profile)
         .into_iter()
         .collect::<BTreeSet<_>>();
+    let closing_probe_sequence = *probes
+        .last()
+        .expect("closed scheduled profiles must declare a closing probe");
     let stall_deadline = stall.map(|duration| {
         workload_origin_ns
             .checked_add(duration_ns(duration))
@@ -584,7 +711,31 @@ async fn run_schedule_through_real_queue_at(
                 .await
                 .expect("reference admission deadline must be reachable");
         } else {
-            clock_ns.store(scheduled_ns, Ordering::SeqCst);
+            let admitted_clock_ns = if injection
+                == PerformanceTrialInjection::SupportedLoadDegradation
+                && sequence == 1
+            {
+                scheduled_ns
+                    .checked_add(duration_ns(workload::period(profile)))
+                    .expect("degradation injection admission timestamp must fit u64")
+            } else {
+                scheduled_ns
+            };
+            if injection == PerformanceTrialInjection::SupportedLoadDegradation {
+                // Admission 1 intentionally lands on admission 2's scheduled base. Preserve that
+                // bucket while keeping every later admission strictly after prior raw samples.
+                clock_ns
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                        if admitted_clock_ns > current {
+                            Some(admitted_clock_ns)
+                        } else {
+                            current.checked_add(1)
+                        }
+                    })
+                    .expect("degradation injection admission timestamp must fit u64");
+            } else {
+                clock_ns.store(admitted_clock_ns, Ordering::SeqCst);
+            }
         }
         submitted_sequences.push(sequence);
         let response = handle
@@ -597,6 +748,41 @@ async fn run_schedule_through_real_queue_at(
             )
             .await;
         assert_eq!(response, ControllerResponse::Accepted);
+        if profile == WorkloadProfile::TwiceTarget && sequence == 1_201 {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if performance_watch
+                        .borrow()
+                        .snapshot
+                        .reasons
+                        .contains(&PerformanceDegradationReason::EventsSixtySeconds)
+                    {
+                        break;
+                    }
+                    performance_watch
+                        .changed()
+                        .await
+                        .expect("twice-target performance publication should remain available");
+                }
+            })
+            .await
+            .expect("the stable sixty-second reason must publish after admission 1,201");
+        }
+        if injection == PerformanceTrialInjection::SupportedLoadDegradation && sequence == 101 {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if !performance_watch.borrow().snapshot.reasons.is_empty() {
+                        break;
+                    }
+                    performance_watch
+                        .changed()
+                        .await
+                        .expect("supported-load performance publication should remain available");
+                }
+            })
+            .await
+            .expect("the truthful rolling-window breach must publish after admission 101");
+        }
         if probes.contains(&sequence) {
             pending_probes.push(sequence);
         }
@@ -604,12 +790,13 @@ async fn run_schedule_through_real_queue_at(
         if !pending_probes.is_empty()
             && (!stall_holds || stall.is_none())
             && probes.contains(&sequence)
+            && sequence < closing_probe_sequence
         {
-            let rendered_ns = if uses_realtime_clock {
+            let observation = if uses_realtime_clock {
                 loop {
                     let frame = driver.step(false).unwrap();
                     if frame.draw_ordinal.is_some() {
-                        break clock();
+                        break frame;
                     }
                     tokio::time::sleep(frame.poll_duration).await;
                 }
@@ -620,8 +807,13 @@ async fn run_schedule_through_real_queue_at(
                 clock_ns.store(rendered_ns, Ordering::SeqCst);
                 let frame = driver.step(true).unwrap();
                 assert!(frame.draw_ordinal.is_some());
-                rendered_ns
+                frame
             };
+            let rendered_ns = duration_ns(
+                observation
+                    .rendered_at
+                    .expect("successful workload draw must record its timestamp"),
+            );
             let new_probe_count = pending_probes.len();
             for rendered_sequence in pending_probes.drain(..) {
                 let terminal = lock_workload(&terminals)
@@ -647,53 +839,12 @@ async fn run_schedule_through_real_queue_at(
                         % 100_000_000,
                 });
             }
-            frames.push(RealQueueFrame { new_probe_count });
-        }
-    }
-    if !pending_probes.is_empty() {
-        let rendered_ns = if uses_realtime_clock {
-            loop {
-                let frame = driver.step(false).unwrap();
-                if frame.draw_ordinal.is_some() {
-                    break clock();
-                }
-                tokio::time::sleep(frame.poll_duration).await;
-            }
-        } else {
-            let rendered_ns = clock_ns
-                .load(Ordering::SeqCst)
-                .checked_add(100_000_000)
-                .unwrap();
-            clock_ns.store(rendered_ns, Ordering::SeqCst);
-            assert!(driver.step(true).unwrap().draw_ordinal.is_some());
-            rendered_ns
-        };
-        let new_probe_count = pending_probes.len();
-        for rendered_sequence in pending_probes.drain(..) {
-            let terminal = lock_workload(&terminals)
-                .iter()
-                .find(|sample| sample.sequence == rendered_sequence)
-                .cloned()
-                .unwrap();
-            let admission = lock_workload(&admissions)
-                .iter()
-                .find(|sample| sample.sequence == rendered_sequence)
-                .cloned()
-                .unwrap();
-            rendered_sequences.push(rendered_sequence);
-            screen_observations.push(LatencyObservationV1 {
-                sequence: rendered_sequence,
-                admitted_ns: admission.admitted_ns,
-                terminal_ns: terminal.terminal_ns,
-                published_ns: terminal.published_ns,
-                rendered_ns,
-                observed_frame_phase_ns: rendered_ns.checked_sub(admission.admitted_ns).unwrap()
-                    % 100_000_000,
+            frames.push(RealQueueFrame {
+                new_probe_count,
+                observation,
             });
         }
-        frames.push(RealQueueFrame { new_probe_count });
     }
-
     wait_for_sequence_count(&persisted, submitted_sequences.len()).await;
     let expected_high_water = u64::try_from(submitted_sequences.len()).unwrap();
     let mut performance = handle.collector.performance.clone();
@@ -707,6 +858,12 @@ async fn run_schedule_through_real_queue_at(
                     && snapshot.completion_high_water == expected_high_water
                     && snapshot.pending_events == 0;
                 let has_expected_terminal_quality = match profile {
+                    WorkloadProfile::TargetBurst
+                        if injection == PerformanceTrialInjection::SupportedLoadDegradation =>
+                    {
+                        snapshot.reasons.is_empty()
+                            && publication.effective_quality == ObservationQuality::Live
+                    }
                     WorkloadProfile::SustainedTarget | WorkloadProfile::TargetBurst => {
                         snapshot.reasons.is_empty()
                             && publication.effective_quality == ObservationQuality::Live
@@ -732,19 +889,111 @@ async fn run_schedule_through_real_queue_at(
     })
     .await
     .expect("final real-queue performance generation must publish after persistence completion");
+    assert!(
+        !pending_probes.is_empty(),
+        "the closed scheduled profiles must retain their final probe for the closing draw"
+    );
+    let closing_observation = if uses_realtime_clock {
+        loop {
+            let frame = driver.step(true).unwrap();
+            if frame.draw_ordinal.is_some() {
+                break frame;
+            }
+            tokio::time::sleep(frame.poll_duration).await;
+        }
+    } else {
+        let closing_ns = lock_workload(&admissions)
+            .last()
+            .expect("closing draw requires the final admission")
+            .scheduled_ns
+            .checked_add(frame_phase_offset_ns)
+            .expect("closing draw timestamp must fit u64");
+        clock_ns.store(closing_ns, Ordering::SeqCst);
+        let frame = driver.step(true).unwrap();
+        assert!(frame.draw_ordinal.is_some());
+        frame
+    };
+    let closing_rendered_ns = duration_ns(
+        closing_observation
+            .rendered_at
+            .expect("successful closing draw must record its timestamp"),
+    );
+    let closing_probe_count = pending_probes.len();
+    for rendered_sequence in pending_probes.drain(..) {
+        let terminal = lock_workload(&terminals)
+            .iter()
+            .find(|sample| sample.sequence == rendered_sequence)
+            .cloned()
+            .expect("every closing probe must have a terminal observation");
+        let admission = lock_workload(&admissions)
+            .iter()
+            .find(|sample| sample.sequence == rendered_sequence)
+            .cloned()
+            .expect("every closing probe must have an admission observation");
+        rendered_sequences.push(rendered_sequence);
+        screen_observations.push(LatencyObservationV1 {
+            sequence: rendered_sequence,
+            admitted_ns: admission.admitted_ns,
+            terminal_ns: terminal.terminal_ns,
+            published_ns: terminal.published_ns,
+            rendered_ns: closing_rendered_ns,
+            observed_frame_phase_ns: closing_rendered_ns
+                .checked_sub(admission.admitted_ns)
+                .unwrap()
+                % 100_000_000,
+        });
+    }
+    frames.push(RealQueueFrame {
+        new_probe_count: closing_probe_count,
+        observation: closing_observation,
+    });
+    let (raw_ordinal_before_trailing, performance_samples_at_close, next_sample_ordinal) = {
+        let samples = lock_workload(&performance_samples);
+        let raw_ordinal_before_trailing = samples
+            .last()
+            .and_then(|sample| sample.publication.workload_sample_stamp)
+            .expect("closing frame must follow a raw performance sample")
+            .sample_ordinal;
+        let (performance_samples_at_close, next_sample_ordinal) =
+            freeze_performance_samples_at_close(
+                &samples,
+                carry_in_sample_ordinal,
+                closing_rendered_ns,
+            );
+        (
+            raw_ordinal_before_trailing,
+            performance_samples_at_close,
+            next_sample_ordinal,
+        )
+    };
+    wait_for_performance_sample(
+        &performance_samples,
+        performance_notification.as_ref(),
+        |samples| {
+            samples.last().is_some_and(|sample| {
+                sample
+                    .publication
+                    .workload_sample_stamp
+                    .is_some_and(|stamp| stamp.sample_ordinal > raw_ordinal_before_trailing)
+            })
+        },
+        "a trailing equal raw sample must follow the successful closing frame",
+    )
+    .await;
     let final_identities = structural_identities(&handle.collector.model.borrow());
     let admission_observations = lock_workload(&admissions).clone();
     let admitted_sequences = admission_observations
         .iter()
         .map(|sample| sample.sequence)
         .collect();
-    let completed_sequences = lock_workload(&terminals)
+    let terminal_observations = lock_workload(&terminals).clone();
+    let completed_sequences = terminal_observations
         .iter()
         .map(|sample| sample.sequence)
         .collect();
     let persisted_sequences = lock_workload(&persisted).clone();
     let scoped_observations = lock_workload(&timings).clone();
-    let performance_samples = lock_workload(&performance_samples).clone();
+    let next_draw_ordinal = driver.next_draw_ordinal();
     let final_performance = handle.collector.performance.borrow().clone();
     let final_compatibility_quality = *handle.collector.quality.borrow();
     handle.collector.stop().await.unwrap();
@@ -757,6 +1006,7 @@ async fn run_schedule_through_real_queue_at(
         priming_frame_recorded_ns,
         workload_origin_ns,
         admission_observations,
+        terminal_observations,
         screen_observations,
         scoped_observations,
         submitted_sequences,
@@ -766,7 +1016,10 @@ async fn run_schedule_through_real_queue_at(
         rendered_sequences,
         final_identities,
         frames,
-        performance_samples,
+        carry_in_sample_ordinal,
+        next_sample_ordinal,
+        next_draw_ordinal,
+        performance_samples: performance_samples_at_close,
         final_performance,
         final_compatibility_quality,
     }
@@ -836,6 +1089,7 @@ async fn run_virtual_schedule_through_real_queue_at(
         Some(workload_origin_ns),
         30_000_000,
         stall,
+        PerformanceTrialInjection::None,
         None,
     )
     .await
@@ -858,6 +1112,7 @@ async fn run_reference_schedule_through_real_queue(
         None,
         desired_phase_ns,
         None,
+        PerformanceTrialInjection::None,
         Some(clock),
     )
     .await
@@ -977,6 +1232,638 @@ fn assert_real_queue_outcome_is_exact(result: &RealQueueResult, profile: Workloa
                     && sample.publication.snapshot.execution_edges == expected.execution_edges
             )
     );
+}
+
+#[cfg(feature = "workload-harness")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PerformanceTrialInjection {
+    None,
+    SupportedLoadDegradation,
+    OmitRequiredRenderedReason,
+}
+
+#[cfg(feature = "workload-harness")]
+struct FinalPerformanceTrialResult {
+    outcome: ReferenceOutcomeV1,
+    workload_origin_ns: u64,
+    admission_observations: Vec<AdmissionObservationV1>,
+    carry_in_sample_ordinal: u64,
+}
+
+#[cfg(feature = "workload-harness")]
+fn evidence_quality(quality: ObservationQuality) -> EffectiveQualityV1 {
+    match quality {
+        ObservationQuality::Live => EffectiveQualityV1::Live,
+        ObservationQuality::Reconciling => EffectiveQualityV1::Reconciling,
+        ObservationQuality::Disconnected => EffectiveQualityV1::Disconnected,
+        ObservationQuality::Degraded => EffectiveQualityV1::Degraded,
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+fn evidence_reason(reason: PerformanceDegradationReason) -> PerformanceReasonV1 {
+    match reason {
+        PerformanceDegradationReason::LivePanes => PerformanceReasonV1::LivePanes,
+        PerformanceDegradationReason::DefaultVisibleTaskRuns => {
+            PerformanceReasonV1::DefaultVisibleTaskRuns
+        }
+        PerformanceDegradationReason::DependencyEdges => PerformanceReasonV1::DependencyEdges,
+        PerformanceDegradationReason::EventsOneSecond => PerformanceReasonV1::EventsOneSecond,
+        PerformanceDegradationReason::EventsTenSeconds => PerformanceReasonV1::EventsTenSeconds,
+        PerformanceDegradationReason::EventsSixtySeconds => PerformanceReasonV1::EventsSixtySeconds,
+        PerformanceDegradationReason::EventLag => PerformanceReasonV1::EventLag,
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+fn performance_sample_evidence(sample: &WorkloadPerformanceSample) -> PerformanceSampleEvidenceV1 {
+    let stamp = sample
+        .publication
+        .workload_sample_stamp
+        .expect("raw workload samples must carry an exact stamp");
+    let snapshot = &sample.publication.snapshot;
+    PerformanceSampleEvidenceV1 {
+        sample_ordinal: stamp.sample_ordinal,
+        sampled_at_ns: stamp.sampled_at_ns,
+        event_lag_ns: duration_ns(snapshot.event_lag),
+        pending_events: u64::try_from(snapshot.pending_events).unwrap(),
+        admission_high_water: snapshot.admission_high_water,
+        completion_high_water: snapshot.completion_high_water,
+        live_panes: u64::try_from(snapshot.live_panes).unwrap(),
+        default_visible_task_runs: u64::try_from(snapshot.default_visible_task_runs).unwrap(),
+        dependency_edges: u64::try_from(snapshot.dependency_edges).unwrap(),
+        execution_edges: u64::try_from(snapshot.execution_edges).unwrap(),
+        events_one_second: u64::try_from(snapshot.events_one_second).unwrap(),
+        events_ten_seconds: u64::try_from(snapshot.events_ten_seconds).unwrap(),
+        events_sixty_seconds: u64::try_from(snapshot.events_sixty_seconds).unwrap(),
+        source_quality: evidence_quality(sample.source_quality),
+        effective_quality: evidence_quality(sample.publication.effective_quality),
+        reasons: snapshot
+            .reasons
+            .iter()
+            .copied()
+            .map(evidence_reason)
+            .collect(),
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+fn canonical_rendered_header(raw_header: &str, publication: &PerformancePublication) -> String {
+    let quality = match publication.effective_quality {
+        ObservationQuality::Live => "LIVE",
+        ObservationQuality::Reconciling => "RECONCILING",
+        ObservationQuality::Disconnected => "DISCONNECTED",
+        ObservationQuality::Degraded => "DEGRADED",
+    };
+    assert!(
+        raw_header.contains(quality),
+        "raw header omitted its cached effective quality: {raw_header}"
+    );
+    let rendered_labels = raw_header
+        .split_once("perf:")
+        .map(|(_, suffix)| {
+            suffix
+                .split(" | ")
+                .next()
+                .unwrap_or_default()
+                .split('│')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .replace('+', ",")
+        })
+        .unwrap_or_default();
+    format!("{quality} | perf:{rendered_labels}")
+}
+
+#[cfg(feature = "workload-harness")]
+fn performance_frame_evidence(frame: &RealQueueFrame) -> PerformanceFrameEvidenceV1 {
+    let publication = frame
+        .observation
+        .performance_publication
+        .as_ref()
+        .expect("recorded workload frames must name the exact App cache");
+    let stamp = publication
+        .workload_sample_stamp
+        .expect("recorded workload frames must name a stamped publication");
+    let raw_header = frame
+        .observation
+        .rendered_header_line
+        .as_deref()
+        .expect("recorded workload frames must retain the raw header");
+    PerformanceFrameEvidenceV1 {
+        draw_ordinal: frame.observation.draw_ordinal.unwrap(),
+        sample_ordinal: stamp.sample_ordinal,
+        state_observed_at_ns: stamp.sampled_at_ns,
+        rendered_at_ns: duration_ns(frame.observation.rendered_at.unwrap()),
+        effective_quality: evidence_quality(publication.effective_quality),
+        reasons: publication
+            .snapshot
+            .reasons
+            .iter()
+            .copied()
+            .map(evidence_reason)
+            .collect(),
+        rendered_header_line: canonical_rendered_header(raw_header, publication),
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+fn performance_stream(result: &RealQueueResult) -> PerformanceEvidenceStreamV1 {
+    let samples = result
+        .performance_samples
+        .iter()
+        .map(performance_sample_evidence)
+        .collect::<Vec<_>>();
+    let frames = result
+        .frames
+        .iter()
+        .map(performance_frame_evidence)
+        .collect::<Vec<_>>();
+    let mut terminal_observations = result
+        .terminal_observations
+        .iter()
+        .map(|observation| TerminalObservationV1 {
+            sequence: observation.sequence,
+            terminal_ns: observation.terminal_ns,
+        })
+        .collect::<Vec<_>>();
+    terminal_observations.sort_by_key(|observation| observation.sequence);
+    let workload_close_ns = frames.last().unwrap().rendered_at_ns;
+    let deadline = result.workload_origin_ns + 60_000_000_000;
+    let selected_terminal_draw_ordinal = (result.profile == WorkloadProfile::TwiceTarget)
+        .then(|| {
+            frames.iter().find(|frame| {
+                frame.rendered_at_ns <= deadline
+                    && frame
+                        .reasons
+                        .contains(&PerformanceReasonV1::EventsSixtySeconds)
+                    && frame.rendered_header_line.contains("events_60s")
+            })
+        })
+        .flatten()
+        .map(|frame| frame.draw_ordinal);
+    PerformanceEvidenceStreamV1 {
+        workload_start_ns: result.workload_origin_ns,
+        workload_close_ns,
+        first_sample_ordinal: result.carry_in_sample_ordinal,
+        next_sample_ordinal: result.next_sample_ordinal,
+        first_draw_ordinal: frames.first().unwrap().draw_ordinal,
+        next_draw_ordinal: result.next_draw_ordinal,
+        samples,
+        frames,
+        terminal_observations,
+        selected_terminal_draw_ordinal,
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+fn reference_profile_performance_stream(
+    stage: MeasurementStageV1,
+    scenario: ScenarioV1,
+    result: &RealQueueResult,
+) -> Option<PerformanceEvidenceStreamV1> {
+    (stage == MeasurementStageV1::Final
+        && matches!(
+            scenario,
+            ScenarioV1::Sustained | ScenarioV1::Burst | ScenarioV1::TwiceTarget
+        ))
+    .then(|| performance_stream(result))
+}
+
+#[cfg(feature = "workload-harness")]
+fn compose_final_performance_outcome(mut candidate: ReferenceOutcomeV1) -> ReferenceOutcomeV1 {
+    let scenario = candidate.document().scenario;
+    let baseline_parent = tempfile::tempdir().unwrap();
+    let baseline_root = baseline_parent.path().canonicalize().unwrap();
+    let scenario_directory = &workload_schema()
+        .scenarios
+        .iter()
+        .find(|spec| spec.scenario == scenario)
+        .unwrap()
+        .directory;
+    let baseline_scenario_root = baseline_root.join(scenario_directory);
+    let mut baseline = synthetic_result(scenario, MeasurementStageV1::Baseline);
+    write_synthetic_raw_scenario_root(&baseline_scenario_root, &mut baseline).unwrap();
+    atomic_write_reference_outcome(&baseline_scenario_root.join("result-v1.json"), &baseline)
+        .unwrap();
+
+    candidate.document_mut().controlled_environment.insert(
+        "HERDR_PERF_BASELINE_RESULTS_ROOT".to_owned(),
+        baseline_root.to_string_lossy().into_owned(),
+    );
+    let production_subject_sha = candidate.document().production_subject_sha.clone();
+    let preflight_head = candidate.document().harness_sha.clone();
+    let fixture = RawFixture::from_outcome(candidate);
+    let request = ComposeRequestV1 {
+        raw_root: fixture.root.path().to_path_buf(),
+        output: fixture.output_path("candidate-v1.json"),
+        measurement_stage: MeasurementStageV1::Final,
+        scenario,
+        production_subject_sha,
+        preflight_head,
+        baseline_results_root: Some(baseline_root),
+    };
+    let outcome = compose_reference_outcome_from_raw_impl(&request).unwrap();
+    assert!(validate_with_raw_root(&outcome, fixture.root.path()).is_ok());
+    outcome
+}
+
+#[cfg(feature = "workload-harness")]
+async fn run_final_performance_trial(
+    profile: WorkloadProfile,
+    injection: PerformanceTrialInjection,
+) -> FinalPerformanceTrialResult {
+    let mut outcome = match profile {
+        WorkloadProfile::SustainedTarget => valid_final_sustained_result(),
+        WorkloadProfile::TargetBurst => valid_final_burst_result(),
+        WorkloadProfile::TwiceTarget => valid_twice_target_result(),
+        _ => panic!("final performance trial requires a stream-bearing profile"),
+    };
+    let template = &outcome.document().trials[0].raw;
+    let trial_origin_ns = template.trial_origin_ns;
+    let workload_origin_ns = template.workload_origin_ns.unwrap();
+    let phase = template.frame_phase_offset_ns.unwrap();
+    let result = run_schedule_through_real_queue_at(
+        profile,
+        trial_origin_ns,
+        trial_origin_ns + 1,
+        Some(workload_origin_ns),
+        phase,
+        None,
+        injection,
+        None,
+    )
+    .await;
+    let stream = performance_stream(&result);
+    outcome.document_mut().trials[0].raw.admission_observations =
+        result.admission_observations.clone();
+    let document = outcome.document_mut();
+    document.trials[0].raw.performance_evidence_stream = Some(stream);
+    let failure = match injection {
+        PerformanceTrialInjection::None => None,
+        PerformanceTrialInjection::SupportedLoadDegradation => {
+            Some(FailureReasonV1::SupportedLoadDegradation)
+        }
+        PerformanceTrialInjection::OmitRequiredRenderedReason => {
+            Some(FailureReasonV1::MissingDegradation)
+        }
+    };
+    if let Some(failure) = failure {
+        document.failure_reasons = vec![failure];
+        outcome = match outcome {
+            ReferenceOutcomeV1::Pass { document } => ReferenceOutcomeV1::Failed { document },
+            _ => panic!("synthetic final performance outcome must start as pass"),
+        };
+    }
+    outcome = compose_final_performance_outcome(outcome);
+    FinalPerformanceTrialResult {
+        outcome,
+        workload_origin_ns: result.workload_origin_ns,
+        admission_observations: result.admission_observations,
+        carry_in_sample_ordinal: result.carry_in_sample_ordinal,
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+#[tokio::test]
+async fn reference_profile_stream_selection_writes_valid_final_and_non_final_artifacts() {
+    let mut final_candidate = valid_final_sustained_result();
+    let template = &final_candidate.document().trials[0].raw;
+    let trial_origin_ns = template.trial_origin_ns;
+    let workload_origin_ns = template.workload_origin_ns.unwrap();
+    let phase = template.frame_phase_offset_ns.unwrap();
+    let result = run_schedule_through_real_queue_at(
+        WorkloadProfile::SustainedTarget,
+        trial_origin_ns,
+        trial_origin_ns + 1,
+        Some(workload_origin_ns),
+        phase,
+        None,
+        PerformanceTrialInjection::None,
+        None,
+    )
+    .await;
+
+    final_candidate.document_mut().trials[0]
+        .raw
+        .admission_observations = result.admission_observations.clone();
+    final_candidate.document_mut().trials[0]
+        .raw
+        .performance_evidence_stream = reference_profile_performance_stream(
+        MeasurementStageV1::Final,
+        ScenarioV1::Sustained,
+        &result,
+    );
+    let final_outcome = compose_final_performance_outcome(final_candidate);
+    let final_root = tempfile::tempdir().unwrap();
+    let final_path = final_root.path().join("result-v1.json");
+    atomic_write_reference_outcome(&final_path, &final_outcome).unwrap();
+    let written_final = read_and_validate_reference_outcome(&final_path).unwrap();
+    assert!(
+        written_final.document().trials[0]
+            .raw
+            .performance_evidence_stream
+            .is_some()
+    );
+
+    let mut baseline = valid_synthetic_result();
+    baseline.document_mut().trials[0]
+        .raw
+        .performance_evidence_stream = reference_profile_performance_stream(
+        MeasurementStageV1::Baseline,
+        ScenarioV1::Sustained,
+        &result,
+    );
+    let baseline_root = tempfile::tempdir().unwrap();
+    let baseline_path = baseline_root.path().join("result-v1.json");
+    atomic_write_reference_outcome(&baseline_path, &baseline).unwrap();
+    let written_baseline = read_and_validate_reference_outcome(&baseline_path).unwrap();
+    assert!(
+        written_baseline.document().trials[0]
+            .raw
+            .performance_evidence_stream
+            .is_none()
+    );
+}
+
+#[cfg(feature = "workload-harness")]
+#[test]
+fn close_snapshot_excludes_strictly_later_barrier_sample() {
+    let samples = [
+        WorkloadPerformanceSample {
+            source_quality: ObservationQuality::Live,
+            publication: stamped_publication(40, 90, ObservationQuality::Live, []),
+        },
+        WorkloadPerformanceSample {
+            source_quality: ObservationQuality::Live,
+            publication: stamped_publication(41, 100, ObservationQuality::Live, []),
+        },
+        WorkloadPerformanceSample {
+            source_quality: ObservationQuality::Live,
+            publication: stamped_publication(42, 101, ObservationQuality::Live, []),
+        },
+    ];
+
+    let (included, next_sample_ordinal) = freeze_performance_samples_at_close(&samples, 40, 100);
+
+    assert_eq!(
+        included
+            .iter()
+            .map(|sample| {
+                sample
+                    .publication
+                    .workload_sample_stamp
+                    .unwrap()
+                    .sample_ordinal
+            })
+            .collect::<Vec<_>>(),
+        [40, 41]
+    );
+    assert_eq!(next_sample_ordinal, 42);
+    assert!(included.iter().all(|sample| {
+        sample
+            .publication
+            .workload_sample_stamp
+            .unwrap()
+            .sampled_at_ns
+            <= 100
+    }));
+}
+
+#[cfg(feature = "workload-harness")]
+#[tokio::test]
+async fn supported_load_records_complete_live_performance_stream() {
+    for profile in [
+        WorkloadProfile::SustainedTarget,
+        WorkloadProfile::TargetBurst,
+    ] {
+        let result = run_final_performance_trial(profile, PerformanceTrialInjection::None).await;
+        let stream = result.outcome.document().trials[0]
+            .raw
+            .performance_evidence_stream
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            stream.samples[0].sample_ordinal,
+            stream.first_sample_ordinal
+        );
+        assert_eq!(
+            stream.samples.last().unwrap().sample_ordinal + 1,
+            stream.next_sample_ordinal
+        );
+        assert_eq!(stream.frames[0].draw_ordinal, stream.first_draw_ordinal);
+        assert_eq!(
+            stream.frames.last().unwrap().draw_ordinal + 1,
+            stream.next_draw_ordinal
+        );
+        assert!(stream.samples.iter().all(|sample| {
+            sample.source_quality == EffectiveQualityV1::Live
+                && sample.effective_quality == EffectiveQualityV1::Live
+                && sample.reasons.is_empty()
+        }));
+        assert!(stream.frames.iter().all(|frame| frame.reasons.is_empty()));
+        assert!(result.outcome.failure_reasons().is_empty());
+        assert!(result.outcome.validate().is_ok());
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+#[tokio::test]
+async fn supported_load_truthful_degradation_is_a_valid_measured_failure() {
+    let result = run_final_performance_trial(
+        WorkloadProfile::TargetBurst,
+        PerformanceTrialInjection::SupportedLoadDegradation,
+    )
+    .await;
+    assert_eq!(
+        workload::admission_schedule_attained(
+            WorkloadProfile::TargetBurst,
+            result.workload_origin_ns,
+            &result.admission_observations,
+        ),
+        Ok(true)
+    );
+    assert_eq!(
+        result.outcome.failure_reasons(),
+        [FailureReasonV1::SupportedLoadDegradation]
+    );
+    assert_eq!(result.outcome.status(), ReferenceOutcomeStatusV1::Failed);
+    assert!(result.outcome.validate().is_ok());
+
+    let mut suite = [
+        ScenarioV1::Target,
+        ScenarioV1::Sustained,
+        ScenarioV1::Burst,
+        ScenarioV1::Startup,
+        ScenarioV1::Idle,
+        ScenarioV1::FallbackRescan,
+        ScenarioV1::TwiceTarget,
+    ]
+    .map(|scenario| synthetic_result(scenario, MeasurementStageV1::Final));
+    suite[2] = result.outcome;
+    assert_eq!(
+        classify_d4_checkpoint(&suite).unwrap(),
+        D4CheckpointDecisionV1::AmendmentsRequired {
+            amendments: vec![RequiredAmendmentV1::NonD4],
+        }
+    );
+}
+
+#[cfg(feature = "workload-harness")]
+#[tokio::test]
+async fn twice_target_renders_real_collector_performance_reason() {
+    let result = run_final_performance_trial(
+        WorkloadProfile::TwiceTarget,
+        PerformanceTrialInjection::None,
+    )
+    .await;
+    let stream = result.outcome.document().trials[0]
+        .raw
+        .performance_evidence_stream
+        .as_ref()
+        .unwrap();
+    let selected = stream
+        .frames
+        .iter()
+        .find(|frame| Some(frame.draw_ordinal) == stream.selected_terminal_draw_ordinal)
+        .unwrap();
+    assert!(
+        selected
+            .reasons
+            .contains(&PerformanceReasonV1::EventsSixtySeconds)
+    );
+    assert!(selected.rendered_header_line.contains("perf:events_60s"));
+    assert!(selected.rendered_at_ns <= stream.workload_start_ns + 60_000_000_000);
+    assert!(result.outcome.validate().is_ok());
+}
+
+#[cfg(feature = "workload-harness")]
+#[tokio::test]
+async fn twice_target_deadline_without_required_rendered_reason_is_valid_measured_failure() {
+    let result = run_final_performance_trial(
+        WorkloadProfile::TwiceTarget,
+        PerformanceTrialInjection::OmitRequiredRenderedReason,
+    )
+    .await;
+    let stream = result.outcome.document().trials[0]
+        .raw
+        .performance_evidence_stream
+        .as_ref()
+        .unwrap();
+    assert!(stream.samples.iter().any(|sample| {
+        sample
+            .reasons
+            .contains(&PerformanceReasonV1::EventsSixtySeconds)
+    }));
+    assert!(
+        stream
+            .frames
+            .iter()
+            .all(|frame| { !frame.rendered_header_line.contains("events_60s") })
+    );
+    assert_eq!(stream.selected_terminal_draw_ordinal, None);
+    assert!(stream.workload_close_ns > stream.workload_start_ns + 60_000_000_000);
+    assert_eq!(
+        result.outcome.failure_reasons(),
+        [FailureReasonV1::MissingDegradation]
+    );
+    assert_eq!(result.outcome.status(), ReferenceOutcomeStatusV1::Failed);
+    assert!(result.outcome.validate().is_ok());
+}
+
+#[cfg(feature = "workload-harness")]
+#[test]
+fn workload_frame_uses_exact_app_cached_performance_publication() {
+    let (_model_sender, model_receiver) =
+        tokio::sync::watch::channel(Arc::new(DomainModel::default()));
+    let older = stamped_publication(1, 10, ObservationQuality::Live, []);
+    let newer = stamped_publication(
+        2,
+        20,
+        ObservationQuality::Degraded,
+        [PerformanceDegradationReason::EventsSixtySeconds],
+    );
+    let (performance_sender, performance_receiver) = tokio::sync::watch::channel(older.clone());
+    let app = App::new(
+        model_receiver,
+        HeaderInputs {
+            performance: performance_receiver,
+            ..HeaderInputs::default()
+        },
+    );
+    let clock = Arc::new(AtomicU64::new(100_000_000));
+    let terminal = Terminal::new(TestBackend::new(160, 48)).unwrap();
+    let driver_clock = Arc::clone(&clock);
+    let mut driver = WorkloadFrameDriver::new(app, terminal, move || {
+        Duration::from_nanos(driver_clock.load(Ordering::SeqCst))
+    });
+    assert!(!driver.refresh_app_if_changed().unwrap());
+
+    performance_sender.send(newer.clone()).unwrap();
+    let cached = driver.step_without_refresh(true).unwrap();
+    assert_eq!(cached.performance_publication, Some(older));
+    let cached_header = cached.rendered_header_line.unwrap();
+    assert!(cached_header.contains("LIVE"));
+    assert!(!cached_header.contains("DEGRADED"));
+    assert!(!cached_header.contains("events_60s"));
+
+    clock.store(200_000_000, Ordering::SeqCst);
+    let refreshed = driver.step(true).unwrap();
+    assert_eq!(refreshed.performance_publication, Some(newer));
+    assert!(
+        refreshed
+            .rendered_header_line
+            .unwrap()
+            .contains("events_60s")
+    );
+}
+
+#[cfg(feature = "workload-harness")]
+#[tokio::test]
+async fn workload_performance_stream_retains_pre_origin_carry_in_and_contiguous_suffix() {
+    let result = run_final_performance_trial(
+        WorkloadProfile::SustainedTarget,
+        PerformanceTrialInjection::None,
+    )
+    .await;
+    let stream = result.outcome.document().trials[0]
+        .raw
+        .performance_evidence_stream
+        .as_ref()
+        .unwrap();
+    assert_eq!(stream.first_sample_ordinal, result.carry_in_sample_ordinal);
+    assert!(stream.samples[0].sampled_at_ns < stream.workload_start_ns);
+    assert_eq!(
+        stream
+            .samples
+            .iter()
+            .map(|sample| sample.sample_ordinal)
+            .collect::<Vec<_>>(),
+        (stream.first_sample_ordinal..stream.next_sample_ordinal).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        stream
+            .frames
+            .iter()
+            .map(|frame| frame.draw_ordinal)
+            .collect::<Vec<_>>(),
+        (stream.first_draw_ordinal..stream.next_draw_ordinal).collect::<Vec<_>>()
+    );
+    let last_referenced = stream
+        .frames
+        .iter()
+        .map(|frame| frame.sample_ordinal)
+        .max()
+        .unwrap();
+    assert!(stream.samples.last().unwrap().sample_ordinal >= last_referenced);
+    assert!(
+        stream
+            .samples
+            .iter()
+            .all(|sample| sample.sampled_at_ns <= stream.workload_close_ns)
+    );
+    assert!(result.outcome.validate().is_ok());
 }
 
 #[cfg(feature = "workload-harness")]
@@ -1153,9 +2040,7 @@ fn valid_five_phase_trials() -> Vec<PhaseTrial> {
             let clock = Arc::new(AtomicU64::new(priming_ns));
             let (model_sender, model_receiver) =
                 tokio::sync::watch::channel(Arc::new(workload::target_model()));
-            let (_quality_sender, quality_receiver) =
-                tokio::sync::watch::channel(herdr_top::herdr::collector::ObservationQuality::Live);
-            let app = App::new(model_receiver, quality_receiver, HeaderInputs::default());
+            let app = App::new(model_receiver, HeaderInputs::default());
             let terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
             let driver_clock = Arc::clone(&clock);
             let mut driver = WorkloadFrameDriver::new(app, terminal, move || {
@@ -1264,13 +2149,7 @@ async fn run_screen_and_input_through_driver_at(
     let screen_clock = Arc::new(AtomicU64::new(priming_ns));
     let (screen_model_sender, screen_model_receiver) =
         tokio::sync::watch::channel(Arc::new(workload::target_model()));
-    let (_screen_quality_sender, screen_quality_receiver) =
-        tokio::sync::watch::channel(herdr_top::herdr::collector::ObservationQuality::Live);
-    let screen_app = App::new(
-        screen_model_receiver,
-        screen_quality_receiver,
-        HeaderInputs::default(),
-    );
+    let screen_app = App::new(screen_model_receiver, HeaderInputs::default());
     let screen_terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     let screen_driver_clock = Arc::clone(&screen_clock);
     let mut screen_driver = WorkloadFrameDriver::new(screen_app, screen_terminal, move || {
@@ -1284,13 +2163,7 @@ async fn run_screen_and_input_through_driver_at(
     let input_clock = Arc::new(AtomicU64::new(priming_ns));
     let (_input_model_sender, input_model_receiver) =
         tokio::sync::watch::channel(Arc::new(workload::target_model()));
-    let (_input_quality_sender, input_quality_receiver) =
-        tokio::sync::watch::channel(herdr_top::herdr::collector::ObservationQuality::Live);
-    let input_app = App::new(
-        input_model_receiver,
-        input_quality_receiver,
-        HeaderInputs::default(),
-    );
+    let input_app = App::new(input_model_receiver, HeaderInputs::default());
     let input_terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     let input_driver_clock = Arc::clone(&input_clock);
     let mut input_driver = WorkloadFrameDriver::new(input_app, input_terminal, move || {
@@ -1524,8 +2397,10 @@ async fn run_fallback_arm(poll: Duration, notification: bool, sequence: u64) -> 
     let frame_epoch = std::time::Instant::now();
     let app = App::new(
         handle.collector.model.clone(),
-        handle.collector.quality.clone(),
-        HeaderInputs::default(),
+        HeaderInputs {
+            performance: handle.collector.performance.clone(),
+            ..HeaderInputs::default()
+        },
     );
     let terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     let mut driver = WorkloadFrameDriver::new(app, terminal, move || frame_epoch.elapsed());
@@ -7906,9 +8781,7 @@ async fn run_reference_input_trial(
 ) -> Result<(u64, u64, Vec<InputLatencyObservationV1>), HarnessError> {
     let (_model_sender, model_receiver) =
         tokio::sync::watch::channel(Arc::new(workload::target_model()));
-    let (_quality_sender, quality_receiver) =
-        tokio::sync::watch::channel(herdr_top::herdr::collector::ObservationQuality::Live);
-    let app = App::new(model_receiver, quality_receiver, HeaderInputs::default());
+    let app = App::new(model_receiver, HeaderInputs::default());
     let terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     let mut driver = WorkloadFrameDriver::new(app, terminal, || {
         Duration::from_nanos(
@@ -8112,7 +8985,7 @@ async fn reference_profile_entrypoint_impl() -> Result<(), HarnessError> {
     let scenario_raw = std::env::var("HERDR_PERF_SCENARIO")
         .map_err(|_| HarnessError::Invalid("reference scenario was missing"))?;
     let (scenario, profile) = reference_scenario(&scenario_raw)?;
-    let _stage = reference_stage(
+    let stage = reference_stage(
         &std::env::var("HERDR_PERF_STAGE")
             .map_err(|_| HarnessError::Invalid("reference stage was missing"))?,
     )?;
@@ -8160,6 +9033,7 @@ async fn reference_profile_entrypoint_impl() -> Result<(), HarnessError> {
     let mut prepared_non_gap_event_count = None;
     let mut prepared_ledger_row_count = None;
     let mut restored_activity_count = None;
+    let mut performance_evidence_stream = None;
     let mut idle_window_start_ns = None;
     let mut idle_window_end_ns = None;
 
@@ -8193,6 +9067,8 @@ async fn reference_profile_entrypoint_impl() -> Result<(), HarnessError> {
             workload_origin_ns = Some(result.workload_origin_ns);
             frame_phase_offset_ns = Some(phase);
             priming_frame_count = 1;
+            performance_evidence_stream =
+                reference_profile_performance_stream(stage, scenario, &result);
             admission_observations = result.admission_observations;
             screen_observations = result.screen_observations;
             scoped_observations = result.scoped_observations;
@@ -8316,7 +9192,7 @@ async fn reference_profile_entrypoint_impl() -> Result<(), HarnessError> {
         prepared_non_gap_event_count,
         prepared_ledger_row_count,
         restored_activity_count,
-        performance_evidence_stream: None,
+        performance_evidence_stream,
         idle_window_start_ns,
         idle_window_end_ns,
         child_controls,
@@ -8331,6 +9207,24 @@ async fn reference_profile_entrypoint() {
     reference_profile_entrypoint_impl()
         .await
         .expect("reference profile entrypoint must complete");
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn reference_profile_entrypoint_source_uses_performance_stream_selector() {
+    const START: &str = "async fn reference_profile_entrypoint_impl()";
+    const END: &str =
+        "\n#[cfg(all(target_os = \"linux\", feature = \"workload-harness\"))]\n#[tokio::test]";
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file!());
+    let source = std::fs::read_to_string(path).expect("workload harness source should be readable");
+    let start = source
+        .find(START)
+        .expect("entrypoint declaration should exist");
+    let entrypoint = &source[start..];
+    let end = entrypoint
+        .find(END)
+        .expect("entrypoint boundary should exist");
+    assert!(entrypoint[..end].contains("reference_profile_performance_stream("));
 }
 
 #[cfg(target_os = "linux")]

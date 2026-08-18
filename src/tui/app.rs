@@ -24,8 +24,9 @@ use crate::diagnostics::{
     ControllerCounterSnapshot, ControllerInputStatus, OccurrenceLogStatus, OwnerFreshness,
     PersistenceCounters, RuntimeDiagnosticsSnapshot,
 };
-use crate::herdr::collector::{ObservationQuality, SourceCoverageRegistry};
+use crate::herdr::collector::{ObservationQuality, PerformancePublication, SourceCoverageRegistry};
 use crate::model::{DomainModel, RunId, RunKey, SharedModel};
+use crate::performance::PerformanceSnapshot;
 use crate::store::writer::PersistenceStatus;
 
 use super::dag::DagOrder;
@@ -153,28 +154,35 @@ impl TuiSetup {
     }
 }
 
-/// Static header values plus the collector-published dynamic source coverage.
+/// Static header values plus collector-published dynamic header inputs.
 #[derive(Clone, Debug)]
 pub struct HeaderInputs {
     /// Host that owns the monitored Herdr session.
     pub host: String,
     /// Human-facing Herdr named session.
     pub session: String,
-    /// Age of the oldest received event that has not yet been applied.
-    pub event_lag: Duration,
     /// Honest summary of currently available sources.
     pub source_coverage: tokio::sync::watch::Receiver<SourceCoverageRegistry>,
+    /// Coherent performance snapshot and effective-quality generation.
+    pub performance: tokio::sync::watch::Receiver<PerformancePublication>,
 }
 
 impl Default for HeaderInputs {
     fn default() -> Self {
         let (_coverage_sender, source_coverage) =
             tokio::sync::watch::channel(SourceCoverageRegistry::default());
+        let (_performance_sender, performance) =
+            tokio::sync::watch::channel(PerformancePublication {
+                snapshot: PerformanceSnapshot::default(),
+                effective_quality: ObservationQuality::Live,
+                #[cfg(feature = "workload-harness")]
+                workload_sample_stamp: None,
+            });
         Self {
             host: "unknown".to_owned(),
             session: "unknown".to_owned(),
-            event_lag: Duration::ZERO,
             source_coverage,
+            performance,
         }
     }
 }
@@ -481,14 +489,13 @@ fn default_operator() -> OperatorSnapshot {
     }
 }
 
-/// Fixed-screen monitor state backed only by model and quality watch receivers.
+/// Fixed-screen monitor state backed by coherent model and performance publications.
 pub struct App {
     model_receiver: SharedModel,
-    quality_receiver: tokio::sync::watch::Receiver<ObservationQuality>,
     diagnostics_receiver: tokio::sync::watch::Receiver<RuntimeDiagnosticsSnapshot>,
     operator_receiver: tokio::sync::watch::Receiver<OperatorSnapshot>,
     model: Arc<DomainModel>,
-    quality: ObservationQuality,
+    performance: PerformancePublication,
     diagnostics: RuntimeDiagnosticsSnapshot,
     header: HeaderInputs,
     state: AppState,
@@ -500,17 +507,12 @@ pub struct App {
 impl App {
     /// Creates an application from observation receivers and display-only header inputs.
     #[must_use]
-    pub fn new(
-        model_receiver: SharedModel,
-        quality_receiver: tokio::sync::watch::Receiver<ObservationQuality>,
-        header: HeaderInputs,
-    ) -> Self {
+    pub fn new(model_receiver: SharedModel, header: HeaderInputs) -> Self {
         let (_diagnostics_sender, diagnostics_receiver) =
             tokio::sync::watch::channel(default_diagnostics());
         let (_operator_sender, operator_receiver) = tokio::sync::watch::channel(default_operator());
         Self::with_inputs(
             model_receiver,
-            quality_receiver,
             header,
             diagnostics_receiver,
             operator_receiver,
@@ -523,7 +525,6 @@ impl App {
     #[must_use]
     pub fn with_inputs(
         model_receiver: SharedModel,
-        quality_receiver: tokio::sync::watch::Receiver<ObservationQuality>,
         header: HeaderInputs,
         diagnostics_receiver: tokio::sync::watch::Receiver<RuntimeDiagnosticsSnapshot>,
         operator_receiver: tokio::sync::watch::Receiver<OperatorSnapshot>,
@@ -531,7 +532,7 @@ impl App {
         clock: Arc<dyn Clock>,
     ) -> Self {
         let model = Arc::clone(&model_receiver.borrow());
-        let quality = *quality_receiver.borrow();
+        let performance = header.performance.borrow().clone();
         let diagnostics = diagnostics_receiver.borrow().clone();
         let operator_activity = Arc::clone(&operator_receiver.borrow().activity);
         let terminal_times = Arc::clone(&operator_receiver.borrow().terminal_times);
@@ -540,11 +541,10 @@ impl App {
         let session_display_name = super::projection::escape_controls(&header.session);
         let mut app = Self {
             model_receiver,
-            quality_receiver,
             diagnostics_receiver,
             operator_receiver,
             model,
-            quality,
+            performance,
             diagnostics,
             header,
             state: AppState {
@@ -568,7 +568,7 @@ impl App {
         app
     }
 
-    /// Refreshes the cached coherent model and independently published quality.
+    /// Refreshes the cached coherent model and performance publication.
     pub fn refresh(&mut self) {
         self.refresh_cached(true);
     }
@@ -579,7 +579,7 @@ impl App {
         } else {
             Vec::new()
         };
-        self.quality = *self.quality_receiver.borrow_and_update();
+        self.performance = self.header.performance.borrow_and_update().clone();
         self.diagnostics = self.diagnostics_receiver.borrow_and_update().clone();
         self.header.source_coverage.borrow_and_update();
         if !recompute_projection {
@@ -612,12 +612,7 @@ impl App {
                 "model watch closed; collector is no longer publishing state",
             )
         })?;
-        let quality_changed = self.quality_receiver.has_changed().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "quality watch closed; collector is no longer publishing diagnostics",
-            )
-        })?;
+        let performance_changed = self.header.performance.has_changed().unwrap_or(false);
         let coverage_changed = self.header.source_coverage.has_changed().unwrap_or(false);
         let diagnostics_changed = self.diagnostics_receiver.has_changed().unwrap_or(false);
         let operator_changed = self.operator_receiver.has_changed().unwrap_or(false);
@@ -625,7 +620,7 @@ impl App {
             .next_expiry_ms
             .is_some_and(|deadline| self.clock.now_ms() >= deadline);
         if model_changed
-            || quality_changed
+            || performance_changed
             || coverage_changed
             || diagnostics_changed
             || operator_changed
@@ -704,7 +699,7 @@ impl App {
         view::render(
             frame,
             self.model.as_ref(),
-            self.quality,
+            &self.performance,
             &self.header,
             &self.state,
             &self.diagnostics,
@@ -1146,10 +1141,16 @@ impl FrameLimiter {
 // increment5-workload-harness: begin production frame limiter driver
 #[cfg(feature = "workload-harness")]
 #[doc(hidden)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkloadFrameObservation {
     /// Ordinal assigned to this draw, or `None` when the limiter skipped it.
     pub draw_ordinal: Option<u64>,
+    /// Complete App-cached publication used by the successful draw.
+    pub performance_publication: Option<PerformancePublication>,
+    /// Monotonic timestamp observed immediately after the successful draw.
+    pub rendered_at: Option<Duration>,
+    /// Raw header body row emitted by the real renderer.
+    pub rendered_header_line: Option<String>,
     /// The production poll duration computed after this iteration.
     pub poll_duration: Duration,
 }
@@ -1164,6 +1165,7 @@ pub struct WorkloadFrameDriver {
     clock: Box<dyn FnMut() -> Duration>,
     dirty: bool,
     next_draw_ordinal: u64,
+    header_projection: view::workload_header_projection::WorkloadHeaderProjection,
 }
 
 #[cfg(feature = "workload-harness")]
@@ -1182,23 +1184,84 @@ impl WorkloadFrameDriver {
             clock: Box::new(clock),
             dirty: true,
             next_draw_ordinal: 0,
+            header_projection: view::workload_header_projection::WorkloadHeaderProjection::default(
+            ),
         }
+    }
+
+    /// Creates a driver with an explicit feature-only performance-label projection.
+    #[must_use]
+    pub fn new_with_header_projection(
+        app: App,
+        terminal: Terminal<ratatui::backend::TestBackend>,
+        clock: impl FnMut() -> Duration + 'static,
+        omit_performance_label: bool,
+    ) -> Self {
+        let mut driver = Self::new(app, terminal, clock);
+        driver.header_projection = view::workload_header_projection::WorkloadHeaderProjection {
+            omit_performance_label,
+        };
+        driver
     }
 
     /// Runs one production-ordered refresh, limiter, draw, record, and poll iteration.
     pub fn step(&mut self, dirty: bool) -> io::Result<WorkloadFrameObservation> {
+        self.step_inner(dirty, true)
+    }
+
+    /// Applies the ordinary App watch refresh without entering the draw phase.
+    pub fn refresh_app_if_changed(&mut self) -> io::Result<bool> {
+        let changed = self.app.refresh_if_changed()?;
+        self.dirty |= changed;
+        Ok(changed)
+    }
+
+    /// Runs a limiter/draw iteration from the already refreshed App cache.
+    pub fn step_without_refresh(&mut self, dirty: bool) -> io::Result<WorkloadFrameObservation> {
+        self.step_inner(dirty, false)
+    }
+
+    fn step_inner(
+        &mut self,
+        dirty: bool,
+        refresh_app: bool,
+    ) -> io::Result<WorkloadFrameObservation> {
         self.dirty |= dirty;
-        self.dirty |= self.app.refresh_if_changed()?;
+        if refresh_app {
+            self.dirty |= self.app.refresh_if_changed()?;
+        }
         let now = (self.clock)();
+        let mut performance_publication = None;
+        let mut rendered_at = None;
+        let mut rendered_header_line = None;
         let draw_ordinal = if self.limiter.ready(self.dirty, now) {
             let draw_ordinal = self.next_draw_ordinal;
             let next_draw_ordinal = draw_ordinal
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("workload frame draw ordinal exceeded u64"))?;
-            match self.terminal.draw(|frame| self.app.render(frame)) {
+            let publication = self.app.performance.clone();
+            let projection = self.header_projection;
+            match self.terminal.draw(|frame| {
+                if projection.omit_performance_label {
+                    view::workload_header_projection::render_with_workload_projection(
+                        frame,
+                        self.app.model.as_ref(),
+                        &publication,
+                        &self.app.header,
+                        &self.app.state,
+                        &self.app.diagnostics,
+                        &self.app.setup,
+                        projection,
+                    );
+                } else {
+                    self.app.render(frame);
+                }
+            }) {
                 Ok(_) => {}
                 Err(never) => match never {},
             }
+            performance_publication = Some(publication);
+            rendered_header_line = Some(workload_rendered_header_line(&self.terminal)?);
             self.limiter.record(now);
             self.dirty = false;
             self.next_draw_ordinal = next_draw_ordinal;
@@ -1206,11 +1269,18 @@ impl WorkloadFrameDriver {
         } else {
             None
         };
+        let after_iteration = (self.clock)();
+        if draw_ordinal.is_some() {
+            rendered_at = Some(after_iteration);
+        }
         let poll_duration = self
             .app
-            .poll_duration(&self.limiter, self.dirty, (self.clock)());
+            .poll_duration(&self.limiter, self.dirty, after_iteration);
         Ok(WorkloadFrameObservation {
             draw_ordinal,
+            performance_publication,
+            rendered_at,
+            rendered_header_line,
             poll_duration,
         })
     }
@@ -1238,6 +1308,33 @@ impl WorkloadFrameDriver {
     pub const fn terminal(&self) -> &Terminal<ratatui::backend::TestBackend> {
         &self.terminal
     }
+
+    /// Returns the complete publication currently cached by App.
+    #[must_use]
+    pub const fn cached_performance_publication(&self) -> &PerformancePublication {
+        &self.app.performance
+    }
+
+    /// Returns the exclusive draw watermark for the next successful draw.
+    #[must_use]
+    pub const fn next_draw_ordinal(&self) -> u64 {
+        self.next_draw_ordinal
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+fn workload_rendered_header_line(
+    terminal: &Terminal<ratatui::backend::TestBackend>,
+) -> io::Result<String> {
+    let buffer = terminal.backend().buffer();
+    let width = usize::from(buffer.area.width);
+    buffer
+        .content()
+        .chunks(width)
+        .map(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>())
+        .find(|row| row.contains("session:"))
+        .map(|row| row.trim_end().to_owned())
+        .ok_or_else(|| io::Error::other("workload render omitted the header body row"))
 }
 // increment5-workload-harness: end production frame limiter driver
 
@@ -1357,12 +1454,15 @@ mod tests {
         DiagnosticSource, InputAvailability, OccurrenceLogStatus, OwnerFreshness,
         PersistenceCounters, RuntimeDiagnosticsSnapshot, SourceCoverageSnapshot,
     };
-    use crate::herdr::collector::ObservationQuality;
-    use crate::herdr::collector::{CoverageSource, SourceAvailability, SourceCoverageRegistry};
+    use crate::herdr::collector::{
+        CoverageSource, ObservationQuality, PerformancePublication, SourceAvailability,
+        SourceCoverageRegistry,
+    };
     use crate::model::{
         AgentNode, DependencyEdge, DisplayOrdinal, DomainModel, ExecState, Execution, Pane,
         Provider, RunId, RunKey, Tab, TaskRun, TaskState, Workspace,
     };
+    use crate::performance::{PerformanceDegradationReason, PerformanceSnapshot};
     use crate::store::writer::{
         DurabilityDisposition, PersistenceFailure, PersistenceFailureCode, PersistenceOperation,
         PersistencePhase, PersistenceStatus,
@@ -1470,18 +1570,101 @@ mod tests {
 
     fn app_with_model(model: DomainModel) -> (App, watch::Sender<Arc<DomainModel>>) {
         let (model_sender, model_receiver) = watch::channel(Arc::new(model));
-        let (_quality_sender, quality_receiver) = watch::channel(ObservationQuality::Live);
         let app = App::new(
             model_receiver,
-            quality_receiver,
             HeaderInputs {
                 host: "host".to_owned(),
                 session: "session".to_owned(),
-                event_lag: Duration::ZERO,
                 ..HeaderInputs::default()
             },
         );
         (app, model_sender)
+    }
+
+    fn performance_publication(
+        quality: ObservationQuality,
+        reasons: impl IntoIterator<Item = PerformanceDegradationReason>,
+    ) -> PerformancePublication {
+        PerformancePublication {
+            snapshot: PerformanceSnapshot {
+                reasons: reasons.into_iter().collect(),
+                ..PerformanceSnapshot::default()
+            },
+            effective_quality: quality,
+            #[cfg(feature = "workload-harness")]
+            workload_sample_stamp: None,
+        }
+    }
+
+    #[test]
+    fn performance_only_refresh_does_not_rebuild_row_projection() {
+        let (_model_sender, model_receiver) = watch::channel(Arc::new(DomainModel::default()));
+        let (performance_sender, performance_receiver) =
+            watch::channel(performance_publication(ObservationQuality::Live, []));
+        let mut app = App::new(
+            model_receiver,
+            HeaderInputs {
+                performance: performance_receiver,
+                ..HeaderInputs::default()
+            },
+        );
+        app.reset_projection_build_count();
+
+        performance_sender
+            .send(performance_publication(
+                ObservationQuality::Degraded,
+                [PerformanceDegradationReason::DependencyEdges],
+            ))
+            .unwrap();
+
+        assert!(app.refresh_if_changed().unwrap());
+        assert_eq!(app.projection_build_count(), 0);
+        assert_eq!(
+            app.performance,
+            performance_publication(
+                ObservationQuality::Degraded,
+                [PerformanceDegradationReason::DependencyEdges],
+            )
+        );
+    }
+
+    #[test]
+    fn app_never_joins_performance_and_quality_from_different_generations() {
+        let (_model_sender, model_receiver) = watch::channel(Arc::new(DomainModel::default()));
+        let live = performance_publication(ObservationQuality::Live, []);
+        let degraded = performance_publication(
+            ObservationQuality::Degraded,
+            [PerformanceDegradationReason::EventsSixtySeconds],
+        );
+        let (performance_sender, performance_receiver) = watch::channel(live.clone());
+        let mut app = App::new(
+            model_receiver,
+            HeaderInputs {
+                performance: performance_receiver,
+                ..HeaderInputs::default()
+            },
+        );
+
+        for publication in [
+            degraded.clone(),
+            live.clone(),
+            degraded.clone(),
+            live.clone(),
+        ] {
+            performance_sender.send(publication.clone()).unwrap();
+            assert!(app.refresh_if_changed().unwrap());
+            let screen = render_at_width(&app, 140);
+            let rendered_pair = (
+                screen.contains("LIVE"),
+                screen.contains("DEGRADED"),
+                screen.contains("perf:events_60s"),
+            );
+            assert!(
+                matches!(rendered_pair, (true, false, false) | (false, true, true)),
+                "rendered a mixed coherent-publication pair: {screen}"
+            );
+            assert_eq!(app.performance, publication);
+        }
     }
 
     fn render(app: &App) -> String {
@@ -1601,7 +1784,7 @@ mod tests {
 
     struct RuntimeSenders {
         model: watch::Sender<Arc<DomainModel>>,
-        _quality: watch::Sender<ObservationQuality>,
+        _performance: watch::Sender<PerformancePublication>,
         diagnostics: watch::Sender<RuntimeDiagnosticsSnapshot>,
         operator: watch::Sender<OperatorSnapshot>,
     }
@@ -1613,14 +1796,15 @@ mod tests {
         clock: Arc<dyn Clock>,
     ) -> (App, RuntimeSenders) {
         let (model_sender, model_receiver) = watch::channel(Arc::new(model));
-        let (quality_sender, quality_receiver) = watch::channel(ObservationQuality::Live);
+        let (performance_sender, performance) =
+            watch::channel(performance_publication(ObservationQuality::Live, []));
         let (diagnostics_sender, diagnostics_receiver) = watch::channel(healthy_diagnostics());
         let (operator_sender, operator_receiver) = watch::channel(operator);
         let app = App::with_inputs(
             model_receiver,
-            quality_receiver,
             HeaderInputs {
                 session: "session".to_owned(),
+                performance,
                 ..HeaderInputs::default()
             },
             diagnostics_receiver,
@@ -1632,7 +1816,7 @@ mod tests {
             app,
             RuntimeSenders {
                 model: model_sender,
-                _quality: quality_sender,
+                _performance: performance_sender,
                 diagnostics: diagnostics_sender,
                 operator: operator_sender,
             },
@@ -1819,11 +2003,9 @@ mod tests {
             (first, "first", 1, TaskState::Running),
             (second, "second", 2, TaskState::Running),
         ])));
-        let (_quality_sender, quality_receiver) = watch::channel(ObservationQuality::Live);
         let session_name = "named-session-i4-a3";
         let mut app = App::new(
             model_receiver,
-            quality_receiver,
             HeaderInputs {
                 session: session_name.to_owned(),
                 ..HeaderInputs::default()
@@ -2569,7 +2751,8 @@ mod tests {
             1,
             TaskState::Running,
         )])));
-        let (quality_sender, quality_receiver) = watch::channel(ObservationQuality::Live);
+        let (performance_sender, performance) =
+            watch::channel(performance_publication(ObservationQuality::Live, []));
         let (diagnostics_sender, diagnostics_receiver) = watch::channel(healthy_diagnostics());
         let (operator_sender, operator_receiver) = watch::channel(empty_operator(HashMap::new()));
         let (coverage_sender, coverage_receiver) = watch::channel(SourceCoverageRegistry::new(
@@ -2577,10 +2760,10 @@ mod tests {
         ));
         let mut app = App::with_inputs(
             model_receiver,
-            quality_receiver,
             HeaderInputs {
                 session: "session".to_owned(),
                 source_coverage: coverage_receiver,
+                performance,
                 ..HeaderInputs::default()
             },
             diagnostics_receiver,
@@ -2598,7 +2781,12 @@ mod tests {
         operator_sender
             .send(empty_operator(HashMap::from([(terminal, terminal_at_ms)])))
             .unwrap();
-        quality_sender.send(ObservationQuality::Degraded).unwrap();
+        performance_sender
+            .send(performance_publication(
+                ObservationQuality::Degraded,
+                [PerformanceDegradationReason::DependencyEdges],
+            ))
+            .unwrap();
         let mut changed_diagnostics = healthy_diagnostics();
         changed_diagnostics.dangling_announcement_components = 41;
         diagnostics_sender.send(changed_diagnostics).unwrap();
@@ -2608,7 +2796,10 @@ mod tests {
 
         app.reset_projection_build_count();
         app.refresh_cached(false);
-        assert_eq!(app.quality, ObservationQuality::Degraded);
+        assert_eq!(
+            app.performance.effective_quality,
+            ObservationQuality::Degraded
+        );
         assert_eq!(app.diagnostics.dangling_announcement_components, 41);
         assert_eq!(
             app.header
@@ -3015,12 +3206,10 @@ mod tests {
     #[test]
     fn source_coverage_refreshes_dynamically() {
         let (model_sender, model_receiver) = watch::channel(Arc::new(DomainModel::default()));
-        let (_quality_sender, quality_receiver) = watch::channel(ObservationQuality::Live);
         let (coverage_sender, coverage_receiver) =
             watch::channel(SourceCoverageRegistry::new(SourceAvailability::Available));
         let mut app = App::new(
             model_receiver,
-            quality_receiver,
             HeaderInputs {
                 source_coverage: coverage_receiver,
                 ..HeaderInputs::default()
@@ -3136,23 +3325,36 @@ mod tests {
         let model = model_with_runs(&[(run, "run", 1, TaskState::Running)]);
         let expected_run_count = model.task_runs().count();
         let (model_sender, model_receiver) = watch::channel(Arc::new(model));
-        let (quality_sender, quality_receiver) = watch::channel(ObservationQuality::Live);
-        let mut app = App::new(model_receiver, quality_receiver, HeaderInputs::default());
+        let (performance_sender, performance) =
+            watch::channel(performance_publication(ObservationQuality::Live, []));
+        let mut app = App::new(
+            model_receiver,
+            HeaderInputs {
+                performance,
+                ..HeaderInputs::default()
+            },
+        );
 
         let outcome = app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
 
         assert_eq!(outcome, LoopControl::Exit);
         assert_eq!(app.model().task_runs().count(), expected_run_count);
         assert!(model_sender.send(Arc::new(DomainModel::default())).is_ok());
-        assert!(quality_sender.send(ObservationQuality::Degraded).is_ok());
+        assert!(
+            performance_sender
+                .send(performance_publication(
+                    ObservationQuality::Degraded,
+                    [PerformanceDegradationReason::EventLag],
+                ))
+                .is_ok()
+        );
         assert_eq!(app.model().task_runs().count(), expected_run_count);
     }
 
     #[test]
     fn tui_exits_on_closed_watch() {
         let (model_sender, model_receiver) = watch::channel(Arc::new(DomainModel::default()));
-        let (_quality_sender, quality_receiver) = watch::channel(ObservationQuality::Live);
-        let mut app = App::new(model_receiver, quality_receiver, HeaderInputs::default());
+        let mut app = App::new(model_receiver, HeaderInputs::default());
         drop(model_sender);
 
         let error = app
