@@ -36,7 +36,10 @@ use ratatui::backend::TestBackend;
 use rusqlite::{Connection, MAIN_DB};
 use serde_json::{Value, json};
 
-const WAIT: Duration = Duration::from_secs(5);
+// Bounds event-driven waits only; generous because these assertions prove
+// non-vacuity, not speed, and the suite runs under full-host load. (A 5s
+// bound flaked under load twice across eras at ~35x its isolated runtime.)
+const WAIT: Duration = Duration::from_secs(30);
 const ROOT_THREAD: &str = "ALLOWLIST_NEGATIVE_CONTROL_THREAD_I2E_91B7";
 const CHILD_THREAD: &str = "ALLOWLIST_CHILD_THREAD_I2E_3F62";
 const PROMPT_SENTINEL: &str = "PROMPT_FORBIDDEN_SENTINEL_I2E_4C21";
