@@ -1236,6 +1236,15 @@ mod tests {
         performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO))).0
     }
 
+    async fn shutdown_client_write(stream: &mut UnixStream) {
+        match stream.shutdown().await {
+            Ok(()) => {}
+            // Darwin may report ENOTCONN after the peer closes; Linux accepts the same shutdown(2).
+            Err(error) if error.kind() == io::ErrorKind::NotConnected => {}
+            Err(error) => panic!("client-side UnixStream shutdown failed: {error}"),
+        }
+    }
+
     async fn service_frame(
         frame: Value,
         reducer: &mut Reducer,
@@ -1485,7 +1494,7 @@ mod tests {
             .write_all(b"{\"schema_version\":1,\"event_id\":\"full\"}\n")
             .await
             .unwrap();
-        client.shutdown().await.unwrap();
+        shutdown_client_write(&mut client).await;
         let mut response = Vec::new();
         BufReader::new(&mut client)
             .read_until(b'\n', &mut response)
@@ -1541,7 +1550,7 @@ mod tests {
             .unwrap();
             frame.push(b'\n');
             client.write_all(&frame).await.unwrap();
-            client.shutdown().await.unwrap();
+            shutdown_client_write(&mut client).await;
 
             let mut response = Vec::new();
             let mut reader = BufReader::new(client);

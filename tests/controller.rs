@@ -432,10 +432,19 @@ async fn send_wire_value(path: &Path, value: &Value) -> Value {
     serde_json::from_slice(&send_wire_bytes_bounded(path, &bytes).await).unwrap()
 }
 
+async fn shutdown_client_write(stream: &mut UnixStream) {
+    match stream.shutdown().await {
+        Ok(()) => {}
+        // Darwin may report ENOTCONN after the peer closes; Linux accepts the same shutdown(2).
+        Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
+        Err(error) => panic!("client-side UnixStream shutdown failed: {error}"),
+    }
+}
+
 async fn send_wire_bytes(path: &Path, bytes: &[u8]) -> Vec<u8> {
     let mut stream = UnixStream::connect(path).await.unwrap();
     stream.write_all(bytes).await.unwrap();
-    stream.shutdown().await.unwrap();
+    shutdown_client_write(&mut stream).await;
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await.unwrap();
     response
@@ -447,6 +456,25 @@ async fn send_wire_bytes_bounded(path: &Path, bytes: &[u8]) -> Vec<u8> {
     })
     .await
     .expect("Controller wire exchange timed out")
+}
+
+#[tokio::test]
+async fn client_shutdown_after_peer_close_preserves_buffered_response() {
+    let (mut client, mut server) = UnixStream::pair().unwrap();
+    let server = tokio::spawn(async move {
+        let mut request = [0; 7];
+        server.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"request");
+        server.write_all(b"response").await.unwrap();
+    });
+
+    client.write_all(b"request").await.unwrap();
+    server.await.unwrap();
+    shutdown_client_write(&mut client).await;
+
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).await.unwrap();
+    assert_eq!(response, b"response");
 }
 
 fn controlled_diagnostics() -> (
