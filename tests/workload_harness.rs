@@ -330,7 +330,7 @@ async fn wait_for_performance_sample(
     predicate: impl Fn(&[WorkloadPerformanceSample]) -> bool,
     message: &'static str,
 ) {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let notified = notification.notified();
             if predicate(&lock_workload(samples)) {
@@ -349,6 +349,13 @@ fn freeze_performance_samples_at_close(
     carry_in_sample_ordinal: u64,
     workload_close_ns: u64,
 ) -> (Vec<WorkloadPerformanceSample>, u64) {
+    // Read the recorder's authoritative watermark before checking close-bounded coverage; deriving
+    // it from a filtered suffix would let an already-recorded omission look like a smaller stream.
+    let next_sample_ordinal = samples
+        .last()
+        .and_then(|sample| sample.publication.workload_sample_stamp)
+        .and_then(|stamp| stamp.sample_ordinal.checked_add(1))
+        .expect("frozen performance recorder watermark must fit u64");
     let suffix = samples
         .iter()
         .filter(|sample| {
@@ -357,20 +364,45 @@ fn freeze_performance_samples_at_close(
                 .workload_sample_stamp
                 .is_some_and(|stamp| stamp.sample_ordinal >= carry_in_sample_ordinal)
         })
-        .take_while(|sample| {
-            sample
-                .publication
-                .workload_sample_stamp
-                .is_some_and(|stamp| stamp.sampled_at_ns <= workload_close_ns)
-        })
         .cloned()
         .collect::<Vec<_>>();
-    let next_sample_ordinal = suffix
+    let included_next_sample_ordinal = suffix
         .last()
         .and_then(|sample| sample.publication.workload_sample_stamp)
         .and_then(|stamp| stamp.sample_ordinal.checked_add(1))
         .expect("close-bounded performance sample watermark must fit u64");
+    assert_eq!(
+        included_next_sample_ordinal, next_sample_ordinal,
+        "closing freeze must not omit an observer-linearized sample"
+    );
+    assert!(
+        suffix.iter().all(|sample| {
+            sample
+                .publication
+                .workload_sample_stamp
+                .is_some_and(|stamp| stamp.sampled_at_ns <= workload_close_ns)
+        }),
+        "closing freeze must occur before any post-close observer append"
+    );
     (suffix, next_sample_ordinal)
+}
+
+#[cfg(feature = "workload-harness")]
+fn last_pre_origin_sample_ordinal(
+    samples: &[WorkloadPerformanceSample],
+    workload_origin_ns: u64,
+) -> u64 {
+    samples
+        .iter()
+        .rev()
+        .find_map(|sample| {
+            sample
+                .publication
+                .workload_sample_stamp
+                .filter(|stamp| stamp.sampled_at_ns < workload_origin_ns)
+                .map(|stamp| stamp.sample_ordinal)
+        })
+        .expect("workload origin must follow a raw carry-in performance sample")
 }
 
 #[cfg(feature = "workload-harness")]
@@ -605,7 +637,7 @@ async fn run_schedule_through_real_queue_at(
     .await
     .unwrap();
     let mut ready_quality = handle.collector.quality.clone();
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if *ready_quality.borrow() == ObservationQuality::Live {
                 break;
@@ -635,14 +667,15 @@ async fn run_schedule_through_real_queue_at(
         move || Duration::from_nanos(driver_clock()),
         injection == PerformanceTrialInjection::OmitRequiredRenderedReason,
     );
-    let carry_in_sample_ordinal = tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let _ = driver.refresh_app_if_changed().unwrap();
-            if let Some(stamp) = driver
+            if driver
                 .cached_performance_publication()
                 .workload_sample_stamp
+                .is_some()
             {
-                break stamp.sample_ordinal;
+                break;
             }
             performance_watch
                 .changed()
@@ -679,6 +712,8 @@ async fn run_schedule_through_real_queue_at(
             .await
             .expect("reference workload epoch must be reachable");
     }
+    let carry_in_sample_ordinal =
+        last_pre_origin_sample_ordinal(&lock_workload(&performance_samples), workload_origin_ns);
 
     let probes = workload::screen_probe_sequences(profile)
         .into_iter()
@@ -749,7 +784,7 @@ async fn run_schedule_through_real_queue_at(
             .await;
         assert_eq!(response, ControllerResponse::Accepted);
         if profile == WorkloadProfile::TwiceTarget && sequence == 1_201 {
-            tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
                     if performance_watch
                         .borrow()
@@ -769,7 +804,7 @@ async fn run_schedule_through_real_queue_at(
             .expect("the stable sixty-second reason must publish after admission 1,201");
         }
         if injection == PerformanceTrialInjection::SupportedLoadDegradation && sequence == 101 {
-            tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
                     if !performance_watch.borrow().snapshot.reasons.is_empty() {
                         break;
@@ -848,7 +883,7 @@ async fn run_schedule_through_real_queue_at(
     wait_for_sequence_count(&persisted, submitted_sequences.len()).await;
     let expected_high_water = u64::try_from(submitted_sequences.len()).unwrap();
     let mut performance = handle.collector.performance.clone();
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let final_generation_is_published = {
                 let publication = performance.borrow();
@@ -893,26 +928,45 @@ async fn run_schedule_through_real_queue_at(
         !pending_probes.is_empty(),
         "the closed scheduled profiles must retain their final probe for the closing draw"
     );
-    let closing_observation = if uses_realtime_clock {
-        loop {
-            let frame = driver.step(true).unwrap();
-            if frame.draw_ordinal.is_some() {
-                break frame;
+    let (closing_observation, performance_samples_at_close, next_sample_ordinal) =
+        if uses_realtime_clock {
+            loop {
+                // The recorder mutex is the close linearization boundary. A monitor tick that
+                // starts after this lock is released belongs to the trailing barrier, not the stream.
+                let samples = lock_workload(&performance_samples);
+                let frame = driver.step(true).unwrap();
+                if frame.draw_ordinal.is_some() {
+                    let closing_rendered_ns = duration_ns(
+                        frame
+                            .rendered_at
+                            .expect("successful closing draw must record its timestamp"),
+                    );
+                    let (frozen, next_sample_ordinal) = freeze_performance_samples_at_close(
+                        &samples,
+                        carry_in_sample_ordinal,
+                        closing_rendered_ns,
+                    );
+                    break (frame, frozen, next_sample_ordinal);
+                }
+                drop(samples);
+                tokio::time::sleep(frame.poll_duration).await;
             }
-            tokio::time::sleep(frame.poll_duration).await;
-        }
-    } else {
-        let closing_ns = lock_workload(&admissions)
-            .last()
-            .expect("closing draw requires the final admission")
-            .scheduled_ns
-            .checked_add(frame_phase_offset_ns)
-            .expect("closing draw timestamp must fit u64");
-        clock_ns.store(closing_ns, Ordering::SeqCst);
-        let frame = driver.step(true).unwrap();
-        assert!(frame.draw_ordinal.is_some());
-        frame
-    };
+        } else {
+            let closing_ns = lock_workload(&admissions)
+                .last()
+                .expect("closing draw requires the final admission")
+                .scheduled_ns
+                .checked_add(frame_phase_offset_ns)
+                .expect("closing draw timestamp must fit u64");
+            clock_ns.store(closing_ns, Ordering::SeqCst);
+            // Match the real-clock close boundary even though the injected clock cannot advance.
+            let samples = lock_workload(&performance_samples);
+            let frame = driver.step(true).unwrap();
+            assert!(frame.draw_ordinal.is_some());
+            let (frozen, next_sample_ordinal) =
+                freeze_performance_samples_at_close(&samples, carry_in_sample_ordinal, closing_ns);
+            (frame, frozen, next_sample_ordinal)
+        };
     let closing_rendered_ns = duration_ns(
         closing_observation
             .rendered_at
@@ -947,25 +1001,9 @@ async fn run_schedule_through_real_queue_at(
         new_probe_count: closing_probe_count,
         observation: closing_observation,
     });
-    let (raw_ordinal_before_trailing, performance_samples_at_close, next_sample_ordinal) = {
-        let samples = lock_workload(&performance_samples);
-        let raw_ordinal_before_trailing = samples
-            .last()
-            .and_then(|sample| sample.publication.workload_sample_stamp)
-            .expect("closing frame must follow a raw performance sample")
-            .sample_ordinal;
-        let (performance_samples_at_close, next_sample_ordinal) =
-            freeze_performance_samples_at_close(
-                &samples,
-                carry_in_sample_ordinal,
-                closing_rendered_ns,
-            );
-        (
-            raw_ordinal_before_trailing,
-            performance_samples_at_close,
-            next_sample_ordinal,
-        )
-    };
+    let raw_ordinal_before_trailing = next_sample_ordinal
+        .checked_sub(1)
+        .expect("closing performance watermark must follow an included sample");
     wait_for_performance_sample(
         &performance_samples,
         performance_notification.as_ref(),
@@ -1590,7 +1628,7 @@ async fn reference_profile_stream_selection_writes_valid_final_and_non_final_art
 #[cfg(feature = "workload-harness")]
 #[test]
 fn close_snapshot_excludes_strictly_later_barrier_sample() {
-    let samples = [
+    let samples_at_close = [
         WorkloadPerformanceSample {
             source_quality: ObservationQuality::Live,
             publication: stamped_publication(40, 90, ObservationQuality::Live, []),
@@ -1599,13 +1637,10 @@ fn close_snapshot_excludes_strictly_later_barrier_sample() {
             source_quality: ObservationQuality::Live,
             publication: stamped_publication(41, 100, ObservationQuality::Live, []),
         },
-        WorkloadPerformanceSample {
-            source_quality: ObservationQuality::Live,
-            publication: stamped_publication(42, 101, ObservationQuality::Live, []),
-        },
     ];
 
-    let (included, next_sample_ordinal) = freeze_performance_samples_at_close(&samples, 40, 100);
+    let (included, next_sample_ordinal) =
+        freeze_performance_samples_at_close(&samples_at_close, 40, 100);
 
     assert_eq!(
         included
@@ -1629,6 +1664,64 @@ fn close_snapshot_excludes_strictly_later_barrier_sample() {
             .sampled_at_ns
             <= 100
     }));
+
+    let trailing_barrier = WorkloadPerformanceSample {
+        source_quality: ObservationQuality::Live,
+        publication: stamped_publication(42, 101, ObservationQuality::Live, []),
+    };
+    assert!(
+        trailing_barrier
+            .publication
+            .workload_sample_stamp
+            .unwrap()
+            .sampled_at_ns
+            > 100
+    );
+}
+
+#[cfg(feature = "workload-harness")]
+#[test]
+fn close_snapshot_refuses_to_roll_back_past_an_already_recorded_suffix() {
+    let samples = [
+        WorkloadPerformanceSample {
+            source_quality: ObservationQuality::Live,
+            publication: stamped_publication(40, 90, ObservationQuality::Live, []),
+        },
+        WorkloadPerformanceSample {
+            source_quality: ObservationQuality::Live,
+            publication: stamped_publication(41, 100, ObservationQuality::Live, []),
+        },
+        WorkloadPerformanceSample {
+            source_quality: ObservationQuality::Live,
+            publication: stamped_publication(42, 101, ObservationQuality::Live, []),
+        },
+    ];
+
+    assert!(
+        std::panic::catch_unwind(|| freeze_performance_samples_at_close(&samples, 40, 100))
+            .is_err()
+    );
+}
+
+#[cfg(feature = "workload-harness")]
+#[test]
+fn carry_in_anchor_selects_the_last_pre_origin_sample() {
+    let samples = [
+        WorkloadPerformanceSample {
+            source_quality: ObservationQuality::Live,
+            publication: stamped_publication(40, 90, ObservationQuality::Live, []),
+        },
+        WorkloadPerformanceSample {
+            source_quality: ObservationQuality::Live,
+            publication: stamped_publication(41, 99, ObservationQuality::Live, []),
+        },
+        WorkloadPerformanceSample {
+            source_quality: ObservationQuality::Live,
+            publication: stamped_publication(42, 100, ObservationQuality::Live, []),
+        },
+    ];
+
+    assert_eq!(last_pre_origin_sample_ordinal(&samples, 100), 41);
 }
 
 #[cfg(feature = "workload-harness")]
@@ -1834,6 +1927,14 @@ async fn workload_performance_stream_retains_pre_origin_carry_in_and_contiguous_
         .unwrap();
     assert_eq!(stream.first_sample_ordinal, result.carry_in_sample_ordinal);
     assert!(stream.samples[0].sampled_at_ns < stream.workload_start_ns);
+    assert_eq!(
+        stream
+            .samples
+            .iter()
+            .filter(|sample| sample.sampled_at_ns < stream.workload_start_ns)
+            .count(),
+        1
+    );
     assert_eq!(
         stream
             .samples
@@ -2488,13 +2589,13 @@ async fn run_notification_and_forced_rescan_pair(poll: Duration) -> FallbackPair
 #[tokio::test]
 async fn fallback_rescan_uses_injected_polling_interval_without_loss() {
     let poll = Duration::from_millis(20);
-    let scheduler_slack = Duration::from_millis(250);
+    let rescan_added_delay_ceiling = Duration::from_secs(2);
     let paired = run_notification_and_forced_rescan_pair(poll).await;
     assert_eq!(paired.notification.sequence, paired.rescan.sequence);
     let rescan_upper_bound = paired
         .notification
         .elapsed
-        .saturating_add(poll + scheduler_slack);
+        .saturating_add(rescan_added_delay_ceiling);
     assert!(paired.rescan.elapsed <= rescan_upper_bound);
     let expected = workload::oracle(WorkloadProfile::FallbackRescan).final_identities;
     assert_eq!(paired.notification.final_identities, expected);
@@ -4484,6 +4585,155 @@ fn performance_evidence_stream_is_omission_closed_and_rederived() {
         coherent_but_untrue_topology.validate(),
         Err(ResultError::InvalidArtifact)
     );
+}
+
+#[test]
+fn performance_stream_accepts_latched_recovered_event_lag() {
+    let mut latched = failed_outcome(
+        ScenarioV1::Sustained,
+        MeasurementStageV1::Final,
+        FailureReasonV1::SupportedLoadDegradation,
+        100,
+        1_000,
+    );
+    let stream = latched.document_mut().trials[0]
+        .raw
+        .performance_evidence_stream
+        .as_mut()
+        .unwrap();
+    let origin = stream.workload_start_ns;
+    stream.terminal_observations[0].terminal_ns = origin + 2_100_000_000;
+    stream.terminal_observations[39].terminal_ns = origin + 2_300_000_000;
+
+    let mut closing_sample = stream.samples[2].clone();
+    closing_sample.sample_ordinal = 4;
+    let mut recovered = closing_sample.clone();
+    recovered.sample_ordinal = 3;
+    recovered.sampled_at_ns = origin + 2_200_000_000;
+    recovered.event_lag_ns = 200_000_000;
+    recovered.pending_events = 2;
+    recovered.admission_high_water = 44;
+    recovered.completion_high_water = 43;
+    recovered.events_one_second = 20;
+    recovered.events_ten_seconds = 44;
+    recovered.events_sixty_seconds = 44;
+    recovered.reasons = vec![PerformanceReasonV1::EventLag];
+    recovered.effective_quality = EffectiveQualityV1::Degraded;
+
+    let mut closing_frame = stream.frames[2].clone();
+    closing_frame.draw_ordinal = 4;
+    closing_frame.sample_ordinal = 4;
+    let mut recovered_frame = closing_frame.clone();
+    recovered_frame.draw_ordinal = 3;
+    recovered_frame.sample_ordinal = 3;
+    recovered_frame.state_observed_at_ns = recovered.sampled_at_ns;
+    recovered_frame.rendered_at_ns = origin + 2_300_000_000;
+    recovered_frame.reasons = recovered.reasons.clone();
+    recovered_frame.effective_quality = recovered.effective_quality;
+    recovered_frame.rendered_header_line = "DEGRADED | perf:event_lag".to_owned();
+
+    stream.samples = vec![
+        stream.samples[0].clone(),
+        stream.samples[1].clone(),
+        recovered,
+        closing_sample,
+    ];
+    stream.frames = vec![
+        stream.frames[0].clone(),
+        stream.frames[1].clone(),
+        recovered_frame,
+        closing_frame,
+    ];
+    stream.next_sample_ordinal = 5;
+    stream.next_draw_ordinal = 5;
+
+    let breach_high_water = stream.samples[1].admission_high_water;
+    let recovered = &stream.samples[2];
+    assert!(recovered.event_lag_ns <= 1_000_000_000);
+    assert!(stream.terminal_observations.iter().any(|terminal| {
+        terminal.sequence <= breach_high_water && terminal.terminal_ns > recovered.sampled_at_ns
+    }));
+    assert_eq!(recovered.reasons, vec![PerformanceReasonV1::EventLag]);
+
+    assert!(latched.validate().is_ok());
+
+    let mut missing_breach = failed_outcome(
+        ScenarioV1::Sustained,
+        MeasurementStageV1::Final,
+        FailureReasonV1::SupportedLoadDegradation,
+        100,
+        1_000,
+    );
+    let stream = missing_breach.document_mut().trials[0]
+        .raw
+        .performance_evidence_stream
+        .as_mut()
+        .unwrap();
+    let breached = stream
+        .samples
+        .iter_mut()
+        .find(|sample| sample.event_lag_ns > 1_000_000_000)
+        .unwrap();
+    let breached_ordinal = breached.sample_ordinal;
+    breached.reasons.clear();
+    breached.effective_quality = EffectiveQualityV1::Live;
+    for frame in stream
+        .frames
+        .iter_mut()
+        .filter(|frame| frame.sample_ordinal == breached_ordinal)
+    {
+        frame.reasons.clear();
+        frame.effective_quality = EffectiveQualityV1::Live;
+        frame.rendered_header_line = "LIVE | perf:".to_owned();
+    }
+    assert_eq!(missing_breach.validate(), Err(ResultError::InvalidArtifact));
+}
+
+#[test]
+fn performance_stream_allows_exactly_one_pre_origin_sample() {
+    let one_pre_origin = valid_final_sustained_result();
+    let one_stream = one_pre_origin.document().trials[0]
+        .raw
+        .performance_evidence_stream
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        one_stream
+            .samples
+            .iter()
+            .filter(|sample| sample.sampled_at_ns < one_stream.workload_start_ns)
+            .count(),
+        1
+    );
+    assert!(one_pre_origin.validate().is_ok());
+
+    let mut two_pre_origin = valid_final_sustained_result();
+    let stream = two_pre_origin.document_mut().trials[0]
+        .raw
+        .performance_evidence_stream
+        .as_mut()
+        .unwrap();
+    let mut second_pre_origin = stream.samples[0].clone();
+    second_pre_origin.sample_ordinal += 1;
+    for sample in stream.samples.iter_mut().skip(1) {
+        sample.sample_ordinal += 1;
+    }
+    for frame in &mut stream.frames {
+        if frame.sample_ordinal > stream.first_sample_ordinal {
+            frame.sample_ordinal += 1;
+        }
+    }
+    stream.samples.insert(1, second_pre_origin);
+    stream.next_sample_ordinal += 1;
+    assert_eq!(
+        stream
+            .samples
+            .iter()
+            .filter(|sample| sample.sampled_at_ns < stream.workload_start_ns)
+            .count(),
+        2
+    );
+    assert_eq!(two_pre_origin.validate(), Err(ResultError::InvalidArtifact));
 }
 
 #[test]

@@ -787,13 +787,6 @@ pub(crate) async fn service_request(
             return;
         }
     };
-    // increment5-workload-harness: begin controller terminal timestamp
-    #[cfg(feature = "workload-harness")]
-    let workload_terminal_ns = request
-        .workload
-        .as_ref()
-        .map(|workload| (workload.hooks.clock)());
-    // increment5-workload-harness: end controller terminal timestamp
     let Some(permit) = persistence.reserve_enqueue() else {
         let _ = request.responder.send(ControllerResponse::Retryable {
             reason: RetryableReason::PersistenceUnavailable,
@@ -812,6 +805,13 @@ pub(crate) async fn service_request(
         }
     };
     admission.complete();
+    // increment5-workload-harness: begin controller terminal timestamp
+    #[cfg(feature = "workload-harness")]
+    let workload_terminal_ns = request
+        .workload
+        .as_ref()
+        .map(|workload| (workload.hooks.clock)());
+    // increment5-workload-harness: end controller terminal timestamp
     // increment5-workload-harness: begin controller publication observation
     #[cfg(feature = "workload-harness")]
     if let Some(workload_timing) = workload_timing {
@@ -1171,6 +1171,10 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::future::pending;
     use std::sync::Arc;
+    #[cfg(feature = "workload-harness")]
+    use std::sync::Mutex;
+    #[cfg(feature = "workload-harness")]
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -1179,8 +1183,6 @@ mod tests {
     use crate::activity::OperatorSnapshot;
     use crate::lockfile::StateRoot;
     use crate::model::{DomainModel, NormalizedEvent};
-    #[cfg(feature = "workload-harness")]
-    use crate::performance::PerformanceClock;
     use crate::performance::{
         PerformanceIngress, TestPerformanceClock, admitted_channel, performance_tracker,
     };
@@ -1318,14 +1320,34 @@ mod tests {
         let origin = Duration::from_secs(123_456) + Duration::from_nanos(789);
         let origin_ns = u64::try_from(origin.as_nanos()).unwrap();
         let clock = Arc::new(TestPerformanceClock::new(origin));
-        let (performance, mut sampler) = performance_tracker(clock.clone());
+        let (performance, sampler) = performance_tracker(clock.clone());
+        let sampler = Arc::new(Mutex::new(sampler));
+        let hook_timestamp = Arc::new(AtomicU64::new(origin_ns));
+        let pending_at_timestamp = Arc::new(Mutex::new(Vec::new()));
         let admissions = Arc::new(std::sync::Mutex::new(Vec::new()));
         let terminals = Arc::new(std::sync::Mutex::new(Vec::new()));
         let persisted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let hooks = WorkloadControllerHooks {
             clock: {
-                let clock = Arc::clone(&clock);
-                Arc::new(move || u64::try_from(clock.monotonic_now().as_nanos()).unwrap())
+                let sampler = Arc::clone(&sampler);
+                let hook_timestamp = Arc::clone(&hook_timestamp);
+                let pending_at_timestamp = Arc::clone(&pending_at_timestamp);
+                Arc::new(move || {
+                    let timestamp = hook_timestamp.fetch_add(1, Ordering::SeqCst);
+                    let snapshot = sampler.lock().unwrap().sample(
+                        &DomainModel::default(),
+                        &OperatorSnapshot {
+                            activity: Arc::from(Vec::new()),
+                            terminal_times: Arc::new(HashMap::new()),
+                        },
+                        0,
+                    );
+                    pending_at_timestamp
+                        .lock()
+                        .unwrap()
+                        .push((timestamp, snapshot.pending_events));
+                    timestamp
+                })
             },
             admission_observer: {
                 let admissions = Arc::clone(&admissions);
@@ -1389,12 +1411,21 @@ mod tests {
         assert_eq!(observed_terminals.len(), 1);
         assert_eq!(observed_terminals[0].sequence, 77);
         assert_eq!(observed_terminals[0].terminal_ns, origin_ns);
-        assert_eq!(observed_terminals[0].published_ns, origin_ns);
+        assert_eq!(observed_terminals[0].published_ns, origin_ns + 1);
+        assert_eq!(
+            pending_at_timestamp
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(timestamp, _)| *timestamp == observed_terminals[0].terminal_ns)
+                .map(|(_, pending)| *pending),
+            Some(0)
+        );
         let observed_persistence = persisted.lock().unwrap().clone();
         assert_eq!(observed_persistence.len(), 1);
         assert_eq!(observed_persistence[0].sequence, 77);
-        assert_eq!(observed_persistence[0].persisted_ns, origin_ns);
-        let snapshot = sampler.sample(
+        assert_eq!(observed_persistence[0].persisted_ns, origin_ns + 2);
+        let snapshot = sampler.lock().unwrap().sample(
             &shared.borrow(),
             &OperatorSnapshot {
                 activity: Arc::from(Vec::new()),

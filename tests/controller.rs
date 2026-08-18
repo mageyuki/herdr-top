@@ -1630,6 +1630,18 @@ async fn collector_handle_publishes_coherent_performance_generation() {
     .await
     .expect("Controller admission must publish a performance generation");
 
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if *running.collector.quality.borrow() == collector::ObservationQuality::Disconnected {
+                break;
+            }
+            let mut quality = running.collector.quality.clone();
+            quality.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+
     let publication = performance.borrow().clone();
     assert_eq!(publication.snapshot.admission_high_water, 1);
     assert_eq!(publication.snapshot.completion_high_water, 1);

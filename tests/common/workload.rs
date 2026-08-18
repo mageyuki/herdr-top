@@ -2397,20 +2397,26 @@ fn validate_performance_stream(
         {
             return Err(ResultError::InvalidArtifact);
         }
-        let reasons = expected_performance_reasons(sample);
-        let effective = if reasons.is_empty() {
+        let instantaneous_reasons = expected_performance_reasons(sample);
+        // EventLag is generation-latched until the breached admission generation drains. The
+        // remaining reasons are instantaneous and must still match exactly in canonical order.
+        let reasons_are_valid = sample.reasons == instantaneous_reasons
+            || sample.event_lag_ns <= 1_000_000_000
+                && sample.reasons.last() == Some(&PerformanceReasonV1::EventLag)
+                && sample.reasons[..sample.reasons.len() - 1] == instantaneous_reasons;
+        let effective = if sample.reasons.is_empty() {
             sample.source_quality
         } else {
             EffectiveQualityV1::Degraded
         };
-        if sample.reasons != reasons || sample.effective_quality != effective {
+        if !reasons_are_valid || sample.effective_quality != effective {
             return Err(ResultError::InvalidArtifact);
         }
         if prior_sample.is_none_or(|prior| performance_payload_changed(prior, sample)) {
             publication_ordinals.insert(sample.sample_ordinal);
         }
         prior_sample = Some(sample);
-        degraded_samples += usize::from(!reasons.is_empty());
+        degraded_samples += usize::from(!sample.reasons.is_empty());
     }
     for frame in &stream.frames {
         let sample = sample_map
@@ -7858,7 +7864,7 @@ fn section15_predicate_rows(
                     stream
                         .samples
                         .iter()
-                        .filter(|sample| !expected_performance_reasons(sample).is_empty())
+                        .filter(|sample| !sample.reasons.is_empty())
                         .count() as u128
                 };
                 push(

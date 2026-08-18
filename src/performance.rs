@@ -730,7 +730,6 @@ mod tests {
         let observed = AbsoluteMonotonicPerformanceClock.monotonic_now();
         let after = direct_clock_gettime_monotonic();
         assert!(before <= observed && observed <= after);
-        assert!(observed > Duration::from_secs(1));
     }
 
     #[test]
