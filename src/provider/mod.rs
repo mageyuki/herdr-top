@@ -161,6 +161,54 @@ impl ProviderEvent {
     }
 }
 
+enum ProviderEventSender {
+    Raw(tokio::sync::mpsc::Sender<ProviderEvent>),
+    #[allow(dead_code)] // removed by Task 6 when the tracked production caller lands
+    Tracked {
+        sender: tokio::sync::mpsc::Sender<ProviderIngressEvent>,
+        ingress: crate::performance::PerformanceIngress,
+    },
+}
+
+#[allow(dead_code)] // removed by Task 6 when the tracked production caller lands
+pub(crate) struct ProviderIngressEvent {
+    pub event: ProviderEvent,
+    pub admission: Option<crate::performance::Admission>,
+}
+
+impl ProviderEventSender {
+    // Full and closed reservations must return the original provider event without boxing it.
+    #[allow(clippy::result_large_err)]
+    fn try_send(
+        &self,
+        event: ProviderEvent,
+    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<ProviderEvent>> {
+        match self {
+            Self::Raw(sender) => sender.try_send(event),
+            Self::Tracked { sender, ingress } => {
+                let permit = match sender.try_reserve() {
+                    Ok(permit) => permit,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+                        return Err(tokio::sync::mpsc::error::TrySendError::Full(event));
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
+                        return Err(tokio::sync::mpsc::error::TrySendError::Closed(event));
+                    }
+                };
+                let admission = matches!(
+                    &event,
+                    ProviderEvent::SessionResolved { .. }
+                        | ProviderEvent::AgentUpsert { .. }
+                        | ProviderEvent::Activity { .. }
+                )
+                .then(|| ingress.admit());
+                permit.send(ProviderIngressEvent { event, admission });
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Returns whether a provider-native identifier fits the colon-free grammar.
 #[must_use]
 pub fn valid_native_id(value: &str) -> bool {
@@ -805,6 +853,10 @@ impl PendingEvents {
 
     /// Flushes in deterministic source/depth/slot/malformed order without blocking.
     pub fn flush_to(&mut self, sender: &tokio_mpsc::Sender<ProviderEvent>) {
+        self.flush_to_sender(&ProviderEventSender::Raw(sender.clone()));
+    }
+
+    fn flush_to_sender(&mut self, sender: &ProviderEventSender) {
         while let Some((token, event)) = self.next_event() {
             match sender.try_send(event) {
                 Ok(()) => self.remove(token),
@@ -1411,7 +1463,7 @@ pub fn spawn_provider_thread(
 ) -> Result<ProviderThreadHandle, ProviderSpawnError> {
     spawn_provider_thread_configured(
         worker,
-        egress,
+        ProviderEventSender::Raw(egress),
         notify_factory,
         ProviderDiagnostics::default(),
         RESCAN_INTERVAL,
@@ -1427,7 +1479,7 @@ pub fn spawn_provider_thread_with_rescan_interval(
 ) -> Result<ProviderThreadHandle, ProviderSpawnError> {
     spawn_provider_thread_configured(
         worker,
-        egress,
+        ProviderEventSender::Raw(egress),
         notify_factory,
         ProviderDiagnostics::default(),
         rescan_interval,
@@ -1440,12 +1492,18 @@ pub(crate) fn spawn_provider_thread_with_diagnostics(
     notify_factory: Option<Box<dyn NotifyFactory>>,
     diagnostics: ProviderDiagnostics,
 ) -> Result<ProviderThreadHandle, ProviderSpawnError> {
-    spawn_provider_thread_configured(worker, egress, notify_factory, diagnostics, RESCAN_INTERVAL)
+    spawn_provider_thread_configured(
+        worker,
+        ProviderEventSender::Raw(egress),
+        notify_factory,
+        diagnostics,
+        RESCAN_INTERVAL,
+    )
 }
 
 fn spawn_provider_thread_configured(
     worker: impl ProviderWorker,
-    egress: tokio_mpsc::Sender<ProviderEvent>,
+    egress: ProviderEventSender,
     notify_factory: Option<Box<dyn NotifyFactory>>,
     diagnostics: ProviderDiagnostics,
     rescan_interval: Duration,
@@ -1528,7 +1586,7 @@ const fn notify_error_code(error: &notify::Error) -> &'static str {
 #[allow(clippy::too_many_arguments)]
 fn provider_thread_main(
     mut worker: impl ProviderWorker,
-    egress: tokio_mpsc::Sender<ProviderEvent>,
+    egress: ProviderEventSender,
     receiver: Receiver<Control>,
     targets: Arc<Mutex<Option<TargetSet>>>,
     force_rescan: Arc<AtomicBool>,
@@ -1581,7 +1639,7 @@ fn provider_thread_main(
 #[allow(clippy::too_many_arguments)]
 fn run_provider_cycle(
     worker: &mut impl ProviderWorker,
-    egress: &tokio_mpsc::Sender<ProviderEvent>,
+    egress: &ProviderEventSender,
     targets: &Arc<Mutex<Option<TargetSet>>>,
     force_rescan: &AtomicBool,
     stop_flag: &AtomicBool,
@@ -1591,7 +1649,7 @@ fn run_provider_cycle(
     hint: Option<&Path>,
     timed_out: bool,
 ) {
-    pending.flush_to(egress);
+    pending.flush_to_sender(egress);
     let current_targets = lock_unpoisoned(targets).clone().unwrap_or_default();
     let force = force_rescan.swap(false, Ordering::AcqRel) || timed_out;
     let mut watch_requests = Vec::new();
@@ -1614,7 +1672,7 @@ fn run_provider_cycle(
             }
         }
     }
-    pending.flush_to(egress);
+    pending.flush_to_sender(egress);
     diagnostics.record_cycle();
 }
 
@@ -1731,6 +1789,7 @@ fn fstat_fd(fd: RawFd) -> io::Result<libc::stat> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::panic::{self, AssertUnwindSafe};
@@ -1738,6 +1797,9 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::activity::OperatorSnapshot;
+    use crate::model::DomainModel;
+    use crate::performance::{TestPerformanceClock, performance_tracker};
 
     // I2a test list, written before implementation:
     // - bootstrap skips non-structural lines and obeys byte/record caps
@@ -1941,6 +2003,53 @@ mod tests {
             generation,
             offset,
         }
+    }
+
+    fn source_state(provider: Provider) -> ProviderEvent {
+        ProviderEvent::SourceState {
+            provider,
+            state: ProviderSourceState::Available,
+        }
+    }
+
+    fn agent_upsert(provider: Provider) -> ProviderEvent {
+        ProviderEvent::AgentUpsert {
+            provider,
+            agent_thread_id: "tracked-agent".to_owned(),
+            owner_session_id: None,
+            parent_thread_id: None,
+            state: Some(ExecState::Working),
+            model_id: None,
+            depth: Some(0),
+            event_id: "tracked-agent-upsert".to_owned(),
+            observed_at_ms: 1,
+            position: position(20, 0, 1),
+        }
+    }
+
+    fn agent_activity(provider: Provider) -> ProviderEvent {
+        ProviderEvent::Activity {
+            provider,
+            agent_thread_id: "tracked-agent".to_owned(),
+            activity: MinimalProviderMetadata {
+                event_kind: Some("working".to_owned()),
+                ..MinimalProviderMetadata::default()
+            },
+            depth: Some(0),
+            event_id: "tracked-agent-activity".to_owned(),
+            observed_at_ms: 2,
+            position: position(20, 0, 2),
+        }
+    }
+
+    fn empty_performance_inputs() -> (DomainModel, OperatorSnapshot) {
+        (
+            DomainModel::default(),
+            OperatorSnapshot {
+                activity: Arc::from(Vec::new()),
+                terminal_times: Arc::new(HashMap::new()),
+            },
+        )
     }
 
     fn activity(
@@ -2242,6 +2351,119 @@ mod tests {
                 ..
             } if agent_thread_id == "depth-two-agent"
         ));
+    }
+
+    #[test]
+    fn provider_flush_admits_only_events_that_enter_the_bounded_queue() {
+        let clock = Arc::new(TestPerformanceClock::new(Duration::ZERO));
+        let (ingress, mut sampler) = performance_tracker(clock);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        let mut pending = PendingEvents::new(ProviderDiagnostics::default());
+        assert_eq!(
+            pending.merge(source_state(Provider::Claude)),
+            MergeOutcome::Accepted
+        );
+        assert_eq!(
+            pending.merge(agent_upsert(Provider::Codex)),
+            MergeOutcome::Accepted
+        );
+        assert_eq!(
+            pending.merge(agent_activity(Provider::Codex)),
+            MergeOutcome::Accepted
+        );
+        pending.flush_to_sender(&ProviderEventSender::Tracked { sender, ingress });
+        let (model, operator) = empty_performance_inputs();
+        let full = sampler.sample(&model, &operator, 0);
+        assert_eq!(
+            (
+                full.pending_events,
+                full.admission_high_water,
+                full.events_one_second
+            ),
+            (1, 1, 1)
+        );
+        let control = receiver.blocking_recv().unwrap();
+        assert!(matches!(control.event, ProviderEvent::SourceState { .. }));
+        assert!(control.admission.is_none());
+        let reducer_bound = receiver.blocking_recv().unwrap();
+        assert!(matches!(
+            reducer_bound.event,
+            ProviderEvent::AgentUpsert { .. }
+        ));
+        reducer_bound.admission.unwrap().complete();
+        assert_eq!(sampler.sample(&model, &operator, 0).pending_events, 0);
+        assert!(matches!(
+            pending.next_event(),
+            Some((PendingToken::Activity(_), _))
+        ));
+    }
+
+    #[test]
+    fn provider_closed_queue_returns_the_original_pending_event_without_lag_leak() {
+        let clock = Arc::new(TestPerformanceClock::new(Duration::ZERO));
+        let (ingress, mut sampler) = performance_tracker(clock);
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+        let mut pending = PendingEvents::new(ProviderDiagnostics::default());
+        assert_eq!(
+            pending.merge(agent_upsert(Provider::Claude)),
+            MergeOutcome::Accepted
+        );
+        pending.flush_to_sender(&ProviderEventSender::Tracked { sender, ingress });
+        let (model, operator) = empty_performance_inputs();
+        let closed = sampler.sample(&model, &operator, 0);
+        assert_eq!(
+            (
+                closed.pending_events,
+                closed.admission_high_water,
+                closed.events_one_second,
+                closed.events_ten_seconds,
+                closed.events_sixty_seconds
+            ),
+            (0, 0, 0, 0, 0)
+        );
+        assert_eq!(closed.event_lag, Duration::ZERO);
+        assert!(matches!(
+            pending.next_event(),
+            Some((PendingToken::Upsert(_), _))
+        ));
+    }
+
+    #[test]
+    fn provider_malformed_event_carries_no_admission_or_performance_change() {
+        let clock = Arc::new(TestPerformanceClock::new(Duration::ZERO));
+        let (ingress, mut sampler) = performance_tracker(clock);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let mut pending = PendingEvents::new(ProviderDiagnostics::default());
+        assert_eq!(
+            pending.merge(ProviderEvent::Malformed {
+                provider: Provider::Codex,
+                path_display: "~/malformed.jsonl".to_owned(),
+                generation: 0,
+                byte_offset: 7,
+                error_code: "json",
+            }),
+            MergeOutcome::Accepted
+        );
+
+        pending.flush_to_sender(&ProviderEventSender::Tracked { sender, ingress });
+
+        let malformed = receiver.blocking_recv().unwrap();
+        assert!(matches!(malformed.event, ProviderEvent::Malformed { .. }));
+        assert!(malformed.admission.is_none());
+        let (model, operator) = empty_performance_inputs();
+        let snapshot = sampler.sample(&model, &operator, 0);
+        assert_eq!(
+            (
+                snapshot.pending_events,
+                snapshot.admission_high_water,
+                snapshot.events_one_second,
+                snapshot.events_ten_seconds,
+                snapshot.events_sixty_seconds,
+            ),
+            (0, 0, 0, 0, 0)
+        );
+        assert_eq!(snapshot.event_lag, Duration::ZERO);
     }
 
     #[derive(Clone)]
