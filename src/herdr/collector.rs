@@ -280,11 +280,7 @@ impl RuntimePersistence {
         self.writer.is_duplicate(event_id)
     }
 
-    #[allow(
-        mismatched_lifetime_syntaxes,
-        reason = "removed by Task 2B.2b after EnqueuePermit becomes borrowing"
-    )]
-    pub(crate) fn reserve_enqueue(&mut self) -> Option<crate::store::EnqueuePermit> {
+    pub(crate) fn reserve_enqueue(&mut self) -> Option<crate::store::EnqueuePermit<'_>> {
         self.observe_writer_health();
         if self.snapshot.persistence != PersistenceStatus::Healthy {
             return None;
