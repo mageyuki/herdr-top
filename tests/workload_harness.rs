@@ -29,8 +29,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "workload-harness")]
 use std::sync::{Arc, Mutex};
 
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+use herdr_top::activity::ActivityItem;
 #[cfg(feature = "workload-harness")]
-use herdr_top::activity::{ActivityItem, RestoredOperatorState};
+use herdr_top::activity::RestoredOperatorState;
 #[cfg(feature = "workload-harness")]
 use herdr_top::herdr::collector::{
     ObservationQuality, PerformancePublication, WorkloadCollectorConfig, WorkloadPerformanceSample,
@@ -41,10 +43,11 @@ use herdr_top::herdr::controller::{
     ControllerResponse, WorkloadAdmissionObservation, WorkloadControllerHooks,
     WorkloadPersistenceObservation, WorkloadTerminalObservation,
 };
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+use herdr_top::performance::AbsoluteMonotonicPerformanceClock;
 #[cfg(feature = "workload-harness")]
 use herdr_top::performance::{
-    AbsoluteMonotonicPerformanceClock, PerformanceClock, PerformanceDegradationReason,
-    TestPerformanceClock,
+    PerformanceClock, PerformanceDegradationReason, TestPerformanceClock,
 };
 #[cfg(feature = "workload-harness")]
 use herdr_top::provider::{DiscoveryRoot, NotifyFactory, NotifySink, NotifyWatcher};
@@ -571,6 +574,7 @@ async fn run_schedule_through_real_queue_at(
                 + 1
         })
     };
+    #[cfg(target_os = "linux")]
     let performance_clock: Arc<dyn PerformanceClock> = if uses_realtime_clock {
         Arc::new(AbsoluteMonotonicPerformanceClock)
     } else {
@@ -578,6 +582,10 @@ async fn run_schedule_through_real_queue_at(
             nanoseconds: Arc::clone(&clock_ns),
         })
     };
+    #[cfg(not(target_os = "linux"))]
+    let performance_clock: Arc<dyn PerformanceClock> = Arc::new(AtomicPerformanceClock {
+        nanoseconds: Arc::clone(&clock_ns),
+    });
     let admissions = Arc::new(Mutex::new(Vec::new()));
     let terminals = Arc::new(Mutex::new(Vec::new()));
     let persisted = Arc::new(Mutex::new(Vec::new()));

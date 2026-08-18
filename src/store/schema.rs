@@ -198,7 +198,7 @@ fn sqlite_file_uri(path: &Path, parameter: &str) -> PathBuf {
     PathBuf::from(OsString::from_vec(uri))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn schema_inspection_uri_for_test(path: &Path) -> PathBuf {
     sqlite_file_uri(path, "immutable=1")
 }
