@@ -488,6 +488,7 @@ fn controlled_diagnostics() -> (
         owner: OwnerFreshness::Current,
         persistence_counters: PersistenceCounters::default(),
         controller_counters,
+        enrichment_counters: herdr_top::diagnostics::EnrichmentCounterSnapshot::default(),
         source_coverage: [
             DiagnosticSource::Herdr,
             DiagnosticSource::Controller,

@@ -476,6 +476,7 @@ fn default_diagnostics() -> RuntimeDiagnosticsSnapshot {
         owner: OwnerFreshness::Current,
         persistence_counters: PersistenceCounters::default(),
         controller_counters: ControllerCounterSnapshot::default(),
+        enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
         source_coverage: Vec::new(),
         dangling_announcement_components: 0,
         first_failure_log: OccurrenceLogStatus::NotAttempted,
@@ -1736,6 +1737,7 @@ mod tests {
             owner: OwnerFreshness::Current,
             persistence_counters: PersistenceCounters::default(),
             controller_counters: ControllerCounterSnapshot::default(),
+            enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
             source_coverage: Vec::new(),
             dangling_announcement_components: 0,
             first_failure_log: OccurrenceLogStatus::NotAttempted,
@@ -2456,6 +2458,7 @@ mod tests {
                 socket_saturations: 17,
                 accept_failures: 18,
             },
+            enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
             source_coverage: vec![
                 SourceCoverageSnapshot {
                     source: DiagnosticSource::Herdr,

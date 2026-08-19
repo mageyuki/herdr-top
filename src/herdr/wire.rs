@@ -119,6 +119,11 @@ impl EventStream {
             .ok_or_else(|| WireError::MalformedFrame("event push has no data".into()))?;
         Ok(Some((event, data)))
     }
+
+    pub(crate) async fn close(mut self) -> Result<(), WireError> {
+        timeout("subscription close", self.reader.get_mut().shutdown()).await??;
+        Ok(())
+    }
 }
 
 /// Sends one request over a fresh Unix-socket connection.
@@ -234,7 +239,13 @@ async fn read_response(
         .await?
         .ok_or_else(|| WireError::MalformedFrame("EOF before response".into()))?;
     let envelope: ResponseEnvelope = serde_json::from_value(frame).map_err(malformed_json)?;
-    if envelope.id != expected_id {
+    let matching_decorated_error = envelope.result.is_none()
+        && envelope.error.is_some()
+        && envelope
+            .id
+            .strip_prefix(expected_id)
+            .is_some_and(|suffix| suffix.starts_with(':'));
+    if envelope.id != expected_id && !matching_decorated_error {
         return Err(WireError::UnexpectedResponse(format!(
             "expected response id {expected_id}, received {}",
             envelope.id
@@ -264,4 +275,67 @@ async fn read_value(reader: &mut BufReader<UnixStream>) -> Result<Option<Value>,
 
 fn malformed_json(error: serde_json::Error) -> WireError {
     WireError::MalformedFrame(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tokio::io::AsyncWriteExt;
+
+    use super::*;
+
+    async fn decode_response(frame: Value, expected_id: &str) -> Result<WireResult, WireError> {
+        let (mut server, client) = UnixStream::pair().expect("Unix stream pair should open");
+        let mut bytes = serde_json::to_vec(&frame).expect("response should encode");
+        bytes.push(b'\n');
+        server
+            .write_all(&bytes)
+            .await
+            .expect("response should write");
+        drop(server);
+        read_response(&mut BufReader::new(client), expected_id).await
+    }
+
+    #[tokio::test]
+    async fn decorated_ids_are_accepted_only_for_matching_error_responses() {
+        let error = decode_response(
+            json!({
+                "id": "req:sub:1:probe",
+                "error": {"code": "pane_not_found", "message": "pane w9:p99 not found"}
+            }),
+            "req",
+        )
+        .await
+        .expect_err("matching decorated error should surface as a server error");
+        assert!(matches!(
+            error,
+            WireError::Server { ref code, ref message }
+                if code == "pane_not_found" && message.contains("w9:p99")
+        ));
+
+        let unrelated = decode_response(
+            json!({
+                "id": "other:sub:1:probe",
+                "error": {"code": "pane_not_found", "message": "pane w9:p99 not found"}
+            }),
+            "req",
+        )
+        .await
+        .expect_err("an unrelated decorated id must be rejected");
+        assert!(matches!(unrelated, WireError::UnexpectedResponse(_)));
+
+        let decorated_success = decode_response(
+            json!({
+                "id": "req:sub:1:probe",
+                "result": {"type": "subscription_started"}
+            }),
+            "req",
+        )
+        .await
+        .expect_err("successful responses must echo the request id verbatim");
+        assert!(matches!(
+            decorated_success,
+            WireError::UnexpectedResponse(_)
+        ));
+    }
 }

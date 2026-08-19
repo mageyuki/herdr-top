@@ -19,8 +19,8 @@ use crate::diagnostics::remote::{
 };
 use crate::diagnostics::{
     ControllerCounterSnapshot, ControllerInputStatus, ControllerInputUnavailableReason,
-    DiagnosticSource, InputAvailability, OccurrenceLogStatus, OwnerFreshness, PersistenceCounters,
-    RuntimeDiagnosticsSnapshot, SourceCoverageSnapshot,
+    DiagnosticSource, EnrichmentCounterSnapshot, InputAvailability, OccurrenceLogStatus,
+    OwnerFreshness, PersistenceCounters, RuntimeDiagnosticsSnapshot, SourceCoverageSnapshot,
 };
 use crate::herdr::controller;
 use crate::herdr::types::{AgentSessionKind, Pong, Snapshot};
@@ -1455,7 +1455,7 @@ fn parse_runtime_status(response: &Value) -> Option<RuntimeDiagnosticsSnapshot> 
 
 fn parse_runtime_snapshot(value: &Value) -> Option<RuntimeDiagnosticsSnapshot> {
     let object = value.as_object()?;
-    if object.len() != 8 {
+    if object.len() != 9 {
         return None;
     }
     let persistence = parse_persistence_status(object.get("persistence")?)?;
@@ -1467,6 +1467,7 @@ fn parse_runtime_snapshot(value: &Value) -> Option<RuntimeDiagnosticsSnapshot> {
     };
     let persistence_counters = parse_persistence_counters(object.get("persistence_counters")?)?;
     let controller_counters = parse_controller_counters(object.get("controller_counters")?)?;
+    let enrichment_counters = parse_enrichment_counters(object.get("enrichment_counters")?)?;
     let mut source_coverage = object
         .get("source_coverage")?
         .as_array()?
@@ -1493,9 +1494,21 @@ fn parse_runtime_snapshot(value: &Value) -> Option<RuntimeDiagnosticsSnapshot> {
         owner,
         persistence_counters,
         controller_counters,
+        enrichment_counters,
         source_coverage,
         dangling_announcement_components,
         first_failure_log,
+    })
+}
+
+fn parse_enrichment_counters(value: &Value) -> Option<EnrichmentCounterSnapshot> {
+    let object = value.as_object()?;
+    if object.len() != 2 {
+        return None;
+    }
+    Some(EnrichmentCounterSnapshot {
+        channel_full_drops: object.get("channel_full_drops")?.as_u64()?,
+        episode_discards: object.get("episode_discards")?.as_u64()?,
     })
 }
 
@@ -1824,6 +1837,7 @@ mod tests {
             owner: OwnerFreshness::Current,
             persistence_counters: PersistenceCounters::default(),
             controller_counters: ControllerCounterSnapshot::default(),
+            enrichment_counters: EnrichmentCounterSnapshot::default(),
             source_coverage: Vec::new(),
             dangling_announcement_components: 0,
             first_failure_log: OccurrenceLogStatus::NotAttempted,
@@ -2091,6 +2105,27 @@ mod tests {
         let unavailable = controller_runtime_check(ControllerRuntimeProbe::Live, None);
         assert_eq!(unavailable.code, "controller_unavailable");
         assert_ne!(unavailable.code, "controller_live_degraded");
+    }
+
+    #[test]
+    fn runtime_parser_preserves_enrichment_counters() {
+        let mut diagnostics = serde_json::to_value(runtime(PersistenceStatus::Healthy)).unwrap();
+        diagnostics.as_object_mut().unwrap().insert(
+            "enrichment_counters".to_owned(),
+            json!({"channel_full_drops": 7, "episode_discards": 11}),
+        );
+
+        let parsed = parse_runtime_status(&json!({
+            "status": "ok",
+            "schema_version": 1,
+            "diagnostics": diagnostics,
+        }))
+        .expect("the closed runtime parser should accept the enrichment family");
+        let rendered = serde_json::to_value(parsed).unwrap();
+        assert_eq!(
+            rendered["enrichment_counters"],
+            json!({"channel_full_drops": 7, "episode_discards": 11})
+        );
     }
 
     #[test]

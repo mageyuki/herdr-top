@@ -1,6 +1,8 @@
 #[allow(dead_code)]
 mod common;
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::hardening_mock::{HardeningConfig, HardeningHerdr, SnapshotReply};
@@ -28,9 +30,1087 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 const WAIT: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Debug)]
+struct ScopedHerdrConfig {
+    snapshots: Vec<Value>,
+    reject_pane_once: Option<String>,
+    reject_all_enrichment: bool,
+    snapshot_delay: Duration,
+}
+
+impl ScopedHerdrConfig {
+    fn snapshots(snapshots: Vec<Value>) -> Self {
+        Self {
+            snapshots,
+            reject_pane_once: None,
+            reject_all_enrichment: false,
+            snapshot_delay: Duration::ZERO,
+        }
+    }
+}
+
+enum ScopedStreamCommand {
+    Push(Value, oneshot::Sender<()>),
+    PushMany(Vec<Value>, oneshot::Sender<()>),
+    Close(oneshot::Sender<()>),
+}
+
+struct ScopedHerdr {
+    _directory: TempDir,
+    socket_path: std::path::PathBuf,
+    requests: Arc<Mutex<Vec<Value>>>,
+    ordering: Arc<Mutex<Vec<String>>>,
+    primary: Arc<Mutex<Option<mpsc::UnboundedSender<ScopedStreamCommand>>>>,
+    enrichment: Arc<Mutex<Option<mpsc::UnboundedSender<ScopedStreamCommand>>>>,
+    enrichment_subscriptions: Arc<AtomicUsize>,
+    enrichment_closures: Arc<AtomicUsize>,
+    snapshot_requests: Arc<AtomicUsize>,
+    accept_task: JoinHandle<()>,
+}
+
+impl ScopedHerdr {
+    async fn start(config: ScopedHerdrConfig) -> std::io::Result<Self> {
+        let directory = tempfile::tempdir()?;
+        let socket_path = directory.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path)?;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let ordering = Arc::new(Mutex::new(Vec::new()));
+        let primary = Arc::new(Mutex::new(None));
+        let enrichment = Arc::new(Mutex::new(None));
+        let enrichment_subscriptions = Arc::new(AtomicUsize::new(0));
+        let enrichment_closures = Arc::new(AtomicUsize::new(0));
+        let snapshot_requests = Arc::new(AtomicUsize::new(0));
+        let rejected = Arc::new(AtomicBool::new(false));
+        let config = Arc::new(config);
+        let accept_task = {
+            let requests = Arc::clone(&requests);
+            let ordering = Arc::clone(&ordering);
+            let primary = Arc::clone(&primary);
+            let enrichment = Arc::clone(&enrichment);
+            let enrichment_subscriptions = Arc::clone(&enrichment_subscriptions);
+            let enrichment_closures = Arc::clone(&enrichment_closures);
+            let snapshot_requests = Arc::clone(&snapshot_requests);
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let config = Arc::clone(&config);
+                    let requests = Arc::clone(&requests);
+                    let ordering = Arc::clone(&ordering);
+                    let primary = Arc::clone(&primary);
+                    let enrichment = Arc::clone(&enrichment);
+                    let enrichment_subscriptions = Arc::clone(&enrichment_subscriptions);
+                    let enrichment_closures = Arc::clone(&enrichment_closures);
+                    let snapshot_requests = Arc::clone(&snapshot_requests);
+                    let rejected = Arc::clone(&rejected);
+                    tokio::spawn(async move {
+                        let _ = scoped_handle_connection(
+                            stream,
+                            &config,
+                            &requests,
+                            &ordering,
+                            &primary,
+                            &enrichment,
+                            &enrichment_subscriptions,
+                            &enrichment_closures,
+                            &snapshot_requests,
+                            &rejected,
+                        )
+                        .await;
+                    });
+                }
+            })
+        };
+        Ok(Self {
+            _directory: directory,
+            socket_path,
+            requests,
+            ordering,
+            primary,
+            enrichment,
+            enrichment_subscriptions,
+            enrichment_closures,
+            snapshot_requests,
+            accept_task,
+        })
+    }
+
+    fn socket_path(&self) -> &std::path::Path {
+        &self.socket_path
+    }
+
+    fn requests(&self) -> Vec<Value> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    fn ordering(&self) -> Vec<String> {
+        self.ordering.lock().unwrap().clone()
+    }
+
+    fn enrichment_subscriptions(&self) -> usize {
+        self.enrichment_subscriptions.load(Ordering::SeqCst)
+    }
+
+    fn enrichment_closures(&self) -> usize {
+        self.enrichment_closures.load(Ordering::SeqCst)
+    }
+
+    fn snapshot_requests(&self) -> usize {
+        self.snapshot_requests.load(Ordering::SeqCst)
+    }
+
+    async fn push_primary(&self, frame: Value) -> std::io::Result<()> {
+        scoped_push(&self.primary, frame).await
+    }
+
+    async fn push_enrichment(&self, frame: Value) -> std::io::Result<()> {
+        scoped_push(&self.enrichment, frame).await
+    }
+
+    async fn push_enrichment_many(&self, frames: Vec<Value>) -> std::io::Result<()> {
+        let sender = self
+            .enrichment
+            .lock()
+            .map_err(|_| std::io::Error::other("enrichment fixture mutex poisoned"))?
+            .clone()
+            .ok_or_else(|| std::io::Error::other("enrichment stream is not connected"))?;
+        let (acknowledgement, response) = oneshot::channel();
+        sender
+            .send(ScopedStreamCommand::PushMany(frames, acknowledgement))
+            .map_err(|_| std::io::Error::other("enrichment stream is closed"))?;
+        response
+            .await
+            .map_err(|_| std::io::Error::other("enrichment burst was not acknowledged"))
+    }
+
+    async fn close_enrichment(&self) -> std::io::Result<()> {
+        let sender = self
+            .enrichment
+            .lock()
+            .map_err(|_| std::io::Error::other("enrichment fixture mutex poisoned"))?
+            .clone()
+            .ok_or_else(|| std::io::Error::other("enrichment stream is not connected"))?;
+        let (acknowledgement, response) = oneshot::channel();
+        sender
+            .send(ScopedStreamCommand::Close(acknowledgement))
+            .map_err(|_| std::io::Error::other("enrichment stream is closed"))?;
+        response
+            .await
+            .map_err(|_| std::io::Error::other("enrichment close was not acknowledged"))
+    }
+}
+
+impl Drop for ScopedHerdr {
+    fn drop(&mut self) {
+        self.accept_task.abort();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn scoped_handle_connection(
+    stream: tokio::net::UnixStream,
+    config: &ScopedHerdrConfig,
+    requests: &Mutex<Vec<Value>>,
+    ordering: &Mutex<Vec<String>>,
+    primary: &Mutex<Option<mpsc::UnboundedSender<ScopedStreamCommand>>>,
+    enrichment: &Mutex<Option<mpsc::UnboundedSender<ScopedStreamCommand>>>,
+    enrichment_subscriptions: &AtomicUsize,
+    enrichment_closures: &AtomicUsize,
+    snapshot_requests: &AtomicUsize,
+    rejected: &AtomicBool,
+) -> std::io::Result<()> {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    if reader.read_line(&mut line).await? == 0 {
+        return Ok(());
+    }
+    let request: Value = serde_json::from_str(&line)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    requests.lock().unwrap().push(request.clone());
+    let id = request["id"]
+        .as_str()
+        .ok_or_else(|| std::io::Error::other("request id missing"))?
+        .to_owned();
+    match request["method"].as_str() {
+        Some("session.snapshot") => {
+            let index = snapshot_requests.fetch_add(1, Ordering::SeqCst);
+            if !config.snapshot_delay.is_zero() {
+                tokio::time::sleep(config.snapshot_delay).await;
+            }
+            let snapshot = config
+                .snapshots
+                .get(index)
+                .or_else(|| config.snapshots.last())
+                .ok_or_else(|| std::io::Error::other("no snapshot configured"))?;
+            scoped_write_frame(
+                &mut write_half,
+                &json!({"id": id, "result": {"type": "session_snapshot", "snapshot": snapshot}}),
+            )
+            .await
+        }
+        Some("events.subscribe") => {
+            let scoped =
+                request["params"]["subscriptions"]
+                    .as_array()
+                    .is_some_and(|subscriptions| {
+                        subscriptions.iter().any(|subscription| {
+                            subscription["type"].as_str() == Some("pane.agent_status_changed")
+                        })
+                    });
+            if scoped {
+                let index = enrichment_subscriptions.fetch_add(1, Ordering::SeqCst) + 1;
+                ordering
+                    .lock()
+                    .unwrap()
+                    .push(format!("enrichment_subscribe:{index}"));
+                if config.reject_all_enrichment {
+                    return scoped_write_frame(
+                        &mut write_half,
+                        &json!({
+                            "id": format!("{id}:sub:0:probe"),
+                            "error": {"code": "subscription_unavailable", "message": "enrichment unavailable"}
+                        }),
+                    )
+                    .await;
+                }
+                if let Some(pane_id) = &config.reject_pane_once
+                    && !rejected.swap(true, Ordering::SeqCst)
+                    && request["params"]["subscriptions"]
+                        .as_array()
+                        .is_some_and(|subscriptions| {
+                            subscriptions.iter().any(|subscription| {
+                                subscription["pane_id"].as_str() == Some(pane_id)
+                            })
+                        })
+                {
+                    return scoped_write_frame(
+                        &mut write_half,
+                        &json!({
+                            "id": format!("{id}:sub:1:probe"),
+                            "error": {
+                                "code": "pane_not_found",
+                                "message": format!("pane {pane_id} not found")
+                            }
+                        }),
+                    )
+                    .await;
+                }
+            }
+            scoped_write_frame(
+                &mut write_half,
+                &json!({"id": id, "result": {"type": "subscription_started"}}),
+            )
+            .await?;
+            let (sender, mut commands) = mpsc::unbounded_channel();
+            if scoped {
+                *enrichment.lock().unwrap() = Some(sender);
+            } else {
+                *primary.lock().unwrap() = Some(sender);
+            }
+            line.clear();
+            loop {
+                tokio::select! {
+                    command = commands.recv() => match command {
+                        Some(ScopedStreamCommand::Push(frame, acknowledgement)) => {
+                            scoped_write_frame(&mut write_half, &frame).await?;
+                            let _ = acknowledgement.send(());
+                        }
+                        Some(ScopedStreamCommand::PushMany(frames, acknowledgement)) => {
+                            for frame in frames {
+                                scoped_write_frame(&mut write_half, &frame).await?;
+                            }
+                            let _ = acknowledgement.send(());
+                        }
+                        Some(ScopedStreamCommand::Close(acknowledgement)) => {
+                            let _ = acknowledgement.send(());
+                            break;
+                        }
+                        None => break,
+                    },
+                    result = reader.read_line(&mut line) => {
+                        let _ = result?;
+                        break;
+                    }
+                }
+            }
+            if scoped {
+                let index = enrichment_closures.fetch_add(1, Ordering::SeqCst) + 1;
+                ordering
+                    .lock()
+                    .unwrap()
+                    .push(format!("enrichment_close:{index}"));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+async fn scoped_write_frame(
+    stream: &mut tokio::net::unix::OwnedWriteHalf,
+    frame: &Value,
+) -> std::io::Result<()> {
+    let mut bytes = serde_json::to_vec(frame)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    bytes.push(b'\n');
+    stream.write_all(&bytes).await?;
+    stream.flush().await
+}
+
+async fn scoped_push(
+    stream: &Mutex<Option<mpsc::UnboundedSender<ScopedStreamCommand>>>,
+    frame: Value,
+) -> std::io::Result<()> {
+    let sender = stream
+        .lock()
+        .map_err(|_| std::io::Error::other("scoped fixture mutex poisoned"))?
+        .clone()
+        .ok_or_else(|| std::io::Error::other("scoped stream is not connected"))?;
+    let (acknowledgement, response) = oneshot::channel();
+    sender
+        .send(ScopedStreamCommand::Push(frame, acknowledgement))
+        .map_err(|_| std::io::Error::other("scoped stream is closed"))?;
+    response
+        .await
+        .map_err(|_| std::io::Error::other("scoped push was not acknowledged"))
+}
+
+#[tokio::test]
+async fn scoped_subscription_keeps_primary_unscoped_and_enriches_each_snapshot_pane() {
+    let mut snapshot = p1_snapshot();
+    snapshot["panes"] = json!([
+        snapshot["panes"][0].clone(),
+        pane_value("w1:p2", "terminal-2", "w1", "w1:t1")
+    ]);
+    let mock = ScopedHerdr::start(ScopedHerdrConfig::snapshots(vec![snapshot]))
+        .await
+        .unwrap();
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .unwrap();
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    wait_until(|| mock.enrichment_subscriptions() == 1).await;
+
+    let subscriptions: Vec<_> = mock
+        .requests()
+        .into_iter()
+        .filter(|request| request["method"] == "events.subscribe")
+        .collect();
+    assert_eq!(subscriptions.len(), 2);
+    assert_eq!(
+        subscriptions[0]["params"]["subscriptions"],
+        json!([
+            {"type":"workspace.created"},
+            {"type":"workspace.renamed"},
+            {"type":"workspace.closed"},
+            {"type":"workspace.focused"},
+            {"type":"tab.created"},
+            {"type":"tab.closed"},
+            {"type":"tab.focused"},
+            {"type":"pane.created"},
+            {"type":"pane.closed"},
+            {"type":"pane.updated"},
+            {"type":"pane.focused"},
+            {"type":"pane.moved"},
+            {"type":"pane.exited"},
+            {"type":"pane.agent_detected"},
+            {"type":"layout.updated"}
+        ])
+    );
+    assert_eq!(
+        subscriptions[1]["params"]["subscriptions"],
+        json!([
+            {"type":"pane.agent_status_changed", "pane_id":"w1:p1"},
+            {"type":"pane.agent_status_changed", "pane_id":"w1:p2"}
+        ])
+    );
+
+    shutdown(handle, lifecycle).await;
+}
+
+#[tokio::test]
+async fn pane_not_found_prunes_only_rejected_enrichment_target_and_retries() {
+    let mut snapshot = p1_snapshot();
+    snapshot["panes"] = json!([
+        snapshot["panes"][0].clone(),
+        pane_value("w9:p99", "terminal-99", "w1", "w1:t1")
+    ]);
+    let mut config = ScopedHerdrConfig::snapshots(vec![snapshot]);
+    config.reject_pane_once = Some("w9:p99".to_owned());
+    let mock = ScopedHerdr::start(config).await.unwrap();
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .unwrap();
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    wait_until(|| mock.enrichment_subscriptions() >= 2).await;
+
+    let scoped: Vec<_> = mock
+        .requests()
+        .into_iter()
+        .filter(|request| {
+            request["method"] == "events.subscribe"
+                && request["params"]["subscriptions"]
+                    .as_array()
+                    .is_some_and(|subscriptions| {
+                        subscriptions
+                            .iter()
+                            .any(|subscription| subscription["type"] == "pane.agent_status_changed")
+                    })
+        })
+        .collect();
+    assert_eq!(scoped.len(), 2);
+    assert!(scoped[0].to_string().contains("w9:p99"));
+    assert_eq!(
+        scoped[1]["params"]["subscriptions"],
+        json!([{"type":"pane.agent_status_changed", "pane_id":"w1:p1"}])
+    );
+
+    shutdown(handle, lifecycle).await;
+}
+
+#[tokio::test]
+async fn pane_created_swaps_enrichment_break_before_make_without_collector_gap() {
+    let snapshot = agent_snapshot("swap-created", AgentSessionReferenceKind::Id, "idle");
+    let mock = ScopedHerdr::start(ScopedHerdrConfig::snapshots(vec![snapshot]))
+        .await
+        .unwrap();
+    let (_directory, root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .unwrap();
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    wait_until(|| mock.enrichment_subscriptions() == 1).await;
+    let execution_id = handle
+        .model
+        .borrow()
+        .executions()
+        .find(|execution| !execution.state.is_terminal())
+        .unwrap()
+        .execution_id
+        .clone();
+
+    mock.push_primary(push(
+        "pane_created",
+        json!({"type":"pane_created", "pane": pane_value("w1:p2", "terminal-2", "w1", "w1:t1")}),
+    ))
+    .await
+    .unwrap();
+    wait_until(|| mock.enrichment_subscriptions() == 2).await;
+    wait_until(|| mock.enrichment_closures() >= 1).await;
+
+    let order = mock.ordering();
+    let closed = order
+        .iter()
+        .position(|entry| entry == "enrichment_close:1")
+        .unwrap();
+    let opened = order
+        .iter()
+        .position(|entry| entry == "enrichment_subscribe:2")
+        .unwrap();
+    assert!(
+        closed < opened,
+        "old connection must close before replacement: {order:?}"
+    );
+    let second = mock
+        .requests()
+        .into_iter()
+        .filter(|request| {
+            request["method"] == "events.subscribe"
+                && request["params"]["subscriptions"][0]["type"] == "pane.agent_status_changed"
+        })
+        .nth(1)
+        .unwrap();
+    assert_eq!(
+        second["params"]["subscriptions"],
+        json!([
+            {"type":"pane.agent_status_changed", "pane_id":"w1:p1"},
+            {"type":"pane.agent_status_changed", "pane_id":"w1:p2"}
+        ])
+    );
+    assert!(
+        handle
+            .model
+            .borrow()
+            .execution(&execution_id)
+            .is_some_and(|execution| !execution.state.is_terminal())
+    );
+
+    shutdown(handle, lifecycle).await;
+    let connection = Connection::open(database_path(&root)).unwrap();
+    let gaps: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE normalized_kind = 'collector_gap'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        gaps, 1,
+        "enrichment replacement must not record a collector gap"
+    );
+}
+
+#[tokio::test]
+async fn pane_moved_replaces_old_public_pane_id_in_enrichment_target() {
+    let mock = ScopedHerdr::start(ScopedHerdrConfig::snapshots(vec![p1_snapshot()]))
+        .await
+        .unwrap();
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .unwrap();
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    wait_until(|| mock.enrichment_subscriptions() == 1).await;
+    let moved = fixture_payloads("p4-terminal-id-move.jsonl", "B2", "recv")
+        .into_iter()
+        .find(|payload| payload["event"] == "pane_moved")
+        .unwrap();
+    mock.push_primary(moved).await.unwrap();
+    wait_until(|| mock.enrichment_subscriptions() == 2).await;
+
+    let second = mock
+        .requests()
+        .into_iter()
+        .filter(|request| {
+            request["method"] == "events.subscribe"
+                && request["params"]["subscriptions"][0]["type"] == "pane.agent_status_changed"
+        })
+        .nth(1)
+        .unwrap();
+    assert_eq!(
+        second["params"]["subscriptions"],
+        json!([{"type":"pane.agent_status_changed", "pane_id":"w2:p2"}])
+    );
+    let order = mock.ordering();
+    assert!(
+        order.iter().position(|entry| entry == "enrichment_close:1")
+            < order
+                .iter()
+                .position(|entry| entry == "enrichment_subscribe:2"),
+        "pane move replacement must be break-before-make: {order:?}"
+    );
+
+    shutdown(handle, lifecycle).await;
+}
+
+#[tokio::test]
+async fn swap_window_records_one_transition_on_each_side_without_overlap() {
+    let snapshot = agent_snapshot("swap-window", AgentSessionReferenceKind::Id, "idle");
+    let mock = ScopedHerdr::start(ScopedHerdrConfig::snapshots(vec![snapshot]))
+        .await
+        .unwrap();
+    let (_directory, root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .unwrap();
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    wait_until(|| mock.enrichment_subscriptions() == 1).await;
+
+    mock.push_enrichment(agent_status_push("w1:p1", "term_6583d08d791e41", "working"))
+        .await
+        .unwrap();
+    wait_execution_state(&handle, ExecState::Working).await;
+    mock.push_primary(push(
+        "pane_created",
+        json!({"type":"pane_created", "pane": pane_value("w1:p2", "terminal-2", "w1", "w1:t1")}),
+    ))
+    .await
+    .unwrap();
+    wait_until(|| mock.enrichment_subscriptions() == 2).await;
+    mock.push_enrichment(agent_status_push("w1:p1", "term_6583d08d791e41", "blocked"))
+        .await
+        .unwrap();
+    wait_execution_state(&handle, ExecState::Blocked).await;
+
+    let order = mock.ordering();
+    assert!(
+        order.iter().position(|entry| entry == "enrichment_close:1")
+            < order
+                .iter()
+                .position(|entry| entry == "enrichment_subscribe:2"),
+        "the old stream must close before the replacement subscribes: {order:?}"
+    );
+    shutdown(handle, lifecycle).await;
+    let connection = Connection::open(database_path(&root)).unwrap();
+    let rows: Vec<(String, String)> = connection
+        .prepare(
+            "SELECT event_id, source_event_type FROM events \
+             WHERE source_event_type = 'pane_agent_status_changed' ORDER BY event_row_id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_ne!(rows[0].0, rows[1].0);
+}
+
+#[tokio::test]
+async fn enrichment_eof_retries_without_changing_primary_quality_or_resnapshotting() {
+    let mock = ScopedHerdr::start(ScopedHerdrConfig::snapshots(vec![p1_snapshot()]))
+        .await
+        .unwrap();
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .unwrap();
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    wait_until(|| mock.enrichment_subscriptions() == 1).await;
+
+    mock.close_enrichment().await.unwrap();
+    wait_until(|| mock.enrichment_subscriptions() == 2).await;
+    assert_eq!(*handle.quality.borrow(), ObservationQuality::Live);
+    assert_eq!(mock.snapshot_requests(), 1);
+
+    shutdown(handle, lifecycle).await;
+}
+
+#[tokio::test]
+async fn enrichment_flood_counts_plain_channel_drops_without_primary_resnapshot() {
+    let snapshot = agent_snapshot("enrichment-flood", AgentSessionReferenceKind::Id, "idle");
+    let mock = ScopedHerdr::start(ScopedHerdrConfig::snapshots(vec![snapshot]))
+        .await
+        .unwrap();
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .unwrap();
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    wait_until(|| mock.enrichment_subscriptions() == 1).await;
+    let frames = (0..512)
+        .map(|index| {
+            agent_status_push(
+                "w1:p1",
+                "term_6583d08d791e41",
+                if index % 2 == 0 { "working" } else { "blocked" },
+            )
+        })
+        .collect();
+    mock.push_enrichment_many(frames).await.unwrap();
+    mock.push_primary(push(
+        "workspace_focused",
+        json!({"type":"workspace_focused", "workspace_id":"w1"}),
+    ))
+    .await
+    .unwrap();
+    wait_until(|| {
+        serde_json::to_value(handle.diagnostics.borrow().clone()).unwrap()
+            ["enrichment_counters"]["channel_full_drops"]
+            .as_u64()
+            .is_some_and(|drops| drops > 0)
+    })
+    .await;
+
+    assert_eq!(*handle.quality.borrow(), ObservationQuality::Live);
+    assert_eq!(mock.snapshot_requests(), 1);
+    shutdown(handle, lifecycle).await;
+}
+
+#[tokio::test]
+async fn queued_enrichment_during_convergence_is_discarded_before_live() {
+    let snapshot = agent_snapshot("episode-discard", AgentSessionReferenceKind::Id, "idle");
+    let mut config = ScopedHerdrConfig::snapshots(vec![snapshot.clone(), snapshot]);
+    config.snapshot_delay = Duration::from_millis(250);
+    let mock = ScopedHerdr::start(config).await.unwrap();
+    let (_directory, root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .unwrap();
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    wait_until(|| mock.enrichment_subscriptions() == 1).await;
+
+    mock.push_primary(push(
+        "pane_focused",
+        json!({"type":"pane_focused", "pane_id":"ghost:p1", "workspace_id":"ghost"}),
+    ))
+    .await
+    .unwrap();
+    wait_until(|| mock.snapshot_requests() == 2).await;
+    mock.push_enrichment_many(
+        (0..10)
+            .map(|_| agent_status_push("w1:p1", "term_6583d08d791e41", "working"))
+            .collect(),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    mock.push_primary(push(
+        "workspace_focused",
+        json!({"type":"workspace_focused", "workspace_id":"w1"}),
+    ))
+    .await
+    .unwrap();
+    wait_until(|| {
+        serde_json::to_value(handle.diagnostics.borrow().clone()).unwrap()
+            ["enrichment_counters"]["episode_discards"]
+            .as_u64()
+            .is_some_and(|discards| discards >= 10)
+    })
+    .await;
+    assert!(
+        handle.model.borrow().executions().any(|execution| {
+            !execution.state.is_terminal() && execution.state == ExecState::Idle
+        })
+    );
+
+    shutdown(handle, lifecycle).await;
+    let connection = Connection::open(database_path(&root)).unwrap();
+    let rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE source_event_type = 'pane_agent_status_changed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[tokio::test]
+async fn pane_updated_fallback_converges_when_enrichment_is_unavailable() {
+    let snapshot = agent_snapshot("fallback-only", AgentSessionReferenceKind::Id, "idle");
+    let mut config = ScopedHerdrConfig::snapshots(vec![snapshot]);
+    config.reject_all_enrichment = true;
+    let mock = ScopedHerdr::start(config).await.unwrap();
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .unwrap();
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    wait_until(|| mock.enrichment_subscriptions() >= 2).await;
+
+    mock.push_primary(push(
+        "pane_updated",
+        json!({
+            "type":"pane_updated",
+            "pane": agent_pane_value(
+                "w1:p1",
+                "term_6583d08d791e41",
+                "w1",
+                "w1:t1",
+                "fallback-only"
+            )
+        }),
+    ))
+    .await
+    .unwrap();
+    wait_execution_state(&handle, ExecState::Working).await;
+    assert_eq!(*handle.quality.borrow(), ObservationQuality::Live);
+    assert_eq!(mock.snapshot_requests(), 1);
+
+    shutdown(handle, lifecycle).await;
+}
+
+#[tokio::test]
+async fn terminal_reconciling_keeps_discarding_enrichment_at_the_driven_rate() {
+    let snapshot = agent_snapshot("terminal-discard", AgentSessionReferenceKind::Id, "idle");
+    let mut config = ScopedHerdrConfig::snapshots(vec![snapshot; 5]);
+    config.snapshot_delay = Duration::from_millis(100);
+    let mock = ScopedHerdr::start(config).await.unwrap();
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .unwrap();
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    wait_until(|| mock.enrichment_subscriptions() == 1).await;
+
+    for expected_snapshot in 2..=5 {
+        mock.push_primary(resnapshot_anomaly()).await.unwrap();
+        wait_until(|| mock.snapshot_requests() == expected_snapshot).await;
+    }
+    wait_quality(&mut handle.quality, ObservationQuality::Reconciling).await;
+
+    for _ in 0..3 {
+        mock.push_enrichment(agent_status_push("w1:p1", "term_6583d08d791e41", "working"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        mock.push_primary(push(
+            "workspace_focused",
+            json!({"type":"workspace_focused", "workspace_id":"w1"}),
+        ))
+        .await
+        .unwrap();
+    }
+    wait_until(|| {
+        serde_json::to_value(handle.diagnostics.borrow().clone()).unwrap()
+            ["enrichment_counters"]["episode_discards"]
+            .as_u64()
+            .is_some_and(|discards| discards >= 3)
+    })
+    .await;
+    assert_eq!(*handle.quality.borrow(), ObservationQuality::Reconciling);
+
+    shutdown(handle, lifecycle).await;
+}
+
+#[tokio::test]
+async fn member_pane_stale_from_agentless_snapshot_is_restored_by_live_status() {
+    let present = agent_snapshot("stale-member", AgentSessionReferenceKind::Id, "idle");
+    let mut agentless = present.clone();
+    agentless["panes"][0]["agent"] = Value::Null;
+    agentless["panes"][0]["agent_status"] = json!("unknown");
+    agentless["panes"][0]["agent_session"] = Value::Null;
+    let mock = ScopedHerdr::start(ScopedHerdrConfig::snapshots(vec![present, agentless]))
+        .await
+        .unwrap();
+    let (_directory, root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .unwrap();
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    wait_until(|| mock.enrichment_subscriptions() == 1).await;
+
+    mock.push_primary(resnapshot_anomaly()).await.unwrap();
+    wait_until(|| mock.snapshot_requests() == 2).await;
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    wait_until(|| {
+        handle
+            .model
+            .borrow()
+            .executions()
+            .any(|execution| matches!(execution.state, ExecState::Stale { .. }))
+    })
+    .await;
+    mock.push_enrichment(agent_status_push("w1:p1", "term_6583d08d791e41", "working"))
+        .await
+        .unwrap();
+    wait_execution_state(&handle, ExecState::Working).await;
+    assert!(handle.model.borrow().pane("w1:p1").is_some());
+
+    shutdown(handle, lifecycle).await;
+    let connection = Connection::open(database_path(&root)).unwrap();
+    let row: (i64, i64, String) = connection
+        .query_row(
+            "SELECT seen_at_ms, event_timestamp_ms, source_event_type FROM events \
+             WHERE source_event_type = 'pane_agent_status_changed'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row.0, row.1);
+    assert_eq!(row.2, "pane_agent_status_changed");
+}
+
+#[tokio::test]
+async fn grace_remnant_status_is_rescue_only_and_never_applies_outside_target_set() {
+    let mut present = agent_snapshot("grace-gate", AgentSessionReferenceKind::Id, "working");
+    let survivor = pane_value("w1:p2", "terminal-2", "w1", "w1:t1");
+    present["panes"]
+        .as_array_mut()
+        .unwrap()
+        .push(survivor.clone());
+    let mut missing = present.clone();
+    missing["panes"] = json!([survivor]);
+    let mock = ScopedHerdr::start(ScopedHerdrConfig::snapshots(vec![present, missing]))
+        .await
+        .unwrap();
+    let (_directory, root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .unwrap();
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    wait_until(|| mock.enrichment_subscriptions() == 1).await;
+    mock.push_primary(resnapshot_anomaly()).await.unwrap();
+    wait_until(|| mock.snapshot_requests() == 2).await;
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    wait_until(|| mock.enrichment_subscriptions() == 2).await;
+    let before = handle.performance.borrow().snapshot.admission_high_water;
+
+    mock.push_enrichment(agent_status_push("w1:p1", "term_6583d08d791e41", "idle"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(handle.model.borrow().executions().any(|execution| {
+        execution.pane_id == "w1:p1" && matches!(execution.state, ExecState::Stale { .. })
+    }));
+    assert_eq!(
+        handle.performance.borrow().snapshot.admission_high_water,
+        before
+    );
+
+    shutdown(handle, lifecycle).await;
+    let connection = Connection::open(database_path(&root)).unwrap();
+    let rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE source_event_type = 'pane_agent_status_changed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[tokio::test]
+async fn equal_live_status_has_no_row_and_no_performance_admission() {
+    let snapshot = agent_snapshot("equal-status", AgentSessionReferenceKind::Id, "working");
+    let mock = ScopedHerdr::start(ScopedHerdrConfig::snapshots(vec![snapshot]))
+        .await
+        .unwrap();
+    let (_directory, root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .unwrap();
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    wait_until(|| mock.enrichment_subscriptions() == 1).await;
+    let before = handle.performance.borrow().snapshot.admission_high_water;
+
+    mock.push_enrichment(agent_status_push("w1:p1", "term_6583d08d791e41", "working"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let after = handle.performance.borrow().snapshot.admission_high_water;
+    assert_eq!(after, before);
+
+    shutdown(handle, lifecycle).await;
+    let connection = Connection::open(database_path(&root)).unwrap();
+    let rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE source_event_type = 'pane_agent_status_changed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[tokio::test]
+async fn collector_shutdown_joins_enrichment_reader_and_stops_post_shutdown_sends() {
+    let mock = ScopedHerdr::start(ScopedHerdrConfig::snapshots(vec![p1_snapshot()]))
+        .await
+        .unwrap();
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .unwrap();
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    wait_until(|| mock.enrichment_subscriptions() == 1).await;
+
+    shutdown(handle, lifecycle).await;
+    wait_until(|| mock.enrichment_closures() == 1).await;
+    assert!(
+        mock.push_enrichment(agent_status_push("w1:p1", "term_6583d08d791e41", "working"))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn sustained_enrichment_does_not_cancel_snapshot_or_replay_convergence_futures() {
+    let snapshot = agent_snapshot("liveness", AgentSessionReferenceKind::Id, "idle");
+    let mut config = ScopedHerdrConfig::snapshots(vec![snapshot.clone(), snapshot]);
+    config.snapshot_delay = Duration::from_millis(150);
+    let mock = ScopedHerdr::start(config).await.unwrap();
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .unwrap();
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    wait_until(|| mock.enrichment_subscriptions() == 1).await;
+
+    mock.push_primary(resnapshot_anomaly()).await.unwrap();
+    wait_until(|| mock.snapshot_requests() == 2).await;
+    mock.push_enrichment_many(
+        (0..40)
+            .map(|index| {
+                agent_status_push(
+                    "w1:p1",
+                    "term_6583d08d791e41",
+                    if index % 2 == 0 { "working" } else { "blocked" },
+                )
+            })
+            .collect(),
+    )
+    .await
+    .unwrap();
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(mock.snapshot_requests(), 2);
+
+    shutdown(handle, lifecycle).await;
+}
 
 #[tokio::test]
 async fn i4_operator_coverage_only_change_wakes_diagnostics() {
@@ -220,7 +1300,23 @@ async fn anomaly_triggers_fresh_generation_resnapshot() {
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
 
     assert_eq!(mock.snapshot_requests(), 2);
-    assert_eq!(mock.subscription_connections(), 1);
+    assert_eq!(
+        mock.requests()
+            .iter()
+            .filter(|request| {
+                request["method"] == "events.subscribe"
+                    && request["params"]["subscriptions"]
+                        .as_array()
+                        .is_some_and(|subscriptions| {
+                            subscriptions.iter().all(|subscription| {
+                                subscription["type"] != "pane.agent_status_changed"
+                            })
+                        })
+            })
+            .count(),
+        1,
+        "an in-place resnapshot must not reconnect the primary subscription"
+    );
     shutdown(handle, lifecycle).await;
 }
 
@@ -2364,6 +3460,18 @@ fn push(event: &str, data: Value) -> Value {
     json!({"event": event, "data": data})
 }
 
+fn agent_status_push(pane_id: &str, terminal_id: &str, status: &str) -> Value {
+    push(
+        "pane_agent_status_changed",
+        json!({
+            "type": "pane_agent_status_changed",
+            "pane_id": pane_id,
+            "terminal_id": terminal_id,
+            "agent_status": status,
+        }),
+    )
+}
+
 fn spawn_static_herdr(path: &std::path::Path, snapshot: Value) -> JoinHandle<()> {
     let listener = UnixListener::bind(path).unwrap();
     tokio::spawn(async move {
@@ -2507,6 +3615,27 @@ async fn wait_model_pane(model: &herdr_top::model::SharedModel, pane_id: &str) {
     })
     .await
     .unwrap_or_else(|_| panic!("pane {pane_id:?} did not appear before timeout"));
+}
+
+async fn wait_execution_state(handle: &CollectorHandle, expected: ExecState) {
+    let mut model = handle.model.clone();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if model
+                .borrow()
+                .executions()
+                .any(|execution| !execution.state.is_terminal() && execution.state == expected)
+            {
+                return;
+            }
+            model
+                .changed()
+                .await
+                .expect("model publisher should remain available");
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("execution did not become {expected:?}"));
 }
 
 async fn shutdown(handle: CollectorHandle, lifecycle: WriterLifecycle) {

@@ -92,6 +92,13 @@ pub struct ControllerCounterSnapshot {
     pub accept_failures: u64,
 }
 
+/// Immutable copy of enrichment-stream loss counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub struct EnrichmentCounterSnapshot {
+    pub channel_full_drops: u64,
+    pub episode_discards: u64,
+}
+
 /// Result of the process's single persistence-occurrence append attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -109,6 +116,7 @@ pub struct RuntimeDiagnosticsSnapshot {
     pub owner: OwnerFreshness,
     pub persistence_counters: PersistenceCounters,
     pub controller_counters: ControllerCounterSnapshot,
+    pub enrichment_counters: EnrichmentCounterSnapshot,
     pub source_coverage: Vec<SourceCoverageSnapshot>,
     pub dangling_announcement_components: u64,
     pub first_failure_log: OccurrenceLogStatus,
@@ -265,6 +273,7 @@ mod tests {
                 dangling_announcement_components: 7,
                 ..ControllerCounterSnapshot::default()
             },
+            enrichment_counters: EnrichmentCounterSnapshot::default(),
             source_coverage: vec![
                 SourceCoverageSnapshot {
                     source: DiagnosticSource::Herdr,
@@ -317,6 +326,10 @@ mod tests {
                     "provider_identity_disagreements": 0,
                     "socket_saturations": 0,
                     "accept_failures": 0
+                },
+                "enrichment_counters": {
+                    "channel_full_drops": 0,
+                    "episode_discards": 0
                 },
                 "source_coverage": [
                     {"source": "herdr", "availability": "available"},

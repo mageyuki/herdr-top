@@ -1236,6 +1236,7 @@ mod tests {
             owner: OwnerFreshness::Current,
             persistence_counters: PersistenceCounters::default(),
             controller_counters: ControllerCounterSnapshot::default(),
+            enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
             source_coverage: [
                 DiagnosticSource::Herdr,
                 DiagnosticSource::Controller,
@@ -1827,7 +1828,7 @@ mod tests {
         ));
         assert_eq!(
             serde_json::to_vec(&valid).unwrap(),
-            br#"{"status":"ok","schema_version":1,"diagnostics":{"persistence":{"status":"healthy"},"controller_input":{"status":"available"},"owner":"current","persistence_counters":{"not_committed_batches":0,"durability_unknown_batches":0,"committed_but_degraded_batches":0,"skipped_batches":0,"skipped_owner_updates":0},"controller_counters":{"binding_conflicts":0,"terminal_blocked_progress_noops":0,"terminal_forward_reference_creations":0,"dangling_announcement_components":0,"ingest_sequence_exhaustions":0,"provider_parent_conflicts":0,"provider_identity_disagreements":0,"socket_saturations":0,"accept_failures":0},"source_coverage":[{"source":"herdr","availability":"unavailable"},{"source":"controller","availability":"available"},{"source":"claude","availability":"unavailable"},{"source":"codex","availability":"unavailable"}],"dangling_announcement_components":0,"first_failure_log":"not_attempted"}}"#,
+            br#"{"status":"ok","schema_version":1,"diagnostics":{"persistence":{"status":"healthy"},"controller_input":{"status":"available"},"owner":"current","persistence_counters":{"not_committed_batches":0,"durability_unknown_batches":0,"committed_but_degraded_batches":0,"skipped_batches":0,"skipped_owner_updates":0},"controller_counters":{"binding_conflicts":0,"terminal_blocked_progress_noops":0,"terminal_forward_reference_creations":0,"dangling_announcement_components":0,"ingest_sequence_exhaustions":0,"provider_parent_conflicts":0,"provider_identity_disagreements":0,"socket_saturations":0,"accept_failures":0},"enrichment_counters":{"channel_full_drops":0,"episode_discards":0},"source_coverage":[{"source":"herdr","availability":"unavailable"},{"source":"controller","availability":"available"},{"source":"claude","availability":"unavailable"},{"source":"codex","availability":"unavailable"}],"dangling_announcement_components":0,"first_failure_log":"not_attempted"}}"#,
         );
         let extra = status_response(
             br#"{"request":"status","schema_version":1,"extra":true}"#,

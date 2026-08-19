@@ -1,6 +1,6 @@
 //! T9 subscribe/buffer/snapshot/replay collector, convergence, and gap reconciliation.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::ffi::OsStr;
 use std::future::pending;
@@ -19,18 +19,19 @@ use tokio_util::sync::CancellationToken;
 
 use crate::activity::{OperatorSnapshot, RestoredOperatorState};
 use crate::diagnostics::{
-    ControllerInputStatus, ControllerInputUnavailableReason, DiagnosticSource, InputAvailability,
-    OccurrenceLogStatus, OwnerFreshness, PersistenceCounters, PersistenceOccurrenceSink,
-    RuntimeDiagnosticsSnapshot, RuntimeWriteOutcome, SourceCoverageSnapshot,
-    controller_counter_snapshot, encode_persistence_occurrence,
+    ControllerInputStatus, ControllerInputUnavailableReason, DiagnosticSource,
+    EnrichmentCounterSnapshot, InputAvailability, OccurrenceLogStatus, OwnerFreshness,
+    PersistenceCounters, PersistenceOccurrenceSink, RuntimeDiagnosticsSnapshot,
+    RuntimeWriteOutcome, SourceCoverageSnapshot, controller_counter_snapshot,
+    encode_persistence_occurrence,
 };
 use crate::lockfile::OwnerRecord;
 use crate::model::{
     AgentNodeObservation, AgentSessionReference, AgentSessionReferenceKind,
-    ControllerDiagnosticsHandle, DomainModel, EventMetadata, ExecState, Execution, GapKind,
-    MinimalProviderMetadata, NormalizedEvent, Pane, PaneSnapshot, Provider, ReconcileBatch, RunId,
-    RunKey, SharedModel, SnapshotAgent, SourceCoverage, Tab, TopologyEntity, TopologyEntityId,
-    TopologySnapshot, Workspace,
+    ControllerDiagnosticsHandle, DomainModel, EnrichmentDiagnosticsHandle, EventMetadata,
+    ExecState, Execution, GapKind, MinimalProviderMetadata, NormalizedEvent, Pane, PaneSnapshot,
+    Provider, ReconcileBatch, RunId, RunKey, SharedModel, SnapshotAgent, SourceCoverage, Tab,
+    TopologyEntity, TopologyEntityId, TopologySnapshot, Workspace,
 };
 use crate::performance::{
     Admission, Admitted, PerformanceClock, PerformanceIngress, PerformanceSampler,
@@ -59,6 +60,7 @@ use super::types::{AgentSessionKind, PaneInfo, Snapshot, Subscription, TabInfo, 
 use super::wire::{self, EventStream, WireError};
 
 const EVENT_QUEUE_CAPACITY: usize = 64;
+const ENRICHMENT_QUEUE_CAPACITY: usize = 64;
 const RESNAPSHOT_ATTEMPTS: usize = 3;
 const RECONNECT_DELAY: Duration = Duration::from_millis(50);
 const DRAIN_QUIET_PERIOD: Duration = Duration::from_millis(5);
@@ -430,6 +432,7 @@ pub(crate) struct RuntimePersistence {
     occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
     occurrence_attempted: bool,
     acceptor_diagnostics: ControllerDiagnosticsHandle,
+    enrichment_diagnostics: EnrichmentDiagnosticsHandle,
 }
 
 impl RuntimePersistence {
@@ -444,12 +447,14 @@ impl RuntimePersistence {
             controller_input_from_coverage(coverage.state(CoverageSource::Controller));
         let controller_counters = controller_counter_snapshot(model);
         let acceptor_diagnostics = model.controller_diagnostics().acceptor_handle();
+        let enrichment_diagnostics = EnrichmentDiagnosticsHandle::default();
         let snapshot = RuntimeDiagnosticsSnapshot {
             persistence: writer.persistence_status(),
             controller_input,
             owner: OwnerFreshness::Current,
             persistence_counters: PersistenceCounters::default(),
             controller_counters,
+            enrichment_counters: EnrichmentCounterSnapshot::default(),
             source_coverage: diagnostic_source_coverage(coverage, controller_input),
             dangling_announcement_components: controller_counters.dangling_announcement_components,
             first_failure_log: OccurrenceLogStatus::NotAttempted,
@@ -464,6 +469,7 @@ impl RuntimePersistence {
                 occurrence_sink,
                 occurrence_attempted: false,
                 acceptor_diagnostics,
+                enrichment_diagnostics,
             },
             diagnostics,
         )
@@ -486,6 +492,10 @@ impl RuntimePersistence {
         self.publisher.subscribe()
     }
 
+    fn enrichment_diagnostics(&self) -> EnrichmentDiagnosticsHandle {
+        self.enrichment_diagnostics.clone()
+    }
+
     pub(crate) fn is_duplicate(&self, event_id: &str) -> bool {
         self.writer.is_duplicate(event_id)
     }
@@ -504,6 +514,7 @@ impl RuntimePersistence {
             occurrence_sink,
             occurrence_attempted,
             acceptor_diagnostics,
+            enrichment_diagnostics,
         } = self;
         let permit = writer.reserve_enqueue();
         let status = {
@@ -517,6 +528,7 @@ impl RuntimePersistence {
             occurrence_sink.as_ref(),
             occurrence_attempted,
             acceptor_diagnostics,
+            enrichment_diagnostics,
         );
         match status {
             PersistenceStatus::Healthy => permit,
@@ -615,6 +627,7 @@ impl RuntimePersistence {
             occurrence_sink,
             occurrence_attempted,
             acceptor_diagnostics,
+            enrichment_diagnostics,
             ..
         } = self;
         Self::ingest_writer_status(
@@ -624,6 +637,7 @@ impl RuntimePersistence {
             occurrence_sink.as_ref(),
             occurrence_attempted,
             acceptor_diagnostics,
+            enrichment_diagnostics,
         );
     }
 
@@ -634,6 +648,7 @@ impl RuntimePersistence {
         occurrence_sink: &dyn PersistenceOccurrenceSink,
         occurrence_attempted: &mut bool,
         acceptor_diagnostics: &ControllerDiagnosticsHandle,
+        enrichment_diagnostics: &EnrichmentDiagnosticsHandle,
     ) {
         if snapshot.persistence != PersistenceStatus::Healthy {
             return;
@@ -654,6 +669,7 @@ impl RuntimePersistence {
                 occurrence_sink,
                 occurrence_attempted,
                 acceptor_diagnostics,
+                enrichment_diagnostics,
             );
         }
     }
@@ -671,9 +687,11 @@ impl RuntimePersistence {
             self.occurrence_sink.as_ref(),
             &mut self.occurrence_attempted,
             &self.acceptor_diagnostics,
+            &self.enrichment_diagnostics,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_facade_failure(
         failure: PersistenceFailure,
         class: RuntimeCommandClass,
@@ -682,6 +700,7 @@ impl RuntimePersistence {
         occurrence_sink: &dyn PersistenceOccurrenceSink,
         occurrence_attempted: &mut bool,
         acceptor_diagnostics: &ControllerDiagnosticsHandle,
+        enrichment_diagnostics: &EnrichmentDiagnosticsHandle,
     ) -> RuntimeWriteOutcome {
         let outcome = match failure.durability {
             DurabilityDisposition::Committed => RuntimeWriteOutcome::CommittedButDegraded(failure),
@@ -738,7 +757,12 @@ impl RuntimePersistence {
                 OccurrenceLogStatus::Failed
             };
         }
-        Self::publish_facade(snapshot, publisher, acceptor_diagnostics);
+        Self::publish_facade(
+            snapshot,
+            publisher,
+            acceptor_diagnostics,
+            enrichment_diagnostics,
+        );
         outcome
     }
 
@@ -767,6 +791,7 @@ impl RuntimePersistence {
             &mut self.snapshot,
             &self.publisher,
             &self.acceptor_diagnostics,
+            &self.enrichment_diagnostics,
         );
     }
 
@@ -774,9 +799,14 @@ impl RuntimePersistence {
         snapshot: &mut RuntimeDiagnosticsSnapshot,
         publisher: &watch::Sender<RuntimeDiagnosticsSnapshot>,
         acceptor_diagnostics: &ControllerDiagnosticsHandle,
+        enrichment_diagnostics: &EnrichmentDiagnosticsHandle,
     ) {
         snapshot.controller_counters.socket_saturations = acceptor_diagnostics.socket_saturations();
         snapshot.controller_counters.accept_failures = acceptor_diagnostics.accept_failures();
+        snapshot.enrichment_counters = EnrichmentCounterSnapshot {
+            channel_full_drops: enrichment_diagnostics.channel_full_drops(),
+            episode_discards: enrichment_diagnostics.episode_discards(),
+        };
         let publication = snapshot.clone();
         publisher.send_if_modified(|current| {
             if *current == publication {
@@ -1522,6 +1552,28 @@ async fn run_collector(
         let reader_cancellation = cancellation.child_token();
         let (events, overflowed, reader) =
             spawn_event_reader(stream, reader_cancellation.clone(), performance.clone());
+        let enrichment_cancellation = cancellation.child_token();
+        let (target_publisher, target_receiver) = watch::channel(BTreeSet::new());
+        let (enrichment_sender, enrichment_events) = mpsc::channel(ENRICHMENT_QUEUE_CAPACITY);
+        let (prune_sender, prune_events) = mpsc::unbounded_channel();
+        let enrichment_diagnostics = persistence.enrichment_diagnostics();
+        let enrichment_reader = spawn_enrichment_reader(
+            sock.clone(),
+            target_receiver,
+            enrichment_sender,
+            prune_sender,
+            enrichment_diagnostics.clone(),
+            enrichment_cancellation.clone(),
+        );
+        let mut enrichment = EnrichmentConverge {
+            target_set: BTreeSet::new(),
+            target_publisher,
+            published: false,
+            events: enrichment_events,
+            prunes: prune_events,
+            diagnostics: enrichment_diagnostics,
+            performance: performance.clone(),
+        };
         let outcome = converge(
             &sock,
             &mut persistence,
@@ -1533,13 +1585,18 @@ async fn run_collector(
             gap_kind,
             events,
             Arc::clone(&overflowed),
+            &mut enrichment,
             &mut controller_requests,
             &mut provider,
         )
         .await;
 
         reader_cancellation.cancel();
+        enrichment_cancellation.cancel();
         let reader_result = reader
+            .await
+            .map_err(|error| CollectorError::Task(error.to_string()))?;
+        enrichment_reader
             .await
             .map_err(|error| CollectorError::Task(error.to_string()))?;
         let outcome = outcome?;
@@ -1579,6 +1636,7 @@ async fn converge(
     gap_kind: GapKind,
     mut events: mpsc::Receiver<Admitted<ReceivedEvent>>,
     overflowed: Arc<AtomicBool>,
+    enrichment: &mut EnrichmentConverge,
     controller_requests: &mut Option<ControllerRequestReceiver>,
     provider: &mut ProviderIntegration,
 ) -> Result<ConvergeOutcome, CollectorError> {
@@ -1587,6 +1645,7 @@ async fn converge(
     let mut pending_closures = PendingTopologyClosures::default();
 
     loop {
+        enrichment.discard_episode_payloads();
         overflowed.store(false, Ordering::Release);
         let snapshot = tokio::select! {
             () = cancellation.cancelled() => return Ok(ConvergeOutcome::new(SubscriptionOutcome::Cancelled, !first_generation)),
@@ -1626,6 +1685,13 @@ async fn converge(
             apply_snapshot_in_place(reducer, shared, topology, session, &mut pending_closures)?
         };
         let _ = persist_submission(persistence, reducer, std::mem::take(&mut batch)).await?;
+        enrichment.replace_targets(
+            snapshot
+                .panes
+                .iter()
+                .map(|pane| pane.pane_id.clone())
+                .collect(),
+        );
         provider.publish_targets(shared);
         owner.refresh_from_snapshot(&snapshot, persistence).await?;
         persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
@@ -1639,6 +1705,7 @@ async fn converge(
             &snapshot,
             &mut events,
             &overflowed,
+            enrichment,
             cancellation,
             &mut pending_closures,
             controller_requests,
@@ -1659,6 +1726,8 @@ async fn converge(
                 ));
             }
             ReplayOutcome::Clean => {
+                enrichment.discard_episode_payloads();
+                enrichment.activate();
                 provider.set_herdr_quality(ObservationQuality::Live, persistence, shared);
                 match monitor_live(
                     reducer,
@@ -1668,6 +1737,7 @@ async fn converge(
                     session,
                     &mut events,
                     &overflowed,
+                    enrichment,
                     cancellation,
                     &mut pending_closures,
                     controller_requests,
@@ -1708,6 +1778,7 @@ async fn converge(
                         owner,
                         session,
                         events,
+                        enrichment,
                         cancellation,
                         &mut pending_closures,
                         controller_requests,
@@ -1732,6 +1803,7 @@ async fn replay_generation(
     snapshot: &Snapshot,
     events: &mut mpsc::Receiver<Admitted<ReceivedEvent>>,
     overflowed: &AtomicBool,
+    enrichment: &mut EnrichmentConverge,
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
     controller_requests: &mut Option<ControllerRequestReceiver>,
@@ -1746,8 +1818,10 @@ async fn replay_generation(
     let mut channel_state = drain_events(events, &mut buffered);
 
     loop {
+        enrichment.discard_episode_payloads();
         while let Some(admitted) = buffered.pop_front() {
             let (received, admission) = admitted.into_parts();
+            let target_delta = enrichment_target_delta(&received, shared);
             record_replay_facts(
                 next,
                 &received,
@@ -1767,6 +1841,7 @@ async fn replay_generation(
                 provider,
             )
             .await?;
+            enrichment.apply_target_delta(target_delta);
             next += 1;
             channel_state = drain_events(events, &mut buffered);
         }
@@ -1826,14 +1901,23 @@ async fn monitor_live(
     session: &str,
     events: &mut mpsc::Receiver<Admitted<ReceivedEvent>>,
     overflowed: &AtomicBool,
+    enrichment: &mut EnrichmentConverge,
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
     controller_requests: &mut Option<ControllerRequestReceiver>,
     provider: &mut ProviderIntegration,
 ) -> Result<ReplayOutcome, CollectorError> {
+    enum LiveReceipt {
+        Primary(Admitted<ReceivedEvent>),
+        Enrichment(EnrichmentPayload),
+        Sweep,
+    }
+
     let mut stale_sweep = tokio::time::interval(STALE_SWEEP_INTERVAL);
     stale_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     stale_sweep.tick().await;
+    let mut enrichment_events_open = true;
+    let mut enrichment_prunes_open = true;
     loop {
         let received = tokio::select! {
             () = cancellation.cancelled() => return Ok(ReplayOutcome::Cancelled),
@@ -1863,44 +1947,80 @@ async fn monitor_live(
                 continue;
             }
             received = events.recv() => match received {
-                Some(received) => Some(received),
+                Some(received) => LiveReceipt::Primary(received),
                 None => return Ok(ReplayOutcome::Ended),
             },
-            _ = stale_sweep.tick() => None,
+            payload = enrichment.events.recv(), if enrichment_events_open => match payload {
+                Some(payload) => LiveReceipt::Enrichment(payload),
+                None => {
+                    enrichment_events_open = false;
+                    continue;
+                }
+            },
+            prune = enrichment.prunes.recv(), if enrichment_prunes_open => {
+                let Some(prune) = prune else {
+                    enrichment_prunes_open = false;
+                    continue;
+                };
+                enrichment.apply_prune(prune);
+                continue;
+            },
+            _ = stale_sweep.tick() => LiveReceipt::Sweep,
         };
-        let Some(received) = received else {
-            let mut persist = reducer.sweep_stale(unix_now_ms());
-            persist.extend(apply_pending_topology_closures(
-                reducer,
-                shared,
-                session,
-                pending_closures,
-            )?);
-            if !persist.is_empty() {
-                let _ = persist_submission(persistence, reducer, persist).await?;
-                provider.publish_targets(shared);
+        match received {
+            LiveReceipt::Sweep => {
+                let mut persist = reducer.sweep_stale(unix_now_ms());
+                persist.extend(apply_pending_topology_closures(
+                    reducer,
+                    shared,
+                    session,
+                    pending_closures,
+                )?);
+                if !persist.is_empty() {
+                    let _ = persist_submission(persistence, reducer, persist).await?;
+                    provider.publish_targets(shared);
+                }
+                let _ = persistence.cleanup(unix_now_ms()).await?;
+                persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
+                continue;
             }
-            let _ = persistence.cleanup(unix_now_ms()).await?;
-            persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
-            continue;
-        };
-        let (received, admission) = received.into_parts();
-        let anomalous =
-            updated_entity(&received).is_some_and(|entity| !entity_exists(shared, &entity));
-        apply_received_event(
-            reducer,
-            shared,
-            persistence,
-            owner,
-            session,
-            received,
-            admission,
-            pending_closures,
-            provider,
-        )
-        .await?;
-        if anomalous || overflowed.swap(false, Ordering::AcqRel) {
-            return Ok(ReplayOutcome::Dirty);
+            LiveReceipt::Enrichment(payload) => {
+                apply_enrichment_payload(
+                    reducer,
+                    shared,
+                    persistence,
+                    session,
+                    payload,
+                    &enrichment.target_set,
+                    &enrichment.performance,
+                    pending_closures,
+                    provider,
+                )
+                .await?;
+                continue;
+            }
+            LiveReceipt::Primary(received) => {
+                let (received, admission) = received.into_parts();
+                let target_delta = enrichment_target_delta(&received, shared);
+                let anomalous =
+                    updated_entity(&received).is_some_and(|entity| !entity_exists(shared, &entity));
+                apply_received_event(
+                    reducer,
+                    shared,
+                    persistence,
+                    owner,
+                    session,
+                    received,
+                    admission,
+                    pending_closures,
+                    provider,
+                )
+                .await?;
+                enrichment.apply_target_delta(target_delta);
+                if anomalous || overflowed.swap(false, Ordering::AcqRel) {
+                    return Ok(ReplayOutcome::Dirty);
+                }
+            }
         }
     }
 }
@@ -1913,6 +2033,7 @@ async fn monitor_reconciling(
     owner: &mut OwnerTracker,
     session: &str,
     mut events: mpsc::Receiver<Admitted<ReceivedEvent>>,
+    enrichment: &mut EnrichmentConverge,
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
     controller_requests: &mut Option<ControllerRequestReceiver>,
@@ -1922,6 +2043,7 @@ async fn monitor_reconciling(
     stale_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     stale_sweep.tick().await;
     loop {
+        enrichment.discard_episode_payloads();
         let received = tokio::select! {
             () = cancellation.cancelled() => return Ok(SubscriptionOutcome::Cancelled),
             request = receive_controller(controller_requests) => {
@@ -1972,6 +2094,7 @@ async fn monitor_reconciling(
             continue;
         };
         let (received, admission) = received.into_parts();
+        let target_delta = enrichment_target_delta(&received, shared);
         apply_received_event(
             reducer,
             shared,
@@ -1984,6 +2107,7 @@ async fn monitor_reconciling(
             provider,
         )
         .await?;
+        enrichment.apply_target_delta(target_delta);
     }
 }
 
@@ -1992,6 +2116,338 @@ type EventReader = (
     Arc<AtomicBool>,
     JoinHandle<Result<(), WireError>>,
 );
+
+#[derive(Clone, Debug)]
+struct EnrichmentPayload {
+    pane_id: String,
+    terminal_id: Option<String>,
+    state: ExecState,
+    timestamp_ms: i64,
+    receipt_time_ms: i64,
+}
+
+struct EnrichmentPrune {
+    pane_id: String,
+    acknowledgement: tokio::sync::oneshot::Sender<()>,
+}
+
+struct EnrichmentConverge {
+    target_set: BTreeSet<String>,
+    target_publisher: watch::Sender<BTreeSet<String>>,
+    published: bool,
+    events: mpsc::Receiver<EnrichmentPayload>,
+    prunes: mpsc::UnboundedReceiver<EnrichmentPrune>,
+    diagnostics: EnrichmentDiagnosticsHandle,
+    performance: PerformanceIngress,
+}
+
+impl EnrichmentConverge {
+    fn replace_targets(&mut self, targets: BTreeSet<String>) {
+        if self.target_set == targets {
+            return;
+        }
+        self.target_set = targets;
+        self.publish_targets();
+    }
+
+    fn activate(&mut self) {
+        if self.published {
+            return;
+        }
+        self.published = true;
+        self.publish_targets();
+    }
+
+    fn publish_targets(&self) {
+        if !self.published {
+            return;
+        }
+        let targets = self.target_set.clone();
+        self.target_publisher.send_if_modified(|current| {
+            if *current == targets {
+                false
+            } else {
+                *current = targets;
+                true
+            }
+        });
+    }
+
+    fn apply_target_delta(&mut self, delta: EnrichmentTargetDelta) {
+        let mut targets = self.target_set.clone();
+        for pane_id in delta.removed {
+            targets.remove(&pane_id);
+        }
+        targets.extend(delta.created);
+        self.replace_targets(targets);
+    }
+
+    fn drain_prunes(&mut self) {
+        while let Ok(prune) = self.prunes.try_recv() {
+            self.apply_prune(prune);
+        }
+    }
+
+    fn apply_prune(&mut self, prune: EnrichmentPrune) {
+        let mut targets = self.target_set.clone();
+        targets.remove(&prune.pane_id);
+        self.replace_targets(targets);
+        let _ = prune.acknowledgement.send(());
+    }
+
+    fn discard_episode_payloads(&mut self) {
+        self.drain_prunes();
+        for _ in 0..ENRICHMENT_QUEUE_CAPACITY {
+            match self.events.try_recv() {
+                Ok(_) => self.diagnostics.record_episode_discard(),
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct EnrichmentTargetDelta {
+    created: BTreeSet<String>,
+    removed: BTreeSet<String>,
+}
+
+fn enrichment_target_delta(
+    received: &ReceivedEvent,
+    shared: &SharedModel,
+) -> EnrichmentTargetDelta {
+    let mut delta = EnrichmentTargetDelta::default();
+    match received.event.as_str() {
+        "pane_created" => {
+            if let Some(pane_id) = nested_string(&received.data, "pane", "pane_id") {
+                delta.created.insert(pane_id);
+            }
+        }
+        "pane_closed" => {
+            if let Some(pane_id) = string_field(&received.data, "pane_id") {
+                delta.removed.insert(pane_id);
+            }
+        }
+        "pane_moved" => {
+            if let Some(pane_id) = nested_string(&received.data, "pane", "pane_id") {
+                delta.created.insert(pane_id);
+            }
+            if let Some(pane_id) = string_field(&received.data, "previous_pane_id") {
+                delta.removed.insert(pane_id);
+            }
+        }
+        "tab_closed" => {
+            if let Some(tab_id) = string_field(&received.data, "tab_id") {
+                delta.removed.extend(
+                    shared
+                        .borrow()
+                        .panes()
+                        .filter(|pane| pane.tab_id == tab_id)
+                        .map(|pane| pane.pane_id.clone()),
+                );
+            }
+        }
+        "workspace_closed" => {
+            if let Some(workspace_id) = string_field(&received.data, "workspace_id") {
+                delta.removed.extend(
+                    shared
+                        .borrow()
+                        .panes()
+                        .filter(|pane| pane.workspace_id == workspace_id)
+                        .map(|pane| pane.pane_id.clone()),
+                );
+            }
+        }
+        _ => {}
+    }
+    delta
+}
+
+fn spawn_enrichment_reader(
+    sock: PathBuf,
+    targets: watch::Receiver<BTreeSet<String>>,
+    sender: mpsc::Sender<EnrichmentPayload>,
+    prunes: mpsc::UnboundedSender<EnrichmentPrune>,
+    diagnostics: EnrichmentDiagnosticsHandle,
+    cancellation: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(run_enrichment_reader(
+        sock,
+        targets,
+        sender,
+        prunes,
+        diagnostics,
+        cancellation,
+    ))
+}
+
+async fn run_enrichment_reader(
+    sock: PathBuf,
+    mut targets: watch::Receiver<BTreeSet<String>>,
+    sender: mpsc::Sender<EnrichmentPayload>,
+    prunes: mpsc::UnboundedSender<EnrichmentPrune>,
+    diagnostics: EnrichmentDiagnosticsHandle,
+    cancellation: CancellationToken,
+) {
+    let mut target_set = targets.borrow_and_update().clone();
+    loop {
+        while target_set.is_empty() {
+            tokio::select! {
+                () = cancellation.cancelled() => return,
+                changed = targets.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    target_set = targets.borrow_and_update().clone();
+                }
+            }
+        }
+
+        let delayed = tokio::select! {
+            () = cancellation.cancelled() => return,
+            changed = targets.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                target_set = targets.borrow_and_update().clone();
+                false
+            }
+            () = tokio::time::sleep(RECONNECT_DELAY) => true,
+        };
+        if !delayed {
+            continue;
+        }
+
+        let subscriptions = enrichment_subscriptions(&target_set);
+        let subscribed = tokio::select! {
+            () = cancellation.cancelled() => return,
+            changed = targets.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                target_set = targets.borrow_and_update().clone();
+                continue;
+            }
+            result = wire::subscribe(&sock, &subscriptions) => result,
+        };
+        let mut stream = match subscribed {
+            Ok(stream) => stream,
+            Err(WireError::Server { code, message }) if code == "pane_not_found" => {
+                let Some(pane_id) = rejected_enrichment_pane(&message, &target_set) else {
+                    tracing::warn!(
+                        warning_code = "herdr_enrichment_subscription_failed",
+                        error = %WireError::Server { code, message },
+                        "Herdr enrichment subscription failed; retrying"
+                    );
+                    continue;
+                };
+                let (acknowledgement, applied) = tokio::sync::oneshot::channel();
+                if prunes
+                    .send(EnrichmentPrune {
+                        pane_id: pane_id.clone(),
+                        acknowledgement,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::select! {
+                    () = cancellation.cancelled() => return,
+                    result = applied => {
+                        if result.is_err() {
+                            return;
+                        }
+                    }
+                }
+                target_set.remove(&pane_id);
+                target_set = targets.borrow_and_update().clone();
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    warning_code = "herdr_enrichment_subscription_failed",
+                    error = %error,
+                    "Herdr enrichment subscription failed; retrying"
+                );
+                continue;
+            }
+        };
+
+        loop {
+            let received = tokio::select! {
+                () = cancellation.cancelled() => {
+                    let _ = stream.close().await;
+                    return;
+                }
+                changed = targets.changed() => {
+                    if changed.is_err() {
+                        let _ = stream.close().await;
+                        return;
+                    }
+                    target_set = targets.borrow_and_update().clone();
+                    let _ = stream.close().await;
+                    break;
+                }
+                received = stream.next_event() => received,
+            };
+            let (event, data) = match received {
+                Ok(Some(received)) => received,
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::warn!(
+                        warning_code = "herdr_enrichment_stream_failed",
+                        error = %error,
+                        "Herdr enrichment stream ended; retrying"
+                    );
+                    break;
+                }
+            };
+            let Some(payload) = enrichment_payload(&event, &data) else {
+                continue;
+            };
+            match sender.try_send(payload) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    diagnostics.record_channel_full_drop();
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return,
+            }
+        }
+    }
+}
+
+fn rejected_enrichment_pane(message: &str, targets: &BTreeSet<String>) -> Option<String> {
+    message
+        .strip_prefix("pane ")
+        .and_then(|message| message.strip_suffix(" not found"))
+        .filter(|pane_id| targets.contains(*pane_id))
+        .map(str::to_owned)
+}
+
+fn enrichment_payload(event: &str, data: &Value) -> Option<EnrichmentPayload> {
+    if event != "pane_agent_status_changed" {
+        return None;
+    }
+    let pane_id =
+        string_field(data, "pane_id").or_else(|| nested_string(data, "pane", "pane_id"))?;
+    let terminal_id =
+        string_field(data, "terminal_id").or_else(|| nested_string(data, "pane", "terminal_id"));
+    let state = status_from_value(
+        data.get("agent_status")
+            .or_else(|| data.get("status"))
+            .or_else(|| data.get("new_status")),
+    );
+    let receipt_time_ms = unix_now_ms();
+    Some(EnrichmentPayload {
+        pane_id,
+        terminal_id,
+        state,
+        timestamp_ms: receipt_time_ms,
+        receipt_time_ms,
+    })
+}
 
 fn spawn_event_reader(
     mut stream: EventStream,
@@ -3131,6 +3587,52 @@ async fn apply_received_event(
     Ok(())
 }
 
+fn cancel_pending_pane_closure(pane_id: &str, pending: &mut PendingTopologyClosures) {
+    pending.panes.remove(pane_id);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_enrichment_payload(
+    reducer: &mut Reducer,
+    shared: &SharedModel,
+    persistence: &mut RuntimePersistence,
+    session: &str,
+    payload: EnrichmentPayload,
+    target_set: &BTreeSet<String>,
+    performance: &PerformanceIngress,
+    pending_closures: &mut PendingTopologyClosures,
+    provider: &mut ProviderIntegration,
+) -> Result<(), CollectorError> {
+    cancel_pending_pane_closure(&payload.pane_id, pending_closures);
+    if !target_set.contains(&payload.pane_id) {
+        return Ok(());
+    }
+
+    let events = agent_status_events(
+        shared,
+        session,
+        &payload.pane_id,
+        payload.terminal_id.as_deref(),
+        payload.state,
+        Some((payload.timestamp_ms, payload.receipt_time_ms)),
+    );
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let admission = performance.admit();
+    let outcome = apply_collector_observation(reducer, events);
+    admission.complete();
+    if let Some(persist) = outcome?
+        && !persist.is_empty()
+    {
+        let _ = persist_submission(persistence, reducer, persist).await?;
+    }
+    persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
+    provider.publish_targets(shared);
+    Ok(())
+}
+
 fn apply_collector_event(
     reducer: &mut Reducer,
     event: NormalizedEvent,
@@ -3369,21 +3871,58 @@ fn normalize_event(
                 .or_else(|| nested_string(&received.data, "pane", "pane_id"));
             let terminal_id = string_field(&received.data, "terminal_id")
                 .or_else(|| nested_string(&received.data, "pane", "terminal_id"));
-            for execution in shared.borrow().executions().filter(|execution| {
-                !execution.state.is_terminal()
-                    && (pane_id.as_deref() == Some(execution.pane_id.as_str())
-                        || terminal_id.as_deref() == Some(execution.terminal_id.as_str()))
-            }) {
-                events.push(NormalizedEvent::AgentStatusChanged {
-                    metadata: metadata(session, &received.event),
-                    execution_id: execution.execution_id.clone(),
-                    state: state.clone(),
-                });
+            if let Some(pane_id) = pane_id {
+                events.extend(agent_status_events(
+                    shared,
+                    session,
+                    &pane_id,
+                    terminal_id.as_deref(),
+                    state,
+                    None,
+                ));
             }
         }
         _ => {}
     }
     Ok(events)
+}
+
+fn agent_status_events(
+    shared: &SharedModel,
+    session: &str,
+    pane_id: &str,
+    terminal_id: Option<&str>,
+    state: ExecState,
+    receipt_instants: Option<(i64, i64)>,
+) -> Vec<NormalizedEvent> {
+    let executions: Vec<_> = shared
+        .borrow()
+        .executions()
+        .filter(|execution| {
+            !execution.state.is_terminal()
+                && (execution.pane_id == pane_id
+                    || terminal_id == Some(execution.terminal_id.as_str()))
+                && std::mem::discriminant(&execution.state) != std::mem::discriminant(&state)
+        })
+        .cloned()
+        .collect();
+    executions
+        .into_iter()
+        .map(|execution| {
+            let mut metadata = metadata(session, "pane_agent_status_changed");
+            metadata.pane_id = Some(pane_id.to_owned());
+            metadata.terminal_id = terminal_id.map(str::to_owned);
+            if let Some((timestamp_ms, receipt_time_ms)) = receipt_instants {
+                metadata.timestamp_ms = timestamp_ms;
+                metadata.receipt_time_ms = receipt_time_ms;
+            }
+            NormalizedEvent::AgentStatusChanged {
+                metadata,
+                execution_id: execution.execution_id,
+                state: state.clone(),
+            }
+        })
+        .collect()
 }
 
 fn append_pane_move(
@@ -3932,14 +4471,20 @@ fn subscriptions() -> Vec<Subscription> {
         "pane.moved",
         "pane.exited",
         "pane.agent_detected",
-        // Herdr 0.8.0 requires pane.agent_status_changed to carry a non-null pane_id;
-        // requesting it unscoped rejects the whole subscription. Agent status still flows
-        // through full pane.updated payloads; pane-scoped subscriptions are a follow-up.
+        // Pane-scoped status events ride the isolated enrichment connection. Keeping them off
+        // this primary stream preserves its gap and convergence semantics.
         "layout.updated",
     ]
     .into_iter()
     .map(Subscription::new)
     .collect()
+}
+
+fn enrichment_subscriptions(pane_ids: &BTreeSet<String>) -> Vec<Subscription> {
+    pane_ids
+        .iter()
+        .map(|pane_id| Subscription::for_pane("pane.agent_status_changed", pane_id))
+        .collect()
 }
 
 fn topology_upsert(session: &str, kind: &str, entity: TopologyEntity) -> NormalizedEvent {
@@ -5857,6 +6402,106 @@ mod tests {
         );
     }
 
+    fn status_model(states: &[(&str, ExecState)]) -> SharedModel {
+        let mut model = DomainModel::default();
+        for (index, (execution_id, state)) in states.iter().enumerate() {
+            let run_id = RunId::new();
+            model.insert_task_run(TaskRun {
+                run_id,
+                key: RunKey::Controller(format!("status-run-{index}")),
+                display_ordinal: DisplayOrdinal::new(i64::try_from(index + 1).unwrap()),
+                state: TaskState::Running,
+                has_controller_task_state_event: false,
+            });
+            model.insert_execution(Execution {
+                execution_id: (*execution_id).to_owned(),
+                pane_id: "w1:p1".to_owned(),
+                terminal_id: "terminal-1".to_owned(),
+                task_run_id: run_id,
+                state: state.clone(),
+            });
+        }
+        watch::channel(Arc::new(model)).1
+    }
+
+    fn status_received(status: &str) -> ReceivedEvent {
+        ReceivedEvent {
+            event: "pane_agent_status_changed".to_owned(),
+            data: json!({
+                "pane_id": "w1:p1",
+                "terminal_id": "terminal-1",
+                "agent_status": status,
+            }),
+        }
+    }
+
+    #[test]
+    fn live_status_expands_per_differing_execution_with_distinct_receipt_identity() {
+        let shared = status_model(&[
+            ("live", ExecState::Idle),
+            ("stale", ExecState::Stale { since_ms: 7 }),
+        ]);
+        let normalized = normalize_event(&shared, "status-session", &status_received("working"))
+            .expect("status payload should normalize");
+        assert_eq!(normalized.len(), 2);
+        let mut identities = BTreeSet::new();
+        let mut executions = BTreeSet::new();
+        for event in normalized {
+            let NormalizedEvent::AgentStatusChanged {
+                metadata,
+                execution_id,
+                state,
+            } = event
+            else {
+                panic!("status receipt emitted a non-status event");
+            };
+            assert_eq!(state, ExecState::Working);
+            assert_eq!(metadata.source_event_type, "pane_agent_status_changed");
+            assert_eq!(metadata.pane_id.as_deref(), Some("w1:p1"));
+            assert_eq!(metadata.terminal_id.as_deref(), Some("terminal-1"));
+            assert_eq!(metadata.timestamp_ms, metadata.receipt_time_ms);
+            identities.insert(metadata.event_id);
+            executions.insert(execution_id);
+        }
+        assert_eq!(identities.len(), 2);
+        assert_eq!(
+            executions,
+            BTreeSet::from(["live".to_owned(), "stale".to_owned()])
+        );
+    }
+
+    #[test]
+    fn live_status_equal_to_every_execution_emits_nothing() {
+        let shared = status_model(&[
+            ("first", ExecState::Working),
+            ("second", ExecState::Working),
+        ]);
+        let normalized = normalize_event(&shared, "status-session", &status_received("working"))
+            .expect("status payload should normalize");
+        assert!(normalized.is_empty());
+    }
+
+    #[test]
+    fn live_status_filters_each_execution_independently_and_skips_terminal_sibling() {
+        let shared = status_model(&[
+            ("equal", ExecState::Working),
+            ("different", ExecState::Idle),
+            ("terminal", ExecState::Ended),
+        ]);
+        let normalized = normalize_event(&shared, "status-session", &status_received("working"))
+            .expect("status payload should normalize");
+        assert_eq!(normalized.len(), 1);
+        assert!(matches!(
+            &normalized[0],
+            NormalizedEvent::AgentStatusChanged { execution_id, state, .. }
+                if execution_id == "different" && *state == ExecState::Working
+        ));
+        assert_eq!(
+            shared.borrow().execution("terminal").unwrap().state,
+            ExecState::Ended
+        );
+    }
+
     #[tokio::test]
     async fn i4_d3_herdr_disconnect_immediately_refreshes_diagnostics_once() {
         let directory = tempfile::tempdir().unwrap();
@@ -6004,6 +6649,7 @@ mod provider_integration_tests {
             owner: OwnerFreshness::Current,
             persistence_counters: PersistenceCounters::default(),
             controller_counters: crate::diagnostics::ControllerCounterSnapshot::default(),
+            enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
             source_coverage: Vec::new(),
             dangling_announcement_components: 0,
             first_failure_log: OccurrenceLogStatus::NotAttempted,
