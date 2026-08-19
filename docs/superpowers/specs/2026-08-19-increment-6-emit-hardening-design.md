@@ -154,6 +154,21 @@ subscribe error path (observed: `<id>:sub:<index>:<token>`), so the wire
 client must recognize a decorated error response as belonging to its
 request before the collector can read `pane_not_found`.
 
+Two consequences are binding. First, pane-set changes swap the enrichment
+connection BREAK-BEFORE-MAKE: the old connection closes before the new
+one subscribes, so no transition is ever delivered twice — herdr-sourced
+events carry no deduplication key, and an overlap window would
+double-record ledger rows, activity items, and rate observations; the
+bounded gap between close and resubscribe is covered by the fallback
+path. Second, enrichment events are isolated from the primary pipeline:
+they never enter the primary connection's replay and anomaly
+classification, they apply only while the primary is converged and are
+discarded during reconciliation (the snapshot re-establishes status),
+they never touch the primary's overflow state, and their subscription
+health is tracked separately so an enrichment failure can neither
+degrade the primary's observation quality nor be masked by primary
+health.
+
 The existing derivation of agent status from `pane.updated` payloads remains
 in place as the fallback path; the scoped subscription restores the richer
 event stream: transition-timestamp fidelity, the ledger row and activity
@@ -251,16 +266,27 @@ measurement attempt:
    `Failed` document by re-deriving its failure set, so under the amended
    validator the preserved burst document (recorded `failed`, every flagged
    sample the tolerated shape) would re-derive empty and be rejected as an
-   invalid artifact. The re-derivation entrypoint therefore gains an
-   explicit legacy-reclassification mode, used only by this closing path:
-   a stored `Failed` document is reclassified as an amended pass if and
-   only if its recorded `failure_reasons` equal exactly
+   invalid artifact. The SHARED stored-outcome reader therefore gains an
+   explicit legacy-reclassification mode, enabled by an environment flag
+   set only by this closing path and honored uniformly by every consumer
+   that reads stored outcomes in the closing process — the Section 15
+   re-derivation, the report's own self-validation re-read (which
+   re-derives a fresh document and requires equality with the stored
+   report), and the D4 checkpoint classifier: a stored `Failed` document
+   is reclassified at read time as an amended pass if and only if its
+   recorded `failure_reasons` equal exactly
    `["supported_load_degradation"]` AND the amended predicate derives no
    failure from its evidence; any other divergence between recorded and
-   derived outcomes remains fail-closed. Reclassification is recorded in
-   the regenerated report. Expected decision: `no_miss_d4_not_authorized`.
-   Both regenerated documents are preserved with their hashes recorded.
-   This closes `AmendmentsRequired[non_d4]`.
+   derived outcomes remains fail-closed. Because reclassification happens
+   at read time in one shared place, the regenerated report contains no
+   burst failure and the self-validation equality gate holds without
+   special-casing. The reclassification itself is recorded in a SIDECAR
+   document beside the regenerated report and in the increment ledger —
+   never inside the report, which would break its deterministic
+   re-derivation equality. Expected decision:
+   `no_miss_d4_not_authorized`. Both regenerated documents and the
+   sidecar are preserved with their hashes recorded. This closes
+   `AmendmentsRequired[non_d4]`.
 3. Independently, run one full confirmation measurement (next fresh attempt
    identifier 20260827) at the post-Phase-A/B head under the same
    fail-closed protocol as Increment 5, comparing against the Increment 5
@@ -310,12 +336,16 @@ Behavioral rules:
    output, and Codex validates it against a closed schema and marks the
    hook invalid on any unrecognized JSON — so all adapter diagnostics go to
    standard error.
-2. Event identifiers are unique per invocation with a deterministic prefix:
+2. Event identifiers are collision-resistant per invocation with a
+   deterministic prefix:
    `hook:<provider>:<native-session-id>:<hook-event>:<entity>:<transition>:<emitted-at-ms>:<nonce>`.
    The transition segment is mandatory on every event (two events mapped
    from one hook invocation must never share an identifier), and the nonce
    is a per-invocation random component, because millisecond timestamps
-   alone can collide across two invocations in the same millisecond.
+   alone can collide across two invocations in the same millisecond. The
+   random nonce makes accidental collision negligible rather than
+   impossible; the correctness backstop is the semantic-no-op idempotency
+   below, not identifier uniqueness.
    A fully deterministic identifier would be wrong: a session resume fires
    `SessionStart` again, and its `task_started` must reactivate the run,
    but an identifier already present in the deduplication ledger returns
@@ -338,16 +368,24 @@ Behavioral rules:
    `stale_event`; liveness for the session run flows from observed
    executions (retirement to `ended_unknown`, reactivation on resume).
    `SessionEnd` maps to nothing.
-6. Labels carry structural metadata only — agent type, task subject — never
-   prompt, response, or transcript content, per design section 14.
-   `last_assistant_message` is never forwarded. Design decision, recorded:
-   `task_subject` and `agent_type` are Controller-declared descriptions of
-   orchestration structure, the exact material the design's
-   Controller-supplied `label` exists to carry, and they pass the design's
-   existing sanitization (256-byte cap, control-character escaping,
-   UTF-8-safe truncation); fields that are prompt-, response-, or
-   tool-derived (`prompt`, `description`, `last_assistant_message`, tool
-   inputs) are never read by the adapter, and a sentinel test pins that.
+6. Labels the adapter forwards are exactly two: `agent_type` (a
+   structural type name) and `task_subject`. Design amendment, decided by
+   the owner with the display consequences reviewed: `task_subject` is
+   agent-authored task text supplied at task creation, which the base
+   design's section 7.2 allowlist sentence would exclude; this increment
+   amends that sentence with a recorded carve-out — Controller-supplied
+   `label` values may carry Controller-declared task descriptions,
+   including agent-authored task subjects, passing the existing label
+   sanitization (256-byte cap, control-character escaping, UTF-8-safe
+   truncation) — via an ADR under `docs/adr/` plus the matching one-line
+   amendment to `docs/design/herdr-top-mvp.md` section 7.2, landed and
+   reviewed together with the adapter task. Everything else stays
+   excluded: the adapter's payload struct has no `prompt`,
+   `description`, `task_description`, `teammate_name`, `team_name`,
+   `last_assistant_message`, or tool-input fields, and a sentinel test
+   pins that a payload carrying all of those alongside the structural
+   fields maps to envelopes whose serialized JSON contains none of their
+   values.
 7. Within one hook invocation the mapped envelopes are delivered strictly
    in order and delivery stops at the first failure: delivering a child's
    `task_started` after its `dispatch` failed would create a permanently

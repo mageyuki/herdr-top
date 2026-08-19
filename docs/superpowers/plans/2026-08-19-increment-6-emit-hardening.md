@@ -262,9 +262,10 @@ Expected: PASS, no existing test regresses.
 Behavior — the scoped subscriptions ride a DEDICATED secondary
 "enrichment" connection (spec section "A2"); the primary subscription
 connection, its startup order, and its gap/convergence semantics are
-untouched. Design section 9.2 forbids treating pane churn as an
-observation gap: a new subscription connection's first snapshot is a gap
-reconciliation that retires every pre-gap execution
+untouched. The design's gap-uniformity rule
+(`docs/design/herdr-top-mvp.md:222`, in section 7.1) forbids treating
+pane churn as an observation gap: a new subscription connection's first
+snapshot is a gap reconciliation that retires every pre-gap execution
 (`src/herdr/collector.rs:1614-1620`), so the pane-scoped stream must
 never ride the primary connection's lifecycle.
 
@@ -273,15 +274,21 @@ never ride the primary connection's lifecycle.
    `pane_created` / pane-removal handling (note: creation flows through
    `pane_created`; `pane_updated` silently ignores unknown panes —
    `src/herdr/collector.rs:3287-3300`).
-2. On a pane-set change, the collector opens a NEW enrichment connection
-   subscribed to `enrichment_subscriptions(target_set)` and closes the old
-   one after the new subscription is acknowledged. Changes arriving while
-   a swap is in flight coalesce into the next single swap (no per-event
-   storm). Enrichment-connection replacement records no collector gap,
-   retires no execution, and performs no resnapshot: the primary stream
-   and the `pane.updated` fallback stay continuous throughout, and a
-   transition missed during a swap is bounded fidelity loss the fallback
-   family already covers.
+2. On a pane-set change, the collector swaps the enrichment connection
+   BREAK-BEFORE-MAKE: it closes the old connection FIRST, then opens a
+   new one subscribed to `enrichment_subscriptions(target_set)`. There is
+   deliberately no overlap window: herdr-sourced events get a fresh ULID
+   per receipt (`src/herdr/collector.rs:3985-3990`) and every applied
+   event is recorded unconditionally (`src/reducer.rs:714-718`), so two
+   simultaneously subscribed connections would double-record ledger rows,
+   activity items, and rate observations for one physical transition.
+   Changes arriving while a swap is in flight coalesce into the next
+   single swap (no per-event storm). Enrichment-connection replacement
+   records no collector gap, retires no execution, and performs no
+   resnapshot: the primary stream and the `pane.updated` fallback stay
+   continuous throughout, and a transition missed during the bounded
+   close-to-resubscribe gap is fidelity loss the fallback family already
+   covers.
 3. If the enrichment subscribe fails with `WireError::Server` code
    `pane_not_found`, the collector parses the pane id from the message,
    prunes exactly that id from the target set, and retries; other errors
@@ -294,6 +301,22 @@ never ride the primary connection's lifecycle.
    and activity items, rate accounting, and the fourth topology-closure
    rescue trigger. The `pane.updated`-derived fallback stays byte-level
    untouched.
+4b. Isolation contract (binding): enrichment events NEVER enter the
+   primary connection's shared event channel, replay classification, or
+   anomaly detection — the replay path classifies events for
+   snapshot-absent entities as anomalous and forces `Dirty`
+   reconciliation (`src/herdr/collector.rs:1804-1812`, `1701-1703`), so
+   merging the streams would let enrichment traffic degrade primary
+   observation quality. The enrichment reader is a separate task with
+   its own bounded channel; it applies events only while the primary is
+   converged (Live) and DISCARDS them during gap reconciliation or
+   resnapshot (the snapshot re-establishes current status); it never
+   sets the primary's `overflowed` flag; its cancellation and join are
+   owned by the collector's existing shutdown lifecycle; on EOF or read
+   error it re-enters the enrichment retry path only. Subscription
+   health for Task 3's edge-triggered warning is tracked PER STREAM, so
+   a healthy primary cannot mask a failed enrichment subscription and an
+   enrichment failure never changes primary quality.
 5. The stale reality comment at lines 3935-3937 is replaced by the new
    contract description.
 
@@ -321,10 +344,25 @@ assert the second request omits exactly `w9:p99`.
 
 - [ ] **Step 4: Write failing pane-created swap test**: after enrichment
 convergence with one pane, deliver a `pane_created` event for a new pane
-on the primary stream; assert the enrichment listener observes a second
-subscribe containing both panes, and assert NO collector gap is recorded
-and no execution retires (query the persisted ops / reducer state the
-existing gap tests use).
+on the primary stream; assert the enrichment listener observes the OLD
+connection close BEFORE the second subscribe arrives (break-before-make),
+the second subscribe contains both panes, and NO collector gap is
+recorded and no execution retires (query the persisted ops / reducer
+state the existing gap tests use).
+
+- [ ] **Step 4b: Write failing single-record swap test**: drive an
+agent-status transition delivered once on the new connection immediately
+after a swap; assert exactly ONE ledger row / activity item / rate
+observation exists for it (the double-record regression for the overlap
+window that break-before-make eliminates).
+
+- [ ] **Step 4c: Write failing isolation tests** (three): (i) enrichment
+EOF mid-stream → enrichment retry path re-subscribes while primary
+quality stays Live and no `Dirty` reconciliation occurs; (ii) a flood on
+the enrichment channel never sets the primary `overflowed` flag or
+triggers a resnapshot; (iii) an enrichment event arriving DURING a
+primary gap reconciliation is discarded (no reducer application, no
+ledger row), and status re-establishes from the snapshot.
 
 - [ ] **Step 5: Write failing fallback-unavailable convergence test**: with
 the enrichment endpoint permanently refusing connections, drive the
@@ -333,12 +371,13 @@ the `pane.updated` fallback with observation quality unchanged (this is
 the spec's "fallback path unchanged when scoped subscriptions are
 unavailable" proof).
 
-- [ ] **Step 6: Run the five tests** — expected FAIL.
+- [ ] **Step 6: Run all nine tests** — expected FAIL.
 
 - [ ] **Step 7: Implement** the wire-id recognition,
-`enrichment_subscriptions`, the enrichment-connection manager with
-coalesced swaps, and prune-on-`pane_not_found`. Do not touch the reducer,
-writer, or the primary connection's startup order.
+`enrichment_subscriptions`, the isolated enrichment reader with
+break-before-make coalesced swaps and per-stream health, and
+prune-on-`pane_not_found`. Do not touch the reducer, writer, or the
+primary connection's startup order.
 
 - [ ] **Step 8: Run collector suite + wire suite + `tests/convergence.rs`**
 — all green, fallback tests unchanged.
@@ -404,7 +443,9 @@ changing the struct shape: `std::mem::forget(coverage_sender)` and
 senders deliberately, so their channels never close. The leak is one
 channel pair per `Default` call, and `Default` is a fixture/test
 constructor (production `main.rs:288` builds the literal directly); a
-comment in `default()` states the contract.
+doc comment on the `Default` impl states the deliberate leak so a future
+production caller never adopts `Default` in a loop, and an inline comment
+in `default()` marks each `mem::forget`.
 
 - [ ] **Step 1: Write the failing regression**: construct an `App` whose
 model watch is alive while the performance watch's sender is dropped;
@@ -484,15 +525,35 @@ the backstop).
   `section15_predicate_rows(stage: MeasurementStageV1, trial: &TrialResultV1)`
   — the stage parameter is a declared signature change, plumbed from each
   call site's scenario document (`document.measurement_stage`), because
-  `HarnessTrialV1` carries `scenario` but no stage (lines 676-706).
+  `HarnessTrialV1` carries `scenario` but no stage (lines 676-706). The
+  full plumbing chain is declared: `section15_predicate_rows` is called
+  by `section15_trial_row_with_predicates` (line 7594), itself wrapped by
+  `section15_trial_row` (line 7588) which is used as a bare function
+  reference in a `.map(section15_trial_row)` at line 7418 — all three
+  signatures gain the stage (or the bare reference becomes a closure);
+  predicates are computed only under `include_predicates == true` and the
+  baseline call site passes `false` (line 7412), so Baseline behavior is
+  structurally unchanged.
 - Produces (Task 8 consumes): a legacy-reclassification mode on the
-  stored-outcome reader, enabled only by the re-derivation entrypoint: a
-  stored `Failed` document whose recorded `failure_reasons` equal exactly
-  `["supported_load_degradation"]` and whose amended re-derivation yields
-  an EMPTY failure set is reclassified as an amended pass, with the
-  reclassification recorded in the regenerated report; every other
-  recorded/derived divergence stays `InvalidArtifact` (fail-closed), and
-  the mode is off everywhere else.
+  SHARED stored-outcome reader (`read_and_validate_reference_outcome`,
+  whose `Failed`-arm consistency check is at lines 1074-1081), enabled by
+  the environment flag `HERDR_PERF_ACCEPT_AMENDED_LEGACY=1` and honored
+  at READ time, so every consumer in the closing process sees the same
+  reclassified outcome without special-casing: the re-derivation
+  entrypoint, the report self-validation re-read
+  (`validate_section15_selected_evidence` at line 3041 re-reads outcomes
+  at line 3097 and requires `fresh != *report` equality at lines
+  3122-3133 — read-time uniformity is what makes that gate hold), and
+  the D4 checkpoint classifier (which loads through the same reader).
+  Semantics: a stored `Failed` document whose recorded `failure_reasons`
+  equal exactly `["supported_load_degradation"]` and whose amended
+  re-derivation yields an EMPTY failure set is presented as an amended
+  pass; every other recorded/derived divergence stays `InvalidArtifact`
+  (fail-closed); with the flag unset (every other context, including CI
+  and Task 9) behavior is byte-identical to today. The reclassification
+  fact is reported to the caller for SIDECAR recording — never written
+  into the regenerated report, which must stay deterministically
+  re-derivable.
 
 Amended predicate (spec section "B1: the amendment"): the tolerance
 applies only when `stage == Final` and `scenario` is `Sustained` or
@@ -519,15 +580,23 @@ the shared function and the non-tolerated count directly, so they are RED
 today because neither exists yet. Record the four observed failures.
 - [ ] **Step 3: Implement the shared function, the stage plumbing, and
 route both sites.**
-- [ ] **Step 4: Write the three failing reclassification tests**: (a)
-stored `Failed` burst document with recorded
+- [ ] **Step 4: Write the failing reclassification tests** — reader unit
+cases AND end-to-end: (a) stored `Failed` burst document with recorded
 `["supported_load_degradation"]` whose every flagged sample is the
-tolerated shape → reclassified amended pass, recorded in the output; (b)
-same recorded reasons but one flagged sample at 102 → recorded and
-derived failure sets agree, so the document stays a valid `Failed` and is
-never reclassified; (c) recorded reasons
+tolerated shape, flag SET → presented as amended pass with the
+reclassification fact reported; (b) same recorded reasons but one flagged
+sample at 102 → recorded and derived failure sets agree, so the document
+stays a valid `Failed` and is never reclassified; (c) recorded reasons
 `["supported_load_degradation"]` with a derived nonempty DIFFERENT set →
-`InvalidArtifact` (fail-closed). Then implement the mode and verify green.
+`InvalidArtifact` (fail-closed); (d) flag UNSET with fixture (a) →
+`InvalidArtifact` exactly as today; (e) END-TO-END with the flag set over
+a synthetic legacy root (fixture (a) beside six passing scenario
+fixtures): the Section 15 re-derivation entrypoint produces a report with
+no burst failure, the report's self-validation
+(`validate_section15_selected_evidence`) passes its `fresh` equality
+gate on readback, and the D4 checkpoint classifier over the same root
+returns `no_miss_d4_not_authorized`. Then implement the mode and verify
+green.
 - [ ] **Step 5: Harness suite green** (feature-gated suite plus doctests).
 - [ ] **Step 6: Full verification; commit**
 `fix(perf): tolerate one-quantum boundary degradation at final acceptance`
@@ -634,20 +703,26 @@ Increment 5 research workspace (~370 MB, preserved; report SHA-256
   Section 15 re-derivation entrypoint and the D4 checkpoint classifier
   (the same native Controller-launch bootstrap and
   `classify_d4_checkpoint_from_results` entrypoints the Increment 5 plan
-  defined, with their HEAD/clean predicates), binding BOTH required roots —
+  defined, with their HEAD/clean predicates), with
+  `HERDR_PERF_ACCEPT_AMENDED_LEGACY=1` exported to BOTH invocations
+  (Task 6's read-time reclassification; without it the preserved burst
+  document, recorded `failed` with every flagged sample the tolerated
+  shape, re-derives an empty failure set and is rejected as
+  `InvalidArtifact` at `tests/common/workload.rs:1074-1081`). Environment
+  bindings: for the re-derivation,
   `HERDR_PERF_REDERIVE_BASELINE_RESULTS_ROOT` to the preserved baseline
-  attempt 20260822 and `HERDR_PERF_REDERIVE_FINAL_RESULTS_ROOT` to the
-  preserved final attempt 20260826 (`tests/common/workload.rs:5111-5115`) —
-  with Task 6's legacy-reclassification mode enabled for the stored-outcome
-  read (without it the preserved burst document, recorded `failed` with
-  every flagged sample the tolerated shape, re-derives an empty failure
-  set and is rejected as `InvalidArtifact` by the stored-outcome validator
-  at `tests/common/workload.rs:1074-1081`). Regenerated documents are
-  written into the Increment 6 research workspace — never into the
-  repository or the preserved roots. This refines the spec's "preserved
-  alongside the originals": the preserved roots stay immutable, and the
-  workspace records the original and regenerated document hashes side by
-  side, including the reclassification record.
+  attempt 20260822, `HERDR_PERF_REDERIVE_FINAL_RESULTS_ROOT` to the
+  preserved final attempt 20260826, and `HERDR_PERF_REDERIVE_OUTPUT` to
+  the workspace destination (`tests/common/workload.rs:5111-5115`); for
+  the D4 classifier, `HERDR_PERF_CLASSIFY_RESULTS_ROOT` to the preserved
+  final root and `HERDR_PERF_CLASSIFY_OUTPUT` to the workspace
+  destination (`tests/common/workload.rs:5091-5095`). Regenerated
+  documents and the reclassification SIDECAR are written into the
+  Increment 6 research workspace — never into the repository or the
+  preserved roots. This refines the spec's "preserved alongside the
+  originals": the preserved roots stay immutable, and the workspace
+  records the original and regenerated document hashes side by side with
+  the sidecar.
 - [ ] **Step 3** Expected: decision `no_miss_d4_not_authorized` from both.
   Record regenerated document hashes and the closure in the Increment 6
   ledger. Any other decision stops the increment for user consultation.
@@ -697,6 +772,13 @@ stable; no steps execute.
 
 **Files:**
 - Create: `src/hook_adapter.rs`
+- Create: `docs/adr/2026-08-19-controller-label-provenance.md` (the
+  owner-decided carve-out: Controller-supplied labels may carry
+  Controller-declared task descriptions, including agent-authored task
+  subjects, under the existing label sanitization; records the
+  alternative considered — no label — and the display consequence)
+- Modify: `docs/design/herdr-top-mvp.md` (one-line amendment to the
+  section 7.2 allowlist sentence referencing the ADR)
 - Modify: `src/lib.rs` (module registration)
 - Test: `src/hook_adapter.rs` module tests
 
@@ -762,15 +844,20 @@ invocations):
 4. `TaskCreated` (Claude Code only; with `task_id`) → `dispatch` (subject
    `…:task:<task_id>`, transition `dispatch`) then `progress` with
    `label` = `task_subject`, transition `created`.
-5. `TaskCompleted` (with `task_id`) → one `complete` (transition
-   `complete`).
+5. `TaskCompleted` (Claude Code only; with `task_id`) → one `complete`
+   (transition `complete`).
 6. `SessionEnd` and every other event name → empty vec.
 7. No field from the payload other than the listed structural fields is
    ever read; `native_session_id` appears only on the SessionStart
-   envelope. Prompt-, response-, or tool-derived fields (`prompt`,
-   `description`, `last_assistant_message`, tool inputs) are never
-   deserialized: `HookPayload` simply has no such fields, and the privacy
-   sentinel test pins that the struct never gains them.
+   envelope. `task_subject` IS forwarded as the task-run label under the
+   recorded design amendment (spec C1 rule 6: owner-decided carve-out,
+   existing label sanitization applies — the ADR and the design-sentence
+   amendment land inside this task). Every other content-bearing or
+   name-bearing payload field (`prompt`, `description`,
+   `task_description`, `teammate_name`, `team_name`,
+   `last_assistant_message`, tool inputs) is never deserialized:
+   `HookPayload` simply has no such fields, and the privacy sentinel test
+   pins that their values cannot reach a serialized envelope.
 
 - [ ] **Step 1: Write failing unit tests**: one per table row and per
 guard —
@@ -783,10 +870,20 @@ unknown event → empty; missing agent_id/task_id → empty; event ids carry
 the `emitted_at_ms` and nonce suffixes and never start with `prov:`; two
 invocations with the SAME timestamp but different nonces produce
 different event ids for the same hook; the privacy sentinel — a payload
-containing `prompt`, `description`, and `last_assistant_message` fields
-maps to envelopes whose serialized JSON contains none of those values.
+carrying values in `prompt`, `description`, `task_description`,
+`teammate_name`, `team_name`, and `last_assistant_message` alongside the
+structural fields maps to envelopes whose serialized JSON contains none
+of those values (while `task_subject` DOES appear as the label, pinning
+both halves of the amended rule).
 - [ ] **Step 2: Verify RED** (module absent).
 - [ ] **Step 3: Implement the module exactly per the table.**
+- [ ] **Step 3b: Write the label-provenance ADR and the design
+amendment**: create `docs/adr/2026-08-19-controller-label-provenance.md`
+(context, decision, alternative considered, consequences) and apply the
+one-line carve-out to the section 7.2 allowlist sentence in
+`docs/design/herdr-top-mvp.md`, referencing the ADR; both land in this
+task's commit so the behavior and its authorization are reviewed
+together.
 - [ ] **Step 4: GREEN; full verification; commit**
 `feat(emit): map controller hook payloads to envelope events`
 
@@ -846,6 +943,13 @@ failure while the non-strict outcome is success with a stderr diagnostic.
 stdin, JSON missing `session_id`, and stdin exceeding the 1 MiB cap each
 produce exit-0 semantics, zero deliveries, zero stdout bytes, and a
 stderr warning.
+- [ ] **Step 1d: Write the terminal-before-start race regression**:
+deliver a `SubagentStop` payload's `complete` before any `SubagentStart`
+for the same agent through the wire fixture; assert the forward-referenced
+terminal run is accepted, and a subsequent `SubagentStart` invocation's
+`task_started` is answered `rejected`/`stale_event` while its `dispatch`
+is accepted — the documented benign race outcome of spec C1 rule 7,
+pinned so the adapter never treats either response as an error.
 - [ ] **Step 2: Write the failing CLI-surface tests** (unit, in
 `src/main.rs` tests): `--from-hook claude-code` parses with no manual
 arguments; `--from-hook claude-code --strict` parses; manual invocation
@@ -869,10 +973,11 @@ NOT dependency edges); installing the standalone CLI per design section
 12.3; registration presented as an APPEND/MERGE procedure, never a
 replacement — the document states in prose that each entry below is
 APPENDED to the corresponding event's existing array in the operator's
-live file (both files routinely already contain handlers: herdr's own
-integration, permission guards), shows this valid-JSON fragment of the
-entries to add (the target-path comment lives in prose above the fence,
-not inside the JSON):
+live file (operator files routinely already contain handlers — on this
+host the Claude file carries context-mode and permission-guard hooks and
+the Codex file carries herdr's integration and guard hooks), shows this
+valid-JSON fragment of the entries to add (the target-path comment lives
+in prose above the fence, not inside the JSON):
 
 ```json
 {
@@ -906,7 +1011,9 @@ failure, forward-referenced terminals flagged in diagnostics, stale
 panes (no resolvable session → warn, exit 0, deliver nothing);
 dependency-edge guidance with one complete manual
 `herdr-top emit --event-type depends_on` example including every required
-flag; troubleshooting via `herdr-top doctor`.
+flag; what labels display (subagent runs show the agent type; task runs
+show the task subject in the detail pane's activity lines, per the
+recorded label-provenance ADR); troubleshooting via `herdr-top doctor`.
 
 - [ ] **Step 1** Write the document; verify every snippet against the
 implemented CLI by executing the commands with a throwaway session name.
@@ -917,11 +1024,17 @@ implemented CLI by executing the commands with a throwaway session name.
 - [ ] **Step 0** Rebuild the release binary at the integrated head and
 reinstall it to `~/.local/bin/herdr-top` (the repository's established
 procedure), then verify `herdr-top --version` and a digest match against
-the fresh build, and prove the adapter surface exists:
-`printf '{"hook_event_name":"SessionStart","session_id":"probe"}' | herdr-top emit --from-hook claude-code`
-must exit 0 (the currently installed 0.1.0 binary exits 2 on this —
-registering hooks against a stale binary would silently exercise the old
-CLI).
+the fresh build, and prove the adapter surface exists WITHOUT delivering
+anything — this shell is a managed pane with a live collector, and a
+delivered probe would create a permanent fake run (the protocol has no
+removal events):
+`printf '{"hook_event_name":"SessionStart","session_id":"probe"}' | herdr-top emit --from-hook claude-code --strict --session i6-step0-throwaway`
+Expected: nonzero exit with a stderr diagnostic naming the unresolvable
+throwaway session (`--strict` turns the refusal into an observable
+outcome; the sentinel for that session name does not exist, so nothing
+is delivered), while the STALE 0.1.0 binary fails differently — a clap
+`unexpected argument '--from-hook'` usage error — and the two are
+distinguished by the stderr text, not the exit code alone.
 - [ ] **Step 1** With user confirmation, register the Task 13 hooks in the
 live `~/.claude/settings.json` and `~/.codex/hooks.json` using Task 13's
 merge procedure: back up both files, APPEND the new entries to each
@@ -939,8 +1052,8 @@ fact 6: managed script present, `settings.json` entry absent) to the user
 with the suggestion to re-run `herdr integration install claude` if herdr's
 own reporting is wanted; this plan takes no action on it.
 - [ ] **Step 4** Record acceptance evidence (pane reads, doctor output) in
-the increment ledger. If Codex shipped session-level only (Task 10), the
-recorded gap is part of the acceptance statement, not a failure.
+the increment ledger, covering both providers' session runs and subagent
+children (the Codex rows are unconditional per Task 10).
 
 ## Integration, final review, and completion
 
