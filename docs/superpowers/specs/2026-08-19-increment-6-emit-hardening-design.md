@@ -173,17 +173,25 @@ needs an execution identity that only application-time matching
 determines, and event identities are unique in the store) forwarded
 over a dedicated bounded channel to the converge task. Losses are
 observable through a new dedicated diagnostics counter family
-(channel-full drops and episode discards — two complementary views of
-the same loss), published beside the existing counter families and
-rendered by doctor without touching the closed controller-counter
-shape. The converge task is the single consumer and already owns every
-piece of state involved — the model, the pending topology closures,
-and its own phase — so no cross-task lock, counter, or watermark
-exists. It APPLIES payloads only while Live; in every non-Live phase,
-including the terminal Reconciling state, it still consumes the
-channel and discard-counts without applying, and on entering Live it
-drains and discards what was enqueued before the drain completes (the
-reader is phase-unaware, so that is the exact discarded set). This is
+(channel-full drops — failed enqueues in any phase — and episode
+discards — enqueued payloads consumed without applying in a non-Live
+loop; which counter a lost transition lands in is determined by where
+it was lost, not by phase duration), produced by a cloneable handle in
+the codebase's existing cross-task counter pattern, published beside
+the existing counter families, and rendered by doctor without touching
+the closed controller-counter shape. The converge task is the single
+consumer and already owns every piece of state involved — the model,
+the pending topology closures, and its own phase — so no cross-task
+EVENT-ORDERING apparatus (lock, ordering counter, watermark) exists;
+the diagnostics handle orders nothing and is orthogonal. It APPLIES
+payloads only while Live; in every non-Live LOOP, including the
+terminal Reconciling state, it consumes the channel through a bounded
+synchronous drain at each loop iteration — never a `select!` arm,
+which would cancel the convergence loops' inline primary futures and
+let sustained enrichment traffic starve convergence — discard-counting
+without applying, and on entering Live it drains and discards what was
+enqueued before the drain completes (the reader is phase-unaware, so
+that is the exact discarded set). This is
 an owner-decided simplification, accepted on the accurate premise:
 ordinary convergence episodes (startup, reconnect, resnapshot) are
 seconds-scale, while the terminal Reconciling state is open-ended —

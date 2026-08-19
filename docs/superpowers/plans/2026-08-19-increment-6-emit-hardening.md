@@ -242,9 +242,13 @@ Expected: PASS, no existing test regresses.
   5827)
 - Modify: `src/herdr/wire.rs` (response-id matching near lines 236-246:
   recognize decorated error ids)
-- Modify: `src/diagnostics/mod.rs` (new counter family and handle — see
+- Modify: `src/diagnostics/mod.rs` (new counter snapshot family — see
   the diagnostics contract in Behavior 4b; `RuntimeDiagnosticsSnapshot`
   grows from eight fields to nine)
+- Modify: `src/model/entities.rs` (the new
+  `EnrichmentDiagnosticsHandle`, defined beside
+  `ControllerDiagnosticsHandle` at lines 203-206 per the pattern it
+  follows)
 - Modify: `src/doctor.rs` — the BINDING parser constraint is the ROOT
   snapshot parser `parse_runtime_snapshot` at lines 1456-1459, closed
   at `object.len() != 8` and failing SILENTLY (returns `None`, so
@@ -255,10 +259,11 @@ Expected: PASS, no existing test regresses.
   constructed exhaustively in nine files): `src/herdr/collector.rs`,
   `src/herdr/controller.rs`, `src/tui/app.rs`, `src/tui/projection.rs`,
   `src/tui/view.rs`, `tests/controller.rs`, `tests/doctor.rs` (plus the
-  two already-declared files). Two EXACT serialized fixtures must be
+  two already-declared files). THREE exact serialized fixtures must be
   regenerated for the new field: the byte-literal status assertion at
-  `src/herdr/controller.rs:1828-1831` and `HEALTHY_JSON_V1`
-  (`tests/doctor.rs:26`, asserted at line 527).
+  `src/herdr/controller.rs:1828-1831`, `HEALTHY_JSON_V1`
+  (`tests/doctor.rs:26`, asserted at line 527), and the whole-object
+  `serde_json::to_value` assertion at `src/diagnostics/mod.rs:286-289`.
 - Modify (only if the `Subscription` type lacks an optional `pane_id`
   field): `src/herdr/types.rs`
 - Test: `src/herdr/collector.rs` module tests; `src/herdr/wire.rs` module
@@ -362,21 +367,28 @@ never ride the primary connection's lifecycle.
    `EnrichmentCounterSnapshot { channel_full_drops: u64, episode_discards: u64 }`
    in `src/diagnostics/mod.rs`, produced by a cloneable
    process-lifetime `EnrichmentDiagnosticsHandle` of monotonic atomics
-   — the codebase's established cross-task counter pattern
-   (`ControllerDiagnosticsHandle`, `src/herdr/controller.rs:272-279`).
-   The collector creates the handle once; the enrichment reader holds a
-   clone across its retries and reconnects and increments
-   `channel_full_drops` on each failed enqueue (any phase); the
-   converge task increments `episode_discards` for each successfully
-   enqueued payload it consumes without applying in a non-Live loop.
-   Publication: `publish_facade` (collector.rs:773-780) pulls both
-   values from the handle into the snapshot exactly as it already pulls
-   the acceptor's counters from `ControllerDiagnosticsHandle` — the
-   published watch is a clone of the local snapshot, so writing the
-   watch directly would be silently overwritten by the next publish —
-   on the same publication triggers that refresh the controller
-   counters; tests assert on the published snapshot after driving a
-   publication. Counter semantics, precisely: `channel_full_drops`
+   defined in `src/model/entities.rs` beside the existing handles it
+   patterns on — `ControllerDiagnosticsHandle` is DEFINED at
+   `src/model/entities.rs:203-206` (with `ProviderDiagnosticsHandle`
+   at 209-218; `src/herdr/controller.rs:272-279` is a HOLDER of the
+   controller handle, not its definition). The collector creates the
+   handle once; the enrichment reader holds a clone across its retries
+   and reconnects and increments `channel_full_drops` on each
+   `TrySendError::Full` (any phase) — `TrySendError::Closed` is NOT
+   counted: it means receiver teardown and terminates the reader
+   through the existing lifecycle; the converge task increments
+   `episode_discards` for each successfully enqueued payload it
+   consumes without applying in a non-Live loop. Publication:
+   `publish_facade` (collector.rs:773-780) pulls both values from the
+   handle into the snapshot exactly as it already pulls the acceptor's
+   counters — the published watch is a clone of the local snapshot, so
+   writing the watch directly would be silently overwritten by the
+   next publish. Visibility is deliberately publication-bounded: no
+   dedicated wakeup is added (the controller pattern's
+   `diagnostic_changes` half is not mirrored), increments surface at
+   the next publication — at most the existing stale-sweep cadence —
+   and tests assert on the published snapshot after driving a
+   publication explicitly. Counter semantics, precisely: `channel_full_drops`
    counts failed enqueues in ANY phase (a finite queue can fill
    whenever production outpaces consumption, including bursts while
    Live and the straight-line convergence region at collector.rs
@@ -400,15 +412,27 @@ never ride the primary connection's lifecycle.
    counter pattern and orders nothing). It APPLIES payloads only in its
    Live loop (`monitor_live`, whose `select!` already hosts a second
    async source — the `receive_provider` arm — so the added arm is the
-   established pattern); in every non-Live LOOP — the snapshot-request
-   `select!`, `replay_generation`, and the TERMINAL Reconciling state
+   established pattern; a `recv()` arm is cancel-safe there). In the
+   non-Live LOOPS — the snapshot-request `select!`,
+   `replay_generation`, and the TERMINAL Reconciling state
    (`monitor_reconciling`, reachable after `RESNAPSHOT_ATTEMPTS`
    failures, collector.rs:1701-1718, and pinned by
-   `three_attempts_then_stays_reconciling`) — it consumes the channel
-   and discard-counts each payload without applying, so a LONG non-Live
-   phase drains rather than saturates; the straight-line convergence
-   region (collector.rs:1614-1631) runs no select, so a burst there can
-   still fill the finite queue, landing those losses in
+   `three_attempts_then_stays_reconciling`) — consumption is NOT a
+   `select!` arm: both convergence loops construct their primary
+   futures INLINE inside the `select!` beside `continue` branches
+   (collector.rs:1591-1606; the replay loop's
+   `DRAIN_QUIET_PERIOD = 5ms` timeout at collector.rs:64/1792), and
+   `select!` cancels the losing branches, so an enrichment arm firing
+   under sustained traffic would drop and re-issue the in-flight
+   `session.snapshot` request and reset the replay quiet period on
+   every payload — starving convergence. Instead, each non-Live loop
+   ITERATION runs a bounded synchronous drain: up to
+   `ENRICHMENT_QUEUE_CAPACITY` `try_recv` calls at the top of the loop
+   body, discard-counting each payload without applying — no new
+   future, nothing cancelled, and a LONG non-Live phase drains rather
+   than saturates. The straight-line convergence region
+   (collector.rs:1614-1631) runs no loop, so a burst there can still
+   fill the finite queue, landing those losses in
    `channel_full_drops`. On
    entering Live it first drains and DISCARDS what is queued; the
    honest race wording: payloads whose send lands after the drain
@@ -524,8 +548,8 @@ assertion is the discriminating half against a make-before-break
 regression (a single delivery can never double-record; only the
 forbidden overlap can).
 
-- [ ] **Step 4c: Write failing processing-contract tests** (nine
-numbered groups, ten scenarios — group (iii) contains a Reconciling
+- [ ] **Step 4c: Write failing processing-contract tests** (ten
+numbered groups, eleven scenarios — group (iii) contains a Reconciling
 sibling; the fixture controls both streams, so every case establishes
 its preconditions explicitly rather than passing by accident): (i)
 enrichment EOF mid-stream → enrichment retry path re-subscribes while
@@ -575,7 +599,13 @@ leaves `Stale`, the row is written with the original receipt instants,
 and no closure fires (the restoration this stream exists for); (ix)
 THE LIFECYCLE PIN — collector shutdown cancels and joins the
 enrichment reader cleanly (no leaked task, no post-shutdown sends
-observed).
+observed); (x) THE LIVENESS PIN — sustained enrichment traffic flowing
+throughout a convergence episode (during the snapshot request AND the
+replay quiet period) never stalls the primary: convergence completes,
+the snapshot request is issued once (not dropped and re-issued per
+payload), and the replay quiet period is not reset by enrichment
+arrivals — a `select!`-arm implementation that cancels the inline
+primary futures must fail this case.
 
 - [ ] **Step 5: Write failing fallback-unavailable convergence test**: with
 the enrichment endpoint permanently refusing connections, drive the
