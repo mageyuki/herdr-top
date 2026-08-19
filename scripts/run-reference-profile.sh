@@ -1825,7 +1825,7 @@ run_trial_process_tree() {
   local pidstat_status outer_deadline_seconds shared_orchestration_functions
   [[ $handshake_attempt_limit =~ ^[1-9][0-9]*$ ]] || return 20
   runtime_socket_path_has_shape "$observer_control_socket" || return 20
-  outer_deadline_seconds=$((deadline + 1))
+  outer_deadline_seconds=$((deadline + 90))
 
   shared_orchestration_functions="$(
     declare -f guard_fixture_output_node validate_fixture_output_path publish_trial_status \
@@ -2086,12 +2086,13 @@ prepare_runtime_dir() {
   [[ $# -eq 2 ]] || return 20
   local scenario_code=$1
   local trial_code=$2
-  local uid mode type extra
+  local uid mode type extra parent_pid
   active_runtime_dir=
   active_runtime_dir_identity=
   install_outer_runtime_traps || return 20
+  parent_pid=$BASHPID
   IFS=' ' read -r active_runtime_dir active_runtime_dir_identity extra \
-    < <(create_runtime_dir_identity "$BASHPID") || return 20
+    < <(create_runtime_dir_identity "$parent_pid") || return 20
   [[ -n $active_runtime_dir && -n $active_runtime_dir_identity && -z $extra ]] || return 20
   [[ -d $active_runtime_dir && ! -L $active_runtime_dir ]] || return 20
   uid="$("$auth_stat_executable" --format='%u' -- "$active_runtime_dir")" || return 20

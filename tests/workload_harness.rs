@@ -200,16 +200,6 @@ fn lock_workload<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-#[cfg(all(target_os = "linux", feature = "workload-harness"))]
-static SIGNAL_FIXTURE_GUARD: Mutex<()> = Mutex::new(());
-
-#[cfg(all(target_os = "linux", feature = "workload-harness"))]
-fn lock_signal_fixture() -> std::sync::MutexGuard<'static, ()> {
-    SIGNAL_FIXTURE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 #[cfg(feature = "workload-harness")]
 fn duration_ns(value: Duration) -> u64 {
     u64::try_from(value.as_nanos()).expect("frozen workload duration must fit u64")
@@ -8562,8 +8552,6 @@ fn runner_fixture_rejects_uncontained_attempt_id() {
 fn wait_process_pair_reaps_a_preexited_supervisor_before_blocking() {
     use reference_runner_test_support as support;
 
-    let _signal_fixture_guard = lock_signal_fixture();
-
     // Break caught: Bash <= 5.2 `wait -n` skips children that exited before
     // the call, so the live workers used to outrun an already-dead watchdog.
     let temporary = tempfile::tempdir().unwrap();
@@ -8620,8 +8608,6 @@ fn wait_process_pair_reaps_a_preexited_supervisor_before_blocking() {
 fn runner_fixture_reaps_timeout_and_signal_groups() {
     use reference_runner_test_support as support;
 
-    let _signal_fixture_guard = lock_signal_fixture();
-
     // Break caught: a timeout/signal path that leaves either process group live,
     // reports a default-death status without executing its trap body, skips
     // wait/reap, publishes before cleanup, or creates promotable evidence.
@@ -8662,7 +8648,7 @@ fn runner_fixture_reaps_timeout_and_signal_groups() {
                 observer.to_string_lossy().into_owned(),
                 trap_marker.to_string_lossy().into_owned(),
             ],
-            Duration::from_secs(360),
+            Duration::from_secs(120),
         );
         assert_eq!(exit_status.code(), Some(20), "case={case}: {exit_status:?}");
         assert_eq!(
@@ -8717,8 +8703,6 @@ fn runner_fixture_reaps_timeout_and_signal_groups() {
 fn orchestration_signal_traps_are_self_contained_across_reexec() {
     use reference_runner_test_support as support;
     use std::process::{Command, Stdio};
-
-    let _signal_fixture_guard = lock_signal_fixture();
 
     // Break caught: a trap body calls a shell function that is absent after a
     // fresh protected Bash re-exec, so the shell reports the intended status
@@ -8803,8 +8787,6 @@ exec /usr/bin/bash -p -c \
 #[test]
 fn cleanup_process_groups_bounds_a_missed_group_signal() {
     use reference_runner_test_support as support;
-
-    let _signal_fixture_guard = lock_signal_fixture();
 
     // Break caught: swallowing a failed negative-PGID signal and then waiting
     // unconditionally for the still-live direct child.
@@ -9034,8 +9016,6 @@ fn baseline_set_is_typed_stage_and_identity_validated_up_front() {
 fn outer_runtime_trap_reaps_live_trial_and_removes_owned_socket_on_signal() {
     use reference_runner_test_support as support;
 
-    let _signal_fixture_guard = lock_signal_fixture();
-
     // Break caught: a TERM after a group and socket are live only clears the
     // directory path, without reaping the group or unlinking the frozen socket.
     let temporary = tempfile::tempdir().unwrap();
@@ -9070,8 +9050,6 @@ fn outer_runtime_trap_reaps_live_trial_and_removes_owned_socket_on_signal() {
 #[test]
 fn source_fixture_executes_production_nested_orchestration_body() {
     use reference_runner_test_support as support;
-
-    let _signal_fixture_guard = lock_signal_fixture();
 
     // Break caught: the source seam reimplements orchestration instead of
     // executing run_trial_process_tree's 31-operand nested body, environments,
@@ -9555,8 +9533,6 @@ fn assert_fixture_write_refuses_node(site: &str, node: &str) {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, symlink};
 
-    let _signal_fixture_guard = (site == "trap-marker").then(lock_signal_fixture);
-
     let temporary = tempfile::tempdir().unwrap();
     let destination = temporary.path().join("destination");
     let target = temporary.path().join("target");
@@ -9665,8 +9641,6 @@ fn orchestration_trap_marker_refuses_fifo() {
 fn outer_trap_identity_window_is_single_command() {
     use reference_runner_test_support as support;
 
-    let _signal_fixture_guard = lock_signal_fixture();
-
     // Break caught: a signal between runtime-directory creation and identity
     // capture leaves an unowned directory that the outer trap cannot remove.
     let temporary = tempfile::tempdir().unwrap();
@@ -9680,6 +9654,11 @@ fn outer_trap_identity_window_is_single_command() {
         ],
     );
     assert_eq!(output.status.code(), Some(20), "{output:?}");
+    assert_eq!(
+        std::str::from_utf8(&output.stderr).unwrap(),
+        "error: child status was outside the closed set\n",
+        "{output:?}"
+    );
     let captured = std::fs::read_to_string(capture).unwrap();
     let (directory, identity) = captured.trim_end().split_once(' ').unwrap();
     assert_eq!(identity.split(':').count(), 5);
@@ -9690,8 +9669,6 @@ fn outer_trap_identity_window_is_single_command() {
 #[test]
 fn outer_trap_group_publication_is_atomic() {
     use reference_runner_test_support as support;
-
-    let _signal_fixture_guard = lock_signal_fixture();
 
     // Break caught: interruption while replacing the outer state exposes a
     // truncated mixture of measured/observer group identifiers.
@@ -9718,8 +9695,6 @@ fn outer_trap_group_publication_is_atomic() {
 fn publisher_temp_never_blocks_rmdir() {
     use reference_runner_test_support as support;
 
-    let _signal_fixture_guard = lock_signal_fixture();
-
     // Break caught: an interrupted `.outer-state.tmp.*` publisher artifact
     // survives state cleanup and makes the identity-checked rmdir fail.
     let temporary = tempfile::tempdir().unwrap();
@@ -9741,8 +9716,6 @@ fn publisher_temp_never_blocks_rmdir() {
 #[test]
 fn orchestration_wait_is_deadline_bounded() {
     use reference_runner_test_support as support;
-
-    let _signal_fixture_guard = lock_signal_fixture();
 
     // Break caught: cleanup waits forever for an orchestration child that
     // never exits or signals after the scenario supervisor fires.
@@ -9868,8 +9841,6 @@ fn trial_status_reader_rejects_unterminated_trailing_bytes() {
 #[test]
 fn runner_fixture_preserves_measured_and_observer_exit_status_precedence() {
     use reference_runner_test_support as support;
-
-    let _signal_fixture_guard = lock_signal_fixture();
 
     // Break caught: `wait` under `set -e`, boolean status collapse, observer
     // precedence over a measured failure, a non-atomic sentinel, or clearing
