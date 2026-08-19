@@ -189,19 +189,36 @@ different-status leftover must not regress newer snapshot truth).
 Second, a TARGET-SET GATE plus a per-execution filter, applied
 identically at the flush and on the direct path: the enrichment target
 set is defined as the most recent snapshot's panes plus panes created
-since, excluding a grace-retained remnant — a pane the snapshot removed
-that the model holds only while a stale execution's closure grace runs —
-so an event for such a remnant is dropped on both paths and can never
-resurrect the pane; for a member pane (pane records carry no status;
-status lives on executions, and one pane can host several), the
-transition applies to matching executions that are non-terminal and
+or moved in since (`pane_moved` is a creation path for a new public
+pane id, not only `pane_created`), excluding a grace-retained remnant —
+a pane the snapshot removed that the model holds only while a stale
+execution's closure grace runs — so an event for such a remnant never
+applies status on either path; for a member pane (pane records carry
+no status; status lives on executions, and one pane can host several),
+the transition applies to matching executions that are non-terminal and
 whose state differs from the event's status, so a transition the replay
 already re-established flushes to nothing instead of duplicating a
 ledger row. A stale execution on a MEMBER pane stays eligible:
 staleness also arises from a snapshot momentarily reporting no agent,
 and restoring exactly that transition is this stream's purpose — only
-the target-set gate guards resurrection. Buffered entries keep their
-original receipt timestamps across the flush. An episode that never
+the target-set gate guards resurrection. The gate governs STATUS
+APPLICATION only: every received scoped event still performs the
+existing re-observation closure cancellation for its pane, which is
+how the fourth topology-closure rescue trigger — promised by this
+increment and reachable only for snapshot-absent panes — survives the
+gate; a wrongful cancellation self-corrects at the next
+reconciliation, exactly as the fallback family's does today. Buffered
+entries are pane-level payloads (a normalized status event needs an
+execution identity that only application-time matching determines, and
+event identities are unique in the store), expanded at application
+into one event per matching execution with fresh identities and the
+STORED receipt instants — which is how original timestamps survive the
+flush. Stamping is serialized with the watermark reads and the flush
+drain on one lock, taken immediately after each socket read before
+parsing; the one residual — a reader descheduled between read-return
+and lock acquisition can stamp a genuinely pre-capture event past the
+watermark — is accepted as bounded staleness the next event or
+snapshot corrects. An episode that never
 reaches the flush point keeps its bounded buffer, with the watermark
 still advancing per snapshot, and the first flush drains it.
 Transitions inside the episode window coalesce to the final state and
