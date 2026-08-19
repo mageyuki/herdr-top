@@ -282,10 +282,16 @@ Behavioral rules:
    unmapped event, an unresolvable session, and every delivery failure exit
    with status 0 after at most a warning. `--strict` remains available but
    reference registrations never use it.
-2. Event identifiers are deterministic:
-   `hook:<provider>:<native-session-id>:<hook-event>:<entity>[:<transition>]`.
-   Re-fired hooks are absorbed by the protocol's `duplicate` response.
-   The reserved `prov:` prefix is never produced.
+2. Event identifiers are unique per invocation with a deterministic prefix:
+   `hook:<provider>:<native-session-id>:<hook-event>:<entity>[:<transition>]:<emitted-at-ms>`.
+   A fully deterministic identifier would be wrong: a session resume fires
+   `SessionStart` again, and its `task_started` must reactivate the run,
+   but an identifier already present in the deduplication ledger returns
+   `duplicate` and applies nothing. Idempotency against hook re-fires comes
+   from section 7.3's semantic no-ops instead — `task_started` on a running
+   run, a re-stated `dispatch` parent, and a repeated terminal of the same
+   kind are all accepted no-ops. The reserved `prov:` prefix is never
+   produced.
 3. Task Run identifiers are deterministic: the session run is
    `hook:<provider>:<native-session-id>`; a subagent run appends
    `:agent:<agent-id>`; a task run appends `:task:<task-id>`.
