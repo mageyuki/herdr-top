@@ -1825,7 +1825,7 @@ run_trial_process_tree() {
   local pidstat_status outer_deadline_seconds shared_orchestration_functions
   [[ $handshake_attempt_limit =~ ^[1-9][0-9]*$ ]] || return 20
   runtime_socket_path_has_shape "$observer_control_socket" || return 20
-  outer_deadline_seconds=$((deadline + 90))
+  outer_deadline_seconds=$((deadline + 10))
 
   shared_orchestration_functions="$(
     declare -f guard_fixture_output_node validate_fixture_output_path publish_trial_status \
