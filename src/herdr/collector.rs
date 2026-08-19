@@ -70,6 +70,21 @@ const STALE_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const PERFORMANCE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
 
+#[derive(Default)]
+struct HealthEdge {
+    failed: bool,
+}
+
+impl HealthEdge {
+    fn record_failure(&mut self) -> bool {
+        !std::mem::replace(&mut self.failed, true)
+    }
+
+    fn record_recovery(&mut self) -> bool {
+        std::mem::replace(&mut self.failed, false)
+    }
+}
+
 /// Current quality of the Herdr physical-state observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObservationQuality {
@@ -1481,6 +1496,7 @@ async fn run_collector(
 ) -> Result<(), CollectorError> {
     let mut first_subscription = true;
     let mut previous_socket = None;
+    let mut subscription_health = HealthEdge::default();
     let mut retention_cleanup = tokio::time::interval(STALE_SWEEP_INTERVAL);
     retention_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     retention_cleanup.tick().await;
@@ -1513,13 +1529,23 @@ async fn run_collector(
             }
             result = wire::subscribe(&sock, &subscriptions) => result,
         } {
-            Ok(stream) => stream,
+            Ok(stream) => {
+                if subscription_health.record_recovery() {
+                    tracing::info!(
+                        notice_code = "herdr_subscription_recovered",
+                        "Herdr event subscription recovered"
+                    );
+                }
+                stream
+            }
             Err(error) => {
-                tracing::warn!(
-                    warning_code = "herdr_subscription_failed",
-                    error = %error,
-                    "Herdr event subscription failed; retrying"
-                );
+                if subscription_health.record_failure() {
+                    tracing::warn!(
+                        warning_code = "herdr_subscription_failed",
+                        error = %error,
+                        "Herdr event subscription failed; retrying"
+                    );
+                }
                 provider.set_herdr_quality(
                     ObservationQuality::Disconnected,
                     &mut persistence,
@@ -2314,6 +2340,8 @@ async fn run_enrichment_reader(
 ) {
     let mut target_set = targets.borrow_and_update().clone();
     let mut deferral = EnrichmentDeferral { first: None };
+    let mut subscription_health = HealthEdge::default();
+    let mut stream_health = HealthEdge::default();
     loop {
         while target_set.is_empty() {
             deferral.on_empty();
@@ -2361,14 +2389,24 @@ async fn run_enrichment_reader(
             result = wire::subscribe(&sock, &subscriptions) => result,
         };
         let mut stream = match subscribed {
-            Ok(stream) => stream,
+            Ok(stream) => {
+                if subscription_health.record_recovery() {
+                    tracing::info!(
+                        notice_code = "herdr_enrichment_subscription_recovered",
+                        "Herdr enrichment subscription recovered"
+                    );
+                }
+                stream
+            }
             Err(WireError::Server { code, message }) if code == "pane_not_found" => {
                 let Some(pane_id) = rejected_enrichment_pane(&message, &target_set) else {
-                    tracing::warn!(
-                        warning_code = "herdr_enrichment_subscription_failed",
-                        error = %WireError::Server { code, message },
-                        "Herdr enrichment subscription failed; retrying"
-                    );
+                    if subscription_health.record_failure() {
+                        tracing::warn!(
+                            warning_code = "herdr_enrichment_subscription_failed",
+                            error = %WireError::Server { code, message },
+                            "Herdr enrichment subscription failed; retrying"
+                        );
+                    }
                     continue;
                 };
                 let (acknowledgement, applied) = tokio::sync::oneshot::channel();
@@ -2394,11 +2432,13 @@ async fn run_enrichment_reader(
                 continue;
             }
             Err(error) => {
-                tracing::warn!(
-                    warning_code = "herdr_enrichment_subscription_failed",
-                    error = %error,
-                    "Herdr enrichment subscription failed; retrying"
-                );
+                if subscription_health.record_failure() {
+                    tracing::warn!(
+                        warning_code = "herdr_enrichment_subscription_failed",
+                        error = %error,
+                        "Herdr enrichment subscription failed; retrying"
+                    );
+                }
                 continue;
             }
         };
@@ -2422,14 +2462,24 @@ async fn run_enrichment_reader(
                 received = stream.next_event() => received,
             };
             let (event, data) = match received {
-                Ok(Some(received)) => received,
+                Ok(Some(received)) => {
+                    if stream_health.record_recovery() {
+                        tracing::info!(
+                            notice_code = "herdr_enrichment_stream_recovered",
+                            "Herdr enrichment stream recovered"
+                        );
+                    }
+                    received
+                }
                 Ok(None) => break,
                 Err(error) => {
-                    tracing::warn!(
-                        warning_code = "herdr_enrichment_stream_failed",
-                        error = %error,
-                        "Herdr enrichment stream ended; retrying"
-                    );
+                    if stream_health.record_failure() {
+                        tracing::warn!(
+                            warning_code = "herdr_enrichment_stream_failed",
+                            error = %error,
+                            "Herdr enrichment stream ended; retrying"
+                        );
+                    }
                     break;
                 }
             };
@@ -5510,6 +5560,295 @@ mod tests {
             .unwrap();
     }
 
+    async fn wait_for_attempts(attempts: &AtomicUsize, expected: usize, context: &str) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while attempts.load(Ordering::Acquire) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{context}: observed {} attempts, expected at least {expected}",
+                attempts.load(Ordering::Acquire)
+            )
+        });
+    }
+
+    async fn wait_for_quality(
+        quality: &mut watch::Receiver<ObservationQuality>,
+        expected: ObservationQuality,
+        context: &str,
+    ) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if *quality.borrow_and_update() == expected {
+                    return;
+                }
+                quality
+                    .changed()
+                    .await
+                    .expect("collector quality publisher closed before the expected transition");
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{context}: quality did not become {expected:?}"));
+    }
+
+    async fn accept_wire_request(
+        listener: &tokio::net::UnixListener,
+    ) -> (tokio::io::BufReader<tokio::net::UnixStream>, Value) {
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .expect("fake Herdr listener timed out waiting for a connection")
+            .expect("fake Herdr listener failed to accept a connection");
+        let mut reader = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line))
+            .await
+            .expect("fake Herdr listener timed out reading a request")
+            .expect("fake Herdr listener failed to read a request");
+        let request = serde_json::from_str(&line).expect("collector sent malformed request JSON");
+        (reader, request)
+    }
+
+    async fn write_wire_frame(
+        reader: &mut tokio::io::BufReader<tokio::net::UnixStream>,
+        frame: &Value,
+    ) {
+        let mut bytes = serde_json::to_vec(frame).expect("fake Herdr response did not serialize");
+        bytes.push(b'\n');
+        tokio::time::timeout(Duration::from_secs(3), reader.get_mut().write_all(&bytes))
+            .await
+            .expect("fake Herdr listener timed out writing a response")
+            .expect("fake Herdr listener failed to write a response");
+    }
+
+    async fn wait_for_wire_peer_close(reader: &mut tokio::io::BufReader<tokio::net::UnixStream>) {
+        let mut line = String::new();
+        let bytes_read = tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line))
+            .await
+            .expect("fake Herdr listener timed out waiting for peer close")
+            .expect("fake Herdr listener failed while waiting for peer close");
+        assert_eq!(
+            bytes_read, 0,
+            "collector sent an unexpected second request frame"
+        );
+    }
+
+    async fn write_malformed_wire_event(reader: &mut tokio::io::BufReader<tokio::net::UnixStream>) {
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            reader.get_mut().write_all(b"not-json\n"),
+        )
+        .await
+        .expect("fake Herdr listener timed out writing a malformed event")
+        .expect("fake Herdr listener failed to write a malformed event");
+    }
+
+    async fn wait_for_server_cancellation(cancellation: &CancellationToken) {
+        tokio::time::timeout(Duration::from_secs(3), cancellation.cancelled())
+            .await
+            .expect("fake Herdr server did not receive cancellation");
+    }
+
+    async fn join_fake_server(server: JoinHandle<()>, context: &str) {
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap_or_else(|_| panic!("{context}: fake Herdr server did not stop"))
+            .expect("fake Herdr server task panicked");
+    }
+
+    struct PrimaryCollectorHarness {
+        cancellation: CancellationToken,
+        task: JoinHandle<Result<(), CollectorError>>,
+        provider_events: mpsc::Sender<ProviderIngressEvent>,
+        ignored_provider_events: mpsc::Receiver<ProviderEvent>,
+        provider_thread: ProviderThreadHandle,
+        lifecycle: crate::store::WriterLifecycle,
+        source_quality: watch::Receiver<ObservationQuality>,
+        log_path: PathBuf,
+    }
+
+    impl PrimaryCollectorHarness {
+        async fn stop(self) -> String {
+            let Self {
+                cancellation,
+                task,
+                provider_events,
+                ignored_provider_events,
+                provider_thread,
+                lifecycle,
+                source_quality: _,
+                log_path,
+            } = self;
+            cancellation.cancel();
+            drop(provider_events);
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .expect("primary collector did not stop after cancellation")
+                .expect("primary collector task panicked")
+                .expect("primary collector returned an error");
+            tokio::time::timeout(Duration::from_secs(3), provider_thread.stop())
+                .await
+                .expect("provider thread did not stop")
+                .unwrap();
+            drop(ignored_provider_events);
+            shutdown_writer(lifecycle).await;
+            std::fs::read_to_string(log_path).expect("failed to read primary collector log")
+        }
+    }
+
+    fn spawn_primary_collector_harness(
+        directory: &tempfile::TempDir,
+        socket: PathBuf,
+        log_name: &str,
+    ) -> PrimaryCollectorHarness {
+        let log_path = directory.path().join(log_name);
+        let log = std::fs::File::create(&log_path).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(log)
+            .finish();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let restored = store.load_restored_state().unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (reducer, shared) = Reducer::new(restored);
+        let initial_coverage = SourceCoverageRegistry::new(SourceAvailability::NotApplicable);
+        let (coverage_sender, _source_coverage) = watch::channel(initial_coverage.clone());
+        let (source_quality_sender, source_quality) =
+            watch::channel(ObservationQuality::Reconciling);
+        let coverage = CoverageTracker::new(
+            SourceAvailability::NotApplicable,
+            coverage_sender,
+            source_quality_sender,
+        );
+        let (persistence, _diagnostics) = RuntimePersistence::new(
+            writer,
+            &shared.borrow(),
+            &initial_coverage,
+            Arc::new(RecordingOccurrenceSink::default()),
+        );
+
+        let provider_diagnostics = crate::provider::ProviderDiagnostics::default();
+        let (ignored_events, ignored_provider_events) = mpsc::channel(1);
+        let provider_thread = spawn_provider_thread_with_diagnostics(
+            AdapterProviderWorker::new(Vec::new(), provider_diagnostics.clone()),
+            ignored_events,
+            None,
+            provider_diagnostics,
+        )
+        .unwrap();
+        let (provider_events, provider_receiver) = mpsc::channel(1);
+        let provider = ProviderIntegration::new(
+            provider_receiver,
+            provider_thread.target_publisher(),
+            TargetSet::default(),
+            coverage,
+        );
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let (performance, _sampler) =
+            performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
+        let task = tokio::spawn(
+            run_collector(
+                socket,
+                "health-edge-session".to_owned(),
+                persistence,
+                reducer,
+                shared,
+                performance,
+                task_cancellation,
+                OwnerTracker::from_environment(),
+                None,
+                provider,
+            )
+            .with_subscriber(subscriber),
+        );
+
+        PrimaryCollectorHarness {
+            cancellation,
+            task,
+            provider_events,
+            ignored_provider_events,
+            provider_thread,
+            lifecycle,
+            source_quality,
+            log_path,
+        }
+    }
+
+    struct EnrichmentReaderHarness {
+        cancellation: CancellationToken,
+        task: JoinHandle<()>,
+        targets: watch::Sender<BTreeSet<String>>,
+        events: mpsc::Receiver<EnrichmentPayload>,
+        prunes: mpsc::UnboundedReceiver<EnrichmentPrune>,
+        log_path: PathBuf,
+    }
+
+    impl EnrichmentReaderHarness {
+        async fn stop(self) -> String {
+            let Self {
+                cancellation,
+                task,
+                targets,
+                events,
+                prunes,
+                log_path,
+            } = self;
+            cancellation.cancel();
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .expect("enrichment reader did not stop after cancellation")
+                .expect("enrichment reader task panicked");
+            drop(targets);
+            drop(events);
+            drop(prunes);
+            std::fs::read_to_string(log_path).expect("failed to read enrichment reader log")
+        }
+    }
+
+    fn spawn_enrichment_reader_harness(
+        directory: &tempfile::TempDir,
+        socket: PathBuf,
+        log_name: &str,
+    ) -> EnrichmentReaderHarness {
+        let log_path = directory.path().join(log_name);
+        let log = std::fs::File::create(&log_path).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(log)
+            .finish();
+        let (targets, target_receiver) = watch::channel(BTreeSet::from(["pane-1".to_owned()]));
+        let (sender, events) = mpsc::channel(ENRICHMENT_QUEUE_CAPACITY);
+        let (prune_sender, prunes) = mpsc::unbounded_channel();
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(
+            run_enrichment_reader(
+                socket,
+                target_receiver,
+                sender,
+                prune_sender,
+                EnrichmentDiagnosticsHandle::default(),
+                task_cancellation,
+            )
+            .with_subscriber(subscriber),
+        );
+        EnrichmentReaderHarness {
+            cancellation,
+            task,
+            targets,
+            events,
+            prunes,
+            log_path,
+        }
+    }
+
     fn target_performance_inputs() -> (DomainModel, OperatorSnapshot, usize) {
         let mut model = DomainModel::default();
         model.insert_workspace(Workspace {
@@ -6429,6 +6768,430 @@ mod tests {
             }),
             "pane.agent_status_changed requires pane_id and must not be requested unscoped: {requested:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a3_primary_subscribe_failures_warn_once_across_three_retries() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut reader, request) = accept_wire_request(&listener).await;
+                assert_eq!(request["method"], "events.subscribe");
+                write_wire_frame(
+                    &mut reader,
+                    &json!({
+                        "id": request["id"],
+                        "result": {"type": "not_subscription_started"},
+                    }),
+                )
+                .await;
+                wait_for_wire_peer_close(&mut reader).await;
+                server_attempts.fetch_add(1, Ordering::Release);
+            }
+        });
+        let harness =
+            spawn_primary_collector_harness(&directory, socket, "primary-failures-once.log");
+
+        wait_for_attempts(&attempts, 3, "primary subscribe failures").await;
+        let contents = harness.stop().await;
+        join_fake_server(server, "primary subscribe failures").await;
+
+        assert_eq!(
+            contents
+                .matches("warning_code=\"herdr_subscription_failed\"")
+                .count(),
+            1,
+            "primary subscribe failures must log once per failed edge: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a3_primary_decorated_server_rejection_warns_once_and_keeps_retrying() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut reader, request) = accept_wire_request(&listener).await;
+                assert_eq!(request["method"], "events.subscribe");
+                let request_id = request["id"]
+                    .as_str()
+                    .expect("subscribe request id was not a string");
+                write_wire_frame(
+                    &mut reader,
+                    &json!({
+                        "id": format!("{request_id}:pane-1"),
+                        "error": {
+                            "code": "pane_not_found",
+                            "message": "pane pane-1 not found",
+                        },
+                    }),
+                )
+                .await;
+                wait_for_wire_peer_close(&mut reader).await;
+                server_attempts.fetch_add(1, Ordering::Release);
+            }
+        });
+        let harness =
+            spawn_primary_collector_harness(&directory, socket, "primary-server-rejection.log");
+
+        wait_for_attempts(&attempts, 3, "decorated server rejection retries").await;
+        let contents = harness.stop().await;
+        join_fake_server(server, "decorated server rejection retries").await;
+
+        assert!(
+            attempts.load(Ordering::Acquire) >= 3,
+            "collector did not continue retrying after WireError::Server"
+        );
+        assert!(
+            contents.contains("warning_code=\"herdr_subscription_failed\""),
+            "decorated server rejection did not log the warning code: {contents}"
+        );
+        assert!(
+            contents.contains("herdr server error pane_not_found: pane pane-1 not found"),
+            "decorated server rejection did not log WireError::Server Display: {contents}"
+        );
+        assert_eq!(
+            contents
+                .matches("warning_code=\"herdr_subscription_failed\"")
+                .count(),
+            1,
+            "decorated server rejections must log once while retries continue: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a3_primary_subscribe_recovery_logs_one_notice() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (allow_success, success_allowed) = tokio::sync::oneshot::channel();
+        let mut harness =
+            spawn_primary_collector_harness(&directory, socket, "primary-recovery.log");
+        let server_cancellation = harness.cancellation.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut reader, request) = accept_wire_request(&listener).await;
+                write_wire_frame(
+                    &mut reader,
+                    &json!({
+                        "id": request["id"],
+                        "error": {"code": "unavailable", "message": "temporarily offline"},
+                    }),
+                )
+                .await;
+            }
+            let (mut reader, request) = accept_wire_request(&listener).await;
+            tokio::time::timeout(Duration::from_secs(3), success_allowed)
+                .await
+                .expect("primary recovery success was not allowed")
+                .expect("primary recovery success gate was dropped");
+            write_wire_frame(
+                &mut reader,
+                &json!({
+                    "id": request["id"],
+                    "result": {"type": "subscription_started"},
+                }),
+            )
+            .await;
+            wait_for_server_cancellation(&server_cancellation).await;
+        });
+
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Disconnected,
+            "primary failure edge",
+        )
+        .await;
+        allow_success
+            .send(())
+            .expect("primary recovery server stopped before success was allowed");
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Reconciling,
+            "primary recovery publication barrier",
+        )
+        .await;
+        let contents = harness.stop().await;
+        join_fake_server(server, "primary recovery").await;
+
+        assert_eq!(
+            contents
+                .matches("notice_code=\"herdr_subscription_recovered\"")
+                .count(),
+            1,
+            "primary failed-to-healthy transition must log one recovery notice: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a3_enrichment_unextractable_rejections_warn_once_across_three_retries() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut reader, request) = accept_wire_request(&listener).await;
+                write_wire_frame(
+                    &mut reader,
+                    &json!({
+                        "id": request["id"],
+                        "error": {
+                            "code": "pane_not_found",
+                            "message": "missing pane without a parseable id",
+                        },
+                    }),
+                )
+                .await;
+                wait_for_wire_peer_close(&mut reader).await;
+                server_attempts.fetch_add(1, Ordering::Release);
+            }
+        });
+        let harness = spawn_enrichment_reader_harness(
+            &directory,
+            socket,
+            "enrichment-unextractable-rejection.log",
+        );
+
+        wait_for_attempts(&attempts, 3, "unextractable enrichment rejections").await;
+        let contents = harness.stop().await;
+        join_fake_server(server, "unextractable enrichment rejections").await;
+
+        assert_eq!(
+            contents
+                .matches("warning_code=\"herdr_enrichment_subscription_failed\"")
+                .count(),
+            1,
+            "unextractable enrichment rejections must log once per failed edge: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a3_enrichment_generic_subscribe_failures_warn_once_across_three_retries() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut reader, request) = accept_wire_request(&listener).await;
+                write_wire_frame(
+                    &mut reader,
+                    &json!({
+                        "id": request["id"],
+                        "error": {"code": "busy", "message": "try again"},
+                    }),
+                )
+                .await;
+                wait_for_wire_peer_close(&mut reader).await;
+                server_attempts.fetch_add(1, Ordering::Release);
+            }
+        });
+        let harness =
+            spawn_enrichment_reader_harness(&directory, socket, "enrichment-generic-failure.log");
+
+        wait_for_attempts(&attempts, 3, "generic enrichment subscribe failures").await;
+        let contents = harness.stop().await;
+        join_fake_server(server, "generic enrichment subscribe failures").await;
+
+        assert_eq!(
+            contents
+                .matches("warning_code=\"herdr_enrichment_subscription_failed\"")
+                .count(),
+            1,
+            "generic enrichment failures must log once per failed edge: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a3_enrichment_subscribe_recovery_logs_one_notice() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mut harness = spawn_enrichment_reader_harness(
+            &directory,
+            socket,
+            "enrichment-subscribe-recovery.log",
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut reader, request) = accept_wire_request(&listener).await;
+                write_wire_frame(
+                    &mut reader,
+                    &json!({
+                        "id": request["id"],
+                        "error": {"code": "busy", "message": "try again"},
+                    }),
+                )
+                .await;
+            }
+            let (mut reader, request) = accept_wire_request(&listener).await;
+            write_wire_frame(
+                &mut reader,
+                &json!({
+                    "id": request["id"],
+                    "result": {"type": "subscription_started"},
+                }),
+            )
+            .await;
+            write_wire_frame(
+                &mut reader,
+                &json!({
+                    "event": "pane_agent_status_changed",
+                    "data": {
+                        "pane_id": "pane-1",
+                        "terminal_id": "terminal-1",
+                        "agent_status": "working",
+                    },
+                }),
+            )
+            .await;
+            wait_for_server_cancellation(&server_cancellation).await;
+        });
+
+        let payload = tokio::time::timeout(Duration::from_secs(3), harness.events.recv())
+            .await
+            .expect("enrichment recovery event was not delivered")
+            .expect("enrichment recovery event channel closed");
+        assert_eq!(payload.pane_id, "pane-1");
+        let contents = harness.stop().await;
+        join_fake_server(server, "enrichment subscribe recovery").await;
+
+        assert_eq!(
+            contents
+                .matches("notice_code=\"herdr_enrichment_subscription_recovered\"")
+                .count(),
+            1,
+            "enrichment failed-to-healthy subscribe transition must log one notice: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a3_enrichment_stream_failures_warn_once_across_three_retries() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut reader, request) = accept_wire_request(&listener).await;
+                write_wire_frame(
+                    &mut reader,
+                    &json!({
+                        "id": request["id"],
+                        "result": {"type": "subscription_started"},
+                    }),
+                )
+                .await;
+                write_malformed_wire_event(&mut reader).await;
+                wait_for_wire_peer_close(&mut reader).await;
+                server_attempts.fetch_add(1, Ordering::Release);
+            }
+        });
+        let harness =
+            spawn_enrichment_reader_harness(&directory, socket, "enrichment-stream-failures.log");
+
+        wait_for_attempts(&attempts, 3, "enrichment stream failures").await;
+        let contents = harness.stop().await;
+        join_fake_server(server, "enrichment stream failures").await;
+
+        assert_eq!(
+            contents
+                .matches("warning_code=\"herdr_enrichment_stream_failed\"")
+                .count(),
+            1,
+            "enrichment stream failures must log once per failed edge: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a3_enrichment_stream_recovery_logs_after_valid_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mut harness =
+            spawn_enrichment_reader_harness(&directory, socket, "enrichment-stream-recovery.log");
+        let server_cancellation = harness.cancellation.clone();
+        let server = tokio::spawn(async move {
+            let (mut failed_reader, failed_request) = accept_wire_request(&listener).await;
+            write_wire_frame(
+                &mut failed_reader,
+                &json!({
+                    "id": failed_request["id"],
+                    "result": {"type": "subscription_started"},
+                }),
+            )
+            .await;
+            write_malformed_wire_event(&mut failed_reader).await;
+            drop(failed_reader);
+
+            let (mut recovered_reader, recovered_request) = accept_wire_request(&listener).await;
+            write_wire_frame(
+                &mut recovered_reader,
+                &json!({
+                    "id": recovered_request["id"],
+                    "result": {"type": "subscription_started"},
+                }),
+            )
+            .await;
+            write_wire_frame(
+                &mut recovered_reader,
+                &json!({
+                    "event": "pane_agent_status_changed",
+                    "data": {
+                        "pane_id": "pane-1",
+                        "terminal_id": "terminal-1",
+                        "agent_status": "working",
+                    },
+                }),
+            )
+            .await;
+            wait_for_server_cancellation(&server_cancellation).await;
+        });
+
+        let payload = tokio::time::timeout(Duration::from_secs(3), harness.events.recv())
+            .await
+            .expect("valid post-failure enrichment event was not delivered")
+            .expect("enrichment event channel closed before stream recovery");
+        assert_eq!(payload.pane_id, "pane-1");
+        let contents = harness.stop().await;
+        join_fake_server(server, "enrichment stream recovery").await;
+
+        assert_eq!(
+            contents
+                .matches("warning_code=\"herdr_enrichment_stream_failed\"")
+                .count(),
+            1,
+            "the initial malformed stream must log one warning: {contents}"
+        );
+        assert_eq!(
+            contents
+                .matches("notice_code=\"herdr_enrichment_stream_recovered\"")
+                .count(),
+            1,
+            "the first valid event after a stream failure must log one recovery notice: {contents}"
+        );
+    }
+
+    #[test]
+    fn health_edge_reports_only_failure_and_recovery_transitions() {
+        let mut edge = HealthEdge::default();
+
+        assert!(edge.record_failure());
+        assert!(!edge.record_failure());
+        assert!(edge.record_recovery());
+        assert!(!edge.record_recovery());
     }
 
     #[test]
