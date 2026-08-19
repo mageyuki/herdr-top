@@ -286,9 +286,12 @@ never ride the primary connection's lifecycle.
    single swap (no per-event storm). Enrichment-connection replacement
    records no collector gap, retires no execution, and performs no
    resnapshot: the primary stream and the `pane.updated` fallback stay
-   continuous throughout, and a transition missed during the bounded
-   close-to-resubscribe gap is fidelity loss the fallback family already
-   covers.
+   continuous throughout. The close-to-resubscribe gap is bounded PER
+   ATTEMPT (`IO_TIMEOUT` 5s at `src/herdr/wire.rs:14`, `RECONNECT_DELAY`
+   50ms at `src/herdr/collector.rs:63`) but open-ended under sustained
+   enrichment failure — that outage is surfaced by the per-stream health
+   (Behavior 4b), and transitions missed during it are fidelity loss the
+   fallback family already covers.
 3. If the enrichment subscribe fails with `WireError::Server` code
    `pane_not_found`, the collector parses the pane id from the message,
    prunes exactly that id from the target set, and retries; other errors
@@ -308,9 +311,22 @@ never ride the primary connection's lifecycle.
    reconciliation (`src/herdr/collector.rs:1804-1812`, `1701-1703`), so
    merging the streams would let enrichment traffic degrade primary
    observation quality. The enrichment reader is a separate task with
-   its own bounded channel; it applies events only while the primary is
-   converged (Live) and DISCARDS them during gap reconciliation or
-   resnapshot (the snapshot re-establishes current status); it never
+   its own bounded channel. Convergence-window rule (the window is
+   defined by the COLLECTOR'S OWN PHASE — a convergence episode from gap
+   start until the snapshot batch applies — never by an
+   `ObservationQuality` value, which is ambiguous between herdr quality
+   at `set_herdr_quality` (collector.rs:1661-1663) and the composed
+   effective quality (collector.rs:133-134)): enrichment events are NOT
+   discarded during an episode — an event arriving after snapshot
+   capture is not in that snapshot, and the primary reaches `Live` only
+   after post-snapshot replay (line 1662), so discard-until-Live would
+   lose exactly the transitions this stream exists to restore. Instead
+   they are BUFFERED coalesced per pane (latest event per pane) and
+   flushed through the ordinary handler immediately after the snapshot
+   batch applies; a flushed event carrying the status the snapshot
+   already established is a no-op under the existing state-family
+   semantics (no duplicate ledger row, no regression), which the tests
+   pin. Outside an episode, events apply directly. The reader never
    sets the primary's `overflowed` flag; its cancellation and join are
    owned by the collector's existing shutdown lifecycle; on EOF or read
    error it re-enters the enrichment retry path only. Subscription
@@ -350,19 +366,26 @@ the second subscribe contains both panes, and NO collector gap is
 recorded and no execution retires (query the persisted ops / reducer
 state the existing gap tests use).
 
-- [ ] **Step 4b: Write failing single-record swap test**: drive an
-agent-status transition delivered once on the new connection immediately
-after a swap; assert exactly ONE ledger row / activity item / rate
-observation exists for it (the double-record regression for the overlap
-window that break-before-make eliminates).
+- [ ] **Step 4b: Write failing swap-window integrity test**: deliver
+transition A on the old connection before the swap trigger and
+transition B on the new connection after resubscribe; assert exactly one
+record each (accounting sanity) AND that the listener observed the old
+connection's close strictly before the new subscribe — the ordering
+assertion is the discriminating half against a make-before-break
+regression (a single delivery can never double-record; only the
+forbidden overlap can).
 
-- [ ] **Step 4c: Write failing isolation tests** (three): (i) enrichment
-EOF mid-stream → enrichment retry path re-subscribes while primary
-quality stays Live and no `Dirty` reconciliation occurs; (ii) a flood on
-the enrichment channel never sets the primary `overflowed` flag or
-triggers a resnapshot; (iii) an enrichment event arriving DURING a
-primary gap reconciliation is discarded (no reducer application, no
-ledger row), and status re-establishes from the snapshot.
+- [ ] **Step 4c: Write failing convergence-window tests** (four): (i)
+enrichment EOF mid-stream → enrichment retry path re-subscribes while
+primary quality stays Live and no `Dirty` reconciliation occurs; (ii) a
+flood on the enrichment channel never sets the primary `overflowed`
+flag or triggers a resnapshot; (iii) THE HOLE-PINNING CASE — an
+enrichment transition arriving AFTER snapshot capture but BEFORE the
+primary finishes its buffered replay (post-snapshot, pre-`Live`) is
+buffered and applied after the snapshot batch: its ledger row, activity
+item, and rate observation EXIST after convergence; (iv) a buffered
+pre-snapshot leftover whose status equals the snapshot's is a no-op —
+no duplicate ledger row, no state regression.
 
 - [ ] **Step 5: Write failing fallback-unavailable convergence test**: with
 the enrichment endpoint permanently refusing connections, drive the
@@ -529,30 +552,50 @@ the backstop).
   full plumbing chain is declared: `section15_predicate_rows` is called
   by `section15_trial_row_with_predicates` (line 7594), itself wrapped by
   `section15_trial_row` (line 7588) which is used as a bare function
-  reference in a `.map(section15_trial_row)` at line 7418 — all three
-  signatures gain the stage (or the bare reference becomes a closure);
+  reference in `.map(section15_trial_row)` at line 7418 AND at line 8005
+  (inside the synthetic re-derivation builder) — all three signatures
+  gain the stage (or the bare references become closures);
   predicates are computed only under `include_predicates == true` and the
   baseline call site passes `false` (line 7412), so Baseline behavior is
   structurally unchanged.
 - Produces (Task 8 consumes): a legacy-reclassification mode on the
   SHARED stored-outcome reader (`read_and_validate_reference_outcome`,
-  whose `Failed`-arm consistency check is at lines 1074-1081), enabled by
-  the environment flag `HERDR_PERF_ACCEPT_AMENDED_LEGACY=1` and honored
-  at READ time, so every consumer in the closing process sees the same
-  reclassified outcome without special-casing: the re-derivation
-  entrypoint, the report self-validation re-read
-  (`validate_section15_selected_evidence` at line 3041 re-reads outcomes
-  at line 3097 and requires `fresh != *report` equality at lines
-  3122-3133 — read-time uniformity is what makes that gate hold), and
-  the D4 checkpoint classifier (which loads through the same reader).
-  Semantics: a stored `Failed` document whose recorded `failure_reasons`
-  equal exactly `["supported_load_degradation"]` and whose amended
-  re-derivation yields an EMPTY failure set is presented as an amended
-  pass; every other recorded/derived divergence stays `InvalidArtifact`
-  (fail-closed); with the flag unset (every other context, including CI
-  and Task 9) behavior is byte-identical to today. The reclassification
-  fact is reported to the caller for SIDECAR recording — never written
-  into the regenerated report, which must stay deterministically
+  whose `Failed`-arm consistency check is at lines 1074-1081), threaded
+  as an explicit PARAMETER `legacy: AmendedLegacyMode` (`Off` |
+  `AcceptAmendedLegacy`) — the reader NEVER consults the environment.
+  Only the two closing entrypoints translate the environment flag
+  `HERDR_PERF_ACCEPT_AMENDED_LEGACY=1` into that parameter, reading it
+  once at entry. Their closed-environment gate
+  (`require_closed_environment` at lines 8613-8631, exact key-set
+  equality — an undeclared key is rejected BEFORE any reader runs, and
+  adding the key to the expected list would make it mandatory and break
+  Task 9's flag-less use of the same entrypoints) gains an OPTIONAL-KEY
+  contract: a declared optional key may be absent, or present with
+  exactly the value `1`; any other value is rejected, and undeclared
+  keys are rejected exactly as today. The mode makes every consumer in
+  the closing process see the same reclassified outcome without
+  special-casing: the re-derivation entrypoint, the report
+  self-validation re-read (`validate_section15_selected_evidence` at
+  line 3041 re-reads outcomes at line 3097 and requires `fresh !=
+  *report` equality at lines 3122-3133 — read-time uniformity is what
+  makes that gate hold), and the D4 checkpoint classifier (which loads
+  through the same reader). Semantics: a stored `Failed` document whose
+  recorded `failure_reasons` equal exactly
+  `["supported_load_degradation"]` and whose amended re-derivation
+  yields an EMPTY failure set is presented as an amended PASS with its
+  `failure_reasons` CLEARED on the returned in-memory representation
+  (stored bytes untouched) — without the clearing, the pass-side
+  validator rejects non-empty recorded reasons
+  (`ReferenceOutcomeV1::validate` Pass arm, lines 1065-1074); every
+  other recorded/derived divergence stays `InvalidArtifact`
+  (fail-closed); with `Off` (every other context, including CI and
+  Task 9) behavior is byte-identical to today. Sidecar contract: when
+  the mode is active and at least one reclassification occurred, each
+  entrypoint writes `<output>.reclassification.json` beside its declared
+  output — `{"schema_version":1,"rule":"amended_legacy_v1",
+  "reclassified":[{"scenario":"burst",
+  "recorded_failure_reasons":["supported_load_degradation"]}]}` — and no
+  sidecar otherwise; the report itself stays deterministically
   re-derivable.
 
 Amended predicate (spec section "B1: the amendment"): the tolerance
@@ -580,23 +623,35 @@ the shared function and the non-tolerated count directly, so they are RED
 today because neither exists yet. Record the four observed failures.
 - [ ] **Step 3: Implement the shared function, the stage plumbing, and
 route both sites.**
-- [ ] **Step 4: Write the failing reclassification tests** — reader unit
-cases AND end-to-end: (a) stored `Failed` burst document with recorded
+- [ ] **Step 4: Write the failing reclassification tests.** Reader unit
+cases call the reader with the `AmendedLegacyMode` PARAMETER directly —
+no test mutates the process environment (`std::env::set_var` is unsafe
+under edition 2024 and the suite runs in parallel; asserting over a
+process-global would violate Global-Constraints checklist item 1):
+(a) stored `Failed` burst document with recorded
 `["supported_load_degradation"]` whose every flagged sample is the
-tolerated shape, flag SET → presented as amended pass with the
-reclassification fact reported; (b) same recorded reasons but one flagged
-sample at 102 → recorded and derived failure sets agree, so the document
-stays a valid `Failed` and is never reclassified; (c) recorded reasons
+tolerated shape, mode `AcceptAmendedLegacy` → presented as amended pass
+with `failure_reasons` cleared in-memory, and `validate()` on the
+returned outcome SUCCEEDS (pinning the pass-arm interaction at lines
+1065-1074); (b) same recorded reasons but one flagged sample at 102 →
+recorded and derived failure sets agree, so the document stays a valid
+`Failed` and is never reclassified; (c) recorded reasons
 `["supported_load_degradation"]` with a derived nonempty DIFFERENT set →
-`InvalidArtifact` (fail-closed); (d) flag UNSET with fixture (a) →
-`InvalidArtifact` exactly as today; (e) END-TO-END with the flag set over
-a synthetic legacy root (fixture (a) beside six passing scenario
-fixtures): the Section 15 re-derivation entrypoint produces a report with
-no burst failure, the report's self-validation
+`InvalidArtifact` (fail-closed); (d) mode `Off` with fixture (a) →
+`InvalidArtifact` exactly as today. Environment-boundary cases run the
+ENTRYPOINTS as spawned child processes with `env_clear` plus the exact
+allowlist (the Increment 5 bootstrap pattern — no in-process env
+mutation): (e) END-TO-END with `HERDR_PERF_ACCEPT_AMENDED_LEGACY=1` in
+the child environment over a synthetic legacy root (fixture (a) beside
+six passing scenario fixtures): the Section 15 re-derivation entrypoint
+produces a report with no burst failure, the report's self-validation
 (`validate_section15_selected_evidence`) passes its `fresh` equality
-gate on readback, and the D4 checkpoint classifier over the same root
-returns `no_miss_d4_not_authorized`. Then implement the mode and verify
-green.
+gate on readback, the D4 checkpoint classifier over the same root
+returns `no_miss_d4_not_authorized`, and BOTH sidecars exist with the
+specified schema; (f) flag with value `0` (or any non-`1`) in the child
+environment → the closed-environment gate rejects; flag absent →
+byte-identical behavior and NO sidecar. Then implement the mode and
+verify green.
 - [ ] **Step 5: Harness suite green** (feature-gated suite plus doctests).
 - [ ] **Step 6: Full verification; commit**
 `fix(perf): tolerate one-quantum boundary degradation at final acceptance`
@@ -717,9 +772,10 @@ Increment 5 research workspace (~370 MB, preserved; report SHA-256
   the D4 classifier, `HERDR_PERF_CLASSIFY_RESULTS_ROOT` to the preserved
   final root and `HERDR_PERF_CLASSIFY_OUTPUT` to the workspace
   destination (`tests/common/workload.rs:5091-5095`). Regenerated
-  documents and the reclassification SIDECAR are written into the
-  Increment 6 research workspace — never into the repository or the
-  preserved roots. This refines the spec's "preserved alongside the
+  documents and BOTH entrypoints' `<output>.reclassification.json`
+  sidecars are written into the Increment 6 research workspace — never
+  into the repository or the preserved roots — and the closing record
+  consolidates the two sidecars. This refines the spec's "preserved alongside the
   originals": the preserved roots stay immutable, and the workspace
   records the original and regenerated document hashes side by side with
   the sidecar.
@@ -773,12 +829,16 @@ stable; no steps execute.
 **Files:**
 - Create: `src/hook_adapter.rs`
 - Create: `docs/adr/2026-08-19-controller-label-provenance.md` (the
-  owner-decided carve-out: Controller-supplied labels may carry
-  Controller-declared task descriptions, including agent-authored task
-  subjects, under the existing label sanitization; records the
-  alternative considered — no label — and the display consequence)
-- Modify: `docs/design/herdr-top-mvp.md` (one-line amendment to the
-  section 7.2 allowlist sentence referencing the ADR)
+  owner-decided carve-out, EXACTLY as wide as the decision:
+  Controller-supplied labels may carry the agent-authored task SUBJECT —
+  the task's one-line name — and nothing else agent-generated, under the
+  existing label sanitization; records the alternative considered — no
+  label — and the display consequence)
+- Modify: `docs/design/herdr-top-mvp.md` (matching amendments to BOTH
+  normative privacy sentences, so the design cannot contradict itself:
+  the section 7.2 allowlist sentence at line 239 AND the section 14
+  bullet at line 600 — "never prompts, responses, tool arguments or
+  results" — each referencing the ADR)
 - Modify: `src/lib.rs` (module registration)
 - Test: `src/hook_adapter.rs` module tests
 
@@ -879,11 +939,11 @@ both halves of the amended rule).
 - [ ] **Step 3: Implement the module exactly per the table.**
 - [ ] **Step 3b: Write the label-provenance ADR and the design
 amendment**: create `docs/adr/2026-08-19-controller-label-provenance.md`
-(context, decision, alternative considered, consequences) and apply the
-one-line carve-out to the section 7.2 allowlist sentence in
-`docs/design/herdr-top-mvp.md`, referencing the ADR; both land in this
-task's commit so the behavior and its authorization are reviewed
-together.
+(context, decision, alternative considered, consequences; scope = the
+task SUBJECT only) and apply the carve-out to BOTH design sentences —
+the section 7.2 allowlist sentence (line 239) and the section 14 bullet
+(line 600) — each referencing the ADR; all land in this task's commit so
+the behavior and its authorization are reviewed together.
 - [ ] **Step 4: GREEN; full verification; commit**
 `feat(emit): map controller hook payloads to envelope events`
 
@@ -922,7 +982,14 @@ without `--strict`); `emitted_at_ms` from the system wall clock and one
 random `u64` invocation nonce; deliver the mapped envelopes strictly in
 order via `emit_to_endpoint`, and STOP at the first delivery failure —
 delivering a child's `task_started` after its `dispatch` failed would
-create a permanently unlinked run (spec C1 rule 7). In adapter mode
+create a permanently unlinked run (spec C1 rule 7). Failure
+classification inspects the RESPONSE, not only
+`EmitOutcome::is_success` (`src/herdr/controller.rs:254-262`, which
+counts any `Rejected` as unsuccessful): a `rejected` response with
+reason `stale_event` is the documented benign hook-parallelism race and
+is NOT a failure — logged to stderr, delivery continues, `--strict`
+unaffected; every other `rejected` reason, `retryable` exhaustion, and
+`unresolved` is a failure for both the stop rule and `--strict`. In adapter mode
 NOTHING is written to stdout — Codex parses hook stdout against a closed
 output schema and marks the hook invalid on unrecognized JSON (planning
 fact 4), so every diagnostic and every per-envelope outcome line goes to
@@ -947,9 +1014,13 @@ stderr warning.
 deliver a `SubagentStop` payload's `complete` before any `SubagentStart`
 for the same agent through the wire fixture; assert the forward-referenced
 terminal run is accepted, and a subsequent `SubagentStart` invocation's
-`task_started` is answered `rejected`/`stale_event` while its `dispatch`
-is accepted — the documented benign race outcome of spec C1 rule 7,
-pinned so the adapter never treats either response as an error.
+`dispatch` is accepted while its `task_started` is answered
+`rejected`/`stale_event` — and that the adapter classifies the
+`stale_event` as benign: delivery does NOT stop, the invocation's
+non-strict exit is 0, AND `--strict` still succeeds (in deliberate
+contrast to Step 1b, where a `rejected`/`invalid` first envelope stops
+delivery and fails strict — the two tests together pin the
+reason-sensitive classification).
 - [ ] **Step 2: Write the failing CLI-surface tests** (unit, in
 `src/main.rs` tests): `--from-hook claude-code` parses with no manual
 arguments; `--from-hook claude-code --strict` parses; manual invocation
@@ -1029,12 +1100,16 @@ anything — this shell is a managed pane with a live collector, and a
 delivered probe would create a permanent fake run (the protocol has no
 removal events):
 `printf '{"hook_event_name":"SessionStart","session_id":"probe"}' | herdr-top emit --from-hook claude-code --strict --session i6-step0-throwaway`
-Expected: nonzero exit with a stderr diagnostic naming the unresolvable
-throwaway session (`--strict` turns the refusal into an observable
-outcome; the sentinel for that session name does not exist, so nothing
-is delivered), while the STALE 0.1.0 binary fails differently — a clap
-`unexpected argument '--from-hook'` usage error — and the two are
-distinguished by the stderr text, not the exit code alone.
+First verify the throwaway name is genuinely unresolvable — no runtime
+sentinel exists for it (recompute its hash16 and check the runtime
+directory, or simply pick a fresh random suffix) — so nothing can be
+delivered. Expected from the NEW binary: nonzero exit with stderr
+`herdr-top emit: unavailable: SentinelAbsent` (`emit_unavailable` prints
+the `Debug` form of the unavailability reason, `src/main.rs:200-206` and
+`src/rendezvous.rs:98-112` — it does not echo the session name), while
+the STALE 0.1.0 binary fails differently — a clap
+`error: unexpected argument '--from-hook' found` usage error — and the
+two are distinguished by the stderr text, not the exit code alone.
 - [ ] **Step 1** With user confirmation, register the Task 13 hooks in the
 live `~/.claude/settings.json` and `~/.codex/hooks.json` using Task 13's
 merge procedure: back up both files, APPEND the new entries to each

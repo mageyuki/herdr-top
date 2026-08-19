@@ -162,12 +162,21 @@ double-record ledger rows, activity items, and rate observations; the
 bounded gap between close and resubscribe is covered by the fallback
 path. Second, enrichment events are isolated from the primary pipeline:
 they never enter the primary connection's replay and anomaly
-classification, they apply only while the primary is converged and are
-discarded during reconciliation (the snapshot re-establishes status),
-they never touch the primary's overflow state, and their subscription
-health is tracked separately so an enrichment failure can neither
-degrade the primary's observation quality nor be masked by primary
-health.
+classification, they never touch the primary's overflow state, and their
+subscription health is tracked separately so an enrichment failure can
+neither degrade the primary's observation quality nor be masked by
+primary health. During a primary convergence episode (defined by the
+collector's own phase, not by an observation-quality value), enrichment
+events are not discarded — a transition arriving after the snapshot was
+captured is not in that snapshot, and dropping it would lose exactly the
+fidelity this subscription restores. They are buffered coalesced per
+pane (latest event per pane) and flushed through the ordinary handler
+immediately after the snapshot batch applies; a flushed event that
+carries the same status the snapshot already established is a no-op
+under the existing state-family semantics, so a pre-snapshot leftover
+cannot regress state or duplicate a ledger row. Intermediate transitions
+inside the episode window coalesce away — the same bounded fidelity
+loss the fallback family already accepts.
 
 The existing derivation of agent status from `pane.updated` payloads remains
 in place as the fallback path; the scoped subscription restores the richer
@@ -269,7 +278,17 @@ measurement attempt:
    invalid artifact. The SHARED stored-outcome reader therefore gains an
    explicit legacy-reclassification mode, enabled by an environment flag
    set only by this closing path and honored uniformly by every consumer
-   that reads stored outcomes in the closing process — the Section 15
+   that reads stored outcomes in the closing process. The closing
+   entrypoints' closed-environment gate enforces exact key-set equality,
+   so it gains an OPTIONAL-KEY contract: the flag key may be absent
+   (today's behavior, byte-identical) or present with exactly the value
+   `1`; any other value, and any other unexpected key, is still
+   rejected. The flag is read once at each entrypoint and passed down as
+   a parameter — the reader itself never consults the environment.
+   A reclassified outcome is presented as a pass with its recorded
+   failure reasons cleared on the in-memory representation (the stored
+   bytes are never touched); without that clearing the pass-side
+   validator would reject the non-empty recorded reasons — the Section 15
    re-derivation, the report's own self-validation re-read (which
    re-derives a fresh document and requires equality with the stored
    report), and the D4 checkpoint classifier: a stored `Failed` document
@@ -283,9 +302,15 @@ measurement attempt:
    special-casing. The reclassification itself is recorded in a SIDECAR
    document beside the regenerated report and in the increment ledger —
    never inside the report, which would break its deterministic
-   re-derivation equality. Expected decision:
-   `no_miss_d4_not_authorized`. Both regenerated documents and the
-   sidecar are preserved with their hashes recorded. This closes
+   re-derivation equality. The sidecar has a concrete contract: when the
+   flag is set and at least one reclassification occurred, each
+   entrypoint additionally writes `<output>.reclassification.json`
+   beside its declared output — schema version 1, listing per scenario
+   the recorded failure reasons and the rule identifier
+   `amended_legacy_v1` — and writes no sidecar otherwise; the closing
+   step consolidates both sidecars into the increment record. Expected
+   decision: `no_miss_d4_not_authorized`. Both regenerated documents and
+   the sidecars are preserved with their hashes recorded. This closes
    `AmendmentsRequired[non_d4]`.
 3. Independently, run one full confirmation measurement (next fresh attempt
    identifier 20260827) at the post-Phase-A/B head under the same
@@ -373,13 +398,16 @@ Behavioral rules:
    the owner with the display consequences reviewed: `task_subject` is
    agent-authored task text supplied at task creation, which the base
    design's section 7.2 allowlist sentence would exclude; this increment
-   amends that sentence with a recorded carve-out — Controller-supplied
-   `label` values may carry Controller-declared task descriptions,
-   including agent-authored task subjects, passing the existing label
-   sanitization (256-byte cap, control-character escaping, UTF-8-safe
-   truncation) — via an ADR under `docs/adr/` plus the matching one-line
-   amendment to `docs/design/herdr-top-mvp.md` section 7.2, landed and
-   reviewed together with the adapter task. Everything else stays
+   amends the design with a carve-out EXACTLY as wide as the decision —
+   Controller-supplied `label` values may carry the agent-authored task
+   SUBJECT (the task's one-line name) and nothing else agent-generated,
+   passing the existing label sanitization (256-byte cap,
+   control-character escaping, UTF-8-safe truncation) — via an ADR under
+   `docs/adr/` plus matching amendments to BOTH normative sentences: the
+   section 7.2 allowlist sentence and the section 14 bullet ("never
+   prompts, responses, tool arguments or results", design line 600),
+   landed and reviewed together with the adapter task so the design
+   never contradicts itself. Everything else stays
    excluded: the adapter's payload struct has no `prompt`,
    `description`, `task_description`, `teammate_name`, `team_name`,
    `last_assistant_message`, or tool-input fields, and a sentinel test
@@ -394,7 +422,11 @@ Behavioral rules:
    flagged in diagnostics — a documented degraded outcome, not corruption.
    Because hooks run in parallel, a terminal hook can occasionally deliver
    before its start hook; the start's `task_started` is then rejected as
-   `stale_event`, which is harmless and logged only.
+   `stale_event`. The adapter therefore treats a `rejected` response whose
+   reason is `stale_event` as a benign outcome: logged to standard error,
+   not a delivery failure, not a stop condition, and not a `--strict`
+   failure. Every other rejection and every unresolved delivery remains a
+   failure under the stop-on-first-failure and strict rules.
 
 Event mapping:
 
