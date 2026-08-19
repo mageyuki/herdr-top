@@ -28,6 +28,15 @@ pub struct OwnerLock {
     _file: File,
 }
 
+impl Drop for OwnerLock {
+    fn drop(&mut self) {
+        // Explicitly unlock the shared open file description so an inherited
+        // descriptor cannot extend the lock lifetime across fork-before-exec.
+        // Closing the owned descriptor remains the backstop if unlocking fails.
+        let _ = flock_unlock(&self._file);
+    }
+}
+
 /// Diagnostic information about the current session owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerRecord {
@@ -355,4 +364,133 @@ fn effective_uid() -> u32 {
     // SAFETY: `geteuid` takes no arguments, accesses no Rust memory, and has no
     // failure mode.
     unsafe { libc::geteuid() }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::process::{Child, Command};
+
+    use tempfile::tempdir;
+
+    use super::{state_root_in, try_acquire};
+    use crate::session_key::encode;
+
+    #[test]
+    fn owner_lock_drop_releases_for_same_process_reacquire() {
+        let temp = tempdir().unwrap();
+        let key = encode("same-process drop test").unwrap();
+        let root = state_root_in(temp.path(), &key).unwrap();
+        let owner = try_acquire(&root)
+            .unwrap()
+            .expect("first owner should acquire the lock");
+
+        drop(owner);
+
+        assert!(
+            try_acquire(&root).unwrap().is_some(),
+            "dropping the owner should release the lock"
+        );
+    }
+
+    #[test]
+    fn owner_lock_drop_releases_with_inherited_descriptor() {
+        let temp = tempdir().unwrap();
+        let key = encode("inherited-descriptor drop test").unwrap();
+        let root = state_root_in(temp.path(), &key).unwrap();
+        let owner = try_acquire(&root)
+            .unwrap()
+            .expect("first owner should acquire the lock");
+        let inherited = duplicate_without_close_on_exec(&owner._file).unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 5"])
+            .spawn()
+            .expect("child should spawn");
+
+        drop(inherited);
+        drop(owner);
+        let child_state = child.try_wait();
+        let reacquired = try_acquire(&root);
+        kill_and_reap(&mut child);
+
+        assert!(
+            child_state.unwrap().is_none(),
+            "child should still be running during the re-acquire attempt"
+        );
+        assert!(
+            reacquired.unwrap().is_some(),
+            "dropping the owner should unlock an inherited open file description"
+        );
+    }
+
+    #[test]
+    fn owner_lock_file_is_close_on_exec_by_default() {
+        let temp = tempdir().unwrap();
+        let key = encode("close-on-exec drop test").unwrap();
+        let root = state_root_in(temp.path(), &key).unwrap();
+        let owner = try_acquire(&root)
+            .unwrap()
+            .expect("first owner should acquire the lock");
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 5"])
+            .spawn()
+            .expect("child should spawn");
+
+        drop(owner);
+        let child_state = child.try_wait();
+        let reacquired = try_acquire(&root);
+        kill_and_reap(&mut child);
+
+        assert!(
+            child_state.unwrap().is_none(),
+            "child should still be running during the re-acquire attempt"
+        );
+        assert!(
+            reacquired.unwrap().is_some(),
+            "the lock descriptor should be closed across an ordinary exec"
+        );
+    }
+
+    fn duplicate_without_close_on_exec(file: &File) -> io::Result<File> {
+        // SAFETY: `file` owns a valid descriptor for this call. On success,
+        // `dup` returns a distinct descriptor that this function takes ownership of.
+        let descriptor = unsafe { libc::dup(file.as_raw_fd()) };
+        if descriptor == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `descriptor` was just returned by `dup`, is not owned by any
+        // other `File`, and ownership is transferred exactly once here.
+        let duplicate = unsafe { File::from_raw_fd(descriptor) };
+
+        // SAFETY: `duplicate` owns a valid descriptor, and `F_GETFD` neither
+        // retains the descriptor nor dereferences any Rust memory.
+        let flags = unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFD) };
+        if flags == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `duplicate` owns a valid descriptor, and `F_SETFD` only
+        // updates that descriptor's flags for the duration of this call.
+        let result = unsafe {
+            libc::fcntl(
+                duplicate.as_raw_fd(),
+                libc::F_SETFD,
+                flags & !libc::FD_CLOEXEC,
+            )
+        };
+        if result == -1 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(duplicate)
+    }
+
+    fn kill_and_reap(child: &mut Child) {
+        let kill_result = child.kill();
+        let wait_result = child.wait();
+
+        kill_result.expect("child should be killed");
+        wait_result.expect("child should be reaped");
+    }
 }
