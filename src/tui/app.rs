@@ -167,17 +167,24 @@ pub struct HeaderInputs {
     pub performance: tokio::sync::watch::Receiver<PerformancePublication>,
 }
 
+/// Fixture/test default that deliberately leaks one watch-channel sender pair per call so the
+/// channels never close. Production code must build the literal directly rather than call
+/// `Default` in a loop.
 impl Default for HeaderInputs {
     fn default() -> Self {
-        let (_coverage_sender, source_coverage) =
+        let (coverage_sender, source_coverage) =
             tokio::sync::watch::channel(SourceCoverageRegistry::default());
-        let (_performance_sender, performance) =
+        // Deliberately leak this fixture sender so the coverage watch never closes.
+        std::mem::forget(coverage_sender);
+        let (performance_sender, performance) =
             tokio::sync::watch::channel(PerformancePublication {
                 snapshot: PerformanceSnapshot::default(),
                 effective_quality: ObservationQuality::Live,
                 #[cfg(feature = "workload-harness")]
                 workload_sample_stamp: None,
             });
+        // Deliberately leak this fixture sender so the performance watch never closes.
+        std::mem::forget(performance_sender);
         Self {
             host: "unknown".to_owned(),
             session: "unknown".to_owned(),
@@ -613,7 +620,12 @@ impl App {
                 "model watch closed; collector is no longer publishing state",
             )
         })?;
-        let performance_changed = self.header.performance.has_changed().unwrap_or(false);
+        let performance_changed = self.header.performance.has_changed().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "performance watch closed; collector is no longer publishing performance state",
+            )
+        })?;
         let coverage_changed = self.header.source_coverage.has_changed().unwrap_or(false);
         let diagnostics_changed = self.diagnostics_receiver.has_changed().unwrap_or(false);
         let operator_changed = self.operator_receiver.has_changed().unwrap_or(false);
@@ -3366,6 +3378,28 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert!(error.to_string().contains("model watch closed"));
+    }
+
+    #[test]
+    fn tui_exits_on_closed_performance_watch() {
+        let (_model_sender, model_receiver) = watch::channel(Arc::new(DomainModel::default()));
+        let (performance_sender, performance) =
+            watch::channel(performance_publication(ObservationQuality::Live, []));
+        let mut app = App::new(
+            model_receiver,
+            HeaderInputs {
+                performance,
+                ..HeaderInputs::default()
+            },
+        );
+        drop(performance_sender);
+
+        let error = app
+            .refresh_if_changed()
+            .expect_err("closed performance watch must terminate the TUI loop");
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(error.to_string().contains("performance watch closed"));
     }
 
     #[test]
