@@ -1,0 +1,421 @@
+# Increment 6: Controller Emit Integration and Hardening
+
+**Status:** approved design for implementation planning.
+**Baseline:** `main = 5a0eab7` (Increment 5 merged as PR #4; real-herdr
+subscription hotfix merged as PR #5).
+**Design references:** `docs/design/herdr-top-mvp.md` sections 5.4, 7.3, 12.3,
+14, and 20; `docs/superpowers/plans/2026-08-12-increment-5-reliability-performance.md`
+(the frozen Increment 5 plan, called "the Increment 5 plan" below).
+
+## Summary
+
+Increment 6 completes the last unimplemented element of the MVP design's
+Controller story — the calling side of `herdr-top emit` — and discharges every
+obligation carried out of Increment 5. It has three phases, integrated
+serially: Phase A hardens product code (doctor version parsing, per-pane
+agent-status subscriptions, warning throttling, two recorded fragility fixes);
+Phase B closes the open NonD4 amendment with an evidence-backed acceptance
+change, hardens the measurement harness, and runs one confirmation
+measurement; Phase C ships a Rust-native hook adapter (`herdr-top emit
+--from-hook`) plus reference hook registrations and setup documentation for
+both Claude Code and Codex, lighting up deep monitoring content (execution
+tree and task lifecycle) without violating the no-heuristics binding rule.
+
+Increment 7 (packaging and release, MVP design section 12) follows this
+increment and is out of scope here. The release gate depends on the NonD4
+amendment closed by Phase B.
+
+## Goals
+
+1. Close the D4-checkpoint output `AmendmentsRequired[non_d4]` for the burst
+   `SupportedLoadDegradation` miss with a justified acceptance amendment,
+   deterministic re-derivation over the preserved Increment 5 final
+   measurement, and one confirmation measurement on the hardened head.
+2. Fix `doctor`'s integration-version check so live herdr version responses
+   (date-form) no longer report `InvalidActiveVersion` unconditionally.
+3. Restore the pane-scoped `pane.agent_status_changed` subscription in its
+   correct per-pane form, recovering transition-timestamp fidelity, ledger
+   rows and activity items, rate accounting, and the fourth topology-closure
+   rescue trigger lost in the PR #5 hotfix.
+4. Throttle the subscription-failure warning and cover the server-rejection
+   error variant with a regression test.
+5. Apply the two recorded reliability prescriptions: the performance-watch
+   BrokenPipe fix (`HeaderInputs::default()` first) and the OwnerLock
+   explicit-unlock-on-drop plus fork-before-exec regression.
+6. Land the six measurement-harness backlog items, re-adjudicate the two
+   documented permissivenesses, and apply the guard-ordering nicety, before
+   the confirmation measurement uses the harness.
+7. Ship the emit calling side for Claude Code and Codex: a tested Rust hook
+   adapter, reference hook registrations, and setup documentation, so that
+   Controller sessions produce Task Runs, dispatch edges, and task lifecycle
+   in the TUI through explicit events only.
+
+## Non-goals
+
+- Packaging, release artifacts, and Marketplace work (Increment 7).
+- D4 incrementalization. The Increment 5 D4 checkpoint did not authorize it,
+  and nothing in this increment may implement it.
+- Server-side (herdr) changes. herdr is an external product; only client-side
+  behavior changes. Upstream reports remain the only server-side channel.
+- Inference or heuristics for session-to-pane binding. Deep content appears
+  only through explicit Controller events, per the design's non-goal.
+- Automatic dependency-edge derivation from hooks. Hook surfaces expose
+  dispatch structure and task lifecycle, not inter-task data dependencies;
+  `depends_on` remains an explicit Controller action documented in setup
+  guidance.
+- Correction or supersede events, multiple TUI clients, and the other MVP
+  section 18 deferrals.
+
+## Context and carried obligations
+
+Increment 5 closed with all tasks executed and its final measurement
+(attempt 20260826, subject `e86e0ef`) valid: six scenarios passed and burst
+failed with the single reason `supported_load_degradation`, reproduced across
+two attempts. The Section 15 re-derivation (report SHA-256 `48d18f12…`) and
+the D4 checkpoint classifier (document SHA-256 `bb6cc481…`) both returned
+`amendments_required["non_d4"]`. That decision obligates a non-D4 design
+amendment before the acceptance can pass and, through the Increment 7 release
+gate, before any release.
+
+The consolidated carry ledger from Increment 5 and the post-close live-herdr
+findings contribute the remaining obligations: the doctor version-check
+defect, the per-pane subscription follow-up with its two hotfix companions,
+the F3 BrokenPipe and OwnerLock prescriptions, six harness backlog items
+(controller-binary validation hardening, the CurDir/canonicality joint
+validator, the recorder socket-shape predicate, the outer-trap hardening set,
+the fixture TOCTOU class, and comparator exposure), two documented
+permissivenesses (the bounded trailing-EventLag admission and the
+`last_pre_origin` expect), the guard-ordering nicety, and four catalogued
+fragility sub-classes to be carried as review checklist items.
+
+## Considered approaches
+
+Three shaping decisions were made before this design and are recorded with
+their alternatives.
+
+1. Increment structure. Alternatives: one combined increment including
+   packaging; two increments with packaging design written now; two
+   increments with packaging planned after this one lands. The last was
+   chosen: the NonD4 closure is a release-gate dependency, so packaging
+   planning would rest on unfinished ground, and Increment 5 demonstrated the
+   review cost of oversized plans.
+2. Execution order. Hardening before emit was chosen over emit-first: the
+   hardening tasks are small and prescribed, the per-pane subscription
+   changes the collector path that the confirmation measurement must cover,
+   and the emit work is the design-heavy tail that benefits from an already
+   quiet tree.
+3. Hook mapping placement. A Rust-native adapter mode on the existing `emit`
+   subcommand was chosen over a shell reference-script family. The mapping
+   logic becomes unit-testable in the product suite, needs no runtime
+   dependency (no `python3` or `jq` on the hook path), and avoids embedding
+   untested logic in shell — the defect class this project has paid for
+   repeatedly. The alternative would have mirrored herdr's own integration
+   style but placed the most semantically loaded logic outside the test
+   suite.
+
+## Phase A: product hardening
+
+### A1: doctor integration-version parsing
+
+`doctor` currently expects integer integration versions (Claude Code 6 or
+newer, Codex 5 or newer, MVP design section 12.3) while live herdr answers
+the version query in a date form such as `2026.08.12.1`, so the check always
+reports `InvalidActiveVersion`. The parser accepts both forms: an integer
+compares under the existing rule, and a date-form version is treated as
+belonging to a newer versioning era than any legacy integer requirement and
+therefore satisfies the minimum. The raw reported string is preserved in
+`doctor` output either way; nothing is inferred from paths. Malformed values
+keep reporting a structured invalid-version diagnostic. The implementation
+plan must capture the exact live response shape from a real herdr 0.8.0
+server before freezing fixtures, and unit tests must cover integer, date
+form, and malformed inputs for both human and JSON renderers.
+
+### A2: per-pane agent-status subscription
+
+The PR #5 hotfix dropped the unscoped `pane.agent_status_changed`
+subscription because live herdr requires a concrete `pane_id`. This task
+subscribes in the correct per-pane form: the collector derives the live pane
+set from snapshots and `pane.updated` events, adds a scoped subscription when
+a pane appears, and releases or abandons it when the pane closes. Whether
+herdr supports explicit unsubscription — and whether an orphaned scoped
+subscription is benign — must be verified against the live server during
+planning; the design permits either explicit removal or documented benign
+abandonment, but not silent accumulation without evidence.
+
+The existing derivation of agent status from `pane.updated` payloads remains
+in place as the fallback path; the scoped subscription restores the richer
+event stream: transition-timestamp fidelity, the ledger row and activity
+item per transition, rate accounting, and the fourth topology-closure rescue
+trigger. Subscription management is covered by wire-level tests (real
+listener, outbound payload assertions) in the pattern the hotfix
+established, plus convergence coverage proving the fallback path is
+unchanged when scoped subscriptions are unavailable.
+
+### A3: warning throttle and rejection-variant regression
+
+The `herdr_subscription_failed` warning currently repeats on every retry
+(roughly twenty lines per second during an outage). It becomes
+once-per-transition: one warning when subscription health degrades, one
+notice on recovery, with the retry loop otherwise silent. A regression test
+covers the server-rejection error variant (the existing test exercises only
+the I/O variant), asserting both the warning code and the fallback behavior.
+
+### A4: recorded reliability prescriptions
+
+Two prescriptions recorded in the Increment 5 ledger are applied verbatim
+unless the code has drifted, in which case the task returns to design:
+
+1. F3: the performance-watch BrokenPipe path constructs
+   `HeaderInputs::default()` first, so a broken pipe during header
+   composition cannot poison later output.
+2. OwnerLock: the lock guard gains an explicit unlock on drop
+   (`flock_unlock`) and a regression test pinning the fork-before-exec
+   ordering — the fourth catalogued fragility sub-class — so a forked child
+   can never inherit a held lock across exec.
+
+## Phase B: NonD4 amendment, harness hardening, and measurement
+
+### B1: the amendment
+
+Evidence, from the preserved attempt-20260826 burst results: the failing
+predicate is `PerformanceDegradation count == 0`; observed counts were 6,
+10, 0, 5, and 14 across the five trials; every flagged sample carries the
+single reason `EventsOneSecond` with an observed one-second count of exactly
+101 against the envelope of 100; flagged samples show event lag between
+2.4 and 5.3 microseconds; all other burst predicates pass.
+
+Static analysis of both implicated components shows neither is defective.
+The runtime tracker counts admissions in a half-open window
+`(now − width, now]` over actual monotonic admission instants — no boundary
+double-count, no falsification. The burst workload schedules 1,000 events at
+a uniform 10 ms cadence — exactly the 100-events-per-second envelope — and a
+half-open one-second window over an ideal 10 ms grid contains exactly 100
+points at every alignment. The observed 101 therefore comes from real
+scheduling jitter: one admission landing late and a later one landing early
+places 101 actual instants inside one sliding second, and the
+strictly-greater-than classifier truthfully reports it. This explains every
+observation: the flagged value is always exactly 101, lag stays in
+microseconds, one trial shows zero flags, and only burst is affected
+(sustained runs at 20 events per second and twice-target at 40 — neither
+approaches the one-second envelope).
+
+The root cause is an acceptance-predicate mis-specification. The Increment 5
+plan's admission predicate explicitly tolerates exactly one scheduling
+quantum at a bucket boundary; the degradation-count acceptance for Final
+sustained and burst carries no matching tolerance, so an at-envelope
+workload fails on the same jitter the admission side deliberately absorbs.
+
+The amendment changes acceptance only; product code, the classifier, and the
+TUI health surface stay truthful and unchanged. At the Final stage, for
+sustained and burst, a degradation sample is tolerated if and only if all of
+the following hold:
+
+1. its reason set is exactly `{EventsOneSecond}`;
+2. its observed one-second count is exactly 101 (envelope plus one,
+   mirroring the admission side's one-quantum tolerance);
+3. it carries no event-lag breach, and the trial has no `EventLag` reason.
+
+The acceptance predicate becomes: the count of non-tolerated degradation
+samples equals zero. A sample with a count of 102 or more, any other reason,
+or a lag breach is non-tolerated and remains a failure. The
+`MissingDegradation` requirement for twice-target is unchanged. The tolerance definition lives in the shared typed validator used
+by both CI tests and the final validator, with boundary tests for all four
+edges (101 tolerated; 102 rejected; other reason rejected; lag breach
+rejected).
+
+### Closing path
+
+The Section 15 re-derivation and the D4 checkpoint classifier are
+deterministic functions of stored results. Closing therefore does not burn a
+measurement attempt:
+
+1. Amend the validator and the acceptance text (this document plus a ledger
+   amendment referencing the frozen Increment 5 plan; the frozen plan file
+   itself is not rewritten).
+2. Re-run the re-derivation and the D4 checkpoint over the preserved
+   attempt-20260826 results (subject `e86e0ef`). Expected decision:
+   `no_miss_d4_not_authorized`. Both regenerated documents are preserved
+   alongside the originals with their hashes recorded. This closes
+   `AmendmentsRequired[non_d4]`.
+3. Independently, run one full confirmation measurement (next fresh attempt
+   identifier 20260827) at the post-Phase-A/B head under the same
+   fail-closed protocol as Increment 5, comparing against the Increment 5
+   baseline (attempt 20260822). This is Increment 6's own regression
+   evidence — required because Phase A changes the collector runtime path —
+   and is expected to pass all seven scenarios under the amended predicate.
+   Attempt identifiers burn on use whether or not the run completes.
+
+### B2: harness hardening batch
+
+The six backlog items are implemented from their verbatim ledger
+prescriptions, extracted into the implementation plan at planning time:
+controller-binary validation hardening (role-name and path-order checks with
+their covering rows), the CurDir/canonicality joint validator change, the
+recorder socket-shape predicate, the outer-trap hardening set, the fixture
+TOCTOU class, and comparator exposure. The two documented permissivenesses
+(the bounded trailing-EventLag admission and the `last_pre_origin` expect)
+are re-adjudicated: each is either closed with a cheap hardening or
+re-documented with its reasoning carried into this increment's record. The
+guard-ordering nicety is applied. All of B2 lands before the confirmation
+measurement so the measuring harness is the hardened one.
+
+## Phase C: the emit calling side
+
+### C1: `herdr-top emit --from-hook`
+
+The `emit` subcommand gains an adapter mode: `herdr-top emit --from-hook
+<provider>` with `<provider>` one of `claude-code` or `codex`. It reads one
+hook payload (JSON) from standard input, maps it to at most a few section
+7.3 envelope events, and delivers them through the existing emit pipeline —
+session resolution, runtime-sentinel validation, wire protocol, and
+best-effort failure policy all unchanged. The adapter adds no protocol
+surface and no new event kinds.
+
+Both CLIs present the same hook payload shape (`hook_event_name`,
+`session_id`, `transcript_path`, event-specific fields) and the same
+registration schema, so one adapter serves both providers with a small
+per-provider field table.
+
+Behavioral rules:
+
+1. The adapter never blocks or fails an agent session. Malformed input, an
+   unmapped event, an unresolvable session, and every delivery failure exit
+   with status 0 after at most a warning. `--strict` remains available but
+   reference registrations never use it.
+2. Event identifiers are deterministic:
+   `hook:<provider>:<native-session-id>:<hook-event>:<entity>[:<transition>]`.
+   Re-fired hooks are absorbed by the protocol's `duplicate` response.
+   The reserved `prov:` prefix is never produced.
+3. Task Run identifiers are deterministic: the session run is
+   `hook:<provider>:<native-session-id>`; a subagent run appends
+   `:agent:<agent-id>`; a task run appends `:task:<task-id>`.
+4. Session-run events carry the provider and native session identifier as
+   binding identity, producing the durable K2-to-K1 merge of design section
+   5.4 with the run herdr already observes. Subagent and task runs carry no
+   binding identity; they are semantic children connected by dispatch
+   edges, exactly the design's model for Controller-declared sub-runs.
+   Terminal identity (pane addresses) is never used for binding.
+5. The session run never receives a terminal event. Sessions resume
+   routinely, and section 7.3 rejects `task_started` on a terminal run as
+   `stale_event`; liveness for the session run flows from observed
+   executions (retirement to `ended_unknown`, reactivation on resume).
+   `SessionEnd` maps to nothing.
+6. Labels carry structural metadata only — agent type, task subject — never
+   prompt, response, or transcript content, per design section 14.
+   `last_assistant_message` is never forwarded.
+
+Event mapping:
+
+| Hook event (Claude Code / Codex) | Emitted events | Subject |
+| --- | --- | --- |
+| `SessionStart` / `session_start` | `task_started` with binding identity | session run |
+| `SubagentStart` / `subagent_start` | `dispatch` (parent: session run) then `task_started`, label = agent type | subagent run |
+| `SubagentStop` / `subagent_stop` | `complete` | subagent run |
+| `TaskCreated` (Claude Code) | `dispatch` (parent: session run) then `progress` (creates the run queued via the forward-reference rule), label = task subject | task run |
+| `TaskCompleted` (Claude Code) | `complete` | task run |
+| `SessionEnd` / `session_end`, all others | nothing | — |
+
+The Codex subagent rows are conditional on a planning-time verification:
+the Codex payload must carry a usable subagent identity for
+`subagent_start`/`subagent_stop`. If it does not, the Codex adapter ships
+session-level mapping only in this increment and the gap is recorded as a
+follow-up rather than approximated.
+
+### C2: setup documentation
+
+A repository document (location fixed in the implementation plan, referenced
+from the in-product `?` help and first-launch notice text if those name a
+destination) covers: installing the standalone CLI (design section 12.3);
+registration snippets for `~/.claude/settings.json` and `~/.codex/hooks.json`
+running `herdr-top emit --from-hook <provider>` on the mapped events; the
+Codex hook-trust acceptance step; the fact that hooks run in parallel and
+coexist with herdr's own integration hooks; behavior outside managed panes
+(no resolvable session means a warning and a clean exit); and explicit
+`herdr-top emit depends_on` guidance for dependency edges, which no hook
+surface can derive.
+
+### C3: live acceptance
+
+On the real environment: register the hooks for both CLIs, run a session
+with at least one subagent dispatch under each provider, and verify in the
+TUI that the session runs bind to their observed executions (no `unbound`
+diagnostic for them), subagent runs appear as children with correct
+lifecycle, and `doctor` reports a healthy integration surface. This
+acceptance is observational; it complements, never replaces, the unit and
+wire-level suites.
+
+## Error handling and invalid evidence
+
+Phase B keeps Increment 5's fail-closed measurement discipline: an
+incomplete confirmation run is reported as incomplete, never as a pass, and
+burns its attempt identifier. Re-derivation over preserved results must
+reproduce the recorded input hashes before the amended validator runs;
+any mismatch stops the closing path. The adapter treats every failure as
+non-fatal for the hosting agent session while preserving emit's existing
+diagnostics; nothing in the adapter can make a hook exit non-zero in
+reference registrations.
+
+## Verification strategy
+
+1. Test-driven development for every behavior change, red first.
+2. Phase A: doctor version-parser unit tests over integer, date-form, and
+   malformed inputs in both renderers, with fixtures mirroring the live
+   response shape; wire-level subscription tests plus pane-set-following
+   tests for A2 with unchanged-fallback convergence coverage; throttle and
+   rejection-variant regressions for A3; prescription regressions for A4.
+3. Phase B: four-edge boundary tests for the amended tolerance; harness
+   tests for each B2 item from its ledger prescription; deterministic
+   re-derivation with input-hash verification; the confirmation measurement
+   under the full fail-closed protocol.
+4. Phase C: adapter unit tests covering the whole mapping table for both
+   providers, deterministic identifier derivation, the session-terminal
+   prohibition, malformed-payload no-op behavior, and label privacy;
+   wire-level tests proving delivered envelopes; the live acceptance of C3.
+5. Review checklist for every task review in this increment, carried from
+   the Increment 5 ledger: (1) no positive assertions over race-dependent
+   transient state — wait on the asserted channel; (2) no positive age or
+   staleness thresholds over independently scheduled samplers; (3) never
+   join two independently published watches — wait on the channel the
+   assertion reads; (4) resource guards must be exception- and fork-safe
+   (the OwnerLock class).
+6. The final whole-change review runs exactly once over the full integrated
+   diff and explicitly verifies that Phase C touched no runtime hot path
+   (collector, reducer, writer, TUI render), so the Phase B confirmation
+   measurement remains representative of the released head.
+
+## Completion criteria
+
+1. All Phase A behaviors landed with their tests; `doctor` reports a valid
+   integration version against live herdr.
+2. The amended validator is in place with its boundary tests; the
+   re-derivation and D4 checkpoint over preserved attempt-20260826 results
+   return `no_miss_d4_not_authorized`; the amendment is recorded closed.
+3. The confirmation measurement (attempt 20260827) at the post-Phase-A/B
+   head completes all seven scenarios and passes under the amended
+   predicate, with the comparison against the Increment 5 baseline recorded.
+4. B2's six backlog items, the permissiveness re-adjudications, and the
+   guard-ordering change are landed before the confirmation measurement.
+5. The adapter, registrations, and setup document are landed with the full
+   mapping-table test suite; C3 live acceptance passes for both providers,
+   or the Codex subagent gap is explicitly recorded per C1.
+6. The final whole-change review is complete, including the hot-path
+   neutrality verification for Phase C.
+
+## Implementation boundary and process constraints
+
+- Serial integration, one task at a time, on a dedicated increment branch;
+  implementation work runs in linked worktrees, never the primary checkout.
+- Planning-time reality checks (external facts the implementation plan must
+  verify against the live environment before freezing task briefs):
+  (1) the exact live herdr version-query response form;
+  (2) herdr's subscription-removal semantics for scoped subscriptions;
+  (3) the Codex `subagent_start`/`subagent_stop` payload identity fields;
+  (4) how herdr wires its Claude Code integration hook, to prove
+  coexistence; (5) whether the in-product help text names a setup-document
+  destination that C2 must satisfy.
+- Measurement outputs remain outside the repository and every linked
+  worktree; preserved measurement roots are never cleaned; attempt
+  identifiers burn on use, next fresh 20260827.
+- The frozen Increment 5 plan file is never edited; amendments are recorded
+  in this increment's documents and ledger.
+- No push, publication, or release action without an explicit user request.
