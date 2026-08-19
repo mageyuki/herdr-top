@@ -29,8 +29,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "workload-harness")]
 use std::sync::{Arc, Mutex};
 
-#[cfg(all(target_os = "linux", feature = "workload-harness"))]
-use herdr_top::activity::ActivityItem;
 #[cfg(feature = "workload-harness")]
 use herdr_top::activity::RestoredOperatorState;
 #[cfg(feature = "workload-harness")]
@@ -198,6 +196,16 @@ struct RealQueueResult {
 #[cfg(feature = "workload-harness")]
 fn lock_workload<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     value
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+static SIGNAL_FIXTURE_GUARD: Mutex<()> = Mutex::new(());
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+fn lock_signal_fixture() -> std::sync::MutexGuard<'static, ()> {
+    SIGNAL_FIXTURE_GUARD
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -395,6 +403,9 @@ fn last_pre_origin_sample_ordinal(
     samples: &[WorkloadPerformanceSample],
     workload_origin_ns: u64,
 ) -> u64 {
+    // The producer primes a carry-in before choosing the origin, and the
+    // artifact validator requires exactly one pre-origin sample. Keep this
+    // fail-fast so a producer regression cannot silently weaken the anchor.
     samples
         .iter()
         .rev()
@@ -754,19 +765,25 @@ async fn run_schedule_through_real_queue_at(
                 .await
                 .expect("reference admission deadline must be reachable");
         } else {
-            let admitted_clock_ns = if injection
-                == PerformanceTrialInjection::SupportedLoadDegradation
-                && sequence == 1
-            {
+            let supported_load_shift_count = injection.supported_load_shift_count();
+            let admitted_clock_ns = if sequence <= supported_load_shift_count {
+                let shift_periods = supported_load_shift_count
+                    .checked_sub(sequence)
+                    .and_then(|remaining| remaining.checked_add(1))
+                    .expect("shifted admission sequence must have a positive displacement");
                 scheduled_ns
-                    .checked_add(duration_ns(workload::period(profile)))
+                    .checked_add(
+                        duration_ns(workload::period(profile))
+                            .checked_mul(shift_periods)
+                            .expect("degradation injection shift must fit u64"),
+                    )
                     .expect("degradation injection admission timestamp must fit u64")
             } else {
                 scheduled_ns
             };
-            if injection == PerformanceTrialInjection::SupportedLoadDegradation {
-                // Admission 1 intentionally lands on admission 2's scheduled base. Preserve that
-                // bucket while keeping every later admission strictly after prior raw samples.
+            if supported_load_shift_count > 0 {
+                // Every shifted admission lands on the first unshifted admission's scheduled
+                // base. Preserve that bucket while keeping later raw samples strictly ordered.
                 clock_ns
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                         if admitted_clock_ns > current {
@@ -811,10 +828,21 @@ async fn run_schedule_through_real_queue_at(
             .await
             .expect("the stable sixty-second reason must publish after admission 1,201");
         }
-        if injection == PerformanceTrialInjection::SupportedLoadDegradation && sequence == 101 {
+        let supported_load_shift_count = injection.supported_load_shift_count();
+        if supported_load_shift_count > 0 && sequence == 100 + supported_load_shift_count {
+            let expected_events_one_second = usize::try_from(100 + supported_load_shift_count)
+                .expect("supported-load injected event count must fit usize");
             tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
-                    if !performance_watch.borrow().snapshot.reasons.is_empty() {
+                    let injected_boundary_is_recorded = {
+                        let publication = performance_watch.borrow();
+                        publication.snapshot.events_one_second == expected_events_one_second
+                            && publication
+                                .snapshot
+                                .reasons
+                                .contains(&PerformanceDegradationReason::EventsOneSecond)
+                    };
+                    if injected_boundary_is_recorded {
                         break;
                     }
                     performance_watch
@@ -824,7 +852,7 @@ async fn run_schedule_through_real_queue_at(
                 }
             })
             .await
-            .expect("the truthful rolling-window breach must publish after admission 101");
+            .expect("the truthful rolling-window breach must publish at the injected boundary");
         }
         if probes.contains(&sequence) {
             pending_probes.push(sequence);
@@ -901,9 +929,9 @@ async fn run_schedule_through_real_queue_at(
                     && snapshot.completion_high_water == expected_high_water
                     && snapshot.pending_events == 0;
                 let has_expected_terminal_quality = match profile {
-                    WorkloadProfile::TargetBurst
-                        if injection == PerformanceTrialInjection::SupportedLoadDegradation =>
-                    {
+                    WorkloadProfile::TargetBurst if injection.supported_load_shift_count() > 0 => {
+                        // The rolling window drains by the final persisted generation. The
+                        // retained 101/102 breach sample determines the composed outcome below.
                         snapshot.reasons.is_empty()
                             && publication.effective_quality == ObservationQuality::Live
                     }
@@ -1285,7 +1313,19 @@ fn assert_real_queue_outcome_is_exact(result: &RealQueueResult, profile: Workloa
 enum PerformanceTrialInjection {
     None,
     SupportedLoadDegradation,
+    SupportedLoadBeyondTolerance,
     OmitRequiredRenderedReason,
+}
+
+#[cfg(feature = "workload-harness")]
+impl PerformanceTrialInjection {
+    fn supported_load_shift_count(self) -> u64 {
+        match self {
+            Self::SupportedLoadDegradation => 1,
+            Self::SupportedLoadBeyondTolerance => 2,
+            Self::None | Self::OmitRequiredRenderedReason => 0,
+        }
+    }
 }
 
 #[cfg(feature = "workload-harness")]
@@ -1550,6 +1590,9 @@ async fn run_final_performance_trial(
         PerformanceTrialInjection::None | PerformanceTrialInjection::SupportedLoadDegradation => {
             None
         }
+        PerformanceTrialInjection::SupportedLoadBeyondTolerance => {
+            Some(FailureReasonV1::SupportedLoadDegradation)
+        }
         PerformanceTrialInjection::OmitRequiredRenderedReason => {
             Some(FailureReasonV1::MissingDegradation)
         }
@@ -1561,6 +1604,7 @@ async fn run_final_performance_trial(
             _ => panic!("synthetic final performance outcome must start as pass"),
         };
     }
+    assert_eq!(outcome.validate(), Ok(()));
     outcome = compose_final_performance_outcome(outcome);
     FinalPerformanceTrialResult {
         outcome,
@@ -1830,6 +1874,61 @@ async fn supported_load_one_quantum_degradation_is_tolerated_at_final_acceptance
     assert_eq!(
         classify_d4_checkpoint(&suite).unwrap(),
         D4CheckpointDecisionV1::NoMissD4NotAuthorized {}
+    );
+}
+
+#[cfg(feature = "workload-harness")]
+#[tokio::test]
+async fn supported_load_beyond_tolerance_fails_final_through_real_queue() {
+    // Break caught: retaining only synthetic coverage for a real collector
+    // breach beyond Final's one-quantum Burst tolerance.
+    let result = run_final_performance_trial(
+        WorkloadProfile::TargetBurst,
+        PerformanceTrialInjection::SupportedLoadBeyondTolerance,
+    )
+    .await;
+    assert_eq!(
+        workload::admission_schedule_attained(
+            WorkloadProfile::TargetBurst,
+            result.workload_origin_ns,
+            &result.admission_observations,
+        ),
+        Ok(true)
+    );
+    let stream = result.outcome.document().trials[0]
+        .raw
+        .performance_evidence_stream
+        .as_ref()
+        .unwrap();
+    assert!(stream.samples.iter().any(|sample| {
+        sample.events_one_second == 102
+            && sample
+                .reasons
+                .contains(&PerformanceReasonV1::EventsOneSecond)
+    }));
+    assert_eq!(
+        result.outcome.failure_reasons(),
+        [FailureReasonV1::SupportedLoadDegradation]
+    );
+    assert_eq!(result.outcome.status(), ReferenceOutcomeStatusV1::Failed);
+    assert!(result.outcome.validate().is_ok());
+
+    let mut suite = [
+        ScenarioV1::Target,
+        ScenarioV1::Sustained,
+        ScenarioV1::Burst,
+        ScenarioV1::Startup,
+        ScenarioV1::Idle,
+        ScenarioV1::FallbackRescan,
+        ScenarioV1::TwiceTarget,
+    ]
+    .map(|scenario| synthetic_result(scenario, MeasurementStageV1::Final));
+    suite[2] = result.outcome;
+    assert_eq!(
+        classify_d4_checkpoint(&suite).unwrap(),
+        D4CheckpointDecisionV1::AmendmentsRequired {
+            amendments: vec![RequiredAmendmentV1::NonD4],
+        }
     );
 }
 
@@ -3339,10 +3438,20 @@ fn trial_controls_reject_relative_roots() {
         &mut noncanonical_absolute,
         "/a/../tmp/herdr-increment5/sustained/trial-0001",
     );
+    let mut noncanonical_curdir = valid_synthetic_result();
+    rewrite_roots(
+        &mut noncanonical_curdir,
+        "/tmp/./herdr-increment5/sustained/trial-0001",
+    );
 
     assert_eq!(
-        [relative.validate(), noncanonical_absolute.validate()],
         [
+            relative.validate(),
+            noncanonical_absolute.validate(),
+            noncanonical_curdir.validate(),
+        ],
+        [
+            Err(ResultError::InvalidArtifact),
             Err(ResultError::InvalidArtifact),
             Err(ResultError::InvalidArtifact),
         ]
@@ -3400,6 +3509,28 @@ fn trial_controls_reject_trial_local_control_socket() {
 
     assert_eq!(
         trial_local_socket.validate(),
+        Err(ResultError::InvalidArtifact)
+    );
+}
+
+#[test]
+fn trial_controls_reject_absolute_noncanonical_control_socket() {
+    // Break caught: `Path::components` normalizes `.` and must not make a
+    // noncanonical absolute recorder socket indistinguishable from its target.
+    let mut noncanonical_socket = valid_synthetic_result();
+    let socket = "/tmp/herdr-i5.synthetic/./sustained-trial-0001.sock".to_owned();
+    let trial = &mut noncanonical_socket.document_mut().trials[0];
+    trial.raw.child_controls.measured_environment.insert(
+        "HERDR_PERF_OBSERVER_CONTROL_SOCKET".to_owned(),
+        socket.clone(),
+    );
+    trial
+        .control_evidence
+        .observer_environment
+        .insert("HERDR_PERF_OBSERVER_CONTROL_SOCKET".to_owned(), socket);
+
+    assert_eq!(
+        noncanonical_socket.validate(),
         Err(ResultError::InvalidArtifact)
     );
 }
@@ -6865,6 +6996,22 @@ fn section15_selected_evidence_is_reopened_and_rederived() {
 }
 
 #[test]
+fn section15_selected_paths_reject_absolute_noncanonical_spelling() {
+    // Break caught: `Path::components` normalizes `.` before the structural
+    // validator can observe it, despite the field promising canonical text.
+    let fixture = section15_fixture_from_final(&all_passes());
+    let mut report = fixture.report.clone();
+    let identity = &mut report.selected_results[0];
+    identity.canonical_raw_root = "/tmp/./x".to_owned();
+    identity.canonical_result_path = "/tmp/./x/result-v1.json".to_owned();
+
+    assert_eq!(
+        validate_section15_shape_for_test(&report),
+        Err(ResultError::InvalidArtifact)
+    );
+}
+
+#[test]
 fn section15_rederivation_schema_is_closed_complete_and_decision_owned() {
     let fixture = section15_fixture_from_final(&all_passes());
     let d4_fixture = section15_d4_fixture();
@@ -7908,6 +8055,35 @@ esac"#;
             .unwrap()
     }
 
+    pub fn wait_for_source_fixture_exit(
+        attempt_id: Option<&str>,
+        fixture_argv: &[String],
+        budget: Duration,
+    ) -> std::process::ExitStatus {
+        let runner = identity(&runner_script());
+        let tools = fixture_tools();
+        let mut command = source_fixture_command(&runner, &tools, attempt_id, fixture_argv);
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = command.spawn().unwrap();
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let status = child.wait().unwrap();
+                panic!(
+                    "source fixture did not publish a reaped exit status within {budget:?}: {status:?}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     pub fn assert_runner_outcome(path: &Path, exit_code: i32) -> RunnerTestOutcomeV1 {
         let outcome: RunnerTestOutcomeV1 =
             serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
@@ -8267,7 +8443,9 @@ fn source_fixture_revalidates_identity_before_every_use() {
     // Break caught: a successful first identity check must not cache trust
     // across a later requested-path mutation.
     let temporary = tempfile::tempdir().unwrap();
-    let env_alias = temporary.path().join("env-alias");
+    let tool_root = temporary.path().join("tool");
+    std::fs::create_dir(&tool_root).unwrap();
+    let env_alias = tool_root.join("env");
     symlink("/usr/bin/env", &env_alias).unwrap();
     let marker = temporary.path().join("mutation-ran");
     let mutator = temporary.path().join("mutator.sh");
@@ -8384,6 +8562,8 @@ fn runner_fixture_rejects_uncontained_attempt_id() {
 fn wait_process_pair_reaps_a_preexited_supervisor_before_blocking() {
     use reference_runner_test_support as support;
 
+    let _signal_fixture_guard = lock_signal_fixture();
+
     // Break caught: Bash <= 5.2 `wait -n` skips children that exited before
     // the call, so the live workers used to outrun an already-dead watchdog.
     let temporary = tempfile::tempdir().unwrap();
@@ -8440,6 +8620,8 @@ fn wait_process_pair_reaps_a_preexited_supervisor_before_blocking() {
 fn runner_fixture_reaps_timeout_and_signal_groups() {
     use reference_runner_test_support as support;
 
+    let _signal_fixture_guard = lock_signal_fixture();
+
     // Break caught: a timeout/signal path that leaves either process group live,
     // reports a default-death status without executing its trap body, skips
     // wait/reap, publishes before cleanup, or creates promotable evidence.
@@ -8468,8 +8650,7 @@ fn runner_fixture_reaps_timeout_and_signal_groups() {
         let groups = temporary.path().join("groups.txt");
         let status = temporary.path().join("trial-status");
         let trap_marker = temporary.path().join("trap-marker");
-        let started = std::time::Instant::now();
-        let output = support::run_source_fixture(
+        let exit_status = support::wait_for_source_fixture_exit(
             Some("00000001"),
             &[
                 "orchestration".to_owned(),
@@ -8481,12 +8662,9 @@ fn runner_fixture_reaps_timeout_and_signal_groups() {
                 observer.to_string_lossy().into_owned(),
                 trap_marker.to_string_lossy().into_owned(),
             ],
+            Duration::from_secs(360),
         );
-        assert!(
-            started.elapsed() < Duration::from_secs(60),
-            "case={case} waited for a natural child exit instead of bounded cleanup"
-        );
-        assert_eq!(output.status.code(), Some(20), "case={case}: {output:?}");
+        assert_eq!(exit_status.code(), Some(20), "case={case}: {exit_status:?}");
         assert_eq!(
             trap_marker.is_file(),
             expect_trap_marker,
@@ -8536,8 +8714,97 @@ fn runner_fixture_reaps_timeout_and_signal_groups() {
 
 #[cfg(all(target_os = "linux", feature = "workload-harness"))]
 #[test]
+fn orchestration_signal_traps_are_self_contained_across_reexec() {
+    use reference_runner_test_support as support;
+    use std::process::{Command, Stdio};
+
+    let _signal_fixture_guard = lock_signal_fixture();
+
+    // Break caught: a trap body calls a shell function that is absent after a
+    // fresh protected Bash re-exec, so the shell reports the intended status
+    // without executing the trap marker publication. The ready marker also
+    // prevents the test from signalling before the re-exec installed its trap.
+    let temporary = tempfile::tempdir().unwrap();
+    let marker = temporary.path().join("trap-marker");
+    let ready = temporary.path().join("trap-ready");
+    let mut child = Command::new("/usr/bin/bash")
+        .env_clear()
+        .args([
+            "-p",
+            "-c",
+            r#"set -euo pipefail
+source "$1"
+marker=$2
+ready=$3
+trap_command=$(install_orchestration_signal_traps; trap -p HUP)
+export HERDR_PERF_RUNNER_TEST_TRAP_MARKER=$marker
+exec /usr/bin/bash -p -c \
+  "$trap_command"$'\n''builtin printf "%s\n" "$BASHPID" >"$1"; while :; do :; done' \
+  herdr-i5-trap-reexec-child "$ready""#,
+            "herdr-i5-trap-reexec",
+        ])
+        .arg(support::runner_script())
+        .arg(&marker)
+        .arg(&ready)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let readiness_deadline = std::time::Instant::now() + Duration::from_secs(300);
+    let expected_ready = format!("{}\n", child.id());
+    loop {
+        match std::fs::read_to_string(&ready) {
+            Ok(published) if published == expected_ready => break,
+            Ok(published) if published.ends_with('\n') => {
+                let _ = child.kill();
+                let status = child.wait().unwrap();
+                panic!(
+                    "re-exec published the wrong signal target {published:?}, expected {expected_ready:?}: {status:?}"
+                );
+            }
+            Ok(_) | Err(_) => {}
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("re-exec exited before publishing trap readiness: {status:?}");
+        }
+        if std::time::Instant::now() >= readiness_deadline {
+            let _ = child.kill();
+            let status = child.wait().unwrap();
+            panic!("re-exec did not publish trap readiness before deadline: {status:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGHUP) },
+        0,
+        "failed to signal ready re-exec: {}",
+        std::io::Error::last_os_error()
+    );
+    let exit_deadline = std::time::Instant::now() + Duration::from_secs(300);
+    let settled_status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= exit_deadline {
+            let _ = child.kill();
+            let status = child.wait().unwrap();
+            panic!("signalled re-exec did not settle before deadline: {status:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(settled_status.code(), Some(143), "{settled_status:?}");
+    assert!(marker.is_file(), "trap marker was not published");
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
 fn cleanup_process_groups_bounds_a_missed_group_signal() {
     use reference_runner_test_support as support;
+
+    let _signal_fixture_guard = lock_signal_fixture();
 
     // Break caught: swallowing a failed negative-PGID signal and then waiting
     // unconditionally for the still-live direct child.
@@ -8767,6 +9034,8 @@ fn baseline_set_is_typed_stage_and_identity_validated_up_front() {
 fn outer_runtime_trap_reaps_live_trial_and_removes_owned_socket_on_signal() {
     use reference_runner_test_support as support;
 
+    let _signal_fixture_guard = lock_signal_fixture();
+
     // Break caught: a TERM after a group and socket are live only clears the
     // directory path, without reaping the group or unlinking the frozen socket.
     let temporary = tempfile::tempdir().unwrap();
@@ -8801,6 +9070,8 @@ fn outer_runtime_trap_reaps_live_trial_and_removes_owned_socket_on_signal() {
 #[test]
 fn source_fixture_executes_production_nested_orchestration_body() {
     use reference_runner_test_support as support;
+
+    let _signal_fixture_guard = lock_signal_fixture();
 
     // Break caught: the source seam reimplements orchestration instead of
     // executing run_trial_process_tree's 31-operand nested body, environments,
@@ -9151,7 +9422,7 @@ fn source_fixture_inventory_is_portable_and_role_closed() {
         });
         mutations.push(extra);
         let mut workstation = make_tools();
-        workstation[0].requested = PathBuf::from("/home/mageyuki/.cargo/bin/rustup");
+        workstation[0].requested = PathBuf::from("/home/mageyuki/.herdr-i5-task7-absent/env");
         mutations.push(workstation);
 
         for (index, tools) in mutations.iter().enumerate() {
@@ -9168,9 +9439,327 @@ fn source_fixture_inventory_is_portable_and_role_closed() {
                     .output()
                     .unwrap();
             assert_eq!(rejected.status.code(), Some(20), "{case} mutation {index}");
+            if index == 3 {
+                assert_eq!(
+                    String::from_utf8(rejected.stderr).unwrap(),
+                    "error: source fixture tool used a workstation path\n"
+                );
+            }
             assert!(!marker.exists());
         }
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn source_fixture_tool_paths_are_role_bound_and_fail_closed() {
+    use reference_runner_test_support as support;
+
+    // Break caught: substituting an unrelated executable, accepting a
+    // non-absolute path, or deriving trust from an absent/non-executable tool.
+    let temporary = tempfile::tempdir().unwrap();
+    let non_executable_parent = temporary.path().join("non-executable");
+    std::fs::create_dir(&non_executable_parent).unwrap();
+    let non_executable = non_executable_parent.join("env");
+    std::fs::write(&non_executable, b"not executable\n").unwrap();
+    let absent = temporary.path().join("absent").join("env");
+    let rows = [
+        (
+            "wrong-but-plausible substitution",
+            PathBuf::from("/usr/bin/true"),
+            "error: source fixture tool basename disagreed with role\n",
+        ),
+        (
+            "relative path",
+            PathBuf::from("env"),
+            "error: requested tool path was not absolute\n",
+        ),
+        (
+            "absent path",
+            absent,
+            "error: tool canonicalization failed\n",
+        ),
+        (
+            "non-executable path",
+            non_executable,
+            "error: tool was not a regular executable\n",
+        ),
+    ];
+    let runner = support::identity(&support::runner_script());
+
+    for (case, requested, expected_stderr) in rows {
+        let mut tools = support::fixture_tools();
+        tools[0].requested = requested;
+        let marker = temporary.path().join(format!("{case}.json"));
+        let rejected = support::source_fixture_command(
+            &runner,
+            &tools,
+            Some("00000001"),
+            &[
+                "orchestration".to_owned(),
+                "attempt-check".to_owned(),
+                marker.to_string_lossy().into_owned(),
+            ],
+        )
+        .output()
+        .unwrap();
+        assert_eq!(rejected.status.code(), Some(20), "{case}: {rejected:?}");
+        assert_eq!(
+            String::from_utf8(rejected.stderr).unwrap(),
+            expected_stderr,
+            "{case}"
+        );
+        assert!(!marker.exists(), "{case}");
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn runner_control_recorder_applies_socket_shape_predicate() {
+    use reference_runner_test_support as support;
+
+    // Break caught: the recorder accepts a socket spelling that the runner and
+    // closing validator refuse.
+    let temporary = tempfile::tempdir().unwrap();
+    let rejected_outcome = temporary.path().join("rejected.json");
+    let rejected = support::run_source_fixture(
+        Some("00000001"),
+        &[
+            "orchestration".to_owned(),
+            "socket-shape".to_owned(),
+            rejected_outcome.to_string_lossy().into_owned(),
+            "/tmp/not-herdr/socket".to_owned(),
+        ],
+    );
+    assert_eq!(rejected.status.code(), Some(20));
+    assert!(!rejected_outcome.exists());
+
+    let accepted_outcome = temporary.path().join("accepted.json");
+    let accepted = support::run_source_fixture(
+        Some("00000001"),
+        &[
+            "orchestration".to_owned(),
+            "socket-shape".to_owned(),
+            accepted_outcome.to_string_lossy().into_owned(),
+            "/tmp/herdr-i5.12345678/b-t0001.sock".to_owned(),
+        ],
+    );
+    assert_eq!(accepted.status.code(), Some(0), "{accepted:?}");
+    support::assert_runner_outcome(&accepted_outcome, 0);
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+fn assert_fixture_write_refuses_node(site: &str, node: &str) {
+    use reference_runner_test_support as support;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, symlink};
+
+    let _signal_fixture_guard = (site == "trap-marker").then(lock_signal_fixture);
+
+    let temporary = tempfile::tempdir().unwrap();
+    let destination = temporary.path().join("destination");
+    let target = temporary.path().join("target");
+    let mut fifo_guard = None;
+    let expected_stderr = match node {
+        "symlink" => {
+            std::fs::write(&target, b"preserve\n").unwrap();
+            symlink(&target, &destination).unwrap();
+            "error: fixture output path is a symbolic link\n"
+        }
+        "fifo" => {
+            let path = CString::new(destination.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            if site == "trap-marker" {
+                fifo_guard = Some(
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&destination)
+                        .unwrap(),
+                );
+            }
+            "error: fixture output path is a FIFO\n"
+        }
+        _ => panic!("unknown fixture node kind"),
+    };
+    let output = support::run_source_fixture(
+        Some("00000001"),
+        &[
+            "orchestration".to_owned(),
+            "fixture-output-guard".to_owned(),
+            site.to_owned(),
+            destination.to_string_lossy().into_owned(),
+        ],
+    );
+    drop(fifo_guard);
+    assert_eq!(output.status.code(), Some(20), "{site}/{node}: {output:?}");
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        expected_stderr,
+        "{site}/{node}"
+    );
+    if node == "symlink" {
+        assert_eq!(std::fs::read(&target).unwrap(), b"preserve\n");
+    } else {
+        assert!(
+            std::fs::symlink_metadata(&destination)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn fixture_output_validator_refuses_symlink() {
+    assert_fixture_write_refuses_node("validator", "symlink");
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn fixture_output_validator_refuses_fifo() {
+    assert_fixture_write_refuses_node("validator", "fifo");
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn runner_test_outcome_publisher_refuses_symlink() {
+    assert_fixture_write_refuses_node("runner-outcome", "symlink");
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn runner_test_outcome_publisher_refuses_fifo() {
+    assert_fixture_write_refuses_node("runner-outcome", "fifo");
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn trial_status_publisher_refuses_symlink() {
+    assert_fixture_write_refuses_node("trial-status", "symlink");
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn trial_status_publisher_refuses_fifo() {
+    assert_fixture_write_refuses_node("trial-status", "fifo");
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn orchestration_trap_marker_refuses_symlink() {
+    assert_fixture_write_refuses_node("trap-marker", "symlink");
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn orchestration_trap_marker_refuses_fifo() {
+    assert_fixture_write_refuses_node("trap-marker", "fifo");
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn outer_trap_identity_window_is_single_command() {
+    use reference_runner_test_support as support;
+
+    let _signal_fixture_guard = lock_signal_fixture();
+
+    // Break caught: a signal between runtime-directory creation and identity
+    // capture leaves an unowned directory that the outer trap cannot remove.
+    let temporary = tempfile::tempdir().unwrap();
+    let capture = temporary.path().join("identity-window");
+    let output = support::run_source_fixture(
+        Some("00000001"),
+        &[
+            "orchestration".to_owned(),
+            "outer-identity-window".to_owned(),
+            capture.to_string_lossy().into_owned(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(20), "{output:?}");
+    let captured = std::fs::read_to_string(capture).unwrap();
+    let (directory, identity) = captured.trim_end().split_once(' ').unwrap();
+    assert_eq!(identity.split(':').count(), 5);
+    assert!(!PathBuf::from(directory).exists());
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn outer_trap_group_publication_is_atomic() {
+    use reference_runner_test_support as support;
+
+    let _signal_fixture_guard = lock_signal_fixture();
+
+    // Break caught: interruption while replacing the outer state exposes a
+    // truncated mixture of measured/observer group identifiers.
+    let temporary = tempfile::tempdir().unwrap();
+    let capture = temporary.path().join("group-publication");
+    let state_capture = temporary.path().join("settled-state");
+    let output = support::run_source_fixture(
+        Some("00000001"),
+        &[
+            "orchestration".to_owned(),
+            "outer-group-publication".to_owned(),
+            capture.to_string_lossy().into_owned(),
+            state_capture.to_string_lossy().into_owned(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(20), "{output:?}");
+    assert_eq!(std::fs::read_to_string(state_capture).unwrap(), "- - -\n");
+    let directory = std::fs::read_to_string(capture).unwrap();
+    assert!(!PathBuf::from(directory.trim_end()).exists());
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn publisher_temp_never_blocks_rmdir() {
+    use reference_runner_test_support as support;
+
+    let _signal_fixture_guard = lock_signal_fixture();
+
+    // Break caught: an interrupted `.outer-state.tmp.*` publisher artifact
+    // survives state cleanup and makes the identity-checked rmdir fail.
+    let temporary = tempfile::tempdir().unwrap();
+    let capture = temporary.path().join("publisher-temp");
+    let output = support::run_source_fixture(
+        Some("00000001"),
+        &[
+            "orchestration".to_owned(),
+            "publisher-temp-cleanup".to_owned(),
+            capture.to_string_lossy().into_owned(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(20), "{output:?}");
+    let directory = std::fs::read_to_string(capture).unwrap();
+    assert!(!PathBuf::from(directory.trim_end()).exists());
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn orchestration_wait_is_deadline_bounded() {
+    use reference_runner_test_support as support;
+
+    let _signal_fixture_guard = lock_signal_fixture();
+
+    // Break caught: cleanup waits forever for an orchestration child that
+    // never exits or signals after the scenario supervisor fires.
+    let temporary = tempfile::tempdir().unwrap();
+    let outcome = temporary.path().join("deadline-outcome.json");
+    let started = std::time::Instant::now();
+    let output = support::run_source_fixture(
+        Some("00000001"),
+        &[
+            "orchestration".to_owned(),
+            "orchestration-deadline".to_owned(),
+            outcome.to_string_lossy().into_owned(),
+        ],
+    );
+    assert!(started.elapsed() < Duration::from_secs(30), "{output:?}");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    support::assert_runner_outcome(&outcome, 0);
 }
 
 #[cfg(all(target_os = "linux", feature = "workload-harness"))]
@@ -9279,6 +9868,8 @@ fn trial_status_reader_rejects_unterminated_trailing_bytes() {
 #[test]
 fn runner_fixture_preserves_measured_and_observer_exit_status_precedence() {
     use reference_runner_test_support as support;
+
+    let _signal_fixture_guard = lock_signal_fixture();
 
     // Break caught: `wait` under `set -e`, boolean status collapse, observer
     // precedence over a measured failure, a non-atomic sentinel, or clearing
@@ -9937,17 +10528,6 @@ struct ReferenceStartupHelperV1 {
 }
 
 #[cfg(all(target_os = "linux", feature = "workload-harness"))]
-fn compare_reference_activity(left: &ActivityItem, right: &ActivityItem) -> std::cmp::Ordering {
-    right
-        .event_timestamp_ms
-        .cmp(&left.event_timestamp_ms)
-        .then_with(|| right.seen_at_ms.cmp(&left.seen_at_ms))
-        .then_with(|| right.ingest_seq.is_some().cmp(&left.ingest_seq.is_some()))
-        .then_with(|| right.ingest_seq.cmp(&left.ingest_seq))
-        .then_with(|| right.identity.event_id.cmp(&left.identity.event_id))
-}
-
-#[cfg(all(target_os = "linux", feature = "workload-harness"))]
 fn run_reference_startup_helper(
     root: &StateRoot,
     output: &std::path::Path,
@@ -10004,12 +10584,10 @@ fn reference_profile_startup_restore_helper() {
     let expected_activity_count =
         usize::try_from(workload_schema().operator_activity_limit).unwrap();
     assert_eq!(operator.activity.len(), expected_activity_count);
-    assert!(
-        operator
-            .activity
-            .windows(2)
-            .all(|pair| compare_reference_activity(&pair[0], &pair[1]) == std::cmp::Ordering::Less)
-    );
+    assert!(operator.activity.windows(2).all(|pair| {
+        herdr_top::operator::workload_compare_activity(&pair[0], &pair[1])
+            == std::cmp::Ordering::Less
+    }));
     assert_eq!(
         operator
             .activity
@@ -10308,19 +10886,30 @@ async fn reference_profile_entrypoint() {
 #[cfg(all(target_os = "linux", feature = "workload-harness"))]
 #[test]
 fn reference_profile_entrypoint_source_uses_performance_stream_selector() {
+    const HELPER_DECL: &str = "fn reference_profile_performance_stream(";
     const START: &str = "async fn reference_profile_entrypoint_impl()";
     const END: &str =
         "\n#[cfg(all(target_os = \"linux\", feature = \"workload-harness\"))]\n#[tokio::test]";
+    const GUARD_DECL: &str =
+        "fn reference_profile_entrypoint_source_uses_performance_stream_selector()";
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file!());
     let source = std::fs::read_to_string(path).expect("workload harness source should be readable");
+    let helper_decl = source
+        .find(HELPER_DECL)
+        .expect("performance stream helper declaration should exist");
     let start = source
         .find(START)
         .expect("entrypoint declaration should exist");
     let entrypoint = &source[start..];
-    let end = entrypoint
-        .find(END)
-        .expect("entrypoint boundary should exist");
-    assert!(entrypoint[..end].contains("reference_profile_performance_stream("));
+    let end = start
+        + entrypoint
+            .find(END)
+            .expect("entrypoint boundary should exist");
+    let guard_decl = source
+        .find(GUARD_DECL)
+        .expect("source marker guard declaration should exist");
+    assert!(helper_decl < start && start < end && end < guard_decl);
+    assert!(source[start..end].contains("reference_profile_performance_stream("));
 }
 
 #[cfg(target_os = "linux")]

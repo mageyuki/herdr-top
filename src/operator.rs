@@ -259,6 +259,14 @@ fn compare_activity(left: &ActivityItem, right: &ActivityItem) -> Ordering {
         .then_with(|| right.identity.event_id.cmp(&left.identity.event_id))
 }
 
+// increment5-workload-harness: begin operator activity comparator export
+#[cfg(feature = "workload-harness")]
+#[doc(hidden)]
+pub fn workload_compare_activity(left: &ActivityItem, right: &ActivityItem) -> Ordering {
+    compare_activity(left, right)
+}
+// increment5-workload-harness: end operator activity comparator export
+
 fn snapshot(activity: &[ActivityItem], terminal_times: &HashMap<RunId, i64>) -> OperatorSnapshot {
     OperatorSnapshot {
         activity: Arc::from(activity.to_vec()),

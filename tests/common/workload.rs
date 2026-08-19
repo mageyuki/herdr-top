@@ -1573,16 +1573,10 @@ fn validate_trial_controls(
         scenario_spec(document.scenario).directory,
         trial.trial_index
     );
-    if !scratch_root_path.is_absolute()
-        || !raw_root_path.is_absolute()
-        || scratch_root_path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::CurDir | std::path::Component::ParentDir
-            )
-        })
+    if !absolute_path_text_is_canonical(scratch_root_path)
+        || !absolute_path_text_is_canonical(raw_root_path)
         || !scratch_root.ends_with(&expected_suffix)
-        || !control_socket_path.is_absolute()
+        || !absolute_path_text_is_canonical(control_socket_path)
         || !control_socket.starts_with("/tmp/herdr-i5.")
         || control_socket_path.starts_with(raw_root)
         || trial.raw.child_controls.effective_affinity_cpu_ids != document.controls.affinity_cpu_ids
@@ -2398,6 +2392,8 @@ fn validate_performance_stream(
         .iter()
         .map(|sample| (sample.sample_ordinal, sample))
         .collect::<std::collections::BTreeMap<_, _>>();
+    // The one-quantum boundary exception is trial-wide: any EventLag sample
+    // closes the exception, even when the 101-event sample has no EventLag reason.
     let trial_has_event_lag_reason = stream
         .samples
         .iter()
@@ -2747,6 +2743,15 @@ fn is_lower_hex(value: &str, len: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn absolute_path_text_is_canonical(path: &std::path::Path) -> bool {
+    let normalized = path.components().collect::<std::path::PathBuf>();
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+        && path.as_os_str() == normalized.as_os_str()
+}
+
 fn validate_section15_internal(report: &Section15ReDerivationV1) -> Result<(), ResultError> {
     let scenarios = [
         ScenarioV1::Target,
@@ -2789,22 +2794,10 @@ fn validate_section15_internal(report: &Section15ReDerivationV1) -> Result<(), R
             || !is_lower_hex(&identity.result_sha256, 64)
             || !is_lower_hex(&identity.production_subject_sha, 40)
             || !is_lower_hex(&identity.harness_sha, 40)
-            || !result_path.is_absolute()
-            || !raw_root.is_absolute()
+            || !absolute_path_text_is_canonical(result_path)
+            || !absolute_path_text_is_canonical(raw_root)
             || result_path.parent() != Some(raw_root)
             || result_path.file_name() != Some(std::ffi::OsStr::new("result-v1.json"))
-            || result_path.components().any(|component| {
-                matches!(
-                    component,
-                    std::path::Component::CurDir | std::path::Component::ParentDir
-                )
-            })
-            || raw_root.components().any(|component| {
-                matches!(
-                    component,
-                    std::path::Component::CurDir | std::path::Component::ParentDir
-                )
-            })
             || !executable_identity_is_well_formed(&identity.measured_binary)
             || expected_stage == MeasurementStageV1::Baseline
                 && (identity.production_subject_sha != BASELINE_SUBJECT_SHA
@@ -7704,6 +7697,13 @@ pub fn rederive_section15_document_for_test(
     final_results: &[ReferenceOutcomeV1],
 ) -> Result<Section15ReDerivationV1, HarnessError> {
     rederive_section15_document(baseline_root, final_root, baseline, final_results)
+}
+
+#[cfg(feature = "workload-harness")]
+pub fn validate_section15_shape_for_test(
+    report: &Section15ReDerivationV1,
+) -> Result<(), ResultError> {
+    validate_section15_internal(report)
 }
 
 fn section15_baseline_delta_rows(
