@@ -1503,6 +1503,19 @@ async fn run_collector(
     let mut first_subscription = true;
     let mut previous_socket = None;
     let subscription_health = HealthEdge::default();
+    // Keep this outside the primary retry loop. spawn_enrichment_reader runs once per
+    // primary subscription generation, so this one shared value preserves its
+    // independent subscription and stream edges across reconnects. The regression
+    // test a3_enrichment_subscription_health_persists_across_reader_generations
+    // shares one health value across two direct run_enrichment_reader calls: it pins
+    // the shared-health semantics, not this wiring. Moving construction into the loop
+    // would silently restore one warning per flapping primary generation during a
+    // persistent enrichment outage (roughly 10-20 lines per second).
+    //
+    // Accepted trade-off: a genuine socket replacement during a persistent
+    // enrichment outage does not emit a fresh warning. Increment 6 design spec A3
+    // requires one warning on degrade, one notice on recovery, and a silent steady
+    // failed state. This is intentional; do not reset health on socket replacement.
     let enrichment_health = Arc::new(EnrichmentHealth::default());
     let mut retention_cleanup = tokio::time::interval(STALE_SWEEP_INTERVAL);
     retention_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1539,8 +1552,10 @@ async fn run_collector(
             Ok(stream) => {
                 if subscription_health.record_recovery() {
                     // WARN is required because the production subscriber caps at WARN (src/main.rs).
-                    // Keep this before the Reconciling publication below: the test
-                    // a3_primary_subscribe_recovery_logs_one_notice uses it as a happens-after barrier.
+                    // Keep this before the Reconciling publication below: the shared helper
+                    // capture_primary_subscribe_recovery uses it as a happens-after barrier for
+                    // a3_primary_subscribe_recovery_logs_one_notice and
+                    // a3_recovery_notice_survives_production_warn_level_cap.
                     tracing::warn!(
                         notice_code = "herdr_subscription_recovered",
                         "Herdr event subscription recovered"
