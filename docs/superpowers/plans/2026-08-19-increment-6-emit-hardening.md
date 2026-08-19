@@ -318,10 +318,14 @@ never ride the primary connection's lifecycle.
    the flush never interleaves with the replay at lines 1633-1662; the
    phase is never identified by an `ObservationQuality` value, which is
    ambiguous between herdr quality and the composed effective quality at
-   collector.rs:133-134): enrichment events are NOT discarded during an
-   episode — an event arriving after snapshot capture is not in that
-   snapshot, so discard-until-Live would lose exactly the transitions
-   this stream exists to restore. They are BUFFERED coalesced per pane
+   collector.rs:133-134): enrichment events are NOT wholesale-discarded
+   during an episode — an event arriving after snapshot capture is not
+   in that snapshot, so discard-until-Live would lose the entire replay
+   window's transitions. The chosen residual is far narrower: Rule 1
+   below deliberately drops only events that raced the snapshot
+   response within a local socket round trip, a bounded loss both
+   documents state and one test pins as chosen behavior. Events are
+   BUFFERED coalesced per pane
    (latest event per pane, stamped with local arrival order). Buffer
    bounds and lifetime: the map is keyed by pane id and bounded by the
    enrichment target set (inserts for panes outside the set are
@@ -333,19 +337,38 @@ never ride the primary connection's lifecycle.
    receipt gets a fresh ULID event identity (collector.rs:3985-3990),
    `RecordEvent` is unconditional (reducer.rs:714-718), and the activity
    dedup key is that event identity (operator.rs:209-213), so an
-   unfiltered flush would always duplicate ledger rows. Rule 1,
-   WATERMARK: drop every buffered event whose arrival precedes the
-   arrival of the snapshot response (the pre-capture generation — the
-   snapshot already carries that state, and a stale different-status
-   leftover must neither regress newer snapshot truth nor re-touch an
-   execution the snapshot marked `Stale`, which the handler's
-   non-terminal filter at collector.rs:3372-3376 would otherwise admit
-   because `ExecState::Stale` is not terminal). Rule 2, STATUS-DIFFERS:
-   apply a surviving event through the ordinary handler only if its
-   status differs from the pane's current modeled status (a transition
-   the replay already re-established flushes to nothing); drop events
-   for panes absent from the converged model. Outside an episode,
-   events apply directly. The reader never
+   unfiltered flush would always duplicate ledger rows. Ordering
+   domain: buffered arrivals and the watermark are ordered by ONE shared
+   atomic arrival counter (`AtomicU64`, fetch-add per enrichment receipt)
+   owned by the collector and readable from both tasks; the converge
+   task snapshots the counter value at the arrival of each
+   `session.snapshot` response (collector.rs:1606) and the watermark is
+   the value at the MOST RECENT response — one episode can contain up to
+   `RESNAPSHOT_ATTEMPTS = 3` snapshots (collector.rs:62, 1703), and each
+   response advances the watermark so an event captured before a later
+   snapshot cannot survive. An episode that ends without reaching Live
+   never flushes; entries persist bounded (one per target pane), the
+   watermark keeps advancing with every snapshot, and the first Live
+   flush drains them. Rule 1, WATERMARK: drop every buffered event whose
+   arrival counter precedes the watermark (the pre-capture generation —
+   the snapshot already carries that state; a stale different-status
+   leftover must not regress newer snapshot truth). Rule 2, applied per
+   EXECUTION, not per pane (`Pane` carries no status — status lives on
+   `Execution.state`, `src/model/entities.rs:25-39` — and one pane can
+   host several non-terminal executions in differing states): a
+   surviving event is dropped entirely unless its pane is a member of
+   the MOST RECENT SNAPSHOT's pane set (snapshot membership, NOT model
+   presence — a snapshot-removed pane is retained in the model through
+   `Stale` grace, collector.rs:3688-3692, and flushing into it would
+   reset the `Stale` execution and cancel the pending closure,
+   resurrecting the pane); for a member pane, the flush does not call
+   the raw handler blindly (its filter admits `Stale` executions,
+   collector.rs:3372-3376, because `ExecState::Stale` is non-terminal)
+   but applies the same per-execution transition the handler uses to
+   exactly those matching executions that are non-terminal, NOT in
+   `Stale` grace, and whose current state family differs from the
+   event's status (a transition the replay already re-established
+   flushes to nothing). Outside an episode, events apply directly. The reader never
    sets the primary's `overflowed` flag; its cancellation and join are
    owned by the collector's existing shutdown lifecycle; on EOF or read
    error it re-enters the enrichment retry path only. Subscription
@@ -394,22 +417,36 @@ assertion is the discriminating half against a make-before-break
 regression (a single delivery can never double-record; only the
 forbidden overlap can).
 
-- [ ] **Step 4c: Write failing convergence-window tests** (six): (i)
+- [ ] **Step 4c: Write failing convergence-window tests** (eight; the
+fixture controls both streams, so every case establishes its
+preconditions explicitly rather than passing by accident): (i)
 enrichment EOF mid-stream → enrichment retry path re-subscribes while
 primary quality stays Live and no `Dirty` reconciliation occurs; (ii) a
 flood on the enrichment channel never sets the primary `overflowed`
 flag or triggers a resnapshot; (iii) THE HOLE-PINNING CASE — an
-enrichment transition arriving after the snapshot response but before
-`Live` is buffered and applied at the flush: its ledger row, activity
-item, and rate observation EXIST after convergence; (iv) a surviving
-buffered event whose status the replay already re-established flushes
-to NOTHING — no second ledger row for the same transition
-(status-differs rule); (v) a pre-watermark event with a DIFFERENT,
-older status is dropped — the pane's post-convergence status matches
-the snapshot, no regression, and no ledger row from the stale event
-(watermark rule); (vi) two transitions for one pane inside one episode
-coalesce — exactly one flushed application carrying the final status
-(the per-pane-latest rule, pinning the documented fidelity bound).
+enrichment transition injected after the fixture has sent the snapshot
+response and before replay completes is buffered and applied at the
+flush: assert the ledger-row count increases by exactly one across the
+flush and the new row is the flushed transition (unique attribution,
+not mere existence); (iv) an event PROVEN post-watermark (injected
+after the response, with a matching live execution) whose transition
+the replay also re-established → assert the replay's row exists and the
+flush adds NO second row (status-differs rule, not the watermark,
+must be what drops it); (v) a pre-watermark event with a DIFFERENT,
+older status, with a matching non-terminal execution PRESENT (so the
+drop is attributable to Rule 1, not to no-match) → no row from the
+stale event, post-convergence status matches the snapshot; (vi) two
+transitions for one pane BOTH injected post-watermark → exactly one
+flushed application carrying the final status (coalescing, not the
+watermark, must be what removes the first); (vii) THE RESURRECTION PIN
+— a post-watermark event for a pane the most recent snapshot REMOVED,
+while that pane's execution sits in `Stale` grace → the event is
+dropped by snapshot membership: the execution stays `Stale`, no row is
+written, and the pending pane closure completes; (viii) THE CHOSEN
+RESIDUAL — an event injected between the fixture's receipt of the
+snapshot request and its sending of the response → dropped by the
+watermark, no row: the documented capture-to-response jitter loss,
+pinned as chosen behavior.
 
 - [ ] **Step 5: Write failing fallback-unavailable convergence test**: with
 the enrichment endpoint permanently refusing connections, drive the
@@ -418,7 +455,7 @@ the `pane.updated` fallback with observation quality unchanged (this is
 the spec's "fallback path unchanged when scoped subscriptions are
 unavailable" proof).
 
-- [ ] **Step 6: Run all nine tests** — expected FAIL.
+- [ ] **Step 6: Run every test added in Steps 1-5** — expected FAIL.
 
 - [ ] **Step 7: Implement** the wire-id recognition,
 `enrichment_subscriptions`, the isolated enrichment reader with
@@ -595,13 +632,25 @@ the backstop).
   reasons; `load_all_scenario_outcomes` accumulates the records and the
   entrypoints receive them for sidecar writing. Declared mechanical
   ripple: `read_and_validate_reference_outcome` has 16 call sites
-  (`tests/common/workload.rs` 3097 — the self-validation re-read, which
-  receives the caller's mode — 6051, and 7328, plus 13 in
-  `tests/workload_harness.rs`), and `load_all_scenario_outcomes` has 3
-  (5096, 5128, 5129); every site outside the two closing entrypoints
-  passes `Off`, and the site at line 6051 — candidate validation inside
-  the REAL measurement path — is explicitly mandatory-`Off` so no
-  measurement can ever reclassify.
+  (`tests/common/workload.rs` 3097 — the self-validation re-read — 6051,
+  and 7328, plus 13 in `tests/workload_harness.rs`), and
+  `load_all_scenario_outcomes` has 3 (5096, 5128, 5129); every site
+  outside the two closing entrypoints passes `Off`, and the site at line
+  6051 — candidate validation inside the REAL measurement path — is
+  explicitly mandatory-`Off` so no measurement can ever reclassify. The
+  self-validation re-read has no mode path today:
+  `Section15ReDerivationV1::validate()` (lines 1116-1118) calls
+  `validate_section15_selected_evidence` directly and the closing
+  entrypoint invokes `.validate()` at line 5142 — so the plan declares a
+  mode-carrying variant `validate_with_mode(&self, legacy:
+  AmendedLegacyMode)`, with `validate()` delegating to
+  `validate_with_mode(Off)` (every existing caller byte-identical) and
+  the closing entrypoint switched to `validate_with_mode(AcceptAmendedLegacy)`.
+  Sidecar record provenance: the entrypoint takes its
+  `ReclassificationRecordV1` values ONLY from its primary
+  `load_all_scenario_outcomes` pass; records surfacing from the
+  self-validation re-read are discarded, and the sidecar lists at most
+  one record per scenario.
   Only the two closing entrypoints translate the environment flag
   `HERDR_PERF_ACCEPT_AMENDED_LEGACY=1` into that parameter, reading it
   once at entry. Their closed-environment gate

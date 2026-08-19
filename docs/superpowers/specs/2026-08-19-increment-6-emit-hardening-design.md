@@ -180,22 +180,34 @@ and cleared only by flush or target-set removal). The flush runs once
 at the Live transition — after replay, so it never interleaves with
 replayed primary events — under two suppression rules, because applying
 a herdr-sourced event is NEVER a no-op (each receipt gets a fresh event
-identity and an unconditional ledger row): first, a WATERMARK drops
-every buffered event that arrived before the snapshot response arrived
-(the pre-capture generation — the snapshot itself carries that state,
-and a stale different-status leftover must not regress newer snapshot
-truth or touch a stale-marked execution); second, a STATUS-DIFFERS
-filter applies a surviving event only if its status differs from the
-pane's current modeled status (a transition the replay already
-re-established flushes to nothing instead of duplicating a ledger row),
-and events for panes absent from the converged model are dropped.
+identity and an unconditional ledger row). First, a WATERMARK — ordered
+by one shared atomic arrival counter and advanced at every snapshot
+response, so it always names the most recent snapshot — drops every
+buffered event that arrived before that response (the pre-capture
+generation: the snapshot itself carries that state, and a stale
+different-status leftover must not regress newer snapshot truth).
+Second, a per-EXECUTION filter (pane records carry no status; status
+lives on executions, and one pane can host several): a surviving event
+is dropped entirely unless its pane belongs to the most recent
+snapshot's pane set — snapshot membership, not model presence, because
+a snapshot-removed pane lingers in the model through stale grace and
+flushing into it would resurrect it — and, for a member pane, the
+transition applies only to matching executions that are non-terminal,
+not in stale grace, and whose state family differs from the event's
+status, so a transition the replay already re-established flushes to
+nothing instead of duplicating a ledger row. An episode that never
+reaches the flush point keeps its bounded buffer, with the watermark
+still advancing per snapshot, and the first flush drains it.
 Transitions inside the episode window coalesce to the final state and
 the watermark can drop a transition that raced the snapshot response
 within network jitter — bounded fidelity loss of the same class the
 fallback family already accepts, and far narrower than the whole
-episode window. While the primary is converged, the per-transition
-restoration below holds exactly; during an episode it degrades to
-final-state coalescing.
+episode window. The per-transition restoration below holds exactly
+while the primary is converged AND the enrichment subscription is
+healthy; during a convergence episode it degrades to final-state
+coalescing, and during an enrichment outage — which can outlast any
+single retry attempt — it is suspended entirely, with only the fallback
+family covering, until the per-stream health recovers.
 
 The existing derivation of agent status from `pane.updated` payloads remains
 in place as the fallback path; the scoped subscription restores the richer
