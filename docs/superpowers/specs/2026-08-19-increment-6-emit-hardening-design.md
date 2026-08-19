@@ -142,6 +142,18 @@ subscription is benign — must be verified against the live server during
 planning; the design permits either explicit removal or documented benign
 abandonment, but not silent accumulation without evidence.
 
+The scoped subscriptions ride a dedicated secondary connection, separate
+from the primary subscription connection, because live herdr accepts
+exactly one `events.subscribe` per connection. The primary connection and
+its convergence lifecycle are untouched: replacing the secondary
+enrichment connection on a pane-set change is NOT an observation gap in
+the design's sense — the primary stream and the `pane.updated` fallback
+remain continuous throughout, so no execution is retired and no collector
+gap is recorded. Live herdr also decorates the response id on the
+subscribe error path (observed: `<id>:sub:<index>:<token>`), so the wire
+client must recognize a decorated error response as belonging to its
+request before the collector can read `pane_not_found`.
+
 The existing derivation of agent status from `pane.updated` payloads remains
 in place as the fallback path; the scoped subscription restores the richer
 event stream: transition-timestamp fidelity, the ledger row and activity
@@ -233,10 +245,22 @@ measurement attempt:
    amendment referencing the frozen Increment 5 plan; the frozen plan file
    itself is not rewritten).
 2. Re-run the re-derivation and the D4 checkpoint over the preserved
-   attempt-20260826 results (subject `e86e0ef`). Expected decision:
-   `no_miss_d4_not_authorized`. Both regenerated documents are preserved
-   alongside the originals with their hashes recorded. This closes
-   `AmendmentsRequired[non_d4]`.
+   attempt-20260826 results (subject `e86e0ef`), binding BOTH required
+   result roots (the preserved baseline attempt 20260822 and the preserved
+   final attempt 20260826). The stored-outcome reader validates a recorded
+   `Failed` document by re-deriving its failure set, so under the amended
+   validator the preserved burst document (recorded `failed`, every flagged
+   sample the tolerated shape) would re-derive empty and be rejected as an
+   invalid artifact. The re-derivation entrypoint therefore gains an
+   explicit legacy-reclassification mode, used only by this closing path:
+   a stored `Failed` document is reclassified as an amended pass if and
+   only if its recorded `failure_reasons` equal exactly
+   `["supported_load_degradation"]` AND the amended predicate derives no
+   failure from its evidence; any other divergence between recorded and
+   derived outcomes remains fail-closed. Reclassification is recorded in
+   the regenerated report. Expected decision: `no_miss_d4_not_authorized`.
+   Both regenerated documents are preserved with their hashes recorded.
+   This closes `AmendmentsRequired[non_d4]`.
 3. Independently, run one full confirmation measurement (next fresh attempt
    identifier 20260827) at the post-Phase-A/B head under the same
    fail-closed protocol as Increment 5, comparing against the Increment 5
@@ -281,9 +305,17 @@ Behavioral rules:
 1. The adapter never blocks or fails an agent session. Malformed input, an
    unmapped event, an unresolvable session, and every delivery failure exit
    with status 0 after at most a warning. `--strict` remains available but
-   reference registrations never use it.
+   reference registrations never use it. In adapter mode nothing is written
+   to standard output — both CLIs parse hook stdout as structured hook
+   output, and Codex validates it against a closed schema and marks the
+   hook invalid on any unrecognized JSON — so all adapter diagnostics go to
+   standard error.
 2. Event identifiers are unique per invocation with a deterministic prefix:
-   `hook:<provider>:<native-session-id>:<hook-event>:<entity>[:<transition>]:<emitted-at-ms>`.
+   `hook:<provider>:<native-session-id>:<hook-event>:<entity>:<transition>:<emitted-at-ms>:<nonce>`.
+   The transition segment is mandatory on every event (two events mapped
+   from one hook invocation must never share an identifier), and the nonce
+   is a per-invocation random component, because millisecond timestamps
+   alone can collide across two invocations in the same millisecond.
    A fully deterministic identifier would be wrong: a session resume fires
    `SessionStart` again, and its `task_started` must reactivate the run,
    but an identifier already present in the deduplication ledger returns
@@ -308,24 +340,41 @@ Behavioral rules:
    `SessionEnd` maps to nothing.
 6. Labels carry structural metadata only — agent type, task subject — never
    prompt, response, or transcript content, per design section 14.
-   `last_assistant_message` is never forwarded.
+   `last_assistant_message` is never forwarded. Design decision, recorded:
+   `task_subject` and `agent_type` are Controller-declared descriptions of
+   orchestration structure, the exact material the design's
+   Controller-supplied `label` exists to carry, and they pass the design's
+   existing sanitization (256-byte cap, control-character escaping,
+   UTF-8-safe truncation); fields that are prompt-, response-, or
+   tool-derived (`prompt`, `description`, `last_assistant_message`, tool
+   inputs) are never read by the adapter, and a sentinel test pins that.
+7. Within one hook invocation the mapped envelopes are delivered strictly
+   in order and delivery stops at the first failure: delivering a child's
+   `task_started` after its `dispatch` failed would create a permanently
+   unlinked run. A terminal event arriving from a later hook while an
+   earlier one was lost still lands as a forward-referenced terminal run,
+   flagged in diagnostics — a documented degraded outcome, not corruption.
+   Because hooks run in parallel, a terminal hook can occasionally deliver
+   before its start hook; the start's `task_started` is then rejected as
+   `stale_event`, which is harmless and logged only.
 
 Event mapping:
 
-| Hook event (Claude Code / Codex) | Emitted events | Subject |
-| --- | --- | --- |
-| `SessionStart` / `session_start` | `task_started` with binding identity | session run |
-| `SubagentStart` / `subagent_start` | `dispatch` (parent: session run) then `task_started`, label = agent type | subagent run |
-| `SubagentStop` / `subagent_stop` | `complete` | subagent run |
-| `TaskCreated` (Claude Code) | `dispatch` (parent: session run) then `progress` (creates the run queued via the forward-reference rule), label = task subject | task run |
-| `TaskCompleted` (Claude Code) | `complete` | task run |
-| `SessionEnd` / `session_end`, all others | nothing | — |
+Both CLIs use identical PascalCase hook event names (verified against the
+installed Codex binary's embedded hook schemas, whose `hook_event_name`
+constants are `SessionStart`, `SessionEnd`, `SubagentStart`,
+`SubagentStop`, and whose `subagent-start.command.input` schema REQUIRES
+`agent_id` and `agent_type` — so the Codex subagent rows are
+unconditional, not subject to a runtime probe):
 
-The Codex subagent rows are conditional on a planning-time verification:
-the Codex payload must carry a usable subagent identity for
-`subagent_start`/`subagent_stop`. If it does not, the Codex adapter ships
-session-level mapping only in this increment and the gap is recorded as a
-follow-up rather than approximated.
+| Hook event (both CLIs) | Emitted events | Subject |
+| --- | --- | --- |
+| `SessionStart` | `task_started` with binding identity | session run |
+| `SubagentStart` | `dispatch` (parent: session run) then `task_started`, label = agent type | subagent run |
+| `SubagentStop` | `complete` | subagent run |
+| `TaskCreated` (Claude Code only) | `dispatch` (parent: session run) then `progress` (creates the run queued via the forward-reference rule), label = task subject | task run |
+| `TaskCompleted` (Claude Code only) | `complete` | task run |
+| `SessionEnd`, all others | nothing | — |
 
 ### C2: setup documentation
 
@@ -342,7 +391,11 @@ surface can derive.
 
 ### C3: live acceptance
 
-On the real environment: register the hooks for both CLIs, run a session
+On the real environment: rebuild the release binary at the integrated head
+and reinstall it to the standalone CLI location, verifying the installed
+binary's version and digest before any registration (hooks registered
+against a stale installed binary would silently exercise the old CLI);
+then register the hooks for both CLIs, run a session
 with at least one subagent dispatch under each provider, and verify in the
 TUI that the session runs bind to their observed executions (no `unbound`
 diagnostic for them), subagent runs appear as children with correct
@@ -402,8 +455,7 @@ reference registrations.
 4. B2's six backlog items, the permissiveness re-adjudications, and the
    guard-ordering change are landed before the confirmation measurement.
 5. The adapter, registrations, and setup document are landed with the full
-   mapping-table test suite; C3 live acceptance passes for both providers,
-   or the Codex subagent gap is explicitly recorded per C1.
+   mapping-table test suite; C3 live acceptance passes for both providers.
 6. The final whole-change review is complete, including the hot-path
    neutrality verification for Phase C.
 
@@ -415,7 +467,9 @@ reference registrations.
   verify against the live environment before freezing task briefs):
   (1) the exact live herdr version-query response form;
   (2) herdr's subscription-removal semantics for scoped subscriptions;
-  (3) the Codex `subagent_start`/`subagent_stop` payload identity fields;
+  (3) the Codex `SubagentStart`/`SubagentStop` payload identity fields
+  (RESOLVED at planning time: the installed binary's embedded schemas
+  require `agent_id` and `agent_type`);
   (4) how herdr wires its Claude Code integration hook, to prove
   coexistence; (5) whether the in-product help text names a setup-document
   destination that C2 must satisfy.

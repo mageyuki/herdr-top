@@ -68,21 +68,37 @@ re-derives them with the listed commands.
    `subscription_started`; including a nonexistent pane answers error code
    `pane_not_found` with the pane id in the message and rejects the whole
    request; the herdr binary exposes no `events.unsubscribe` method
-   (`strings ~/.local/bin/herdr | grep -o 'events\.[a-z_]*'`).
+   (`strings ~/.local/bin/herdr | grep -o 'events\.[a-z_]*'`). On the
+   subscribe ERROR path the server decorates the response id — observed
+   `<request-id>:sub:<index>:<token>` — while the success path echoes the
+   id verbatim; the wire client's strict id-equality check therefore turns
+   every subscribe error into `WireError::UnexpectedResponse`
+   (`src/herdr/wire.rs:236-246`), and Task 2 must teach it to recognize
+   decorated error ids before `pane_not_found` is reachable.
 3. Claude Code hooks (official docs, code.claude.com/docs/en/hooks.md):
    events include `SessionStart`, `SessionEnd`, `SubagentStart`
    (`agent_id`, `agent_type`), `SubagentStop`, `TaskCreated`/`TaskCompleted`
    (`task_id`, `task_subject`); `session_id` and `hook_event_name` are
    always present; hooks inherit the process environment; headless `-p`
    sessions fire the same events; exit 0 never blocks.
-4. Codex CLI 0.147.0: `hooks` feature stable and enabled; registration in
-   `~/.codex/hooks.json` with the same schema as Claude Code; event set
-   includes `session_start`, `session_end`, `subagent_start`,
-   `subagent_stop`; hook stdin carries `hook_event_name`, `session_id`,
-   `transcript_path` (proven by herdr's own installed integration script,
-   which parses exactly those fields); hook trust (`trusted_hash`) applies.
-   The `subagent_start`/`subagent_stop` payload identity fields are NOT yet
-   verified — Task 10 resolves this empirically before the adapter tasks.
+4. Codex CLI (self-updating; 0.148.0 at plan revision — re-derive the
+   version at execution time with `codex --version`): `hooks` feature
+   stable and enabled; registration in `~/.codex/hooks.json` with the same
+   schema as Claude Code; hook event names are PascalCase and IDENTICAL to
+   Claude Code's — the binary's embedded hook schemas carry
+   `hook_event_name` constants `SessionStart`, `SessionEnd`,
+   `SubagentStart`, `SubagentStop`, `Stop` and NO snake_case variants
+   (re-derive: `strings -a ~/.local/bin/codex | grep -A1 '"hook_event_name"' | grep '"const"'`).
+   The `subagent-start.command.input` schema REQUIRES `agent_id`,
+   `agent_type`, `session_id`, `transcript_path` (among others) and
+   `subagent-stop.command.input` requires `agent_id`,
+   `agent_transcript_path`, `agent_type` — so the Codex subagent mapping
+   rows are unconditional. Codex parses hook stdout as JSON against a
+   CLOSED output schema (`session-start.command.output` etc.,
+   `additionalProperties: false`) and marks the hook invalid on any
+   unrecognized JSON ("hook returned invalid session start JSON output"),
+   so the adapter must write nothing to stdout. Hook trust
+   (`trusted_hash`) applies.
 5. The in-product notice and help text (`src/tui/view.rs`, `notice_lines`
    and `help_lines`) name no setup-document destination, so Task 13 may
    choose `docs/guides/controller-emit-setup.md` freely and no TUI text
@@ -103,7 +119,12 @@ re-derives them with the listed commands.
 **Files:**
 - Modify: `src/diagnostics/remote.rs` (function `assess_official_integration`
   near line 114, helper `normalize_integer` near line 616, module tests)
-- Test: same file, `mod tests`
+- Test: same file, `mod tests`; plus `src/doctor.rs` `mod tests` renderer
+  coverage (the spec requires integer, date-form, and malformed inputs
+  exercised through BOTH the human and JSON renderers — assert the
+  `compatibility.integrations` check row renders the verbatim date-form
+  `active_version` and the correct code in each renderer for all three
+  input classes)
 
 **Interfaces:**
 - Consumes: `AgentManifestStatus` (unchanged), `OfficialIntegrationStatus`,
@@ -214,77 +235,115 @@ Expected: PASS, no existing test regresses.
 ### Task 2: per-pane agent-status subscriptions
 
 **Files:**
-- Modify: `src/herdr/collector.rs` (`subscriptions()` near line 3919, the
-  subscribe site near line 1462, pane-set tracking in the event loop,
-  module tests including
+- Modify: `src/herdr/collector.rs` (the primary subscribe site near line
+  1462 stays untouched in behavior; new enrichment-connection management;
+  pane-set tracking; module tests including
   `unscoped_subscriptions_omit_pane_scoped_agent_status_event` near line
   5827)
+- Modify: `src/herdr/wire.rs` (response-id matching near lines 236-246:
+  recognize decorated error ids)
 - Modify (only if the `Subscription` type lacks an optional `pane_id`
   field): `src/herdr/types.rs`
-- Test: `src/herdr/collector.rs` module tests; `tests/convergence.rs`
-  stays green unchanged.
+- Test: `src/herdr/collector.rs` module tests; `src/herdr/wire.rs` module
+  tests; `tests/convergence.rs`.
 
 **Interfaces:**
-- Produces: `fn subscriptions_for_panes(pane_ids: &BTreeSet<String>) -> Vec<Subscription>`
-  replacing the argumentless `subscriptions()`; base list identical to
-  today's 15 unscoped types plus one
-  `pane.agent_status_changed` entry per pane id.
-- Consumes: reality facts 2 (one subscribe per connection; whole-request
-  rejection on `pane_not_found`).
+- Produces: `fn enrichment_subscriptions(pane_ids: &BTreeSet<String>) -> Vec<Subscription>`
+  building one `pane.agent_status_changed` entry per pane id (the primary
+  connection keeps today's argumentless `subscriptions()` and its 15
+  unscoped types, byte-identical); a wire-client change so an error
+  response whose id equals the expected id OR starts with the expected id
+  followed by `:` is accepted as this request's error and surfaces as
+  `WireError::Server { code, message }` (Task 3 consumes this for its
+  server-rejection regression).
+- Consumes: reality fact 2 (one subscribe per connection; whole-request
+  rejection on `pane_not_found`; decorated error ids).
 
-Behavior:
+Behavior — the scoped subscriptions ride a DEDICATED secondary
+"enrichment" connection (spec section "A2"); the primary subscription
+connection, its startup order, and its gap/convergence semantics are
+untouched. Design section 9.2 forbids treating pane churn as an
+observation gap: a new subscription connection's first snapshot is a gap
+reconciliation that retires every pre-gap execution
+(`src/herdr/collector.rs:1614-1620`), so the pane-scoped stream must
+never ride the primary connection's lifecycle.
 
-1. The collector derives the target pane set from the converged snapshot
-   and keeps it current from `pane.updated` and pane-removal events.
-2. When the target set differs from the subscribed set, the collector
-   triggers its existing reconnect-and-resubscribe convergence cycle (the
-   same machinery as overflow recovery: fresh subscription connection with
-   the full new list, then the bounded in-place resnapshot). No attempt is
-   made to add subscriptions on the live connection (reality fact 2). Pane
-   churn is human-scale, so a resubscribe per change is acceptable;
-   coalescing multiple changes arriving during one cycle into the next
-   single resubscribe is required (no per-event storm).
-3. If subscribe fails with `pane_not_found`, the collector prunes exactly
-   the named pane id from the target set and retries within the existing
-   retry flow; other errors keep the existing warn-and-retry behavior.
-4. The `pane.updated`-derived agent-status fallback path stays byte-level
-   untouched; scoped events restore timestamp fidelity, ledger rows and
-   activity items, rate accounting, and the fourth topology-closure rescue
-   trigger through the existing `pane_agent_status_changed` handler
-   (near line 3360), which already consumes `pane_id` (line 4544).
+1. After the primary connection converges, the collector derives the
+   target pane set from the converged model and keeps it current from
+   `pane_created` / pane-removal handling (note: creation flows through
+   `pane_created`; `pane_updated` silently ignores unknown panes —
+   `src/herdr/collector.rs:3287-3300`).
+2. On a pane-set change, the collector opens a NEW enrichment connection
+   subscribed to `enrichment_subscriptions(target_set)` and closes the old
+   one after the new subscription is acknowledged. Changes arriving while
+   a swap is in flight coalesce into the next single swap (no per-event
+   storm). Enrichment-connection replacement records no collector gap,
+   retires no execution, and performs no resnapshot: the primary stream
+   and the `pane.updated` fallback stay continuous throughout, and a
+   transition missed during a swap is bounded fidelity loss the fallback
+   family already covers.
+3. If the enrichment subscribe fails with `WireError::Server` code
+   `pane_not_found`, the collector parses the pane id from the message,
+   prunes exactly that id from the target set, and retries; other errors
+   warn (through Task 3's edge-triggered path) and retry with the existing
+   backoff. Enrichment failures never degrade the primary connection's
+   observation quality.
+4. Events arriving on the enrichment connection feed the existing
+   `pane_agent_status_changed` handler (near line 3360; its `pane_id`
+   read is at lines 3368-3369), restoring timestamp fidelity, ledger rows
+   and activity items, rate accounting, and the fourth topology-closure
+   rescue trigger. The `pane.updated`-derived fallback stays byte-level
+   untouched.
 5. The stale reality comment at lines 3935-3937 is replaced by the new
    contract description.
 
-- [ ] **Step 1: Write failing wire-level test**: real `UnixListener` accepts
-the subscribe request and the test asserts the outbound payload contains
-one `pane.agent_status_changed` entry per snapshot pane with matching
-`pane_id`, alongside the unchanged unscoped list. Model on the existing
-wire-level pattern of `unscoped_subscriptions_omit_pane_scoped_agent_status_event`,
-which this test replaces (delete the omission assertion; it is now false by
-design).
+- [ ] **Step 1: Write failing wire-id test** in `src/herdr/wire.rs`
+`mod tests`: an error envelope with id `req:sub:1:probe` for expected id
+`req` decodes to `WireError::Server { code: "pane_not_found", .. }`; an
+error with an unrelated id (`other:sub:1:probe`) still fails as
+`UnexpectedResponse`; a success envelope with a decorated id remains
+`UnexpectedResponse` (success echoes verbatim — reality fact 2).
 
-- [ ] **Step 2: Write failing prune-retry test**: listener answers the first
-subscribe with `{"error":{"code":"pane_not_found","message":"pane w9:p99 not found"}}`
-and the second subscribe succeeds; assert the second request omits exactly
-`w9:p99` and the collector reaches its subscribed state.
+- [ ] **Step 2: Write failing enrichment-subscribe test**: real
+`UnixListener` plays the enrichment endpoint; after primary convergence
+with two panes the collector opens the enrichment connection and the test
+asserts its subscribe payload is exactly one `pane.agent_status_changed`
+entry per pane with matching `pane_id` and nothing else; the primary
+connection's subscribe payload stays the unchanged unscoped list (replace
+the omission test at line 5827 with this pair of assertions).
 
-- [ ] **Step 3: Write failing pane-set-change test**: after convergence with
-one pane, deliver a `pane.updated` for a new pane; assert the collector
-opens a new subscription connection whose list includes both panes (listener
-observes a second subscribe request).
+- [ ] **Step 3: Write failing prune-retry test**: the enrichment listener
+answers the first subscribe with the DECORATED error frame
+`{"id":"<request-id>:sub:1:probe","error":{"code":"pane_not_found","message":"pane w9:p99 not found"}}`
+(the mandatory `id` mirrors live herdr; an id-less error does not even
+deserialize as `ResponseEnvelope`), and the second subscribe succeeds;
+assert the second request omits exactly `w9:p99`.
 
-- [ ] **Step 4: Run the three tests** — expected FAIL (current code never
-scopes).
+- [ ] **Step 4: Write failing pane-created swap test**: after enrichment
+convergence with one pane, deliver a `pane_created` event for a new pane
+on the primary stream; assert the enrichment listener observes a second
+subscribe containing both panes, and assert NO collector gap is recorded
+and no execution retires (query the persisted ops / reducer state the
+existing gap tests use).
 
-- [ ] **Step 5: Implement** `subscriptions_for_panes`, target-set tracking,
-resubscribe trigger, and prune-on-`pane_not_found`, reusing the existing
-reconnect machinery. Keep the change inside the collector; do not touch the
-reducer or writer.
+- [ ] **Step 5: Write failing fallback-unavailable convergence test**: with
+the enrichment endpoint permanently refusing connections, drive the
+existing convergence scenario and assert agent-status still converges via
+the `pane.updated` fallback with observation quality unchanged (this is
+the spec's "fallback path unchanged when scoped subscriptions are
+unavailable" proof).
 
-- [ ] **Step 6: Run collector suite + `tests/convergence.rs`** — all green,
-fallback tests unchanged.
+- [ ] **Step 6: Run the five tests** — expected FAIL.
 
-- [ ] **Step 7: Full verification, then commit**
+- [ ] **Step 7: Implement** the wire-id recognition,
+`enrichment_subscriptions`, the enrichment-connection manager with
+coalesced swaps, and prune-on-`pane_not_found`. Do not touch the reducer,
+writer, or the primary connection's startup order.
+
+- [ ] **Step 8: Run collector suite + wire suite + `tests/convergence.rs`**
+— all green, fallback tests unchanged.
+
+- [ ] **Step 9: Full verification, then commit**
 `feat(collector): subscribe pane agent status per pane`
 
 ### Task 3: subscription-warning throttle and rejection-variant regression
@@ -306,9 +365,14 @@ continues.
 retries, count warning emissions via the existing test logging capture used
 by the PR #5 disconnect test; assert exactly one).
 - [ ] **Step 2: Write failing server-rejection regression** (wire error
-answer; assert `herdr_subscription_failed` with the error `Display` and
-continued retry).
-- [ ] **Step 3: Verify both fail.**
+answer with the decorated id shape from Task 2 Step 3, surfacing as
+`WireError::Server`; assert `herdr_subscription_failed` with the error
+`Display` and continued retry).
+- [ ] **Step 2b: Write failing recovery-notice test** (failed retries, then
+a successful subscribe; assert exactly one recovery notice is logged on
+the failed-to-healthy transition — the spec requires the notice, not only
+the warning).
+- [ ] **Step 3: Verify all three fail.**
 - [ ] **Step 4: Implement the health-edge state in the collector's
 subscribe/retry loop.**
 - [ ] **Step 5: Suite green; full verification; commit**
@@ -317,17 +381,30 @@ subscribe/retry loop.**
 ### Task 4: F3 — performance watch BrokenPipe
 
 **Files:**
-- Modify: `src/tui/app.rs` (`HeaderInputs::default` near line 174; the
-  performance watch refresh; mirror the model watch's BrokenPipe handling
-  near line 615)
+- Modify: `src/tui/app.rs` (`HeaderInputs::default` at line 170; the
+  performance watch read at line 615, mirroring the model watch's
+  BrokenPipe arm at lines 609-613)
 - Test: `src/tui/app.rs` module tests
 
 Verbatim carried prescription (Increment 5 ledger): "fix Default to retain
 a live sender → mirror the model watch's BrokenPipe at :615 → regression
 test (model alive, performance dropped → BrokenPipe)". Today
-`HeaderInputs::default()` constructs and drops its performance sender, so a
-bare error mapping would fail every default-backed `App` on first refresh —
+`HeaderInputs::default()` constructs and drops both senders, so a bare
+error mapping would fail every default-backed `App` on first refresh —
 the Default change must land together with the watch change.
+
+Constraint on the "retain a live sender" mechanism: `HeaderInputs` is a
+public four-field struct constructed with exhaustive literals in 21 places
+across five files (`git grep -n 'HeaderInputs {' -- src tests`: main.rs 1,
+app.rs 10, view.rs 3, coverage_harness.rs 3, workload_harness.rs 4), so
+adding a field — public or private — breaks either those literals or
+external construction. Instead, `Default` keeps its senders alive without
+changing the struct shape: `std::mem::forget(coverage_sender)` and
+`std::mem::forget(performance_sender)` inside `default()` leak the two
+senders deliberately, so their channels never close. The leak is one
+channel pair per `Default` call, and `Default` is a fixture/test
+constructor (production `main.rs:288` builds the literal directly); a
+comment in `default()` states the contract.
 
 - [ ] **Step 1: Write the failing regression**: construct an `App` whose
 model watch is alive while the performance watch's sender is dropped;
@@ -336,9 +413,10 @@ error the model watch path produces (not a panic, not a silent stale
 header).
 - [ ] **Step 2: Verify it fails** (current code ignores the closed
 performance channel or panics — record which).
-- [ ] **Step 3: Implement**: `HeaderInputs::default()` retains a live
-sender (store the sender beside the receiver in the struct); the
-performance-watch read mirrors the model watch's BrokenPipe arm.
+- [ ] **Step 3: Implement**: `HeaderInputs::default()` retains its live
+senders via the documented `mem::forget` leak (struct shape unchanged);
+the performance-watch read at line 615 mirrors the model watch's
+BrokenPipe arm at lines 609-613.
 - [ ] **Step 4: App suite green; full verification; commit**
 `fix(tui): surface performance watch closure as broken pipe`
 
@@ -352,20 +430,32 @@ performance-watch read mirrors the model watch's BrokenPipe arm.
 Verbatim carried prescription: "OwnerLock explicit-Drop flock_unlock +
 fork-before-exec regression (4th fragility sub-class)".
 
-- [ ] **Step 1: Write failing drop test**: acquire the lock, drop the
-`OwnerLock`, then re-acquire on the same path within the same process using
-a second `File` handle; assert immediate success (today release relies on
-process exit closing the descriptor; within one process, re-acquisition
-after drop must succeed only with an explicit unlock).
-- [ ] **Step 2: Write the exec-safety regression**: while holding the lock,
-spawn a real child via `std::process::Command` (a `sleep`-equivalent
-helper binary or `/bin/sh -c 'exec sleep 5'`), then drop the parent's
-guard and assert re-acquisition succeeds while the child still runs —
-pinning that the lock descriptor is not inherited across exec
-(close-on-exec) and that unlock-on-drop is not defeated by a forked child.
-- [ ] **Step 3: Verify both fail or record which already passes** (the
-CLOEXEC half may already hold via std; a currently passing half stays as a
-pinned regression).
+RED premise, corrected: `OwnerLock` is `{ _file: File }`
+(`src/lockfile.rs:25-29`), and dropping it closes the descriptor, which
+already releases `flock` when no other process shares the open file
+description. The same-process drop/re-acquire case therefore ALREADY
+passes and is pinned, not RED. The genuine defect explicit unlock fixes is
+the inherited-descriptor case: `flock` belongs to the open file
+description, so a child that inherited the descriptor keeps the lock alive
+after the parent's close — while `LOCK_UN` releases the lock on the
+description even though the child still holds a descriptor to it.
+
+- [ ] **Step 1: Write the pinned drop test** (expected to pass already;
+records the baseline): acquire the lock, drop the `OwnerLock`, re-acquire
+on the same path within the same process; assert success.
+- [ ] **Step 2: Write the FAILING inherited-descriptor regression**:
+acquire the lock, then spawn a long-lived child (`/bin/sh -c 'sleep 5'`)
+with the lock descriptor deliberately inherited into it (clear
+`FD_CLOEXEC` on a dup of the lock fd passed to the child, simulating the
+fork-before-exec window), drop the parent's guard, and assert re-acquire
+SUCCEEDS while the child still runs. Without explicit `LOCK_UN` this
+fails — the child's descriptor keeps the lock — which is the RED.
+- [ ] **Step 2b: Write the exec-safety pin**: spawn a child through plain
+`std::process::Command` while holding the lock, drop the guard, assert
+re-acquire succeeds — pinning that std's default close-on-exec keeps
+ordinary children from inheriting the lock descriptor.
+- [ ] **Step 3: Verify Step 2 is RED and Steps 1/2b are recorded** (pass
+expected; any surprise stops the task for re-diagnosis).
 - [ ] **Step 4: Implement** `impl Drop for OwnerLock` calling
 `flock_unlock` (best-effort; ignore the error, the descriptor close remains
 the backstop).
@@ -377,28 +467,43 @@ the backstop).
 ### Task 6: amended degradation tolerance in the shared validator
 
 **Files:**
-- Modify: `tests/common/workload.rs` (both degradation-count derivation
-  sites — the scenario-result derivation near the
-  `FailureReasonV1::SupportedLoadDegradation` insertions at lines 2452 and
-  2906, and the Section 15 observed-count consumer near line 7867 noted in
-  the Increment 5 ledger; plus the reason mapping near line 4928)
+- Modify: `tests/common/workload.rs` (the degradation COUNT site at line
+  2419 — `degraded_samples += usize::from(!sample.reasons.is_empty());` —
+  whose failure insertion is at line 2452; the Section 15 observed-count
+  consumer at line 7867 inside `section15_predicate_rows` (declared at
+  lines 7673-7675), whose signature gains the stage; and the
+  stored-outcome reader's legacy-reclassification mode at lines
+  1074-1081)
 - Test: `tests/workload_harness.rs`
 
 **Interfaces:**
-- Produces: `pub fn tolerated_boundary_degradation(sample: &PerformanceSampleEvidenceV1, trial_has_event_lag_reason: bool) -> bool`
+- Produces: `pub fn tolerated_boundary_degradation(stage: MeasurementStageV1, scenario: ScenarioV1, sample: &PerformanceSampleEvidenceV1, trial_has_event_lag_reason: bool) -> bool`
   in `tests/common/workload.rs` (`PerformanceSampleEvidenceV1` is defined
   there at line 400 with `reasons: Vec<PerformanceReasonV1>`), used by
-  every degradation-count site.
+  every degradation-count site; and
+  `section15_predicate_rows(stage: MeasurementStageV1, trial: &TrialResultV1)`
+  — the stage parameter is a declared signature change, plumbed from each
+  call site's scenario document (`document.measurement_stage`), because
+  `HarnessTrialV1` carries `scenario` but no stage (lines 676-706).
+- Produces (Task 8 consumes): a legacy-reclassification mode on the
+  stored-outcome reader, enabled only by the re-derivation entrypoint: a
+  stored `Failed` document whose recorded `failure_reasons` equal exactly
+  `["supported_load_degradation"]` and whose amended re-derivation yields
+  an EMPTY failure set is reclassified as an amended pass, with the
+  reclassification recorded in the regenerated report; every other
+  recorded/derived divergence stays `InvalidArtifact` (fail-closed), and
+  the mode is off everywhere else.
 
-Amended predicate (spec section "B1: the amendment"): at Final stage for
-Sustained and Burst, the acceptance counts only non-tolerated degradation
-samples; a sample is tolerated iff its reason set is exactly
-`{EventsOneSecond}`, its `events_one_second` equals 101 (envelope plus
-one), and the trial carries no `EventLag` reason anywhere. The count
-threshold stays `== 0`. `MissingDegradation` for TwiceTarget is unchanged.
-Both derivation sites and the Section 15 consumer route through the single
-shared function — no reimplementation, mirroring the plan rule that the
-runner never reimplements harness predicates.
+Amended predicate (spec section "B1: the amendment"): the tolerance
+applies only when `stage == Final` and `scenario` is `Sustained` or
+`Burst` — the function returns false for every other stage/scenario, so
+Baseline-stage observed counts are unchanged; a sample is tolerated iff
+its reason set is exactly `{EventsOneSecond}`, its `events_one_second`
+equals 101 (envelope plus one), and the trial carries no `EventLag`
+reason anywhere. The count threshold stays `== 0`. `MissingDegradation`
+for TwiceTarget is unchanged. Both derivation sites route through the
+single shared function — no reimplementation, mirroring the plan rule
+that the runner never reimplements harness predicates.
 
 - [ ] **Step 1: Write the four failing boundary tests** in
 `tests/workload_harness.rs` against the shared function and one end-to-end
@@ -408,12 +513,23 @@ validator case per edge:
   2. same but count 102 → fails with `SupportedLoadDegradation`;
   3. same but reasons `[EventsOneSecond, LivePanes]` → fails;
   4. same but another sample in the trial carries `[EventLag]` → fails.
-- [ ] **Step 2: Verify all four fail** (edge 1 fails today; 2-4 pass today
-for the wrong reason — assert on the tolerated-count field so all four are
-discriminating; RED must show edge 1 red).
-- [ ] **Step 3: Implement the shared function and route all sites.**
-- [ ] **Step 4: Harness suite green** (feature-gated suite plus doctests).
-- [ ] **Step 5: Full verification; commit**
+- [ ] **Step 2: Verify the RED gate precisely**: edge 1 must be RED today
+(the validator still fails the tolerated shape); edges 2-4 assert against
+the shared function and the non-tolerated count directly, so they are RED
+today because neither exists yet. Record the four observed failures.
+- [ ] **Step 3: Implement the shared function, the stage plumbing, and
+route both sites.**
+- [ ] **Step 4: Write the three failing reclassification tests**: (a)
+stored `Failed` burst document with recorded
+`["supported_load_degradation"]` whose every flagged sample is the
+tolerated shape → reclassified amended pass, recorded in the output; (b)
+same recorded reasons but one flagged sample at 102 → recorded and
+derived failure sets agree, so the document stays a valid `Failed` and is
+never reclassified; (c) recorded reasons
+`["supported_load_degradation"]` with a derived nonempty DIFFERENT set →
+`InvalidArtifact` (fail-closed). Then implement the mode and verify green.
+- [ ] **Step 5: Harness suite green** (feature-gated suite plus doctests).
+- [ ] **Step 6: Full verification; commit**
 `fix(perf): tolerate one-quantum boundary degradation at final acceptance`
 
 ### Task 7: measurement-harness hardening batch
@@ -425,9 +541,15 @@ re-locate by symbol at execution time.
 
 **Files:**
 - Modify: `tests/support/reference_profile_controller.rs` (sub-change 1)
-- Modify: `tests/common/workload.rs` (sub-changes 2, 6)
+- Modify: `tests/common/workload.rs` (sub-change 2)
 - Modify: `scripts/run-reference-profile.sh` (sub-changes 3, 4, 5)
-- Test: `tests/workload_harness.rs` (all sub-changes)
+- Modify: `src/operator.rs` (sub-change 6: the private `compare_activity`
+  at line 252 gains a feature-gated export; the sibling copy at
+  `src/tui/projection.rs:502` is out of scope and untouched)
+- Test: `tests/workload_harness.rs` (all sub-changes; sub-change 6 deletes
+  the byte-identical mirror `compare_reference_activity` at line 9152 and
+  keeps its ordering assertion pointed at the exported production
+  comparator)
 
 Sub-changes:
 
@@ -453,13 +575,30 @@ Sub-changes:
    (items 2 and 4 interact): one-command identity window;
    group-publication windows; publisher temp blocking rmdir; unsignalled
    orchestration wait bounded by the scenario deadline.
+   Test contract (one named harness test per race, driven through the
+   source-mode runner fixtures the errexit fix established):
+   `outer_trap_identity_window_is_single_command` (interrupt inside the
+   former multi-command identity window; assert the trap records a
+   coherent identity), `outer_trap_group_publication_is_atomic`
+   (interrupt during group publication; assert no partial group is
+   observable), `publisher_temp_never_blocks_rmdir` (plant a leftover
+   publisher temp; assert cleanup succeeds), and
+   `orchestration_wait_is_deadline_bounded` (never-signalling child;
+   assert the wait returns at the scenario deadline instead of hanging).
 5. Fixture-write TOCTOU class — harden `publish_runner_test_outcome`,
    `publish_trial_status`, `validate_fixture_output_path`, and the trap
-   marker with the offered two-token guards (`! -L` and `! -p`).
+   marker with the offered two-token guards (`! -L` and `! -p`). Test
+   contract: for each of the four sites, one named test plants a symlink
+   and one plants a FIFO at the destination and asserts the write is
+   refused with the guard's diagnostic (RED first: today's behavior
+   follows or overwrites, failing the new expectation).
 6. Comparator exposure — "exposing the production comparator under the
-   feature would remove the duplication": export `compare_activity` under
-   the harness feature and delete the byte-identical startup mirror,
-   keeping the ordering assertion that made mirror drift fail closed.
+   feature would remove the duplication": give `src/operator.rs`'s private
+   `compare_activity` (line 252) a feature-gated
+   (`workload-harness`) public export, delete the byte-identical mirror
+   `compare_reference_activity` (`tests/workload_harness.rs:9152`), and
+   keep the ordering assertion that made mirror drift fail closed, now
+   exercising the production comparator directly.
 
 Permissiveness re-adjudication (recorded decisions, not silent carries):
 the bounded trailing-EventLag admission and the `last_pre_origin` expect
@@ -495,12 +634,20 @@ Increment 5 research workspace (~370 MB, preserved; report SHA-256
   Section 15 re-derivation entrypoint and the D4 checkpoint classifier
   (the same native Controller-launch bootstrap and
   `classify_d4_checkpoint_from_results` entrypoints the Increment 5 plan
-  defined, with their HEAD/clean predicates) against the preserved root,
-  writing the regenerated documents into the Increment 6 research
-  workspace — never into the repository or the preserved root. This
-  refines the spec's "preserved alongside the originals": the preserved
-  root stays immutable, and the workspace records the original and
-  regenerated document hashes side by side.
+  defined, with their HEAD/clean predicates), binding BOTH required roots —
+  `HERDR_PERF_REDERIVE_BASELINE_RESULTS_ROOT` to the preserved baseline
+  attempt 20260822 and `HERDR_PERF_REDERIVE_FINAL_RESULTS_ROOT` to the
+  preserved final attempt 20260826 (`tests/common/workload.rs:5111-5115`) —
+  with Task 6's legacy-reclassification mode enabled for the stored-outcome
+  read (without it the preserved burst document, recorded `failed` with
+  every flagged sample the tolerated shape, re-derives an empty failure
+  set and is rejected as `InvalidArtifact` by the stored-outcome validator
+  at `tests/common/workload.rs:1074-1081`). Regenerated documents are
+  written into the Increment 6 research workspace — never into the
+  repository or the preserved roots. This refines the spec's "preserved
+  alongside the originals": the preserved roots stay immutable, and the
+  workspace records the original and regenerated document hashes side by
+  side, including the reclassification record.
 - [ ] **Step 3** Expected: decision `no_miss_d4_not_authorized` from both.
   Record regenerated document hashes and the closure in the Increment 6
   ledger. Any other decision stops the increment for user consultation.
@@ -530,26 +677,21 @@ re-derivation, D4 checkpoint), with the amended validator from Task 6.
 
 ## Phase C: emit calling side
 
-### Task 10: Codex subagent payload probe (operational, throwaway)
+### Task 10: RESOLVED AT PLANNING TIME — no work
 
-Decision input for Tasks 11-13 (spec: the Codex subagent mapping rows are
-conditional on a usable identity in the payload).
-
-- [ ] **Step 1** Create an isolated `CODEX_HOME` under the session
-  scratchpad with a minimal config and a `hooks.json` registering
-  `SessionStart`, `SubagentStart`, and `SubagentStop` command hooks that
-  append their stdin to a capture file. Never touch `~/.codex`.
-- [ ] **Step 2** Run one bounded `codex exec` (pinned model `gpt-5.6-sol`)
-  with a prompt that instructs delegating a trivial subtask to a subagent.
-  If the run spawns no subagent after two bounded attempts, the probe
-  concludes "not provocable" — that outcome selects the session-level
-  branch, it does not fail the task.
-- [ ] **Step 3** Record the captured payloads (redacting nothing beyond
-  content fields, which the capture must not persist) in the Increment 6
-  research workspace, and decide: identity fields present → Tasks 11-12
-  implement the full Codex mapping rows; absent or not provocable →
-  session-level rows only, gap recorded in the ledger and in Task 13's
-  document.
+The question this task existed to answer (does the Codex
+`SubagentStart`/`SubagentStop` payload carry a usable subagent identity?)
+is answered by the installed binary's embedded hook schemas:
+`subagent-start.command.input` REQUIRES `agent_id` and `agent_type`, and
+`subagent-stop.command.input` requires `agent_id`,
+`agent_transcript_path`, `agent_type` (planning fact 4; re-derive with
+`strings -a ~/.local/bin/codex | grep -B45 '"title": "subagent-start.command.input"' | grep -A12 '"required"'`).
+A runtime probe would also have been unexecutable cleanly: `codex exec
+--ignore-user-config` still uses `CODEX_HOME` auth and hook trust is
+path-bound, so "no subagent observed" could not be distinguished from an
+auth or trust failure. The Codex mapping rows in Tasks 11-13 are
+therefore UNCONDITIONAL. Task numbering is retained to keep references
+stable; no steps execute.
 
 ### Task 11: hook mapping module
 
@@ -584,40 +726,65 @@ pub fn map_hook_payload(
     provider: HookProvider,
     payload: &HookPayload,
     emitted_at_ms: i64,
+    invocation_nonce: u64,
 ) -> Vec<ControllerEnvelope>
 ```
 
-Mapping (spec table; every envelope: `schema_version` 1, `source`
-`hook:claude-code`|`hook:codex`, `provider` `claude-code`|`codex`,
-`emitted_at_ms` as passed, `event_id`
-`hook:<provider>:<session_id>:<hook_event_name>:<entity>[:<transition>]:<emitted_at_ms>`):
+The nonce is one random `u64` generated once per CLI invocation by the
+caller (Task 12) and rendered as fixed-width lowercase hex in every event
+id; passing it as a parameter keeps the mapping function deterministic and
+unit-testable.
 
-1. `SessionStart`/`session_start` → one `task_started`; `task_run_id`
-   `hook:<provider>:<session_id>`; `native_session_id` = session_id;
-   entity `session`.
-2. `SubagentStart`/`subagent_start` (with `agent_id`) → `dispatch`
+Mapping (spec table; both CLIs use the SAME PascalCase event names —
+planning fact 4). Every envelope: `schema_version` 1, `source`
+`hook:claude-code`|`hook:codex`, **wire `provider` `claude`|`codex`** —
+the envelope decoder `optional_provider`
+(`src/herdr/controller.rs:1055-1061`) accepts ONLY `claude`/`codex` and
+rejects anything else as `invalid`, so `claude-code` is the CLI selector
+and `source` token, never the wire provider value — `emitted_at_ms` as
+passed, and `event_id`
+`hook:<provider-selector>:<session_id>:<hook_event_name>:<entity>:<transition>:<emitted_at_ms>:<nonce-hex>`
+(the transition segment is MANDATORY on every event so two events from
+one invocation can never collide, and the nonce guards same-millisecond
+invocations):
+
+1. `SessionStart` → one `task_started`; `task_run_id`
+   `hook:<provider-selector>:<session_id>`; `native_session_id` =
+   session_id; entity `session`, transition `started`.
+2. `SubagentStart` (with `agent_id`) → `dispatch`
    (subject `…:agent:<agent_id>`, `parent_task_run_id` = session run,
    entity `<agent_id>`, transition `dispatch`) then `task_started` (same
    subject, `label` = `agent_type` when present, transition `started`).
-   Codex rows only per Task 10's decision; missing `agent_id` → empty vec.
-3. `SubagentStop`/`subagent_stop` (with `agent_id`) → one `complete`
+   Missing `agent_id` → empty vec (cannot occur per the Codex schema and
+   the Claude docs; guarded anyway).
+3. `SubagentStop` (with `agent_id`) → one `complete`
    (transition `complete`).
-4. `TaskCreated` (Claude Code; with `task_id`) → `dispatch` (subject
-   `…:task:<task_id>`) then `progress` with `label` = `task_subject`.
-5. `TaskCompleted` (with `task_id`) → one `complete`.
-6. `SessionEnd`, `session_end`, and every other event name → empty vec.
+4. `TaskCreated` (Claude Code only; with `task_id`) → `dispatch` (subject
+   `…:task:<task_id>`, transition `dispatch`) then `progress` with
+   `label` = `task_subject`, transition `created`.
+5. `TaskCompleted` (with `task_id`) → one `complete` (transition
+   `complete`).
+6. `SessionEnd` and every other event name → empty vec.
 7. No field from the payload other than the listed structural fields is
    ever read; `native_session_id` appears only on the SessionStart
-   envelope.
+   envelope. Prompt-, response-, or tool-derived fields (`prompt`,
+   `description`, `last_assistant_message`, tool inputs) are never
+   deserialized: `HookPayload` simply has no such fields, and the privacy
+   sentinel test pins that the struct never gains them.
 
 - [ ] **Step 1: Write failing unit tests**: one per table row and per
 guard —
-session-start shape (all envelope fields asserted exactly);
+session-start shape (all envelope fields asserted exactly, including wire
+`provider` `"claude"` for the `claude-code` selector);
 subagent start pair (dispatch parent, ids, label, distinct event_ids);
-subagent stop; task created pair; task completed; session_end → empty;
+subagent stop; task created pair (distinct `dispatch`/`created`
+transitions in the ids); task completed; SessionEnd → empty;
 unknown event → empty; missing agent_id/task_id → empty; event ids carry
-the `emitted_at_ms` suffix and never start with `prov:`; two invocations
-with different timestamps produce different event ids for the same hook.
+the `emitted_at_ms` and nonce suffixes and never start with `prov:`; two
+invocations with the SAME timestamp but different nonces produce
+different event ids for the same hook; the privacy sentinel — a payload
+containing `prompt`, `description`, and `last_assistant_message` fields
+maps to envelopes whose serialized JSON contains none of those values.
 - [ ] **Step 2: Verify RED** (module absent).
 - [ ] **Step 3: Implement the module exactly per the table.**
 - [ ] **Step 4: GREEN; full verification; commit**
@@ -641,29 +808,49 @@ to `EmitArgs`, where `HookProviderArg` is a two-variant clap `ValueEnum`
 (`claude-code`, `codex`) with a `From<HookProviderArg> for
 hook_adapter::HookProvider` conversion; every currently required manual argument (`event_id`,
 `emitted_at_ms`, `source`, `event_type`, `task_run_id`) becomes
-`required_unless_present = "from_hook"` and `conflicts_with = "from_hook"`
-(optional manual arguments only gain `conflicts_with`). The manual path is
-byte-for-byte unchanged when `--from-hook` is absent.
+`required_unless_present = "from_hook"` and `conflicts_with = "from_hook"`.
+The optional manual arguments (`parent_task_run_id`, `depends_on_id`,
+`label`, `reason`, `progress`, `provider`, `native_session_id`,
+`terminal_id`) gain `conflicts_with = "from_hook"`; `strict` and
+`schema_version` do NOT — `--strict` must remain usable in adapter mode
+(the strict exit rule below depends on it), and `schema_version` keeps its
+default. The manual path is byte-for-byte unchanged when `--from-hook` is
+absent.
 
 Adapter path behavior: read standard input to end with a 1 MiB cap
-(oversize → warn, exit 0); parse `HookPayload` (failure → warn, exit 0);
-resolve session and endpoint once through the existing `run_emit` calls
-(unavailable → existing `emit_unavailable`, which exits 0 without
-`--strict`); `emitted_at_ms` from the system wall clock; deliver every
-mapped envelope sequentially via `emit_to_endpoint`, printing each response
-line exactly as the manual path does; delivery failure warns and continues
-to the next envelope; exit 0 unless `--strict` and any envelope failed.
+(oversize → warn on stderr, exit 0); parse `HookPayload` (failure → warn
+on stderr, exit 0); resolve session and endpoint once through the existing
+`run_emit` calls (unavailable → existing `emit_unavailable`, which exits 0
+without `--strict`); `emitted_at_ms` from the system wall clock and one
+random `u64` invocation nonce; deliver the mapped envelopes strictly in
+order via `emit_to_endpoint`, and STOP at the first delivery failure —
+delivering a child's `task_started` after its `dispatch` failed would
+create a permanently unlinked run (spec C1 rule 7). In adapter mode
+NOTHING is written to stdout — Codex parses hook stdout against a closed
+output schema and marks the hook invalid on unrecognized JSON (planning
+fact 4), so every diagnostic and every per-envelope outcome line goes to
+stderr. Exit 0 unless `--strict` and any envelope failed or was skipped.
 
 - [ ] **Step 1: Write the failing wire test** in `tests/controller.rs`: a
 real listener plays collector, the test invokes the adapter code path (the
 extracted `run_emit_from_hook` function called with a `SubagentStart`
 payload string), and asserts two envelopes arrive in order (`dispatch`
-then `task_started`) with the exact ids and fields from the Task 11 table,
-each acknowledged `accepted`.
+then `task_started`) with the exact ids and fields from the Task 11 table
+(wire `provider` `"claude"`), each acknowledged `accepted` — and that the
+function produced ZERO bytes on stdout.
+- [ ] **Step 1b: Write the failing stop-on-failure test**: the listener
+rejects the first envelope (`rejected`/`invalid`); assert the second
+envelope is never sent and, under `--strict` semantics, the outcome is
+failure while the non-strict outcome is success with a stderr diagnostic.
+- [ ] **Step 1c: Write the failing malformed-input tests**: non-JSON
+stdin, JSON missing `session_id`, and stdin exceeding the 1 MiB cap each
+produce exit-0 semantics, zero deliveries, zero stdout bytes, and a
+stderr warning.
 - [ ] **Step 2: Write the failing CLI-surface tests** (unit, in
 `src/main.rs` tests): `--from-hook claude-code` parses with no manual
-arguments; manual invocation without `--event-id` still errors; combining
-`--from-hook` with `--event-id` errors.
+arguments; `--from-hook claude-code --strict` parses; manual invocation
+without `--event-id` still errors; combining `--from-hook` with
+`--event-id` errors.
 - [ ] **Step 3: RED, implement, GREEN.**
 - [ ] **Step 4** Confirm the breadcrumb non-publication test
 (`i4_local_doctor_emit_and_nonplugin_launch_never_publish_breadcrumb`,
@@ -679,10 +866,15 @@ arguments; manual invocation without `--event-id` still errors; combining
 Content contract (self-contained for a third-party operator): what the
 emit integration provides (execution tree and task lifecycle; explicitly
 NOT dependency edges); installing the standalone CLI per design section
-12.3; exact registration snippets —
+12.3; registration presented as an APPEND/MERGE procedure, never a
+replacement — the document states in prose that each entry below is
+APPENDED to the corresponding event's existing array in the operator's
+live file (both files routinely already contain handlers: herdr's own
+integration, permission guards), shows this valid-JSON fragment of the
+entries to add (the target-path comment lives in prose above the fence,
+not inside the JSON):
 
 ```json
-// ~/.claude/settings.json (merge into "hooks")
 {
   "hooks": {
     "SessionStart": [{"hooks": [{"type": "command",
@@ -699,13 +891,22 @@ NOT dependency edges); installing the standalone CLI per design section
 }
 ```
 
-and the `~/.codex/hooks.json` equivalent for the events Task 10 selected;
-the Codex hook-trust acceptance step; that hooks run in parallel and
-coexist with herdr's own integration hooks; behavior outside managed panes
-(no resolvable session → warn, exit 0, deliver nothing); dependency-edge
-guidance with one complete manual `herdr-top emit --event-type depends_on`
-example including every required flag; troubleshooting via
-`herdr-top doctor`.
+and prescribes the merge procedure: back up the file, append the new
+entries to each event's array (creating the event key only when absent),
+then verify with `jq` that every pre-existing handler is still present
+and the file parses. The `~/.codex/hooks.json` fragment is the same shape
+for `SessionStart`, `SubagentStart`, `SubagentStop` (PascalCase — the
+Codex event names are identical to Claude Code's) with
+`--from-hook codex`; the Codex hook-trust acceptance step follows the
+registration. The document also covers: hooks run in parallel and coexist
+with herdr's own integration hooks; the delivery semantics under partial
+failure and hook-parallelism races (spec C1 rule 7 — stop-on-first-
+failure, forward-referenced terminals flagged in diagnostics, stale
+`task_started` after a terminal is harmless); behavior outside managed
+panes (no resolvable session → warn, exit 0, deliver nothing);
+dependency-edge guidance with one complete manual
+`herdr-top emit --event-type depends_on` example including every required
+flag; troubleshooting via `herdr-top doctor`.
 
 - [ ] **Step 1** Write the document; verify every snippet against the
 implemented CLI by executing the commands with a throwaway session name.
@@ -713,11 +914,22 @@ implemented CLI by executing the commands with a throwaway session name.
 
 ### Task 14: live acceptance (operational, Controller-executed with the user)
 
+- [ ] **Step 0** Rebuild the release binary at the integrated head and
+reinstall it to `~/.local/bin/herdr-top` (the repository's established
+procedure), then verify `herdr-top --version` and a digest match against
+the fresh build, and prove the adapter surface exists:
+`printf '{"hook_event_name":"SessionStart","session_id":"probe"}' | herdr-top emit --from-hook claude-code`
+must exit 0 (the currently installed 0.1.0 binary exits 2 on this —
+registering hooks against a stale binary would silently exercise the old
+CLI).
 - [ ] **Step 1** With user confirmation, register the Task 13 hooks in the
-live `~/.claude/settings.json` and `~/.codex/hooks.json` (these are
-live-authoritative user files: Controller edits them directly, per the
-established rule for worker-uneditable live paths, and reports the exact
-diff).
+live `~/.claude/settings.json` and `~/.codex/hooks.json` using Task 13's
+merge procedure: back up both files, APPEND the new entries to each
+event's existing array (never replace an array — both files already carry
+herdr-integration and guard hooks), verify with `jq` that every
+pre-existing handler survived and both files parse, and report the exact
+diff (these are live-authoritative user files: Controller edits them
+directly, per the established rule for worker-uneditable live paths).
 - [ ] **Step 2** Run one Claude Code session and one Codex session inside
 managed panes, each dispatching at least one subagent; observe the TUI:
 session runs bound (no `unbound` diagnostic), subagent children with
