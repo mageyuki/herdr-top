@@ -593,6 +593,7 @@ async fn pane_moved_replaces_old_public_pane_id_in_enrichment_target() {
         .unwrap();
     mock.push_primary(moved).await.unwrap();
     wait_until(|| mock.enrichment_subscriptions() == 2).await;
+    wait_until(|| mock.enrichment_closures() >= 1).await;
 
     let second = mock
         .requests()
@@ -608,11 +609,16 @@ async fn pane_moved_replaces_old_public_pane_id_in_enrichment_target() {
         json!([{"type":"pane.agent_status_changed", "pane_id":"w2:p2"}])
     );
     let order = mock.ordering();
+    let closed = order
+        .iter()
+        .position(|entry| entry == "enrichment_close:1")
+        .unwrap();
+    let opened = order
+        .iter()
+        .position(|entry| entry == "enrichment_subscribe:2")
+        .unwrap();
     assert!(
-        order.iter().position(|entry| entry == "enrichment_close:1")
-            < order
-                .iter()
-                .position(|entry| entry == "enrichment_subscribe:2"),
+        closed < opened,
         "pane move replacement must be break-before-make: {order:?}"
     );
 
@@ -648,17 +654,23 @@ async fn swap_window_records_one_transition_on_each_side_without_overlap() {
     .await
     .unwrap();
     wait_until(|| mock.enrichment_subscriptions() == 2).await;
+    wait_until(|| mock.enrichment_closures() >= 1).await;
     mock.push_enrichment(agent_status_push("w1:p1", "term_6583d08d791e41", "blocked"))
         .await
         .unwrap();
     wait_execution_state(&handle, ExecState::Blocked).await;
 
     let order = mock.ordering();
+    let closed = order
+        .iter()
+        .position(|entry| entry == "enrichment_close:1")
+        .unwrap();
+    let opened = order
+        .iter()
+        .position(|entry| entry == "enrichment_subscribe:2")
+        .unwrap();
     assert!(
-        order.iter().position(|entry| entry == "enrichment_close:1")
-            < order
-                .iter()
-                .position(|entry| entry == "enrichment_subscribe:2"),
+        closed < opened,
         "the old stream must close before the replacement subscribes: {order:?}"
     );
     shutdown(handle, lifecycle).await;
@@ -986,7 +998,7 @@ async fn grace_remnant_status_is_rescue_only_and_never_applies_outside_target_se
 
     mock.push_enrichment(agent_status_push("w1:p1", "term_6583d08d791e41", "idle"))
         .await
-        .unwrap();
+        .expect("grace-remnant payload must be written to the active enrichment stream");
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(handle.model.borrow().executions().any(|execution| {
         execution.pane_id == "w1:p1" && matches!(execution.state, ExecState::Stale { .. })

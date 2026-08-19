@@ -63,6 +63,7 @@ const EVENT_QUEUE_CAPACITY: usize = 64;
 const ENRICHMENT_QUEUE_CAPACITY: usize = 64;
 const RESNAPSHOT_ATTEMPTS: usize = 3;
 const RECONNECT_DELAY: Duration = Duration::from_millis(50);
+const ENRICHMENT_RECONNECT_MAX_DEFERRAL: Duration = RECONNECT_DELAY.saturating_mul(5);
 const DRAIN_QUIET_PERIOD: Duration = Duration::from_millis(5);
 const STALE_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2283,6 +2284,13 @@ fn spawn_enrichment_reader(
     ))
 }
 
+fn enrichment_reconnect_deadline(
+    first_deferred_at: tokio::time::Instant,
+    latest_change_at: tokio::time::Instant,
+) -> tokio::time::Instant {
+    (latest_change_at + RECONNECT_DELAY).min(first_deferred_at + ENRICHMENT_RECONNECT_MAX_DEFERRAL)
+}
+
 async fn run_enrichment_reader(
     sock: PathBuf,
     mut targets: watch::Receiver<BTreeSet<String>>,
@@ -2292,8 +2300,10 @@ async fn run_enrichment_reader(
     cancellation: CancellationToken,
 ) {
     let mut target_set = targets.borrow_and_update().clone();
+    let mut defer_started_at = None;
     loop {
         while target_set.is_empty() {
+            defer_started_at = None;
             tokio::select! {
                 () = cancellation.cancelled() => return,
                 changed = targets.changed() => {
@@ -2301,24 +2311,38 @@ async fn run_enrichment_reader(
                         return;
                     }
                     target_set = targets.borrow_and_update().clone();
+                    if !target_set.is_empty() {
+                        defer_started_at = Some(tokio::time::Instant::now());
+                    }
                 }
             }
         }
 
-        let delayed = tokio::select! {
-            () = cancellation.cancelled() => return,
-            changed = targets.changed() => {
-                if changed.is_err() {
-                    return;
+        let first_deferred_at = *defer_started_at.get_or_insert_with(tokio::time::Instant::now);
+        let delayed = loop {
+            let deadline =
+                enrichment_reconnect_deadline(first_deferred_at, tokio::time::Instant::now());
+            tokio::select! {
+                () = cancellation.cancelled() => return,
+                changed = targets.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    target_set = targets.borrow_and_update().clone();
+                    if target_set.is_empty() {
+                        break false;
+                    }
                 }
-                target_set = targets.borrow_and_update().clone();
-                false
+                () = tokio::time::sleep_until(deadline) => {
+                    target_set = targets.borrow_and_update().clone();
+                    break !target_set.is_empty();
+                }
             }
-            () = tokio::time::sleep(RECONNECT_DELAY) => true,
         };
         if !delayed {
             continue;
         }
+        defer_started_at = None;
 
         let subscriptions = enrichment_subscriptions(&target_set);
         let subscribed = tokio::select! {
@@ -2328,6 +2352,7 @@ async fn run_enrichment_reader(
                     return;
                 }
                 target_set = targets.borrow_and_update().clone();
+                defer_started_at = Some(tokio::time::Instant::now());
                 continue;
             }
             result = wire::subscribe(&sock, &subscriptions) => result,
@@ -2387,6 +2412,7 @@ async fn run_enrichment_reader(
                         return;
                     }
                     target_set = targets.borrow_and_update().clone();
+                    defer_started_at = Some(tokio::time::Instant::now());
                     let _ = stream.close().await;
                     break;
                 }
@@ -5424,7 +5450,7 @@ mod tests {
         DurabilityDisposition, PersistenceFailure, PersistenceFailureCode, PersistenceOperation,
         PersistencePhase,
     };
-    use crate::store::{open_writer, spawn_writer};
+    use crate::store::{PersistExecution, PersistTaskRun, open_writer, spawn_writer};
 
     #[derive(Default)]
     struct RecordingOccurrenceSink {
@@ -6402,6 +6428,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn enrichment_reconnect_deadline_keeps_quiet_debounce_and_caps_sustained_churn() {
+        let first_deferred_at = tokio::time::Instant::now();
+        let quiet_change_at = first_deferred_at + Duration::from_millis(10);
+        assert_eq!(
+            enrichment_reconnect_deadline(first_deferred_at, quiet_change_at),
+            quiet_change_at + RECONNECT_DELAY
+        );
+
+        let sustained_change_at = first_deferred_at + Duration::from_millis(500);
+        assert_eq!(
+            enrichment_reconnect_deadline(first_deferred_at, sustained_change_at),
+            first_deferred_at + Duration::from_millis(250)
+        );
+    }
+
     fn status_model(states: &[(&str, ExecState)]) -> SharedModel {
         let mut model = DomainModel::default();
         for (index, (execution_id, state)) in states.iter().enumerate() {
@@ -6433,6 +6475,39 @@ mod tests {
                 "agent_status": status,
             }),
         }
+    }
+
+    fn inactive_provider_integration() -> (
+        mpsc::Sender<ProviderIngressEvent>,
+        ProviderIntegration,
+        ProviderThreadHandle,
+    ) {
+        let provider_diagnostics = crate::provider::ProviderDiagnostics::default();
+        let (ignored_events, _ignored_receiver) = mpsc::channel(1);
+        let provider_thread = spawn_provider_thread_with_diagnostics(
+            AdapterProviderWorker::new(Vec::new(), provider_diagnostics.clone()),
+            ignored_events,
+            None,
+            provider_diagnostics,
+        )
+        .unwrap();
+        let (provider_sender, provider_events) = mpsc::channel(1);
+        let initial_coverage = SourceCoverageRegistry::default();
+        let (coverage_sender, _source_coverage) = watch::channel(initial_coverage);
+        let (source_quality_sender, _source_quality) =
+            watch::channel(ObservationQuality::Reconciling);
+        let coverage = CoverageTracker::new(
+            SourceAvailability::NotApplicable,
+            coverage_sender,
+            source_quality_sender,
+        );
+        let provider = ProviderIntegration::new(
+            provider_events,
+            provider_thread.target_publisher(),
+            TargetSet::default(),
+            coverage,
+        );
+        (provider_sender, provider, provider_thread)
     }
 
     #[test]
@@ -6468,6 +6543,215 @@ mod tests {
             executions,
             BTreeSet::from(["live".to_owned(), "stale".to_owned()])
         );
+    }
+
+    #[tokio::test]
+    async fn enrichment_payload_persists_distinct_receipt_identity_activity_and_one_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let run_id = RunId::new();
+        let task_run = TaskRun {
+            run_id,
+            key: RunKey::Controller("persisted-status-run".to_owned()),
+            display_ordinal: DisplayOrdinal::new(4),
+            state: TaskState::Running,
+            has_controller_task_state_event: false,
+        };
+        let executions = ["live", "stale"].map(|execution_id| Execution {
+            execution_id: execution_id.to_owned(),
+            pane_id: "w1:p1".to_owned(),
+            terminal_id: "terminal-1".to_owned(),
+            task_run_id: run_id,
+            state: if execution_id == "live" {
+                ExecState::Idle
+            } else {
+                ExecState::Stale { since_ms: 7 }
+            },
+        });
+        store
+            .apply_batch(
+                [
+                    PersistOp::UpsertWorkspace {
+                        workspace: Workspace {
+                            workspace_id: "w1".to_owned(),
+                        },
+                        display_ordinal: DisplayOrdinal::new(1),
+                    },
+                    PersistOp::UpsertTab {
+                        tab: Tab {
+                            tab_id: "w1:t1".to_owned(),
+                            workspace_id: "w1".to_owned(),
+                        },
+                        display_ordinal: DisplayOrdinal::new(2),
+                    },
+                    PersistOp::UpsertPane {
+                        pane: Pane {
+                            pane_id: "w1:p1".to_owned(),
+                            workspace_id: "w1".to_owned(),
+                            tab_id: "w1:t1".to_owned(),
+                            terminal_id: "terminal-1".to_owned(),
+                        },
+                        display_ordinal: DisplayOrdinal::new(3),
+                    },
+                    PersistOp::UpsertTaskRun(PersistTaskRun {
+                        task_run,
+                        native_session: None,
+                        created_at_ms: 1,
+                        updated_at_ms: 1,
+                        finished_at_ms: None,
+                    }),
+                ]
+                .into_iter()
+                .chain(executions.into_iter().map(|execution| {
+                    PersistOp::UpsertExecution(PersistExecution {
+                        execution,
+                        started_at_ms: 1,
+                        updated_at_ms: 1,
+                        ended_at_ms: None,
+                    })
+                }))
+                .collect(),
+            )
+            .unwrap();
+        let restored = store.load_restored_state().unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared, operator) =
+            Reducer::new_with_operator(restored, empty_operator_seed());
+        let (mut persistence, diagnostics) =
+            RuntimePersistence::new_for_test(writer, Arc::new(RecordingOccurrenceSink::default()));
+        let (provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+        let (performance, mut sampler) =
+            performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
+        let before = sampler
+            .sample(&shared.borrow(), &operator.borrow(), 1_900_000_000_222)
+            .admission_high_water;
+        let mut pending = PendingTopologyClosures::default();
+
+        apply_enrichment_payload(
+            &mut reducer,
+            &shared,
+            &mut persistence,
+            "status-session",
+            EnrichmentPayload {
+                pane_id: "w1:p1".to_owned(),
+                terminal_id: Some("terminal-1".to_owned()),
+                state: ExecState::Working,
+                timestamp_ms: 1_900_000_000_111,
+                receipt_time_ms: 1_900_000_000_222,
+            },
+            &BTreeSet::from(["w1:p1".to_owned()]),
+            &performance,
+            &mut pending,
+            &mut provider,
+        )
+        .await
+        .unwrap();
+        assert_eq!(diagnostics.borrow().persistence, PersistenceStatus::Healthy);
+
+        let after = sampler
+            .sample(&shared.borrow(), &operator.borrow(), 1_900_000_000_222)
+            .admission_high_water;
+        assert_eq!(after, before + 1);
+        let activity = operator.borrow();
+        let status_activity = activity
+            .activity
+            .iter()
+            .filter(|item| item.source_event_type == "pane_agent_status_changed")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            status_activity.len(),
+            2,
+            "unexpected operator activity: {:?}",
+            activity.activity
+        );
+        assert!(status_activity.iter().all(|item| {
+            item.source == "herdr"
+                && item.normalized_kind == "agent_status_changed"
+                && item.event_timestamp_ms == 1_900_000_000_111
+                && item.seen_at_ms == 1_900_000_000_222
+        }));
+        assert_ne!(
+            status_activity[0].identity.event_id,
+            status_activity[1].identity.event_id
+        );
+        drop(activity);
+
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+        drop(persistence);
+        shutdown_writer(lifecycle).await;
+        let connection = rusqlite::Connection::open(crate::store::database_path(&root)).unwrap();
+        let rows = connection
+            .prepare(
+                "SELECT event_id, event_timestamp_ms, seen_at_ms, source_event_type FROM events \
+                 ORDER BY event_row_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2, "unexpected persisted rows: {rows:?}");
+        assert_ne!(rows[0].0, rows[1].0);
+        assert!(rows.iter().all(|row| {
+            row.1 == 1_900_000_000_111
+                && row.2 == 1_900_000_000_222
+                && row.3 == "pane_agent_status_changed"
+        }));
+    }
+
+    #[tokio::test]
+    async fn enrichment_payload_cancels_pending_pane_closure_through_application_path() {
+        let restored = RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        };
+        let (mut reducer, shared) = Reducer::new(restored);
+        let (_directory, lifecycle, mut persistence, _diagnostics) =
+            runtime_with_sink(Arc::new(RecordingOccurrenceSink::default()));
+        let (provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+        let (performance, _sampler) =
+            performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
+        let mut pending = PendingTopologyClosures {
+            panes: HashSet::from(["w1:p1".to_owned()]),
+            ..PendingTopologyClosures::default()
+        };
+
+        apply_enrichment_payload(
+            &mut reducer,
+            &shared,
+            &mut persistence,
+            "status-session",
+            EnrichmentPayload {
+                pane_id: "w1:p1".to_owned(),
+                terminal_id: Some("terminal-1".to_owned()),
+                state: ExecState::Working,
+                timestamp_ms: 111,
+                receipt_time_ms: 222,
+            },
+            &BTreeSet::new(),
+            &performance,
+            &mut pending,
+            &mut provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(!pending.panes.contains("w1:p1"));
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+        drop(persistence);
+        shutdown_writer(lifecycle).await;
     }
 
     #[test]
