@@ -1547,9 +1547,8 @@ async fn run_final_performance_trial(
     let document = outcome.document_mut();
     document.trials[0].raw.performance_evidence_stream = Some(stream);
     let failure = match injection {
-        PerformanceTrialInjection::None => None,
-        PerformanceTrialInjection::SupportedLoadDegradation => {
-            Some(FailureReasonV1::SupportedLoadDegradation)
+        PerformanceTrialInjection::None | PerformanceTrialInjection::SupportedLoadDegradation => {
+            None
         }
         PerformanceTrialInjection::OmitRequiredRenderedReason => {
             Some(FailureReasonV1::MissingDegradation)
@@ -1605,7 +1604,9 @@ async fn reference_profile_stream_selection_writes_valid_final_and_non_final_art
     let final_root = tempfile::tempdir().unwrap();
     let final_path = final_root.path().join("result-v1.json");
     atomic_write_reference_outcome(&final_path, &final_outcome).unwrap();
-    let written_final = read_and_validate_reference_outcome(&final_path).unwrap();
+    let written_final = read_and_validate_reference_outcome(&final_path, AmendedLegacyMode::Off)
+        .unwrap()
+        .outcome;
     assert!(
         written_final.document().trials[0]
             .raw
@@ -1624,7 +1625,10 @@ async fn reference_profile_stream_selection_writes_valid_final_and_non_final_art
     let baseline_root = tempfile::tempdir().unwrap();
     let baseline_path = baseline_root.path().join("result-v1.json");
     atomic_write_reference_outcome(&baseline_path, &baseline).unwrap();
-    let written_baseline = read_and_validate_reference_outcome(&baseline_path).unwrap();
+    let written_baseline =
+        read_and_validate_reference_outcome(&baseline_path, AmendedLegacyMode::Off)
+            .unwrap()
+            .outcome;
     assert!(
         written_baseline.document().trials[0]
             .raw
@@ -1771,7 +1775,7 @@ async fn supported_load_records_complete_live_performance_stream() {
 
 #[cfg(feature = "workload-harness")]
 #[tokio::test]
-async fn supported_load_truthful_degradation_is_a_valid_measured_failure() {
+async fn supported_load_one_quantum_degradation_is_tolerated_at_final_acceptance() {
     let result = run_final_performance_trial(
         WorkloadProfile::TargetBurst,
         PerformanceTrialInjection::SupportedLoadDegradation,
@@ -1785,11 +1789,31 @@ async fn supported_load_truthful_degradation_is_a_valid_measured_failure() {
         ),
         Ok(true)
     );
-    assert_eq!(
-        result.outcome.failure_reasons(),
-        [FailureReasonV1::SupportedLoadDegradation]
+    let stream = result.outcome.document().trials[0]
+        .raw
+        .performance_evidence_stream
+        .as_ref()
+        .unwrap();
+    let degraded = stream
+        .samples
+        .iter()
+        .filter(|sample| !sample.reasons.is_empty())
+        .collect::<Vec<_>>();
+    assert!(!degraded.is_empty());
+    assert!(
+        stream
+            .samples
+            .iter()
+            .all(|sample| { !sample.reasons.contains(&PerformanceReasonV1::EventLag) })
     );
-    assert_eq!(result.outcome.status(), ReferenceOutcomeStatusV1::Failed);
+    assert!(degraded.iter().all(|sample| tolerated_boundary_degradation(
+        MeasurementStageV1::Final,
+        ScenarioV1::Burst,
+        sample,
+        false,
+    )));
+    assert!(result.outcome.failure_reasons().is_empty());
+    assert_eq!(result.outcome.status(), ReferenceOutcomeStatusV1::Pass);
     assert!(result.outcome.validate().is_ok());
 
     let mut suite = [
@@ -1805,9 +1829,7 @@ async fn supported_load_truthful_degradation_is_a_valid_measured_failure() {
     suite[2] = result.outcome;
     assert_eq!(
         classify_d4_checkpoint(&suite).unwrap(),
-        D4CheckpointDecisionV1::AmendmentsRequired {
-            amendments: vec![RequiredAmendmentV1::NonD4],
-        }
+        D4CheckpointDecisionV1::NoMissD4NotAuthorized {}
     );
 }
 
@@ -4433,6 +4455,599 @@ fn supported_load_stream_is_complete_live_and_non_degraded() {
     assert!(degraded.validate().is_ok());
 }
 
+fn boundary_distribution(mut values: Vec<u64>) -> DistributionV1 {
+    values.sort_unstable();
+    DistributionV1 {
+        sample_count: values.len(),
+        minimum_ns: values[0],
+        median_ns: percentile(&values, 50).unwrap(),
+        p95_ns: percentile(&values, 95).unwrap(),
+        p99_ns: percentile(&values, 99).unwrap(),
+        maximum_ns: *values.last().unwrap(),
+    }
+}
+
+fn boundary_degradation_outcome(
+    events_one_second: u64,
+    extra_live_panes_reason: bool,
+    trial_event_lag: bool,
+    recorded_failure: bool,
+) -> ReferenceOutcomeV1 {
+    assert!(matches!(events_one_second, 101 | 102));
+    let mut outcome = valid_final_burst_result();
+    let trial = &mut outcome.document_mut().trials[0];
+    let origin = trial.raw.workload_origin_ns.unwrap();
+
+    let shifted = usize::try_from(events_one_second - 100).unwrap();
+    let mut shifted_terminals = Vec::with_capacity(shifted);
+    for offset in 0..shifted {
+        let index = 100 - shifted + offset;
+        let admitted_ns = origin + 1_000_000_000 + u64::try_from(offset + 1).unwrap();
+        trial.raw.admission_observations[index].admitted_ns = admitted_ns;
+        shifted_terminals.push((
+            trial.raw.admission_observations[index].sequence,
+            admitted_ns + 10_000_000,
+        ));
+    }
+    for observation in &mut trial.raw.screen_observations {
+        let admitted = trial.raw.admission_observations
+            [usize::try_from(observation.sequence - 1).unwrap()]
+        .admitted_ns;
+        observation.admitted_ns = admitted;
+        observation.observed_frame_phase_ns = (observation.rendered_ns - admitted) % 100_000_000;
+    }
+    trial.screen_update = Some(boundary_distribution(
+        trial
+            .raw
+            .screen_observations
+            .iter()
+            .map(|observation| observation.rendered_ns - observation.admitted_ns)
+            .collect(),
+    ));
+    trial.reducer_lag = Some(boundary_distribution(
+        trial
+            .raw
+            .screen_observations
+            .iter()
+            .map(|observation| observation.terminal_ns - observation.admitted_ns)
+            .collect(),
+    ));
+
+    let stream = trial.raw.performance_evidence_stream.as_mut().unwrap();
+    for (sequence, terminal_ns) in shifted_terminals {
+        stream
+            .terminal_observations
+            .iter_mut()
+            .find(|terminal| terminal.sequence == sequence)
+            .unwrap()
+            .terminal_ns = terminal_ns;
+    }
+    if trial_event_lag {
+        stream.terminal_observations[0].terminal_ns = origin + 1_900_000_000;
+    }
+    let mut closing_sample = stream.samples[1].clone();
+    let mut closing_frame = stream.frames[1].clone();
+    let mut samples = vec![stream.samples[0].clone()];
+    let mut frames = vec![stream.frames[0].clone()];
+
+    if trial_event_lag {
+        let lag_sample = PerformanceSampleEvidenceV1 {
+            sample_ordinal: 2,
+            sampled_at_ns: origin + 1_500_000_000,
+            event_lag_ns: 1_490_000_000,
+            pending_events: 2,
+            admission_high_water: 150,
+            completion_high_water: 149,
+            live_panes: 50,
+            default_visible_task_runs: 200,
+            dependency_edges: 1_000,
+            execution_edges: 199,
+            events_one_second: 100,
+            events_ten_seconds: 150,
+            events_sixty_seconds: 150,
+            source_quality: EffectiveQualityV1::Live,
+            effective_quality: EffectiveQualityV1::Degraded,
+            reasons: vec![PerformanceReasonV1::EventLag],
+        };
+        frames.push(PerformanceFrameEvidenceV1 {
+            draw_ordinal: 2,
+            sample_ordinal: 2,
+            state_observed_at_ns: lag_sample.sampled_at_ns,
+            rendered_at_ns: origin + 1_600_000_000,
+            effective_quality: EffectiveQualityV1::Degraded,
+            reasons: lag_sample.reasons.clone(),
+            rendered_header_line: "DEGRADED | perf:event_lag".to_owned(),
+        });
+        samples.push(lag_sample);
+    }
+
+    let boundary_ordinal = u64::try_from(samples.len() + 1).unwrap();
+    let mut reasons = vec![PerformanceReasonV1::EventsOneSecond];
+    let live_panes = if extra_live_panes_reason {
+        reasons.push(PerformanceReasonV1::LivePanes);
+        51
+    } else {
+        50
+    };
+    let boundary_sample = PerformanceSampleEvidenceV1 {
+        sample_ordinal: boundary_ordinal,
+        sampled_at_ns: origin + 2_000_000_000,
+        event_lag_ns: 0,
+        pending_events: 1,
+        admission_high_water: 200,
+        completion_high_water: 199,
+        live_panes,
+        default_visible_task_runs: 200,
+        dependency_edges: 1_000,
+        execution_edges: 199,
+        events_one_second,
+        events_ten_seconds: 200,
+        events_sixty_seconds: 200,
+        source_quality: EffectiveQualityV1::Live,
+        effective_quality: EffectiveQualityV1::Degraded,
+        reasons,
+    };
+    frames.push(PerformanceFrameEvidenceV1 {
+        draw_ordinal: boundary_ordinal,
+        sample_ordinal: boundary_ordinal,
+        state_observed_at_ns: boundary_sample.sampled_at_ns,
+        rendered_at_ns: origin + 2_100_000_000,
+        effective_quality: EffectiveQualityV1::Degraded,
+        reasons: boundary_sample.reasons.clone(),
+        rendered_header_line: if extra_live_panes_reason {
+            "DEGRADED | perf:events_1s,live_panes".to_owned()
+        } else {
+            "DEGRADED | perf:events_1s".to_owned()
+        },
+    });
+    samples.push(boundary_sample);
+
+    let closing_ordinal = u64::try_from(samples.len() + 1).unwrap();
+    closing_sample.sample_ordinal = closing_ordinal;
+    closing_frame.draw_ordinal = closing_ordinal;
+    closing_frame.sample_ordinal = closing_ordinal;
+    samples.push(closing_sample);
+    frames.push(closing_frame);
+    stream.samples = samples;
+    stream.frames = frames;
+    stream.next_sample_ordinal = closing_ordinal + 1;
+    stream.next_draw_ordinal = closing_ordinal + 1;
+
+    if recorded_failure {
+        outcome.document_mut().failure_reasons = vec![FailureReasonV1::SupportedLoadDegradation];
+        outcome = match outcome {
+            ReferenceOutcomeV1::Pass { document } => ReferenceOutcomeV1::Failed { document },
+            _ => unreachable!(),
+        };
+    }
+    outcome
+}
+
+#[test]
+fn final_boundary_degradation_at_101_is_tolerated_end_to_end() {
+    // Break caught: counting the one-quantum Final burst boundary sample as degradation.
+    let outcome = boundary_degradation_outcome(101, false, false, false);
+    let sample = &outcome.document().trials[0]
+        .raw
+        .performance_evidence_stream
+        .as_ref()
+        .unwrap()
+        .samples[1];
+    assert!(tolerated_boundary_degradation(
+        MeasurementStageV1::Final,
+        ScenarioV1::Burst,
+        sample,
+        false,
+    ));
+    assert!(tolerated_boundary_degradation(
+        MeasurementStageV1::Final,
+        ScenarioV1::Sustained,
+        sample,
+        false,
+    ));
+    assert!(!tolerated_boundary_degradation(
+        MeasurementStageV1::Baseline,
+        ScenarioV1::Burst,
+        sample,
+        false,
+    ));
+    assert!(!tolerated_boundary_degradation(
+        MeasurementStageV1::Final,
+        ScenarioV1::Target,
+        sample,
+        false,
+    ));
+    assert_eq!(outcome.validate(), Ok(()));
+}
+
+#[test]
+fn final_boundary_degradation_at_102_is_not_tolerated() {
+    // Break caught: broadening the one-quantum tolerance to two excess events.
+    let outcome = boundary_degradation_outcome(102, false, false, true);
+    let sample = &outcome.document().trials[0]
+        .raw
+        .performance_evidence_stream
+        .as_ref()
+        .unwrap()
+        .samples[1];
+    assert!(!tolerated_boundary_degradation(
+        MeasurementStageV1::Final,
+        ScenarioV1::Burst,
+        sample,
+        false,
+    ));
+    assert_eq!(
+        outcome.failure_reasons(),
+        [FailureReasonV1::SupportedLoadDegradation]
+    );
+    assert_eq!(outcome.validate(), Ok(()));
+}
+
+#[test]
+fn final_boundary_degradation_with_another_reason_is_not_tolerated() {
+    // Break caught: accepting EventsOneSecond when its reason set is not exact.
+    let outcome = boundary_degradation_outcome(101, true, false, false);
+    let sample = &outcome.document().trials[0]
+        .raw
+        .performance_evidence_stream
+        .as_ref()
+        .unwrap()
+        .samples[1];
+    assert!(!tolerated_boundary_degradation(
+        MeasurementStageV1::Final,
+        ScenarioV1::Burst,
+        sample,
+        false,
+    ));
+    assert_eq!(outcome.validate(), Err(ResultError::InvalidArtifact));
+}
+
+#[test]
+fn final_boundary_degradation_with_trial_event_lag_is_not_tolerated() {
+    // Break caught: tolerating the boundary sample despite an EventLag reason elsewhere.
+    let outcome = boundary_degradation_outcome(101, false, true, true);
+    let stream = outcome.document().trials[0]
+        .raw
+        .performance_evidence_stream
+        .as_ref()
+        .unwrap();
+    let sample = stream
+        .samples
+        .iter()
+        .find(|sample| sample.reasons == [PerformanceReasonV1::EventsOneSecond])
+        .unwrap();
+    assert!(
+        stream
+            .samples
+            .iter()
+            .any(|sample| { sample.reasons.contains(&PerformanceReasonV1::EventLag) })
+    );
+    assert!(!tolerated_boundary_degradation(
+        MeasurementStageV1::Final,
+        ScenarioV1::Burst,
+        sample,
+        true,
+    ));
+    assert_eq!(
+        outcome.failure_reasons(),
+        [FailureReasonV1::SupportedLoadDegradation]
+    );
+    assert!(outcome.validate().is_ok());
+}
+
+fn write_unvalidated_outcome(outcome: &ReferenceOutcomeV1) -> (tempfile::TempDir, PathBuf) {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("result-v1.json");
+    let mut bytes = serde_json::to_vec(outcome).unwrap();
+    bytes.push(b'\n');
+    std::fs::write(&path, bytes).unwrap();
+    (root, path)
+}
+
+#[test]
+fn amended_legacy_reader_reclassifies_tolerated_supported_load_failure() {
+    // Break caught: the closing reader rejects a legacy failure made empty by the amendment.
+    let stored = boundary_degradation_outcome(101, false, false, true);
+    assert_eq!(stored.validate(), Err(ResultError::InvalidArtifact));
+    let (_root, path) = write_unvalidated_outcome(&stored);
+
+    let read =
+        read_and_validate_reference_outcome(&path, AmendedLegacyMode::AcceptAmendedLegacy).unwrap();
+
+    assert_eq!(read.outcome.status(), ReferenceOutcomeStatusV1::Pass);
+    assert!(read.outcome.failure_reasons().is_empty());
+    assert_eq!(read.outcome.validate(), Ok(()));
+    assert_eq!(
+        read.reclassified,
+        Some(ReclassificationRecordV1 {
+            scenario: ScenarioV1::Burst,
+            recorded_failure_reasons: vec![FailureReasonV1::SupportedLoadDegradation],
+        })
+    );
+}
+
+#[test]
+fn amended_legacy_reader_keeps_still_derived_failure() {
+    // Break caught: reclassifying a 102-event sample whose failure still derives.
+    let stored = boundary_degradation_outcome(102, false, false, true);
+    assert_eq!(stored.validate(), Ok(()));
+    let (_root, path) = write_unvalidated_outcome(&stored);
+
+    let read =
+        read_and_validate_reference_outcome(&path, AmendedLegacyMode::AcceptAmendedLegacy).unwrap();
+
+    assert_eq!(read.outcome.status(), ReferenceOutcomeStatusV1::Failed);
+    assert_eq!(
+        read.outcome.failure_reasons(),
+        [FailureReasonV1::SupportedLoadDegradation]
+    );
+    assert_eq!(read.reclassified, None);
+}
+
+#[test]
+fn amended_legacy_reader_rejects_different_derived_failure_set() {
+    // Break caught: treating any legacy failure-set divergence as reclassifiable.
+    let mut stored = failed_outcome(
+        ScenarioV1::Burst,
+        MeasurementStageV1::Final,
+        FailureReasonV1::ScreenLatency,
+        100,
+        1_000,
+    );
+    stored.document_mut().failure_reasons = vec![FailureReasonV1::SupportedLoadDegradation];
+    let (_root, path) = write_unvalidated_outcome(&stored);
+
+    assert!(
+        read_and_validate_reference_outcome(&path, AmendedLegacyMode::AcceptAmendedLegacy,)
+            .is_err()
+    );
+}
+
+#[test]
+fn amended_legacy_reader_off_preserves_fail_closed_behavior() {
+    // Break caught: allowing ordinary readers to reclassify without explicit authority.
+    let stored = boundary_degradation_outcome(101, false, false, true);
+    let (_root, path) = write_unvalidated_outcome(&stored);
+
+    assert!(read_and_validate_reference_outcome(&path, AmendedLegacyMode::Off).is_err());
+}
+
+struct AmendedLegacyEntrypointFixture {
+    baseline_root: tempfile::TempDir,
+    final_root: tempfile::TempDir,
+}
+
+fn amended_legacy_entrypoint_fixture() -> AmendedLegacyEntrypointFixture {
+    let baseline_root = tempfile::tempdir().unwrap();
+    let final_root = tempfile::tempdir().unwrap();
+    for spec in &workload_schema().scenarios {
+        let mut baseline = synthetic_result(spec.scenario, MeasurementStageV1::Baseline);
+        let legacy_burst = spec.scenario == ScenarioV1::Burst;
+        let mut final_outcome = if legacy_burst {
+            boundary_degradation_outcome(101, false, false, false)
+        } else {
+            synthetic_result(spec.scenario, MeasurementStageV1::Final)
+        };
+        let baseline_scenario_root = baseline_root.path().join(&spec.directory);
+        let final_scenario_root = final_root.path().join(&spec.directory);
+        write_synthetic_raw_scenario_root(&baseline_scenario_root, &mut baseline).unwrap();
+        write_synthetic_raw_scenario_root(&final_scenario_root, &mut final_outcome).unwrap();
+        if legacy_burst {
+            final_outcome.document_mut().failure_reasons =
+                vec![FailureReasonV1::SupportedLoadDegradation];
+            final_outcome = match final_outcome {
+                ReferenceOutcomeV1::Pass { document } => ReferenceOutcomeV1::Failed { document },
+                _ => unreachable!(),
+            };
+        }
+        atomic_write_reference_outcome(&baseline_scenario_root.join("result-v1.json"), &baseline)
+            .unwrap();
+        let mut bytes = serde_json::to_vec(&final_outcome).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(final_scenario_root.join("result-v1.json"), bytes).unwrap();
+    }
+    AmendedLegacyEntrypointFixture {
+        baseline_root,
+        final_root,
+    }
+}
+
+fn closed_entrypoint_environment(
+    additional: impl IntoIterator<Item = (String, String)>,
+) -> BTreeMap<String, String> {
+    let mut environment = BTreeMap::from([
+        ("CARGO_HOME".to_owned(), "/home/mageyuki/.cargo".to_owned()),
+        ("HOME".to_owned(), "/home/mageyuki".to_owned()),
+        ("LC_ALL".to_owned(), "C".to_owned()),
+        ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+        (
+            "RUSTUP_HOME".to_owned(),
+            "/home/mageyuki/.rustup".to_owned(),
+        ),
+        ("TZ".to_owned(), "UTC".to_owned()),
+    ]);
+    environment.extend(additional);
+    environment
+}
+
+fn run_closed_entrypoint(
+    name: &str,
+    environment: BTreeMap<String, String>,
+) -> std::process::Output {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--ignored", "--test-threads=1"])
+        .env_clear()
+        .envs(environment)
+        .output()
+        .unwrap()
+}
+
+fn reclassification_sidecar_path(output: &std::path::Path) -> PathBuf {
+    let mut path = output.as_os_str().to_os_string();
+    path.push(".reclassification.json");
+    path.into()
+}
+
+fn rederive_entrypoint_environment(
+    fixture: &AmendedLegacyEntrypointFixture,
+    output: &std::path::Path,
+    flag: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut additional = vec![
+        (
+            "HERDR_PERF_REDERIVE_BASELINE_RESULTS_ROOT".to_owned(),
+            fixture.baseline_root.path().to_string_lossy().into_owned(),
+        ),
+        (
+            "HERDR_PERF_REDERIVE_FINAL_RESULTS_ROOT".to_owned(),
+            fixture.final_root.path().to_string_lossy().into_owned(),
+        ),
+        (
+            "HERDR_PERF_REDERIVE_OUTPUT".to_owned(),
+            output.to_string_lossy().into_owned(),
+        ),
+    ];
+    if let Some(value) = flag {
+        additional.push((
+            "HERDR_PERF_ACCEPT_AMENDED_LEGACY".to_owned(),
+            value.to_owned(),
+        ));
+    }
+    closed_entrypoint_environment(additional)
+}
+
+fn classify_entrypoint_environment(
+    fixture: &AmendedLegacyEntrypointFixture,
+    output: &std::path::Path,
+    flag: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut additional = vec![
+        (
+            "HERDR_PERF_CLASSIFY_RESULTS_ROOT".to_owned(),
+            fixture.final_root.path().to_string_lossy().into_owned(),
+        ),
+        (
+            "HERDR_PERF_CLASSIFY_OUTPUT".to_owned(),
+            output.to_string_lossy().into_owned(),
+        ),
+    ];
+    if let Some(value) = flag {
+        additional.push((
+            "HERDR_PERF_ACCEPT_AMENDED_LEGACY".to_owned(),
+            value.to_owned(),
+        ));
+    }
+    closed_entrypoint_environment(additional)
+}
+
+fn expected_reclassification_sidecar() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "rule": "amended_legacy_v1",
+        "reclassified": [{
+            "scenario": "burst",
+            "recorded_failure_reasons": ["supported_load_degradation"],
+        }],
+    })
+}
+
+#[test]
+fn amended_legacy_entrypoints_reclassify_uniformly_and_write_sidecars() {
+    // Break caught: either closing consumer observes a different outcome or omits provenance.
+    let fixture = amended_legacy_entrypoint_fixture();
+    let outputs = tempfile::tempdir().unwrap();
+    let report_path = outputs.path().join("section15.json");
+    let checkpoint_path = outputs.path().join("checkpoint.json");
+
+    let rederive = run_closed_entrypoint(
+        "rederive_section15_report_from_results",
+        rederive_entrypoint_environment(&fixture, &report_path, Some("1")),
+    );
+    assert_eq!(rederive.status.code(), Some(0), "{rederive:?}");
+    assert!(rederive.stderr.is_empty(), "{rederive:?}");
+    let classify = run_closed_entrypoint(
+        "classify_d4_checkpoint_from_results",
+        classify_entrypoint_environment(&fixture, &checkpoint_path, Some("1")),
+    );
+    assert_eq!(classify.status.code(), Some(0), "{classify:?}");
+    assert!(classify.stderr.is_empty(), "{classify:?}");
+
+    let report: Section15ReDerivationV1 =
+        serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
+    assert_eq!(
+        report.validate_with_mode(AmendedLegacyMode::AcceptAmendedLegacy),
+        Ok(())
+    );
+    let burst = report
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.scenario == ScenarioV1::Burst)
+        .unwrap();
+    assert_eq!(burst.final_status, ReferenceOutcomeStatusV1::Pass);
+    assert!(burst.final_failure_reasons.is_empty());
+    let checkpoint: D4CheckpointDocumentV1 =
+        serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    assert_eq!(
+        checkpoint.decision,
+        D4CheckpointDecisionV1::NoMissD4NotAuthorized {}
+    );
+
+    for sidecar in [
+        reclassification_sidecar_path(&report_path),
+        reclassification_sidecar_path(&checkpoint_path),
+    ] {
+        let actual: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(sidecar).unwrap()).unwrap();
+        assert_eq!(actual, expected_reclassification_sidecar());
+    }
+}
+
+#[test]
+fn amended_legacy_entrypoints_reject_non_one_flag() {
+    // Break caught: treating a present non-1 flag as disabled instead of rejecting the process.
+    let fixture = amended_legacy_entrypoint_fixture();
+    let outputs = tempfile::tempdir().unwrap();
+    let report_path = outputs.path().join("invalid-flag-section15.json");
+    let checkpoint_path = outputs.path().join("invalid-flag-checkpoint.json");
+    let rederive = run_closed_entrypoint(
+        "rederive_section15_report_from_results",
+        rederive_entrypoint_environment(&fixture, &report_path, Some("0")),
+    );
+    let classify = run_closed_entrypoint(
+        "classify_d4_checkpoint_from_results",
+        classify_entrypoint_environment(&fixture, &checkpoint_path, Some("0")),
+    );
+    for (result, output) in [(rederive, report_path), (classify, checkpoint_path)] {
+        assert_eq!(result.status.code(), Some(20), "{result:?}");
+        assert!(result.stderr.is_empty(), "{result:?}");
+        assert!(!output.exists());
+        assert!(!reclassification_sidecar_path(&output).exists());
+    }
+}
+
+#[test]
+fn amended_legacy_entrypoints_without_flag_preserve_fail_closed_behavior() {
+    // Break caught: implicitly enabling reclassification when the optional flag is absent.
+    let fixture = amended_legacy_entrypoint_fixture();
+    let outputs = tempfile::tempdir().unwrap();
+    let report_path = outputs.path().join("off-section15.json");
+    let checkpoint_path = outputs.path().join("off-checkpoint.json");
+    let rederive = run_closed_entrypoint(
+        "rederive_section15_report_from_results",
+        rederive_entrypoint_environment(&fixture, &report_path, None),
+    );
+    let classify = run_closed_entrypoint(
+        "classify_d4_checkpoint_from_results",
+        classify_entrypoint_environment(&fixture, &checkpoint_path, None),
+    );
+    for (result, output) in [(rederive, report_path), (classify, checkpoint_path)] {
+        assert_eq!(result.status.code(), Some(20), "{result:?}");
+        assert!(result.stderr.is_empty(), "{result:?}");
+        assert!(!output.exists());
+        assert!(!reclassification_sidecar_path(&output).exists());
+    }
+}
+
 #[test]
 fn artifact_time_semantics_startup_generality_and_overflow_fail_closed() {
     let mut close_after_sample = valid_twice_target_result();
@@ -6412,8 +7027,9 @@ fn typed_reference_composer_owns_candidate_construction_and_atomic_finalization(
     assert!(outcome.validate().is_ok());
     assert!(atomic_write_reference_outcome(&output, &outcome).is_ok());
     assert_eq!(
-        read_and_validate_reference_outcome(&output)
+        read_and_validate_reference_outcome(&output, AmendedLegacyMode::Off)
             .unwrap()
+            .outcome
             .status(),
         ReferenceOutcomeStatusV1::Pass
     );
@@ -6580,8 +7196,9 @@ fn typed_reference_validator_owns_final_publication_and_status_mapping() {
     };
     assert_eq!(validate_reference_outcome_impl(&request).unwrap(), 0);
     assert_eq!(
-        read_and_validate_reference_outcome(&output)
+        read_and_validate_reference_outcome(&output, AmendedLegacyMode::Off)
             .unwrap()
+            .outcome
             .status(),
         ReferenceOutcomeStatusV1::Pass
     );
@@ -6598,9 +7215,13 @@ fn typed_reference_validator_owns_final_publication_and_status_mapping() {
         20
     );
     assert_eq!(
-        read_and_validate_reference_outcome(&fixture.output_path("result-v1.json"))
-            .unwrap()
-            .failure_reasons(),
+        read_and_validate_reference_outcome(
+            &fixture.output_path("result-v1.json"),
+            AmendedLegacyMode::Off,
+        )
+        .unwrap()
+        .outcome
+        .failure_reasons(),
         &[FailureReasonV1::InvalidArtifact]
     );
     assert!(!substituted_request.output.exists());
@@ -6639,8 +7260,9 @@ fn typed_reference_validator_owns_final_publication_and_status_mapping() {
             "malformed composer token must fail closed: {token}"
         );
         assert_eq!(
-            read_and_validate_reference_outcome(&malformed_request.output)
+            read_and_validate_reference_outcome(&malformed_request.output, AmendedLegacyMode::Off,)
                 .unwrap()
+                .outcome
                 .failure_reasons(),
             &[FailureReasonV1::InvalidArtifact]
         );
@@ -6686,7 +7308,9 @@ fn typed_reference_validator_owns_final_publication_and_status_mapping() {
             baseline_results_root: None,
         };
         let actual_code = validate_reference_outcome_impl(&matrix_request).unwrap();
-        let published = read_and_validate_reference_outcome(&output).unwrap();
+        let published = read_and_validate_reference_outcome(&output, AmendedLegacyMode::Off)
+            .unwrap()
+            .outcome;
         assert_eq!(
             published.status(),
             expected_status,
@@ -6727,8 +7351,9 @@ fn typed_reference_validator_owns_final_publication_and_status_mapping() {
                 20
             );
             assert_eq!(
-                read_and_validate_reference_outcome(&output)
+                read_and_validate_reference_outcome(&output, AmendedLegacyMode::Off)
                     .unwrap()
+                    .outcome
                     .failure_reasons(),
                 &[FailureReasonV1::CommandFailed]
             );
@@ -6764,8 +7389,9 @@ fn typed_reference_validator_owns_final_publication_and_status_mapping() {
             20
         );
         assert_eq!(
-            read_and_validate_reference_outcome(&output)
+            read_and_validate_reference_outcome(&output, AmendedLegacyMode::Off)
                 .unwrap()
+                .outcome
                 .failure_reasons(),
             &[FailureReasonV1::CommandFailed]
         );
@@ -6803,8 +7429,9 @@ fn typed_reference_validator_owns_final_publication_and_status_mapping() {
         20
     );
     assert_eq!(
-        read_and_validate_reference_outcome(&output)
+        read_and_validate_reference_outcome(&output, AmendedLegacyMode::Off)
             .unwrap()
+            .outcome
             .failure_reasons(),
         &[FailureReasonV1::CommandFailed]
     );
@@ -6818,8 +7445,9 @@ fn typed_reference_validator_owns_final_publication_and_status_mapping() {
         20
     );
     assert_eq!(
-        read_and_validate_reference_outcome(&output)
+        read_and_validate_reference_outcome(&output, AmendedLegacyMode::Off)
             .unwrap()
+            .outcome
             .failure_reasons(),
         &[FailureReasonV1::InvalidArtifact]
     );
@@ -8239,8 +8867,9 @@ fn runner_fixture_aggregates_closed_statuses_and_promotes_atomically() {
         };
         assert_eq!(validate_reference_outcome_impl(&request).unwrap(), 20);
         assert_eq!(
-            read_and_validate_reference_outcome(&output)
+            read_and_validate_reference_outcome(&output, AmendedLegacyMode::Off)
                 .unwrap()
+                .outcome
                 .failure_reasons(),
             &[FailureReasonV1::CommandFailed]
         );
@@ -8865,7 +9494,9 @@ fn validate_reference_baseline_set_from_environment() -> Result<(), HarnessError
     ] {
         let outcome = read_and_validate_reference_outcome(
             &canonical_root.join(mapped).join("result-v1.json"),
-        )?;
+            AmendedLegacyMode::Off,
+        )?
+        .outcome;
         let document = match outcome {
             ReferenceOutcomeV1::Pass { document } | ReferenceOutcomeV1::Failed { document } => {
                 document
