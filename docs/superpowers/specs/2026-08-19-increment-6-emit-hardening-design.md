@@ -159,24 +159,43 @@ connection BREAK-BEFORE-MAKE: the old connection closes before the new
 one subscribes, so no transition is ever delivered twice — herdr-sourced
 events carry no deduplication key, and an overlap window would
 double-record ledger rows, activity items, and rate observations; the
-bounded gap between close and resubscribe is covered by the fallback
-path. Second, enrichment events are isolated from the primary pipeline:
+close-to-resubscribe gap is bounded per attempt but open-ended under
+sustained enrichment failure — surfaced by the per-stream health below —
+and is covered throughout by the fallback path. Second, enrichment events are isolated from the primary pipeline:
 they never enter the primary connection's replay and anomaly
 classification, they never touch the primary's overflow state, and their
 subscription health is tracked separately so an enrichment failure can
 neither degrade the primary's observation quality nor be masked by
-primary health. During a primary convergence episode (defined by the
-collector's own phase, not by an observation-quality value), enrichment
-events are not discarded — a transition arriving after the snapshot was
-captured is not in that snapshot, and dropping it would lose exactly the
-fidelity this subscription restores. They are buffered coalesced per
-pane (latest event per pane) and flushed through the ordinary handler
-immediately after the snapshot batch applies; a flushed event that
-carries the same status the snapshot already established is a no-op
-under the existing state-family semantics, so a pre-snapshot leftover
-cannot regress state or duplicate a ledger row. Intermediate transitions
-inside the episode window coalesce away — the same bounded fidelity
-loss the fallback family already accepts.
+primary health. During a primary convergence episode — defined by the
+collector's own phase, from episode start until the convergence loop
+sets herdr quality Live after clean replay, never by an
+observation-quality value — enrichment events are not discarded: a
+transition arriving after the snapshot was captured is not in that
+snapshot, and dropping it would lose exactly the fidelity this
+subscription restores. They are buffered coalesced per pane (latest
+event per pane, stamped with local arrival order; the map is bounded by
+the enrichment target set, entries for panes outside it are dropped at
+insert, and the buffer is retained across enrichment-connection swaps
+and cleared only by flush or target-set removal). The flush runs once
+at the Live transition — after replay, so it never interleaves with
+replayed primary events — under two suppression rules, because applying
+a herdr-sourced event is NEVER a no-op (each receipt gets a fresh event
+identity and an unconditional ledger row): first, a WATERMARK drops
+every buffered event that arrived before the snapshot response arrived
+(the pre-capture generation — the snapshot itself carries that state,
+and a stale different-status leftover must not regress newer snapshot
+truth or touch a stale-marked execution); second, a STATUS-DIFFERS
+filter applies a surviving event only if its status differs from the
+pane's current modeled status (a transition the replay already
+re-established flushes to nothing instead of duplicating a ledger row),
+and events for panes absent from the converged model are dropped.
+Transitions inside the episode window coalesce to the final state and
+the watermark can drop a transition that raced the snapshot response
+within network jitter — bounded fidelity loss of the same class the
+fallback family already accepts, and far narrower than the whole
+episode window. While the primary is converged, the per-transition
+restoration below holds exactly; during an episode it degrades to
+final-state coalescing.
 
 The existing derivation of agent status from `pane.updated` payloads remains
 in place as the fallback path; the scoped subscription restores the richer
@@ -288,15 +307,16 @@ measurement attempt:
    A reclassified outcome is presented as a pass with its recorded
    failure reasons cleared on the in-memory representation (the stored
    bytes are never touched); without that clearing the pass-side
-   validator would reject the non-empty recorded reasons — the Section 15
-   re-derivation, the report's own self-validation re-read (which
-   re-derives a fresh document and requires equality with the stored
-   report), and the D4 checkpoint classifier: a stored `Failed` document
-   is reclassified at read time as an amended pass if and only if its
-   recorded `failure_reasons` equal exactly
-   `["supported_load_degradation"]` AND the amended predicate derives no
-   failure from its evidence; any other divergence between recorded and
-   derived outcomes remains fail-closed. Because reclassification happens
+   validator would reject the non-empty recorded reasons. The mode's
+   consumers are the Section 15 re-derivation, the report's own
+   self-validation re-read (which re-derives a fresh document and
+   requires equality with the stored report), and the D4 checkpoint
+   classifier — all of them read through the one shared reader. The
+   rule: a stored `Failed` document is reclassified at read time as an
+   amended pass if and only if its recorded `failure_reasons` equal
+   exactly `["supported_load_degradation"]` AND the amended predicate
+   derives no failure from its evidence; any other divergence between
+   recorded and derived outcomes remains fail-closed. Because reclassification happens
    at read time in one shared place, the regenerated report contains no
    burst failure and the self-validation equality gate holds without
    special-casing. The reclassification itself is recorded in a SIDECAR

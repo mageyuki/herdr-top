@@ -311,22 +311,41 @@ never ride the primary connection's lifecycle.
    reconciliation (`src/herdr/collector.rs:1804-1812`, `1701-1703`), so
    merging the streams would let enrichment traffic degrade primary
    observation quality. The enrichment reader is a separate task with
-   its own bounded channel. Convergence-window rule (the window is
-   defined by the COLLECTOR'S OWN PHASE — a convergence episode from gap
-   start until the snapshot batch applies — never by an
-   `ObservationQuality` value, which is ambiguous between herdr quality
-   at `set_herdr_quality` (collector.rs:1661-1663) and the composed
-   effective quality (collector.rs:133-134)): enrichment events are NOT
-   discarded during an episode — an event arriving after snapshot
-   capture is not in that snapshot, and the primary reaches `Live` only
-   after post-snapshot replay (line 1662), so discard-until-Live would
-   lose exactly the transitions this stream exists to restore. Instead
-   they are BUFFERED coalesced per pane (latest event per pane) and
-   flushed through the ordinary handler immediately after the snapshot
-   batch applies; a flushed event carrying the status the snapshot
-   already established is a no-op under the existing state-family
-   semantics (no duplicate ledger row, no regression), which the tests
-   pin. Outside an episode, events apply directly. The reader never
+   its own bounded channel. Convergence-window rule — the window is
+   defined by the COLLECTOR'S OWN PHASE, from episode start until the
+   convergence loop sets herdr quality Live after clean replay
+   (collector.rs:1661-1663; explicitly ONE boundary, chosen at Live so
+   the flush never interleaves with the replay at lines 1633-1662; the
+   phase is never identified by an `ObservationQuality` value, which is
+   ambiguous between herdr quality and the composed effective quality at
+   collector.rs:133-134): enrichment events are NOT discarded during an
+   episode — an event arriving after snapshot capture is not in that
+   snapshot, so discard-until-Live would lose exactly the transitions
+   this stream exists to restore. They are BUFFERED coalesced per pane
+   (latest event per pane, stamped with local arrival order). Buffer
+   bounds and lifetime: the map is keyed by pane id and bounded by the
+   enrichment target set (inserts for panes outside the set are
+   dropped); it is retained across enrichment-connection swaps and
+   cleared only by flush or target-set removal; under sustained primary
+   failure it holds at most one entry per target pane. The FLUSH runs
+   once at the Live transition under two suppression rules — necessary
+   because applying a herdr-sourced event is NEVER a no-op: every
+   receipt gets a fresh ULID event identity (collector.rs:3985-3990),
+   `RecordEvent` is unconditional (reducer.rs:714-718), and the activity
+   dedup key is that event identity (operator.rs:209-213), so an
+   unfiltered flush would always duplicate ledger rows. Rule 1,
+   WATERMARK: drop every buffered event whose arrival precedes the
+   arrival of the snapshot response (the pre-capture generation — the
+   snapshot already carries that state, and a stale different-status
+   leftover must neither regress newer snapshot truth nor re-touch an
+   execution the snapshot marked `Stale`, which the handler's
+   non-terminal filter at collector.rs:3372-3376 would otherwise admit
+   because `ExecState::Stale` is not terminal). Rule 2, STATUS-DIFFERS:
+   apply a surviving event through the ordinary handler only if its
+   status differs from the pane's current modeled status (a transition
+   the replay already re-established flushes to nothing); drop events
+   for panes absent from the converged model. Outside an episode,
+   events apply directly. The reader never
    sets the primary's `overflowed` flag; its cancellation and join are
    owned by the collector's existing shutdown lifecycle; on EOF or read
    error it re-enters the enrichment retry path only. Subscription
@@ -375,17 +394,22 @@ assertion is the discriminating half against a make-before-break
 regression (a single delivery can never double-record; only the
 forbidden overlap can).
 
-- [ ] **Step 4c: Write failing convergence-window tests** (four): (i)
+- [ ] **Step 4c: Write failing convergence-window tests** (six): (i)
 enrichment EOF mid-stream → enrichment retry path re-subscribes while
 primary quality stays Live and no `Dirty` reconciliation occurs; (ii) a
 flood on the enrichment channel never sets the primary `overflowed`
 flag or triggers a resnapshot; (iii) THE HOLE-PINNING CASE — an
-enrichment transition arriving AFTER snapshot capture but BEFORE the
-primary finishes its buffered replay (post-snapshot, pre-`Live`) is
-buffered and applied after the snapshot batch: its ledger row, activity
-item, and rate observation EXIST after convergence; (iv) a buffered
-pre-snapshot leftover whose status equals the snapshot's is a no-op —
-no duplicate ledger row, no state regression.
+enrichment transition arriving after the snapshot response but before
+`Live` is buffered and applied at the flush: its ledger row, activity
+item, and rate observation EXIST after convergence; (iv) a surviving
+buffered event whose status the replay already re-established flushes
+to NOTHING — no second ledger row for the same transition
+(status-differs rule); (v) a pre-watermark event with a DIFFERENT,
+older status is dropped — the pane's post-convergence status matches
+the snapshot, no regression, and no ledger row from the stale event
+(watermark rule); (vi) two transitions for one pane inside one episode
+coalesce — exactly one flushed application carrying the final status
+(the per-pane-latest rule, pinning the documented fidelity bound).
 
 - [ ] **Step 5: Write failing fallback-unavailable convergence test**: with
 the enrichment endpoint permanently refusing connections, drive the
@@ -563,6 +587,21 @@ the backstop).
   whose `Failed`-arm consistency check is at lines 1074-1081), threaded
   as an explicit PARAMETER `legacy: AmendedLegacyMode` (`Off` |
   `AcceptAmendedLegacy`) — the reader NEVER consults the environment.
+  Return channel (required because clearing `failure_reasons` makes a
+  reclassified pass indistinguishable from a genuine one afterward): the
+  reader's success type becomes a wrapper
+  `ReferenceOutcomeRead { outcome: ReferenceOutcomeV1, reclassified: Option<ReclassificationRecordV1> }`
+  where the record carries the scenario and the recorded failure
+  reasons; `load_all_scenario_outcomes` accumulates the records and the
+  entrypoints receive them for sidecar writing. Declared mechanical
+  ripple: `read_and_validate_reference_outcome` has 16 call sites
+  (`tests/common/workload.rs` 3097 — the self-validation re-read, which
+  receives the caller's mode — 6051, and 7328, plus 13 in
+  `tests/workload_harness.rs`), and `load_all_scenario_outcomes` has 3
+  (5096, 5128, 5129); every site outside the two closing entrypoints
+  passes `Off`, and the site at line 6051 — candidate validation inside
+  the REAL measurement path — is explicitly mandatory-`Off` so no
+  measurement can ever reclassify.
   Only the two closing entrypoints translate the environment flag
   `HERDR_PERF_ACCEPT_AMENDED_LEGACY=1` into that parameter, reading it
   once at entry. Their closed-environment gate
@@ -631,9 +670,10 @@ process-global would violate Global-Constraints checklist item 1):
 (a) stored `Failed` burst document with recorded
 `["supported_load_degradation"]` whose every flagged sample is the
 tolerated shape, mode `AcceptAmendedLegacy` → presented as amended pass
-with `failure_reasons` cleared in-memory, and `validate()` on the
-returned outcome SUCCEEDS (pinning the pass-arm interaction at lines
-1065-1074); (b) same recorded reasons but one flagged sample at 102 →
+with `failure_reasons` cleared in-memory, `validate()` on the returned
+`outcome` SUCCEEDS (pinning the pass-arm interaction at lines
+1065-1074), and the wrapper's `reclassified` record is `Some` carrying
+scenario `burst` and the recorded reasons; (b) same recorded reasons but one flagged sample at 102 →
 recorded and derived failure sets agree, so the document stays a valid
 `Failed` and is never reclassified; (c) recorded reasons
 `["supported_load_degradation"]` with a derived nonempty DIFFERENT set →
@@ -641,7 +681,10 @@ recorded and derived failure sets agree, so the document stays a valid
 `InvalidArtifact` exactly as today. Environment-boundary cases run the
 ENTRYPOINTS as spawned child processes with `env_clear` plus the exact
 allowlist (the Increment 5 bootstrap pattern — no in-process env
-mutation): (e) END-TO-END with `HERDR_PERF_ACCEPT_AMENDED_LEGACY=1` in
+mutation; the existing helpers `run_closed_command`/`run_closed_status`
+at `tests/common/workload.rs:5693/5711` supply only
+`invariant_environment()` and treat any stderr as failure, so these
+cases add a sibling helper that also injects the `HERDR_PERF_*` keys): (e) END-TO-END with `HERDR_PERF_ACCEPT_AMENDED_LEGACY=1` in
 the child environment over a synthetic legacy root (fixture (a) beside
 six passing scenario fixtures): the Section 15 re-derivation entrypoint
 produces a report with no burst failure, the report's self-validation
