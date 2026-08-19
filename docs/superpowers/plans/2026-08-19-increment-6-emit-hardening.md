@@ -242,12 +242,23 @@ Expected: PASS, no existing test regresses.
   5827)
 - Modify: `src/herdr/wire.rs` (response-id matching near lines 236-246:
   recognize decorated error ids)
-- Modify: `src/diagnostics/mod.rs` (new counter family — see the
-  diagnostics contract in Behavior 4b; the existing
-  `ControllerCounterSnapshot` and its exactly-nine-field doctor parser,
-  `src/doctor.rs:1594-1596`, are NOT touched)
-- Modify: `src/doctor.rs` (render the new counter family in both
-  renderers; the controller-counter parser stays at nine fields)
+- Modify: `src/diagnostics/mod.rs` (new counter family and handle — see
+  the diagnostics contract in Behavior 4b; `RuntimeDiagnosticsSnapshot`
+  grows from eight fields to nine)
+- Modify: `src/doctor.rs` — the BINDING parser constraint is the ROOT
+  snapshot parser `parse_runtime_snapshot` at lines 1456-1459, closed
+  at `object.len() != 8` and failing SILENTLY (returns `None`, so
+  doctor would report runtime diagnostics as unavailable): it moves to
+  nine and parses the new family. The nine-field
+  `ControllerCounterSnapshot` parser (lines 1594-1596) is untouched.
+- Modify (mechanical literal ripple — `RuntimeDiagnosticsSnapshot` is
+  constructed exhaustively in nine files): `src/herdr/collector.rs`,
+  `src/herdr/controller.rs`, `src/tui/app.rs`, `src/tui/projection.rs`,
+  `src/tui/view.rs`, `tests/controller.rs`, `tests/doctor.rs` (plus the
+  two already-declared files). Two EXACT serialized fixtures must be
+  regenerated for the new field: the byte-literal status assertion at
+  `src/herdr/controller.rs:1828-1831` and `HEALTHY_JSON_V1`
+  (`tests/doctor.rs:26`, asserted at line 527).
 - Modify (only if the `Subscription` type lacks an optional `pane_id`
   field): `src/herdr/types.rs`
 - Test: `src/herdr/collector.rs` module tests; `src/herdr/wire.rs` module
@@ -347,16 +358,32 @@ never ride the primary connection's lifecycle.
    dropped or discarded payload never appears in event-rate metrics) to
    the CONVERGE TASK; when that channel is full the event is dropped and
    counted (never any backpressure onto the primary). Diagnostics
-   contract: a new process-lifetime monotonic family
+   contract: a new snapshot family
    `EnrichmentCounterSnapshot { channel_full_drops: u64, episode_discards: u64 }`
-   in `src/diagnostics/mod.rs`, published beside `persistence_counters`
-   and `controller_counters` in the runtime diagnostics snapshot and
-   rendered by both doctor renderers as its own family — the closed
-   nine-field `ControllerCounterSnapshot` parser is untouched. The two
-   counters are COMPLEMENTARY views of the same loss: a long non-Live
-   phase fills the channel, after which further losses land in
-   `channel_full_drops` rather than `episode_discards`; tests assert on
-   the published snapshot. A pane-level payload is the only constructible receipt
+   in `src/diagnostics/mod.rs`, produced by a cloneable
+   process-lifetime `EnrichmentDiagnosticsHandle` of monotonic atomics
+   — the codebase's established cross-task counter pattern
+   (`ControllerDiagnosticsHandle`, `src/herdr/controller.rs:272-279`).
+   The collector creates the handle once; the enrichment reader holds a
+   clone across its retries and reconnects and increments
+   `channel_full_drops` on each failed enqueue (any phase); the
+   converge task increments `episode_discards` for each successfully
+   enqueued payload it consumes without applying in a non-Live loop.
+   Publication: `publish_facade` (collector.rs:773-780) pulls both
+   values from the handle into the snapshot exactly as it already pulls
+   the acceptor's counters from `ControllerDiagnosticsHandle` — the
+   published watch is a clone of the local snapshot, so writing the
+   watch directly would be silently overwritten by the next publish —
+   on the same publication triggers that refresh the controller
+   counters; tests assert on the published snapshot after driving a
+   publication. Counter semantics, precisely: `channel_full_drops`
+   counts failed enqueues in ANY phase (a finite queue can fill
+   whenever production outpaces consumption, including bursts while
+   Live and the straight-line convergence region at collector.rs
+   1614-1631 where no select runs); `episode_discards` counts enqueued
+   payloads consumed-without-applying in non-Live loops. Which counter
+   a lost transition lands in is determined by where it was lost, not
+   by phase duration. A pane-level payload is the only constructible receipt
    representation: a `NormalizedEvent::AgentStatusChanged` requires an
    `execution_id` (`src/model/entities.rs:886-890`) that only
    application-time model matching determines, and sharing one event
@@ -367,16 +394,22 @@ never ride the primary connection's lifecycle.
 
    The CONVERGE TASK is the single consumer and the single owner of
    every piece of state involved (the model, `pending_closures`, its
-   own phase), so no cross-task mutex, arrival counter, or watermark
-   exists. It APPLIES payloads only in its Live loop (`monitor_live`,
-   whose `select!` already hosts a second async source — the
-   `receive_provider` arm — so the added arm is the established
-   pattern); in every NON-Live phase it still consumes the channel but
-   discard-counts each payload without applying — including the
-   TERMINAL Reconciling state (`monitor_reconciling`, reachable after
-   `RESNAPSHOT_ATTEMPTS` failures, collector.rs:1701-1718, and pinned
-   by `three_attempts_then_stays_reconciling`), so the channel never
-   saturates in a long non-Live phase and the loss stays counted. On
+   own phase), so no cross-task EVENT-ORDERING apparatus — mutex,
+   arrival counter, watermark — exists; the diagnostics handle above is
+   orthogonal to this rule (it is the codebase's existing cross-task
+   counter pattern and orders nothing). It APPLIES payloads only in its
+   Live loop (`monitor_live`, whose `select!` already hosts a second
+   async source — the `receive_provider` arm — so the added arm is the
+   established pattern); in every non-Live LOOP — the snapshot-request
+   `select!`, `replay_generation`, and the TERMINAL Reconciling state
+   (`monitor_reconciling`, reachable after `RESNAPSHOT_ATTEMPTS`
+   failures, collector.rs:1701-1718, and pinned by
+   `three_attempts_then_stays_reconciling`) — it consumes the channel
+   and discard-counts each payload without applying, so a LONG non-Live
+   phase drains rather than saturates; the straight-line convergence
+   region (collector.rs:1614-1631) runs no select, so a burst there can
+   still fill the finite queue, landing those losses in
+   `channel_full_drops`. On
    entering Live it first drains and DISCARDS what is queued; the
    honest race wording: payloads whose send lands after the drain
    completes apply as Live — the reader is phase-unaware, so
@@ -491,9 +524,10 @@ assertion is the discriminating half against a make-before-break
 regression (a single delivery can never double-record; only the
 forbidden overlap can).
 
-- [ ] **Step 4c: Write failing processing-contract tests** (nine; the
-fixture controls both streams, so every case establishes its
-preconditions explicitly rather than passing by accident): (i)
+- [ ] **Step 4c: Write failing processing-contract tests** (nine
+numbered groups, ten scenarios — group (iii) contains a Reconciling
+sibling; the fixture controls both streams, so every case establishes
+its preconditions explicitly rather than passing by accident): (i)
 enrichment EOF mid-stream → enrichment retry path re-subscribes while
 primary quality stays Live and no `Dirty` reconciliation occurs; (ii) a
 flood on the enrichment channel never sets the primary `overflowed`
@@ -517,7 +551,8 @@ items and exactly ONE performance admission for the payload (pinning
 the pane-level expansion against the store's UNIQUE event_id
 constraint, the activity dedup, and the one-admission rule); (v) THE
 DISCRIMINANT PIN — a Live event whose status equals every matching
-execution's current state → no application, no row (the discriminant
+execution's current state → no application, no row, and NO performance
+admission (the zero-side of the one-admission rule; the discriminant
 filter, not any dedup, is what prevents the duplicate); (vi) THE
 INDEPENDENCE PIN — a member pane hosting one matching execution EQUAL
 to the event's status, one DIFFERING, and one terminal (`Ended`)
@@ -531,7 +566,8 @@ state) → no status application and no row, the execution stays `Stale`
 (no wall-clock wait on the closure sweep), AND the pending closure is
 CANCELLED via `cancel_pending_pane_closure` — the promised fourth
 rescue trigger, exercised in the converge task that owns
-`pending_closures`; (viii) THE STALE-RESTORATION PIN, distinguishing
+`pending_closures` — and NO performance admission occurs (rescue-only
+processing admits nothing); (viii) THE STALE-RESTORATION PIN, distinguishing
 the two stale causes — a MEMBER pane whose execution went `Stale`
 because the snapshot momentarily reported `agent: None`, then a Live
 scoped transition `working` → the event IS applied: the execution
