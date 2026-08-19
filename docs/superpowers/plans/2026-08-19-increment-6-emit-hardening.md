@@ -270,10 +270,21 @@ snapshot is a gap reconciliation that retires every pre-gap execution
 never ride the primary connection's lifecycle.
 
 1. After the primary connection converges, the collector derives the
-   target pane set from the converged model and keeps it current from
-   `pane_created` / pane-removal handling (note: creation flows through
-   `pane_created`; `pane_updated` silently ignores unknown panes —
-   `src/herdr/collector.rs:3287-3300`).
+   enrichment TARGET SET and keeps it current from `pane_created` /
+   pane-removal handling (note: creation flows through `pane_created`;
+   `pane_updated` silently ignores unknown panes —
+   `src/herdr/collector.rs:3287-3300`). The target set is precisely:
+   panes present in the most recent snapshot, plus panes created since
+   via `pane_created`, minus closed panes — and it EXCLUDES
+   grace-retained remnants, meaning a pane the most recent snapshot
+   removed but which the model still holds only because a `Stale`
+   execution sits inside its closure grace
+   (`src/herdr/collector.rs:3688-3692`). The target set is the SINGLE
+   membership gate for scoped-event application on BOTH the flush and
+   the direct path (Behavior 4b) — one definition, so an in-flight
+   post-Live event for a grace remnant is dropped by the same gate the
+   flush uses — and it is refreshed when each snapshot batch applies,
+   so the Live flush always consults the refreshed set.
 2. On a pane-set change, the collector swaps the enrichment connection
    BREAK-BEFORE-MAKE: it closes the old connection FIRST, then opens a
    new one subscribed to `enrichment_subscriptions(target_set)`. There is
@@ -338,37 +349,63 @@ never ride the primary connection's lifecycle.
    `RecordEvent` is unconditional (reducer.rs:714-718), and the activity
    dedup key is that event identity (operator.rs:209-213), so an
    unfiltered flush would always duplicate ledger rows. Ordering
-   domain: buffered arrivals and the watermark are ordered by ONE shared
-   atomic arrival counter (`AtomicU64`, fetch-add per enrichment receipt)
-   owned by the collector and readable from both tasks; the converge
-   task snapshots the counter value at the arrival of each
-   `session.snapshot` response (collector.rs:1606) and the watermark is
-   the value at the MOST RECENT response — one episode can contain up to
-   `RESNAPSHOT_ATTEMPTS = 3` snapshots (collector.rs:62, 1703), and each
-   response advances the watermark so an event captured before a later
-   snapshot cannot survive. An episode that ends without reaching Live
-   never flushes; entries persist bounded (one per target pane), the
-   watermark keeps advancing with every snapshot, and the first Live
-   flush drains them. Rule 1, WATERMARK: drop every buffered event whose
-   arrival counter precedes the watermark (the pre-capture generation —
-   the snapshot already carries that state; a stale different-status
-   leftover must not regress newer snapshot truth). Rule 2, applied per
-   EXECUTION, not per pane (`Pane` carries no status — status lives on
+   domain and handoff: arrivals and the watermark are ordered by ONE
+   shared arrival counter, and stamping is race-free by construction —
+   the enrichment reader NORMALIZES the event at receipt (minting its
+   metadata exactly as the handler's `metadata()` does, with
+   `source_event_type` `"agent_status_changed"`, so the reducer's
+   `source == "herdr" && source_event_type == "done"` special case at
+   `src/reducer.rs:2121` is never touched) and then, inside ONE critical
+   section on the buffer mutex, increments the counter and inserts the
+   stamped, already-normalized entry; the converge task records the
+   watermark by reading the counter under the SAME mutex at the arrival
+   of each `session.snapshot` response (collector.rs:1606). The stamp is
+   the post-increment value; Rule 1 drops entries with
+   `stamp <= watermark`. Because stamp+insert and watermark-read are
+   serialized on one lock, an event stamped after the watermark read
+   always has `stamp > watermark`, and no event can be stamped but
+   unbuffered when the flush drains the map under the same mutex. The
+   watermark is the value at the MOST RECENT response — one episode can
+   contain up to `RESNAPSHOT_ATTEMPTS = 3` snapshots (collector.rs:62,
+   1703), and each response advances it so an event captured before a
+   later snapshot cannot survive. An episode that ends without reaching
+   Live never flushes; entries persist bounded (one per target pane),
+   the watermark keeps advancing with every snapshot, and the first
+   Live flush drains them. Buffered entries preserve their
+   receipt-time metadata across the flush — the flush replays the
+   stored normalized event as-is, so `timestamp_ms` and
+   `receipt_time_ms` are the ORIGINAL receipt instants, keeping the
+   transition-timestamp fidelity Behavior 4 promises; only the
+   application filter below is flush-specific. Rule 1, WATERMARK: drop
+   every buffered event whose stamp is at or below the watermark (the
+   pre-capture generation — the snapshot already carries that state; a
+   stale different-status leftover must not regress newer snapshot
+   truth). Rule 2, the TARGET-SET GATE plus a per-EXECUTION filter,
+   applied IDENTICALLY on the flush and the direct path: an event is
+   dropped entirely unless its pane is in the current enrichment target
+   set (Behavior 1's definition excludes grace-retained remnants, so a
+   snapshot-removed pane's in-flight events are dropped on BOTH paths
+   and can never reset its `Stale` execution or cancel its pending
+   closure); for a member pane, the transition applies to exactly those
+   matching executions that are non-terminal AND whose current
+   `ExecState` discriminant differs from the event's status (the event
+   side is one of the payload-free `Idle | Working | Blocked | Unknown`
+   from `status_from_str`, collector.rs:4415-4422, so plain equality
+   suffices there; `Pane` carries no status — status lives on
    `Execution.state`, `src/model/entities.rs:25-39` — and one pane can
-   host several non-terminal executions in differing states): a
-   surviving event is dropped entirely unless its pane is a member of
-   the MOST RECENT SNAPSHOT's pane set (snapshot membership, NOT model
-   presence — a snapshot-removed pane is retained in the model through
-   `Stale` grace, collector.rs:3688-3692, and flushing into it would
-   reset the `Stale` execution and cancel the pending closure,
-   resurrecting the pane); for a member pane, the flush does not call
-   the raw handler blindly (its filter admits `Stale` executions,
-   collector.rs:3372-3376, because `ExecState::Stale` is non-terminal)
-   but applies the same per-execution transition the handler uses to
-   exactly those matching executions that are non-terminal, NOT in
-   `Stale` grace, and whose current state family differs from the
-   event's status (a transition the replay already re-established
-   flushes to nothing). Outside an episode, events apply directly. The reader never
+   host several non-terminal executions in differing states, each
+   compared independently; a replay-re-established transition therefore
+   flushes to nothing). A `Stale` execution on a MEMBER pane is
+   deliberately ELIGIBLE: staleness is keyed on the snapshot reporting
+   no agent for the terminal (collector.rs:3642-3652), not on pane
+   removal, so a member pane's execution that went `Stale` on a
+   momentary `agent: None` is exactly what a fresh scoped transition
+   must restore — the target-set gate alone guards resurrection. The
+   flush does not call the raw handler entry (whose construction would
+   re-mint metadata); it applies the handler's per-execution transition
+   to the stored entry under this rule. Outside an episode, events
+   apply directly under the SAME target-set gate and per-execution
+   filter. The reader never
    sets the primary's `overflowed` flag; its cancellation and join are
    owned by the collector's existing shutdown lifecycle; on EOF or read
    error it re-enters the enrichment retry path only. Subscription
@@ -417,7 +454,7 @@ assertion is the discriminating half against a make-before-break
 regression (a single delivery can never double-record; only the
 forbidden overlap can).
 
-- [ ] **Step 4c: Write failing convergence-window tests** (eight; the
+- [ ] **Step 4c: Write failing convergence-window tests** (nine; the
 fixture controls both streams, so every case establishes its
 preconditions explicitly rather than passing by accident): (i)
 enrichment EOF mid-stream → enrichment retry path re-subscribes while
@@ -427,26 +464,37 @@ flag or triggers a resnapshot; (iii) THE HOLE-PINNING CASE — an
 enrichment transition injected after the fixture has sent the snapshot
 response and before replay completes is buffered and applied at the
 flush: assert the ledger-row count increases by exactly one across the
-flush and the new row is the flushed transition (unique attribution,
-not mere existence); (iv) an event PROVEN post-watermark (injected
-after the response, with a matching live execution) whose transition
-the replay also re-established → assert the replay's row exists and the
-flush adds NO second row (status-differs rule, not the watermark,
-must be what drops it); (v) a pre-watermark event with a DIFFERENT,
-older status, with a matching non-terminal execution PRESENT (so the
-drop is attributable to Rule 1, not to no-match) → no row from the
-stale event, post-convergence status matches the snapshot; (vi) two
-transitions for one pane BOTH injected post-watermark → exactly one
-flushed application carrying the final status (coalescing, not the
-watermark, must be what removes the first); (vii) THE RESURRECTION PIN
-— a post-watermark event for a pane the most recent snapshot REMOVED,
-while that pane's execution sits in `Stale` grace → the event is
-dropped by snapshot membership: the execution stays `Stale`, no row is
-written, and the pending pane closure completes; (viii) THE CHOSEN
-RESIDUAL — an event injected between the fixture's receipt of the
-snapshot request and its sending of the response → dropped by the
-watermark, no row: the documented capture-to-response jitter loss,
-pinned as chosen behavior.
+flush, the new row is the flushed transition carrying its ORIGINAL
+receipt timestamp (not flush time), and the transition's activity item
+and rate observation exist after convergence; (iv) an event PROVEN
+post-watermark (injected after the response, with a matching live
+execution) whose transition the replay also re-established → assert
+the replay's row exists and the flush adds NO second row (the
+per-execution discriminant filter, not the watermark, must be what
+drops it); (v) a pre-watermark event with a DIFFERENT, older status,
+where the pane is a CURRENT TARGET-SET MEMBER and a matching
+non-terminal, non-`Stale` execution is present (so the drop is
+attributable to Rule 1 and to nothing else) → no row from the stale
+event, post-convergence status matches the snapshot; (vi) two
+transitions for one pane BOTH injected post-watermark, BOTH statuses
+differing from the pane's starting modeled state (so the first cannot
+be removed by the discriminant filter) → exactly one flushed
+application carrying the final status (coalescing must be what removes
+the first); (vii) THE RESURRECTION PIN — a post-watermark event for a
+pane the most recent snapshot REMOVED, while that pane's execution
+sits in `Stale` grace → the event is dropped by the target-set gate:
+the execution stays `Stale` and no row is written (no wall-clock wait
+on the closure sweep — the immediate assertions are the discriminating
+ones); (viii) THE CHOSEN RESIDUAL — an event injected between the
+fixture's receipt of the snapshot request and its sending of the
+response → dropped by the watermark, no row: the documented
+capture-to-response jitter loss, pinned as chosen behavior; (ix) THE
+STALE-RESTORATION PIN, distinguishing the two stale causes — a MEMBER
+pane whose execution went `Stale` because the snapshot momentarily
+reported `agent: None`, then a post-watermark scoped transition
+`working` → the event IS applied: the execution leaves `Stale`, the
+row is written, and no closure fires (the restoration this stream
+exists for, which a blanket `Stale` exclusion would suppress).
 
 - [ ] **Step 5: Write failing fallback-unavailable convergence test**: with
 the enrichment endpoint permanently refusing connections, drive the
@@ -645,7 +693,8 @@ the backstop).
   mode-carrying variant `validate_with_mode(&self, legacy:
   AmendedLegacyMode)`, with `validate()` delegating to
   `validate_with_mode(Off)` (every existing caller byte-identical) and
-  the closing entrypoint switched to `validate_with_mode(AcceptAmendedLegacy)`.
+  the closing entrypoint calling `validate_with_mode(mode)` with its
+  environment-derived mode — `Off` whenever the flag is absent.
   Sidecar record provenance: the entrypoint takes its
   `ReclassificationRecordV1` values ONLY from its primary
   `load_all_scenario_outcomes` pass; records surfacing from the

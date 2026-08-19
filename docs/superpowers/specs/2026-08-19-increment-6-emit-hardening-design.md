@@ -186,16 +186,22 @@ response, so it always names the most recent snapshot — drops every
 buffered event that arrived before that response (the pre-capture
 generation: the snapshot itself carries that state, and a stale
 different-status leftover must not regress newer snapshot truth).
-Second, a per-EXECUTION filter (pane records carry no status; status
-lives on executions, and one pane can host several): a surviving event
-is dropped entirely unless its pane belongs to the most recent
-snapshot's pane set — snapshot membership, not model presence, because
-a snapshot-removed pane lingers in the model through stale grace and
-flushing into it would resurrect it — and, for a member pane, the
-transition applies only to matching executions that are non-terminal,
-not in stale grace, and whose state family differs from the event's
-status, so a transition the replay already re-established flushes to
-nothing instead of duplicating a ledger row. An episode that never
+Second, a TARGET-SET GATE plus a per-execution filter, applied
+identically at the flush and on the direct path: the enrichment target
+set is defined as the most recent snapshot's panes plus panes created
+since, excluding a grace-retained remnant — a pane the snapshot removed
+that the model holds only while a stale execution's closure grace runs —
+so an event for such a remnant is dropped on both paths and can never
+resurrect the pane; for a member pane (pane records carry no status;
+status lives on executions, and one pane can host several), the
+transition applies to matching executions that are non-terminal and
+whose state differs from the event's status, so a transition the replay
+already re-established flushes to nothing instead of duplicating a
+ledger row. A stale execution on a MEMBER pane stays eligible:
+staleness also arises from a snapshot momentarily reporting no agent,
+and restoring exactly that transition is this stream's purpose — only
+the target-set gate guards resurrection. Buffered entries keep their
+original receipt timestamps across the flush. An episode that never
 reaches the flush point keeps its bounded buffer, with the watermark
 still advancing per snapshot, and the first flush drains it.
 Transitions inside the episode window coalesce to the final state and
