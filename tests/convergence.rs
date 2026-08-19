@@ -517,7 +517,12 @@ async fn pane_created_swaps_enrichment_break_before_make_without_collector_gap()
     .await
     .unwrap();
     wait_until(|| mock.enrichment_subscriptions() == 2).await;
-    wait_until(|| mock.enrichment_closures() >= 1).await;
+    wait_until(|| {
+        mock.ordering()
+            .iter()
+            .any(|entry| entry == "enrichment_close:1")
+    })
+    .await;
 
     let order = mock.ordering();
     let closed = order
@@ -593,7 +598,12 @@ async fn pane_moved_replaces_old_public_pane_id_in_enrichment_target() {
         .unwrap();
     mock.push_primary(moved).await.unwrap();
     wait_until(|| mock.enrichment_subscriptions() == 2).await;
-    wait_until(|| mock.enrichment_closures() >= 1).await;
+    wait_until(|| {
+        mock.ordering()
+            .iter()
+            .any(|entry| entry == "enrichment_close:1")
+    })
+    .await;
 
     let second = mock
         .requests()
@@ -654,7 +664,12 @@ async fn swap_window_records_one_transition_on_each_side_without_overlap() {
     .await
     .unwrap();
     wait_until(|| mock.enrichment_subscriptions() == 2).await;
-    wait_until(|| mock.enrichment_closures() >= 1).await;
+    wait_until(|| {
+        mock.ordering()
+            .iter()
+            .any(|entry| entry == "enrichment_close:1")
+    })
+    .await;
     mock.push_enrichment(agent_status_push("w1:p1", "term_6583d08d791e41", "blocked"))
         .await
         .unwrap();

@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::activity::{OperatorSnapshot, RestoredOperatorState};
@@ -2284,11 +2285,23 @@ fn spawn_enrichment_reader(
     ))
 }
 
-fn enrichment_reconnect_deadline(
-    first_deferred_at: tokio::time::Instant,
-    latest_change_at: tokio::time::Instant,
-) -> tokio::time::Instant {
-    (latest_change_at + RECONNECT_DELAY).min(first_deferred_at + ENRICHMENT_RECONNECT_MAX_DEFERRAL)
+struct EnrichmentDeferral {
+    first: Option<tokio::time::Instant>,
+}
+
+impl EnrichmentDeferral {
+    fn on_change(&mut self, now: Instant) -> Instant {
+        let first = *self.first.get_or_insert(now);
+        (now + RECONNECT_DELAY).min(first + ENRICHMENT_RECONNECT_MAX_DEFERRAL)
+    }
+
+    fn on_swap(&mut self) {
+        self.first = None;
+    }
+
+    fn on_empty(&mut self) {
+        self.first = None;
+    }
 }
 
 async fn run_enrichment_reader(
@@ -2300,10 +2313,10 @@ async fn run_enrichment_reader(
     cancellation: CancellationToken,
 ) {
     let mut target_set = targets.borrow_and_update().clone();
-    let mut defer_started_at = None;
+    let mut deferral = EnrichmentDeferral { first: None };
     loop {
         while target_set.is_empty() {
-            defer_started_at = None;
+            deferral.on_empty();
             tokio::select! {
                 () = cancellation.cancelled() => return,
                 changed = targets.changed() => {
@@ -2312,16 +2325,14 @@ async fn run_enrichment_reader(
                     }
                     target_set = targets.borrow_and_update().clone();
                     if !target_set.is_empty() {
-                        defer_started_at = Some(tokio::time::Instant::now());
+                        let _ = deferral.on_change(Instant::now());
                     }
                 }
             }
         }
 
-        let first_deferred_at = *defer_started_at.get_or_insert_with(tokio::time::Instant::now);
         let delayed = loop {
-            let deadline =
-                enrichment_reconnect_deadline(first_deferred_at, tokio::time::Instant::now());
+            let deadline = deferral.on_change(Instant::now());
             tokio::select! {
                 () = cancellation.cancelled() => return,
                 changed = targets.changed() => {
@@ -2342,19 +2353,11 @@ async fn run_enrichment_reader(
         if !delayed {
             continue;
         }
-        defer_started_at = None;
+        deferral.on_swap();
 
         let subscriptions = enrichment_subscriptions(&target_set);
         let subscribed = tokio::select! {
             () = cancellation.cancelled() => return,
-            changed = targets.changed() => {
-                if changed.is_err() {
-                    return;
-                }
-                target_set = targets.borrow_and_update().clone();
-                defer_started_at = Some(tokio::time::Instant::now());
-                continue;
-            }
             result = wire::subscribe(&sock, &subscriptions) => result,
         };
         let mut stream = match subscribed {
@@ -2412,7 +2415,7 @@ async fn run_enrichment_reader(
                         return;
                     }
                     target_set = targets.borrow_and_update().clone();
-                    defer_started_at = Some(tokio::time::Instant::now());
+                    let _ = deferral.on_change(Instant::now());
                     let _ = stream.close().await;
                     break;
                 }
@@ -6429,18 +6432,88 @@ mod tests {
     }
 
     #[test]
-    fn enrichment_reconnect_deadline_keeps_quiet_debounce_and_caps_sustained_churn() {
-        let first_deferred_at = tokio::time::Instant::now();
-        let quiet_change_at = first_deferred_at + Duration::from_millis(10);
+    fn enrichment_deferral_keeps_quiet_reconnect_delay() {
+        let base = tokio::time::Instant::now();
+        let mut deferral = EnrichmentDeferral { first: None };
+
+        assert_eq!(deferral.on_change(base), base + Duration::from_millis(50));
+    }
+
+    #[test]
+    fn enrichment_deferral_clamps_twenty_changes_to_first_change_budget() {
+        let base = tokio::time::Instant::now();
+        let mut deferral = EnrichmentDeferral { first: None };
+        let expected_deadlines_ms = [
+            50, 90, 130, 170, 210, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250,
+            250, 250,
+        ];
+
+        for (index, expected_deadline_ms) in expected_deadlines_ms.into_iter().enumerate() {
+            let now = base + Duration::from_millis(index as u64 * 40);
+            assert_eq!(
+                deferral.on_change(now),
+                base + Duration::from_millis(expected_deadline_ms)
+            );
+        }
+    }
+
+    #[test]
+    fn enrichment_deferral_swap_resets_anchor_and_budget() {
+        let base = tokio::time::Instant::now();
+        let mut deferral = EnrichmentDeferral { first: None };
+        assert_eq!(deferral.on_change(base), base + Duration::from_millis(50));
         assert_eq!(
-            enrichment_reconnect_deadline(first_deferred_at, quiet_change_at),
-            quiet_change_at + RECONNECT_DELAY
+            deferral.on_change(base + Duration::from_millis(400)),
+            base + Duration::from_millis(250)
         );
 
-        let sustained_change_at = first_deferred_at + Duration::from_millis(500);
+        deferral.on_swap();
+        let next = base + Duration::from_millis(800);
+        assert_eq!(deferral.on_change(next), next + Duration::from_millis(50));
         assert_eq!(
-            enrichment_reconnect_deadline(first_deferred_at, sustained_change_at),
-            first_deferred_at + Duration::from_millis(250)
+            deferral.on_change(next + Duration::from_millis(240)),
+            next + Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn enrichment_deferral_empty_target_resets_anchor_and_budget() {
+        let base = tokio::time::Instant::now();
+        let mut deferral = EnrichmentDeferral { first: None };
+        assert_eq!(deferral.on_change(base), base + Duration::from_millis(50));
+        assert_eq!(
+            deferral.on_change(base + Duration::from_millis(400)),
+            base + Duration::from_millis(250)
+        );
+
+        deferral.on_empty();
+        let next = base + Duration::from_millis(800);
+        assert_eq!(deferral.on_change(next), next + Duration::from_millis(50));
+        assert_eq!(
+            deferral.on_change(next + Duration::from_millis(240)),
+            next + Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn enrichment_deferral_reanchors_after_resolved_stream_swap() {
+        let base = tokio::time::Instant::now();
+        let mut deferral = EnrichmentDeferral { first: None };
+        assert_eq!(deferral.on_change(base), base + Duration::from_millis(50));
+        assert_eq!(
+            deferral.on_change(base + Duration::from_millis(600)),
+            base + Duration::from_millis(250)
+        );
+
+        deferral.on_swap();
+        let later_change = base + Duration::from_millis(1_000);
+        assert_eq!(
+            deferral.on_change(later_change),
+            later_change + Duration::from_millis(50)
+        );
+        assert_eq!(
+            deferral.on_change(later_change + Duration::from_millis(400)),
+            later_change + Duration::from_millis(250)
         );
     }
 
