@@ -171,18 +171,28 @@ event becomes a pane-level payload (pane and terminal identity, the
 parsed status, and the receipt instants — a normalized status event
 needs an execution identity that only application-time matching
 determines, and event identities are unique in the store) forwarded
-over a dedicated bounded channel to the converge task, with
-channel-full drops counted in a diagnostic. The converge task is the
-single consumer and already owns every piece of state involved — the
-model, the pending topology closures, and its own phase — so no
-cross-task lock, counter, or watermark exists. It consumes the channel
-only while Live; on entering Live it drains and DISCARDS everything
-queued during the convergence episode, counting the discards. This is
-an owner-decided simplification: transitions during a convergence
-episode (startup, reconnect, resnapshot — rare and seconds-scale)
-surface only through the fallback family's final state, an explicit
-bounded fidelity loss accepted in exchange for eliminating the
-buffering apparatus. While Live, each payload has two decoupled
+over a dedicated bounded channel to the converge task. Losses are
+observable through a new dedicated diagnostics counter family
+(channel-full drops and episode discards — two complementary views of
+the same loss), published beside the existing counter families and
+rendered by doctor without touching the closed controller-counter
+shape. The converge task is the single consumer and already owns every
+piece of state involved — the model, the pending topology closures,
+and its own phase — so no cross-task lock, counter, or watermark
+exists. It APPLIES payloads only while Live; in every non-Live phase,
+including the terminal Reconciling state, it still consumes the
+channel and discard-counts without applying, and on entering Live it
+drains and discards what was enqueued before the drain completes (the
+reader is phase-unaware, so that is the exact discarded set). This is
+an owner-decided simplification, accepted on the accurate premise:
+ordinary convergence episodes (startup, reconnect, resnapshot) are
+seconds-scale, while the terminal Reconciling state is open-ended —
+but there the entire herdr source is already degraded and surfaced as
+Reconciling observation quality, so the scoped stream's suspension is
+subsumed by that larger surfaced condition. Transitions in any
+non-Live phase surface only through the fallback family's final
+state — an explicit bounded-per-event fidelity loss accepted in
+exchange for eliminating the buffering apparatus. While Live, each payload has two decoupled
 effects. Closure cancellation always fires — the existing
 re-observation cancellation, which is how the fourth topology-closure
 rescue trigger (reachable only for snapshot-absent panes) survives;

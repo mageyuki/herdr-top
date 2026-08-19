@@ -242,10 +242,17 @@ Expected: PASS, no existing test regresses.
   5827)
 - Modify: `src/herdr/wire.rs` (response-id matching near lines 236-246:
   recognize decorated error ids)
+- Modify: `src/diagnostics/mod.rs` (new counter family — see the
+  diagnostics contract in Behavior 4b; the existing
+  `ControllerCounterSnapshot` and its exactly-nine-field doctor parser,
+  `src/doctor.rs:1594-1596`, are NOT touched)
+- Modify: `src/doctor.rs` (render the new counter family in both
+  renderers; the controller-counter parser stays at nine fields)
 - Modify (only if the `Subscription` type lacks an optional `pane_id`
   field): `src/herdr/types.rs`
 - Test: `src/herdr/collector.rs` module tests; `src/herdr/wire.rs` module
-  tests; `tests/convergence.rs`.
+  tests; `src/doctor.rs` module tests (new-family rendering);
+  `tests/convergence.rs`.
 
 **Interfaces:**
 - Produces: `fn enrichment_subscriptions(pane_ids: &BTreeSet<String>) -> Vec<Subscription>`
@@ -332,10 +339,24 @@ never ride the primary connection's lifecycle.
    re-enters the enrichment retry path only. Each received event is
    parsed to a PANE-LEVEL payload — pane id, terminal id, the parsed
    status, and the receipt instants (`timestamp_ms`, `receipt_time_ms`)
-   captured at receipt — and forwarded through a dedicated bounded
-   channel to the CONVERGE TASK; when that channel is full the event is
-   dropped and counted in a diagnostic (never any backpressure onto the
-   primary). A pane-level payload is the only constructible receipt
+   captured at receipt — and forwarded through a dedicated plain
+   bounded `tokio::sync::mpsc` channel (a new named constant
+   `ENRICHMENT_QUEUE_CAPACITY = 64`, mirroring the existing
+   `EVENT_QUEUE_CAPACITY`; deliberately NOT the repository's
+   `admitted_channel` — enqueue performs NO performance admission, so a
+   dropped or discarded payload never appears in event-rate metrics) to
+   the CONVERGE TASK; when that channel is full the event is dropped and
+   counted (never any backpressure onto the primary). Diagnostics
+   contract: a new process-lifetime monotonic family
+   `EnrichmentCounterSnapshot { channel_full_drops: u64, episode_discards: u64 }`
+   in `src/diagnostics/mod.rs`, published beside `persistence_counters`
+   and `controller_counters` in the runtime diagnostics snapshot and
+   rendered by both doctor renderers as its own family — the closed
+   nine-field `ControllerCounterSnapshot` parser is untouched. The two
+   counters are COMPLEMENTARY views of the same loss: a long non-Live
+   phase fills the channel, after which further losses land in
+   `channel_full_drops` rather than `episode_discards`; tests assert on
+   the published snapshot. A pane-level payload is the only constructible receipt
    representation: a `NormalizedEvent::AgentStatusChanged` requires an
    `execution_id` (`src/model/entities.rs:886-890`) that only
    application-time model matching determines, and sharing one event
@@ -347,22 +368,42 @@ never ride the primary connection's lifecycle.
    The CONVERGE TASK is the single consumer and the single owner of
    every piece of state involved (the model, `pending_closures`, its
    own phase), so no cross-task mutex, arrival counter, or watermark
-   exists. It reads the enrichment channel ONLY in its Live loop
-   (`monitor_live`); phase is the task's own control flow, never an
-   `ObservationQuality` value. On entering Live it first drains and
-   DISCARDS everything queued during the episode, counting the discards
-   in a diagnostic — the owner-accepted bounded fidelity loss:
-   transitions during a convergence episode (startup, reconnect,
-   resnapshot — rare and seconds-scale) surface only through the
-   fallback family's final state, and per-transition fidelity holds
+   exists. It APPLIES payloads only in its Live loop (`monitor_live`,
+   whose `select!` already hosts a second async source — the
+   `receive_provider` arm — so the added arm is the established
+   pattern); in every NON-Live phase it still consumes the channel but
+   discard-counts each payload without applying — including the
+   TERMINAL Reconciling state (`monitor_reconciling`, reachable after
+   `RESNAPSHOT_ATTEMPTS` failures, collector.rs:1701-1718, and pinned
+   by `three_attempts_then_stays_reconciling`), so the channel never
+   saturates in a long non-Live phase and the loss stays counted. On
+   entering Live it first drains and DISCARDS what is queued; the
+   honest race wording: payloads whose send lands after the drain
+   completes apply as Live — the reader is phase-unaware, so
+   "enqueued before the drain completes" is the exact discarded set,
+   and the test establishes its enqueue-completion precondition
+   explicitly. Fidelity loss, stated on the accurate premise: ordinary
+   convergence episodes are seconds-scale, but the terminal Reconciling
+   state is OPEN-ENDED — the suspension then lasts as long as the
+   degradation itself, during which the entire herdr source is already
+   degraded and surfaced as Reconciling observation quality, so the
+   scoped stream's suspension is subsumed by that larger, surfaced
+   condition; transitions in any non-Live phase surface only through
+   the fallback family's final state, and per-transition fidelity holds
    only while Live. While Live, each payload is processed exactly like
-   a directly received scoped event, in two decoupled effects:
+   a directly received scoped event, in two decoupled effects (exactly
+   ONE performance admission per applied payload, at application time,
+   independent of expansion — matching the one-admission-per-wire-event
+   precedent; discarded and dropped payloads admit nothing):
 
-   1. Closure cancellation ALWAYS fires: the payload performs the
-      existing re-observation cancellation for its pane
-      (`cancel_pending_topology_closures`, collector.rs:3043-3059;
-      `pane_agent_status_changed` is an `updated_entity` at line 4544)
-      in the same task that owns `pending_closures` — this is the
+   1. Closure cancellation ALWAYS fires: a payload-shaped helper
+      `cancel_pending_pane_closure(pane_id, pending)` performs
+      `pending.panes.remove(&pane_id)` — the pane arm of the existing
+      `cancel_pending_topology_closures` (collector.rs:3043-3059, whose
+      signature takes a `ReceivedEvent` and therefore cannot consume
+      the payload directly; `pane_agent_status_changed` is an
+      `updated_entity` at line 4544) — in the same task that owns
+      `pending_closures` — this is the
       promised fourth topology-closure rescue trigger, reachable
       because `pending_closures.panes` holds exactly snapshot-absent
       panes. The honest bound, identical to the fallback family's
@@ -450,43 +491,55 @@ assertion is the discriminating half against a make-before-break
 regression (a single delivery can never double-record; only the
 forbidden overlap can).
 
-- [ ] **Step 4c: Write failing processing-contract tests** (eight; the
+- [ ] **Step 4c: Write failing processing-contract tests** (nine; the
 fixture controls both streams, so every case establishes its
 preconditions explicitly rather than passing by accident): (i)
 enrichment EOF mid-stream → enrichment retry path re-subscribes while
 primary quality stays Live and no `Dirty` reconciliation occurs; (ii) a
 flood on the enrichment channel never sets the primary `overflowed`
-flag or triggers a resnapshot, and channel-full drops increment the
-diagnostic counter; (iii) THE EPISODE-DISCARD PIN — enrichment
-transitions injected while the primary is inside a convergence episode
-are discarded: after Live, no ledger row exists for them, the pane's
-status is the snapshot/fallback state, and the discard diagnostic
-counted them (the owner-accepted bounded loss, pinned as chosen
-behavior); (iv) THE LIVE-FIDELITY PIN — a transition received while
-Live on a member pane hosting TWO matching non-terminal executions
-(one live, one `Stale`) whose states both differ from the event →
-exactly TWO rows with DISTINCT event identities, both carrying the
-ORIGINAL receipt instants, plus the activity items and rate
-observations (pinning the pane-level expansion against the store's
-UNIQUE event_id constraint and the activity dedup); (v) THE
+flag or triggers a resnapshot, and channel-full drops increment
+`channel_full_drops` in the published snapshot; (iii) THE
+EPISODE-DISCARD PIN — enrichment transitions whose ENQUEUE IS PROVEN
+COMPLETE (the fixture confirms channel depth before letting the
+primary reach Live — the reader is phase-unaware, so the discarded set
+is "enqueued before the drain completes") while the primary is inside
+a convergence episode are discarded: after Live, no ledger row exists
+for them, the pane's status is the snapshot/fallback state, and
+`episode_discards` counted them; a sibling case holds the primary in
+the TERMINAL Reconciling state and asserts payloads keep being
+discard-counted without channel saturation; (iv) THE LIVE-FIDELITY
+PIN — a transition received while Live on a member pane hosting TWO
+matching non-terminal executions (one live, one `Stale`) whose states
+both differ from the event → exactly TWO rows with DISTINCT event
+identities, both carrying the ORIGINAL receipt instants and
+`source_event_type == "pane_agent_status_changed"`, plus the activity
+items and exactly ONE performance admission for the payload (pinning
+the pane-level expansion against the store's UNIQUE event_id
+constraint, the activity dedup, and the one-admission rule); (v) THE
 DISCRIMINANT PIN — a Live event whose status equals every matching
 execution's current state → no application, no row (the discriminant
 filter, not any dedup, is what prevents the duplicate); (vi) THE
-GATE PIN — a Live event for a grace-remnant pane (most recent snapshot
-removed it; its execution sits in `Stale` grace) → no status
-application and no row: the execution stays `Stale` (no wall-clock
-wait on the closure sweep — the immediate assertions are the
-discriminating ones), while the decoupled re-observation closure
-cancellation fires; (vii) THE RESCUE-TRIGGER PIN — a Live event for a
-pane pending topology closure → the pending closure is CANCELLED (the
-promised fourth rescue trigger, exercised in the converge task that
-owns `pending_closures`); (viii) THE STALE-RESTORATION PIN,
-distinguishing the two stale causes — a MEMBER pane whose execution
-went `Stale` because the snapshot momentarily reported `agent: None`,
-then a Live scoped transition `working` → the event IS applied: the
-execution leaves `Stale`, the row is written with the original receipt
-instants, and no closure fires (the restoration this stream exists
-for).
+INDEPENDENCE PIN — a member pane hosting one matching execution EQUAL
+to the event's status, one DIFFERING, and one terminal (`Ended`)
+sibling → exactly ONE row, for the differing execution only, and the
+`Ended` sibling untouched (an implementation emitting for all matches
+when any differs must fail this case); (vii) THE GATE-AND-RESCUE PIN —
+a Live event for a grace-remnant pane (most recent snapshot removed
+it; its execution sits in `Stale` grace — which per
+collector.rs:3685/3700-3706 is exactly the still-pending-closure
+state) → no status application and no row, the execution stays `Stale`
+(no wall-clock wait on the closure sweep), AND the pending closure is
+CANCELLED via `cancel_pending_pane_closure` — the promised fourth
+rescue trigger, exercised in the converge task that owns
+`pending_closures`; (viii) THE STALE-RESTORATION PIN, distinguishing
+the two stale causes — a MEMBER pane whose execution went `Stale`
+because the snapshot momentarily reported `agent: None`, then a Live
+scoped transition `working` → the event IS applied: the execution
+leaves `Stale`, the row is written with the original receipt instants,
+and no closure fires (the restoration this stream exists for); (ix)
+THE LIFECYCLE PIN — collector shutdown cancels and joins the
+enrichment reader cleanly (no leaked task, no post-shutdown sends
+observed).
 
 - [ ] **Step 5: Write failing fallback-unavailable convergence test**: with
 the enrichment endpoint permanently refusing connections, drive the
