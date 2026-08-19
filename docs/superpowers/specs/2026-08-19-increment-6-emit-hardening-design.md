@@ -166,71 +166,49 @@ they never enter the primary connection's replay and anomaly
 classification, they never touch the primary's overflow state, and their
 subscription health is tracked separately so an enrichment failure can
 neither degrade the primary's observation quality nor be masked by
-primary health. During a primary convergence episode — defined by the
-collector's own phase, from episode start until the convergence loop
-sets herdr quality Live after clean replay, never by an
-observation-quality value — enrichment events are not discarded: a
-transition arriving after the snapshot was captured is not in that
-snapshot, and dropping it would lose exactly the fidelity this
-subscription restores. They are buffered coalesced per pane (latest
-event per pane, stamped with local arrival order; the map is bounded by
-the enrichment target set, entries for panes outside it are dropped at
-insert, and the buffer is retained across enrichment-connection swaps
-and cleared only by flush or target-set removal). The flush runs once
-at the Live transition — after replay, so it never interleaves with
-replayed primary events — under two suppression rules, because applying
-a herdr-sourced event is NEVER a no-op (each receipt gets a fresh event
-identity and an unconditional ledger row). First, a WATERMARK — ordered
-by one shared atomic arrival counter and advanced at every snapshot
-response, so it always names the most recent snapshot — drops every
-buffered event that arrived before that response (the pre-capture
-generation: the snapshot itself carries that state, and a stale
-different-status leftover must not regress newer snapshot truth).
-Second, a TARGET-SET GATE plus a per-execution filter, applied
-identically at the flush and on the direct path: the enrichment target
-set is defined as the most recent snapshot's panes plus panes created
-or moved in since (`pane_moved` is a creation path for a new public
-pane id, not only `pane_created`), excluding a grace-retained remnant —
-a pane the snapshot removed that the model holds only while a stale
-execution's closure grace runs — so an event for such a remnant never
-applies status on either path; for a member pane (pane records carry
+primary health. The enrichment reader only reads and parses; each
+event becomes a pane-level payload (pane and terminal identity, the
+parsed status, and the receipt instants — a normalized status event
+needs an execution identity that only application-time matching
+determines, and event identities are unique in the store) forwarded
+over a dedicated bounded channel to the converge task, with
+channel-full drops counted in a diagnostic. The converge task is the
+single consumer and already owns every piece of state involved — the
+model, the pending topology closures, and its own phase — so no
+cross-task lock, counter, or watermark exists. It consumes the channel
+only while Live; on entering Live it drains and DISCARDS everything
+queued during the convergence episode, counting the discards. This is
+an owner-decided simplification: transitions during a convergence
+episode (startup, reconnect, resnapshot — rare and seconds-scale)
+surface only through the fallback family's final state, an explicit
+bounded fidelity loss accepted in exchange for eliminating the
+buffering apparatus. While Live, each payload has two decoupled
+effects. Closure cancellation always fires — the existing
+re-observation cancellation, which is how the fourth topology-closure
+rescue trigger (reachable only for snapshot-absent panes) survives;
+its honest bound is the fallback family's today: a cancellation on
+in-flight stale evidence defers that closure until the next
+observation gap repopulates the pending set — an existing exposure
+class, not a new one. Status application is gated by the enrichment
+target set — the most recent snapshot's panes plus panes created or
+moved in since (`pane_moved` is a creation path for a new public pane
+id, not only `pane_created`), excluding a grace-retained remnant — so
+a stale in-flight event can never reset a removed pane's stale
+execution or write a row for it; for a member pane (pane records carry
 no status; status lives on executions, and one pane can host several),
-the transition applies to matching executions that are non-terminal and
-whose state differs from the event's status, so a transition the replay
-already re-established flushes to nothing instead of duplicating a
-ledger row. A stale execution on a MEMBER pane stays eligible:
-staleness also arises from a snapshot momentarily reporting no agent,
-and restoring exactly that transition is this stream's purpose — only
-the target-set gate guards resurrection. The gate governs STATUS
-APPLICATION only: every received scoped event still performs the
-existing re-observation closure cancellation for its pane, which is
-how the fourth topology-closure rescue trigger — promised by this
-increment and reachable only for snapshot-absent panes — survives the
-gate; a wrongful cancellation self-corrects at the next
-reconciliation, exactly as the fallback family's does today. Buffered
-entries are pane-level payloads (a normalized status event needs an
-execution identity that only application-time matching determines, and
-event identities are unique in the store), expanded at application
-into one event per matching execution with fresh identities and the
-STORED receipt instants — which is how original timestamps survive the
-flush. Stamping is serialized with the watermark reads and the flush
-drain on one lock, taken immediately after each socket read before
-parsing; the one residual — a reader descheduled between read-return
-and lock acquisition can stamp a genuinely pre-capture event past the
-watermark — is accepted as bounded staleness the next event or
-snapshot corrects. An episode that never
-reaches the flush point keeps its bounded buffer, with the watermark
-still advancing per snapshot, and the first flush drains it.
-Transitions inside the episode window coalesce to the final state and
-the watermark can drop a transition that raced the snapshot response
-within network jitter — bounded fidelity loss of the same class the
-fallback family already accepts, and far narrower than the whole
-episode window. The per-transition restoration below holds exactly
-while the primary is converged AND the enrichment subscription is
-healthy; during a convergence episode it degrades to final-state
-coalescing, and during an enrichment outage — which can outlast any
-single retry attempt — it is suspended entirely, with only the fallback
-family covering, until the per-stream health recovers.
+the payload expands into one event per matching non-terminal execution
+whose state differs from the event's status, each with a fresh
+identity and the stored receipt instants — original timestamps
+survive, and the differs-filter, not any dedup, prevents duplicate
+rows. A stale execution on a member pane stays eligible: staleness
+also arises from a snapshot momentarily reporting no agent, and
+restoring exactly that transition is this stream's purpose — only the
+target-set gate guards resurrection. The per-transition restoration
+below holds exactly while the primary is Live AND the enrichment
+subscription is healthy; during a convergence episode it is suspended
+with only the fallback family covering, and likewise during an
+enrichment outage — which can outlast any single retry attempt —
+until the per-stream health recovers.
 
 The existing derivation of agent status from `pane.updated` payloads remains
 in place as the fallback path; the scoped subscription restores the richer
