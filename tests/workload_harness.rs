@@ -4735,6 +4735,27 @@ fn final_boundary_degradation_with_trial_event_lag_is_not_tolerated() {
     assert!(outcome.validate().is_ok());
 }
 
+#[test]
+fn final_boundary_degradation_with_sample_event_lag_is_not_tolerated_standalone() {
+    // Break caught: the public helper omits the sample's own event-lag breach contract.
+    let mut outcome = boundary_degradation_outcome(101, false, false, false);
+    let sample = &mut outcome.document_mut().trials[0]
+        .raw
+        .performance_evidence_stream
+        .as_mut()
+        .unwrap()
+        .samples[1];
+    sample.event_lag_ns = 1_000_000_001;
+    assert_eq!(sample.reasons, [PerformanceReasonV1::EventsOneSecond]);
+
+    assert!(!tolerated_boundary_degradation(
+        MeasurementStageV1::Final,
+        ScenarioV1::Burst,
+        sample,
+        false,
+    ));
+}
+
 fn write_unvalidated_outcome(outcome: &ReferenceOutcomeV1) -> (tempfile::TempDir, PathBuf) {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("result-v1.json");
@@ -4742,6 +4763,15 @@ fn write_unvalidated_outcome(outcome: &ReferenceOutcomeV1) -> (tempfile::TempDir
     bytes.push(b'\n');
     std::fs::write(&path, bytes).unwrap();
     (root, path)
+}
+
+fn clean_evidence_recorded_supported_load_failure(stage: MeasurementStageV1) -> ReferenceOutcomeV1 {
+    let outcome = synthetic_result(ScenarioV1::Burst, stage);
+    let ReferenceOutcomeV1::Pass { mut document } = outcome else {
+        unreachable!();
+    };
+    document.failure_reasons = vec![FailureReasonV1::SupportedLoadDegradation];
+    ReferenceOutcomeV1::Failed { document }
 }
 
 #[test]
@@ -4763,6 +4793,30 @@ fn amended_legacy_reader_reclassifies_tolerated_supported_load_failure() {
             scenario: ScenarioV1::Burst,
             recorded_failure_reasons: vec![FailureReasonV1::SupportedLoadDegradation],
         })
+    );
+}
+
+#[test]
+fn amended_legacy_reader_rejects_clean_final_evidence_with_recorded_degradation() {
+    // Break caught: promoting a mis-assembled failure with no tolerated degradation evidence.
+    let stored = clean_evidence_recorded_supported_load_failure(MeasurementStageV1::Final);
+    assert_eq!(stored.validate(), Err(ResultError::InvalidArtifact));
+    let (_root, path) = write_unvalidated_outcome(&stored);
+
+    assert!(
+        read_and_validate_reference_outcome(&path, AmendedLegacyMode::AcceptAmendedLegacy).is_err()
+    );
+}
+
+#[test]
+fn amended_legacy_reader_rejects_clean_baseline_evidence_with_recorded_degradation() {
+    // Break caught: applying the Final-only amendment to a Baseline artifact.
+    let stored = clean_evidence_recorded_supported_load_failure(MeasurementStageV1::Baseline);
+    assert_eq!(stored.validate(), Err(ResultError::InvalidArtifact));
+    let (_root, path) = write_unvalidated_outcome(&stored);
+
+    assert!(
+        read_and_validate_reference_outcome(&path, AmendedLegacyMode::AcceptAmendedLegacy).is_err()
     );
 }
 
@@ -4817,13 +4871,13 @@ struct AmendedLegacyEntrypointFixture {
     final_root: tempfile::TempDir,
 }
 
-fn amended_legacy_entrypoint_fixture() -> AmendedLegacyEntrypointFixture {
+fn amended_legacy_entrypoint_fixture(legacy_burst: bool) -> AmendedLegacyEntrypointFixture {
     let baseline_root = tempfile::tempdir().unwrap();
     let final_root = tempfile::tempdir().unwrap();
     for spec in &workload_schema().scenarios {
         let mut baseline = synthetic_result(spec.scenario, MeasurementStageV1::Baseline);
-        let legacy_burst = spec.scenario == ScenarioV1::Burst;
-        let mut final_outcome = if legacy_burst {
+        let scenario_is_legacy_burst = legacy_burst && spec.scenario == ScenarioV1::Burst;
+        let mut final_outcome = if scenario_is_legacy_burst {
             boundary_degradation_outcome(101, false, false, false)
         } else {
             synthetic_result(spec.scenario, MeasurementStageV1::Final)
@@ -4832,7 +4886,7 @@ fn amended_legacy_entrypoint_fixture() -> AmendedLegacyEntrypointFixture {
         let final_scenario_root = final_root.path().join(&spec.directory);
         write_synthetic_raw_scenario_root(&baseline_scenario_root, &mut baseline).unwrap();
         write_synthetic_raw_scenario_root(&final_scenario_root, &mut final_outcome).unwrap();
-        if legacy_burst {
+        if scenario_is_legacy_burst {
             final_outcome.document_mut().failure_reasons =
                 vec![FailureReasonV1::SupportedLoadDegradation];
             final_outcome = match final_outcome {
@@ -4954,7 +5008,7 @@ fn expected_reclassification_sidecar() -> serde_json::Value {
 #[test]
 fn amended_legacy_entrypoints_reclassify_uniformly_and_write_sidecars() {
     // Break caught: either closing consumer observes a different outcome or omits provenance.
-    let fixture = amended_legacy_entrypoint_fixture();
+    let fixture = amended_legacy_entrypoint_fixture(true);
     let outputs = tempfile::tempdir().unwrap();
     let report_path = outputs.path().join("section15.json");
     let checkpoint_path = outputs.path().join("checkpoint.json");
@@ -5002,10 +5056,113 @@ fn amended_legacy_entrypoints_reclassify_uniformly_and_write_sidecars() {
     }
 }
 
+fn assert_non_reclassified_entrypoint_outputs(
+    report_path: &std::path::Path,
+    checkpoint_path: &std::path::Path,
+) {
+    let report: Section15ReDerivationV1 =
+        serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+    assert_eq!(
+        report.validate_with_mode(AmendedLegacyMode::AcceptAmendedLegacy),
+        Ok(())
+    );
+    assert!(report.scenarios.iter().all(|scenario| {
+        scenario.final_status == ReferenceOutcomeStatusV1::Pass
+            && scenario.final_failure_reasons.is_empty()
+    }));
+    let checkpoint: D4CheckpointDocumentV1 =
+        serde_json::from_slice(&std::fs::read(checkpoint_path).unwrap()).unwrap();
+    assert_eq!(
+        checkpoint.decision,
+        D4CheckpointDecisionV1::NoMissD4NotAuthorized {}
+    );
+}
+
+#[test]
+fn amended_legacy_entrypoints_remove_stale_sidecars_when_nothing_reclassifies() {
+    // Break caught: preserving stale provenance after a non-reclassifying primary rewrite.
+    let fixture = amended_legacy_entrypoint_fixture(false);
+    let outputs = tempfile::tempdir().unwrap();
+    let report_path = outputs.path().join("section15.json");
+    let checkpoint_path = outputs.path().join("checkpoint.json");
+    for output in [&report_path, &checkpoint_path] {
+        std::fs::write(reclassification_sidecar_path(output), b"stale\n").unwrap();
+    }
+
+    let rederive = run_closed_entrypoint(
+        "rederive_section15_report_from_results",
+        rederive_entrypoint_environment(&fixture, &report_path, Some("1")),
+    );
+    assert_eq!(rederive.status.code(), Some(0), "{rederive:?}");
+    assert!(rederive.stderr.is_empty(), "{rederive:?}");
+    let classify = run_closed_entrypoint(
+        "classify_d4_checkpoint_from_results",
+        classify_entrypoint_environment(&fixture, &checkpoint_path, Some("1")),
+    );
+    assert_eq!(classify.status.code(), Some(0), "{classify:?}");
+    assert!(classify.stderr.is_empty(), "{classify:?}");
+
+    assert_non_reclassified_entrypoint_outputs(&report_path, &checkpoint_path);
+    assert!(!reclassification_sidecar_path(&report_path).exists());
+    assert!(!reclassification_sidecar_path(&checkpoint_path).exists());
+}
+
+#[test]
+fn amended_legacy_entrypoints_remove_sidecars_when_output_paths_are_reused() {
+    // Break caught: retaining provenance from the prior contents of a reused output path.
+    let legacy_fixture = amended_legacy_entrypoint_fixture(true);
+    let clean_fixture = amended_legacy_entrypoint_fixture(false);
+    let outputs = tempfile::tempdir().unwrap();
+    let report_path = outputs.path().join("section15.json");
+    let checkpoint_path = outputs.path().join("checkpoint.json");
+
+    let first_rederive = run_closed_entrypoint(
+        "rederive_section15_report_from_results",
+        rederive_entrypoint_environment(&legacy_fixture, &report_path, Some("1")),
+    );
+    assert_eq!(first_rederive.status.code(), Some(0), "{first_rederive:?}");
+    let first_classify = run_closed_entrypoint(
+        "classify_d4_checkpoint_from_results",
+        classify_entrypoint_environment(&legacy_fixture, &checkpoint_path, Some("1")),
+    );
+    assert_eq!(first_classify.status.code(), Some(0), "{first_classify:?}");
+    for output in [&report_path, &checkpoint_path] {
+        let actual: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(reclassification_sidecar_path(output)).unwrap())
+                .unwrap();
+        assert_eq!(actual, expected_reclassification_sidecar());
+    }
+
+    let second_rederive = run_closed_entrypoint(
+        "rederive_section15_report_from_results",
+        rederive_entrypoint_environment(&clean_fixture, &report_path, Some("1")),
+    );
+    assert_eq!(
+        second_rederive.status.code(),
+        Some(0),
+        "{second_rederive:?}"
+    );
+    assert!(second_rederive.stderr.is_empty(), "{second_rederive:?}");
+    let second_classify = run_closed_entrypoint(
+        "classify_d4_checkpoint_from_results",
+        classify_entrypoint_environment(&clean_fixture, &checkpoint_path, Some("1")),
+    );
+    assert_eq!(
+        second_classify.status.code(),
+        Some(0),
+        "{second_classify:?}"
+    );
+    assert!(second_classify.stderr.is_empty(), "{second_classify:?}");
+
+    assert_non_reclassified_entrypoint_outputs(&report_path, &checkpoint_path);
+    assert!(!reclassification_sidecar_path(&report_path).exists());
+    assert!(!reclassification_sidecar_path(&checkpoint_path).exists());
+}
+
 #[test]
 fn amended_legacy_entrypoints_reject_non_one_flag() {
     // Break caught: treating a present non-1 flag as disabled instead of rejecting the process.
-    let fixture = amended_legacy_entrypoint_fixture();
+    let fixture = amended_legacy_entrypoint_fixture(true);
     let outputs = tempfile::tempdir().unwrap();
     let report_path = outputs.path().join("invalid-flag-section15.json");
     let checkpoint_path = outputs.path().join("invalid-flag-checkpoint.json");
@@ -5028,7 +5185,7 @@ fn amended_legacy_entrypoints_reject_non_one_flag() {
 #[test]
 fn amended_legacy_entrypoints_without_flag_preserve_fail_closed_behavior() {
     // Break caught: implicitly enabling reclassification when the optional flag is absent.
-    let fixture = amended_legacy_entrypoint_fixture();
+    let fixture = amended_legacy_entrypoint_fixture(true);
     let outputs = tempfile::tempdir().unwrap();
     let report_path = outputs.path().join("off-section15.json");
     let checkpoint_path = outputs.path().join("off-checkpoint.json");

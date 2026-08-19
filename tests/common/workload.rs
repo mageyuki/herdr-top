@@ -2665,6 +2665,7 @@ pub fn tolerated_boundary_degradation(
         && matches!(scenario, ScenarioV1::Sustained | ScenarioV1::Burst)
         && sample.reasons == [PerformanceReasonV1::EventsOneSecond]
         && sample.events_one_second == 101
+        && sample.event_lag_ns <= 1_000_000_000
         && !trial_has_event_lag_reason
 }
 
@@ -5164,6 +5165,7 @@ pub fn classify_d4_checkpoint_from_environment() -> Result<(), HarnessError> {
     document
         .validate()
         .map_err(|_| HarnessError::Invalid("D4 checkpoint document was invalid"))?;
+    validate_reclassification_records(&loaded.reclassified)?;
     atomic_write_json(&output, &document)?;
     write_reclassification_sidecar(&output, &loaded.reclassified)
 }
@@ -5213,9 +5215,10 @@ pub fn rederive_section15_report_from_environment() -> Result<(), HarnessError> 
     report
         .validate_with_mode(legacy)
         .map_err(|_| HarnessError::Invalid("Section 15 document was invalid"))?;
-    atomic_write_json(&output, &report)?;
     let mut reclassified = baseline.reclassified;
     reclassified.extend(final_results.reclassified);
+    validate_reclassification_records(&reclassified)?;
+    atomic_write_json(&output, &report)?;
     write_reclassification_sidecar(&output, &reclassified)
 }
 
@@ -6083,13 +6086,9 @@ fn reclassification_sidecar_path(output: &std::path::Path) -> std::path::PathBuf
     path.into()
 }
 
-fn write_reclassification_sidecar(
-    output: &std::path::Path,
+fn validate_reclassification_records(
     records: &[ReclassificationRecordV1],
 ) -> Result<(), HarnessError> {
-    if records.is_empty() {
-        return Ok(());
-    }
     if records.iter().enumerate().any(|(index, record)| {
         records[index + 1..]
             .iter()
@@ -6099,6 +6098,20 @@ fn write_reclassification_sidecar(
             "legacy reclassification contained duplicate scenarios",
         ));
     }
+    Ok(())
+}
+
+fn write_reclassification_sidecar(
+    output: &std::path::Path,
+    records: &[ReclassificationRecordV1],
+) -> Result<(), HarnessError> {
+    if records.is_empty() {
+        return match std::fs::remove_file(reclassification_sidecar_path(output)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        };
+    }
     atomic_write_json(
         &reclassification_sidecar_path(output),
         &ReclassificationSidecarV1 {
@@ -6107,6 +6120,29 @@ fn write_reclassification_sidecar(
             reclassified: records,
         },
     )
+}
+
+fn document_has_tolerated_boundary_sample(document: &ReferenceRunV1) -> bool {
+    document.trials.iter().any(|trial| {
+        trial
+            .raw
+            .performance_evidence_stream
+            .as_ref()
+            .is_some_and(|stream| {
+                let trial_has_event_lag_reason = stream
+                    .samples
+                    .iter()
+                    .any(|sample| sample.reasons.contains(&PerformanceReasonV1::EventLag));
+                stream.samples.iter().any(|sample| {
+                    tolerated_boundary_degradation(
+                        document.measurement_stage,
+                        document.scenario,
+                        sample,
+                        trial_has_event_lag_reason,
+                    )
+                })
+            })
+    })
 }
 
 pub fn read_and_validate_reference_outcome(
@@ -6124,6 +6160,8 @@ pub fn read_and_validate_reference_outcome(
     let reclassified = match (&outcome, legacy) {
         (ReferenceOutcomeV1::Failed { document }, AmendedLegacyMode::AcceptAmendedLegacy)
             if document.failure_reasons == [FailureReasonV1::SupportedLoadDegradation]
+                && document.measurement_stage == MeasurementStageV1::Final
+                && document_has_tolerated_boundary_sample(document)
                 && validate_reference_run(document, false)
                     .is_ok_and(|derived| derived.is_empty()) =>
         {
