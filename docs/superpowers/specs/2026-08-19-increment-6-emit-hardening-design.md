@@ -189,9 +189,11 @@ terminal Reconciling state, it consumes the channel through a bounded
 synchronous drain at each loop iteration — never a `select!` arm,
 which would cancel the convergence loops' inline primary futures and
 let sustained enrichment traffic starve convergence — discard-counting
-without applying, and on entering Live it drains and discards what was
-enqueued before the drain completes (the reader is phase-unaware, so
-that is the exact discarded set). This is
+without applying, and on entering Live it drains and discards what the
+drain observes (the reader is phase-unaware and the runtime is
+multi-threaded, so a payload enqueued concurrently with the drain may
+instead apply as Live — the same accepted race as a send landing after
+the drain). This is
 an owner-decided simplification, accepted on the accurate premise:
 ordinary convergence episodes (startup, reconnect, resnapshot) are
 seconds-scale, while the terminal Reconciling state is open-ended —

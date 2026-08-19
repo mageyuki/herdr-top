@@ -369,9 +369,10 @@ never ride the primary connection's lifecycle.
    process-lifetime `EnrichmentDiagnosticsHandle` of monotonic atomics
    defined in `src/model/entities.rs` beside the existing handles it
    patterns on — `ControllerDiagnosticsHandle` is DEFINED at
-   `src/model/entities.rs:203-206` (with `ProviderDiagnosticsHandle`
-   at 209-218; `src/herdr/controller.rs:272-279` is a HOLDER of the
-   controller handle, not its definition). The collector creates the
+   `src/model/entities.rs:203-206` (with `ProviderDiagnostics` at 210
+   and `ProviderDiagnosticsHandle` at 293;
+   `src/herdr/controller.rs:272-279` is a HOLDER of the controller
+   handle, not its definition). The collector creates the
    handle once; the enrichment reader holds a clone across its retries
    and reconnects and increments `channel_full_drops` on each
    `TrySendError::Full` (any phase) — `TrySendError::Closed` is NOT
@@ -386,8 +387,9 @@ never ride the primary connection's lifecycle.
    next publish. Visibility is deliberately publication-bounded: no
    dedicated wakeup is added (the controller pattern's
    `diagnostic_changes` half is not mirrored), increments surface at
-   the next publication — at most the existing stale-sweep cadence —
-   and tests assert on the published snapshot after driving a
+   the next publication trigger — publication-trigger-bounded, with no
+   fixed cadence figure claimed (the snapshot-request loop has no tick
+   arm) — and tests assert on the published snapshot after driving a
    publication explicitly. Counter semantics, precisely: `channel_full_drops`
    counts failed enqueues in ANY phase (a finite queue can fill
    whenever production outpaces consumption, including bursts while
@@ -429,17 +431,21 @@ never ride the primary connection's lifecycle.
    ITERATION runs a bounded synchronous drain: up to
    `ENRICHMENT_QUEUE_CAPACITY` `try_recv` calls at the top of the loop
    body, discard-counting each payload without applying — no new
-   future, nothing cancelled, and a LONG non-Live phase drains rather
-   than saturates. The straight-line convergence region
+   future, nothing cancelled. The drain runs once per iteration, and a
+   single iteration can await for up to two sequential `IO_TIMEOUT`
+   periods inside `wire::request` (wire.rs:124-134), so the finite
+   queue can still fill between drains — those losses land in
+   `channel_full_drops`, which is the accounting, not a saturation
+   guarantee. The straight-line convergence region
    (collector.rs:1614-1631) runs no loop, so a burst there can still
    fill the finite queue, landing those losses in
    `channel_full_drops`. On
    entering Live it first drains and DISCARDS what is queued; the
-   honest race wording: payloads whose send lands after the drain
-   completes apply as Live — the reader is phase-unaware, so
-   "enqueued before the drain completes" is the exact discarded set,
-   and the test establishes its enqueue-completion precondition
-   explicitly. Fidelity loss, stated on the accurate premise: ordinary
+   honest race wording: the discarded set is what the drain OBSERVES —
+   on the multi-threaded runtime a payload enqueued concurrently with
+   the drain may instead apply as Live, the same phase-unaware race
+   already accepted for sends landing after the drain — and the test
+   establishes its enqueue-completion precondition explicitly. Fidelity loss, stated on the accurate premise: ordinary
    convergence episodes are seconds-scale, but the terminal Reconciling
    state is OPEN-ENDED — the suspension then lasts as long as the
    degradation itself, during which the entire herdr source is already
@@ -564,8 +570,10 @@ is "enqueued before the drain completes") while the primary is inside
 a convergence episode are discarded: after Live, no ledger row exists
 for them, the pane's status is the snapshot/fallback state, and
 `episode_discards` counted them; a sibling case holds the primary in
-the TERMINAL Reconciling state and asserts payloads keep being
-discard-counted without channel saturation; (iv) THE LIVE-FIDELITY
+the TERMINAL Reconciling state at a fixture-driven rate the per-
+iteration drain can absorb and asserts payloads keep being
+discard-counted (the assertion is scoped to the driven rate so it
+cannot fail for reasons unrelated to the behavior under test); (iv) THE LIVE-FIDELITY
 PIN — a transition received while Live on a member pane hosting TWO
 matching non-terminal executions (one live, one `Stale`) whose states
 both differ from the event → exactly TWO rows with DISTINCT event
