@@ -15,7 +15,7 @@ Repository: [mageyuki/herdr-top](https://github.com/mageyuki/herdr-top)
 | Product name | Herdr Top |
 | Repository and binary | `herdr-top` |
 | Runtime | A regular Herdr-managed pane or tab inside the target named session |
-| Required platform | Herdr 0.8.0 or newer; initial development and test baseline: Herdr 0.8.0, socket protocol 19 |
+| Required platform | Herdr 0.8.0 or newer; initial development and test baseline: Herdr 0.8.0, socket protocol 19; reviewed socket-protocol set: {19, 20} (Herdr 0.8.2 adds protocol 20 with an additive-only bundled schema change) |
 | Agent providers | Claude Code and Codex |
 | Superpowers | Not required and not used as a required data source |
 | Primary view | Fixed-screen, htop-style live TUI |
