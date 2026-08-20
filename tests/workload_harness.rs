@@ -5297,6 +5297,11 @@ fn amended_legacy_entrypoints_reject_non_one_flag() {
     );
     for (result, output) in [(rederive, report_path), (classify, checkpoint_path)] {
         assert_eq!(result.status.code(), Some(20), "{result:?}");
+        assert!(
+            String::from_utf8_lossy(&result.stdout)
+                .contains("entrypoint error: Invalid(\"optional environment value was invalid\")"),
+            "{result:?}"
+        );
         assert!(result.stderr.is_empty(), "{result:?}");
         assert!(!output.exists());
         assert!(!reclassification_sidecar_path(&output).exists());
@@ -5320,6 +5325,11 @@ fn amended_legacy_entrypoints_without_flag_preserve_fail_closed_behavior() {
     );
     for (result, output) in [(rederive, report_path), (classify, checkpoint_path)] {
         assert_eq!(result.status.code(), Some(20), "{result:?}");
+        assert!(
+            String::from_utf8_lossy(&result.stdout)
+                .contains("entrypoint error: Invalid(\"stored outcome failed validation\")"),
+            "{result:?}"
+        );
         assert!(result.stderr.is_empty(), "{result:?}");
         assert!(!output.exists());
         assert!(!reclassification_sidecar_path(&output).exists());
@@ -11071,10 +11081,20 @@ fn fixture_nested_observer_helper() {
     }
 }
 
+fn report_entrypoint_error(error: &impl std::fmt::Debug) {
+    // libtest captures `println!` output and `std::process::exit` discards
+    // that buffer, so write straight to the process stdout handle.
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout();
+    let _ = writeln!(stdout, "entrypoint error: {error:?}");
+    let _ = stdout.flush();
+}
+
 #[test]
 #[ignore = "authoritative classification requires explicit result roots"]
 fn classify_d4_checkpoint_from_results() {
-    if classify_d4_checkpoint_from_environment().is_err() {
+    if let Err(error) = classify_d4_checkpoint_from_environment() {
+        report_entrypoint_error(&error);
         std::process::exit(20);
     }
 }
@@ -11082,7 +11102,8 @@ fn classify_d4_checkpoint_from_results() {
 #[test]
 #[ignore = "authoritative Section 15 re-derivation requires explicit result roots"]
 fn rederive_section15_report_from_results() {
-    if rederive_section15_report_from_environment().is_err() {
+    if let Err(error) = rederive_section15_report_from_environment() {
+        report_entrypoint_error(&error);
         std::process::exit(20);
     }
 }
@@ -11100,7 +11121,10 @@ fn compose_reference_outcome_from_raw() {
     match compose_reference_outcome_from_environment() {
         Ok(0) => {}
         Ok(code) => std::process::exit(code),
-        Err(_) => std::process::exit(20),
+        Err(error) => {
+            report_entrypoint_error(&error);
+            std::process::exit(20);
+        }
     }
 }
 
@@ -11110,7 +11134,10 @@ fn validate_reference_outcome() {
     match validate_reference_outcome_from_environment() {
         Ok(0) => {}
         Ok(code) => std::process::exit(code),
-        Err(_) => std::process::exit(20),
+        Err(error) => {
+            report_entrypoint_error(&error);
+            std::process::exit(20);
+        }
     }
 }
 
@@ -11118,7 +11145,8 @@ fn validate_reference_outcome() {
 #[test]
 #[ignore = "native runner validates the selected baseline root before trials"]
 fn validate_reference_baseline_set() {
-    if validate_reference_baseline_set_from_environment().is_err() {
+    if let Err(error) = validate_reference_baseline_set_from_environment() {
+        report_entrypoint_error(&error);
         std::process::exit(20);
     }
 }

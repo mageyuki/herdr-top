@@ -8818,6 +8818,15 @@ fn linux_current_affinity() -> Result<Vec<u32>, HarnessError> {
         .collect())
 }
 
+/// CoreFoundation, linked through `notify` -> `fsevent-sys`, sets this key
+/// inside the child process after exec on macOS, so a parent's
+/// `env_clear()` cannot exclude it. Tolerate exactly this key: it is never
+/// required, and its value is never pinned or read.
+#[cfg(target_os = "macos")]
+const HOST_INJECTED_ENVIRONMENT_KEYS: &[&str] = &["__CF_USER_TEXT_ENCODING"];
+#[cfg(not(target_os = "macos"))]
+const HOST_INJECTED_ENVIRONMENT_KEYS: &[&str] = &[];
+
 fn require_exact_environment(expected: &[&str]) -> Result<(), HarnessError> {
     let expected = expected.iter().copied().collect::<BTreeSet<_>>();
     let actual = std::env::vars_os()
@@ -8826,7 +8835,11 @@ fn require_exact_environment(expected: &[&str]) -> Result<(), HarnessError> {
                 .map_err(|_| HarnessError::Invalid("environment key was not UTF-8"))
         })
         .collect::<Result<BTreeSet<_>, _>>()?;
-    if actual.iter().map(String::as_str).collect::<BTreeSet<_>>() != expected {
+    let mut actual_keys = actual.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    for key in HOST_INJECTED_ENVIRONMENT_KEYS {
+        actual_keys.remove(*key);
+    }
+    if actual_keys != expected {
         return Err(HarnessError::Invalid("environment key set was not closed"));
     }
     Ok(())
@@ -8854,6 +8867,7 @@ fn require_closed_environment_with_optional(
     required.extend(additional.iter().copied());
     let mut allowed = required.clone();
     allowed.extend(optional.iter().copied());
+    allowed.extend(HOST_INJECTED_ENVIRONMENT_KEYS.iter().copied());
     let actual_keys = actual.keys().map(String::as_str).collect::<BTreeSet<_>>();
     if !required.is_subset(&actual_keys) || !actual_keys.is_subset(&allowed) {
         return Err(HarnessError::Invalid("environment key set was not closed"));
