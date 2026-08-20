@@ -98,8 +98,11 @@ pub fn assess_herdr_compatibility(pong: &Pong) -> HerdrCompatibility {
             version: version.normalized,
         };
     }
-    // A gap inside the reviewed range (impossible while the set is
-    // contiguous, but the tier function stays total).
+    // A protocol below the newest reviewed one that the reviewed set does not
+    // contain. The set is contiguous today, so this is unreachable; were it
+    // ever extended across a gap (say `[19, 20, 22]`), the skipped protocol is
+    // deliberately an Error and not a tolerated newer one, because a gap means
+    // that protocol was never reviewed.
     HerdrCompatibility::Unavailable {
         reason: HerdrCompatibilityIssue::ProtocolMismatch,
         version: Some(version.normalized),
@@ -1016,11 +1019,15 @@ mod tests {
                 );
             }
         }
-        // The version floor precedes every protocol tier, including 20.
-        assert_eq!(
-            assess_herdr_compatibility(&pong("0.7.9", 20)).issue(),
-            Some(HerdrCompatibilityIssue::VersionTooOld)
-        );
+        // The version floor precedes every protocol tier: a below-floor
+        // release reports VersionTooOld whichever tier its protocol lands in,
+        // so hoisting a protocol check above the floor cannot go unnoticed.
+        for protocol in [0_u32, 18, 19, 20, 21, u32::MAX] {
+            assert_eq!(
+                assess_herdr_compatibility(&pong("0.7.9", protocol)).issue(),
+                Some(HerdrCompatibilityIssue::VersionTooOld)
+            );
+        }
         // Below the floor protocol: hard mismatch.
         for protocol in [0_u32, 18] {
             assert_eq!(

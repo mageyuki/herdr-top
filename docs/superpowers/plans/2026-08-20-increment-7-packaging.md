@@ -112,11 +112,15 @@ runners), GitHub Releases via `gh` CLI.
                 );
             }
         }
-        // The version floor precedes every protocol tier, including 20.
-        assert_eq!(
-            assess_herdr_compatibility(&pong("0.7.9", 20)).issue(),
-            Some(HerdrCompatibilityIssue::VersionTooOld)
-        );
+        // The version floor precedes every protocol tier: a below-floor
+        // release reports VersionTooOld whichever tier its protocol lands in,
+        // so hoisting a protocol check above the floor cannot go unnoticed.
+        for protocol in [0_u32, 18, 19, 20, 21, u32::MAX] {
+            assert_eq!(
+                assess_herdr_compatibility(&pong("0.7.9", protocol)).issue(),
+                Some(HerdrCompatibilityIssue::VersionTooOld)
+            );
+        }
         // Below the floor protocol: hard mismatch.
         for protocol in [0_u32, 18] {
             assert_eq!(
