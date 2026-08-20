@@ -3,20 +3,24 @@
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{OpenOptions, Permissions};
-use std::io;
+use std::hash::{BuildHasher, Hasher};
+use std::io::{self, Read};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use herdr_top::diagnostics::local::{self, BreadcrumbPublishError};
 use herdr_top::diagnostics::{PersistenceOccurrenceSink, SharedFileOccurrenceSink};
 use herdr_top::doctor::{self, DoctorVersionRunner};
 use herdr_top::herdr::collector::{self, CollectorError, SourceAvailability};
-use herdr_top::herdr::controller::{self, ControllerEnvelope, EmitOutcome};
+use herdr_top::herdr::controller::{
+    self, ControllerEnvelope, ControllerResponse, EmitOutcome, RejectResponseReason,
+};
 use herdr_top::herdr::wire;
+use herdr_top::hook_adapter::{self, HookPayload};
 use herdr_top::lockfile::{self, LockError, OwnerRecord, StateRoot};
 use herdr_top::rendezvous::{self, RvError};
 use herdr_top::session_key::{self, ResolvedSession, SessionKeyError};
@@ -29,6 +33,7 @@ const OWNER_STARTING_RETRIES: usize = 5;
 const OWNER_STARTING_DELAY: Duration = Duration::from_millis(200);
 const LOG_FILE: &str = "herdr-top.log";
 const LOG_FILE_MODE: u32 = 0o600;
+const MAX_HOOK_PAYLOAD_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "herdr-top", version)]
@@ -64,32 +69,70 @@ struct EmitArgs {
     /// Controller wire schema version.
     #[arg(long, default_value_t = 1)]
     schema_version: u64,
-    #[arg(long)]
-    event_id: String,
-    #[arg(long)]
-    emitted_at_ms: i64,
-    #[arg(long)]
-    source: String,
-    #[arg(long)]
-    event_type: String,
-    #[arg(long)]
-    task_run_id: String,
-    #[arg(long)]
+    /// Adapt a provider hook payload read from standard input.
+    #[arg(long, value_enum)]
+    from_hook: Option<HookProviderArg>,
+    #[arg(
+        long,
+        required_unless_present = "from_hook",
+        conflicts_with = "from_hook"
+    )]
+    event_id: Option<String>,
+    #[arg(
+        long,
+        required_unless_present = "from_hook",
+        conflicts_with = "from_hook"
+    )]
+    emitted_at_ms: Option<i64>,
+    #[arg(
+        long,
+        required_unless_present = "from_hook",
+        conflicts_with = "from_hook"
+    )]
+    source: Option<String>,
+    #[arg(
+        long,
+        required_unless_present = "from_hook",
+        conflicts_with = "from_hook"
+    )]
+    event_type: Option<String>,
+    #[arg(
+        long,
+        required_unless_present = "from_hook",
+        conflicts_with = "from_hook"
+    )]
+    task_run_id: Option<String>,
+    #[arg(long, conflicts_with = "from_hook")]
     parent_task_run_id: Option<String>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "from_hook")]
     depends_on_id: Option<String>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "from_hook")]
     label: Option<String>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "from_hook")]
     reason: Option<String>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "from_hook")]
     progress: Option<f64>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "from_hook")]
     provider: Option<String>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "from_hook")]
     native_session_id: Option<String>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "from_hook")]
     terminal_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum HookProviderArg {
+    ClaudeCode,
+    Codex,
+}
+
+impl From<HookProviderArg> for hook_adapter::HookProvider {
+    fn from(provider: HookProviderArg) -> Self {
+        match provider {
+            HookProviderArg::ClaudeCode => Self::ClaudeCode,
+            HookProviderArg::Codex => Self::Codex,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -151,6 +194,39 @@ async fn main() -> ExitCode {
 }
 
 async fn run_emit(cli: &Cli, args: &EmitArgs) -> ExitCode {
+    let hook_envelopes = if let Some(provider) = args.from_hook {
+        let payload = match read_hook_payload() {
+            Ok(payload) => payload,
+            Err(reason) => {
+                eprintln!("herdr-top emit: warning: {reason}; ignored");
+                return ExitCode::SUCCESS;
+            }
+        };
+        let emitted_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let invocation_nonce = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        let mut envelopes = hook_adapter::map_hook_payload(
+            provider.into(),
+            &payload,
+            emitted_at_ms,
+            invocation_nonce,
+        );
+        for envelope in &mut envelopes {
+            envelope.schema_version = args.schema_version;
+        }
+        if envelopes.is_empty() {
+            return ExitCode::SUCCESS;
+        }
+        Some(envelopes)
+    } else {
+        None
+    };
+
     let resolved = match resolve_session(cli) {
         Ok(resolved) => resolved,
         Err(error) => return emit_unavailable(args.strict, error.to_string()),
@@ -166,13 +242,30 @@ async fn run_emit(cli: &Cli, args: &EmitArgs) -> ExitCode {
         }
         Err(error) => return emit_unavailable(args.strict, error.to_string()),
     };
+    if let Some(envelopes) = hook_envelopes {
+        return run_emit_from_hook(&endpoint, &envelopes, args.strict).await;
+    }
     let envelope = ControllerEnvelope {
         schema_version: args.schema_version,
-        event_id: args.event_id.clone(),
-        emitted_at_ms: args.emitted_at_ms,
-        source: args.source.clone(),
-        event_type: args.event_type.clone(),
-        task_run_id: args.task_run_id.clone(),
+        event_id: args
+            .event_id
+            .clone()
+            .expect("clap requires --event-id in manual mode"),
+        emitted_at_ms: args
+            .emitted_at_ms
+            .expect("clap requires --emitted-at-ms in manual mode"),
+        source: args
+            .source
+            .clone()
+            .expect("clap requires --source in manual mode"),
+        event_type: args
+            .event_type
+            .clone()
+            .expect("clap requires --event-type in manual mode"),
+        task_run_id: args
+            .task_run_id
+            .clone()
+            .expect("clap requires --task-run-id in manual mode"),
         parent_task_run_id: args.parent_task_run_id.clone(),
         depends_on_id: args.depends_on_id.clone(),
         label: args.label.clone(),
@@ -191,6 +284,80 @@ async fn run_emit(cli: &Cli, args: &EmitArgs) -> ExitCode {
         EmitOutcome::Unresolved(reason) => eprintln!("herdr-top emit: unresolved: {reason}"),
     }
     if args.strict && !outcome.is_success() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn read_hook_payload() -> Result<HookPayload, String> {
+    let mut input = Vec::with_capacity(MAX_HOOK_PAYLOAD_BYTES + 1);
+    io::stdin()
+        .lock()
+        .take((MAX_HOOK_PAYLOAD_BYTES + 1) as u64)
+        .read_to_end(&mut input)
+        .map_err(|error| format!("failed to read hook input: {error}"))?;
+    if input.len() > MAX_HOOK_PAYLOAD_BYTES {
+        return Err(format!(
+            "hook input exceeds the {MAX_HOOK_PAYLOAD_BYTES}-byte limit"
+        ));
+    }
+    serde_json::from_slice(&input).map_err(|error| format!("invalid hook payload: {error}"))
+}
+
+async fn run_emit_from_hook(
+    endpoint: &Path,
+    envelopes: &[ControllerEnvelope],
+    strict: bool,
+) -> ExitCode {
+    let mut failed = false;
+    for (index, envelope) in envelopes.iter().enumerate() {
+        let outcome = controller::emit_to_endpoint(endpoint, envelope).await;
+        let delivery_failed = match &outcome {
+            EmitOutcome::Response(response) => {
+                match serde_json::to_string(response) {
+                    Ok(response) => {
+                        eprintln!("herdr-top emit: {}: {response}", envelope.event_id);
+                    }
+                    Err(error) => {
+                        eprintln!("herdr-top emit: {}: unresolved: {error}", envelope.event_id);
+                    }
+                }
+                match response {
+                    ControllerResponse::Accepted | ControllerResponse::Duplicate => false,
+                    ControllerResponse::Rejected {
+                        reason: RejectResponseReason::StaleEvent,
+                    } => {
+                        eprintln!(
+                            "herdr-top emit: {}: benign stale_event; continuing",
+                            envelope.event_id
+                        );
+                        false
+                    }
+                    ControllerResponse::Rejected { .. } | ControllerResponse::Retryable { .. } => {
+                        true
+                    }
+                }
+            }
+            EmitOutcome::Unresolved(reason) => {
+                eprintln!(
+                    "herdr-top emit: {}: unresolved: {reason}",
+                    envelope.event_id
+                );
+                true
+            }
+        };
+        if delivery_failed {
+            failed = true;
+            let skipped = envelopes.len() - index - 1;
+            if skipped > 0 {
+                eprintln!("herdr-top emit: skipped {skipped} envelope(s) after delivery failure");
+            }
+            break;
+        }
+    }
+
+    if strict && failed {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
@@ -497,7 +664,76 @@ mod tests {
     use std::ffi::OsStr;
     use std::os::unix::fs::PermissionsExt;
 
+    use clap::error::ErrorKind;
+
     use super::*;
+
+    #[test]
+    fn emit_from_hook_parses_without_manual_arguments() {
+        assert!(
+            Cli::try_parse_from([
+                "herdr-top",
+                "--session",
+                "session",
+                "emit",
+                "--from-hook",
+                "claude-code",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn emit_from_hook_parses_with_strict() {
+        assert!(
+            Cli::try_parse_from([
+                "herdr-top",
+                "--session",
+                "session",
+                "emit",
+                "--from-hook",
+                "claude-code",
+                "--strict",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn emit_manual_invocation_still_requires_event_id() {
+        let error = Cli::try_parse_from([
+            "herdr-top",
+            "--session",
+            "session",
+            "emit",
+            "--emitted-at-ms",
+            "123",
+            "--source",
+            "test",
+            "--event-type",
+            "task_started",
+            "--task-run-id",
+            "run",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn emit_from_hook_conflicts_with_manual_event_id() {
+        let error = Cli::try_parse_from([
+            "herdr-top",
+            "--session",
+            "session",
+            "emit",
+            "--from-hook",
+            "claude-code",
+            "--event-id",
+            "manual",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
 
     #[test]
     fn i4_local_plugin_owner_and_held_launch_publish_breadcrumb() {
@@ -537,11 +773,12 @@ mod tests {
         let emit = Command::Emit(Box::new(EmitArgs {
             strict: false,
             schema_version: 1,
-            event_id: "event".to_owned(),
-            emitted_at_ms: 1,
-            source: "controller".to_owned(),
-            event_type: "task_started".to_owned(),
-            task_run_id: "run".to_owned(),
+            from_hook: None,
+            event_id: Some("event".to_owned()),
+            emitted_at_ms: Some(1),
+            source: Some("controller".to_owned()),
+            event_type: Some("task_started".to_owned()),
+            task_run_id: Some("run".to_owned()),
             parent_task_run_id: None,
             depends_on_id: None,
             label: None,
@@ -551,9 +788,19 @@ mod tests {
             native_session_id: None,
             terminal_id: None,
         }));
+        let hook_cli = Cli::try_parse_from([
+            "herdr-top",
+            "--session",
+            "session",
+            "emit",
+            "--from-hook",
+            "claude-code",
+        ])
+        .unwrap();
+        let hook_emit = hook_cli.command.as_ref().unwrap();
 
         let doctor = Command::Doctor(DoctorArgs { json: false });
-        for command in [Some(&doctor), Some(&emit)] {
+        for command in [Some(&doctor), Some(&emit), Some(hook_emit)] {
             assert!(plugin_state_dir_for_command(command, Some(plugin.as_os_str())).is_none());
         }
         let (owner, status) = acquire_monitor_lock_with_plugin_dir(&root, None).unwrap();

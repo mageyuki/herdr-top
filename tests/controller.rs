@@ -1,7 +1,8 @@
 use std::fs::{self, Permissions};
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use herdr_top::diagnostics::{
 };
 use herdr_top::herdr::collector::{self, CollectorHandle, SourceAvailability};
 use herdr_top::herdr::controller::{
-    self, ControllerResponse, RejectResponseReason, RetryableReason,
+    self, ControllerEnvelope, ControllerResponse, RejectResponseReason, RetryableReason,
 };
 use herdr_top::lockfile::{OwnerLock, StateRoot, state_root_in, try_acquire};
 use herdr_top::model::{
@@ -31,7 +32,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -595,6 +596,57 @@ fn emit_command(runtime_base: &Path, strict: bool, event_id: &str) -> Output {
     command.output().unwrap()
 }
 
+fn hook_emit_command(
+    runtime_base: &Path,
+    strict: bool,
+    provider: &str,
+    payload: Vec<u8>,
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_herdr-top"));
+    command
+        .args(["--session", SESSION, "emit", "--from-hook", provider])
+        .env("XDG_RUNTIME_DIR", runtime_base)
+        .env_remove("TMPDIR")
+        .env_remove("HERDR_SESSION")
+        .env_remove("HERDR_ENV")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if strict {
+        command.arg("--strict");
+    }
+
+    let mut child = command.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = std::thread::spawn(move || stdin.write_all(&payload));
+    let output = child.wait_with_output().unwrap();
+    match writer.join().unwrap() {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(error) => panic!("hook stdin write failed: {error}"),
+    }
+    output
+}
+
+fn scripted_emit_listener() -> (
+    TempDir,
+    ValidatedRuntimeDir,
+    std::os::unix::net::UnixListener,
+) {
+    let runtime_base = tempfile::tempdir().unwrap();
+    fs::set_permissions(runtime_base.path(), Permissions::from_mode(0o700)).unwrap();
+    let runtime = open_runtime_dir_at(runtime_base.path()).unwrap();
+    let key = session_key::encode(SESSION).unwrap();
+    let runtime_child = runtime_base.path().join("herdr-top");
+    let sentinel = runtime_child.join(format!("{}.name", key.hash16()));
+    fs::write(&sentinel, SESSION.as_bytes()).unwrap();
+    fs::set_permissions(&sentinel, Permissions::from_mode(0o600)).unwrap();
+    let socket = runtime_child.join(format!("{}.sock", key.hash16()));
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    (runtime_base, runtime, listener)
+}
+
 fn output_text(output: &Output) -> String {
     format!(
         "{}{}",
@@ -626,6 +678,89 @@ async fn serve_responses(
         stream.write_all(&bytes).await.unwrap();
         stream.shutdown().await.unwrap();
     }
+}
+
+struct CapturedEnvelope {
+    wire: Value,
+    envelope: ControllerEnvelope,
+}
+
+async fn receive_captured_envelope(
+    listener: &UnixListener,
+    response: &ControllerResponse,
+) -> CapturedEnvelope {
+    let (mut stream, _) = tokio::time::timeout(Duration::from_secs(8), listener.accept())
+        .await
+        .expect("adapter connection timed out")
+        .unwrap();
+    let mut request = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        let read = stream.read(&mut byte).await.unwrap();
+        if read == 0 || byte[0] == b'\n' {
+            break;
+        }
+        request.push(byte[0]);
+    }
+    assert!(!request.is_empty());
+    let wire: Value = serde_json::from_slice(&request).unwrap();
+    let envelope = serde_json::from_value(wire.clone()).unwrap();
+    let mut bytes = serde_json::to_vec(response).unwrap();
+    bytes.push(b'\n');
+    stream.write_all(&bytes).await.unwrap();
+    shutdown_client_write(&mut stream).await;
+    CapturedEnvelope { wire, envelope }
+}
+
+async fn serve_captured_responses(
+    listener: std::os::unix::net::UnixListener,
+    responses: Vec<ControllerResponse>,
+) -> Vec<CapturedEnvelope> {
+    let listener = UnixListener::from_std(listener).unwrap();
+    let mut envelopes = Vec::with_capacity(responses.len());
+    for response in responses {
+        envelopes.push(receive_captured_envelope(&listener, &response).await);
+    }
+    envelopes
+}
+
+async fn serve_captured_responses_until_done(
+    listener: std::os::unix::net::UnixListener,
+    responses: Vec<ControllerResponse>,
+    mut done: oneshot::Receiver<()>,
+) -> Vec<CapturedEnvelope> {
+    let listener = UnixListener::from_std(listener).unwrap();
+    let mut envelopes = Vec::with_capacity(responses.len());
+    for response in responses {
+        envelopes.push(receive_captured_envelope(&listener, &response).await);
+    }
+    loop {
+        tokio::select! {
+            biased;
+            connection = listener.accept() => {
+                let (mut stream, _) = connection.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut byte = [0_u8; 1];
+                    let read = stream.read(&mut byte).await.unwrap();
+                    if read == 0 || byte[0] == b'\n' {
+                        break;
+                    }
+                    request.push(byte[0]);
+                }
+                assert!(!request.is_empty());
+                let wire: Value = serde_json::from_slice(&request).unwrap();
+                let envelope = serde_json::from_value(wire.clone()).unwrap();
+                envelopes.push(CapturedEnvelope { wire, envelope });
+                let mut bytes = serde_json::to_vec(&rejected(RejectResponseReason::Invalid)).unwrap();
+                bytes.push(b'\n');
+                stream.write_all(&bytes).await.unwrap();
+                shutdown_client_write(&mut stream).await;
+            }
+            _ = &mut done => break,
+        }
+    }
+    envelopes
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1169,6 +1304,270 @@ async fn emit_roundtrip_accepted() {
             .task_run_by_key(&RunKey::Controller("run".to_owned()))
             .is_some()
     );
+    running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn emit_from_hook_delivers_subagent_dispatch_then_started_without_stdout() {
+    let (runtime_base, _runtime, listener) = scripted_emit_listener();
+    let server = tokio::spawn(serve_captured_responses(
+        listener,
+        vec![ControllerResponse::Accepted, ControllerResponse::Accepted],
+    ));
+    let runtime_path = runtime_base.path().to_path_buf();
+    let payload = serde_json::to_vec(&json!({
+        "hook_event_name": "SubagentStart",
+        "session_id": "session-123",
+        "agent_id": "agent-7",
+        "agent_type": "researcher"
+    }))
+    .unwrap();
+    let output = tokio::task::spawn_blocking(move || {
+        hook_emit_command(&runtime_path, false, "claude-code", payload)
+    })
+    .await
+    .unwrap();
+
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(
+        output.stdout.is_empty(),
+        "adapter stdout must be zero bytes"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr)
+            .matches("\"status\":\"accepted\"")
+            .count(),
+        2
+    );
+
+    let envelopes = server.await.unwrap();
+    assert_eq!(envelopes.len(), 2);
+    let dispatch = &envelopes[0].envelope;
+    let started = &envelopes[1].envelope;
+    let dispatch_wire = &envelopes[0].wire;
+    let started_wire = &envelopes[1].wire;
+    let session_run_id = "hook:claude-code:session-123";
+    let agent_run_id = "hook:claude-code:session-123:agent:agent-7";
+
+    assert_eq!(dispatch.schema_version, 1);
+    assert_eq!(dispatch.source, "hook:claude-code");
+    assert_eq!(dispatch.event_type, "dispatch");
+    assert_eq!(dispatch.task_run_id, agent_run_id);
+    assert_eq!(dispatch.parent_task_run_id.as_deref(), Some(session_run_id));
+    assert_eq!(dispatch.depends_on_id, None);
+    assert_eq!(dispatch.label, None);
+    assert_eq!(dispatch.reason, None);
+    assert_eq!(dispatch.progress, None);
+    assert_eq!(dispatch.provider.as_deref(), Some("claude"));
+    assert_eq!(dispatch.native_session_id, None);
+    assert_eq!(dispatch.terminal_id, None);
+    assert_eq!(dispatch_wire.as_object().unwrap().len(), 14);
+    assert_eq!(dispatch_wire["depends_on_id"], Value::Null);
+    assert_eq!(dispatch_wire["label"], Value::Null);
+    assert_eq!(dispatch_wire["reason"], Value::Null);
+    assert_eq!(dispatch_wire["progress"], Value::Null);
+    assert_eq!(dispatch_wire["native_session_id"], Value::Null);
+    assert_eq!(dispatch_wire["terminal_id"], Value::Null);
+
+    assert_eq!(started.schema_version, 1);
+    assert_eq!(started.source, "hook:claude-code");
+    assert_eq!(started.event_type, "task_started");
+    assert_eq!(started.task_run_id, agent_run_id);
+    assert_eq!(started.parent_task_run_id, None);
+    assert_eq!(started.depends_on_id, None);
+    assert_eq!(started.label.as_deref(), Some("researcher"));
+    assert_eq!(started.reason, None);
+    assert_eq!(started.progress, None);
+    assert_eq!(started.provider.as_deref(), Some("claude"));
+    assert_eq!(started.native_session_id, None);
+    assert_eq!(started.terminal_id, None);
+    assert_eq!(started_wire.as_object().unwrap().len(), 14);
+    assert_eq!(started_wire["parent_task_run_id"], Value::Null);
+    assert_eq!(started_wire["depends_on_id"], Value::Null);
+    assert_eq!(started_wire["reason"], Value::Null);
+    assert_eq!(started_wire["progress"], Value::Null);
+    assert_eq!(started_wire["native_session_id"], Value::Null);
+    assert_eq!(started_wire["terminal_id"], Value::Null);
+
+    let dispatch_suffix = dispatch
+        .event_id
+        .strip_prefix("hook:claude-code:session-123:SubagentStart:agent-7:dispatch:")
+        .unwrap();
+    let started_suffix = started
+        .event_id
+        .strip_prefix("hook:claude-code:session-123:SubagentStart:agent-7:started:")
+        .unwrap();
+    assert_eq!(dispatch_suffix, started_suffix);
+    let (millis, nonce) = dispatch_suffix.split_once(':').unwrap();
+    assert_eq!(millis.parse::<i64>().unwrap(), dispatch.emitted_at_ms);
+    assert_eq!(dispatch.emitted_at_ms, started.emitted_at_ms);
+    assert_eq!(nonce.len(), 16);
+    assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_ne!(dispatch.event_id, started.event_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn emit_from_hook_stops_after_invalid_rejection_and_strict_fails() {
+    let payload = serde_json::to_vec(&json!({
+        "hook_event_name": "SubagentStart",
+        "session_id": "session-123",
+        "agent_id": "agent-7",
+        "agent_type": "researcher"
+    }))
+    .unwrap();
+
+    for strict in [false, true] {
+        let (runtime_base, _runtime, listener) = scripted_emit_listener();
+        let (done_sender, done_receiver) = oneshot::channel();
+        let server = tokio::spawn(serve_captured_responses_until_done(
+            listener,
+            vec![rejected(RejectResponseReason::Invalid)],
+            done_receiver,
+        ));
+        let runtime_path = runtime_base.path().to_path_buf();
+        let payload = payload.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            hook_emit_command(&runtime_path, strict, "claude-code", payload)
+        })
+        .await
+        .unwrap();
+        done_sender.send(()).unwrap();
+
+        assert_eq!(output.status.success(), !strict, "{}", output_text(&output));
+        assert!(
+            output.stdout.is_empty(),
+            "adapter stdout must be zero bytes"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("\"status\":\"rejected\""), "{stderr}");
+        assert!(stderr.contains("\"reason\":\"invalid\""), "{stderr}");
+        assert!(stderr.contains("skipped 1"), "{stderr}");
+
+        let envelopes = server.await.unwrap();
+        assert_eq!(envelopes.len(), 1, "task_started must never be sent");
+        assert_eq!(envelopes[0].envelope.event_type, "dispatch");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn emit_from_hook_malformed_or_oversized_input_is_ignored_without_delivery() {
+    let cases = [
+        ("non-json", b"not-json".to_vec()),
+        (
+            "missing-session-id",
+            serde_json::to_vec(&json!({"hook_event_name": "SessionStart"})).unwrap(),
+        ),
+        ("oversized", vec![b'x'; 1_048_577]),
+    ];
+
+    for (case, payload) in cases {
+        let (runtime_base, _runtime, listener) = scripted_emit_listener();
+        let runtime_path = runtime_base.path().to_path_buf();
+        let output = tokio::task::spawn_blocking(move || {
+            hook_emit_command(&runtime_path, true, "claude-code", payload)
+        })
+        .await
+        .unwrap();
+
+        assert!(output.status.success(), "{case}: {}", output_text(&output));
+        assert!(
+            output.stdout.is_empty(),
+            "{case}: adapter stdout must be zero bytes"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("herdr-top emit:"), "{case}: {stderr}");
+        assert!(stderr.contains("hook"), "{case}: {stderr}");
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "{case}: malformed input must not connect to the Controller"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn emit_from_hook_treats_terminal_before_start_stale_event_as_benign() {
+    let running = RendezvousController::start().await;
+    let stop_payload = serde_json::to_vec(&json!({
+        "hook_event_name": "SubagentStop",
+        "session_id": "race-session",
+        "agent_id": "agent-7"
+    }))
+    .unwrap();
+    let runtime_path = running.runtime_base.path().to_path_buf();
+    let stop_output = tokio::task::spawn_blocking(move || {
+        hook_emit_command(&runtime_path, true, "claude-code", stop_payload)
+    })
+    .await
+    .unwrap();
+    assert!(
+        stop_output.status.success(),
+        "{}",
+        output_text(&stop_output)
+    );
+    assert!(stop_output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&stop_output.stderr).contains("\"status\":\"accepted\""));
+
+    let agent_run_id = "hook:claude-code:race-session:agent:agent-7";
+    assert_eq!(
+        running
+            .collector
+            .model
+            .borrow()
+            .task_run_by_key(&RunKey::Controller(agent_run_id.to_owned()))
+            .unwrap()
+            .state,
+        TaskState::Completed
+    );
+
+    let start_payload = serde_json::to_vec(&json!({
+        "hook_event_name": "SubagentStart",
+        "session_id": "race-session",
+        "agent_id": "agent-7",
+        "agent_type": "researcher"
+    }))
+    .unwrap();
+    for strict in [false, true] {
+        let runtime_path = running.runtime_base.path().to_path_buf();
+        let payload = start_payload.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            hook_emit_command(&runtime_path, strict, "claude-code", payload)
+        })
+        .await
+        .unwrap();
+
+        assert!(output.status.success(), "{}", output_text(&output));
+        assert!(
+            output.stdout.is_empty(),
+            "adapter stdout must be zero bytes"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(stderr.matches("\"status\":\"accepted\"").count(), 1);
+        assert_eq!(
+            stderr
+                .matches("\"status\":\"rejected\",\"reason\":\"stale_event\"")
+                .count(),
+            1,
+            "{stderr}"
+        );
+        assert!(!stderr.contains("skipped"), "{stderr}");
+    }
+
+    let model = running.collector.model.borrow();
+    let agent = model
+        .task_run_by_key(&RunKey::Controller(agent_run_id.to_owned()))
+        .unwrap();
+    let session = model
+        .task_run_by_key(&RunKey::Controller(
+            "hook:claude-code:race-session".to_owned(),
+        ))
+        .unwrap();
+    assert_eq!(agent.state, TaskState::Completed);
+    assert!(
+        model.execution_edges().any(|edge| {
+            edge.child_run_id == agent.run_id && edge.parent_run_id == session.run_id
+        })
+    );
+    drop(model);
     running.stop().await;
 }
 
