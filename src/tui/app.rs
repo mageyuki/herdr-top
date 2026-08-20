@@ -24,8 +24,11 @@ use crate::diagnostics::{
     ControllerCounterSnapshot, ControllerInputStatus, OccurrenceLogStatus, OwnerFreshness,
     PersistenceCounters, RuntimeDiagnosticsSnapshot,
 };
-use crate::herdr::collector::{ObservationQuality, PerformancePublication, SourceCoverageRegistry};
+#[cfg(any(test, feature = "workload-harness"))]
+use crate::herdr::collector::ObservationQuality;
+use crate::herdr::collector::{PerformancePublication, SourceCoverageRegistry};
 use crate::model::{DomainModel, RunId, RunKey, SharedModel};
+#[cfg(any(test, feature = "workload-harness"))]
 use crate::performance::PerformanceSnapshot;
 use crate::store::writer::PersistenceStatus;
 
@@ -170,6 +173,7 @@ pub struct HeaderInputs {
 /// Fixture/test default that deliberately leaks one watch-channel sender pair per call so the
 /// channels never close. Production code must build the literal directly rather than call
 /// `Default` in a loop.
+#[cfg(any(test, feature = "workload-harness"))]
 impl Default for HeaderInputs {
     fn default() -> Self {
         let (coverage_sender, source_coverage) =
