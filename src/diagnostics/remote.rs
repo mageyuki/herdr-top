@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 use crate::herdr::types::{AgentManifestStatus, Pong};
 use crate::model::Provider;
 
-/// Herdr socket protocol supported by this package.
-pub const REQUIRED_HERDR_PROTOCOL: u32 = 19;
+/// Reviewed Herdr socket protocols.
+/// Herdr 0.8.0 uses 19; 0.8.2 uses 20 with an additive-only schema change.
+pub const SUPPORTED_HERDR_PROTOCOLS: [u32; 2] = [19, 20];
 /// Oldest Herdr release compatible with the typed remote probes.
 pub const MINIMUM_HERDR_VERSION: &str = "0.8.0";
 /// Default wall-clock limit for one external version command.
@@ -55,7 +56,7 @@ impl HerdrCompatibility {
     }
 }
 
-/// Evaluates the exact Herdr release and protocol compatibility contract.
+/// Evaluates Herdr compatibility using the minimum version floor and reviewed protocol set.
 #[must_use]
 pub fn assess_herdr_compatibility(pong: &Pong) -> HerdrCompatibility {
     let Some(version) = NumericVersion::parse(&pong.version) else {
@@ -70,7 +71,7 @@ pub fn assess_herdr_compatibility(pong: &Pong) -> HerdrCompatibility {
             version: Some(version.normalized),
         };
     }
-    if pong.protocol != REQUIRED_HERDR_PROTOCOL {
+    if !SUPPORTED_HERDR_PROTOCOLS.contains(&pong.protocol) {
         return HerdrCompatibility::Unavailable {
             reason: HerdrCompatibilityIssue::ProtocolMismatch,
             version: Some(version.normalized),
@@ -984,6 +985,18 @@ mod tests {
                 version: "1.25.300".to_owned(),
             }
         );
+        assert_eq!(
+            assess_herdr_compatibility(&pong("0.8.0", 20)),
+            HerdrCompatibility::Compatible {
+                version: "0.8.0".to_owned(),
+            }
+        );
+        assert_eq!(
+            assess_herdr_compatibility(&pong("1.25.300", 20)),
+            HerdrCompatibility::Compatible {
+                version: "1.25.300".to_owned(),
+            }
+        );
         assert!(matches!(
             assess_herdr_compatibility(&pong("999999999999999999999999.25.300", 19)),
             HerdrCompatibility::Compatible { .. }
@@ -1000,7 +1013,7 @@ mod tests {
                 "unexpected result for {version}"
             );
         }
-        for protocol in [0, 18, 20, u32::MAX] {
+        for protocol in [0, 18, 21, u32::MAX] {
             assert_eq!(
                 assess_herdr_compatibility(&pong("99.0.0", protocol)).issue(),
                 Some(HerdrCompatibilityIssue::ProtocolMismatch)

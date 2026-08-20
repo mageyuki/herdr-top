@@ -229,7 +229,7 @@ pub struct HerdrCompatibilityObservation {
     pub found_version: String,
     pub minimum_version: String,
     pub found_protocol: u32,
-    pub required_protocol: u32,
+    pub supported_protocols: Vec<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -516,7 +516,7 @@ fn herdr_compatibility_check(pong: Option<&Pong>) -> Check<HerdrCompatibilityObs
         found_version,
         minimum_version: remote::MINIMUM_HERDR_VERSION.to_owned(),
         found_protocol: pong.protocol,
-        required_protocol: remote::REQUIRED_HERDR_PROTOCOL,
+        supported_protocols: remote::SUPPORTED_HERDR_PROTOCOLS.to_vec(),
     });
     match assessment {
         HerdrCompatibility::Compatible { .. } => {
@@ -2167,7 +2167,11 @@ mod tests {
             capabilities: None,
         }));
         assert_eq!(current.code, "herdr_compatible");
-        assert_eq!(current.observed.unwrap().found_protocol, 19_u32);
+        let current_observed = current
+            .observed
+            .expect("compatible Herdr has a typed observation");
+        assert_eq!(current_observed.found_protocol, 19_u32);
+        assert_eq!(current_observed.supported_protocols, vec![19, 20]);
 
         let old = herdr_compatibility_check(Some(&Pong {
             result_type: "pong".to_owned(),
@@ -2183,7 +2187,17 @@ mod tests {
             protocol: 20,
             capabilities: None,
         }));
-        assert_eq!(protocol.code, "herdr_protocol_mismatch");
+        assert_eq!(protocol.code, "herdr_compatible");
+        assert_eq!(protocol.observed.unwrap().found_protocol, 20_u32);
+
+        let protocol_mismatch = herdr_compatibility_check(Some(&Pong {
+            result_type: "pong".to_owned(),
+            version: "0.9.0".to_owned(),
+            protocol: 21,
+            capabilities: None,
+        }));
+        assert_eq!(protocol_mismatch.code, "herdr_protocol_mismatch");
+        assert_eq!(protocol_mismatch.observed.unwrap().found_protocol, 21_u32);
 
         let invalid = herdr_compatibility_check(Some(&Pong {
             result_type: "pong".to_owned(),
