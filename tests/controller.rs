@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use herdr_top::diagnostics::{
     ControllerCounterSnapshot, ControllerInputStatus, DiagnosticSource, InputAvailability,
@@ -1447,6 +1447,111 @@ async fn emit_from_hook_stops_after_invalid_rejection_and_strict_fails() {
         assert_eq!(envelopes.len(), 1, "task_started must never be sent");
         assert_eq!(envelopes[0].envelope.event_type, "dispatch");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn emit_from_hook_continues_after_stale_event_with_fresh_invocation_metadata() {
+    let payload = serde_json::to_vec(&json!({
+        "hook_event_name": "SubagentStart",
+        "session_id": "stale-first-session",
+        "agent_id": "agent-7",
+        "agent_type": "researcher"
+    }))
+    .unwrap();
+    let mut invocation_nonces = Vec::new();
+
+    for _ in 0..2 {
+        let (runtime_base, _runtime, listener) = scripted_emit_listener();
+        let server = tokio::spawn(serve_captured_responses(
+            listener,
+            vec![
+                rejected(RejectResponseReason::StaleEvent),
+                ControllerResponse::Accepted,
+            ],
+        ));
+        let runtime_path = runtime_base.path().to_path_buf();
+        let payload = payload.clone();
+        let before_ms = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        let output = tokio::task::spawn_blocking(move || {
+            hook_emit_command(&runtime_path, true, "claude-code", payload)
+        })
+        .await
+        .unwrap();
+        let after_ms = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+
+        assert!(output.status.success(), "{}", output_text(&output));
+        assert!(
+            output.stdout.is_empty(),
+            "adapter stdout must be zero bytes"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let benign_position = stderr
+            .find("benign stale_event; continuing")
+            .unwrap_or_else(|| panic!("missing benign stale_event diagnostic: {stderr}"));
+        let accepted_position = stderr
+            .find("\"status\":\"accepted\"")
+            .unwrap_or_else(|| panic!("missing accepted diagnostic: {stderr}"));
+        assert!(
+            benign_position < accepted_position,
+            "accepted diagnostic must follow the benign stale_event note: {stderr}"
+        );
+        assert!(!stderr.contains("skipped"), "{stderr}");
+
+        let envelopes = server.await.unwrap();
+        assert_eq!(envelopes.len(), 2);
+        let dispatch = &envelopes[0].envelope;
+        let started = &envelopes[1].envelope;
+        let session_run_id = "hook:claude-code:stale-first-session";
+        let agent_run_id = "hook:claude-code:stale-first-session:agent:agent-7";
+
+        assert_eq!(dispatch.event_type, "dispatch");
+        assert_eq!(dispatch.task_run_id, agent_run_id);
+        assert_eq!(dispatch.parent_task_run_id.as_deref(), Some(session_run_id));
+        assert_eq!(started.event_type, "task_started");
+        assert_eq!(started.task_run_id, dispatch.task_run_id);
+        assert_eq!(started.parent_task_run_id, None);
+
+        for captured in &envelopes {
+            assert!(
+                (before_ms..=after_ms).contains(&captured.envelope.emitted_at_ms),
+                "emitted_at_ms {} is outside invocation bounds {before_ms}..={after_ms}",
+                captured.envelope.emitted_at_ms
+            );
+        }
+        assert_eq!(dispatch.emitted_at_ms, started.emitted_at_ms);
+
+        let dispatch_suffix = dispatch
+            .event_id
+            .strip_prefix("hook:claude-code:stale-first-session:SubagentStart:agent-7:dispatch:")
+            .unwrap();
+        let started_suffix = started
+            .event_id
+            .strip_prefix("hook:claude-code:stale-first-session:SubagentStart:agent-7:started:")
+            .unwrap();
+        assert_eq!(dispatch_suffix, started_suffix);
+        let (emitted_at_ms, nonce) = dispatch_suffix.split_once(':').unwrap();
+        assert_eq!(
+            emitted_at_ms.parse::<i64>().unwrap(),
+            dispatch.emitted_at_ms
+        );
+        assert_eq!(nonce.len(), 16);
+        assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        invocation_nonces.push(nonce.to_owned());
+    }
+
+    assert_ne!(invocation_nonces[0], invocation_nonces[1]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
