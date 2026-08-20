@@ -1,4 +1,5 @@
 use crate::herdr::controller::ControllerEnvelope;
+use crate::model::sanitize_controller_text;
 
 pub enum HookProvider {
     ClaudeCode,
@@ -51,7 +52,7 @@ pub fn map_hook_payload(
         task_run_id,
         parent_task_run_id,
         depends_on_id: None,
-        label,
+        label: label.as_deref().map(sanitize_controller_text),
         reason: None,
         progress: None,
         provider: Some(wire_provider.to_owned()),
@@ -157,6 +158,7 @@ pub fn map_hook_payload(
 mod tests {
     use super::{HookPayload, HookProvider, map_hook_payload};
     use crate::herdr::controller::ControllerEnvelope;
+    use crate::model::sanitize_controller_text;
     use serde_json::json;
 
     const EMITTED_AT_MS: i64 = 1_723_456_789_012;
@@ -264,6 +266,34 @@ mod tests {
     }
 
     #[test]
+    fn subagent_start_bounds_oversized_agent_type_below_frame_limit() {
+        let huge_agent_type = "a".repeat(100_000);
+        let mut payload = payload("SubagentStart");
+        payload.agent_id = Some("agent-7".to_owned());
+        payload.agent_type = Some(huge_agent_type.clone());
+
+        let actual = map_hook_payload(HookProvider::ClaudeCode, &payload, EMITTED_AT_MS, NONCE);
+        let started = actual
+            .iter()
+            .find(|envelope| envelope.event_type == "task_started")
+            .expect("SubagentStart should produce a task_started envelope");
+        let label = started
+            .label
+            .as_deref()
+            .expect("task_started should carry the agent type label");
+
+        assert!(
+            label.len() <= 256,
+            "sanitized agent type was {} bytes",
+            label.len()
+        );
+        assert_eq!(label, sanitize_controller_text(&huge_agent_type));
+        assert!(
+            serde_json::to_vec(started).unwrap().len() < crate::herdr::controller::MAX_FRAME_BYTES
+        );
+    }
+
+    #[test]
     fn subagent_stop_maps_to_exact_complete_envelope() {
         let payload = serde_json::from_value(json!({
             "hook_event_name": "SubagentStop",
@@ -324,6 +354,34 @@ mod tests {
             ]
         );
         assert_ne!(actual[0].event_id, actual[1].event_id);
+    }
+
+    #[test]
+    fn task_created_bounds_oversized_subject_below_frame_limit() {
+        let huge_subject = "s".repeat(100_000);
+        let mut payload = payload("TaskCreated");
+        payload.task_id = Some("task-9".to_owned());
+        payload.task_subject = Some(huge_subject.clone());
+
+        let actual = map_hook_payload(HookProvider::ClaudeCode, &payload, EMITTED_AT_MS, NONCE);
+        let progress = actual
+            .iter()
+            .find(|envelope| envelope.event_type == "progress")
+            .expect("TaskCreated should produce a progress envelope");
+        let label = progress
+            .label
+            .as_deref()
+            .expect("progress should carry the task subject label");
+
+        assert!(
+            label.len() <= 256,
+            "sanitized task subject was {} bytes",
+            label.len()
+        );
+        assert_eq!(label, sanitize_controller_text(&huge_subject));
+        assert!(
+            serde_json::to_vec(progress).unwrap().len() < crate::herdr::controller::MAX_FRAME_BYTES
+        );
     }
 
     #[test]

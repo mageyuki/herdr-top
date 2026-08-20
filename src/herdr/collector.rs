@@ -2500,7 +2500,16 @@ async fn run_enrichment_reader(
                     }
                     received
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    if health.stream.record_failure() {
+                        // WARN is required because the production subscriber caps at WARN (src/main.rs).
+                        tracing::warn!(
+                            warning_code = "herdr_enrichment_stream_failed",
+                            "Herdr enrichment stream closed; retrying"
+                        );
+                    }
+                    break;
+                }
                 Err(error) => {
                     if health.stream.record_failure() {
                         tracing::warn!(
@@ -7328,6 +7337,85 @@ mod tests {
                 .count(),
             0,
             "successful subscribes without a preceding failure must not log recovery: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a3_enrichment_clean_stream_eof_warns_once_then_recovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mut harness =
+            spawn_enrichment_reader_harness(&directory, socket, "enrichment-clean-stream-eof.log");
+        let server_cancellation = harness.cancellation.clone();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut reader, request) = accept_wire_request(&listener).await;
+                write_wire_frame(
+                    &mut reader,
+                    &json!({
+                        "id": request["id"],
+                        "result": {"type": "subscription_started"},
+                    }),
+                )
+                .await;
+                reader
+                    .get_mut()
+                    .shutdown()
+                    .await
+                    .expect("fake Herdr listener failed to close the stream cleanly");
+                wait_for_wire_peer_close(&mut reader).await;
+                server_attempts.fetch_add(1, Ordering::Release);
+            }
+
+            let (mut recovered_reader, recovered_request) = accept_wire_request(&listener).await;
+            write_wire_frame(
+                &mut recovered_reader,
+                &json!({
+                    "id": recovered_request["id"],
+                    "result": {"type": "subscription_started"},
+                }),
+            )
+            .await;
+            write_wire_frame(
+                &mut recovered_reader,
+                &json!({
+                    "event": "pane_agent_status_changed",
+                    "data": {
+                        "pane_id": "pane-1",
+                        "terminal_id": "terminal-1",
+                        "agent_status": "working",
+                    },
+                }),
+            )
+            .await;
+            wait_for_server_cancellation(&server_cancellation).await;
+        });
+
+        wait_for_attempts(&attempts, 3, "clean enrichment stream closes").await;
+        let payload = tokio::time::timeout(Duration::from_secs(3), harness.events.recv())
+            .await
+            .expect("valid post-EOF enrichment event was not delivered")
+            .expect("enrichment event channel closed before clean-EOF recovery");
+        assert_eq!(payload.pane_id, "pane-1");
+        let contents = harness.stop().await;
+        join_fake_server(server, "clean enrichment stream EOF recovery").await;
+
+        assert_eq!(
+            contents
+                .matches("warning_code=\"herdr_enrichment_stream_failed\"")
+                .count(),
+            1,
+            "clean enrichment stream closes must warn once per failed edge: {contents}"
+        );
+        assert_eq!(
+            contents
+                .matches("notice_code=\"herdr_enrichment_stream_recovered\"")
+                .count(),
+            1,
+            "the first valid event after clean stream EOF must log one recovery notice: {contents}"
         );
     }
 
