@@ -12,9 +12,12 @@ use std::time::{Duration, Instant};
 use crate::herdr::types::{AgentManifestStatus, Pong};
 use crate::model::Provider;
 
-/// Reviewed Herdr socket protocols.
-/// Herdr 0.8.0 uses 19; 0.8.2 uses 20 with an additive-only schema change.
-pub const SUPPORTED_HERDR_PROTOCOLS: [u32; 2] = [19, 20];
+/// Oldest Herdr socket protocol the typed probes accept at all.
+pub const MINIMUM_HERDR_PROTOCOL: u32 = 19;
+/// Herdr socket protocols whose bundled schema has been explicitly reviewed
+/// (ascending; 0.8.0 ships 19, 0.8.2 ships 20 with an additive-only change).
+/// Extend ONLY through the procedure in `scripts/review-herdr-protocol.sh`.
+pub const REVIEWED_HERDR_PROTOCOLS: [u32; 2] = [19, 20];
 /// Oldest Herdr release compatible with the typed remote probes.
 pub const MINIMUM_HERDR_VERSION: &str = "0.8.0";
 /// Default wall-clock limit for one external version command.
@@ -39,6 +42,10 @@ pub enum HerdrCompatibility {
     Compatible {
         version: String,
     },
+    /// Handshake is usable, but the protocol is newer than every reviewed one.
+    NewerUnreviewed {
+        version: String,
+    },
     Unavailable {
         reason: HerdrCompatibilityIssue,
         version: Option<String>,
@@ -50,13 +57,14 @@ impl HerdrCompatibility {
     #[must_use]
     pub const fn issue(&self) -> Option<HerdrCompatibilityIssue> {
         match self {
-            Self::Compatible { .. } => None,
+            Self::Compatible { .. } | Self::NewerUnreviewed { .. } => None,
             Self::Unavailable { reason, .. } => Some(*reason),
         }
     }
 }
 
-/// Evaluates Herdr compatibility using the minimum version floor and reviewed protocol set.
+/// Evaluates Herdr compatibility as a version floor plus three protocol tiers:
+/// below-minimum Error, reviewed Ok, newer-than-reviewed tolerated.
 #[must_use]
 pub fn assess_herdr_compatibility(pong: &Pong) -> HerdrCompatibility {
     let Some(version) = NumericVersion::parse(&pong.version) else {
@@ -71,14 +79,30 @@ pub fn assess_herdr_compatibility(pong: &Pong) -> HerdrCompatibility {
             version: Some(version.normalized),
         };
     }
-    if !SUPPORTED_HERDR_PROTOCOLS.contains(&pong.protocol) {
+    if pong.protocol < MINIMUM_HERDR_PROTOCOL {
         return HerdrCompatibility::Unavailable {
             reason: HerdrCompatibilityIssue::ProtocolMismatch,
             version: Some(version.normalized),
         };
     }
-    HerdrCompatibility::Compatible {
-        version: version.normalized,
+    if REVIEWED_HERDR_PROTOCOLS.contains(&pong.protocol) {
+        return HerdrCompatibility::Compatible {
+            version: version.normalized,
+        };
+    }
+    let newest_reviewed = *REVIEWED_HERDR_PROTOCOLS
+        .last()
+        .expect("reviewed protocol set is non-empty");
+    if pong.protocol > newest_reviewed {
+        return HerdrCompatibility::NewerUnreviewed {
+            version: version.normalized,
+        };
+    }
+    // A gap inside the reviewed range (impossible while the set is
+    // contiguous, but the tier function stays total).
+    HerdrCompatibility::Unavailable {
+        reason: HerdrCompatibilityIssue::ProtocolMismatch,
+        version: Some(version.normalized),
     }
 }
 
@@ -627,6 +651,14 @@ enum ActiveVersionForm {
 }
 
 /// Classifies legacy integer and newer date-era active versions.
+///
+/// The date-era predicate is deliberately shape-based (two or more all-digit
+/// dot-separated components, no floor comparison): herdr's date-era format is
+/// not a contract this crate owns, a semantic predicate (4-digit year checks)
+/// would risk false incompatibility on legitimate future forms, and a
+/// wrong-shaped value classified as compatible only degrades a diagnostic,
+/// never an enforcement path. Recorded as a deliberate choice during the
+/// Increment 6 review.
 fn classify_active_version(value: &str) -> Option<ActiveVersionForm> {
     if let Some(integer) = normalize_integer(value) {
         return Some(ActiveVersionForm::LegacyInteger(integer));
@@ -673,12 +705,12 @@ mod tests {
 
     use super::{
         BoundedVersionCommandRunner, HerdrCompatibility, HerdrCompatibilityIssue,
-        OfficialIntegrationAssessment, OfficialIntegrationStatus,
-        OfficialIntegrationUnavailableReason, ProviderCliVersionStatus, RawCommandOutcome,
-        StandaloneVersionStatus, VersionCommand, VersionCommandRunner, VersionProbeFailure,
-        VersionProbeResult, assess_herdr_compatibility, assess_official_integration,
-        classify_command_outcome, execute_command, parse_tool_version, provider_cli_version_status,
-        standalone_version_status,
+        MINIMUM_HERDR_PROTOCOL, OfficialIntegrationAssessment, OfficialIntegrationStatus,
+        OfficialIntegrationUnavailableReason, ProviderCliVersionStatus, REVIEWED_HERDR_PROTOCOLS,
+        RawCommandOutcome, StandaloneVersionStatus, VersionCommand, VersionCommandRunner,
+        VersionProbeFailure, VersionProbeResult, assess_herdr_compatibility,
+        assess_official_integration, classify_command_outcome, execute_command, parse_tool_version,
+        provider_cli_version_status, standalone_version_status,
     };
 
     const CHILD_MODE: &str = "HERDR_TOP_REMOTE_TEST_CHILD_MODE";
@@ -973,30 +1005,38 @@ mod tests {
 
     #[test]
     fn i4_remote_herdr_version_protocol_matrix() {
-        assert_eq!(
-            assess_herdr_compatibility(&pong("0.8.0", 19)),
-            HerdrCompatibility::Compatible {
-                version: "0.8.0".to_owned(),
+        // Reviewed protocols are Compatible (19 and 20, at two versions each).
+        for protocol in [19_u32, 20] {
+            for version in ["0.8.0", "1.25.300"] {
+                assert_eq!(
+                    assess_herdr_compatibility(&pong(version, protocol)),
+                    HerdrCompatibility::Compatible {
+                        version: version.to_owned(),
+                    }
+                );
             }
-        );
+        }
+        // The version floor precedes every protocol tier, including 20.
         assert_eq!(
-            assess_herdr_compatibility(&pong("1.25.300", 19)),
-            HerdrCompatibility::Compatible {
-                version: "1.25.300".to_owned(),
-            }
+            assess_herdr_compatibility(&pong("0.7.9", 20)).issue(),
+            Some(HerdrCompatibilityIssue::VersionTooOld)
         );
-        assert_eq!(
-            assess_herdr_compatibility(&pong("0.8.0", 20)),
-            HerdrCompatibility::Compatible {
-                version: "0.8.0".to_owned(),
-            }
-        );
-        assert_eq!(
-            assess_herdr_compatibility(&pong("1.25.300", 20)),
-            HerdrCompatibility::Compatible {
-                version: "1.25.300".to_owned(),
-            }
-        );
+        // Below the floor protocol: hard mismatch.
+        for protocol in [0_u32, 18] {
+            assert_eq!(
+                assess_herdr_compatibility(&pong("99.0.0", protocol)).issue(),
+                Some(HerdrCompatibilityIssue::ProtocolMismatch)
+            );
+        }
+        // Newer than every reviewed protocol: tolerated but unreviewed.
+        for protocol in [21_u32, u32::MAX] {
+            assert_eq!(
+                assess_herdr_compatibility(&pong("99.0.0", protocol)),
+                HerdrCompatibility::NewerUnreviewed {
+                    version: "99.0.0".to_owned(),
+                }
+            );
+        }
         assert!(matches!(
             assess_herdr_compatibility(&pong("999999999999999999999999.25.300", 19)),
             HerdrCompatibility::Compatible { .. }
@@ -1013,12 +1053,16 @@ mod tests {
                 "unexpected result for {version}"
             );
         }
-        for protocol in [0, 18, 21, u32::MAX] {
-            assert_eq!(
-                assess_herdr_compatibility(&pong("99.0.0", protocol)).issue(),
-                Some(HerdrCompatibilityIssue::ProtocolMismatch)
-            );
-        }
+    }
+
+    #[test]
+    fn i7_reviewed_protocol_set_is_ascending_and_floored() {
+        assert!(REVIEWED_HERDR_PROTOCOLS.windows(2).all(|w| w[0] < w[1]));
+        assert!(
+            REVIEWED_HERDR_PROTOCOLS
+                .iter()
+                .all(|p| *p >= MINIMUM_HERDR_PROTOCOL)
+        );
     }
 
     #[test]
