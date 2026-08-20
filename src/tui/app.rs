@@ -24,8 +24,11 @@ use crate::diagnostics::{
     ControllerCounterSnapshot, ControllerInputStatus, OccurrenceLogStatus, OwnerFreshness,
     PersistenceCounters, RuntimeDiagnosticsSnapshot,
 };
-use crate::herdr::collector::{ObservationQuality, PerformancePublication, SourceCoverageRegistry};
+#[cfg(any(test, feature = "workload-harness"))]
+use crate::herdr::collector::ObservationQuality;
+use crate::herdr::collector::{PerformancePublication, SourceCoverageRegistry};
 use crate::model::{DomainModel, RunId, RunKey, SharedModel};
+#[cfg(any(test, feature = "workload-harness"))]
 use crate::performance::PerformanceSnapshot;
 use crate::store::writer::PersistenceStatus;
 
@@ -167,17 +170,25 @@ pub struct HeaderInputs {
     pub performance: tokio::sync::watch::Receiver<PerformancePublication>,
 }
 
+/// Fixture/test default that deliberately leaks one watch-channel sender pair per call so the
+/// channels never close. Production code must build the literal directly rather than call
+/// `Default` in a loop.
+#[cfg(any(test, feature = "workload-harness"))]
 impl Default for HeaderInputs {
     fn default() -> Self {
-        let (_coverage_sender, source_coverage) =
+        let (coverage_sender, source_coverage) =
             tokio::sync::watch::channel(SourceCoverageRegistry::default());
-        let (_performance_sender, performance) =
+        // Deliberately leak this fixture sender so the coverage watch never closes.
+        std::mem::forget(coverage_sender);
+        let (performance_sender, performance) =
             tokio::sync::watch::channel(PerformancePublication {
                 snapshot: PerformanceSnapshot::default(),
                 effective_quality: ObservationQuality::Live,
                 #[cfg(feature = "workload-harness")]
                 workload_sample_stamp: None,
             });
+        // Deliberately leak this fixture sender so the performance watch never closes.
+        std::mem::forget(performance_sender);
         Self {
             host: "unknown".to_owned(),
             session: "unknown".to_owned(),
@@ -476,6 +487,7 @@ fn default_diagnostics() -> RuntimeDiagnosticsSnapshot {
         owner: OwnerFreshness::Current,
         persistence_counters: PersistenceCounters::default(),
         controller_counters: ControllerCounterSnapshot::default(),
+        enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
         source_coverage: Vec::new(),
         dangling_announcement_components: 0,
         first_failure_log: OccurrenceLogStatus::NotAttempted,
@@ -612,7 +624,12 @@ impl App {
                 "model watch closed; collector is no longer publishing state",
             )
         })?;
-        let performance_changed = self.header.performance.has_changed().unwrap_or(false);
+        let performance_changed = self.header.performance.has_changed().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "performance watch closed; collector is no longer publishing performance state",
+            )
+        })?;
         let coverage_changed = self.header.source_coverage.has_changed().unwrap_or(false);
         let diagnostics_changed = self.diagnostics_receiver.has_changed().unwrap_or(false);
         let operator_changed = self.operator_receiver.has_changed().unwrap_or(false);
@@ -1736,6 +1753,7 @@ mod tests {
             owner: OwnerFreshness::Current,
             persistence_counters: PersistenceCounters::default(),
             controller_counters: ControllerCounterSnapshot::default(),
+            enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
             source_coverage: Vec::new(),
             dangling_announcement_components: 0,
             first_failure_log: OccurrenceLogStatus::NotAttempted,
@@ -2456,6 +2474,7 @@ mod tests {
                 socket_saturations: 17,
                 accept_failures: 18,
             },
+            enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
             source_coverage: vec![
                 SourceCoverageSnapshot {
                     source: DiagnosticSource::Herdr,
@@ -3363,6 +3382,28 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert!(error.to_string().contains("model watch closed"));
+    }
+
+    #[test]
+    fn tui_exits_on_closed_performance_watch() {
+        let (_model_sender, model_receiver) = watch::channel(Arc::new(DomainModel::default()));
+        let (performance_sender, performance) =
+            watch::channel(performance_publication(ObservationQuality::Live, []));
+        let mut app = App::new(
+            model_receiver,
+            HeaderInputs {
+                performance,
+                ..HeaderInputs::default()
+            },
+        );
+        drop(performance_sender);
+
+        let error = app
+            .refresh_if_changed()
+            .expect_err("closed performance watch must terminate the TUI loop");
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(error.to_string().contains("performance watch closed"));
     }
 
     #[test]

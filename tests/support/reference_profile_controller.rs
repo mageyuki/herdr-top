@@ -168,7 +168,11 @@ impl Cursor {
 fn main() {
     let status = match run() {
         Ok(code @ (0 | 10 | 20)) => code,
-        Ok(_) | Err(_) => 20,
+        Ok(_) => 20,
+        Err(error) => {
+            eprintln!("error: {error}");
+            20
+        }
     };
     std::process::exit(status);
 }
@@ -479,10 +483,14 @@ fn serialize_source_fixture_manifest(tools: &[(String, PathBuf)]) -> Result<Stri
         if role != expected_role {
             return Err("source fixture role ordering was invalid");
         }
+        if requested.starts_with("/home/mageyuki") {
+            return Err("source fixture tool used a workstation path");
+        }
+        if requested.file_name() != Some(std::ffi::OsStr::new(expected_role)) {
+            return Err("source fixture tool basename disagreed with role");
+        }
         let identity = derive_identity(requested)?;
-        if identity.requested.starts_with("/home/mageyuki")
-            || identity.canonical.starts_with("/home/mageyuki")
-        {
+        if identity.canonical.starts_with("/home/mageyuki") {
             return Err("source fixture tool used a workstation path");
         }
         identities.push(identity);

@@ -778,6 +778,32 @@ pub enum ReferenceOutcomeV1 {
     Invalid { document: InvalidRunV1 },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AmendedLegacyMode {
+    Off,
+    AcceptAmendedLegacy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReclassificationRecordV1 {
+    pub scenario: ScenarioV1,
+    pub recorded_failure_reasons: Vec<FailureReasonV1>,
+}
+
+#[derive(Debug)]
+pub struct ReferenceOutcomeRead {
+    pub outcome: ReferenceOutcomeV1,
+    pub reclassified: Option<ReclassificationRecordV1>,
+}
+
+#[derive(serde::Serialize)]
+struct ReclassificationSidecarV1<'a> {
+    schema_version: u32,
+    rule: &'static str,
+    reclassified: &'a [ReclassificationRecordV1],
+}
+
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerTestOutcomeV1 {
@@ -1115,7 +1141,11 @@ impl D4CheckpointDocumentV1 {
 
 impl Section15ReDerivationV1 {
     pub fn validate(&self) -> Result<(), ResultError> {
-        validate_section15_selected_evidence(self)
+        self.validate_with_mode(AmendedLegacyMode::Off)
+    }
+
+    pub fn validate_with_mode(&self, legacy: AmendedLegacyMode) -> Result<(), ResultError> {
+        validate_section15_selected_evidence(self, legacy)
     }
 }
 
@@ -1543,16 +1573,10 @@ fn validate_trial_controls(
         scenario_spec(document.scenario).directory,
         trial.trial_index
     );
-    if !scratch_root_path.is_absolute()
-        || !raw_root_path.is_absolute()
-        || scratch_root_path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::CurDir | std::path::Component::ParentDir
-            )
-        })
+    if !absolute_path_text_is_canonical(scratch_root_path)
+        || !absolute_path_text_is_canonical(raw_root_path)
         || !scratch_root.ends_with(&expected_suffix)
-        || !control_socket_path.is_absolute()
+        || !absolute_path_text_is_canonical(control_socket_path)
         || !control_socket.starts_with("/tmp/herdr-i5.")
         || control_socket_path.starts_with(raw_root)
         || trial.raw.child_controls.effective_affinity_cpu_ids != document.controls.affinity_cpu_ids
@@ -2368,6 +2392,12 @@ fn validate_performance_stream(
         .iter()
         .map(|sample| (sample.sample_ordinal, sample))
         .collect::<std::collections::BTreeMap<_, _>>();
+    // The one-quantum boundary exception is trial-wide: any EventLag sample
+    // closes the exception, even when the 101-event sample has no EventLag reason.
+    let trial_has_event_lag_reason = stream
+        .samples
+        .iter()
+        .any(|sample| sample.reasons.contains(&PerformanceReasonV1::EventLag));
     let mut degraded_samples = 0;
     let mut publication_ordinals = BTreeSet::new();
     let mut prior_sample = None;
@@ -2416,7 +2446,15 @@ fn validate_performance_stream(
             publication_ordinals.insert(sample.sample_ordinal);
         }
         prior_sample = Some(sample);
-        degraded_samples += usize::from(!sample.reasons.is_empty());
+        degraded_samples += usize::from(
+            !sample.reasons.is_empty()
+                && !tolerated_boundary_degradation(
+                    document.measurement_stage,
+                    document.scenario,
+                    sample,
+                    trial_has_event_lag_reason,
+                ),
+        );
     }
     for frame in &stream.frames {
         let sample = sample_map
@@ -2613,6 +2651,20 @@ fn expected_performance_reasons(sample: &PerformanceSampleEvidenceV1) -> Vec<Per
     reasons
 }
 
+pub fn tolerated_boundary_degradation(
+    stage: MeasurementStageV1,
+    scenario: ScenarioV1,
+    sample: &PerformanceSampleEvidenceV1,
+    trial_has_event_lag_reason: bool,
+) -> bool {
+    stage == MeasurementStageV1::Final
+        && matches!(scenario, ScenarioV1::Sustained | ScenarioV1::Burst)
+        && sample.reasons == [PerformanceReasonV1::EventsOneSecond]
+        && sample.events_one_second == 101
+        && sample.event_lag_ns <= 1_000_000_000
+        && !trial_has_event_lag_reason
+}
+
 fn expected_header(quality: EffectiveQualityV1, reasons: &[PerformanceReasonV1]) -> String {
     let quality = match quality {
         EffectiveQualityV1::Live => "LIVE",
@@ -2691,6 +2743,15 @@ fn is_lower_hex(value: &str, len: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn absolute_path_text_is_canonical(path: &std::path::Path) -> bool {
+    let normalized = path.components().collect::<std::path::PathBuf>();
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+        && path.as_os_str() == normalized.as_os_str()
+}
+
 fn validate_section15_internal(report: &Section15ReDerivationV1) -> Result<(), ResultError> {
     let scenarios = [
         ScenarioV1::Target,
@@ -2733,22 +2794,10 @@ fn validate_section15_internal(report: &Section15ReDerivationV1) -> Result<(), R
             || !is_lower_hex(&identity.result_sha256, 64)
             || !is_lower_hex(&identity.production_subject_sha, 40)
             || !is_lower_hex(&identity.harness_sha, 40)
-            || !result_path.is_absolute()
-            || !raw_root.is_absolute()
+            || !absolute_path_text_is_canonical(result_path)
+            || !absolute_path_text_is_canonical(raw_root)
             || result_path.parent() != Some(raw_root)
             || result_path.file_name() != Some(std::ffi::OsStr::new("result-v1.json"))
-            || result_path.components().any(|component| {
-                matches!(
-                    component,
-                    std::path::Component::CurDir | std::path::Component::ParentDir
-                )
-            })
-            || raw_root.components().any(|component| {
-                matches!(
-                    component,
-                    std::path::Component::CurDir | std::path::Component::ParentDir
-                )
-            })
             || !executable_identity_is_well_formed(&identity.measured_binary)
             || expected_stage == MeasurementStageV1::Baseline
                 && (identity.production_subject_sha != BASELINE_SUBJECT_SHA
@@ -3040,6 +3089,7 @@ fn validate_section15_internal(report: &Section15ReDerivationV1) -> Result<(), R
 
 fn validate_section15_selected_evidence(
     report: &Section15ReDerivationV1,
+    legacy: AmendedLegacyMode,
 ) -> Result<(), ResultError> {
     validate_section15_internal(report)?;
 
@@ -3094,8 +3144,9 @@ fn validate_section15_selected_evidence(
             return Err(ResultError::InvalidArtifact);
         }
 
-        let outcome = read_and_validate_reference_outcome(result_path)
-            .map_err(|_| ResultError::InvalidArtifact)?;
+        let outcome = read_and_validate_reference_outcome(result_path, legacy)
+            .map_err(|_| ResultError::InvalidArtifact)?
+            .outcome;
         if outcome.status() == ReferenceOutcomeStatusV1::Invalid
             || validate_with_raw_root(&outcome, raw_root).is_err()
         {
@@ -5087,14 +5138,18 @@ pub fn classify_d4_checkpoint(
 }
 
 pub fn classify_d4_checkpoint_from_environment() -> Result<(), HarnessError> {
-    require_closed_environment(&[
-        "HERDR_PERF_CLASSIFY_OUTPUT",
-        "HERDR_PERF_CLASSIFY_RESULTS_ROOT",
-    ])?;
+    let optional = require_closed_environment_with_optional(
+        &[
+            "HERDR_PERF_CLASSIFY_OUTPUT",
+            "HERDR_PERF_CLASSIFY_RESULTS_ROOT",
+        ],
+        &["HERDR_PERF_ACCEPT_AMENDED_LEGACY"],
+    )?;
+    let legacy = amended_legacy_mode(&optional);
     let root = required_environment_path("HERDR_PERF_CLASSIFY_RESULTS_ROOT")?;
     let output = required_environment_path("HERDR_PERF_CLASSIFY_OUTPUT")?;
-    let outcomes = load_all_scenario_outcomes(&root)?;
-    let decision = classify_d4_checkpoint(&outcomes)
+    let loaded = load_all_scenario_outcomes(&root, legacy)?;
+    let decision = classify_d4_checkpoint(&loaded.outcomes)
         .map_err(|_| HarnessError::Invalid("D4 classification input was invalid"))?;
     let document = D4CheckpointDocumentV1 {
         schema_version: 1,
@@ -5103,15 +5158,21 @@ pub fn classify_d4_checkpoint_from_environment() -> Result<(), HarnessError> {
     document
         .validate()
         .map_err(|_| HarnessError::Invalid("D4 checkpoint document was invalid"))?;
-    atomic_write_json(&output, &document)
+    validate_reclassification_records(&loaded.reclassified)?;
+    atomic_write_json(&output, &document)?;
+    write_reclassification_sidecar(&output, &loaded.reclassified)
 }
 
 pub fn rederive_section15_report_from_environment() -> Result<(), HarnessError> {
-    require_closed_environment(&[
-        "HERDR_PERF_REDERIVE_BASELINE_RESULTS_ROOT",
-        "HERDR_PERF_REDERIVE_FINAL_RESULTS_ROOT",
-        "HERDR_PERF_REDERIVE_OUTPUT",
-    ])?;
+    let optional = require_closed_environment_with_optional(
+        &[
+            "HERDR_PERF_REDERIVE_BASELINE_RESULTS_ROOT",
+            "HERDR_PERF_REDERIVE_FINAL_RESULTS_ROOT",
+            "HERDR_PERF_REDERIVE_OUTPUT",
+        ],
+        &["HERDR_PERF_ACCEPT_AMENDED_LEGACY"],
+    )?;
+    let legacy = amended_legacy_mode(&optional);
     let baseline_root = required_environment_path("HERDR_PERF_REDERIVE_BASELINE_RESULTS_ROOT")?;
     let final_root = required_environment_path("HERDR_PERF_REDERIVE_FINAL_RESULTS_ROOT")?;
     let output = required_environment_path("HERDR_PERF_REDERIVE_OUTPUT")?;
@@ -5125,23 +5186,33 @@ pub fn rederive_section15_report_from_environment() -> Result<(), HarnessError> 
             "Section 15 roots must be distinct and non-nested",
         ));
     }
-    let baseline = load_all_scenario_outcomes(&baseline_root)?;
-    let final_results = load_all_scenario_outcomes(&final_root)?;
+    let baseline = load_all_scenario_outcomes(&baseline_root, legacy)?;
+    let final_results = load_all_scenario_outcomes(&final_root, legacy)?;
     if baseline
+        .outcomes
         .iter()
         .any(|outcome| outcome.document().measurement_stage != MeasurementStageV1::Baseline)
         || final_results
+            .outcomes
             .iter()
             .any(|outcome| outcome.document().measurement_stage != MeasurementStageV1::Final)
     {
         return Err(HarnessError::Invalid("Section 15 stage identity mismatch"));
     }
-    let report =
-        rederive_section15_document(&baseline_root, &final_root, &baseline, &final_results)?;
+    let report = rederive_section15_document(
+        &baseline_root,
+        &final_root,
+        &baseline.outcomes,
+        &final_results.outcomes,
+    )?;
     report
-        .validate()
+        .validate_with_mode(legacy)
         .map_err(|_| HarnessError::Invalid("Section 15 document was invalid"))?;
-    atomic_write_json(&output, &report)
+    let mut reclassified = baseline.reclassified;
+    reclassified.extend(final_results.reclassified);
+    validate_reclassification_records(&reclassified)?;
+    atomic_write_json(&output, &report)?;
+    write_reclassification_sidecar(&output, &reclassified)
 }
 
 pub fn compose_reference_outcome_from_environment() -> Result<i32, HarnessError> {
@@ -6002,15 +6073,113 @@ pub fn atomic_write_reference_outcome(
     atomic_write_json(path, outcome)
 }
 
+fn reclassification_sidecar_path(output: &std::path::Path) -> std::path::PathBuf {
+    let mut path = output.as_os_str().to_os_string();
+    path.push(".reclassification.json");
+    path.into()
+}
+
+fn validate_reclassification_records(
+    records: &[ReclassificationRecordV1],
+) -> Result<(), HarnessError> {
+    if records.iter().enumerate().any(|(index, record)| {
+        records[index + 1..]
+            .iter()
+            .any(|later| later.scenario == record.scenario)
+    }) {
+        return Err(HarnessError::Invalid(
+            "legacy reclassification contained duplicate scenarios",
+        ));
+    }
+    Ok(())
+}
+
+fn write_reclassification_sidecar(
+    output: &std::path::Path,
+    records: &[ReclassificationRecordV1],
+) -> Result<(), HarnessError> {
+    if records.is_empty() {
+        return match std::fs::remove_file(reclassification_sidecar_path(output)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        };
+    }
+    atomic_write_json(
+        &reclassification_sidecar_path(output),
+        &ReclassificationSidecarV1 {
+            schema_version: 1,
+            rule: "amended_legacy_v1",
+            reclassified: records,
+        },
+    )
+}
+
+fn document_has_tolerated_boundary_sample(document: &ReferenceRunV1) -> bool {
+    document.trials.iter().any(|trial| {
+        trial
+            .raw
+            .performance_evidence_stream
+            .as_ref()
+            .is_some_and(|stream| {
+                let trial_has_event_lag_reason = stream
+                    .samples
+                    .iter()
+                    .any(|sample| sample.reasons.contains(&PerformanceReasonV1::EventLag));
+                stream.samples.iter().any(|sample| {
+                    tolerated_boundary_degradation(
+                        document.measurement_stage,
+                        document.scenario,
+                        sample,
+                        trial_has_event_lag_reason,
+                    )
+                })
+            })
+    })
+}
+
 pub fn read_and_validate_reference_outcome(
     path: &std::path::Path,
-) -> Result<ReferenceOutcomeV1, HarnessError> {
-    let outcome: ReferenceOutcomeV1 = read_closed_json(path)
+    legacy: AmendedLegacyMode,
+) -> Result<ReferenceOutcomeRead, HarnessError> {
+    let mut outcome: ReferenceOutcomeV1 = read_closed_json(path)
         .map_err(|_| HarnessError::Invalid("stored outcome was not canonical closed JSON"))?;
+    if outcome.validate().is_ok() {
+        return Ok(ReferenceOutcomeRead {
+            outcome,
+            reclassified: None,
+        });
+    }
+    let reclassified = match (&outcome, legacy) {
+        (ReferenceOutcomeV1::Failed { document }, AmendedLegacyMode::AcceptAmendedLegacy)
+            if document.failure_reasons == [FailureReasonV1::SupportedLoadDegradation]
+                && document.measurement_stage == MeasurementStageV1::Final
+                && document_has_tolerated_boundary_sample(document)
+                && validate_reference_run(document, false)
+                    .is_ok_and(|derived| derived.is_empty()) =>
+        {
+            Some(ReclassificationRecordV1 {
+                scenario: document.scenario,
+                recorded_failure_reasons: document.failure_reasons.clone(),
+            })
+        }
+        _ => None,
+    }
+    .ok_or(HarnessError::Invalid("stored outcome failed validation"))?;
+    outcome = match outcome {
+        ReferenceOutcomeV1::Failed { mut document } => {
+            document.failure_reasons.clear();
+            ReferenceOutcomeV1::Pass { document }
+        }
+        _ => return Err(HarnessError::Invalid("stored outcome failed validation")),
+    };
     outcome
         .validate()
         .map_err(|_| HarnessError::Invalid("stored outcome failed validation"))?;
-    Ok(outcome)
+    Ok(ReferenceOutcomeRead {
+        outcome,
+        reclassified: Some(reclassified),
+    })
 }
 
 pub fn validate_reference_outcome_impl(request: &ValidateRequestV1) -> Result<i32, HarnessError> {
@@ -6048,7 +6217,7 @@ pub fn validate_reference_outcome_impl(request: &ValidateRequestV1) -> Result<i3
             return Ok(20);
         }
     };
-    let candidate = read_and_validate_reference_outcome(&request.candidate);
+    let candidate = read_and_validate_reference_outcome(&request.candidate, AmendedLegacyMode::Off);
     let recomposed = compose_reference_outcome_from_raw_impl(&ComposeRequestV1 {
         raw_root: request.raw_root.clone(),
         output: request.candidate.clone(),
@@ -6062,8 +6231,8 @@ pub fn validate_reference_outcome_impl(request: &ValidateRequestV1) -> Result<i3
         scenario_trial_status_transport(&request.raw_root, request.scenario);
     let valid = candidate.as_ref().is_ok_and(|outcome| {
         recomposed.as_ref().is_ok_and(|expected| {
-            serde_json::to_vec(outcome).ok() == serde_json::to_vec(expected).ok()
-                && outcome_identity_matches_validate_request(outcome, request)
+            serde_json::to_vec(&outcome.outcome).ok() == serde_json::to_vec(expected).ok()
+                && outcome_identity_matches_validate_request(&outcome.outcome, request)
         })
     });
     let expected_status = recomposed.as_ref().ok().map(status_code).unwrap_or(20);
@@ -6075,7 +6244,7 @@ pub fn validate_reference_outcome_impl(request: &ValidateRequestV1) -> Result<i3
         atomic_write_reference_outcome(&request.output, &invalid)?;
         return Ok(20);
     }
-    let outcome = candidate.expect("candidate was checked above");
+    let outcome = candidate.expect("candidate was checked above").outcome;
     atomic_write_reference_outcome(&request.output, &outcome)?;
     Ok(expected_status)
 }
@@ -7319,13 +7488,22 @@ fn parse_scenario_token(value: &str) -> Result<ScenarioV1, HarnessError> {
         .ok_or(HarnessError::Invalid("unknown workload scenario"))
 }
 
+struct LoadedScenarioOutcomes {
+    outcomes: Vec<ReferenceOutcomeV1>,
+    reclassified: Vec<ReclassificationRecordV1>,
+}
+
 fn load_all_scenario_outcomes(
     root: &std::path::Path,
-) -> Result<Vec<ReferenceOutcomeV1>, HarnessError> {
+    legacy: AmendedLegacyMode,
+) -> Result<LoadedScenarioOutcomes, HarnessError> {
     let mut outcomes = Vec::new();
+    let mut reclassified = Vec::new();
     for spec in &workload_schema().scenarios {
         let scenario_root = root.join(&spec.directory);
-        let outcome = read_and_validate_reference_outcome(&scenario_root.join("result-v1.json"))?;
+        let read =
+            read_and_validate_reference_outcome(&scenario_root.join("result-v1.json"), legacy)?;
+        let outcome = read.outcome;
         if matches!(outcome, ReferenceOutcomeV1::Invalid { .. })
             || outcome.document().scenario != spec.scenario
         {
@@ -7335,9 +7513,15 @@ fn load_all_scenario_outcomes(
         }
         validate_with_raw_root(&outcome, &scenario_root)
             .map_err(|_| HarnessError::Invalid("selected raw root was invalid"))?;
+        if let Some(record) = read.reclassified {
+            reclassified.push(record);
+        }
         outcomes.push(outcome);
     }
-    Ok(outcomes)
+    Ok(LoadedScenarioOutcomes {
+        outcomes,
+        reclassified,
+    })
 }
 
 fn rederive_section15_document(
@@ -7405,17 +7589,19 @@ fn rederive_section15_document(
         }
         let baseline_outcome = &baseline[index];
         let final_outcome = &final_results[index];
+        let baseline_stage = baseline_outcome.document().measurement_stage;
         let baseline_trials = baseline_outcome
             .document()
             .trials
             .iter()
-            .map(|trial| section15_trial_row_with_predicates(trial, false))
+            .map(|trial| section15_trial_row_with_predicates(baseline_stage, trial, false))
             .collect::<Result<Vec<_>, _>>()?;
+        let final_stage = final_outcome.document().measurement_stage;
         let final_trials = final_outcome
             .document()
             .trials
             .iter()
-            .map(section15_trial_row)
+            .map(|trial| section15_trial_row(final_stage, trial))
             .collect::<Result<Vec<_>, _>>()?;
         baseline_deltas.extend(section15_baseline_delta_rows(
             spec.scenario,
@@ -7513,6 +7699,13 @@ pub fn rederive_section15_document_for_test(
     rederive_section15_document(baseline_root, final_root, baseline, final_results)
 }
 
+#[cfg(feature = "workload-harness")]
+pub fn validate_section15_shape_for_test(
+    report: &Section15ReDerivationV1,
+) -> Result<(), ResultError> {
+    validate_section15_internal(report)
+}
+
 fn section15_baseline_delta_rows(
     scenario: ScenarioV1,
     baseline: &[Section15TrialReDerivationV1],
@@ -7586,12 +7779,14 @@ fn section15_distribution_statistic(
 }
 
 fn section15_trial_row(
+    stage: MeasurementStageV1,
     trial: &TrialResultV1,
 ) -> Result<Section15TrialReDerivationV1, HarnessError> {
-    section15_trial_row_with_predicates(trial, true)
+    section15_trial_row_with_predicates(stage, trial, true)
 }
 
 fn section15_trial_row_with_predicates(
+    stage: MeasurementStageV1,
     trial: &TrialResultV1,
     include_predicates: bool,
 ) -> Result<Section15TrialReDerivationV1, HarnessError> {
@@ -7625,7 +7820,7 @@ fn section15_trial_row_with_predicates(
         structural_identities_match: validate_structural_identities(&trial.raw).is_ok(),
         distributions: section15_distribution_rows(trial),
         predicates: if include_predicates {
-            section15_predicate_rows(trial)?
+            section15_predicate_rows(stage, trial)?
         } else {
             Vec::new()
         },
@@ -7671,6 +7866,7 @@ fn section15_predicate(
 }
 
 fn section15_predicate_rows(
+    stage: MeasurementStageV1,
     trial: &TrialResultV1,
 ) -> Result<Vec<Section15PredicateV1>, HarnessError> {
     let spec = scenario_spec(trial.raw.scenario);
@@ -7861,10 +8057,22 @@ fn section15_predicate_rows(
                 let observed = if trial.raw.scenario == ScenarioV1::TwiceTarget {
                     u128::from(stream.selected_terminal_draw_ordinal.is_some())
                 } else {
+                    let trial_has_event_lag_reason = stream
+                        .samples
+                        .iter()
+                        .any(|sample| sample.reasons.contains(&PerformanceReasonV1::EventLag));
                     stream
                         .samples
                         .iter()
-                        .filter(|sample| !sample.reasons.is_empty())
+                        .filter(|sample| {
+                            !sample.reasons.is_empty()
+                                && !tolerated_boundary_degradation(
+                                    stage,
+                                    trial.raw.scenario,
+                                    sample,
+                                    trial_has_event_lag_reason,
+                                )
+                        })
                         .count() as u128
                 };
                 push(
@@ -8002,7 +8210,7 @@ pub fn synthetic_section15_rederivation() -> Section15ReDerivationV1 {
                     .document()
                     .trials
                     .iter()
-                    .map(section15_trial_row)
+                    .map(|trial| section15_trial_row(MeasurementStageV1::Final, trial))
                     .collect::<Result<Vec<_>, _>>()
                     .expect("synthetic Section 15 trials must re-derive"),
             }
@@ -8610,6 +8818,15 @@ fn linux_current_affinity() -> Result<Vec<u32>, HarnessError> {
         .collect())
 }
 
+/// CoreFoundation, linked through `notify` -> `fsevent-sys`, sets this key
+/// inside the child process after exec on macOS, so a parent's
+/// `env_clear()` cannot exclude it. Tolerate exactly this key: it is never
+/// required, and its value is never pinned or read.
+#[cfg(target_os = "macos")]
+const HOST_INJECTED_ENVIRONMENT_KEYS: &[&str] = &["__CF_USER_TEXT_ENCODING"];
+#[cfg(not(target_os = "macos"))]
+const HOST_INJECTED_ENVIRONMENT_KEYS: &[&str] = &[];
+
 fn require_exact_environment(expected: &[&str]) -> Result<(), HarnessError> {
     let expected = expected.iter().copied().collect::<BTreeSet<_>>();
     let actual = std::env::vars_os()
@@ -8618,23 +8835,71 @@ fn require_exact_environment(expected: &[&str]) -> Result<(), HarnessError> {
                 .map_err(|_| HarnessError::Invalid("environment key was not UTF-8"))
         })
         .collect::<Result<BTreeSet<_>, _>>()?;
-    if actual.iter().map(String::as_str).collect::<BTreeSet<_>>() != expected {
+    let mut actual_keys = actual.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    for key in HOST_INJECTED_ENVIRONMENT_KEYS {
+        actual_keys.remove(*key);
+    }
+    if actual_keys != expected {
         return Err(HarnessError::Invalid("environment key set was not closed"));
     }
     Ok(())
 }
 
 fn require_closed_environment(additional: &[&str]) -> Result<(), HarnessError> {
-    let mut expected = vec!["CARGO_HOME", "HOME", "LC_ALL", "PATH", "RUSTUP_HOME", "TZ"];
-    expected.extend_from_slice(additional);
-    require_exact_environment(&expected)?;
-    if invariant_environment()
-        .iter()
-        .any(|(key, value)| std::env::var(key).ok().as_ref() != Some(value))
-    {
+    require_closed_environment_with_optional(additional, &[])?;
+    Ok(())
+}
+
+fn require_closed_environment_with_optional(
+    additional: &[&str],
+    optional: &[&str],
+) -> Result<BTreeSet<String>, HarnessError> {
+    let actual = std::env::vars_os()
+        .map(|(key, value)| {
+            key.into_string()
+                .map(|key| (key, value))
+                .map_err(|_| HarnessError::Invalid("environment key was not UTF-8"))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+    let mut required = ["CARGO_HOME", "HOME", "LC_ALL", "PATH", "RUSTUP_HOME", "TZ"]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    required.extend(additional.iter().copied());
+    let mut allowed = required.clone();
+    allowed.extend(optional.iter().copied());
+    allowed.extend(HOST_INJECTED_ENVIRONMENT_KEYS.iter().copied());
+    let actual_keys = actual.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if !required.is_subset(&actual_keys) || !actual_keys.is_subset(&allowed) {
+        return Err(HarnessError::Invalid("environment key set was not closed"));
+    }
+    if invariant_environment().iter().any(|(key, value)| {
+        actual
+            .get(key)
+            .and_then(|actual| actual.to_str())
+            .is_none_or(|actual| actual != value)
+    }) {
         return Err(HarnessError::Invalid("invariant environment mismatch"));
     }
-    Ok(())
+    let mut present = BTreeSet::new();
+    for key in optional {
+        if let Some(value) = actual.get(*key) {
+            if value != std::ffi::OsStr::new("1") {
+                return Err(HarnessError::Invalid(
+                    "optional environment value was invalid",
+                ));
+            }
+            present.insert((*key).to_owned());
+        }
+    }
+    Ok(present)
+}
+
+fn amended_legacy_mode(optional: &BTreeSet<String>) -> AmendedLegacyMode {
+    if optional.contains("HERDR_PERF_ACCEPT_AMENDED_LEGACY") {
+        AmendedLegacyMode::AcceptAmendedLegacy
+    } else {
+        AmendedLegacyMode::Off
+    }
 }
 
 #[cfg(target_os = "linux")]

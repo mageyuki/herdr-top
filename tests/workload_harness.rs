@@ -29,8 +29,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "workload-harness")]
 use std::sync::{Arc, Mutex};
 
-#[cfg(all(target_os = "linux", feature = "workload-harness"))]
-use herdr_top::activity::ActivityItem;
 #[cfg(feature = "workload-harness")]
 use herdr_top::activity::RestoredOperatorState;
 #[cfg(feature = "workload-harness")]
@@ -395,6 +393,9 @@ fn last_pre_origin_sample_ordinal(
     samples: &[WorkloadPerformanceSample],
     workload_origin_ns: u64,
 ) -> u64 {
+    // The producer primes a carry-in before choosing the origin, and the
+    // artifact validator requires exactly one pre-origin sample. Keep this
+    // fail-fast so a producer regression cannot silently weaken the anchor.
     samples
         .iter()
         .rev()
@@ -754,19 +755,25 @@ async fn run_schedule_through_real_queue_at(
                 .await
                 .expect("reference admission deadline must be reachable");
         } else {
-            let admitted_clock_ns = if injection
-                == PerformanceTrialInjection::SupportedLoadDegradation
-                && sequence == 1
-            {
+            let supported_load_shift_count = injection.supported_load_shift_count();
+            let admitted_clock_ns = if sequence <= supported_load_shift_count {
+                let shift_periods = supported_load_shift_count
+                    .checked_sub(sequence)
+                    .and_then(|remaining| remaining.checked_add(1))
+                    .expect("shifted admission sequence must have a positive displacement");
                 scheduled_ns
-                    .checked_add(duration_ns(workload::period(profile)))
+                    .checked_add(
+                        duration_ns(workload::period(profile))
+                            .checked_mul(shift_periods)
+                            .expect("degradation injection shift must fit u64"),
+                    )
                     .expect("degradation injection admission timestamp must fit u64")
             } else {
                 scheduled_ns
             };
-            if injection == PerformanceTrialInjection::SupportedLoadDegradation {
-                // Admission 1 intentionally lands on admission 2's scheduled base. Preserve that
-                // bucket while keeping every later admission strictly after prior raw samples.
+            if supported_load_shift_count > 0 {
+                // Every shifted admission lands on the first unshifted admission's scheduled
+                // base. Preserve that bucket while keeping later raw samples strictly ordered.
                 clock_ns
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                         if admitted_clock_ns > current {
@@ -811,10 +818,21 @@ async fn run_schedule_through_real_queue_at(
             .await
             .expect("the stable sixty-second reason must publish after admission 1,201");
         }
-        if injection == PerformanceTrialInjection::SupportedLoadDegradation && sequence == 101 {
+        let supported_load_shift_count = injection.supported_load_shift_count();
+        if supported_load_shift_count > 0 && sequence == 100 + supported_load_shift_count {
+            let expected_events_one_second = usize::try_from(100 + supported_load_shift_count)
+                .expect("supported-load injected event count must fit usize");
             tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
-                    if !performance_watch.borrow().snapshot.reasons.is_empty() {
+                    let injected_boundary_is_recorded = {
+                        let publication = performance_watch.borrow();
+                        publication.snapshot.events_one_second == expected_events_one_second
+                            && publication
+                                .snapshot
+                                .reasons
+                                .contains(&PerformanceDegradationReason::EventsOneSecond)
+                    };
+                    if injected_boundary_is_recorded {
                         break;
                     }
                     performance_watch
@@ -824,7 +842,7 @@ async fn run_schedule_through_real_queue_at(
                 }
             })
             .await
-            .expect("the truthful rolling-window breach must publish after admission 101");
+            .expect("the truthful rolling-window breach must publish at the injected boundary");
         }
         if probes.contains(&sequence) {
             pending_probes.push(sequence);
@@ -901,9 +919,9 @@ async fn run_schedule_through_real_queue_at(
                     && snapshot.completion_high_water == expected_high_water
                     && snapshot.pending_events == 0;
                 let has_expected_terminal_quality = match profile {
-                    WorkloadProfile::TargetBurst
-                        if injection == PerformanceTrialInjection::SupportedLoadDegradation =>
-                    {
+                    WorkloadProfile::TargetBurst if injection.supported_load_shift_count() > 0 => {
+                        // The rolling window drains by the final persisted generation. The
+                        // retained 101/102 breach sample determines the composed outcome below.
                         snapshot.reasons.is_empty()
                             && publication.effective_quality == ObservationQuality::Live
                     }
@@ -1285,7 +1303,19 @@ fn assert_real_queue_outcome_is_exact(result: &RealQueueResult, profile: Workloa
 enum PerformanceTrialInjection {
     None,
     SupportedLoadDegradation,
+    SupportedLoadBeyondTolerance,
     OmitRequiredRenderedReason,
+}
+
+#[cfg(feature = "workload-harness")]
+impl PerformanceTrialInjection {
+    fn supported_load_shift_count(self) -> u64 {
+        match self {
+            Self::SupportedLoadDegradation => 1,
+            Self::SupportedLoadBeyondTolerance => 2,
+            Self::None | Self::OmitRequiredRenderedReason => 0,
+        }
+    }
 }
 
 #[cfg(feature = "workload-harness")]
@@ -1547,8 +1577,10 @@ async fn run_final_performance_trial(
     let document = outcome.document_mut();
     document.trials[0].raw.performance_evidence_stream = Some(stream);
     let failure = match injection {
-        PerformanceTrialInjection::None => None,
-        PerformanceTrialInjection::SupportedLoadDegradation => {
+        PerformanceTrialInjection::None | PerformanceTrialInjection::SupportedLoadDegradation => {
+            None
+        }
+        PerformanceTrialInjection::SupportedLoadBeyondTolerance => {
             Some(FailureReasonV1::SupportedLoadDegradation)
         }
         PerformanceTrialInjection::OmitRequiredRenderedReason => {
@@ -1562,6 +1594,7 @@ async fn run_final_performance_trial(
             _ => panic!("synthetic final performance outcome must start as pass"),
         };
     }
+    assert_eq!(outcome.validate(), Ok(()));
     outcome = compose_final_performance_outcome(outcome);
     FinalPerformanceTrialResult {
         outcome,
@@ -1605,7 +1638,9 @@ async fn reference_profile_stream_selection_writes_valid_final_and_non_final_art
     let final_root = tempfile::tempdir().unwrap();
     let final_path = final_root.path().join("result-v1.json");
     atomic_write_reference_outcome(&final_path, &final_outcome).unwrap();
-    let written_final = read_and_validate_reference_outcome(&final_path).unwrap();
+    let written_final = read_and_validate_reference_outcome(&final_path, AmendedLegacyMode::Off)
+        .unwrap()
+        .outcome;
     assert!(
         written_final.document().trials[0]
             .raw
@@ -1624,7 +1659,10 @@ async fn reference_profile_stream_selection_writes_valid_final_and_non_final_art
     let baseline_root = tempfile::tempdir().unwrap();
     let baseline_path = baseline_root.path().join("result-v1.json");
     atomic_write_reference_outcome(&baseline_path, &baseline).unwrap();
-    let written_baseline = read_and_validate_reference_outcome(&baseline_path).unwrap();
+    let written_baseline =
+        read_and_validate_reference_outcome(&baseline_path, AmendedLegacyMode::Off)
+            .unwrap()
+            .outcome;
     assert!(
         written_baseline.document().trials[0]
             .raw
@@ -1771,7 +1809,7 @@ async fn supported_load_records_complete_live_performance_stream() {
 
 #[cfg(feature = "workload-harness")]
 #[tokio::test]
-async fn supported_load_truthful_degradation_is_a_valid_measured_failure() {
+async fn supported_load_one_quantum_degradation_is_tolerated_at_final_acceptance() {
     let result = run_final_performance_trial(
         WorkloadProfile::TargetBurst,
         PerformanceTrialInjection::SupportedLoadDegradation,
@@ -1785,6 +1823,79 @@ async fn supported_load_truthful_degradation_is_a_valid_measured_failure() {
         ),
         Ok(true)
     );
+    let stream = result.outcome.document().trials[0]
+        .raw
+        .performance_evidence_stream
+        .as_ref()
+        .unwrap();
+    let degraded = stream
+        .samples
+        .iter()
+        .filter(|sample| !sample.reasons.is_empty())
+        .collect::<Vec<_>>();
+    assert!(!degraded.is_empty());
+    assert!(
+        stream
+            .samples
+            .iter()
+            .all(|sample| { !sample.reasons.contains(&PerformanceReasonV1::EventLag) })
+    );
+    assert!(degraded.iter().all(|sample| tolerated_boundary_degradation(
+        MeasurementStageV1::Final,
+        ScenarioV1::Burst,
+        sample,
+        false,
+    )));
+    assert!(result.outcome.failure_reasons().is_empty());
+    assert_eq!(result.outcome.status(), ReferenceOutcomeStatusV1::Pass);
+    assert!(result.outcome.validate().is_ok());
+
+    let mut suite = [
+        ScenarioV1::Target,
+        ScenarioV1::Sustained,
+        ScenarioV1::Burst,
+        ScenarioV1::Startup,
+        ScenarioV1::Idle,
+        ScenarioV1::FallbackRescan,
+        ScenarioV1::TwiceTarget,
+    ]
+    .map(|scenario| synthetic_result(scenario, MeasurementStageV1::Final));
+    suite[2] = result.outcome;
+    assert_eq!(
+        classify_d4_checkpoint(&suite).unwrap(),
+        D4CheckpointDecisionV1::NoMissD4NotAuthorized {}
+    );
+}
+
+#[cfg(feature = "workload-harness")]
+#[tokio::test]
+async fn supported_load_beyond_tolerance_fails_final_through_real_queue() {
+    // Break caught: retaining only synthetic coverage for a real collector
+    // breach beyond Final's one-quantum Burst tolerance.
+    let result = run_final_performance_trial(
+        WorkloadProfile::TargetBurst,
+        PerformanceTrialInjection::SupportedLoadBeyondTolerance,
+    )
+    .await;
+    assert_eq!(
+        workload::admission_schedule_attained(
+            WorkloadProfile::TargetBurst,
+            result.workload_origin_ns,
+            &result.admission_observations,
+        ),
+        Ok(true)
+    );
+    let stream = result.outcome.document().trials[0]
+        .raw
+        .performance_evidence_stream
+        .as_ref()
+        .unwrap();
+    assert!(stream.samples.iter().any(|sample| {
+        sample.events_one_second == 102
+            && sample
+                .reasons
+                .contains(&PerformanceReasonV1::EventsOneSecond)
+    }));
     assert_eq!(
         result.outcome.failure_reasons(),
         [FailureReasonV1::SupportedLoadDegradation]
@@ -3317,10 +3428,20 @@ fn trial_controls_reject_relative_roots() {
         &mut noncanonical_absolute,
         "/a/../tmp/herdr-increment5/sustained/trial-0001",
     );
+    let mut noncanonical_curdir = valid_synthetic_result();
+    rewrite_roots(
+        &mut noncanonical_curdir,
+        "/tmp/./herdr-increment5/sustained/trial-0001",
+    );
 
     assert_eq!(
-        [relative.validate(), noncanonical_absolute.validate()],
         [
+            relative.validate(),
+            noncanonical_absolute.validate(),
+            noncanonical_curdir.validate(),
+        ],
+        [
+            Err(ResultError::InvalidArtifact),
             Err(ResultError::InvalidArtifact),
             Err(ResultError::InvalidArtifact),
         ]
@@ -3378,6 +3499,28 @@ fn trial_controls_reject_trial_local_control_socket() {
 
     assert_eq!(
         trial_local_socket.validate(),
+        Err(ResultError::InvalidArtifact)
+    );
+}
+
+#[test]
+fn trial_controls_reject_absolute_noncanonical_control_socket() {
+    // Break caught: `Path::components` normalizes `.` and must not make a
+    // noncanonical absolute recorder socket indistinguishable from its target.
+    let mut noncanonical_socket = valid_synthetic_result();
+    let socket = "/tmp/herdr-i5.synthetic/./sustained-trial-0001.sock".to_owned();
+    let trial = &mut noncanonical_socket.document_mut().trials[0];
+    trial.raw.child_controls.measured_environment.insert(
+        "HERDR_PERF_OBSERVER_CONTROL_SOCKET".to_owned(),
+        socket.clone(),
+    );
+    trial
+        .control_evidence
+        .observer_environment
+        .insert("HERDR_PERF_OBSERVER_CONTROL_SOCKET".to_owned(), socket);
+
+    assert_eq!(
+        noncanonical_socket.validate(),
         Err(ResultError::InvalidArtifact)
     );
 }
@@ -4431,6 +4574,766 @@ fn supported_load_stream_is_complete_live_and_non_degraded() {
         vec![FailureReasonV1::SupportedLoadDegradation]
     );
     assert!(degraded.validate().is_ok());
+}
+
+fn boundary_distribution(mut values: Vec<u64>) -> DistributionV1 {
+    values.sort_unstable();
+    DistributionV1 {
+        sample_count: values.len(),
+        minimum_ns: values[0],
+        median_ns: percentile(&values, 50).unwrap(),
+        p95_ns: percentile(&values, 95).unwrap(),
+        p99_ns: percentile(&values, 99).unwrap(),
+        maximum_ns: *values.last().unwrap(),
+    }
+}
+
+fn boundary_degradation_outcome(
+    events_one_second: u64,
+    extra_live_panes_reason: bool,
+    trial_event_lag: bool,
+    recorded_failure: bool,
+) -> ReferenceOutcomeV1 {
+    assert!(matches!(events_one_second, 101 | 102));
+    let mut outcome = valid_final_burst_result();
+    let trial = &mut outcome.document_mut().trials[0];
+    let origin = trial.raw.workload_origin_ns.unwrap();
+
+    let shifted = usize::try_from(events_one_second - 100).unwrap();
+    let mut shifted_terminals = Vec::with_capacity(shifted);
+    for offset in 0..shifted {
+        let index = 100 - shifted + offset;
+        let admitted_ns = origin + 1_000_000_000 + u64::try_from(offset + 1).unwrap();
+        trial.raw.admission_observations[index].admitted_ns = admitted_ns;
+        shifted_terminals.push((
+            trial.raw.admission_observations[index].sequence,
+            admitted_ns + 10_000_000,
+        ));
+    }
+    for observation in &mut trial.raw.screen_observations {
+        let admitted = trial.raw.admission_observations
+            [usize::try_from(observation.sequence - 1).unwrap()]
+        .admitted_ns;
+        observation.admitted_ns = admitted;
+        observation.observed_frame_phase_ns = (observation.rendered_ns - admitted) % 100_000_000;
+    }
+    trial.screen_update = Some(boundary_distribution(
+        trial
+            .raw
+            .screen_observations
+            .iter()
+            .map(|observation| observation.rendered_ns - observation.admitted_ns)
+            .collect(),
+    ));
+    trial.reducer_lag = Some(boundary_distribution(
+        trial
+            .raw
+            .screen_observations
+            .iter()
+            .map(|observation| observation.terminal_ns - observation.admitted_ns)
+            .collect(),
+    ));
+
+    let stream = trial.raw.performance_evidence_stream.as_mut().unwrap();
+    for (sequence, terminal_ns) in shifted_terminals {
+        stream
+            .terminal_observations
+            .iter_mut()
+            .find(|terminal| terminal.sequence == sequence)
+            .unwrap()
+            .terminal_ns = terminal_ns;
+    }
+    if trial_event_lag {
+        stream.terminal_observations[0].terminal_ns = origin + 1_900_000_000;
+    }
+    let mut closing_sample = stream.samples[1].clone();
+    let mut closing_frame = stream.frames[1].clone();
+    let mut samples = vec![stream.samples[0].clone()];
+    let mut frames = vec![stream.frames[0].clone()];
+
+    if trial_event_lag {
+        let lag_sample = PerformanceSampleEvidenceV1 {
+            sample_ordinal: 2,
+            sampled_at_ns: origin + 1_500_000_000,
+            event_lag_ns: 1_490_000_000,
+            pending_events: 2,
+            admission_high_water: 150,
+            completion_high_water: 149,
+            live_panes: 50,
+            default_visible_task_runs: 200,
+            dependency_edges: 1_000,
+            execution_edges: 199,
+            events_one_second: 100,
+            events_ten_seconds: 150,
+            events_sixty_seconds: 150,
+            source_quality: EffectiveQualityV1::Live,
+            effective_quality: EffectiveQualityV1::Degraded,
+            reasons: vec![PerformanceReasonV1::EventLag],
+        };
+        frames.push(PerformanceFrameEvidenceV1 {
+            draw_ordinal: 2,
+            sample_ordinal: 2,
+            state_observed_at_ns: lag_sample.sampled_at_ns,
+            rendered_at_ns: origin + 1_600_000_000,
+            effective_quality: EffectiveQualityV1::Degraded,
+            reasons: lag_sample.reasons.clone(),
+            rendered_header_line: "DEGRADED | perf:event_lag".to_owned(),
+        });
+        samples.push(lag_sample);
+    }
+
+    let boundary_ordinal = u64::try_from(samples.len() + 1).unwrap();
+    let mut reasons = vec![PerformanceReasonV1::EventsOneSecond];
+    let live_panes = if extra_live_panes_reason {
+        reasons.push(PerformanceReasonV1::LivePanes);
+        51
+    } else {
+        50
+    };
+    let boundary_sample = PerformanceSampleEvidenceV1 {
+        sample_ordinal: boundary_ordinal,
+        sampled_at_ns: origin + 2_000_000_000,
+        event_lag_ns: 0,
+        pending_events: 1,
+        admission_high_water: 200,
+        completion_high_water: 199,
+        live_panes,
+        default_visible_task_runs: 200,
+        dependency_edges: 1_000,
+        execution_edges: 199,
+        events_one_second,
+        events_ten_seconds: 200,
+        events_sixty_seconds: 200,
+        source_quality: EffectiveQualityV1::Live,
+        effective_quality: EffectiveQualityV1::Degraded,
+        reasons,
+    };
+    frames.push(PerformanceFrameEvidenceV1 {
+        draw_ordinal: boundary_ordinal,
+        sample_ordinal: boundary_ordinal,
+        state_observed_at_ns: boundary_sample.sampled_at_ns,
+        rendered_at_ns: origin + 2_100_000_000,
+        effective_quality: EffectiveQualityV1::Degraded,
+        reasons: boundary_sample.reasons.clone(),
+        rendered_header_line: if extra_live_panes_reason {
+            "DEGRADED | perf:events_1s,live_panes".to_owned()
+        } else {
+            "DEGRADED | perf:events_1s".to_owned()
+        },
+    });
+    samples.push(boundary_sample);
+
+    let closing_ordinal = u64::try_from(samples.len() + 1).unwrap();
+    closing_sample.sample_ordinal = closing_ordinal;
+    closing_frame.draw_ordinal = closing_ordinal;
+    closing_frame.sample_ordinal = closing_ordinal;
+    samples.push(closing_sample);
+    frames.push(closing_frame);
+    stream.samples = samples;
+    stream.frames = frames;
+    stream.next_sample_ordinal = closing_ordinal + 1;
+    stream.next_draw_ordinal = closing_ordinal + 1;
+
+    if recorded_failure {
+        outcome.document_mut().failure_reasons = vec![FailureReasonV1::SupportedLoadDegradation];
+        outcome = match outcome {
+            ReferenceOutcomeV1::Pass { document } => ReferenceOutcomeV1::Failed { document },
+            _ => unreachable!(),
+        };
+    }
+    outcome
+}
+
+#[test]
+fn final_boundary_degradation_at_101_is_tolerated_end_to_end() {
+    // Break caught: counting the one-quantum Final burst boundary sample as degradation.
+    let outcome = boundary_degradation_outcome(101, false, false, false);
+    let sample = &outcome.document().trials[0]
+        .raw
+        .performance_evidence_stream
+        .as_ref()
+        .unwrap()
+        .samples[1];
+    assert!(tolerated_boundary_degradation(
+        MeasurementStageV1::Final,
+        ScenarioV1::Burst,
+        sample,
+        false,
+    ));
+    assert!(tolerated_boundary_degradation(
+        MeasurementStageV1::Final,
+        ScenarioV1::Sustained,
+        sample,
+        false,
+    ));
+    assert!(!tolerated_boundary_degradation(
+        MeasurementStageV1::Baseline,
+        ScenarioV1::Burst,
+        sample,
+        false,
+    ));
+    assert!(!tolerated_boundary_degradation(
+        MeasurementStageV1::Final,
+        ScenarioV1::Target,
+        sample,
+        false,
+    ));
+    assert_eq!(outcome.validate(), Ok(()));
+}
+
+#[test]
+fn final_boundary_degradation_at_102_is_not_tolerated() {
+    // Break caught: broadening the one-quantum tolerance to two excess events.
+    let outcome = boundary_degradation_outcome(102, false, false, true);
+    let sample = &outcome.document().trials[0]
+        .raw
+        .performance_evidence_stream
+        .as_ref()
+        .unwrap()
+        .samples[1];
+    assert!(!tolerated_boundary_degradation(
+        MeasurementStageV1::Final,
+        ScenarioV1::Burst,
+        sample,
+        false,
+    ));
+    assert_eq!(
+        outcome.failure_reasons(),
+        [FailureReasonV1::SupportedLoadDegradation]
+    );
+    assert_eq!(outcome.validate(), Ok(()));
+}
+
+#[test]
+fn final_boundary_degradation_with_another_reason_is_not_tolerated() {
+    // Break caught: accepting EventsOneSecond when its reason set is not exact.
+    let outcome = boundary_degradation_outcome(101, true, false, false);
+    let sample = &outcome.document().trials[0]
+        .raw
+        .performance_evidence_stream
+        .as_ref()
+        .unwrap()
+        .samples[1];
+    assert!(!tolerated_boundary_degradation(
+        MeasurementStageV1::Final,
+        ScenarioV1::Burst,
+        sample,
+        false,
+    ));
+    assert_eq!(outcome.validate(), Err(ResultError::InvalidArtifact));
+}
+
+#[test]
+fn final_boundary_degradation_with_trial_event_lag_is_not_tolerated() {
+    // Break caught: tolerating the boundary sample despite an EventLag reason elsewhere.
+    let outcome = boundary_degradation_outcome(101, false, true, true);
+    let stream = outcome.document().trials[0]
+        .raw
+        .performance_evidence_stream
+        .as_ref()
+        .unwrap();
+    let sample = stream
+        .samples
+        .iter()
+        .find(|sample| sample.reasons == [PerformanceReasonV1::EventsOneSecond])
+        .unwrap();
+    assert!(
+        stream
+            .samples
+            .iter()
+            .any(|sample| { sample.reasons.contains(&PerformanceReasonV1::EventLag) })
+    );
+    assert!(!tolerated_boundary_degradation(
+        MeasurementStageV1::Final,
+        ScenarioV1::Burst,
+        sample,
+        true,
+    ));
+    assert_eq!(
+        outcome.failure_reasons(),
+        [FailureReasonV1::SupportedLoadDegradation]
+    );
+    assert!(outcome.validate().is_ok());
+}
+
+#[test]
+fn final_boundary_degradation_with_sample_event_lag_is_not_tolerated_standalone() {
+    // Break caught: the public helper omits the sample's own event-lag breach contract.
+    let mut outcome = boundary_degradation_outcome(101, false, false, false);
+    let sample = &mut outcome.document_mut().trials[0]
+        .raw
+        .performance_evidence_stream
+        .as_mut()
+        .unwrap()
+        .samples[1];
+    sample.event_lag_ns = 1_000_000_001;
+    assert_eq!(sample.reasons, [PerformanceReasonV1::EventsOneSecond]);
+
+    assert!(!tolerated_boundary_degradation(
+        MeasurementStageV1::Final,
+        ScenarioV1::Burst,
+        sample,
+        false,
+    ));
+}
+
+fn write_unvalidated_outcome(outcome: &ReferenceOutcomeV1) -> (tempfile::TempDir, PathBuf) {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("result-v1.json");
+    let mut bytes = serde_json::to_vec(outcome).unwrap();
+    bytes.push(b'\n');
+    std::fs::write(&path, bytes).unwrap();
+    (root, path)
+}
+
+fn clean_evidence_recorded_supported_load_failure(stage: MeasurementStageV1) -> ReferenceOutcomeV1 {
+    let outcome = synthetic_result(ScenarioV1::Burst, stage);
+    let ReferenceOutcomeV1::Pass { mut document } = outcome else {
+        unreachable!();
+    };
+    document.failure_reasons = vec![FailureReasonV1::SupportedLoadDegradation];
+    ReferenceOutcomeV1::Failed { document }
+}
+
+#[test]
+fn amended_legacy_reader_reclassifies_tolerated_supported_load_failure() {
+    // Break caught: the closing reader rejects a legacy failure made empty by the amendment.
+    let stored = boundary_degradation_outcome(101, false, false, true);
+    assert_eq!(stored.validate(), Err(ResultError::InvalidArtifact));
+    let (_root, path) = write_unvalidated_outcome(&stored);
+
+    let read =
+        read_and_validate_reference_outcome(&path, AmendedLegacyMode::AcceptAmendedLegacy).unwrap();
+
+    assert_eq!(read.outcome.status(), ReferenceOutcomeStatusV1::Pass);
+    assert!(read.outcome.failure_reasons().is_empty());
+    assert_eq!(read.outcome.validate(), Ok(()));
+    assert_eq!(
+        read.reclassified,
+        Some(ReclassificationRecordV1 {
+            scenario: ScenarioV1::Burst,
+            recorded_failure_reasons: vec![FailureReasonV1::SupportedLoadDegradation],
+        })
+    );
+}
+
+#[test]
+fn amended_legacy_reader_rejects_clean_final_evidence_with_recorded_degradation() {
+    // Break caught: promoting a mis-assembled failure with no tolerated degradation evidence.
+    let stored = clean_evidence_recorded_supported_load_failure(MeasurementStageV1::Final);
+    assert_eq!(stored.validate(), Err(ResultError::InvalidArtifact));
+    let (_root, path) = write_unvalidated_outcome(&stored);
+
+    assert!(
+        read_and_validate_reference_outcome(&path, AmendedLegacyMode::AcceptAmendedLegacy).is_err()
+    );
+}
+
+#[test]
+fn amended_legacy_reader_rejects_clean_baseline_evidence_with_recorded_degradation() {
+    // Break caught: applying the Final-only amendment to a Baseline artifact.
+    let stored = clean_evidence_recorded_supported_load_failure(MeasurementStageV1::Baseline);
+    assert_eq!(stored.validate(), Err(ResultError::InvalidArtifact));
+    let (_root, path) = write_unvalidated_outcome(&stored);
+
+    assert!(
+        read_and_validate_reference_outcome(&path, AmendedLegacyMode::AcceptAmendedLegacy).is_err()
+    );
+}
+
+#[test]
+fn amended_legacy_reader_keeps_still_derived_failure() {
+    // Break caught: reclassifying a 102-event sample whose failure still derives.
+    let stored = boundary_degradation_outcome(102, false, false, true);
+    assert_eq!(stored.validate(), Ok(()));
+    let (_root, path) = write_unvalidated_outcome(&stored);
+
+    let read =
+        read_and_validate_reference_outcome(&path, AmendedLegacyMode::AcceptAmendedLegacy).unwrap();
+
+    assert_eq!(read.outcome.status(), ReferenceOutcomeStatusV1::Failed);
+    assert_eq!(
+        read.outcome.failure_reasons(),
+        [FailureReasonV1::SupportedLoadDegradation]
+    );
+    assert_eq!(read.reclassified, None);
+}
+
+#[test]
+fn amended_legacy_reader_rejects_different_derived_failure_set() {
+    // Break caught: treating any legacy failure-set divergence as reclassifiable.
+    let mut stored = failed_outcome(
+        ScenarioV1::Burst,
+        MeasurementStageV1::Final,
+        FailureReasonV1::ScreenLatency,
+        100,
+        1_000,
+    );
+    stored.document_mut().failure_reasons = vec![FailureReasonV1::SupportedLoadDegradation];
+    let (_root, path) = write_unvalidated_outcome(&stored);
+
+    assert!(
+        read_and_validate_reference_outcome(&path, AmendedLegacyMode::AcceptAmendedLegacy,)
+            .is_err()
+    );
+}
+
+#[test]
+fn amended_legacy_reader_off_preserves_fail_closed_behavior() {
+    // Break caught: allowing ordinary readers to reclassify without explicit authority.
+    let stored = boundary_degradation_outcome(101, false, false, true);
+    let (_root, path) = write_unvalidated_outcome(&stored);
+
+    assert!(read_and_validate_reference_outcome(&path, AmendedLegacyMode::Off).is_err());
+}
+
+struct AmendedLegacyEntrypointFixture {
+    baseline_root: tempfile::TempDir,
+    final_root: tempfile::TempDir,
+}
+
+fn amended_legacy_entrypoint_fixture(legacy_burst: bool) -> AmendedLegacyEntrypointFixture {
+    let baseline_root = tempfile::tempdir().unwrap();
+    let final_root = tempfile::tempdir().unwrap();
+    for spec in &workload_schema().scenarios {
+        let mut baseline = synthetic_result(spec.scenario, MeasurementStageV1::Baseline);
+        let scenario_is_legacy_burst = legacy_burst && spec.scenario == ScenarioV1::Burst;
+        let mut final_outcome = if scenario_is_legacy_burst {
+            boundary_degradation_outcome(101, false, false, false)
+        } else {
+            synthetic_result(spec.scenario, MeasurementStageV1::Final)
+        };
+        let baseline_scenario_root = baseline_root.path().join(&spec.directory);
+        let final_scenario_root = final_root.path().join(&spec.directory);
+        write_synthetic_raw_scenario_root(&baseline_scenario_root, &mut baseline).unwrap();
+        write_synthetic_raw_scenario_root(&final_scenario_root, &mut final_outcome).unwrap();
+        if scenario_is_legacy_burst {
+            final_outcome.document_mut().failure_reasons =
+                vec![FailureReasonV1::SupportedLoadDegradation];
+            final_outcome = match final_outcome {
+                ReferenceOutcomeV1::Pass { document } => ReferenceOutcomeV1::Failed { document },
+                _ => unreachable!(),
+            };
+        }
+        atomic_write_reference_outcome(&baseline_scenario_root.join("result-v1.json"), &baseline)
+            .unwrap();
+        let mut bytes = serde_json::to_vec(&final_outcome).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(final_scenario_root.join("result-v1.json"), bytes).unwrap();
+    }
+    AmendedLegacyEntrypointFixture {
+        baseline_root,
+        final_root,
+    }
+}
+
+fn closed_entrypoint_environment(
+    additional: impl IntoIterator<Item = (String, String)>,
+) -> BTreeMap<String, String> {
+    let mut environment = BTreeMap::from([
+        ("CARGO_HOME".to_owned(), "/home/mageyuki/.cargo".to_owned()),
+        ("HOME".to_owned(), "/home/mageyuki".to_owned()),
+        ("LC_ALL".to_owned(), "C".to_owned()),
+        ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+        (
+            "RUSTUP_HOME".to_owned(),
+            "/home/mageyuki/.rustup".to_owned(),
+        ),
+        ("TZ".to_owned(), "UTC".to_owned()),
+    ]);
+    environment.extend(additional);
+    environment
+}
+
+fn run_closed_entrypoint(
+    name: &str,
+    environment: BTreeMap<String, String>,
+) -> std::process::Output {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--ignored", "--test-threads=1"])
+        .env_clear()
+        .envs(environment)
+        .output()
+        .unwrap()
+}
+
+fn reclassification_sidecar_path(output: &std::path::Path) -> PathBuf {
+    let mut path = output.as_os_str().to_os_string();
+    path.push(".reclassification.json");
+    path.into()
+}
+
+fn rederive_entrypoint_environment(
+    fixture: &AmendedLegacyEntrypointFixture,
+    output: &std::path::Path,
+    flag: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut additional = vec![
+        (
+            "HERDR_PERF_REDERIVE_BASELINE_RESULTS_ROOT".to_owned(),
+            fixture.baseline_root.path().to_string_lossy().into_owned(),
+        ),
+        (
+            "HERDR_PERF_REDERIVE_FINAL_RESULTS_ROOT".to_owned(),
+            fixture.final_root.path().to_string_lossy().into_owned(),
+        ),
+        (
+            "HERDR_PERF_REDERIVE_OUTPUT".to_owned(),
+            output.to_string_lossy().into_owned(),
+        ),
+    ];
+    if let Some(value) = flag {
+        additional.push((
+            "HERDR_PERF_ACCEPT_AMENDED_LEGACY".to_owned(),
+            value.to_owned(),
+        ));
+    }
+    closed_entrypoint_environment(additional)
+}
+
+fn classify_entrypoint_environment(
+    fixture: &AmendedLegacyEntrypointFixture,
+    output: &std::path::Path,
+    flag: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut additional = vec![
+        (
+            "HERDR_PERF_CLASSIFY_RESULTS_ROOT".to_owned(),
+            fixture.final_root.path().to_string_lossy().into_owned(),
+        ),
+        (
+            "HERDR_PERF_CLASSIFY_OUTPUT".to_owned(),
+            output.to_string_lossy().into_owned(),
+        ),
+    ];
+    if let Some(value) = flag {
+        additional.push((
+            "HERDR_PERF_ACCEPT_AMENDED_LEGACY".to_owned(),
+            value.to_owned(),
+        ));
+    }
+    closed_entrypoint_environment(additional)
+}
+
+fn expected_reclassification_sidecar() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "rule": "amended_legacy_v1",
+        "reclassified": [{
+            "scenario": "burst",
+            "recorded_failure_reasons": ["supported_load_degradation"],
+        }],
+    })
+}
+
+#[test]
+fn amended_legacy_entrypoints_reclassify_uniformly_and_write_sidecars() {
+    // Break caught: either closing consumer observes a different outcome or omits provenance.
+    let fixture = amended_legacy_entrypoint_fixture(true);
+    let outputs = tempfile::tempdir().unwrap();
+    let report_path = outputs.path().join("section15.json");
+    let checkpoint_path = outputs.path().join("checkpoint.json");
+
+    let rederive = run_closed_entrypoint(
+        "rederive_section15_report_from_results",
+        rederive_entrypoint_environment(&fixture, &report_path, Some("1")),
+    );
+    assert_eq!(rederive.status.code(), Some(0), "{rederive:?}");
+    assert!(rederive.stderr.is_empty(), "{rederive:?}");
+    let classify = run_closed_entrypoint(
+        "classify_d4_checkpoint_from_results",
+        classify_entrypoint_environment(&fixture, &checkpoint_path, Some("1")),
+    );
+    assert_eq!(classify.status.code(), Some(0), "{classify:?}");
+    assert!(classify.stderr.is_empty(), "{classify:?}");
+
+    let report: Section15ReDerivationV1 =
+        serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
+    assert_eq!(
+        report.validate_with_mode(AmendedLegacyMode::AcceptAmendedLegacy),
+        Ok(())
+    );
+    let burst = report
+        .scenarios
+        .iter()
+        .find(|scenario| scenario.scenario == ScenarioV1::Burst)
+        .unwrap();
+    assert_eq!(burst.final_status, ReferenceOutcomeStatusV1::Pass);
+    assert!(burst.final_failure_reasons.is_empty());
+    let checkpoint: D4CheckpointDocumentV1 =
+        serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    assert_eq!(
+        checkpoint.decision,
+        D4CheckpointDecisionV1::NoMissD4NotAuthorized {}
+    );
+
+    for sidecar in [
+        reclassification_sidecar_path(&report_path),
+        reclassification_sidecar_path(&checkpoint_path),
+    ] {
+        let actual: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(sidecar).unwrap()).unwrap();
+        assert_eq!(actual, expected_reclassification_sidecar());
+    }
+}
+
+fn assert_non_reclassified_entrypoint_outputs(
+    report_path: &std::path::Path,
+    checkpoint_path: &std::path::Path,
+) {
+    let report: Section15ReDerivationV1 =
+        serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+    assert_eq!(
+        report.validate_with_mode(AmendedLegacyMode::AcceptAmendedLegacy),
+        Ok(())
+    );
+    assert!(report.scenarios.iter().all(|scenario| {
+        scenario.final_status == ReferenceOutcomeStatusV1::Pass
+            && scenario.final_failure_reasons.is_empty()
+    }));
+    let checkpoint: D4CheckpointDocumentV1 =
+        serde_json::from_slice(&std::fs::read(checkpoint_path).unwrap()).unwrap();
+    assert_eq!(
+        checkpoint.decision,
+        D4CheckpointDecisionV1::NoMissD4NotAuthorized {}
+    );
+}
+
+#[test]
+fn amended_legacy_entrypoints_remove_stale_sidecars_when_nothing_reclassifies() {
+    // Break caught: preserving stale provenance after a non-reclassifying primary rewrite.
+    let fixture = amended_legacy_entrypoint_fixture(false);
+    let outputs = tempfile::tempdir().unwrap();
+    let report_path = outputs.path().join("section15.json");
+    let checkpoint_path = outputs.path().join("checkpoint.json");
+    for output in [&report_path, &checkpoint_path] {
+        std::fs::write(reclassification_sidecar_path(output), b"stale\n").unwrap();
+    }
+
+    let rederive = run_closed_entrypoint(
+        "rederive_section15_report_from_results",
+        rederive_entrypoint_environment(&fixture, &report_path, Some("1")),
+    );
+    assert_eq!(rederive.status.code(), Some(0), "{rederive:?}");
+    assert!(rederive.stderr.is_empty(), "{rederive:?}");
+    let classify = run_closed_entrypoint(
+        "classify_d4_checkpoint_from_results",
+        classify_entrypoint_environment(&fixture, &checkpoint_path, Some("1")),
+    );
+    assert_eq!(classify.status.code(), Some(0), "{classify:?}");
+    assert!(classify.stderr.is_empty(), "{classify:?}");
+
+    assert_non_reclassified_entrypoint_outputs(&report_path, &checkpoint_path);
+    assert!(!reclassification_sidecar_path(&report_path).exists());
+    assert!(!reclassification_sidecar_path(&checkpoint_path).exists());
+}
+
+#[test]
+fn amended_legacy_entrypoints_remove_sidecars_when_output_paths_are_reused() {
+    // Break caught: retaining provenance from the prior contents of a reused output path.
+    let legacy_fixture = amended_legacy_entrypoint_fixture(true);
+    let clean_fixture = amended_legacy_entrypoint_fixture(false);
+    let outputs = tempfile::tempdir().unwrap();
+    let report_path = outputs.path().join("section15.json");
+    let checkpoint_path = outputs.path().join("checkpoint.json");
+
+    let first_rederive = run_closed_entrypoint(
+        "rederive_section15_report_from_results",
+        rederive_entrypoint_environment(&legacy_fixture, &report_path, Some("1")),
+    );
+    assert_eq!(first_rederive.status.code(), Some(0), "{first_rederive:?}");
+    let first_classify = run_closed_entrypoint(
+        "classify_d4_checkpoint_from_results",
+        classify_entrypoint_environment(&legacy_fixture, &checkpoint_path, Some("1")),
+    );
+    assert_eq!(first_classify.status.code(), Some(0), "{first_classify:?}");
+    for output in [&report_path, &checkpoint_path] {
+        let actual: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(reclassification_sidecar_path(output)).unwrap())
+                .unwrap();
+        assert_eq!(actual, expected_reclassification_sidecar());
+    }
+
+    let second_rederive = run_closed_entrypoint(
+        "rederive_section15_report_from_results",
+        rederive_entrypoint_environment(&clean_fixture, &report_path, Some("1")),
+    );
+    assert_eq!(
+        second_rederive.status.code(),
+        Some(0),
+        "{second_rederive:?}"
+    );
+    assert!(second_rederive.stderr.is_empty(), "{second_rederive:?}");
+    let second_classify = run_closed_entrypoint(
+        "classify_d4_checkpoint_from_results",
+        classify_entrypoint_environment(&clean_fixture, &checkpoint_path, Some("1")),
+    );
+    assert_eq!(
+        second_classify.status.code(),
+        Some(0),
+        "{second_classify:?}"
+    );
+    assert!(second_classify.stderr.is_empty(), "{second_classify:?}");
+
+    assert_non_reclassified_entrypoint_outputs(&report_path, &checkpoint_path);
+    assert!(!reclassification_sidecar_path(&report_path).exists());
+    assert!(!reclassification_sidecar_path(&checkpoint_path).exists());
+}
+
+#[test]
+fn amended_legacy_entrypoints_reject_non_one_flag() {
+    // Break caught: treating a present non-1 flag as disabled instead of rejecting the process.
+    let fixture = amended_legacy_entrypoint_fixture(true);
+    let outputs = tempfile::tempdir().unwrap();
+    let report_path = outputs.path().join("invalid-flag-section15.json");
+    let checkpoint_path = outputs.path().join("invalid-flag-checkpoint.json");
+    let rederive = run_closed_entrypoint(
+        "rederive_section15_report_from_results",
+        rederive_entrypoint_environment(&fixture, &report_path, Some("0")),
+    );
+    let classify = run_closed_entrypoint(
+        "classify_d4_checkpoint_from_results",
+        classify_entrypoint_environment(&fixture, &checkpoint_path, Some("0")),
+    );
+    for (result, output) in [(rederive, report_path), (classify, checkpoint_path)] {
+        assert_eq!(result.status.code(), Some(20), "{result:?}");
+        assert!(
+            String::from_utf8_lossy(&result.stdout)
+                .contains("entrypoint error: Invalid(\"optional environment value was invalid\")"),
+            "{result:?}"
+        );
+        assert!(result.stderr.is_empty(), "{result:?}");
+        assert!(!output.exists());
+        assert!(!reclassification_sidecar_path(&output).exists());
+    }
+}
+
+#[test]
+fn amended_legacy_entrypoints_without_flag_preserve_fail_closed_behavior() {
+    // Break caught: implicitly enabling reclassification when the optional flag is absent.
+    let fixture = amended_legacy_entrypoint_fixture(true);
+    let outputs = tempfile::tempdir().unwrap();
+    let report_path = outputs.path().join("off-section15.json");
+    let checkpoint_path = outputs.path().join("off-checkpoint.json");
+    let rederive = run_closed_entrypoint(
+        "rederive_section15_report_from_results",
+        rederive_entrypoint_environment(&fixture, &report_path, None),
+    );
+    let classify = run_closed_entrypoint(
+        "classify_d4_checkpoint_from_results",
+        classify_entrypoint_environment(&fixture, &checkpoint_path, None),
+    );
+    for (result, output) in [(rederive, report_path), (classify, checkpoint_path)] {
+        assert_eq!(result.status.code(), Some(20), "{result:?}");
+        assert!(
+            String::from_utf8_lossy(&result.stdout)
+                .contains("entrypoint error: Invalid(\"stored outcome failed validation\")"),
+            "{result:?}"
+        );
+        assert!(result.stderr.is_empty(), "{result:?}");
+        assert!(!output.exists());
+        assert!(!reclassification_sidecar_path(&output).exists());
+    }
 }
 
 #[test]
@@ -6093,6 +6996,22 @@ fn section15_selected_evidence_is_reopened_and_rederived() {
 }
 
 #[test]
+fn section15_selected_paths_reject_absolute_noncanonical_spelling() {
+    // Break caught: `Path::components` normalizes `.` before the structural
+    // validator can observe it, despite the field promising canonical text.
+    let fixture = section15_fixture_from_final(&all_passes());
+    let mut report = fixture.report.clone();
+    let identity = &mut report.selected_results[0];
+    identity.canonical_raw_root = "/tmp/./x".to_owned();
+    identity.canonical_result_path = "/tmp/./x/result-v1.json".to_owned();
+
+    assert_eq!(
+        validate_section15_shape_for_test(&report),
+        Err(ResultError::InvalidArtifact)
+    );
+}
+
+#[test]
 fn section15_rederivation_schema_is_closed_complete_and_decision_owned() {
     let fixture = section15_fixture_from_final(&all_passes());
     let d4_fixture = section15_d4_fixture();
@@ -6412,8 +7331,9 @@ fn typed_reference_composer_owns_candidate_construction_and_atomic_finalization(
     assert!(outcome.validate().is_ok());
     assert!(atomic_write_reference_outcome(&output, &outcome).is_ok());
     assert_eq!(
-        read_and_validate_reference_outcome(&output)
+        read_and_validate_reference_outcome(&output, AmendedLegacyMode::Off)
             .unwrap()
+            .outcome
             .status(),
         ReferenceOutcomeStatusV1::Pass
     );
@@ -6580,8 +7500,9 @@ fn typed_reference_validator_owns_final_publication_and_status_mapping() {
     };
     assert_eq!(validate_reference_outcome_impl(&request).unwrap(), 0);
     assert_eq!(
-        read_and_validate_reference_outcome(&output)
+        read_and_validate_reference_outcome(&output, AmendedLegacyMode::Off)
             .unwrap()
+            .outcome
             .status(),
         ReferenceOutcomeStatusV1::Pass
     );
@@ -6598,9 +7519,13 @@ fn typed_reference_validator_owns_final_publication_and_status_mapping() {
         20
     );
     assert_eq!(
-        read_and_validate_reference_outcome(&fixture.output_path("result-v1.json"))
-            .unwrap()
-            .failure_reasons(),
+        read_and_validate_reference_outcome(
+            &fixture.output_path("result-v1.json"),
+            AmendedLegacyMode::Off,
+        )
+        .unwrap()
+        .outcome
+        .failure_reasons(),
         &[FailureReasonV1::InvalidArtifact]
     );
     assert!(!substituted_request.output.exists());
@@ -6639,8 +7564,9 @@ fn typed_reference_validator_owns_final_publication_and_status_mapping() {
             "malformed composer token must fail closed: {token}"
         );
         assert_eq!(
-            read_and_validate_reference_outcome(&malformed_request.output)
+            read_and_validate_reference_outcome(&malformed_request.output, AmendedLegacyMode::Off,)
                 .unwrap()
+                .outcome
                 .failure_reasons(),
             &[FailureReasonV1::InvalidArtifact]
         );
@@ -6686,7 +7612,9 @@ fn typed_reference_validator_owns_final_publication_and_status_mapping() {
             baseline_results_root: None,
         };
         let actual_code = validate_reference_outcome_impl(&matrix_request).unwrap();
-        let published = read_and_validate_reference_outcome(&output).unwrap();
+        let published = read_and_validate_reference_outcome(&output, AmendedLegacyMode::Off)
+            .unwrap()
+            .outcome;
         assert_eq!(
             published.status(),
             expected_status,
@@ -6727,8 +7655,9 @@ fn typed_reference_validator_owns_final_publication_and_status_mapping() {
                 20
             );
             assert_eq!(
-                read_and_validate_reference_outcome(&output)
+                read_and_validate_reference_outcome(&output, AmendedLegacyMode::Off)
                     .unwrap()
+                    .outcome
                     .failure_reasons(),
                 &[FailureReasonV1::CommandFailed]
             );
@@ -6764,8 +7693,9 @@ fn typed_reference_validator_owns_final_publication_and_status_mapping() {
             20
         );
         assert_eq!(
-            read_and_validate_reference_outcome(&output)
+            read_and_validate_reference_outcome(&output, AmendedLegacyMode::Off)
                 .unwrap()
+                .outcome
                 .failure_reasons(),
             &[FailureReasonV1::CommandFailed]
         );
@@ -6803,8 +7733,9 @@ fn typed_reference_validator_owns_final_publication_and_status_mapping() {
         20
     );
     assert_eq!(
-        read_and_validate_reference_outcome(&output)
+        read_and_validate_reference_outcome(&output, AmendedLegacyMode::Off)
             .unwrap()
+            .outcome
             .failure_reasons(),
         &[FailureReasonV1::CommandFailed]
     );
@@ -6818,8 +7749,9 @@ fn typed_reference_validator_owns_final_publication_and_status_mapping() {
         20
     );
     assert_eq!(
-        read_and_validate_reference_outcome(&output)
+        read_and_validate_reference_outcome(&output, AmendedLegacyMode::Off)
             .unwrap()
+            .outcome
             .failure_reasons(),
         &[FailureReasonV1::InvalidArtifact]
     );
@@ -7121,6 +8053,35 @@ esac"#;
         source_fixture_command(&runner, &tools, attempt_id, fixture_argv)
             .output()
             .unwrap()
+    }
+
+    pub fn wait_for_source_fixture_exit(
+        attempt_id: Option<&str>,
+        fixture_argv: &[String],
+        budget: Duration,
+    ) -> std::process::ExitStatus {
+        let runner = identity(&runner_script());
+        let tools = fixture_tools();
+        let mut command = source_fixture_command(&runner, &tools, attempt_id, fixture_argv);
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = command.spawn().unwrap();
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let status = child.wait().unwrap();
+                panic!(
+                    "source fixture did not publish a reaped exit status within {budget:?}: {status:?}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     pub fn assert_runner_outcome(path: &Path, exit_code: i32) -> RunnerTestOutcomeV1 {
@@ -7482,7 +8443,9 @@ fn source_fixture_revalidates_identity_before_every_use() {
     // Break caught: a successful first identity check must not cache trust
     // across a later requested-path mutation.
     let temporary = tempfile::tempdir().unwrap();
-    let env_alias = temporary.path().join("env-alias");
+    let tool_root = temporary.path().join("tool");
+    std::fs::create_dir(&tool_root).unwrap();
+    let env_alias = tool_root.join("env");
     symlink("/usr/bin/env", &env_alias).unwrap();
     let marker = temporary.path().join("mutation-ran");
     let mutator = temporary.path().join("mutator.sh");
@@ -7683,8 +8646,7 @@ fn runner_fixture_reaps_timeout_and_signal_groups() {
         let groups = temporary.path().join("groups.txt");
         let status = temporary.path().join("trial-status");
         let trap_marker = temporary.path().join("trap-marker");
-        let started = std::time::Instant::now();
-        let output = support::run_source_fixture(
+        let exit_status = support::wait_for_source_fixture_exit(
             Some("00000001"),
             &[
                 "orchestration".to_owned(),
@@ -7696,12 +8658,9 @@ fn runner_fixture_reaps_timeout_and_signal_groups() {
                 observer.to_string_lossy().into_owned(),
                 trap_marker.to_string_lossy().into_owned(),
             ],
+            Duration::from_secs(120),
         );
-        assert!(
-            started.elapsed() < Duration::from_secs(60),
-            "case={case} waited for a natural child exit instead of bounded cleanup"
-        );
-        assert_eq!(output.status.code(), Some(20), "case={case}: {output:?}");
+        assert_eq!(exit_status.code(), Some(20), "case={case}: {exit_status:?}");
         assert_eq!(
             trap_marker.is_file(),
             expect_trap_marker,
@@ -7747,6 +8706,91 @@ fn runner_fixture_reaps_timeout_and_signal_groups() {
         serde_json::from_slice(&std::fs::read(&outcome).unwrap()).unwrap();
     assert_eq!(reported.exit_code, 20);
     assert!(!reported.all_process_groups_reaped);
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn orchestration_signal_traps_are_self_contained_across_reexec() {
+    use reference_runner_test_support as support;
+    use std::process::{Command, Stdio};
+
+    // Break caught: a trap body calls a shell function that is absent after a
+    // fresh protected Bash re-exec, so the shell reports the intended status
+    // without executing the trap marker publication. The ready marker also
+    // prevents the test from signalling before the re-exec installed its trap.
+    let temporary = tempfile::tempdir().unwrap();
+    let marker = temporary.path().join("trap-marker");
+    let ready = temporary.path().join("trap-ready");
+    let mut child = Command::new("/usr/bin/bash")
+        .env_clear()
+        .args([
+            "-p",
+            "-c",
+            r#"set -euo pipefail
+source "$1"
+marker=$2
+ready=$3
+trap_command=$(install_orchestration_signal_traps; trap -p HUP)
+export HERDR_PERF_RUNNER_TEST_TRAP_MARKER=$marker
+exec /usr/bin/bash -p -c \
+  "$trap_command"$'\n''builtin printf "%s\n" "$BASHPID" >"$1"; while :; do :; done' \
+  herdr-i5-trap-reexec-child "$ready""#,
+            "herdr-i5-trap-reexec",
+        ])
+        .arg(support::runner_script())
+        .arg(&marker)
+        .arg(&ready)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let readiness_deadline = std::time::Instant::now() + Duration::from_secs(300);
+    let expected_ready = format!("{}\n", child.id());
+    loop {
+        match std::fs::read_to_string(&ready) {
+            Ok(published) if published == expected_ready => break,
+            Ok(published) if published.ends_with('\n') => {
+                let _ = child.kill();
+                let status = child.wait().unwrap();
+                panic!(
+                    "re-exec published the wrong signal target {published:?}, expected {expected_ready:?}: {status:?}"
+                );
+            }
+            Ok(_) | Err(_) => {}
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("re-exec exited before publishing trap readiness: {status:?}");
+        }
+        if std::time::Instant::now() >= readiness_deadline {
+            let _ = child.kill();
+            let status = child.wait().unwrap();
+            panic!("re-exec did not publish trap readiness before deadline: {status:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGHUP) },
+        0,
+        "failed to signal ready re-exec: {}",
+        std::io::Error::last_os_error()
+    );
+    let exit_deadline = std::time::Instant::now() + Duration::from_secs(300);
+    let settled_status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= exit_deadline {
+            let _ = child.kill();
+            let status = child.wait().unwrap();
+            panic!("signalled re-exec did not settle before deadline: {status:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(settled_status.code(), Some(143), "{settled_status:?}");
+    assert!(marker.is_file(), "trap marker was not published");
 }
 
 #[cfg(all(target_os = "linux", feature = "workload-harness"))]
@@ -8239,8 +9283,9 @@ fn runner_fixture_aggregates_closed_statuses_and_promotes_atomically() {
         };
         assert_eq!(validate_reference_outcome_impl(&request).unwrap(), 20);
         assert_eq!(
-            read_and_validate_reference_outcome(&output)
+            read_and_validate_reference_outcome(&output, AmendedLegacyMode::Off)
                 .unwrap()
+                .outcome
                 .failure_reasons(),
             &[FailureReasonV1::CommandFailed]
         );
@@ -8365,7 +9410,7 @@ fn source_fixture_inventory_is_portable_and_role_closed() {
         });
         mutations.push(extra);
         let mut workstation = make_tools();
-        workstation[0].requested = PathBuf::from("/home/mageyuki/.cargo/bin/rustup");
+        workstation[0].requested = PathBuf::from("/home/mageyuki/.herdr-i5-task7-absent/env");
         mutations.push(workstation);
 
         for (index, tools) in mutations.iter().enumerate() {
@@ -8382,9 +9427,322 @@ fn source_fixture_inventory_is_portable_and_role_closed() {
                     .output()
                     .unwrap();
             assert_eq!(rejected.status.code(), Some(20), "{case} mutation {index}");
+            if index == 3 {
+                assert_eq!(
+                    String::from_utf8(rejected.stderr).unwrap(),
+                    "error: source fixture tool used a workstation path\n"
+                );
+            }
             assert!(!marker.exists());
         }
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn source_fixture_tool_paths_are_role_bound_and_fail_closed() {
+    use reference_runner_test_support as support;
+
+    // Break caught: substituting an unrelated executable, accepting a
+    // non-absolute path, or deriving trust from an absent/non-executable tool.
+    let temporary = tempfile::tempdir().unwrap();
+    let non_executable_parent = temporary.path().join("non-executable");
+    std::fs::create_dir(&non_executable_parent).unwrap();
+    let non_executable = non_executable_parent.join("env");
+    std::fs::write(&non_executable, b"not executable\n").unwrap();
+    let absent = temporary.path().join("absent").join("env");
+    let rows = [
+        (
+            "wrong-but-plausible substitution",
+            PathBuf::from("/usr/bin/true"),
+            "error: source fixture tool basename disagreed with role\n",
+        ),
+        (
+            "relative path",
+            PathBuf::from("env"),
+            "error: requested tool path was not absolute\n",
+        ),
+        (
+            "absent path",
+            absent,
+            "error: tool canonicalization failed\n",
+        ),
+        (
+            "non-executable path",
+            non_executable,
+            "error: tool was not a regular executable\n",
+        ),
+    ];
+    let runner = support::identity(&support::runner_script());
+
+    for (case, requested, expected_stderr) in rows {
+        let mut tools = support::fixture_tools();
+        tools[0].requested = requested;
+        let marker = temporary.path().join(format!("{case}.json"));
+        let rejected = support::source_fixture_command(
+            &runner,
+            &tools,
+            Some("00000001"),
+            &[
+                "orchestration".to_owned(),
+                "attempt-check".to_owned(),
+                marker.to_string_lossy().into_owned(),
+            ],
+        )
+        .output()
+        .unwrap();
+        assert_eq!(rejected.status.code(), Some(20), "{case}: {rejected:?}");
+        assert_eq!(
+            String::from_utf8(rejected.stderr).unwrap(),
+            expected_stderr,
+            "{case}"
+        );
+        assert!(!marker.exists(), "{case}");
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn runner_control_recorder_applies_socket_shape_predicate() {
+    use reference_runner_test_support as support;
+
+    // Break caught: the recorder accepts a socket spelling that the runner and
+    // closing validator refuse.
+    let temporary = tempfile::tempdir().unwrap();
+    let rejected_outcome = temporary.path().join("rejected.json");
+    let rejected = support::run_source_fixture(
+        Some("00000001"),
+        &[
+            "orchestration".to_owned(),
+            "socket-shape".to_owned(),
+            rejected_outcome.to_string_lossy().into_owned(),
+            "/tmp/not-herdr/socket".to_owned(),
+        ],
+    );
+    assert_eq!(rejected.status.code(), Some(20));
+    assert!(!rejected_outcome.exists());
+
+    let accepted_outcome = temporary.path().join("accepted.json");
+    let accepted = support::run_source_fixture(
+        Some("00000001"),
+        &[
+            "orchestration".to_owned(),
+            "socket-shape".to_owned(),
+            accepted_outcome.to_string_lossy().into_owned(),
+            "/tmp/herdr-i5.12345678/b-t0001.sock".to_owned(),
+        ],
+    );
+    assert_eq!(accepted.status.code(), Some(0), "{accepted:?}");
+    support::assert_runner_outcome(&accepted_outcome, 0);
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+fn assert_fixture_write_refuses_node(site: &str, node: &str) {
+    use reference_runner_test_support as support;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, symlink};
+
+    let temporary = tempfile::tempdir().unwrap();
+    let destination = temporary.path().join("destination");
+    let target = temporary.path().join("target");
+    let mut fifo_guard = None;
+    let expected_stderr = match node {
+        "symlink" => {
+            std::fs::write(&target, b"preserve\n").unwrap();
+            symlink(&target, &destination).unwrap();
+            "error: fixture output path is a symbolic link\n"
+        }
+        "fifo" => {
+            let path = CString::new(destination.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            if site == "trap-marker" {
+                fifo_guard = Some(
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&destination)
+                        .unwrap(),
+                );
+            }
+            "error: fixture output path is a FIFO\n"
+        }
+        _ => panic!("unknown fixture node kind"),
+    };
+    let output = support::run_source_fixture(
+        Some("00000001"),
+        &[
+            "orchestration".to_owned(),
+            "fixture-output-guard".to_owned(),
+            site.to_owned(),
+            destination.to_string_lossy().into_owned(),
+        ],
+    );
+    drop(fifo_guard);
+    assert_eq!(output.status.code(), Some(20), "{site}/{node}: {output:?}");
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        expected_stderr,
+        "{site}/{node}"
+    );
+    if node == "symlink" {
+        assert_eq!(std::fs::read(&target).unwrap(), b"preserve\n");
+    } else {
+        assert!(
+            std::fs::symlink_metadata(&destination)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn fixture_output_validator_refuses_symlink() {
+    assert_fixture_write_refuses_node("validator", "symlink");
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn fixture_output_validator_refuses_fifo() {
+    assert_fixture_write_refuses_node("validator", "fifo");
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn runner_test_outcome_publisher_refuses_symlink() {
+    assert_fixture_write_refuses_node("runner-outcome", "symlink");
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn runner_test_outcome_publisher_refuses_fifo() {
+    assert_fixture_write_refuses_node("runner-outcome", "fifo");
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn trial_status_publisher_refuses_symlink() {
+    assert_fixture_write_refuses_node("trial-status", "symlink");
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn trial_status_publisher_refuses_fifo() {
+    assert_fixture_write_refuses_node("trial-status", "fifo");
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn orchestration_trap_marker_refuses_symlink() {
+    assert_fixture_write_refuses_node("trap-marker", "symlink");
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn orchestration_trap_marker_refuses_fifo() {
+    assert_fixture_write_refuses_node("trap-marker", "fifo");
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn outer_trap_identity_window_is_single_command() {
+    use reference_runner_test_support as support;
+
+    // Break caught: a signal between runtime-directory creation and identity
+    // capture leaves an unowned directory that the outer trap cannot remove.
+    let temporary = tempfile::tempdir().unwrap();
+    let capture = temporary.path().join("identity-window");
+    let output = support::run_source_fixture(
+        Some("00000001"),
+        &[
+            "orchestration".to_owned(),
+            "outer-identity-window".to_owned(),
+            capture.to_string_lossy().into_owned(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(20), "{output:?}");
+    assert_eq!(
+        std::str::from_utf8(&output.stderr).unwrap(),
+        "error: child status was outside the closed set\n",
+        "{output:?}"
+    );
+    let captured = std::fs::read_to_string(capture).unwrap();
+    let (directory, identity) = captured.trim_end().split_once(' ').unwrap();
+    assert_eq!(identity.split(':').count(), 5);
+    assert!(!PathBuf::from(directory).exists());
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn outer_trap_group_publication_is_atomic() {
+    use reference_runner_test_support as support;
+
+    // Break caught: interruption while replacing the outer state exposes a
+    // truncated mixture of measured/observer group identifiers.
+    let temporary = tempfile::tempdir().unwrap();
+    let capture = temporary.path().join("group-publication");
+    let state_capture = temporary.path().join("settled-state");
+    let output = support::run_source_fixture(
+        Some("00000001"),
+        &[
+            "orchestration".to_owned(),
+            "outer-group-publication".to_owned(),
+            capture.to_string_lossy().into_owned(),
+            state_capture.to_string_lossy().into_owned(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(20), "{output:?}");
+    assert_eq!(std::fs::read_to_string(state_capture).unwrap(), "- - -\n");
+    let directory = std::fs::read_to_string(capture).unwrap();
+    assert!(!PathBuf::from(directory.trim_end()).exists());
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn publisher_temp_never_blocks_rmdir() {
+    use reference_runner_test_support as support;
+
+    // Break caught: an interrupted `.outer-state.tmp.*` publisher artifact
+    // survives state cleanup and makes the identity-checked rmdir fail.
+    let temporary = tempfile::tempdir().unwrap();
+    let capture = temporary.path().join("publisher-temp");
+    let output = support::run_source_fixture(
+        Some("00000001"),
+        &[
+            "orchestration".to_owned(),
+            "publisher-temp-cleanup".to_owned(),
+            capture.to_string_lossy().into_owned(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(20), "{output:?}");
+    let directory = std::fs::read_to_string(capture).unwrap();
+    assert!(!PathBuf::from(directory.trim_end()).exists());
+}
+
+#[cfg(all(target_os = "linux", feature = "workload-harness"))]
+#[test]
+fn orchestration_wait_is_deadline_bounded() {
+    use reference_runner_test_support as support;
+
+    // Break caught: cleanup waits forever for an orchestration child that
+    // never exits or signals after the scenario supervisor fires.
+    let temporary = tempfile::tempdir().unwrap();
+    let outcome = temporary.path().join("deadline-outcome.json");
+    let started = std::time::Instant::now();
+    let output = support::run_source_fixture(
+        Some("00000001"),
+        &[
+            "orchestration".to_owned(),
+            "orchestration-deadline".to_owned(),
+            outcome.to_string_lossy().into_owned(),
+        ],
+    );
+    assert!(started.elapsed() < Duration::from_secs(30), "{output:?}");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    support::assert_runner_outcome(&outcome, 0);
 }
 
 #[cfg(all(target_os = "linux", feature = "workload-harness"))]
@@ -8865,7 +10223,9 @@ fn validate_reference_baseline_set_from_environment() -> Result<(), HarnessError
     ] {
         let outcome = read_and_validate_reference_outcome(
             &canonical_root.join(mapped).join("result-v1.json"),
-        )?;
+            AmendedLegacyMode::Off,
+        )?
+        .outcome;
         let document = match outcome {
             ReferenceOutcomeV1::Pass { document } | ReferenceOutcomeV1::Failed { document } => {
                 document
@@ -9149,17 +10509,6 @@ struct ReferenceStartupHelperV1 {
 }
 
 #[cfg(all(target_os = "linux", feature = "workload-harness"))]
-fn compare_reference_activity(left: &ActivityItem, right: &ActivityItem) -> std::cmp::Ordering {
-    right
-        .event_timestamp_ms
-        .cmp(&left.event_timestamp_ms)
-        .then_with(|| right.seen_at_ms.cmp(&left.seen_at_ms))
-        .then_with(|| right.ingest_seq.is_some().cmp(&left.ingest_seq.is_some()))
-        .then_with(|| right.ingest_seq.cmp(&left.ingest_seq))
-        .then_with(|| right.identity.event_id.cmp(&left.identity.event_id))
-}
-
-#[cfg(all(target_os = "linux", feature = "workload-harness"))]
 fn run_reference_startup_helper(
     root: &StateRoot,
     output: &std::path::Path,
@@ -9216,12 +10565,10 @@ fn reference_profile_startup_restore_helper() {
     let expected_activity_count =
         usize::try_from(workload_schema().operator_activity_limit).unwrap();
     assert_eq!(operator.activity.len(), expected_activity_count);
-    assert!(
-        operator
-            .activity
-            .windows(2)
-            .all(|pair| compare_reference_activity(&pair[0], &pair[1]) == std::cmp::Ordering::Less)
-    );
+    assert!(operator.activity.windows(2).all(|pair| {
+        herdr_top::operator::workload_compare_activity(&pair[0], &pair[1])
+            == std::cmp::Ordering::Less
+    }));
     assert_eq!(
         operator
             .activity
@@ -9520,19 +10867,30 @@ async fn reference_profile_entrypoint() {
 #[cfg(all(target_os = "linux", feature = "workload-harness"))]
 #[test]
 fn reference_profile_entrypoint_source_uses_performance_stream_selector() {
+    const HELPER_DECL: &str = "fn reference_profile_performance_stream(";
     const START: &str = "async fn reference_profile_entrypoint_impl()";
     const END: &str =
         "\n#[cfg(all(target_os = \"linux\", feature = \"workload-harness\"))]\n#[tokio::test]";
+    const GUARD_DECL: &str =
+        "fn reference_profile_entrypoint_source_uses_performance_stream_selector()";
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file!());
     let source = std::fs::read_to_string(path).expect("workload harness source should be readable");
+    let helper_decl = source
+        .find(HELPER_DECL)
+        .expect("performance stream helper declaration should exist");
     let start = source
         .find(START)
         .expect("entrypoint declaration should exist");
     let entrypoint = &source[start..];
-    let end = entrypoint
-        .find(END)
-        .expect("entrypoint boundary should exist");
-    assert!(entrypoint[..end].contains("reference_profile_performance_stream("));
+    let end = start
+        + entrypoint
+            .find(END)
+            .expect("entrypoint boundary should exist");
+    let guard_decl = source
+        .find(GUARD_DECL)
+        .expect("source marker guard declaration should exist");
+    assert!(helper_decl < start && start < end && end < guard_decl);
+    assert!(source[start..end].contains("reference_profile_performance_stream("));
 }
 
 #[cfg(target_os = "linux")]
@@ -9723,10 +11081,20 @@ fn fixture_nested_observer_helper() {
     }
 }
 
+fn report_entrypoint_error(error: &impl std::fmt::Debug) {
+    // libtest captures `println!` output and `std::process::exit` discards
+    // that buffer, so write straight to the process stdout handle.
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout();
+    let _ = writeln!(stdout, "entrypoint error: {error:?}");
+    let _ = stdout.flush();
+}
+
 #[test]
 #[ignore = "authoritative classification requires explicit result roots"]
 fn classify_d4_checkpoint_from_results() {
-    if classify_d4_checkpoint_from_environment().is_err() {
+    if let Err(error) = classify_d4_checkpoint_from_environment() {
+        report_entrypoint_error(&error);
         std::process::exit(20);
     }
 }
@@ -9734,7 +11102,8 @@ fn classify_d4_checkpoint_from_results() {
 #[test]
 #[ignore = "authoritative Section 15 re-derivation requires explicit result roots"]
 fn rederive_section15_report_from_results() {
-    if rederive_section15_report_from_environment().is_err() {
+    if let Err(error) = rederive_section15_report_from_environment() {
+        report_entrypoint_error(&error);
         std::process::exit(20);
     }
 }
@@ -9752,7 +11121,10 @@ fn compose_reference_outcome_from_raw() {
     match compose_reference_outcome_from_environment() {
         Ok(0) => {}
         Ok(code) => std::process::exit(code),
-        Err(_) => std::process::exit(20),
+        Err(error) => {
+            report_entrypoint_error(&error);
+            std::process::exit(20);
+        }
     }
 }
 
@@ -9762,7 +11134,10 @@ fn validate_reference_outcome() {
     match validate_reference_outcome_from_environment() {
         Ok(0) => {}
         Ok(code) => std::process::exit(code),
-        Err(_) => std::process::exit(20),
+        Err(error) => {
+            report_entrypoint_error(&error);
+            std::process::exit(20);
+        }
     }
 }
 
@@ -9770,7 +11145,8 @@ fn validate_reference_outcome() {
 #[test]
 #[ignore = "native runner validates the selected baseline root before trials"]
 fn validate_reference_baseline_set() {
-    if validate_reference_baseline_set_from_environment().is_err() {
+    if let Err(error) = validate_reference_baseline_set_from_environment() {
+        report_entrypoint_error(&error);
         std::process::exit(20);
     }
 }

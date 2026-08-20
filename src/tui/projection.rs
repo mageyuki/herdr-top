@@ -826,6 +826,7 @@ mod tests {
             owner: OwnerFreshness::Current,
             persistence_counters: PersistenceCounters::default(),
             controller_counters: ControllerCounterSnapshot::default(),
+            enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
             source_coverage: Vec::new(),
             dangling_announcement_components: 7,
             first_failure_log: OccurrenceLogStatus::NotAttempted,

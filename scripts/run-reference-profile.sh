@@ -121,11 +121,31 @@ validate_output_containment() {
   return 0
 }
 
+guard_fixture_output_node() {
+  [[ $# -eq 1 ]] || return 20
+  local output=$1
+  if [[ -L $output ]]; then
+    builtin printf '%s\n' 'error: fixture output path is a symbolic link' >&2
+    return 20
+  fi
+  if [[ -p $output ]]; then
+    builtin printf '%s\n' 'error: fixture output path is a FIFO' >&2
+    return 20
+  fi
+}
+
 validate_fixture_output_path() {
   [[ $# -eq 1 ]] || return 20
   local output=$1
   [[ $output == /* && ${output##*/} != result-v1.json ]] || return 20
-  [[ ! -e $output && ! -L $output ]] || return 20
+  guard_fixture_output_node "$output" || return 20
+  [[ ! -e $output ]] || return 20
+}
+
+runtime_socket_path_has_shape() {
+  [[ $# -eq 1 ]] || return 20
+  local socket_path=$1
+  [[ $socket_path == /tmp/herdr-i5.????????/*.sock && ${#socket_path} -le 107 ]]
 }
 
 publish_runner_test_outcome() {
@@ -138,7 +158,7 @@ publish_runner_test_outcome() {
   case "$status" in 0|10|20) ;; *) return 20 ;; esac
   case "$reaped" in true|false) ;; *) return 20 ;; esac
   temporary="${output}.tmp.${BASHPID}"
-  [[ ! -e $temporary && ! -L $temporary ]] || return 20
+  validate_fixture_output_path "$temporary" || return 20
   builtin printf \
     '{"schema_version":1,"non_authoritative":true,"exit_code":%s,"all_process_groups_reaped":%s}\n' \
     "$status" "$reaped" >"$temporary" || return 20
@@ -159,10 +179,9 @@ publish_trial_status() {
        [[ $herdr_i5_injected_status == "${herdr_i5_injected_status#0}" ]] || return 20
        herdr_i5_injected_token="failed:$herdr_i5_injected_status" ;;
   esac
-  [[ $herdr_i5_injected_output == /* && ${herdr_i5_injected_output##*/} != result-v1.json ]] || return 20
-  [[ ! -e $herdr_i5_injected_output && ! -L $herdr_i5_injected_output ]] || return 20
+  validate_fixture_output_path "$herdr_i5_injected_output" || return 20
   herdr_i5_injected_temporary="${herdr_i5_injected_output}.tmp.${BASHPID}"
-  [[ ! -e $herdr_i5_injected_temporary && ! -L $herdr_i5_injected_temporary ]] || return 20
+  validate_fixture_output_path "$herdr_i5_injected_temporary" || return 20
   builtin printf '%s\n' "$herdr_i5_injected_token" >"$herdr_i5_injected_temporary" || return 20
   "$herdr_i5_injected_mv_executable" -T -- \
     "$herdr_i5_injected_temporary" "$herdr_i5_injected_output"
@@ -180,10 +199,14 @@ publish_outer_runtime_state() {
   [[ $herdr_i5_injected_measured == - || $herdr_i5_injected_measured =~ ^[1-9][0-9]*$ ]] || return 20
   [[ $herdr_i5_injected_observer == - || $herdr_i5_injected_observer =~ ^[1-9][0-9]*$ ]] || return 20
   [[ $herdr_i5_injected_socket_identity == - || $herdr_i5_injected_socket_identity == *:*:*:*:* ]] || return 20
-  [[ ! -L $herdr_i5_injected_output && ! -e $herdr_i5_injected_temporary && ! -L $herdr_i5_injected_temporary ]] || return 20
+  guard_fixture_output_node "$herdr_i5_injected_output" || return 20
+  validate_fixture_output_path "$herdr_i5_injected_temporary" || return 20
   builtin printf '%s %s %s\n' "$herdr_i5_injected_measured" \
     "$herdr_i5_injected_observer" "$herdr_i5_injected_socket_identity" \
     >"$herdr_i5_injected_temporary" || return 20
+  if [[ ${herdr_i5_interrupt_group_publication-} == true ]]; then
+    builtin kill -TERM "$BASHPID" || return 20
+  fi
   "$herdr_i5_injected_mv_executable" -T -- \
     "$herdr_i5_injected_temporary" "$herdr_i5_injected_output"
 }
@@ -291,18 +314,90 @@ wait_process_pair() {
     "$herdr_i5_injected_measured_status" "$herdr_i5_injected_observer_status" || return 20
 }
 
+wait_orchestration_process() {
+  [[ $# -eq 3 ]] || return 20
+  local herdr_i5_injected_orchestration_pid=$1
+  local herdr_i5_injected_supervisor_pid=$2
+  local herdr_i5_injected_sleep_executable=$3
+  local herdr_i5_injected_dummy_pid herdr_i5_injected_attempt
+  [[ $herdr_i5_injected_orchestration_pid =~ ^[1-9][0-9]*$ ]] || return 20
+  [[ $herdr_i5_injected_supervisor_pid =~ ^[1-9][0-9]*$ ]] || return 20
+  ( exit 0 ) &
+  herdr_i5_injected_dummy_pid=$!
+  wait_process_pair "$herdr_i5_injected_orchestration_pid" \
+    "$herdr_i5_injected_dummy_pid" "$herdr_i5_injected_supervisor_pid" 124 || return 20
+  waited_orchestration_status=$selected_process_status
+  if [[ $supervisor_completed_first == true ]]; then
+    builtin kill -TERM "$herdr_i5_injected_orchestration_pid" 2>/dev/null || true
+    for ((herdr_i5_injected_attempt=0; herdr_i5_injected_attempt<100; herdr_i5_injected_attempt++)); do
+      builtin kill -0 "$herdr_i5_injected_orchestration_pid" 2>/dev/null || break
+      "$herdr_i5_injected_sleep_executable" 0.01 || return 20
+    done
+    if builtin kill -0 "$herdr_i5_injected_orchestration_pid" 2>/dev/null; then
+      builtin kill -KILL "$herdr_i5_injected_orchestration_pid" 2>/dev/null || return 20
+    fi
+    wait "$herdr_i5_injected_orchestration_pid" 2>/dev/null || true
+  else
+    builtin kill "$herdr_i5_injected_supervisor_pid" 2>/dev/null || true
+    wait "$herdr_i5_injected_supervisor_pid" 2>/dev/null || true
+  fi
+}
+
 install_orchestration_signal_traps() {
-  trap 'if [[ ${HERDR_PERF_RUNNER_TEST_TRAP_MARKER+x} == x ]]; then : 2>/dev/null >"$HERDR_PERF_RUNNER_TEST_TRAP_MARKER" || :; fi; exit 130' INT
-  trap 'if [[ ${HERDR_PERF_RUNNER_TEST_TRAP_MARKER+x} == x ]]; then : 2>/dev/null >"$HERDR_PERF_RUNNER_TEST_TRAP_MARKER" || :; fi; exit 143' TERM HUP
-  trap 'if [[ ${HERDR_PERF_RUNNER_TEST_TRAP_MARKER+x} == x ]]; then : 2>/dev/null >"$HERDR_PERF_RUNNER_TEST_TRAP_MARKER" || :; fi; exit 124' USR1
+  local trap_marker_body
+  trap_marker_body='if [[ ${HERDR_PERF_RUNNER_TEST_TRAP_MARKER+x} == x && $HERDR_PERF_RUNNER_TEST_TRAP_MARKER == /* && ${HERDR_PERF_RUNNER_TEST_TRAP_MARKER##*/} != result-v1.json ]]; then
+    if [[ -L $HERDR_PERF_RUNNER_TEST_TRAP_MARKER ]]; then
+      builtin printf "%s\n" "error: fixture output path is a symbolic link" >&2
+    elif [[ -p $HERDR_PERF_RUNNER_TEST_TRAP_MARKER ]]; then
+      builtin printf "%s\n" "error: fixture output path is a FIFO" >&2
+    elif [[ ! -e $HERDR_PERF_RUNNER_TEST_TRAP_MARKER ]]; then
+      : 2>/dev/null >"$HERDR_PERF_RUNNER_TEST_TRAP_MARKER" || :
+    fi
+  fi'
+  trap "$trap_marker_body; exit 130" INT
+  trap "$trap_marker_body; exit 143" TERM HUP
+  trap "$trap_marker_body; exit 124" USR1
 }
 
 run_orchestration_signal_probe() {
-  [[ $# -eq 1 ]] || return 20
+  [[ $# -eq 2 ]] || return 20
   local signal=$1
+  local ready=$2
+  local signal_target signal_sender signal_sender_status
   case "$signal" in INT|TERM|HUP|USR1) ;; *) return 20 ;; esac
+  validate_fixture_output_path "$ready" || return 20
   install_orchestration_signal_traps || return 20
-  builtin kill -"$signal" "$BASHPID" || return 20
+  signal_target=$BASHPID
+  (
+    local ready_target readiness_deadline=$((SECONDS + 300))
+    while :; do
+      if [[ -f $ready && ! -L $ready ]] &&
+        IFS= builtin read -r ready_target <"$ready" &&
+        [[ $ready_target == "$signal_target" ]]; then
+        break
+      fi
+      if (( SECONDS >= readiness_deadline )); then
+        builtin kill -KILL "$signal_target" 2>/dev/null || true
+        exit 20
+      fi
+      "$source_sleep_executable" 0.01 || {
+        builtin kill -KILL "$signal_target" 2>/dev/null || true
+        exit 20
+      }
+    done
+    builtin kill -"$signal" "$signal_target"
+  ) &
+  signal_sender=$!
+  if ! builtin printf '%s\n' "$signal_target" >"$ready"; then
+    builtin kill -KILL "$signal_sender" 2>/dev/null || true
+    wait "$signal_sender" 2>/dev/null || true
+    return 20
+  fi
+  set +e
+  wait "$signal_sender"
+  signal_sender_status=$?
+  set -e
+  [[ $signal_sender_status -eq 0 ]] || return 20
   return 20
 }
 
@@ -497,6 +592,7 @@ run_fixture_process_case() {
   local measured_status observer_status watchdog_pid cleanup_status=0
   local wait_attempt
   local cleanup_measured_pid cleanup_observer_pid
+  local signal_probe_ready
   fixture_measured_pid=
   fixture_observer_pid=
   case "$mode" in
@@ -554,31 +650,46 @@ run_fixture_process_case() {
       fi
       ;;
     signal-int-handshake|signal-int-after-observer)
+      signal_probe_ready="${trap_marker_path}.ready"
       set +e
-      ( HERDR_PERF_RUNNER_TEST_TRAP_MARKER=$trap_marker_path run_orchestration_signal_probe INT )
+      ( HERDR_PERF_RUNNER_TEST_TRAP_MARKER=$trap_marker_path \
+        run_orchestration_signal_probe INT "$signal_probe_ready" )
       requested_status=$?
       set -e
       ;;
     signal-term-handshake|signal-term-after-observer)
+      signal_probe_ready="${trap_marker_path}.ready"
       set +e
-      ( HERDR_PERF_RUNNER_TEST_TRAP_MARKER=$trap_marker_path run_orchestration_signal_probe TERM )
+      ( HERDR_PERF_RUNNER_TEST_TRAP_MARKER=$trap_marker_path \
+        run_orchestration_signal_probe TERM "$signal_probe_ready" )
       requested_status=$?
       set -e
       ;;
     signal-hup-handshake|signal-hup-after-observer)
+      signal_probe_ready="${trap_marker_path}.ready"
       set +e
-      ( HERDR_PERF_RUNNER_TEST_TRAP_MARKER=$trap_marker_path run_orchestration_signal_probe HUP )
+      ( HERDR_PERF_RUNNER_TEST_TRAP_MARKER=$trap_marker_path \
+        run_orchestration_signal_probe HUP "$signal_probe_ready" )
       requested_status=$?
       set -e
       ;;
     signal-usr1-handshake)
+      signal_probe_ready="${trap_marker_path}.ready"
       set +e
-      ( HERDR_PERF_RUNNER_TEST_TRAP_MARKER=$trap_marker_path run_orchestration_signal_probe USR1 )
+      ( HERDR_PERF_RUNNER_TEST_TRAP_MARKER=$trap_marker_path \
+        run_orchestration_signal_probe USR1 "$signal_probe_ready" )
       requested_status=$?
       set -e
       ;;
     *) return 20 ;;
   esac
+  if [[ -n ${signal_probe_ready-} && ( -e $signal_probe_ready || -L $signal_probe_ready ) ]]; then
+    if [[ -f $signal_probe_ready && ! -L $signal_probe_ready && ! -p $signal_probe_ready ]]; then
+      "$source_unlink_executable" -- "$signal_probe_ready" || requested_status=20
+    else
+      requested_status=20
+    fi
+  fi
   cleanup_process_groups "$source_sleep_executable" \
     "$cleanup_measured_pid" "$cleanup_observer_pid" || cleanup_status=20
   [[ $cleanup_status -eq 0 ]] || requested_status=20
@@ -674,6 +785,99 @@ run_orchestration_fixture() {
         "$mutation_callback" "$mutation_operand" || return 20
       revalidate_source_fixture_bootstrap || return 20
       publish_runner_test_outcome "$revalidation_outcome" 0 true || return 20
+      ;;
+    socket-shape)
+      [[ $# -eq 2 ]] || return 20
+      local socket_shape_outcome=$1
+      local socket_shape_path=$2
+      runtime_socket_path_has_shape "$socket_shape_path" || return 20
+      publish_runner_test_outcome "$socket_shape_outcome" 0 true || return 20
+      ;;
+    fixture-output-guard)
+      [[ $# -eq 2 ]] || return 20
+      local fixture_guard_site=$1
+      local fixture_guard_path=$2
+      case "$fixture_guard_site" in
+        validator)
+          validate_fixture_output_path "$fixture_guard_path" || return 20
+          ;;
+        runner-outcome)
+          publish_runner_test_outcome "$fixture_guard_path" 0 true || return 20
+          ;;
+        trial-status)
+          publish_trial_status "$fixture_guard_path" 0 || return 20
+          ;;
+        trap-marker)
+          local fixture_guard_status fixture_guard_ready
+          fixture_guard_ready="${fixture_guard_path}.ready"
+          set +e
+          ( HERDR_PERF_RUNNER_TEST_TRAP_MARKER=$fixture_guard_path \
+            run_orchestration_signal_probe TERM "$fixture_guard_ready" )
+          fixture_guard_status=$?
+          set -e
+          if [[ -f $fixture_guard_ready && ! -L $fixture_guard_ready ]]; then
+            "$source_unlink_executable" -- "$fixture_guard_ready" || return 20
+          else
+            return 20
+          fi
+          [[ $fixture_guard_status -eq 143 ]] || return 20
+          return 20
+          ;;
+        *) return 20 ;;
+      esac
+      return 20
+      ;;
+    outer-identity-window)
+      [[ $# -eq 1 ]] || return 20
+      local identity_window_capture=$1
+      validate_fixture_output_path "$identity_window_capture" || return 20
+      bind_source_trial_tools || return 20
+      herdr_i5_identity_window_capture=$identity_window_capture
+      prepare_runtime_dir fx i0001 || return 20
+      return 20
+      ;;
+    outer-group-publication)
+      [[ $# -eq 2 ]] || return 20
+      local group_publication_directory_capture=$1
+      local group_publication_state_capture=$2
+      validate_fixture_output_path "$group_publication_directory_capture" || return 20
+      validate_fixture_output_path "$group_publication_state_capture" || return 20
+      bind_source_trial_tools || return 20
+      prepare_runtime_dir fx g0001 || return 20
+      builtin printf '%s\n' "$active_runtime_dir" \
+        >"$group_publication_directory_capture" || return 20
+      publish_outer_runtime_state "$active_runtime_state" "$auth_mv_executable" \
+        - - - || return 20
+      herdr_i5_group_publication_capture=$group_publication_state_capture
+      herdr_i5_interrupt_group_publication=true
+      publish_outer_runtime_state "$active_runtime_state" "$auth_mv_executable" \
+        999999 999998 - || return 20
+      return 20
+      ;;
+    publisher-temp-cleanup)
+      [[ $# -eq 1 ]] || return 20
+      local publisher_temp_directory_capture=$1
+      validate_fixture_output_path "$publisher_temp_directory_capture" || return 20
+      bind_source_trial_tools || return 20
+      prepare_runtime_dir fx p0001 || return 20
+      builtin printf '%s\n' "$active_runtime_dir" \
+        >"$publisher_temp_directory_capture" || return 20
+      : >"${active_runtime_state}.tmp.${BASHPID}" || return 20
+      builtin kill -TERM "$BASHPID" || return 20
+      return 20
+      ;;
+    orchestration-deadline)
+      [[ $# -eq 1 ]] || return 20
+      local orchestration_deadline_outcome=$1
+      local orchestration_deadline_pid orchestration_deadline_supervisor
+      "$source_sleep_executable" 300 &
+      orchestration_deadline_pid=$!
+      "$source_sleep_executable" 0.01 &
+      orchestration_deadline_supervisor=$!
+      wait_orchestration_process "$orchestration_deadline_pid" \
+        "$orchestration_deadline_supervisor" "$source_sleep_executable" || return 20
+      [[ $waited_orchestration_status -eq 124 ]] || return 20
+      publish_runner_test_outcome "$orchestration_deadline_outcome" 0 true || return 20
       ;;
     scratch-root)
       [[ $# -eq 3 ]] || return 20
@@ -1487,7 +1691,17 @@ load_outer_runtime_state() {
 }
 
 safe_outer_runtime_state_cleanup() {
-  local cleanup_status=0
+  local temporary cleanup_status=0
+  if [[ -n ${active_runtime_state-} ]]; then
+    for temporary in "$active_runtime_state".tmp.*; do
+      [[ -e $temporary || -L $temporary ]] || continue
+      if [[ -f $temporary && ! -L $temporary && ! -p $temporary ]]; then
+        "$auth_unlink_executable" -- "$temporary" || cleanup_status=20
+      else
+        cleanup_status=20
+      fi
+    done
+  fi
   if [[ -n ${active_runtime_state-} && ( -e $active_runtime_state || -L $active_runtime_state ) ]]; then
     [[ -f $active_runtime_state && ! -L $active_runtime_state ]] || cleanup_status=20
     if [[ $cleanup_status -eq 0 ]]; then
@@ -1527,14 +1741,21 @@ outer_runtime_cleanup_trap() {
   local status=$?
   trap - EXIT INT TERM HUP
   load_outer_runtime_state || status=20
+  if [[ -n ${herdr_i5_group_publication_capture-} ]]; then
+    builtin printf '%s %s %s\n' "${active_measured_pid:--}" \
+      "${active_observer_pid:--}" "${active_socket_identity:--}" \
+      >"$herdr_i5_group_publication_capture" || status=20
+  fi
   if [[ -n ${active_measured_pid-} || -n ${active_observer_pid-} ]]; then
     cleanup_process_groups "$auth_sleep_executable" \
       "${active_measured_pid-}" "${active_observer_pid-}" || status=20
   fi
   if [[ -n ${active_orchestration_pid-} ]]; then
-    set +e
-    wait "$active_orchestration_pid" 2>/dev/null
-    set -e
+    wait_orchestration_process "$active_orchestration_pid" \
+      "$active_orchestration_supervisor_pid" "$auth_sleep_executable" || status=20
+  elif [[ -n ${active_orchestration_supervisor_pid-} ]]; then
+    builtin kill "$active_orchestration_supervisor_pid" 2>/dev/null || true
+    wait "$active_orchestration_supervisor_pid" 2>/dev/null || true
   fi
   safe_outer_runtime_state_cleanup || status=20
   safe_outer_runtime_cleanup || status=20
@@ -1601,15 +1822,20 @@ run_trial_process_tree() {
   local baseline_results_root=${19}
   local deadline=${20}
   local handshake_attempt_limit=${21}
-  local pidstat_status shared_orchestration_functions
+  local pidstat_status outer_deadline_seconds shared_orchestration_functions
   [[ $handshake_attempt_limit =~ ^[1-9][0-9]*$ ]] || return 20
+  runtime_socket_path_has_shape "$observer_control_socket" || return 20
+  outer_deadline_seconds=$((deadline + 10))
 
   shared_orchestration_functions="$(
-    declare -f publish_trial_status publish_outer_runtime_state cleanup_process_groups \
-      select_process_status wait_process_pair install_orchestration_signal_traps
+    declare -f guard_fixture_output_node validate_fixture_output_path publish_trial_status \
+      publish_outer_runtime_state cleanup_process_groups select_process_status wait_process_pair \
+      install_orchestration_signal_traps
   )" || return 20
 
   set +e
+  ( "$auth_sleep_executable" "$outer_deadline_seconds" ) &
+  active_orchestration_supervisor_pid=$!
   "$auth_env_executable" -i HOME=/home/mageyuki RUSTUP_HOME=/home/mageyuki/.rustup \
     CARGO_HOME=/home/mageyuki/.cargo PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
     "$auth_taskset_executable" -c 4-7,12-15 \
@@ -1779,9 +2005,14 @@ run_trial_process_tree() {
       "$auth_id_executable" "$auth_mv_executable" "$handshake_attempt_limit" \
       >"$pidstat_output" 2>"$pidstat_stderr" &
   active_orchestration_pid=$!
-  wait "$active_orchestration_pid"
-  pidstat_status=$?
+  if wait_orchestration_process "$active_orchestration_pid" \
+    "$active_orchestration_supervisor_pid" "$auth_sleep_executable"; then
+    pidstat_status=$waited_orchestration_status
+  else
+    pidstat_status=20
+  fi
   active_orchestration_pid=
+  active_orchestration_supervisor_pid=
   set -e
   last_pidstat_status=$pidstat_status
   read_trial_status "$trial_status_output" || return 20
@@ -1790,12 +2021,14 @@ run_trial_process_tree() {
 }
 
 record_trial_control() {
-  [[ $# -eq 4 ]] || return 20
+  [[ $# -eq 5 ]] || return 20
   local trial_raw_root=$1
   local trial_index=$2
   local scenario=$3
   local baseline_root=$4
+  local control_socket=$5
   local trial_status_output="$trial_raw_root/trial-status"
+  runtime_socket_path_has_shape "$control_socket" || return 20
   local -a control_environment=(
     HOME=/home/mageyuki RUSTUP_HOME=/home/mageyuki/.rustup
     CARGO_HOME=/home/mageyuki/.cargo PATH=/usr/bin:/bin LC_ALL=C TZ=UTC
@@ -1829,14 +2062,38 @@ record_trial_control() {
       --nocapture --test-threads=1
 }
 
+create_runtime_dir_identity() {
+  [[ $# -eq 1 ]] || return 20
+  local herdr_i5_injected_parent_pid=$1
+  local herdr_i5_injected_directory herdr_i5_injected_identity
+  herdr_i5_injected_directory="$("$auth_mktemp_executable" -d /tmp/herdr-i5.XXXXXXXX)" || return 20
+  herdr_i5_injected_identity="$("$auth_stat_executable" --format='%d:%i:%u:%f:%F' \
+    -- "$herdr_i5_injected_directory")" || {
+      "$auth_rmdir_executable" -- "$herdr_i5_injected_directory" || true
+      return 20
+    }
+  if [[ -n ${herdr_i5_identity_window_capture-} ]]; then
+    builtin printf '%s %s\n' "$herdr_i5_injected_directory" "$herdr_i5_injected_identity" \
+      >"$herdr_i5_identity_window_capture" || return 20
+  fi
+  builtin printf '%s %s\n' "$herdr_i5_injected_directory" "$herdr_i5_injected_identity"
+  if [[ -n ${herdr_i5_identity_window_capture-} ]]; then
+    builtin kill -TERM "$herdr_i5_injected_parent_pid" || return 20
+  fi
+}
+
 prepare_runtime_dir() {
   [[ $# -eq 2 ]] || return 20
   local scenario_code=$1
   local trial_code=$2
-  local uid mode type
-  active_runtime_dir="$("$auth_mktemp_executable" -d /tmp/herdr-i5.XXXXXXXX)" || return 20
+  local uid mode type extra parent_pid
+  active_runtime_dir=
+  active_runtime_dir_identity=
   install_outer_runtime_traps || return 20
-  active_runtime_dir_identity="$("$auth_stat_executable" --format='%d:%i:%u:%f:%F' -- "$active_runtime_dir")" || return 20
+  parent_pid=$BASHPID
+  IFS=' ' read -r active_runtime_dir active_runtime_dir_identity extra \
+    < <(create_runtime_dir_identity "$parent_pid") || return 20
+  [[ -n $active_runtime_dir && -n $active_runtime_dir_identity && -z $extra ]] || return 20
   [[ -d $active_runtime_dir && ! -L $active_runtime_dir ]] || return 20
   uid="$("$auth_stat_executable" --format='%u' -- "$active_runtime_dir")" || return 20
   mode="$("$auth_stat_executable" --format='%a' -- "$active_runtime_dir")" || return 20
@@ -1846,13 +2103,14 @@ prepare_runtime_dir() {
   [[ "$("$auth_stat_executable" --format='%d:%i:%u:%f:%F' -- "$active_runtime_dir")" == "$active_runtime_dir_identity" ]] || return 20
   active_runtime_socket="$active_runtime_dir/${scenario_code}-${trial_code}.sock"
   active_runtime_state="$active_runtime_dir/.outer-state"
-  [[ ${#active_runtime_socket} -le 107 ]] || return 20
+  runtime_socket_path_has_shape "$active_runtime_socket" || return 20
   [[ ! -e $active_runtime_socket && ! -L $active_runtime_socket ]] || return 20
   [[ ! -e $active_runtime_state && ! -L $active_runtime_state ]] || return 20
   active_socket_identity=
   active_measured_pid=
   active_observer_pid=
   active_orchestration_pid=
+  active_orchestration_supervisor_pid=
 }
 
 run_one_trial() {
@@ -1862,7 +2120,7 @@ run_one_trial() {
   local trial_index=$3
   local trial_code=$4
   local recorded=$5
-  local baseline_arg=- control_status=0 artifact
+  local baseline_arg=- control_status=0 artifact trial_control_socket
   revalidate_measured_binary || return 20
   revalidate_authoritative_bootstrap || return 20
   prepare_trial_scratch_root "$trial_root" "$auth_mkdir_executable" || return 20
@@ -1873,6 +2131,7 @@ run_one_trial() {
     "$trial_scratch_root/pidstat-calibration-zero.json" \
     "$trial_scratch_root/pidstat-calibration-failure.json" auth || return 20
   prepare_runtime_dir "$short_scenario" "$trial_code" || return 20
+  trial_control_socket=$active_runtime_socket
   if [[ $runner_stage != baseline ]]; then baseline_arg=$runner_baseline_root; fi
   run_trial_process_tree \
     "$trial_root/gnu-time.txt" "$trial_root/stdout" "$trial_root/stderr" \
@@ -1890,7 +2149,8 @@ run_one_trial() {
   read_trial_status "$trial_root/trial-status" || return 20
   if [[ $recorded == true ]]; then
     set +e
-    record_trial_control "$trial_root" "$trial_index" "$mapped_scenario" "$runner_baseline_root"
+    record_trial_control "$trial_root" "$trial_index" "$mapped_scenario" \
+      "$runner_baseline_root" "$trial_control_socket"
     control_status=$?
     set -e
     if [[ $last_trial_code -eq 0 ]]; then

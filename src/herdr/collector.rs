@@ -1,6 +1,6 @@
 //! T9 subscribe/buffer/snapshot/replay collector, convergence, and gap reconciliation.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::ffi::OsStr;
 use std::future::pending;
@@ -15,22 +15,24 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::activity::{OperatorSnapshot, RestoredOperatorState};
 use crate::diagnostics::{
-    ControllerInputStatus, ControllerInputUnavailableReason, DiagnosticSource, InputAvailability,
-    OccurrenceLogStatus, OwnerFreshness, PersistenceCounters, PersistenceOccurrenceSink,
-    RuntimeDiagnosticsSnapshot, RuntimeWriteOutcome, SourceCoverageSnapshot,
-    controller_counter_snapshot, encode_persistence_occurrence,
+    ControllerInputStatus, ControllerInputUnavailableReason, DiagnosticSource,
+    EnrichmentCounterSnapshot, InputAvailability, OccurrenceLogStatus, OwnerFreshness,
+    PersistenceCounters, PersistenceOccurrenceSink, RuntimeDiagnosticsSnapshot,
+    RuntimeWriteOutcome, SourceCoverageSnapshot, controller_counter_snapshot,
+    encode_persistence_occurrence,
 };
 use crate::lockfile::OwnerRecord;
 use crate::model::{
     AgentNodeObservation, AgentSessionReference, AgentSessionReferenceKind,
-    ControllerDiagnosticsHandle, DomainModel, EventMetadata, ExecState, Execution, GapKind,
-    MinimalProviderMetadata, NormalizedEvent, Pane, PaneSnapshot, Provider, ReconcileBatch, RunId,
-    RunKey, SharedModel, SnapshotAgent, SourceCoverage, Tab, TopologyEntity, TopologyEntityId,
-    TopologySnapshot, Workspace,
+    ControllerDiagnosticsHandle, DomainModel, EnrichmentDiagnosticsHandle, EventMetadata,
+    ExecState, Execution, GapKind, MinimalProviderMetadata, NormalizedEvent, Pane, PaneSnapshot,
+    Provider, ReconcileBatch, RunId, RunKey, SharedModel, SnapshotAgent, SourceCoverage, Tab,
+    TopologyEntity, TopologyEntityId, TopologySnapshot, Workspace,
 };
 use crate::performance::{
     Admission, Admitted, PerformanceClock, PerformanceIngress, PerformanceSampler,
@@ -59,12 +61,35 @@ use super::types::{AgentSessionKind, PaneInfo, Snapshot, Subscription, TabInfo, 
 use super::wire::{self, EventStream, WireError};
 
 const EVENT_QUEUE_CAPACITY: usize = 64;
+const ENRICHMENT_QUEUE_CAPACITY: usize = 64;
 const RESNAPSHOT_ATTEMPTS: usize = 3;
 const RECONNECT_DELAY: Duration = Duration::from_millis(50);
+const ENRICHMENT_RECONNECT_MAX_DEFERRAL: Duration = RECONNECT_DELAY.saturating_mul(5);
 const DRAIN_QUIET_PERIOD: Duration = Duration::from_millis(5);
 const STALE_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const PERFORMANCE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
+
+#[derive(Default)]
+struct HealthEdge {
+    failed: AtomicBool,
+}
+
+impl HealthEdge {
+    fn record_failure(&self) -> bool {
+        !self.failed.swap(true, Ordering::Relaxed)
+    }
+
+    fn record_recovery(&self) -> bool {
+        self.failed.swap(false, Ordering::Relaxed)
+    }
+}
+
+#[derive(Default)]
+struct EnrichmentHealth {
+    subscription: HealthEdge,
+    stream: HealthEdge,
+}
 
 /// Current quality of the Herdr physical-state observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -430,6 +455,7 @@ pub(crate) struct RuntimePersistence {
     occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
     occurrence_attempted: bool,
     acceptor_diagnostics: ControllerDiagnosticsHandle,
+    enrichment_diagnostics: EnrichmentDiagnosticsHandle,
 }
 
 impl RuntimePersistence {
@@ -444,12 +470,14 @@ impl RuntimePersistence {
             controller_input_from_coverage(coverage.state(CoverageSource::Controller));
         let controller_counters = controller_counter_snapshot(model);
         let acceptor_diagnostics = model.controller_diagnostics().acceptor_handle();
+        let enrichment_diagnostics = EnrichmentDiagnosticsHandle::default();
         let snapshot = RuntimeDiagnosticsSnapshot {
             persistence: writer.persistence_status(),
             controller_input,
             owner: OwnerFreshness::Current,
             persistence_counters: PersistenceCounters::default(),
             controller_counters,
+            enrichment_counters: EnrichmentCounterSnapshot::default(),
             source_coverage: diagnostic_source_coverage(coverage, controller_input),
             dangling_announcement_components: controller_counters.dangling_announcement_components,
             first_failure_log: OccurrenceLogStatus::NotAttempted,
@@ -464,6 +492,7 @@ impl RuntimePersistence {
                 occurrence_sink,
                 occurrence_attempted: false,
                 acceptor_diagnostics,
+                enrichment_diagnostics,
             },
             diagnostics,
         )
@@ -486,6 +515,10 @@ impl RuntimePersistence {
         self.publisher.subscribe()
     }
 
+    fn enrichment_diagnostics(&self) -> EnrichmentDiagnosticsHandle {
+        self.enrichment_diagnostics.clone()
+    }
+
     pub(crate) fn is_duplicate(&self, event_id: &str) -> bool {
         self.writer.is_duplicate(event_id)
     }
@@ -504,6 +537,7 @@ impl RuntimePersistence {
             occurrence_sink,
             occurrence_attempted,
             acceptor_diagnostics,
+            enrichment_diagnostics,
         } = self;
         let permit = writer.reserve_enqueue();
         let status = {
@@ -517,6 +551,7 @@ impl RuntimePersistence {
             occurrence_sink.as_ref(),
             occurrence_attempted,
             acceptor_diagnostics,
+            enrichment_diagnostics,
         );
         match status {
             PersistenceStatus::Healthy => permit,
@@ -615,6 +650,7 @@ impl RuntimePersistence {
             occurrence_sink,
             occurrence_attempted,
             acceptor_diagnostics,
+            enrichment_diagnostics,
             ..
         } = self;
         Self::ingest_writer_status(
@@ -624,6 +660,7 @@ impl RuntimePersistence {
             occurrence_sink.as_ref(),
             occurrence_attempted,
             acceptor_diagnostics,
+            enrichment_diagnostics,
         );
     }
 
@@ -634,6 +671,7 @@ impl RuntimePersistence {
         occurrence_sink: &dyn PersistenceOccurrenceSink,
         occurrence_attempted: &mut bool,
         acceptor_diagnostics: &ControllerDiagnosticsHandle,
+        enrichment_diagnostics: &EnrichmentDiagnosticsHandle,
     ) {
         if snapshot.persistence != PersistenceStatus::Healthy {
             return;
@@ -654,6 +692,7 @@ impl RuntimePersistence {
                 occurrence_sink,
                 occurrence_attempted,
                 acceptor_diagnostics,
+                enrichment_diagnostics,
             );
         }
     }
@@ -671,9 +710,11 @@ impl RuntimePersistence {
             self.occurrence_sink.as_ref(),
             &mut self.occurrence_attempted,
             &self.acceptor_diagnostics,
+            &self.enrichment_diagnostics,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_facade_failure(
         failure: PersistenceFailure,
         class: RuntimeCommandClass,
@@ -682,6 +723,7 @@ impl RuntimePersistence {
         occurrence_sink: &dyn PersistenceOccurrenceSink,
         occurrence_attempted: &mut bool,
         acceptor_diagnostics: &ControllerDiagnosticsHandle,
+        enrichment_diagnostics: &EnrichmentDiagnosticsHandle,
     ) -> RuntimeWriteOutcome {
         let outcome = match failure.durability {
             DurabilityDisposition::Committed => RuntimeWriteOutcome::CommittedButDegraded(failure),
@@ -738,7 +780,12 @@ impl RuntimePersistence {
                 OccurrenceLogStatus::Failed
             };
         }
-        Self::publish_facade(snapshot, publisher, acceptor_diagnostics);
+        Self::publish_facade(
+            snapshot,
+            publisher,
+            acceptor_diagnostics,
+            enrichment_diagnostics,
+        );
         outcome
     }
 
@@ -767,6 +814,7 @@ impl RuntimePersistence {
             &mut self.snapshot,
             &self.publisher,
             &self.acceptor_diagnostics,
+            &self.enrichment_diagnostics,
         );
     }
 
@@ -774,9 +822,14 @@ impl RuntimePersistence {
         snapshot: &mut RuntimeDiagnosticsSnapshot,
         publisher: &watch::Sender<RuntimeDiagnosticsSnapshot>,
         acceptor_diagnostics: &ControllerDiagnosticsHandle,
+        enrichment_diagnostics: &EnrichmentDiagnosticsHandle,
     ) {
         snapshot.controller_counters.socket_saturations = acceptor_diagnostics.socket_saturations();
         snapshot.controller_counters.accept_failures = acceptor_diagnostics.accept_failures();
+        snapshot.enrichment_counters = EnrichmentCounterSnapshot {
+            channel_full_drops: enrichment_diagnostics.channel_full_drops(),
+            episode_discards: enrichment_diagnostics.episode_discards(),
+        };
         let publication = snapshot.clone();
         publisher.send_if_modified(|current| {
             if *current == publication {
@@ -1449,6 +1502,21 @@ async fn run_collector(
 ) -> Result<(), CollectorError> {
     let mut first_subscription = true;
     let mut previous_socket = None;
+    let subscription_health = HealthEdge::default();
+    // Keep this outside the primary retry loop. spawn_enrichment_reader runs once per
+    // primary subscription generation, so this one shared value preserves its
+    // independent subscription and stream edges across reconnects. The regression
+    // test a3_enrichment_subscription_health_persists_across_reader_generations
+    // shares one health value across two direct run_enrichment_reader calls: it pins
+    // the shared-health semantics, not this wiring. Moving construction into the loop
+    // would silently restore one warning per flapping primary generation during a
+    // persistent enrichment outage (roughly 10-20 lines per second).
+    //
+    // Accepted trade-off: a genuine socket replacement during a persistent
+    // enrichment outage does not emit a fresh warning. Increment 6 design spec A3
+    // requires one warning on degrade, one notice on recovery, and a silent steady
+    // failed state. This is intentional; do not reset health on socket replacement.
+    let enrichment_health = Arc::new(EnrichmentHealth::default());
     let mut retention_cleanup = tokio::time::interval(STALE_SWEEP_INTERVAL);
     retention_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     retention_cleanup.tick().await;
@@ -1481,13 +1549,28 @@ async fn run_collector(
             }
             result = wire::subscribe(&sock, &subscriptions) => result,
         } {
-            Ok(stream) => stream,
+            Ok(stream) => {
+                if subscription_health.record_recovery() {
+                    // WARN is required because the production subscriber caps at WARN (src/main.rs).
+                    // Keep this before the Reconciling publication below: the shared helper
+                    // capture_primary_subscribe_recovery uses it as a happens-after barrier for
+                    // a3_primary_subscribe_recovery_logs_one_notice and
+                    // a3_recovery_notice_survives_production_warn_level_cap.
+                    tracing::warn!(
+                        notice_code = "herdr_subscription_recovered",
+                        "Herdr event subscription recovered"
+                    );
+                }
+                stream
+            }
             Err(error) => {
-                tracing::warn!(
-                    warning_code = "herdr_subscription_failed",
-                    error = %error,
-                    "Herdr event subscription failed; retrying"
-                );
+                if subscription_health.record_failure() {
+                    tracing::warn!(
+                        warning_code = "herdr_subscription_failed",
+                        error = %error,
+                        "Herdr event subscription failed; retrying"
+                    );
+                }
                 provider.set_herdr_quality(
                     ObservationQuality::Disconnected,
                     &mut persistence,
@@ -1522,6 +1605,29 @@ async fn run_collector(
         let reader_cancellation = cancellation.child_token();
         let (events, overflowed, reader) =
             spawn_event_reader(stream, reader_cancellation.clone(), performance.clone());
+        let enrichment_cancellation = cancellation.child_token();
+        let (target_publisher, target_receiver) = watch::channel(BTreeSet::new());
+        let (enrichment_sender, enrichment_events) = mpsc::channel(ENRICHMENT_QUEUE_CAPACITY);
+        let (prune_sender, prune_events) = mpsc::unbounded_channel();
+        let enrichment_diagnostics = persistence.enrichment_diagnostics();
+        let enrichment_reader = spawn_enrichment_reader(
+            sock.clone(),
+            target_receiver,
+            enrichment_sender,
+            prune_sender,
+            enrichment_diagnostics.clone(),
+            Arc::clone(&enrichment_health),
+            enrichment_cancellation.clone(),
+        );
+        let mut enrichment = EnrichmentConverge {
+            target_set: BTreeSet::new(),
+            target_publisher,
+            published: false,
+            events: enrichment_events,
+            prunes: prune_events,
+            diagnostics: enrichment_diagnostics,
+            performance: performance.clone(),
+        };
         let outcome = converge(
             &sock,
             &mut persistence,
@@ -1533,13 +1639,18 @@ async fn run_collector(
             gap_kind,
             events,
             Arc::clone(&overflowed),
+            &mut enrichment,
             &mut controller_requests,
             &mut provider,
         )
         .await;
 
         reader_cancellation.cancel();
+        enrichment_cancellation.cancel();
         let reader_result = reader
+            .await
+            .map_err(|error| CollectorError::Task(error.to_string()))?;
+        enrichment_reader
             .await
             .map_err(|error| CollectorError::Task(error.to_string()))?;
         let outcome = outcome?;
@@ -1579,6 +1690,7 @@ async fn converge(
     gap_kind: GapKind,
     mut events: mpsc::Receiver<Admitted<ReceivedEvent>>,
     overflowed: Arc<AtomicBool>,
+    enrichment: &mut EnrichmentConverge,
     controller_requests: &mut Option<ControllerRequestReceiver>,
     provider: &mut ProviderIntegration,
 ) -> Result<ConvergeOutcome, CollectorError> {
@@ -1587,6 +1699,7 @@ async fn converge(
     let mut pending_closures = PendingTopologyClosures::default();
 
     loop {
+        enrichment.discard_episode_payloads();
         overflowed.store(false, Ordering::Release);
         let snapshot = tokio::select! {
             () = cancellation.cancelled() => return Ok(ConvergeOutcome::new(SubscriptionOutcome::Cancelled, !first_generation)),
@@ -1626,6 +1739,13 @@ async fn converge(
             apply_snapshot_in_place(reducer, shared, topology, session, &mut pending_closures)?
         };
         let _ = persist_submission(persistence, reducer, std::mem::take(&mut batch)).await?;
+        enrichment.replace_targets(
+            snapshot
+                .panes
+                .iter()
+                .map(|pane| pane.pane_id.clone())
+                .collect(),
+        );
         provider.publish_targets(shared);
         owner.refresh_from_snapshot(&snapshot, persistence).await?;
         persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
@@ -1639,6 +1759,7 @@ async fn converge(
             &snapshot,
             &mut events,
             &overflowed,
+            enrichment,
             cancellation,
             &mut pending_closures,
             controller_requests,
@@ -1659,6 +1780,8 @@ async fn converge(
                 ));
             }
             ReplayOutcome::Clean => {
+                enrichment.discard_episode_payloads();
+                enrichment.activate();
                 provider.set_herdr_quality(ObservationQuality::Live, persistence, shared);
                 match monitor_live(
                     reducer,
@@ -1668,6 +1791,7 @@ async fn converge(
                     session,
                     &mut events,
                     &overflowed,
+                    enrichment,
                     cancellation,
                     &mut pending_closures,
                     controller_requests,
@@ -1708,6 +1832,7 @@ async fn converge(
                         owner,
                         session,
                         events,
+                        enrichment,
                         cancellation,
                         &mut pending_closures,
                         controller_requests,
@@ -1732,6 +1857,7 @@ async fn replay_generation(
     snapshot: &Snapshot,
     events: &mut mpsc::Receiver<Admitted<ReceivedEvent>>,
     overflowed: &AtomicBool,
+    enrichment: &mut EnrichmentConverge,
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
     controller_requests: &mut Option<ControllerRequestReceiver>,
@@ -1746,8 +1872,10 @@ async fn replay_generation(
     let mut channel_state = drain_events(events, &mut buffered);
 
     loop {
+        enrichment.discard_episode_payloads();
         while let Some(admitted) = buffered.pop_front() {
             let (received, admission) = admitted.into_parts();
+            let target_delta = enrichment_target_delta(&received, shared);
             record_replay_facts(
                 next,
                 &received,
@@ -1767,6 +1895,7 @@ async fn replay_generation(
                 provider,
             )
             .await?;
+            enrichment.apply_target_delta(target_delta);
             next += 1;
             channel_state = drain_events(events, &mut buffered);
         }
@@ -1826,14 +1955,23 @@ async fn monitor_live(
     session: &str,
     events: &mut mpsc::Receiver<Admitted<ReceivedEvent>>,
     overflowed: &AtomicBool,
+    enrichment: &mut EnrichmentConverge,
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
     controller_requests: &mut Option<ControllerRequestReceiver>,
     provider: &mut ProviderIntegration,
 ) -> Result<ReplayOutcome, CollectorError> {
+    enum LiveReceipt {
+        Primary(Admitted<ReceivedEvent>),
+        Enrichment(EnrichmentPayload),
+        Sweep,
+    }
+
     let mut stale_sweep = tokio::time::interval(STALE_SWEEP_INTERVAL);
     stale_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     stale_sweep.tick().await;
+    let mut enrichment_events_open = true;
+    let mut enrichment_prunes_open = true;
     loop {
         let received = tokio::select! {
             () = cancellation.cancelled() => return Ok(ReplayOutcome::Cancelled),
@@ -1863,44 +2001,80 @@ async fn monitor_live(
                 continue;
             }
             received = events.recv() => match received {
-                Some(received) => Some(received),
+                Some(received) => LiveReceipt::Primary(received),
                 None => return Ok(ReplayOutcome::Ended),
             },
-            _ = stale_sweep.tick() => None,
+            payload = enrichment.events.recv(), if enrichment_events_open => match payload {
+                Some(payload) => LiveReceipt::Enrichment(payload),
+                None => {
+                    enrichment_events_open = false;
+                    continue;
+                }
+            },
+            prune = enrichment.prunes.recv(), if enrichment_prunes_open => {
+                let Some(prune) = prune else {
+                    enrichment_prunes_open = false;
+                    continue;
+                };
+                enrichment.apply_prune(prune);
+                continue;
+            },
+            _ = stale_sweep.tick() => LiveReceipt::Sweep,
         };
-        let Some(received) = received else {
-            let mut persist = reducer.sweep_stale(unix_now_ms());
-            persist.extend(apply_pending_topology_closures(
-                reducer,
-                shared,
-                session,
-                pending_closures,
-            )?);
-            if !persist.is_empty() {
-                let _ = persist_submission(persistence, reducer, persist).await?;
-                provider.publish_targets(shared);
+        match received {
+            LiveReceipt::Sweep => {
+                let mut persist = reducer.sweep_stale(unix_now_ms());
+                persist.extend(apply_pending_topology_closures(
+                    reducer,
+                    shared,
+                    session,
+                    pending_closures,
+                )?);
+                if !persist.is_empty() {
+                    let _ = persist_submission(persistence, reducer, persist).await?;
+                    provider.publish_targets(shared);
+                }
+                let _ = persistence.cleanup(unix_now_ms()).await?;
+                persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
+                continue;
             }
-            let _ = persistence.cleanup(unix_now_ms()).await?;
-            persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
-            continue;
-        };
-        let (received, admission) = received.into_parts();
-        let anomalous =
-            updated_entity(&received).is_some_and(|entity| !entity_exists(shared, &entity));
-        apply_received_event(
-            reducer,
-            shared,
-            persistence,
-            owner,
-            session,
-            received,
-            admission,
-            pending_closures,
-            provider,
-        )
-        .await?;
-        if anomalous || overflowed.swap(false, Ordering::AcqRel) {
-            return Ok(ReplayOutcome::Dirty);
+            LiveReceipt::Enrichment(payload) => {
+                apply_enrichment_payload(
+                    reducer,
+                    shared,
+                    persistence,
+                    session,
+                    payload,
+                    &enrichment.target_set,
+                    &enrichment.performance,
+                    pending_closures,
+                    provider,
+                )
+                .await?;
+                continue;
+            }
+            LiveReceipt::Primary(received) => {
+                let (received, admission) = received.into_parts();
+                let target_delta = enrichment_target_delta(&received, shared);
+                let anomalous =
+                    updated_entity(&received).is_some_and(|entity| !entity_exists(shared, &entity));
+                apply_received_event(
+                    reducer,
+                    shared,
+                    persistence,
+                    owner,
+                    session,
+                    received,
+                    admission,
+                    pending_closures,
+                    provider,
+                )
+                .await?;
+                enrichment.apply_target_delta(target_delta);
+                if anomalous || overflowed.swap(false, Ordering::AcqRel) {
+                    return Ok(ReplayOutcome::Dirty);
+                }
+            }
         }
     }
 }
@@ -1913,6 +2087,7 @@ async fn monitor_reconciling(
     owner: &mut OwnerTracker,
     session: &str,
     mut events: mpsc::Receiver<Admitted<ReceivedEvent>>,
+    enrichment: &mut EnrichmentConverge,
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
     controller_requests: &mut Option<ControllerRequestReceiver>,
@@ -1922,6 +2097,7 @@ async fn monitor_reconciling(
     stale_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     stale_sweep.tick().await;
     loop {
+        enrichment.discard_episode_payloads();
         let received = tokio::select! {
             () = cancellation.cancelled() => return Ok(SubscriptionOutcome::Cancelled),
             request = receive_controller(controller_requests) => {
@@ -1972,6 +2148,7 @@ async fn monitor_reconciling(
             continue;
         };
         let (received, admission) = received.into_parts();
+        let target_delta = enrichment_target_delta(&received, shared);
         apply_received_event(
             reducer,
             shared,
@@ -1984,6 +2161,7 @@ async fn monitor_reconciling(
             provider,
         )
         .await?;
+        enrichment.apply_target_delta(target_delta);
     }
 }
 
@@ -1992,6 +2170,401 @@ type EventReader = (
     Arc<AtomicBool>,
     JoinHandle<Result<(), WireError>>,
 );
+
+#[derive(Clone, Debug)]
+struct EnrichmentPayload {
+    pane_id: String,
+    terminal_id: Option<String>,
+    state: ExecState,
+    timestamp_ms: i64,
+    receipt_time_ms: i64,
+}
+
+struct EnrichmentPrune {
+    pane_id: String,
+    acknowledgement: tokio::sync::oneshot::Sender<()>,
+}
+
+struct EnrichmentConverge {
+    target_set: BTreeSet<String>,
+    target_publisher: watch::Sender<BTreeSet<String>>,
+    published: bool,
+    events: mpsc::Receiver<EnrichmentPayload>,
+    prunes: mpsc::UnboundedReceiver<EnrichmentPrune>,
+    diagnostics: EnrichmentDiagnosticsHandle,
+    performance: PerformanceIngress,
+}
+
+impl EnrichmentConverge {
+    fn replace_targets(&mut self, targets: BTreeSet<String>) {
+        if self.target_set == targets {
+            return;
+        }
+        self.target_set = targets;
+        self.publish_targets();
+    }
+
+    fn activate(&mut self) {
+        if self.published {
+            return;
+        }
+        self.published = true;
+        self.publish_targets();
+    }
+
+    fn publish_targets(&self) {
+        if !self.published {
+            return;
+        }
+        let targets = self.target_set.clone();
+        self.target_publisher.send_if_modified(|current| {
+            if *current == targets {
+                false
+            } else {
+                *current = targets;
+                true
+            }
+        });
+    }
+
+    fn apply_target_delta(&mut self, delta: EnrichmentTargetDelta) {
+        let mut targets = self.target_set.clone();
+        for pane_id in delta.removed {
+            targets.remove(&pane_id);
+        }
+        targets.extend(delta.created);
+        self.replace_targets(targets);
+    }
+
+    fn drain_prunes(&mut self) {
+        while let Ok(prune) = self.prunes.try_recv() {
+            self.apply_prune(prune);
+        }
+    }
+
+    fn apply_prune(&mut self, prune: EnrichmentPrune) {
+        let mut targets = self.target_set.clone();
+        targets.remove(&prune.pane_id);
+        self.replace_targets(targets);
+        let _ = prune.acknowledgement.send(());
+    }
+
+    fn discard_episode_payloads(&mut self) {
+        self.drain_prunes();
+        for _ in 0..ENRICHMENT_QUEUE_CAPACITY {
+            match self.events.try_recv() {
+                Ok(_) => self.diagnostics.record_episode_discard(),
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct EnrichmentTargetDelta {
+    created: BTreeSet<String>,
+    removed: BTreeSet<String>,
+}
+
+fn enrichment_target_delta(
+    received: &ReceivedEvent,
+    shared: &SharedModel,
+) -> EnrichmentTargetDelta {
+    let mut delta = EnrichmentTargetDelta::default();
+    match received.event.as_str() {
+        "pane_created" => {
+            if let Some(pane_id) = nested_string(&received.data, "pane", "pane_id") {
+                delta.created.insert(pane_id);
+            }
+        }
+        "pane_closed" => {
+            if let Some(pane_id) = string_field(&received.data, "pane_id") {
+                delta.removed.insert(pane_id);
+            }
+        }
+        "pane_moved" => {
+            if let Some(pane_id) = nested_string(&received.data, "pane", "pane_id") {
+                delta.created.insert(pane_id);
+            }
+            if let Some(pane_id) = string_field(&received.data, "previous_pane_id") {
+                delta.removed.insert(pane_id);
+            }
+        }
+        "tab_closed" => {
+            if let Some(tab_id) = string_field(&received.data, "tab_id") {
+                delta.removed.extend(
+                    shared
+                        .borrow()
+                        .panes()
+                        .filter(|pane| pane.tab_id == tab_id)
+                        .map(|pane| pane.pane_id.clone()),
+                );
+            }
+        }
+        "workspace_closed" => {
+            if let Some(workspace_id) = string_field(&received.data, "workspace_id") {
+                delta.removed.extend(
+                    shared
+                        .borrow()
+                        .panes()
+                        .filter(|pane| pane.workspace_id == workspace_id)
+                        .map(|pane| pane.pane_id.clone()),
+                );
+            }
+        }
+        _ => {}
+    }
+    delta
+}
+
+fn spawn_enrichment_reader(
+    sock: PathBuf,
+    targets: watch::Receiver<BTreeSet<String>>,
+    sender: mpsc::Sender<EnrichmentPayload>,
+    prunes: mpsc::UnboundedSender<EnrichmentPrune>,
+    diagnostics: EnrichmentDiagnosticsHandle,
+    health: Arc<EnrichmentHealth>,
+    cancellation: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(run_enrichment_reader(
+        sock,
+        targets,
+        sender,
+        prunes,
+        diagnostics,
+        health,
+        cancellation,
+    ))
+}
+
+struct EnrichmentDeferral {
+    first: Option<tokio::time::Instant>,
+}
+
+impl EnrichmentDeferral {
+    fn on_change(&mut self, now: Instant) -> Instant {
+        let first = *self.first.get_or_insert(now);
+        (now + RECONNECT_DELAY).min(first + ENRICHMENT_RECONNECT_MAX_DEFERRAL)
+    }
+
+    fn on_swap(&mut self) {
+        self.first = None;
+    }
+
+    fn on_empty(&mut self) {
+        self.first = None;
+    }
+}
+
+async fn run_enrichment_reader(
+    sock: PathBuf,
+    mut targets: watch::Receiver<BTreeSet<String>>,
+    sender: mpsc::Sender<EnrichmentPayload>,
+    prunes: mpsc::UnboundedSender<EnrichmentPrune>,
+    diagnostics: EnrichmentDiagnosticsHandle,
+    health: Arc<EnrichmentHealth>,
+    cancellation: CancellationToken,
+) {
+    let mut target_set = targets.borrow_and_update().clone();
+    let mut deferral = EnrichmentDeferral { first: None };
+    loop {
+        while target_set.is_empty() {
+            deferral.on_empty();
+            tokio::select! {
+                () = cancellation.cancelled() => return,
+                changed = targets.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    target_set = targets.borrow_and_update().clone();
+                    if !target_set.is_empty() {
+                        let _ = deferral.on_change(Instant::now());
+                    }
+                }
+            }
+        }
+
+        let delayed = loop {
+            let deadline = deferral.on_change(Instant::now());
+            tokio::select! {
+                () = cancellation.cancelled() => return,
+                changed = targets.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    target_set = targets.borrow_and_update().clone();
+                    if target_set.is_empty() {
+                        break false;
+                    }
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    target_set = targets.borrow_and_update().clone();
+                    break !target_set.is_empty();
+                }
+            }
+        };
+        if !delayed {
+            continue;
+        }
+        deferral.on_swap();
+
+        let subscriptions = enrichment_subscriptions(&target_set);
+        let subscribed = tokio::select! {
+            () = cancellation.cancelled() => return,
+            result = wire::subscribe(&sock, &subscriptions) => result,
+        };
+        let mut stream = match subscribed {
+            Ok(stream) => {
+                if health.subscription.record_recovery() {
+                    // WARN is required because the production subscriber caps at WARN (src/main.rs).
+                    tracing::warn!(
+                        notice_code = "herdr_enrichment_subscription_recovered",
+                        "Herdr enrichment subscription recovered"
+                    );
+                }
+                stream
+            }
+            Err(WireError::Server { code, message }) if code == "pane_not_found" => {
+                let Some(pane_id) = rejected_enrichment_pane(&message, &target_set) else {
+                    if health.subscription.record_failure() {
+                        tracing::warn!(
+                            warning_code = "herdr_enrichment_subscription_failed",
+                            error = %WireError::Server { code, message },
+                            "Herdr enrichment subscription failed; retrying"
+                        );
+                    }
+                    continue;
+                };
+                let (acknowledgement, applied) = tokio::sync::oneshot::channel();
+                if prunes
+                    .send(EnrichmentPrune {
+                        pane_id: pane_id.clone(),
+                        acknowledgement,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::select! {
+                    () = cancellation.cancelled() => return,
+                    result = applied => {
+                        if result.is_err() {
+                            return;
+                        }
+                    }
+                }
+                target_set.remove(&pane_id);
+                target_set = targets.borrow_and_update().clone();
+                continue;
+            }
+            Err(error) => {
+                if health.subscription.record_failure() {
+                    tracing::warn!(
+                        warning_code = "herdr_enrichment_subscription_failed",
+                        error = %error,
+                        "Herdr enrichment subscription failed; retrying"
+                    );
+                }
+                continue;
+            }
+        };
+
+        loop {
+            let received = tokio::select! {
+                () = cancellation.cancelled() => {
+                    let _ = stream.close().await;
+                    return;
+                }
+                changed = targets.changed() => {
+                    if changed.is_err() {
+                        let _ = stream.close().await;
+                        return;
+                    }
+                    target_set = targets.borrow_and_update().clone();
+                    let _ = deferral.on_change(Instant::now());
+                    let _ = stream.close().await;
+                    break;
+                }
+                received = stream.next_event() => received,
+            };
+            let (event, data) = match received {
+                Ok(Some(received)) => {
+                    if health.stream.record_recovery() {
+                        // WARN is required because the production subscriber caps at WARN (src/main.rs).
+                        tracing::warn!(
+                            notice_code = "herdr_enrichment_stream_recovered",
+                            "Herdr enrichment stream recovered"
+                        );
+                    }
+                    received
+                }
+                Ok(None) => {
+                    if health.stream.record_failure() {
+                        // WARN is required because the production subscriber caps at WARN (src/main.rs).
+                        tracing::warn!(
+                            warning_code = "herdr_enrichment_stream_failed",
+                            "Herdr enrichment stream closed; retrying"
+                        );
+                    }
+                    break;
+                }
+                Err(error) => {
+                    if health.stream.record_failure() {
+                        tracing::warn!(
+                            warning_code = "herdr_enrichment_stream_failed",
+                            error = %error,
+                            "Herdr enrichment stream ended; retrying"
+                        );
+                    }
+                    break;
+                }
+            };
+            let Some(payload) = enrichment_payload(&event, &data) else {
+                continue;
+            };
+            match sender.try_send(payload) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    diagnostics.record_channel_full_drop();
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return,
+            }
+        }
+    }
+}
+
+fn rejected_enrichment_pane(message: &str, targets: &BTreeSet<String>) -> Option<String> {
+    message
+        .strip_prefix("pane ")
+        .and_then(|message| message.strip_suffix(" not found"))
+        .filter(|pane_id| targets.contains(*pane_id))
+        .map(str::to_owned)
+}
+
+fn enrichment_payload(event: &str, data: &Value) -> Option<EnrichmentPayload> {
+    if event != "pane_agent_status_changed" {
+        return None;
+    }
+    let pane_id =
+        string_field(data, "pane_id").or_else(|| nested_string(data, "pane", "pane_id"))?;
+    let terminal_id =
+        string_field(data, "terminal_id").or_else(|| nested_string(data, "pane", "terminal_id"));
+    let state = status_from_value(
+        data.get("agent_status")
+            .or_else(|| data.get("status"))
+            .or_else(|| data.get("new_status")),
+    );
+    let receipt_time_ms = unix_now_ms();
+    Some(EnrichmentPayload {
+        pane_id,
+        terminal_id,
+        state,
+        timestamp_ms: receipt_time_ms,
+        receipt_time_ms,
+    })
+}
 
 fn spawn_event_reader(
     mut stream: EventStream,
@@ -3131,6 +3704,52 @@ async fn apply_received_event(
     Ok(())
 }
 
+fn cancel_pending_pane_closure(pane_id: &str, pending: &mut PendingTopologyClosures) {
+    pending.panes.remove(pane_id);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_enrichment_payload(
+    reducer: &mut Reducer,
+    shared: &SharedModel,
+    persistence: &mut RuntimePersistence,
+    session: &str,
+    payload: EnrichmentPayload,
+    target_set: &BTreeSet<String>,
+    performance: &PerformanceIngress,
+    pending_closures: &mut PendingTopologyClosures,
+    provider: &mut ProviderIntegration,
+) -> Result<(), CollectorError> {
+    cancel_pending_pane_closure(&payload.pane_id, pending_closures);
+    if !target_set.contains(&payload.pane_id) {
+        return Ok(());
+    }
+
+    let events = agent_status_events(
+        shared,
+        session,
+        &payload.pane_id,
+        payload.terminal_id.as_deref(),
+        payload.state,
+        Some((payload.timestamp_ms, payload.receipt_time_ms)),
+    );
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let admission = performance.admit();
+    let outcome = apply_collector_observation(reducer, events);
+    admission.complete();
+    if let Some(persist) = outcome?
+        && !persist.is_empty()
+    {
+        let _ = persist_submission(persistence, reducer, persist).await?;
+    }
+    persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
+    provider.publish_targets(shared);
+    Ok(())
+}
+
 fn apply_collector_event(
     reducer: &mut Reducer,
     event: NormalizedEvent,
@@ -3369,21 +3988,58 @@ fn normalize_event(
                 .or_else(|| nested_string(&received.data, "pane", "pane_id"));
             let terminal_id = string_field(&received.data, "terminal_id")
                 .or_else(|| nested_string(&received.data, "pane", "terminal_id"));
-            for execution in shared.borrow().executions().filter(|execution| {
-                !execution.state.is_terminal()
-                    && (pane_id.as_deref() == Some(execution.pane_id.as_str())
-                        || terminal_id.as_deref() == Some(execution.terminal_id.as_str()))
-            }) {
-                events.push(NormalizedEvent::AgentStatusChanged {
-                    metadata: metadata(session, &received.event),
-                    execution_id: execution.execution_id.clone(),
-                    state: state.clone(),
-                });
+            if let Some(pane_id) = pane_id {
+                events.extend(agent_status_events(
+                    shared,
+                    session,
+                    &pane_id,
+                    terminal_id.as_deref(),
+                    state,
+                    None,
+                ));
             }
         }
         _ => {}
     }
     Ok(events)
+}
+
+fn agent_status_events(
+    shared: &SharedModel,
+    session: &str,
+    pane_id: &str,
+    terminal_id: Option<&str>,
+    state: ExecState,
+    receipt_instants: Option<(i64, i64)>,
+) -> Vec<NormalizedEvent> {
+    let executions: Vec<_> = shared
+        .borrow()
+        .executions()
+        .filter(|execution| {
+            !execution.state.is_terminal()
+                && (execution.pane_id == pane_id
+                    || terminal_id == Some(execution.terminal_id.as_str()))
+                && std::mem::discriminant(&execution.state) != std::mem::discriminant(&state)
+        })
+        .cloned()
+        .collect();
+    executions
+        .into_iter()
+        .map(|execution| {
+            let mut metadata = metadata(session, "pane_agent_status_changed");
+            metadata.pane_id = Some(pane_id.to_owned());
+            metadata.terminal_id = terminal_id.map(str::to_owned);
+            if let Some((timestamp_ms, receipt_time_ms)) = receipt_instants {
+                metadata.timestamp_ms = timestamp_ms;
+                metadata.receipt_time_ms = receipt_time_ms;
+            }
+            NormalizedEvent::AgentStatusChanged {
+                metadata,
+                execution_id: execution.execution_id,
+                state: state.clone(),
+            }
+        })
+        .collect()
 }
 
 fn append_pane_move(
@@ -3932,14 +4588,20 @@ fn subscriptions() -> Vec<Subscription> {
         "pane.moved",
         "pane.exited",
         "pane.agent_detected",
-        // Herdr 0.8.0 requires pane.agent_status_changed to carry a non-null pane_id;
-        // requesting it unscoped rejects the whole subscription. Agent status still flows
-        // through full pane.updated payloads; pane-scoped subscriptions are a follow-up.
+        // Pane-scoped status events ride the isolated enrichment connection. Keeping them off
+        // this primary stream preserves its gap and convergence semantics.
         "layout.updated",
     ]
     .into_iter()
     .map(Subscription::new)
     .collect()
+}
+
+fn enrichment_subscriptions(pane_ids: &BTreeSet<String>) -> Vec<Subscription> {
+    pane_ids
+        .iter()
+        .map(|pane_id| Subscription::for_pane("pane.agent_status_changed", pane_id))
+        .collect()
 }
 
 fn topology_upsert(session: &str, kind: &str, entity: TopologyEntity) -> NormalizedEvent {
@@ -4879,7 +5541,7 @@ mod tests {
         DurabilityDisposition, PersistenceFailure, PersistenceFailureCode, PersistenceOperation,
         PersistencePhase,
     };
-    use crate::store::{open_writer, spawn_writer};
+    use crate::store::{PersistExecution, PersistTaskRun, open_writer, spawn_writer};
 
     #[derive(Default)]
     struct RecordingOccurrenceSink {
@@ -4934,6 +5596,298 @@ mod tests {
             .await
             .expect("writer shutdown timed out")
             .unwrap();
+    }
+
+    async fn wait_for_attempts(attempts: &AtomicUsize, expected: usize, context: &str) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while attempts.load(Ordering::Acquire) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{context}: observed {} attempts, expected at least {expected}",
+                attempts.load(Ordering::Acquire)
+            )
+        });
+    }
+
+    async fn wait_for_quality(
+        quality: &mut watch::Receiver<ObservationQuality>,
+        expected: ObservationQuality,
+        context: &str,
+    ) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if *quality.borrow_and_update() == expected {
+                    return;
+                }
+                quality
+                    .changed()
+                    .await
+                    .expect("collector quality publisher closed before the expected transition");
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{context}: quality did not become {expected:?}"));
+    }
+
+    async fn accept_wire_request(
+        listener: &tokio::net::UnixListener,
+    ) -> (tokio::io::BufReader<tokio::net::UnixStream>, Value) {
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .expect("fake Herdr listener timed out waiting for a connection")
+            .expect("fake Herdr listener failed to accept a connection");
+        let mut reader = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line))
+            .await
+            .expect("fake Herdr listener timed out reading a request")
+            .expect("fake Herdr listener failed to read a request");
+        let request = serde_json::from_str(&line).expect("collector sent malformed request JSON");
+        (reader, request)
+    }
+
+    async fn write_wire_frame(
+        reader: &mut tokio::io::BufReader<tokio::net::UnixStream>,
+        frame: &Value,
+    ) {
+        let mut bytes = serde_json::to_vec(frame).expect("fake Herdr response did not serialize");
+        bytes.push(b'\n');
+        tokio::time::timeout(Duration::from_secs(3), reader.get_mut().write_all(&bytes))
+            .await
+            .expect("fake Herdr listener timed out writing a response")
+            .expect("fake Herdr listener failed to write a response");
+    }
+
+    async fn wait_for_wire_peer_close(reader: &mut tokio::io::BufReader<tokio::net::UnixStream>) {
+        let mut line = String::new();
+        let bytes_read = tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line))
+            .await
+            .expect("fake Herdr listener timed out waiting for peer close")
+            .expect("fake Herdr listener failed while waiting for peer close");
+        assert_eq!(
+            bytes_read, 0,
+            "collector sent an unexpected second request frame"
+        );
+    }
+
+    async fn write_malformed_wire_event(reader: &mut tokio::io::BufReader<tokio::net::UnixStream>) {
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            reader.get_mut().write_all(b"not-json\n"),
+        )
+        .await
+        .expect("fake Herdr listener timed out writing a malformed event")
+        .expect("fake Herdr listener failed to write a malformed event");
+    }
+
+    async fn wait_for_server_cancellation(cancellation: &CancellationToken) {
+        tokio::time::timeout(Duration::from_secs(3), cancellation.cancelled())
+            .await
+            .expect("fake Herdr server did not receive cancellation");
+    }
+
+    async fn join_fake_server(server: JoinHandle<()>, context: &str) {
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap_or_else(|_| panic!("{context}: fake Herdr server did not stop"))
+            .expect("fake Herdr server task panicked");
+    }
+
+    struct PrimaryCollectorHarness {
+        cancellation: CancellationToken,
+        task: JoinHandle<Result<(), CollectorError>>,
+        provider_events: mpsc::Sender<ProviderIngressEvent>,
+        ignored_provider_events: mpsc::Receiver<ProviderEvent>,
+        provider_thread: ProviderThreadHandle,
+        lifecycle: crate::store::WriterLifecycle,
+        source_quality: watch::Receiver<ObservationQuality>,
+        log_path: PathBuf,
+    }
+
+    impl PrimaryCollectorHarness {
+        async fn stop(self) -> String {
+            let Self {
+                cancellation,
+                task,
+                provider_events,
+                ignored_provider_events,
+                provider_thread,
+                lifecycle,
+                source_quality: _,
+                log_path,
+            } = self;
+            cancellation.cancel();
+            drop(provider_events);
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .expect("primary collector did not stop after cancellation")
+                .expect("primary collector task panicked")
+                .expect("primary collector returned an error");
+            tokio::time::timeout(Duration::from_secs(3), provider_thread.stop())
+                .await
+                .expect("provider thread did not stop")
+                .unwrap();
+            drop(ignored_provider_events);
+            shutdown_writer(lifecycle).await;
+            std::fs::read_to_string(log_path).expect("failed to read primary collector log")
+        }
+    }
+
+    fn spawn_primary_collector_harness(
+        directory: &tempfile::TempDir,
+        socket: PathBuf,
+        log_name: &str,
+    ) -> PrimaryCollectorHarness {
+        let log_path = directory.path().join(log_name);
+        let log = std::fs::File::create(&log_path).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(log)
+            .finish();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let restored = store.load_restored_state().unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (reducer, shared) = Reducer::new(restored);
+        let initial_coverage = SourceCoverageRegistry::new(SourceAvailability::NotApplicable);
+        let (coverage_sender, _source_coverage) = watch::channel(initial_coverage.clone());
+        let (source_quality_sender, source_quality) =
+            watch::channel(ObservationQuality::Reconciling);
+        let coverage = CoverageTracker::new(
+            SourceAvailability::NotApplicable,
+            coverage_sender,
+            source_quality_sender,
+        );
+        let (persistence, _diagnostics) = RuntimePersistence::new(
+            writer,
+            &shared.borrow(),
+            &initial_coverage,
+            Arc::new(RecordingOccurrenceSink::default()),
+        );
+
+        let provider_diagnostics = crate::provider::ProviderDiagnostics::default();
+        let (ignored_events, ignored_provider_events) = mpsc::channel(1);
+        let provider_thread = spawn_provider_thread_with_diagnostics(
+            AdapterProviderWorker::new(Vec::new(), provider_diagnostics.clone()),
+            ignored_events,
+            None,
+            provider_diagnostics,
+        )
+        .unwrap();
+        let (provider_events, provider_receiver) = mpsc::channel(1);
+        let provider = ProviderIntegration::new(
+            provider_receiver,
+            provider_thread.target_publisher(),
+            TargetSet::default(),
+            coverage,
+        );
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let (performance, _sampler) =
+            performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
+        let task = tokio::spawn(
+            run_collector(
+                socket,
+                "health-edge-session".to_owned(),
+                persistence,
+                reducer,
+                shared,
+                performance,
+                task_cancellation,
+                OwnerTracker::from_environment(),
+                None,
+                provider,
+            )
+            .with_subscriber(subscriber),
+        );
+
+        PrimaryCollectorHarness {
+            cancellation,
+            task,
+            provider_events,
+            ignored_provider_events,
+            provider_thread,
+            lifecycle,
+            source_quality,
+            log_path,
+        }
+    }
+
+    struct EnrichmentReaderHarness {
+        cancellation: CancellationToken,
+        task: JoinHandle<()>,
+        targets: watch::Sender<BTreeSet<String>>,
+        events: mpsc::Receiver<EnrichmentPayload>,
+        prunes: mpsc::UnboundedReceiver<EnrichmentPrune>,
+        log_path: PathBuf,
+    }
+
+    impl EnrichmentReaderHarness {
+        async fn stop(self) -> String {
+            let Self {
+                cancellation,
+                task,
+                targets,
+                events,
+                prunes,
+                log_path,
+            } = self;
+            cancellation.cancel();
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .expect("enrichment reader did not stop after cancellation")
+                .expect("enrichment reader task panicked");
+            drop(targets);
+            drop(events);
+            drop(prunes);
+            std::fs::read_to_string(log_path).expect("failed to read enrichment reader log")
+        }
+    }
+
+    fn spawn_enrichment_reader_harness(
+        directory: &tempfile::TempDir,
+        socket: PathBuf,
+        log_name: &str,
+    ) -> EnrichmentReaderHarness {
+        let log_path = directory.path().join(log_name);
+        let log = std::fs::File::create(&log_path).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(log)
+            .finish();
+        let (targets, target_receiver) = watch::channel(BTreeSet::from(["pane-1".to_owned()]));
+        let (sender, events) = mpsc::channel(ENRICHMENT_QUEUE_CAPACITY);
+        let (prune_sender, prunes) = mpsc::unbounded_channel();
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(
+            run_enrichment_reader(
+                socket,
+                target_receiver,
+                sender,
+                prune_sender,
+                EnrichmentDiagnosticsHandle::default(),
+                Arc::new(EnrichmentHealth::default()),
+                task_cancellation,
+            )
+            .with_subscriber(subscriber),
+        );
+        EnrichmentReaderHarness {
+            cancellation,
+            task,
+            targets,
+            events,
+            prunes,
+            log_path,
+        }
     }
 
     fn target_performance_inputs() -> (DomainModel, OperatorSnapshot, usize) {
@@ -5857,6 +6811,1121 @@ mod tests {
         );
     }
 
+    async fn capture_primary_subscribe_recovery(log_name: &str) -> String {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (allow_success, success_allowed) = tokio::sync::oneshot::channel();
+        let mut harness = spawn_primary_collector_harness(&directory, socket, log_name);
+        let server_cancellation = harness.cancellation.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut reader, request) = accept_wire_request(&listener).await;
+                write_wire_frame(
+                    &mut reader,
+                    &json!({
+                        "id": request["id"],
+                        "error": {"code": "unavailable", "message": "temporarily offline"},
+                    }),
+                )
+                .await;
+            }
+            let (mut reader, request) = accept_wire_request(&listener).await;
+            tokio::time::timeout(Duration::from_secs(3), success_allowed)
+                .await
+                .expect("primary recovery success was not allowed")
+                .expect("primary recovery success gate was dropped");
+            write_wire_frame(
+                &mut reader,
+                &json!({
+                    "id": request["id"],
+                    "result": {"type": "subscription_started"},
+                }),
+            )
+            .await;
+            wait_for_server_cancellation(&server_cancellation).await;
+        });
+
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Disconnected,
+            "primary failure edge",
+        )
+        .await;
+        allow_success
+            .send(())
+            .expect("primary recovery server stopped before success was allowed");
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Reconciling,
+            "primary recovery publication barrier",
+        )
+        .await;
+        let contents = harness.stop().await;
+        join_fake_server(server, "primary recovery").await;
+        contents
+    }
+
+    #[tokio::test]
+    async fn a3_primary_subscribe_failures_warn_once_across_three_retries() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut reader, request) = accept_wire_request(&listener).await;
+                assert_eq!(request["method"], "events.subscribe");
+                write_wire_frame(
+                    &mut reader,
+                    &json!({
+                        "id": request["id"],
+                        "result": {"type": "not_subscription_started"},
+                    }),
+                )
+                .await;
+                wait_for_wire_peer_close(&mut reader).await;
+                server_attempts.fetch_add(1, Ordering::Release);
+            }
+        });
+        let harness =
+            spawn_primary_collector_harness(&directory, socket, "primary-failures-once.log");
+
+        wait_for_attempts(&attempts, 3, "primary subscribe failures").await;
+        let contents = harness.stop().await;
+        join_fake_server(server, "primary subscribe failures").await;
+
+        assert_eq!(
+            contents
+                .matches("warning_code=\"herdr_subscription_failed\"")
+                .count(),
+            1,
+            "primary subscribe failures must log once per failed edge: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a3_primary_decorated_server_rejection_warns_once_and_keeps_retrying() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut reader, request) = accept_wire_request(&listener).await;
+                assert_eq!(request["method"], "events.subscribe");
+                let request_id = request["id"]
+                    .as_str()
+                    .expect("subscribe request id was not a string");
+                write_wire_frame(
+                    &mut reader,
+                    &json!({
+                        "id": format!("{request_id}:pane-1"),
+                        "error": {
+                            "code": "pane_not_found",
+                            "message": "pane pane-1 not found",
+                        },
+                    }),
+                )
+                .await;
+                wait_for_wire_peer_close(&mut reader).await;
+                server_attempts.fetch_add(1, Ordering::Release);
+            }
+        });
+        let harness =
+            spawn_primary_collector_harness(&directory, socket, "primary-server-rejection.log");
+
+        wait_for_attempts(&attempts, 3, "decorated server rejection retries").await;
+        let contents = harness.stop().await;
+        join_fake_server(server, "decorated server rejection retries").await;
+
+        assert!(
+            attempts.load(Ordering::Acquire) >= 3,
+            "collector did not continue retrying after WireError::Server"
+        );
+        assert!(
+            contents.contains("warning_code=\"herdr_subscription_failed\""),
+            "decorated server rejection did not log the warning code: {contents}"
+        );
+        assert!(
+            contents.contains("herdr server error pane_not_found: pane pane-1 not found"),
+            "decorated server rejection did not log WireError::Server Display: {contents}"
+        );
+        assert_eq!(
+            contents
+                .matches("warning_code=\"herdr_subscription_failed\"")
+                .count(),
+            1,
+            "decorated server rejections must log once while retries continue: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a3_primary_subscribe_recovery_logs_one_notice() {
+        let contents = capture_primary_subscribe_recovery("primary-recovery.log").await;
+
+        assert_eq!(
+            contents
+                .matches("notice_code=\"herdr_subscription_recovered\"")
+                .count(),
+            1,
+            "primary failed-to-healthy transition must log one recovery notice: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a3_recovery_notice_survives_production_warn_level_cap() {
+        let contents = capture_primary_subscribe_recovery("primary-warn-level-recovery.log").await;
+
+        assert_eq!(
+            contents
+                .matches("notice_code=\"herdr_subscription_recovered\"")
+                .count(),
+            1,
+            "the recovery notice must survive the production WARN level cap: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a3_enrichment_unextractable_rejections_warn_once_across_three_retries() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut reader, request) = accept_wire_request(&listener).await;
+                write_wire_frame(
+                    &mut reader,
+                    &json!({
+                        "id": request["id"],
+                        "error": {
+                            "code": "pane_not_found",
+                            "message": "missing pane without a parseable id",
+                        },
+                    }),
+                )
+                .await;
+                wait_for_wire_peer_close(&mut reader).await;
+                server_attempts.fetch_add(1, Ordering::Release);
+            }
+        });
+        let harness = spawn_enrichment_reader_harness(
+            &directory,
+            socket,
+            "enrichment-unextractable-rejection.log",
+        );
+
+        wait_for_attempts(&attempts, 3, "unextractable enrichment rejections").await;
+        let contents = harness.stop().await;
+        join_fake_server(server, "unextractable enrichment rejections").await;
+
+        assert_eq!(
+            contents
+                .matches("warning_code=\"herdr_enrichment_subscription_failed\"")
+                .count(),
+            1,
+            "unextractable enrichment rejections must log once per failed edge: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a3_enrichment_generic_subscribe_failures_warn_once_across_three_retries() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut reader, request) = accept_wire_request(&listener).await;
+                write_wire_frame(
+                    &mut reader,
+                    &json!({
+                        "id": request["id"],
+                        "error": {"code": "busy", "message": "try again"},
+                    }),
+                )
+                .await;
+                wait_for_wire_peer_close(&mut reader).await;
+                server_attempts.fetch_add(1, Ordering::Release);
+            }
+        });
+        let harness =
+            spawn_enrichment_reader_harness(&directory, socket, "enrichment-generic-failure.log");
+
+        wait_for_attempts(&attempts, 3, "generic enrichment subscribe failures").await;
+        let contents = harness.stop().await;
+        join_fake_server(server, "generic enrichment subscribe failures").await;
+
+        assert_eq!(
+            contents
+                .matches("warning_code=\"herdr_enrichment_subscription_failed\"")
+                .count(),
+            1,
+            "generic enrichment failures must log once per failed edge: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a3_enrichment_subscribe_recovery_logs_one_notice() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mut harness = spawn_enrichment_reader_harness(
+            &directory,
+            socket,
+            "enrichment-subscribe-recovery.log",
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut reader, request) = accept_wire_request(&listener).await;
+                write_wire_frame(
+                    &mut reader,
+                    &json!({
+                        "id": request["id"],
+                        "error": {"code": "busy", "message": "try again"},
+                    }),
+                )
+                .await;
+            }
+            let (mut reader, request) = accept_wire_request(&listener).await;
+            write_wire_frame(
+                &mut reader,
+                &json!({
+                    "id": request["id"],
+                    "result": {"type": "subscription_started"},
+                }),
+            )
+            .await;
+            write_wire_frame(
+                &mut reader,
+                &json!({
+                    "event": "pane_agent_status_changed",
+                    "data": {
+                        "pane_id": "pane-1",
+                        "terminal_id": "terminal-1",
+                        "agent_status": "working",
+                    },
+                }),
+            )
+            .await;
+            wait_for_server_cancellation(&server_cancellation).await;
+        });
+
+        let payload = tokio::time::timeout(Duration::from_secs(3), harness.events.recv())
+            .await
+            .expect("enrichment recovery event was not delivered")
+            .expect("enrichment recovery event channel closed");
+        assert_eq!(payload.pane_id, "pane-1");
+        let contents = harness.stop().await;
+        join_fake_server(server, "enrichment subscribe recovery").await;
+
+        assert_eq!(
+            contents
+                .matches("notice_code=\"herdr_enrichment_subscription_recovered\"")
+                .count(),
+            1,
+            "enrichment failed-to-healthy subscribe transition must log one notice: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a3_enrichment_subscription_health_persists_across_reader_generations() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = Arc::new(tokio::net::UnixListener::bind(&socket).unwrap());
+        let log_path = directory.path().join("enrichment-cross-generation.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(log)
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let health = Arc::new(EnrichmentHealth::default());
+
+        let first_attempts = Arc::new(AtomicUsize::new(0));
+        let first_server_attempts = Arc::clone(&first_attempts);
+        let first_listener = Arc::clone(&listener);
+        let first_cancellation = CancellationToken::new();
+        let first_server_cancellation = first_cancellation.clone();
+        let first_server = tokio::spawn(async move {
+            let (mut reader, request) = accept_wire_request(&first_listener).await;
+            write_wire_frame(
+                &mut reader,
+                &json!({
+                    "id": request["id"],
+                    "error": {"code": "busy", "message": "generation one outage"},
+                }),
+            )
+            .await;
+            wait_for_wire_peer_close(&mut reader).await;
+            first_server_attempts.fetch_add(1, Ordering::Release);
+            first_server_cancellation.cancel();
+        });
+        let (first_targets, first_target_receiver) =
+            watch::channel(BTreeSet::from(["pane-1".to_owned()]));
+        let (first_sender, first_events) = mpsc::channel(ENRICHMENT_QUEUE_CAPACITY);
+        let (first_prune_sender, first_prunes) = mpsc::unbounded_channel();
+        let first_task_cancellation = first_cancellation.clone();
+        let first_task = tokio::spawn(
+            run_enrichment_reader(
+                socket.clone(),
+                first_target_receiver,
+                first_sender,
+                first_prune_sender,
+                EnrichmentDiagnosticsHandle::default(),
+                Arc::clone(&health),
+                first_task_cancellation,
+            )
+            .with_subscriber(dispatch.clone()),
+        );
+
+        wait_for_attempts(&first_attempts, 1, "first enrichment reader generation").await;
+        tokio::time::timeout(Duration::from_secs(3), first_task)
+            .await
+            .expect("first enrichment reader generation did not stop")
+            .expect("first enrichment reader generation panicked");
+        join_fake_server(first_server, "first enrichment reader generation").await;
+        drop(first_targets);
+        drop(first_events);
+        drop(first_prunes);
+
+        let second_attempts = Arc::new(AtomicUsize::new(0));
+        let second_server_attempts = Arc::clone(&second_attempts);
+        let second_listener = Arc::clone(&listener);
+        let second_cancellation = CancellationToken::new();
+        let second_server_cancellation = second_cancellation.clone();
+        let second_server = tokio::spawn(async move {
+            let (mut failed_reader, failed_request) = accept_wire_request(&second_listener).await;
+            write_wire_frame(
+                &mut failed_reader,
+                &json!({
+                    "id": failed_request["id"],
+                    "error": {"code": "busy", "message": "generation two outage"},
+                }),
+            )
+            .await;
+            wait_for_wire_peer_close(&mut failed_reader).await;
+            second_server_attempts.fetch_add(1, Ordering::Release);
+
+            let (mut recovered_reader, recovered_request) =
+                accept_wire_request(&second_listener).await;
+            write_wire_frame(
+                &mut recovered_reader,
+                &json!({
+                    "id": recovered_request["id"],
+                    "result": {"type": "subscription_started"},
+                }),
+            )
+            .await;
+            write_wire_frame(
+                &mut recovered_reader,
+                &json!({
+                    "event": "pane_agent_status_changed",
+                    "data": {
+                        "pane_id": "pane-1",
+                        "terminal_id": "terminal-1",
+                        "agent_status": "working",
+                    },
+                }),
+            )
+            .await;
+            wait_for_server_cancellation(&second_server_cancellation).await;
+        });
+        let (second_targets, second_target_receiver) =
+            watch::channel(BTreeSet::from(["pane-1".to_owned()]));
+        let (second_sender, mut second_events) = mpsc::channel(ENRICHMENT_QUEUE_CAPACITY);
+        let (second_prune_sender, second_prunes) = mpsc::unbounded_channel();
+        let second_task_cancellation = second_cancellation.clone();
+        let second_task = tokio::spawn(
+            run_enrichment_reader(
+                socket,
+                second_target_receiver,
+                second_sender,
+                second_prune_sender,
+                EnrichmentDiagnosticsHandle::default(),
+                Arc::clone(&health),
+                second_task_cancellation,
+            )
+            .with_subscriber(dispatch.clone()),
+        );
+
+        let payload = tokio::time::timeout(Duration::from_secs(3), second_events.recv())
+            .await
+            .expect("later-generation recovery event was not delivered")
+            .expect("later-generation recovery event channel closed");
+        assert_eq!(payload.pane_id, "pane-1");
+        wait_for_attempts(&second_attempts, 1, "second enrichment reader generation").await;
+        second_cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(3), second_task)
+            .await
+            .expect("second enrichment reader generation did not stop")
+            .expect("second enrichment reader generation panicked");
+        join_fake_server(second_server, "second enrichment reader generation").await;
+        drop(second_targets);
+        drop(second_events);
+        drop(second_prunes);
+        drop(dispatch);
+
+        let contents = std::fs::read_to_string(log_path).unwrap();
+        assert!(
+            contents.contains("generation one outage"),
+            "the first generation's uniquely marked log line was lost: {contents}"
+        );
+        assert_eq!(
+            contents
+                .matches("warning_code=\"herdr_enrichment_subscription_failed\"")
+                .count(),
+            1,
+            "a persistent outage must warn once across reader generations: {contents}"
+        );
+        assert_eq!(
+            contents
+                .matches("notice_code=\"herdr_enrichment_subscription_recovered\"")
+                .count(),
+            1,
+            "a later-generation recovery must log one notice: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a3_enrichment_stream_failures_warn_once_across_three_retries() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut reader, request) = accept_wire_request(&listener).await;
+                write_wire_frame(
+                    &mut reader,
+                    &json!({
+                        "id": request["id"],
+                        "result": {"type": "subscription_started"},
+                    }),
+                )
+                .await;
+                write_malformed_wire_event(&mut reader).await;
+                wait_for_wire_peer_close(&mut reader).await;
+                server_attempts.fetch_add(1, Ordering::Release);
+            }
+        });
+        let harness =
+            spawn_enrichment_reader_harness(&directory, socket, "enrichment-stream-failures.log");
+
+        wait_for_attempts(&attempts, 3, "enrichment stream failures").await;
+        let contents = harness.stop().await;
+        join_fake_server(server, "enrichment stream failures").await;
+
+        assert_eq!(
+            contents
+                .matches("warning_code=\"herdr_enrichment_stream_failed\"")
+                .count(),
+            1,
+            "enrichment stream failures must log once per failed edge: {contents}"
+        );
+        assert_eq!(
+            contents
+                .matches("notice_code=\"herdr_enrichment_subscription_recovered\"")
+                .count(),
+            0,
+            "successful subscribes without a preceding failure must not log recovery: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a3_enrichment_clean_stream_eof_warns_once_then_recovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mut harness =
+            spawn_enrichment_reader_harness(&directory, socket, "enrichment-clean-stream-eof.log");
+        let server_cancellation = harness.cancellation.clone();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut reader, request) = accept_wire_request(&listener).await;
+                write_wire_frame(
+                    &mut reader,
+                    &json!({
+                        "id": request["id"],
+                        "result": {"type": "subscription_started"},
+                    }),
+                )
+                .await;
+                reader
+                    .get_mut()
+                    .shutdown()
+                    .await
+                    .expect("fake Herdr listener failed to close the stream cleanly");
+                wait_for_wire_peer_close(&mut reader).await;
+                server_attempts.fetch_add(1, Ordering::Release);
+            }
+
+            let (mut recovered_reader, recovered_request) = accept_wire_request(&listener).await;
+            write_wire_frame(
+                &mut recovered_reader,
+                &json!({
+                    "id": recovered_request["id"],
+                    "result": {"type": "subscription_started"},
+                }),
+            )
+            .await;
+            write_wire_frame(
+                &mut recovered_reader,
+                &json!({
+                    "event": "pane_agent_status_changed",
+                    "data": {
+                        "pane_id": "pane-1",
+                        "terminal_id": "terminal-1",
+                        "agent_status": "working",
+                    },
+                }),
+            )
+            .await;
+            wait_for_server_cancellation(&server_cancellation).await;
+        });
+
+        wait_for_attempts(&attempts, 3, "clean enrichment stream closes").await;
+        let payload = tokio::time::timeout(Duration::from_secs(3), harness.events.recv())
+            .await
+            .expect("valid post-EOF enrichment event was not delivered")
+            .expect("enrichment event channel closed before clean-EOF recovery");
+        assert_eq!(payload.pane_id, "pane-1");
+        let contents = harness.stop().await;
+        join_fake_server(server, "clean enrichment stream EOF recovery").await;
+
+        assert_eq!(
+            contents
+                .matches("warning_code=\"herdr_enrichment_stream_failed\"")
+                .count(),
+            1,
+            "clean enrichment stream closes must warn once per failed edge: {contents}"
+        );
+        assert_eq!(
+            contents
+                .matches("notice_code=\"herdr_enrichment_stream_recovered\"")
+                .count(),
+            1,
+            "the first valid event after clean stream EOF must log one recovery notice: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a3_enrichment_stream_recovery_logs_after_valid_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mut harness =
+            spawn_enrichment_reader_harness(&directory, socket, "enrichment-stream-recovery.log");
+        let server_cancellation = harness.cancellation.clone();
+        let server = tokio::spawn(async move {
+            let (mut failed_reader, failed_request) = accept_wire_request(&listener).await;
+            write_wire_frame(
+                &mut failed_reader,
+                &json!({
+                    "id": failed_request["id"],
+                    "result": {"type": "subscription_started"},
+                }),
+            )
+            .await;
+            write_malformed_wire_event(&mut failed_reader).await;
+            drop(failed_reader);
+
+            let (mut recovered_reader, recovered_request) = accept_wire_request(&listener).await;
+            write_wire_frame(
+                &mut recovered_reader,
+                &json!({
+                    "id": recovered_request["id"],
+                    "result": {"type": "subscription_started"},
+                }),
+            )
+            .await;
+            write_wire_frame(
+                &mut recovered_reader,
+                &json!({
+                    "event": "pane_agent_status_changed",
+                    "data": {
+                        "pane_id": "pane-1",
+                        "terminal_id": "terminal-1",
+                        "agent_status": "working",
+                    },
+                }),
+            )
+            .await;
+            wait_for_server_cancellation(&server_cancellation).await;
+        });
+
+        let payload = tokio::time::timeout(Duration::from_secs(3), harness.events.recv())
+            .await
+            .expect("valid post-failure enrichment event was not delivered")
+            .expect("enrichment event channel closed before stream recovery");
+        assert_eq!(payload.pane_id, "pane-1");
+        let contents = harness.stop().await;
+        join_fake_server(server, "enrichment stream recovery").await;
+
+        assert_eq!(
+            contents
+                .matches("warning_code=\"herdr_enrichment_stream_failed\"")
+                .count(),
+            1,
+            "the initial malformed stream must log one warning: {contents}"
+        );
+        assert_eq!(
+            contents
+                .matches("notice_code=\"herdr_enrichment_stream_recovered\"")
+                .count(),
+            1,
+            "the first valid event after a stream failure must log one recovery notice: {contents}"
+        );
+    }
+
+    #[test]
+    fn health_edge_reports_only_failure_and_recovery_transitions() {
+        let edge = HealthEdge::default();
+
+        assert!(edge.record_failure());
+        assert!(!edge.record_failure());
+        assert!(edge.record_recovery());
+        assert!(!edge.record_recovery());
+    }
+
+    #[test]
+    fn enrichment_deferral_keeps_quiet_reconnect_delay() {
+        let base = tokio::time::Instant::now();
+        let mut deferral = EnrichmentDeferral { first: None };
+
+        assert_eq!(deferral.on_change(base), base + Duration::from_millis(50));
+    }
+
+    #[test]
+    fn enrichment_deferral_clamps_twenty_changes_to_first_change_budget() {
+        let base = tokio::time::Instant::now();
+        let mut deferral = EnrichmentDeferral { first: None };
+        let expected_deadlines_ms = [
+            50, 90, 130, 170, 210, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250,
+            250, 250,
+        ];
+
+        for (index, expected_deadline_ms) in expected_deadlines_ms.into_iter().enumerate() {
+            let now = base + Duration::from_millis(index as u64 * 40);
+            assert_eq!(
+                deferral.on_change(now),
+                base + Duration::from_millis(expected_deadline_ms)
+            );
+        }
+    }
+
+    #[test]
+    fn enrichment_deferral_swap_resets_anchor_and_budget() {
+        let base = tokio::time::Instant::now();
+        let mut deferral = EnrichmentDeferral { first: None };
+        assert_eq!(deferral.on_change(base), base + Duration::from_millis(50));
+        assert_eq!(
+            deferral.on_change(base + Duration::from_millis(400)),
+            base + Duration::from_millis(250)
+        );
+
+        deferral.on_swap();
+        let next = base + Duration::from_millis(800);
+        assert_eq!(deferral.on_change(next), next + Duration::from_millis(50));
+        assert_eq!(
+            deferral.on_change(next + Duration::from_millis(240)),
+            next + Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn enrichment_deferral_empty_target_resets_anchor_and_budget() {
+        let base = tokio::time::Instant::now();
+        let mut deferral = EnrichmentDeferral { first: None };
+        assert_eq!(deferral.on_change(base), base + Duration::from_millis(50));
+        assert_eq!(
+            deferral.on_change(base + Duration::from_millis(400)),
+            base + Duration::from_millis(250)
+        );
+
+        deferral.on_empty();
+        let next = base + Duration::from_millis(800);
+        assert_eq!(deferral.on_change(next), next + Duration::from_millis(50));
+        assert_eq!(
+            deferral.on_change(next + Duration::from_millis(240)),
+            next + Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn enrichment_deferral_reanchors_after_resolved_stream_swap() {
+        let base = tokio::time::Instant::now();
+        let mut deferral = EnrichmentDeferral { first: None };
+        assert_eq!(deferral.on_change(base), base + Duration::from_millis(50));
+        assert_eq!(
+            deferral.on_change(base + Duration::from_millis(600)),
+            base + Duration::from_millis(250)
+        );
+
+        deferral.on_swap();
+        let later_change = base + Duration::from_millis(1_000);
+        assert_eq!(
+            deferral.on_change(later_change),
+            later_change + Duration::from_millis(50)
+        );
+        assert_eq!(
+            deferral.on_change(later_change + Duration::from_millis(400)),
+            later_change + Duration::from_millis(250)
+        );
+    }
+
+    fn status_model(states: &[(&str, ExecState)]) -> SharedModel {
+        let mut model = DomainModel::default();
+        for (index, (execution_id, state)) in states.iter().enumerate() {
+            let run_id = RunId::new();
+            model.insert_task_run(TaskRun {
+                run_id,
+                key: RunKey::Controller(format!("status-run-{index}")),
+                display_ordinal: DisplayOrdinal::new(i64::try_from(index + 1).unwrap()),
+                state: TaskState::Running,
+                has_controller_task_state_event: false,
+            });
+            model.insert_execution(Execution {
+                execution_id: (*execution_id).to_owned(),
+                pane_id: "w1:p1".to_owned(),
+                terminal_id: "terminal-1".to_owned(),
+                task_run_id: run_id,
+                state: state.clone(),
+            });
+        }
+        watch::channel(Arc::new(model)).1
+    }
+
+    fn status_received(status: &str) -> ReceivedEvent {
+        ReceivedEvent {
+            event: "pane_agent_status_changed".to_owned(),
+            data: json!({
+                "pane_id": "w1:p1",
+                "terminal_id": "terminal-1",
+                "agent_status": status,
+            }),
+        }
+    }
+
+    fn inactive_provider_integration() -> (
+        mpsc::Sender<ProviderIngressEvent>,
+        ProviderIntegration,
+        ProviderThreadHandle,
+    ) {
+        let provider_diagnostics = crate::provider::ProviderDiagnostics::default();
+        let (ignored_events, _ignored_receiver) = mpsc::channel(1);
+        let provider_thread = spawn_provider_thread_with_diagnostics(
+            AdapterProviderWorker::new(Vec::new(), provider_diagnostics.clone()),
+            ignored_events,
+            None,
+            provider_diagnostics,
+        )
+        .unwrap();
+        let (provider_sender, provider_events) = mpsc::channel(1);
+        let initial_coverage = SourceCoverageRegistry::default();
+        let (coverage_sender, _source_coverage) = watch::channel(initial_coverage);
+        let (source_quality_sender, _source_quality) =
+            watch::channel(ObservationQuality::Reconciling);
+        let coverage = CoverageTracker::new(
+            SourceAvailability::NotApplicable,
+            coverage_sender,
+            source_quality_sender,
+        );
+        let provider = ProviderIntegration::new(
+            provider_events,
+            provider_thread.target_publisher(),
+            TargetSet::default(),
+            coverage,
+        );
+        (provider_sender, provider, provider_thread)
+    }
+
+    #[test]
+    fn live_status_expands_per_differing_execution_with_distinct_receipt_identity() {
+        let shared = status_model(&[
+            ("live", ExecState::Idle),
+            ("stale", ExecState::Stale { since_ms: 7 }),
+        ]);
+        let normalized = normalize_event(&shared, "status-session", &status_received("working"))
+            .expect("status payload should normalize");
+        assert_eq!(normalized.len(), 2);
+        let mut identities = BTreeSet::new();
+        let mut executions = BTreeSet::new();
+        for event in normalized {
+            let NormalizedEvent::AgentStatusChanged {
+                metadata,
+                execution_id,
+                state,
+            } = event
+            else {
+                panic!("status receipt emitted a non-status event");
+            };
+            assert_eq!(state, ExecState::Working);
+            assert_eq!(metadata.source_event_type, "pane_agent_status_changed");
+            assert_eq!(metadata.pane_id.as_deref(), Some("w1:p1"));
+            assert_eq!(metadata.terminal_id.as_deref(), Some("terminal-1"));
+            assert_eq!(metadata.timestamp_ms, metadata.receipt_time_ms);
+            identities.insert(metadata.event_id);
+            executions.insert(execution_id);
+        }
+        assert_eq!(identities.len(), 2);
+        assert_eq!(
+            executions,
+            BTreeSet::from(["live".to_owned(), "stale".to_owned()])
+        );
+    }
+
+    #[tokio::test]
+    async fn enrichment_payload_persists_distinct_receipt_identity_activity_and_one_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let run_id = RunId::new();
+        let task_run = TaskRun {
+            run_id,
+            key: RunKey::Controller("persisted-status-run".to_owned()),
+            display_ordinal: DisplayOrdinal::new(4),
+            state: TaskState::Running,
+            has_controller_task_state_event: false,
+        };
+        let executions = ["live", "stale"].map(|execution_id| Execution {
+            execution_id: execution_id.to_owned(),
+            pane_id: "w1:p1".to_owned(),
+            terminal_id: "terminal-1".to_owned(),
+            task_run_id: run_id,
+            state: if execution_id == "live" {
+                ExecState::Idle
+            } else {
+                ExecState::Stale { since_ms: 7 }
+            },
+        });
+        store
+            .apply_batch(
+                [
+                    PersistOp::UpsertWorkspace {
+                        workspace: Workspace {
+                            workspace_id: "w1".to_owned(),
+                        },
+                        display_ordinal: DisplayOrdinal::new(1),
+                    },
+                    PersistOp::UpsertTab {
+                        tab: Tab {
+                            tab_id: "w1:t1".to_owned(),
+                            workspace_id: "w1".to_owned(),
+                        },
+                        display_ordinal: DisplayOrdinal::new(2),
+                    },
+                    PersistOp::UpsertPane {
+                        pane: Pane {
+                            pane_id: "w1:p1".to_owned(),
+                            workspace_id: "w1".to_owned(),
+                            tab_id: "w1:t1".to_owned(),
+                            terminal_id: "terminal-1".to_owned(),
+                        },
+                        display_ordinal: DisplayOrdinal::new(3),
+                    },
+                    PersistOp::UpsertTaskRun(PersistTaskRun {
+                        task_run,
+                        native_session: None,
+                        created_at_ms: 1,
+                        updated_at_ms: 1,
+                        finished_at_ms: None,
+                    }),
+                ]
+                .into_iter()
+                .chain(executions.into_iter().map(|execution| {
+                    PersistOp::UpsertExecution(PersistExecution {
+                        execution,
+                        started_at_ms: 1,
+                        updated_at_ms: 1,
+                        ended_at_ms: None,
+                    })
+                }))
+                .collect(),
+            )
+            .unwrap();
+        let restored = store.load_restored_state().unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared, operator) =
+            Reducer::new_with_operator(restored, empty_operator_seed());
+        let (mut persistence, diagnostics) =
+            RuntimePersistence::new_for_test(writer, Arc::new(RecordingOccurrenceSink::default()));
+        let (provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+        let (performance, mut sampler) =
+            performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
+        let before = sampler
+            .sample(&shared.borrow(), &operator.borrow(), 1_900_000_000_222)
+            .admission_high_water;
+        let mut pending = PendingTopologyClosures::default();
+
+        apply_enrichment_payload(
+            &mut reducer,
+            &shared,
+            &mut persistence,
+            "status-session",
+            EnrichmentPayload {
+                pane_id: "w1:p1".to_owned(),
+                terminal_id: Some("terminal-1".to_owned()),
+                state: ExecState::Working,
+                timestamp_ms: 1_900_000_000_111,
+                receipt_time_ms: 1_900_000_000_222,
+            },
+            &BTreeSet::from(["w1:p1".to_owned()]),
+            &performance,
+            &mut pending,
+            &mut provider,
+        )
+        .await
+        .unwrap();
+        assert_eq!(diagnostics.borrow().persistence, PersistenceStatus::Healthy);
+
+        let after = sampler
+            .sample(&shared.borrow(), &operator.borrow(), 1_900_000_000_222)
+            .admission_high_water;
+        assert_eq!(after, before + 1);
+        let activity = operator.borrow();
+        let status_activity = activity
+            .activity
+            .iter()
+            .filter(|item| item.source_event_type == "pane_agent_status_changed")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            status_activity.len(),
+            2,
+            "unexpected operator activity: {:?}",
+            activity.activity
+        );
+        assert!(status_activity.iter().all(|item| {
+            item.source == "herdr"
+                && item.normalized_kind == "agent_status_changed"
+                && item.event_timestamp_ms == 1_900_000_000_111
+                && item.seen_at_ms == 1_900_000_000_222
+        }));
+        assert_ne!(
+            status_activity[0].identity.event_id,
+            status_activity[1].identity.event_id
+        );
+        drop(activity);
+
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+        drop(persistence);
+        shutdown_writer(lifecycle).await;
+        let connection = rusqlite::Connection::open(crate::store::database_path(&root)).unwrap();
+        let rows = connection
+            .prepare(
+                "SELECT event_id, event_timestamp_ms, seen_at_ms, source_event_type FROM events \
+                 ORDER BY event_row_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2, "unexpected persisted rows: {rows:?}");
+        assert_ne!(rows[0].0, rows[1].0);
+        assert!(rows.iter().all(|row| {
+            row.1 == 1_900_000_000_111
+                && row.2 == 1_900_000_000_222
+                && row.3 == "pane_agent_status_changed"
+        }));
+    }
+
+    #[tokio::test]
+    async fn enrichment_payload_cancels_pending_pane_closure_through_application_path() {
+        let restored = RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        };
+        let (mut reducer, shared) = Reducer::new(restored);
+        let (_directory, lifecycle, mut persistence, _diagnostics) =
+            runtime_with_sink(Arc::new(RecordingOccurrenceSink::default()));
+        let (provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+        let (performance, _sampler) =
+            performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
+        let mut pending = PendingTopologyClosures {
+            panes: HashSet::from(["w1:p1".to_owned()]),
+            ..PendingTopologyClosures::default()
+        };
+
+        apply_enrichment_payload(
+            &mut reducer,
+            &shared,
+            &mut persistence,
+            "status-session",
+            EnrichmentPayload {
+                pane_id: "w1:p1".to_owned(),
+                terminal_id: Some("terminal-1".to_owned()),
+                state: ExecState::Working,
+                timestamp_ms: 111,
+                receipt_time_ms: 222,
+            },
+            &BTreeSet::new(),
+            &performance,
+            &mut pending,
+            &mut provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(!pending.panes.contains("w1:p1"));
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+        drop(persistence);
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[test]
+    fn live_status_equal_to_every_execution_emits_nothing() {
+        let shared = status_model(&[
+            ("first", ExecState::Working),
+            ("second", ExecState::Working),
+        ]);
+        let normalized = normalize_event(&shared, "status-session", &status_received("working"))
+            .expect("status payload should normalize");
+        assert!(normalized.is_empty());
+    }
+
+    #[test]
+    fn live_status_filters_each_execution_independently_and_skips_terminal_sibling() {
+        let shared = status_model(&[
+            ("equal", ExecState::Working),
+            ("different", ExecState::Idle),
+            ("terminal", ExecState::Ended),
+        ]);
+        let normalized = normalize_event(&shared, "status-session", &status_received("working"))
+            .expect("status payload should normalize");
+        assert_eq!(normalized.len(), 1);
+        assert!(matches!(
+            &normalized[0],
+            NormalizedEvent::AgentStatusChanged { execution_id, state, .. }
+                if execution_id == "different" && *state == ExecState::Working
+        ));
+        assert_eq!(
+            shared.borrow().execution("terminal").unwrap().state,
+            ExecState::Ended
+        );
+    }
+
     #[tokio::test]
     async fn i4_d3_herdr_disconnect_immediately_refreshes_diagnostics_once() {
         let directory = tempfile::tempdir().unwrap();
@@ -6004,6 +8073,7 @@ mod provider_integration_tests {
             owner: OwnerFreshness::Current,
             persistence_counters: PersistenceCounters::default(),
             controller_counters: crate::diagnostics::ControllerCounterSnapshot::default(),
+            enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
             source_coverage: Vec::new(),
             dangling_announcement_components: 0,
             first_failure_log: OccurrenceLogStatus::NotAttempted,

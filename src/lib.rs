@@ -6,6 +6,7 @@ pub mod activity;
 pub mod diagnostics;
 pub mod doctor;
 pub mod herdr;
+pub mod hook_adapter;
 pub mod identity;
 pub mod lockfile;
 pub mod model;

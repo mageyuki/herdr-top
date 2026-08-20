@@ -153,13 +153,19 @@ pub fn assess_official_integration(
             },
         );
     };
-    let Some(active_version) = normalize_integer(active_version) else {
-        return assessment(
-            None,
-            OfficialIntegrationStatus::Unavailable {
-                reason: OfficialIntegrationUnavailableReason::InvalidActiveVersion,
-            },
-        );
+    let active_version = match classify_active_version(active_version) {
+        Some(ActiveVersionForm::LegacyInteger(active_version)) => active_version,
+        Some(ActiveVersionForm::DateEra(active_version)) => {
+            return assessment(Some(active_version), OfficialIntegrationStatus::Compatible);
+        }
+        None => {
+            return assessment(
+                None,
+                OfficialIntegrationStatus::Unavailable {
+                    reason: OfficialIntegrationUnavailableReason::InvalidActiveVersion,
+                },
+            );
+        }
     };
     if compare_numeric_component(&active_version, minimum).is_lt() {
         return assessment(
@@ -613,6 +619,25 @@ fn normalize_semver_core(value: &str) -> Option<String> {
     Some(components.join("."))
 }
 
+/// Recognized forms of an official integration's active version.
+enum ActiveVersionForm {
+    LegacyInteger(String),
+    DateEra(String),
+}
+
+/// Classifies legacy integer and newer date-era active versions.
+fn classify_active_version(value: &str) -> Option<ActiveVersionForm> {
+    if let Some(integer) = normalize_integer(value) {
+        return Some(ActiveVersionForm::LegacyInteger(integer));
+    }
+    let components: Vec<&str> = value.split('.').collect();
+    let date_era = components.len() >= 2
+        && components
+            .iter()
+            .all(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()));
+    date_era.then(|| ActiveVersionForm::DateEra(value.to_owned()))
+}
+
 fn normalize_integer(value: &str) -> Option<String> {
     if value.is_empty()
         || !value.bytes().all(|byte| byte.is_ascii_digit())
@@ -896,6 +921,53 @@ mod tests {
                 },
             )
         );
+    }
+
+    #[test]
+    fn date_form_active_version_is_compatible_verbatim() {
+        let status = manifest_status(vec![manifest("claude", Some("2026.08.12.1"))]);
+        let a = assess_official_integration(&status, Provider::Claude);
+        assert_eq!(a.status, OfficialIntegrationStatus::Compatible);
+        assert_eq!(a.active_version.as_deref(), Some("2026.08.12.1"));
+    }
+
+    #[test]
+    fn date_form_with_two_components_is_compatible() {
+        let status = manifest_status(vec![manifest("codex", Some("2026.8"))]);
+        let a = assess_official_integration(&status, Provider::Codex);
+        assert_eq!(a.status, OfficialIntegrationStatus::Compatible);
+    }
+
+    #[test]
+    fn legacy_integer_still_compares_against_minimum() {
+        let below = manifest_status(vec![manifest("claude", Some("5"))]);
+        assert!(matches!(
+            assess_official_integration(&below, Provider::Claude).status,
+            OfficialIntegrationStatus::Unavailable {
+                reason: OfficialIntegrationUnavailableReason::BelowMinimum
+            }
+        ));
+        let ok = manifest_status(vec![manifest("claude", Some("7"))]);
+        assert_eq!(
+            assess_official_integration(&ok, Provider::Claude).status,
+            OfficialIntegrationStatus::Compatible
+        );
+    }
+
+    #[test]
+    fn malformed_versions_stay_invalid() {
+        for bad in ["", "v7", "7a", "07", "2026..1", ".1", "1.", "2026.08.x"] {
+            let status = manifest_status(vec![manifest("claude", Some(bad))]);
+            assert!(
+                matches!(
+                    assess_official_integration(&status, Provider::Claude).status,
+                    OfficialIntegrationStatus::Unavailable {
+                        reason: OfficialIntegrationUnavailableReason::InvalidActiveVersion
+                    }
+                ),
+                "{bad:?} must stay invalid"
+            );
+        }
     }
 
     #[test]

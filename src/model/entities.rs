@@ -205,6 +205,13 @@ pub struct ControllerDiagnosticsHandle {
     accept_failures: Arc<AtomicU64>,
 }
 
+/// Reader-shareable atomic counters for the pane-status enrichment stream.
+#[derive(Clone, Debug, Default)]
+pub struct EnrichmentDiagnosticsHandle {
+    channel_full_drops: Arc<AtomicU64>,
+    episode_discards: Arc<AtomicU64>,
+}
+
 /// Provider-I/O counters exposed through coherent domain-model snapshots.
 #[derive(Clone, Debug, Default)]
 pub struct ProviderDiagnostics {
@@ -462,6 +469,36 @@ impl ControllerDiagnosticsHandle {
     #[must_use]
     pub fn socket_saturations(&self) -> u64 {
         self.socket_saturations.load(Ordering::Relaxed)
+    }
+}
+
+impl EnrichmentDiagnosticsHandle {
+    fn increment(counter: &AtomicU64) {
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            Some(value.saturating_add(1))
+        });
+    }
+
+    /// Records one parsed receipt dropped because the enrichment channel was full.
+    pub fn record_channel_full_drop(&self) {
+        Self::increment(&self.channel_full_drops);
+    }
+
+    /// Records one queued receipt discarded outside the Live phase.
+    pub fn record_episode_discard(&self) {
+        Self::increment(&self.episode_discards);
+    }
+
+    /// Returns the process-lifetime full-channel drop count.
+    #[must_use]
+    pub fn channel_full_drops(&self) -> u64 {
+        self.channel_full_drops.load(Ordering::Relaxed)
+    }
+
+    /// Returns the process-lifetime non-Live discard count.
+    #[must_use]
+    pub fn episode_discards(&self) -> u64 {
+        self.episode_discards.load(Ordering::Relaxed)
     }
 }
 

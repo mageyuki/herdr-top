@@ -19,8 +19,8 @@ use crate::diagnostics::remote::{
 };
 use crate::diagnostics::{
     ControllerCounterSnapshot, ControllerInputStatus, ControllerInputUnavailableReason,
-    DiagnosticSource, InputAvailability, OccurrenceLogStatus, OwnerFreshness, PersistenceCounters,
-    RuntimeDiagnosticsSnapshot, SourceCoverageSnapshot,
+    DiagnosticSource, EnrichmentCounterSnapshot, InputAvailability, OccurrenceLogStatus,
+    OwnerFreshness, PersistenceCounters, RuntimeDiagnosticsSnapshot, SourceCoverageSnapshot,
 };
 use crate::herdr::controller;
 use crate::herdr::types::{AgentSessionKind, Pong, Snapshot};
@@ -1455,7 +1455,7 @@ fn parse_runtime_status(response: &Value) -> Option<RuntimeDiagnosticsSnapshot> 
 
 fn parse_runtime_snapshot(value: &Value) -> Option<RuntimeDiagnosticsSnapshot> {
     let object = value.as_object()?;
-    if object.len() != 8 {
+    if object.len() != 9 {
         return None;
     }
     let persistence = parse_persistence_status(object.get("persistence")?)?;
@@ -1467,6 +1467,7 @@ fn parse_runtime_snapshot(value: &Value) -> Option<RuntimeDiagnosticsSnapshot> {
     };
     let persistence_counters = parse_persistence_counters(object.get("persistence_counters")?)?;
     let controller_counters = parse_controller_counters(object.get("controller_counters")?)?;
+    let enrichment_counters = parse_enrichment_counters(object.get("enrichment_counters")?)?;
     let mut source_coverage = object
         .get("source_coverage")?
         .as_array()?
@@ -1493,9 +1494,21 @@ fn parse_runtime_snapshot(value: &Value) -> Option<RuntimeDiagnosticsSnapshot> {
         owner,
         persistence_counters,
         controller_counters,
+        enrichment_counters,
         source_coverage,
         dangling_announcement_components,
         first_failure_log,
+    })
+}
+
+fn parse_enrichment_counters(value: &Value) -> Option<EnrichmentCounterSnapshot> {
+    let object = value.as_object()?;
+    if object.len() != 2 {
+        return None;
+    }
+    Some(EnrichmentCounterSnapshot {
+        channel_full_drops: object.get("channel_full_drops")?.as_u64()?,
+        episode_discards: object.get("episode_discards")?.as_u64()?,
     })
 }
 
@@ -1810,7 +1823,8 @@ mod tests {
         PersistenceCounters, RuntimeDiagnosticsSnapshot,
     };
     use crate::herdr::types::{
-        AgentManifestStatus, AgentSessionInfo, AgentSessionKind, PaneInfo, Pong, Snapshot,
+        AgentManifestInfo, AgentManifestStatus, AgentSessionInfo, AgentSessionKind, PaneInfo, Pong,
+        Snapshot,
     };
     use crate::model::Provider;
     use crate::rendezvous::ControllerRuntimeProbe;
@@ -1823,6 +1837,7 @@ mod tests {
             owner: OwnerFreshness::Current,
             persistence_counters: PersistenceCounters::default(),
             controller_counters: ControllerCounterSnapshot::default(),
+            enrichment_counters: EnrichmentCounterSnapshot::default(),
             source_coverage: Vec::new(),
             dangling_announcement_components: 0,
             first_failure_log: OccurrenceLogStatus::NotAttempted,
@@ -1866,6 +1881,41 @@ mod tests {
             panes,
             layouts: Vec::new(),
             agents: Vec::new(),
+        }
+    }
+
+    fn integration_report(active_version: &str) -> DoctorReportV1 {
+        let manifests = AgentManifestStatus {
+            result_type: "agent_manifest_status".to_owned(),
+            manifests: vec![
+                integration_manifest("claude", active_version),
+                integration_manifest("codex", "5"),
+            ],
+            last_check_unix: None,
+            last_result: None,
+        };
+        let assessments = [Provider::Claude, Provider::Codex]
+            .into_iter()
+            .map(|provider| remote::assess_official_integration(&manifests, provider))
+            .collect::<Vec<_>>();
+        let mut report = canonical_healthy_report_for_test();
+        report.compatibility.integrations = integration_check(&assessments);
+        report.recompute_overall_status();
+        report
+    }
+
+    fn integration_manifest(agent: &str, active_version: &str) -> AgentManifestInfo {
+        AgentManifestInfo {
+            agent: agent.to_owned(),
+            source: "official".to_owned(),
+            source_kind: "remote".to_owned(),
+            local_override_shadowing_remote: false,
+            active_version: Some(active_version.to_owned()),
+            cached_remote_version: None,
+            remote_last_checked_unix: None,
+            remote_update_error: None,
+            remote_update_result: None,
+            warning: None,
         }
     }
 
@@ -1944,6 +1994,72 @@ mod tests {
     }
 
     #[test]
+    fn doctor_renderers_preserve_legacy_integer_integration_version() {
+        let report = integration_report("7");
+        let human = render_human(&report);
+        let integration_line = human
+            .lines()
+            .find(|line| line.starts_with("compatibility.integrations:"))
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&render_json(&report)).unwrap();
+
+        assert!(integration_line.contains("[integrations_current]"));
+        assert!(integration_line.contains(r#""active_version":"7""#));
+        assert_eq!(
+            parsed["compatibility"]["integrations"]["code"],
+            "integrations_current"
+        );
+        assert_eq!(
+            parsed["compatibility"]["integrations"]["observed"][0]["active_version"],
+            "7"
+        );
+    }
+
+    #[test]
+    fn doctor_renderers_preserve_date_form_integration_version() {
+        let report = integration_report("2026.08.12.1");
+        let human = render_human(&report);
+        let integration_line = human
+            .lines()
+            .find(|line| line.starts_with("compatibility.integrations:"))
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&render_json(&report)).unwrap();
+
+        assert!(integration_line.contains("[integrations_current]"));
+        assert!(integration_line.contains(r#""active_version":"2026.08.12.1""#));
+        assert_eq!(
+            parsed["compatibility"]["integrations"]["code"],
+            "integrations_current"
+        );
+        assert_eq!(
+            parsed["compatibility"]["integrations"]["observed"][0]["active_version"],
+            "2026.08.12.1"
+        );
+    }
+
+    #[test]
+    fn doctor_renderers_report_malformed_integration_version_unavailable() {
+        let report = integration_report("07");
+        let human = render_human(&report);
+        let integration_line = human
+            .lines()
+            .find(|line| line.starts_with("compatibility.integrations:"))
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&render_json(&report)).unwrap();
+
+        assert!(integration_line.contains("[integration_version_unavailable]"));
+        assert!(integration_line.contains(r#""active_version":null"#));
+        assert_eq!(
+            parsed["compatibility"]["integrations"]["code"],
+            "integration_version_unavailable"
+        );
+        assert_eq!(
+            parsed["compatibility"]["integrations"]["observed"][0]["active_version"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
     fn i4_doctor_required_optional_not_applicable_exit_matrix() {
         let mut report = canonical_healthy_report_for_test();
         assert_eq!(report.exit_code(), 0);
@@ -1989,6 +2105,27 @@ mod tests {
         let unavailable = controller_runtime_check(ControllerRuntimeProbe::Live, None);
         assert_eq!(unavailable.code, "controller_unavailable");
         assert_ne!(unavailable.code, "controller_live_degraded");
+    }
+
+    #[test]
+    fn runtime_parser_preserves_enrichment_counters() {
+        let mut diagnostics = serde_json::to_value(runtime(PersistenceStatus::Healthy)).unwrap();
+        diagnostics.as_object_mut().unwrap().insert(
+            "enrichment_counters".to_owned(),
+            json!({"channel_full_drops": 7, "episode_discards": 11}),
+        );
+
+        let parsed = parse_runtime_status(&json!({
+            "status": "ok",
+            "schema_version": 1,
+            "diagnostics": diagnostics,
+        }))
+        .expect("the closed runtime parser should accept the enrichment family");
+        let rendered = serde_json::to_value(parsed).unwrap();
+        assert_eq!(
+            rendered["enrichment_counters"],
+            json!({"channel_full_drops": 7, "episode_discards": 11})
+        );
     }
 
     #[test]
