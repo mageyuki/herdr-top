@@ -697,7 +697,7 @@ Then `chmod +x scripts/review-herdr-protocol.sh`.
 - [ ] **Step 6: Run to verify green**
 
 Run: `cargo test --locked --test schema_review_script`
-Expected: 5 passed. Also run the live path once:
+Expected: 19 passed. Also run the live path once:
 `scripts/review-herdr-protocol.sh "$HOME/.local/bin/herdr"` — expected
 "additive or identical", exit 0.
 
