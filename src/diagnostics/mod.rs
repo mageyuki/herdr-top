@@ -104,12 +104,14 @@ pub struct EnrichmentCounterSnapshot {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
 pub struct PrimaryStreamCounterSnapshot {
     pub flat_pane_agent_detected: u64,
+    pub inconclusive_topology_probes: u64,
 }
 
 /// Reader-shareable counters for tolerated primary-stream wire shapes.
 #[derive(Clone, Debug, Default)]
 pub struct PrimaryStreamDiagnosticsHandle {
     flat_pane_agent_detected: Arc<AtomicU64>,
+    inconclusive_topology_probes: Arc<AtomicU64>,
 }
 
 impl PrimaryStreamDiagnosticsHandle {
@@ -122,11 +124,21 @@ impl PrimaryStreamDiagnosticsHandle {
         );
     }
 
+    /// Records one silence probe whose model projection was ambiguous.
+    pub fn record_inconclusive_topology_probe(&self) {
+        let _ = self.inconclusive_topology_probes.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |value| Some(value.saturating_add(1)),
+        );
+    }
+
     /// Returns an immutable copy of the primary-stream counters.
     #[must_use]
     pub fn snapshot(&self) -> PrimaryStreamCounterSnapshot {
         PrimaryStreamCounterSnapshot {
             flat_pane_agent_detected: self.flat_pane_agent_detected.load(Ordering::Relaxed),
+            inconclusive_topology_probes: self.inconclusive_topology_probes.load(Ordering::Relaxed),
         }
     }
 }

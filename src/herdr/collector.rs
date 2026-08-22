@@ -3,10 +3,11 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::ffi::OsStr;
-use std::future::pending;
+use std::future::{Future, pending};
 use std::io;
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1713,6 +1714,7 @@ async fn run_collector(
             &mut controller_requests,
             &mut provider,
             liveness_policy,
+            &primary_stream_diagnostics,
         )
         .await;
 
@@ -1802,6 +1804,7 @@ async fn converge(
     controller_requests: &mut Option<ControllerRequestReceiver>,
     provider: &mut ProviderIntegration,
     liveness_policy: LivenessPolicy,
+    primary_stream_diagnostics: &PrimaryStreamDiagnosticsHandle,
 ) -> Result<ConvergeOutcome, CollectorError> {
     let mut first_generation = true;
     let mut resnapshot_attempts = 0;
@@ -1907,6 +1910,7 @@ async fn converge(
                     controller_requests,
                     provider,
                     liveness_policy,
+                    primary_stream_diagnostics,
                 )
                 .await?
                 {
@@ -1956,6 +1960,7 @@ async fn converge(
                         controller_requests,
                         provider,
                         liveness_policy,
+                        primary_stream_diagnostics,
                     )
                     .await?;
                     return Ok(ConvergeOutcome::new(outcome, !first_generation));
@@ -2073,8 +2078,11 @@ async fn replay_generation(
 
 enum WatchdogProbeOutcome {
     HealthyIdle,
+    Inconclusive,
     Reconnect(WatchdogReconnectReason),
 }
+
+type WatchdogProbeFuture<'a> = Pin<Box<dyn Future<Output = WatchdogProbeOutcome> + Send + 'a>>;
 
 async fn probe_primary_topology(
     sock: &Path,
@@ -2102,7 +2110,7 @@ async fn probe_primary_topology(
         return WatchdogProbeOutcome::Reconnect(WatchdogReconnectReason::ProbeFailed);
     };
     let Some(current) = current_model_topology(shared, &pending_closures) else {
-        return WatchdogProbeOutcome::Reconnect(WatchdogReconnectReason::TopologyDiverged);
+        return WatchdogProbeOutcome::Inconclusive;
     };
     if probe_topology_matches_model(probed, current) {
         WatchdogProbeOutcome::HealthyIdle
@@ -2277,6 +2285,7 @@ async fn monitor_live(
     controller_requests: &mut Option<ControllerRequestReceiver>,
     provider: &mut ProviderIntegration,
     liveness_policy: LivenessPolicy,
+    primary_stream_diagnostics: &PrimaryStreamDiagnosticsHandle,
 ) -> Result<ReplayOutcome, CollectorError> {
     enum LiveReceipt {
         Primary(Admitted<ReceivedEvent>),
@@ -2289,6 +2298,7 @@ async fn monitor_live(
     stale_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     stale_sweep.tick().await;
     let mut watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
+    let mut watchdog_probe: Option<WatchdogProbeFuture<'_>> = None;
     let mut enrichment_events_open = true;
     let mut enrichment_prunes_open = true;
     loop {
@@ -2338,20 +2348,34 @@ async fn monitor_live(
                 enrichment.apply_prune(prune);
                 continue;
             },
-            probe = probe_primary_topology(
-                sock,
-                shared,
-                pending_closures.clone(),
-                liveness_policy,
-            ),
-                if Instant::now() >= watchdog_deadline => LiveReceipt::Probe(probe),
-            () = tokio::time::sleep_until(watchdog_deadline),
-                if Instant::now() < watchdog_deadline => continue,
+            probe = async {
+                match watchdog_probe.as_mut() {
+                    Some(probe) => probe.await,
+                    None => pending().await,
+                }
+            } => LiveReceipt::Probe(probe),
+            () = tokio::time::sleep_until(watchdog_deadline), if watchdog_probe.is_none() => {
+                watchdog_probe = Some(Box::pin(probe_primary_topology(
+                    sock,
+                    shared,
+                    pending_closures.clone(),
+                    liveness_policy,
+                )));
+                continue;
+            },
             _ = stale_sweep.tick() => LiveReceipt::Sweep,
         };
         match received {
             LiveReceipt::Probe(WatchdogProbeOutcome::HealthyIdle) => {
+                watchdog_probe = None;
                 tracing::debug!("silent Herdr event subscription passed its topology probe");
+                watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
+                continue;
+            }
+            LiveReceipt::Probe(WatchdogProbeOutcome::Inconclusive) => {
+                watchdog_probe = None;
+                primary_stream_diagnostics.record_inconclusive_topology_probe();
+                tracing::debug!("silent Herdr event subscription topology probe was inconclusive");
                 watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
                 continue;
             }
@@ -2390,6 +2414,7 @@ async fn monitor_live(
                 continue;
             }
             LiveReceipt::Primary(received) => {
+                watchdog_probe = None;
                 watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
                 let (received, admission) = received.into_parts();
                 let target_delta = enrichment_target_delta(&received, shared);
@@ -2431,11 +2456,19 @@ async fn monitor_reconciling(
     controller_requests: &mut Option<ControllerRequestReceiver>,
     provider: &mut ProviderIntegration,
     liveness_policy: LivenessPolicy,
+    primary_stream_diagnostics: &PrimaryStreamDiagnosticsHandle,
 ) -> Result<SubscriptionOutcome, CollectorError> {
+    enum ReconcilingReceipt {
+        Primary(Admitted<ReceivedEvent>),
+        Probe(WatchdogProbeOutcome),
+        Sweep,
+    }
+
     let mut stale_sweep = tokio::time::interval(STALE_SWEEP_INTERVAL);
     stale_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     stale_sweep.tick().await;
     let mut watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
+    let mut watchdog_probe: Option<WatchdogProbeFuture<'_>> = None;
     loop {
         enrichment.discard_episode_payloads();
         let received = tokio::select! {
@@ -2466,50 +2499,66 @@ async fn monitor_reconciling(
                 continue;
             }
             received = events.recv() => match received {
-                Some(received) => {
-                    watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
-                    Some(received)
-                },
+                Some(received) => ReconcilingReceipt::Primary(received),
                 None => return Ok(SubscriptionOutcome::Ended),
             },
-            probe = probe_primary_topology(
-                sock,
-                shared,
-                pending_closures.clone(),
-                liveness_policy,
-            ),
-                if Instant::now() >= watchdog_deadline => match probe {
-                    WatchdogProbeOutcome::HealthyIdle => {
-                        tracing::debug!(
-                            "silent reconciling Herdr subscription passed its topology probe"
-                        );
-                        watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
-                        continue;
-                    }
-                    WatchdogProbeOutcome::Reconnect(reason) => {
-                        return Ok(SubscriptionOutcome::WatchdogReconnect(reason));
-                    }
-                },
-            () = tokio::time::sleep_until(watchdog_deadline),
-                if Instant::now() < watchdog_deadline => continue,
-            _ = stale_sweep.tick() => None,
+            probe = async {
+                match watchdog_probe.as_mut() {
+                    Some(probe) => probe.await,
+                    None => pending().await,
+                }
+            } => ReconcilingReceipt::Probe(probe),
+            () = tokio::time::sleep_until(watchdog_deadline), if watchdog_probe.is_none() => {
+                watchdog_probe = Some(Box::pin(probe_primary_topology(
+                    sock,
+                    shared,
+                    pending_closures.clone(),
+                    liveness_policy,
+                )));
+                continue;
+            },
+            _ = stale_sweep.tick() => ReconcilingReceipt::Sweep,
         };
-        let Some(received) = received else {
-            let mut persist = reducer.sweep_stale(unix_now_ms());
-            persist.extend(apply_pending_topology_closures(
-                reducer,
-                shared,
-                session,
-                pending_closures,
-            )?);
-            if !persist.is_empty() {
-                let _ = persist_submission(persistence, reducer, persist).await?;
-                provider.publish_targets(shared);
+        let received = match received {
+            ReconcilingReceipt::Probe(WatchdogProbeOutcome::HealthyIdle) => {
+                watchdog_probe = None;
+                tracing::debug!("silent reconciling Herdr subscription passed its topology probe");
+                provider.set_herdr_quality(ObservationQuality::Live, persistence, shared);
+                watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
+                continue;
             }
-            let _ = persistence.cleanup(unix_now_ms()).await?;
-            persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
-            continue;
+            ReconcilingReceipt::Probe(WatchdogProbeOutcome::Inconclusive) => {
+                watchdog_probe = None;
+                primary_stream_diagnostics.record_inconclusive_topology_probe();
+                tracing::debug!(
+                    "silent reconciling Herdr subscription topology probe was inconclusive"
+                );
+                watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
+                continue;
+            }
+            ReconcilingReceipt::Probe(WatchdogProbeOutcome::Reconnect(reason)) => {
+                return Ok(SubscriptionOutcome::WatchdogReconnect(reason));
+            }
+            ReconcilingReceipt::Sweep => {
+                let mut persist = reducer.sweep_stale(unix_now_ms());
+                persist.extend(apply_pending_topology_closures(
+                    reducer,
+                    shared,
+                    session,
+                    pending_closures,
+                )?);
+                if !persist.is_empty() {
+                    let _ = persist_submission(persistence, reducer, persist).await?;
+                    provider.publish_targets(shared);
+                }
+                let _ = persistence.cleanup(unix_now_ms()).await?;
+                persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
+                continue;
+            }
+            ReconcilingReceipt::Primary(received) => received,
         };
+        watchdog_probe = None;
+        watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
         let (received, admission) = received.into_parts();
         let target_delta = enrichment_target_delta(&received, shared);
         apply_received_event(
@@ -6181,6 +6230,7 @@ mod tests {
         cancellation: CancellationToken,
         task: JoinHandle<Result<(), CollectorError>>,
         model: SharedModel,
+        primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle,
         provider_events: mpsc::Sender<ProviderIngressEvent>,
         ignored_provider_events: mpsc::Receiver<ProviderEvent>,
         provider_thread: ProviderThreadHandle,
@@ -6195,6 +6245,7 @@ mod tests {
                 cancellation,
                 task,
                 model: _,
+                primary_stream_diagnostics: _,
                 provider_events,
                 ignored_provider_events,
                 provider_thread,
@@ -6290,6 +6341,8 @@ mod tests {
         let (performance, _sampler) =
             performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
         let task_model = shared.clone();
+        let primary_stream_diagnostics = PrimaryStreamDiagnosticsHandle::default();
+        let task_primary_stream_diagnostics = primary_stream_diagnostics.clone();
         let task = tokio::spawn(
             run_collector(
                 socket,
@@ -6303,7 +6356,7 @@ mod tests {
                 None,
                 provider,
                 liveness_policy,
-                PrimaryStreamDiagnosticsHandle::default(),
+                task_primary_stream_diagnostics,
             )
             .with_subscriber(subscriber),
         );
@@ -6312,6 +6365,7 @@ mod tests {
             cancellation,
             task,
             model: shared,
+            primary_stream_diagnostics,
             provider_events,
             ignored_provider_events,
             provider_thread,
@@ -7540,9 +7594,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn watchdog_probe_rejects_ambiguous_live_executions_until_reconciliation() {
-        let topology = watchdog_probe_topology(Some("claude"), None);
+    #[tokio::test]
+    async fn watchdog_probe_treats_ambiguous_live_executions_as_inconclusive_until_reconciliation()
+    {
+        let topology = watchdog_probe_topology(
+            Some("claude"),
+            Some((
+                AgentSessionReferenceKind::Id,
+                "herdr:claude",
+                "watchdog-session",
+            )),
+        );
         let mut model = DomainModel::default();
         model.insert_workspace(topology.workspaces[0].clone());
         model.insert_tab(topology.tabs[0].clone());
@@ -7569,10 +7631,28 @@ mod tests {
             event_ledger: Vec::new(),
         });
 
-        assert!(
-            current_model_topology(&shared, &PendingTopologyClosures::default()).is_none(),
-            "ambiguous live executions must force a reconciling reconnect"
-        );
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("ambiguous-projection.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut reader, request) = accept_wire_request(&listener).await;
+                write_wire_frame(
+                    &mut reader,
+                    &watchdog_snapshot_frame(&request, false, "claude"),
+                )
+                .await;
+            }
+        });
+
+        let ambiguous = probe_primary_topology(
+            &socket,
+            &shared,
+            PendingTopologyClosures::default(),
+            LivenessPolicy { timeout_ms: 500 },
+        )
+        .await;
+        assert!(matches!(ambiguous, WatchdogProbeOutcome::Inconclusive));
 
         let _ = reducer
             .reconcile_gap(ReconcileBatch {
@@ -7580,10 +7660,15 @@ mod tests {
                 gap_kind: GapKind::Reconnect,
             })
             .unwrap();
-        assert!(
-            current_model_topology(&shared, &PendingTopologyClosures::default()).is_some(),
-            "successful gap reconciliation must collapse ambiguity"
-        );
+        let reconciled = probe_primary_topology(
+            &socket,
+            &shared,
+            PendingTopologyClosures::default(),
+            LivenessPolicy { timeout_ms: 500 },
+        )
+        .await;
+        assert!(matches!(reconciled, WatchdogProbeOutcome::HealthyIdle));
+        join_fake_server(server, "ambiguous projection probes").await;
     }
 
     fn watchdog_snapshot_frame(
@@ -7637,6 +7722,28 @@ mod tests {
         })
     }
 
+    fn watchdog_ambiguous_snapshot_frame(request: &Value) -> Value {
+        let mut frame = watchdog_snapshot_frame(request, false, "claude");
+        frame["result"]["snapshot"]["panes"]
+            .as_array_mut()
+            .expect("watchdog snapshot panes must be an array")
+            .push(json!({
+                "pane_id": "w1:p4",
+                "terminal_id": "terminal-4",
+                "workspace_id": "w1",
+                "tab_id": "w1:t1",
+                "agent": "codex",
+                "agent_status": "working",
+                "agent_session": {
+                    "source": "herdr:codex",
+                    "agent": "codex",
+                    "kind": "id",
+                    "value": "ambiguous-watchdog-session",
+                },
+            }));
+        frame
+    }
+
     fn primary_subscription_is_scoped(request: &Value) -> bool {
         request["params"]["subscriptions"]
             .as_array()
@@ -7665,17 +7772,18 @@ mod tests {
         let socket = directory.path().join("idle-herdr.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let (probes_sender, probes_receiver) = tokio::sync::oneshot::channel();
+        let liveness_policy = LivenessPolicy { timeout_ms: 400 };
         let mut harness = spawn_primary_collector_harness_with_policy(
             &directory,
             socket,
             "idle-watchdog.log",
-            LivenessPolicy { timeout_ms: 400 },
+            liveness_policy,
         );
         let server_cancellation = harness.cancellation.clone();
         let primary_subscriptions = Arc::new(AtomicUsize::new(0));
         let observed_primary_subscriptions = Arc::clone(&primary_subscriptions);
         let server = tokio::spawn(async move {
-            let mut snapshots = 0;
+            let mut snapshot_instants = Vec::new();
             let mut probes_sender = Some(probes_sender);
             let mut held_streams = Vec::new();
             loop {
@@ -7699,16 +7807,16 @@ mod tests {
                         held_streams.push(reader);
                     }
                     Some("session.snapshot") => {
-                        snapshots += 1;
+                        snapshot_instants.push(Instant::now());
                         write_wire_frame(
                             &mut reader,
                             &watchdog_snapshot_frame(&request, false, "claude-code"),
                         )
                         .await;
-                        if snapshots == 3
+                        if snapshot_instants.len() == 3
                             && let Some(sender) = probes_sender.take()
                         {
-                            sender.send(()).unwrap();
+                            sender.send(snapshot_instants.clone()).unwrap();
                         }
                     }
                     method => panic!("unexpected idle watchdog request: {method:?}"),
@@ -7729,10 +7837,16 @@ mod tests {
             .query_row("PRAGMA data_version", [], |row| row.get(0))
             .unwrap();
 
-        tokio::time::timeout(Duration::from_secs(3), probes_receiver)
+        let snapshot_instants = tokio::time::timeout(Duration::from_secs(3), probes_receiver)
             .await
             .expect("matching idle snapshot probes did not run twice")
             .expect("idle snapshot probe observer was dropped");
+        assert_eq!(snapshot_instants.len(), 3);
+        assert!(
+            snapshot_instants[2].duration_since(snapshot_instants[1])
+                >= liveness_timeout(&liveness_policy),
+            "consecutive probes were not separated by a freshly stamped deadline"
+        );
 
         assert_eq!(primary_subscriptions.load(Ordering::Acquire), 1);
         assert_eq!(*harness.source_quality.borrow(), ObservationQuality::Live);
@@ -7761,6 +7875,194 @@ mod tests {
         assert!(
             !contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
             "healthy idle subscription emitted a watchdog warning: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_matching_probe_recovers_live_quality_after_dirty_replays() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("dirty-replays-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (matched_sender, matched_receiver) = tokio::sync::oneshot::channel();
+        let mut harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "dirty-replays-watchdog.log",
+            LivenessPolicy { timeout_ms: 100 },
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let server = tokio::spawn(async move {
+            let mut snapshots = 0;
+            let mut matched_sender = Some(matched_sender);
+            let mut primary_stream = None;
+            let mut held_streams = Vec::new();
+            loop {
+                let (mut reader, request) = tokio::select! {
+                    () = server_cancellation.cancelled() => break,
+                    accepted = accept_wire_request(&listener) => accepted,
+                };
+                match request["method"].as_str() {
+                    Some("events.subscribe") => {
+                        write_wire_frame(
+                            &mut reader,
+                            &json!({
+                                "id": request["id"],
+                                "result": {"type": "subscription_started"},
+                            }),
+                        )
+                        .await;
+                        if primary_subscription_is_scoped(&request) {
+                            held_streams.push(reader);
+                        } else {
+                            assert!(
+                                primary_stream.replace(reader).is_none(),
+                                "dirty replay test unexpectedly reconnected"
+                            );
+                        }
+                    }
+                    Some("session.snapshot") => {
+                        snapshots += 1;
+                        write_wire_frame(
+                            &mut reader,
+                            &watchdog_snapshot_frame(&request, false, "claude"),
+                        )
+                        .await;
+                        if snapshots <= RESNAPSHOT_ATTEMPTS + 1 {
+                            let primary_stream = primary_stream
+                                .as_mut()
+                                .expect("snapshot arrived before the primary subscription");
+                            write_wire_frame(
+                                primary_stream,
+                                &json!({
+                                    "event": "pane_focused",
+                                    "data": {"pane_id": format!("missing-pane-{snapshots}")},
+                                }),
+                            )
+                            .await;
+                        } else if snapshots == RESNAPSHOT_ATTEMPTS + 2
+                            && let Some(sender) = matched_sender.take()
+                        {
+                            sender.send(()).unwrap();
+                        }
+                    }
+                    method => panic!("unexpected dirty replay watchdog request: {method:?}"),
+                }
+            }
+            drop(primary_stream);
+            drop(held_streams);
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), matched_receiver)
+            .await
+            .expect("reconciling watchdog probe did not receive a matching snapshot")
+            .expect("matching reconciling probe observer was dropped");
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "matching reconciling watchdog probe",
+        )
+        .await;
+
+        let contents = harness.stop().await;
+        join_fake_server(server, "dirty replay watchdog recovery").await;
+        assert!(
+            !contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            "matching reconciling probe emitted a watchdog warning: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_repeated_ambiguous_probes_do_not_reconnect_or_record_gaps() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let socket = directory.path().join("ambiguous-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (probed_sender, probed_receiver) = tokio::sync::oneshot::channel();
+        let harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "ambiguous-watchdog.log",
+            LivenessPolicy { timeout_ms: 100 },
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let primary_subscriptions = Arc::new(AtomicUsize::new(0));
+        let observed_primary_subscriptions = Arc::clone(&primary_subscriptions);
+        let server = tokio::spawn(async move {
+            let mut snapshots = 0;
+            let mut probed_sender = Some(probed_sender);
+            let mut held_streams = Vec::new();
+            loop {
+                let (mut reader, request) = tokio::select! {
+                    () = server_cancellation.cancelled() => break,
+                    accepted = accept_wire_request(&listener) => accepted,
+                };
+                match request["method"].as_str() {
+                    Some("events.subscribe") => {
+                        write_wire_frame(
+                            &mut reader,
+                            &json!({
+                                "id": request["id"],
+                                "result": {"type": "subscription_started"},
+                            }),
+                        )
+                        .await;
+                        if !primary_subscription_is_scoped(&request) {
+                            observed_primary_subscriptions.fetch_add(1, Ordering::Release);
+                        }
+                        held_streams.push(reader);
+                    }
+                    Some("session.snapshot") => {
+                        snapshots += 1;
+                        write_wire_frame(&mut reader, &watchdog_ambiguous_snapshot_frame(&request))
+                            .await;
+                        if snapshots == 4
+                            && let Some(sender) = probed_sender.take()
+                        {
+                            sender.send(()).unwrap();
+                        }
+                    }
+                    method => panic!("unexpected ambiguous watchdog request: {method:?}"),
+                }
+            }
+            drop(held_streams);
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), probed_receiver)
+            .await
+            .expect("ambiguous topology was not probed repeatedly")
+            .expect("ambiguous probe observer was dropped");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while harness
+                .primary_stream_diagnostics
+                .snapshot()
+                .inconclusive_topology_probes
+                < 3
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ambiguous topology probes did not increment their diagnostic counter");
+        assert_eq!(
+            harness
+                .primary_stream_diagnostics
+                .snapshot()
+                .inconclusive_topology_probes,
+            3
+        );
+        assert_eq!(
+            primary_subscriptions.load(Ordering::Acquire),
+            1,
+            "inconclusive probes must keep the primary subscription alive"
+        );
+        assert_eq!(reconnect_gap_count(&root), 0);
+
+        let contents = harness.stop().await;
+        join_fake_server(server, "ambiguous watchdog probes").await;
+        assert_eq!(reconnect_gap_count(&root), 0, "collector log: {contents}");
+        assert!(
+            !contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            "inconclusive probes emitted a watchdog warning: {contents}"
         );
     }
 
@@ -7965,6 +8267,127 @@ mod tests {
         let contents = harness.stop().await;
         join_fake_server(server, "dead watchdog reconnect").await;
         assert_eq!(reconnect_gap_count(&root), 1, "collector log: {contents}");
+    }
+
+    #[tokio::test]
+    async fn watchdog_nonresponsive_probe_times_out_reconnects_and_records_one_gap() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let socket = directory.path().join("nonresponsive-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (reconnected_sender, reconnected_receiver) = tokio::sync::oneshot::channel();
+        let harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "nonresponsive-watchdog.log",
+            LivenessPolicy { timeout_ms: 120 },
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let pulse_cancellation = harness.cancellation.clone();
+        let provider_events = harness.provider_events.clone();
+        let pulse = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(25));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    () = pulse_cancellation.cancelled() => break,
+                    _ = interval.tick() => {
+                        let event = ProviderIngressEvent {
+                            event: ProviderEvent::SourceState {
+                                provider: Provider::Claude,
+                                state: ProviderSourceState::NotApplicable,
+                            },
+                            admission: None,
+                        };
+                        let sent = tokio::time::timeout(
+                            Duration::from_secs(1),
+                            provider_events.send(event),
+                        )
+                        .await;
+                        if !matches!(sent, Ok(Ok(()))) {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let server = tokio::spawn(async move {
+            let mut primary_subscriptions = 0;
+            let mut snapshots = 0;
+            let mut reconnected_sender = Some(reconnected_sender);
+            let mut held_streams = Vec::new();
+            let mut nonresponsive_probes = Vec::new();
+            loop {
+                let (mut reader, request) = tokio::select! {
+                    () = server_cancellation.cancelled() => break,
+                    accepted = accept_wire_request(&listener) => accepted,
+                };
+                match request["method"].as_str() {
+                    Some("events.subscribe") => {
+                        write_wire_frame(
+                            &mut reader,
+                            &json!({
+                                "id": request["id"],
+                                "result": {"type": "subscription_started"},
+                            }),
+                        )
+                        .await;
+                        if !primary_subscription_is_scoped(&request) {
+                            primary_subscriptions += 1;
+                            if primary_subscriptions == 2
+                                && let Some(sender) = reconnected_sender.take()
+                            {
+                                sender.send(()).unwrap();
+                            }
+                        }
+                        held_streams.push(reader);
+                    }
+                    Some("session.snapshot") => {
+                        snapshots += 1;
+                        if snapshots == 2 && primary_subscriptions == 1 {
+                            nonresponsive_probes.push(reader);
+                        } else {
+                            write_wire_frame(
+                                &mut reader,
+                                &watchdog_snapshot_frame(&request, false, "claude"),
+                            )
+                            .await;
+                        }
+                    }
+                    method => panic!("unexpected nonresponsive watchdog request: {method:?}"),
+                }
+            }
+            drop(nonresponsive_probes);
+            drop(held_streams);
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), reconnected_receiver)
+            .await
+            .expect("nonresponsive snapshot probe did not time out and reconnect")
+            .expect("nonresponsive reconnect observer was dropped");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while reconnect_gap_count(&root) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("nonresponsive probe reconnect did not record a gap");
+
+        let contents = harness.stop().await;
+        tokio::time::timeout(Duration::from_secs(3), pulse)
+            .await
+            .expect("provider pulse task did not stop")
+            .expect("provider pulse task panicked");
+        join_fake_server(server, "nonresponsive watchdog reconnect").await;
+        assert_eq!(reconnect_gap_count(&root), 1, "collector log: {contents}");
+        assert!(
+            contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            "nonresponsive subscription did not emit the watchdog warning: {contents}"
+        );
+        assert!(
+            contents.contains("reason=\"snapshot_probe_failed\""),
+            "nonresponsive warning did not report probe failure: {contents}"
+        );
     }
 
     async fn capture_primary_subscribe_recovery(log_name: &str) -> String {
