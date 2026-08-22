@@ -1757,6 +1757,8 @@ impl Reducer {
         Ok(run_id)
     }
 
+    /// Resolves an alias/native key first, then unanimous agent-node evidence from
+    /// non-provisional owners; ambiguous claims remain unresolved.
     fn run_for_native_session(&self, provider: Provider, sid: &str) -> Option<RunId> {
         let key = RunKey::Native {
             provider,
@@ -1773,7 +1775,12 @@ impl Reducer {
                 node.provider == provider
                     && node.native_session_id.as_deref() == Some(sid)
                     && self.model.task_run(&node.task_run_id).is_some_and(|run| {
-                        matches!(run.key, RunKey::Controller(_) | RunKey::Native { .. })
+                        matches!(
+                            run.key,
+                            RunKey::Controller(_)
+                                | RunKey::Native { .. }
+                                | RunKey::NativePath { .. }
+                        )
                     })
             })
             .map(|node| node.task_run_id);
@@ -2603,6 +2610,146 @@ mod tests {
             finished_at_ms: None,
             subject: None,
             dismissed_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn run_for_native_session_resolves_registered_native_alias() {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            run_id,
+            RunKey::Controller("controller-run".to_owned()),
+            1,
+            TaskState::Queued,
+        ));
+        model.insert_task_run_alias(
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "aliased-sid".to_owned(),
+            },
+            run_id,
+        );
+        let (reducer, _shared) = Reducer::new(restored(model, 2));
+
+        assert_eq!(
+            reducer.run_for_native_session(Provider::Codex, "aliased-sid"),
+            Some(run_id)
+        );
+    }
+
+    #[test]
+    fn run_for_native_session_resolves_native_key() {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "native-sid".to_owned(),
+            },
+            1,
+            TaskState::Queued,
+        ));
+        let (reducer, _shared) = Reducer::new(restored(model, 2));
+
+        assert_eq!(
+            reducer.run_for_native_session(Provider::Codex, "native-sid"),
+            Some(run_id)
+        );
+    }
+
+    #[test]
+    fn run_for_native_session_resolves_native_path_owner_agent_node() {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            run_id,
+            RunKey::NativePath {
+                provider: Provider::Codex,
+                path: "/tmp/native-path-owner.jsonl".to_owned(),
+            },
+            1,
+            TaskState::Queued,
+        ));
+        model.insert_agent_node(native_agent_node(
+            "native-path-owner",
+            "native-path-sid",
+            run_id,
+            2,
+        ));
+        let (reducer, _shared) = Reducer::new(restored(model, 3));
+
+        assert_eq!(
+            reducer.run_for_native_session(Provider::Codex, "native-path-sid"),
+            Some(run_id)
+        );
+    }
+
+    #[test]
+    fn run_for_native_session_rejects_ambiguous_agent_node_claims() {
+        let first_run_id = RunId::new();
+        let second_run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            first_run_id,
+            RunKey::NativePath {
+                provider: Provider::Codex,
+                path: "/tmp/first-owner.jsonl".to_owned(),
+            },
+            1,
+            TaskState::Queued,
+        ));
+        model.insert_task_run(run(
+            second_run_id,
+            RunKey::NativePath {
+                provider: Provider::Codex,
+                path: "/tmp/second-owner.jsonl".to_owned(),
+            },
+            2,
+            TaskState::Queued,
+        ));
+        model.insert_agent_node(native_agent_node(
+            "first-owner",
+            "ambiguous-sid",
+            first_run_id,
+            3,
+        ));
+        model.insert_agent_node(native_agent_node(
+            "second-owner",
+            "ambiguous-sid",
+            second_run_id,
+            4,
+        ));
+        let (reducer, _shared) = Reducer::new(restored(model, 5));
+
+        assert_eq!(
+            reducer.run_for_native_session(Provider::Codex, "ambiguous-sid"),
+            None
+        );
+    }
+
+    fn native_agent_node(
+        agent_node_id: &str,
+        native_session_id: &str,
+        task_run_id: RunId,
+        ordinal: i64,
+    ) -> AgentNode {
+        AgentNode {
+            agent_node_id: agent_node_id.to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some(native_session_id.to_owned()),
+            task_run_id,
+            display_ordinal: DisplayOrdinal::new(ordinal),
+            parent_agent_node_id: None,
+            state: None,
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
         }
     }
 
