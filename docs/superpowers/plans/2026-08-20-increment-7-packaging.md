@@ -517,10 +517,11 @@ git commit -m "feat(herdr): tolerate additive fields on every inbound wire surfa
   `$schema`, `protocol` (= 20), `schema_version`, `schemas`, `title`
   (verified live; ~255 KB).
 - Produces: the baseline consumed by every future reviewed-set extension;
-  script contract `review-herdr-protocol.sh (--candidate-file FILE | HERDR_BINARY)`
-  with exit 0 = additive or identical, 1 = review required (removed
-  key-paths, or an already-reviewed protocol whose schema is not
-  byte-identical after canonicalization), 2 = extraction/parse failure.
+  script contract `review-herdr-protocol.sh (--candidate-file SCHEMA_JSON |
+  HERDR_BINARY)` with exit 0 = additive or identical, 1 = review required
+  (removed or changed schema records, or an already-reviewed protocol whose
+  canonicalized document differs from the baseline), and 2 = extraction,
+  parse, or invalid-input failure.
 
 - [ ] **Step 1: Generate the baseline**
 
@@ -649,73 +650,47 @@ Expected: FAIL (script does not exist).
 
 - [ ] **Step 5: Write `scripts/review-herdr-protocol.sh`**
 
-```bash
-#!/usr/bin/env bash
-# Compares a candidate herdr bundled API schema against the committed
-# baseline and reports the key-path delta. Gate for extending
-# REVIEWED_HERDR_PROTOCOLS (src/diagnostics/remote.rs).
-#
-# Usage:
-#   scripts/review-herdr-protocol.sh --candidate-file SCHEMA_JSON
-#   scripts/review-herdr-protocol.sh HERDR_BINARY
-#
-# Exit codes: 0 additive or identical; 1 review required (removed key-paths,
-# or an already-reviewed protocol whose canonicalized schema differs from the
-# baseline); 2 extraction or parse failure.
-set -euo pipefail
+The canonical implementation is `scripts/review-herdr-protocol.sh`. This plan
+intentionally does not duplicate its script body, so the plan and executable
+cannot drift. The script accepts either `--candidate-file SCHEMA_JSON` or a
+`HERDR_BINARY` path; the binary form runs `<binary> api schema --json`, and no
+argument is an input error.
 
-repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-baseline="$repo_root/tests/fixtures/herdr-schema/baseline.json"
+Before comparing, it exports `LC_ALL=C` so `sort` and `comm` use the same byte
+collation (some UTF-8 locales make `comm` reject `sort`'s own output). It reads
+the candidate and baseline protocols and requires both to match
+`^[0-9]+$` before any Bash arithmetic comparison, failing closed on malformed
+or attacker-controlled values.
 
-candidate_json=""
-case ${1-} in
-  --candidate-file)
-    [[ $# -eq 2 ]] || { echo "error: --candidate-file needs a path" >&2; exit 2; }
-    candidate_json=$(cat -- "$2" 2>/dev/null) || { echo "error: cannot read $2" >&2; exit 2; }
-    ;;
-  "")
-    echo "error: pass --candidate-file FILE or a herdr binary path" >&2; exit 2
-    ;;
-  *)
-    candidate_json=$("$1" api schema --json 2>/dev/null) || { echo "error: schema extraction from $1 failed" >&2; exit 2; }
-    ;;
-esac
+The comparison unit is a schema record. For every JSON path, the script emits
+`<path>` TAB `type:<jq type>`. It also emits `<path>` TAB `value:<json>` for
+every non-array, non-object value except top-level `.protocol`, whose value is
+compared explicitly so a legitimate protocol bump does not appear to remove a
+record. For every array member that is itself an object or array, it emits
+`<path>` TAB `member:<canonical json>` for the whole member. Record paths
+render every array index as `[]`, so a member's position is not part of its
+records; together with the sorted multiset comparison, this makes reordering
+array members invisible. Recursive object-key sorting instead normalizes key
+order inside each member's JSON, so differing key order does not create a
+difference. Index elision can produce identical records, so every record in the
+sorted stream receives a trailing `occurrence:N` suffix, numbered per distinct
+record text (first instance `occurrence:1`, repeats `occurrence:2`, and so on),
+and this per-record numbering makes the comparison a multiset comparison. Thus
+removal of one of several identical records is detected while document record
+order is ignored.
 
-paths_of() {
-  jq -r '[paths | map(if type == "number" then "[]" else tostring end) | join(".")] | unique | .[]' <<<"$1" 2>/dev/null
-}
+Added and removed records come from `comm -13` and `comm -23` over the sorted
+multisets. The script prints `added schema records:` and
+`removed schema records:` counts followed by each nonempty record list. A
+displayed record longer than 200 characters is shortened to its first 200
+characters plus `...`; comparison always uses the full record.
 
-candidate_protocol=$(jq -er '.protocol' <<<"$candidate_json" 2>/dev/null) || { echo "error: candidate has no protocol field" >&2; exit 2; }
-baseline_json=$(cat -- "$baseline") || { echo "error: baseline missing" >&2; exit 2; }
-baseline_protocol=$(jq -er '.protocol' <<<"$baseline_json")
-
-candidate_paths=$(paths_of "$candidate_json") || { echo "error: candidate is not valid JSON" >&2; exit 2; }
-baseline_paths=$(paths_of "$baseline_json")
-
-added=$(comm -13 <(sort <<<"$baseline_paths") <(sort <<<"$candidate_paths"))
-removed=$(comm -23 <(sort <<<"$baseline_paths") <(sort <<<"$candidate_paths"))
-
-echo "baseline protocol:  $baseline_protocol"
-echo "candidate protocol: $candidate_protocol"
-echo "added key-paths:    $(grep -c . <<<"$added" || true)"
-echo "removed key-paths:  $(grep -c . <<<"$removed" || true)"
-[[ -z $added ]] || { echo "--- added ---"; echo "$added"; }
-[[ -z $removed ]] || { echo "--- removed ---"; echo "$removed"; }
-
-if [[ -n $removed ]]; then
-  echo "verdict: REVIEW REQUIRED (removed key-paths)" >&2
-  exit 1
-fi
-if [[ $candidate_protocol -le $baseline_protocol ]]; then
-  # Already-reviewed protocol: the whole document must be identical after
-  # canonicalization (key-path sets are blind to value/type changes).
-  if [[ "$(jq -S . <<<"$candidate_json")" != "$(jq -S . <<<"$baseline_json")" ]]; then
-    echo "verdict: REVIEW REQUIRED (reviewed protocol drifted from baseline)" >&2
-    exit 1
-  fi
-fi
-echo "verdict: additive or identical"
-```
+Exit 0 means additive or identical. Exit 1 means review is required because a
+schema record was removed or changed, or because a candidate protocol less
+than or equal to the baseline protocol has a different canonicalized whole
+document. Exit 2 means extraction, parsing, or input validation failed,
+including an unreadable candidate file, binary extraction failure, missing
+baseline, invalid JSON, or a missing or non-integer protocol.
 
 Then `chmod +x scripts/review-herdr-protocol.sh`.
 
@@ -1277,9 +1252,9 @@ gh api repos/actions/download-artifact/git/ref/tags/v4 --jq '.object.sha'
 pinned download-artifact version still declares the `merge-multiple` input
 (`gh api repos/actions/download-artifact/contents/action.yml?ref=<sha>`).
 
-- [ ] **Step 2: Write `.github/workflows/release.yml`** (replace the three
-  `<PINNED-*-SHA>` placeholders with the values from Step 1 — they are the
-  only permitted substitutions):
+- [ ] **Step 2: Write `.github/workflows/release.yml`** (reproduce the block
+  exactly, replacing only the three `<PINNED-*-SHA>` placeholders with the
+  values from Step 1):
 
 ```yaml
 name: release
@@ -1385,7 +1360,7 @@ jobs:
           name: SHA256SUMS
           path: artifacts/SHA256SUMS
       - name: Draft release (tags only)
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -1401,10 +1376,12 @@ Design notes anchored in verified facts: the repository is public, so the
 `ubuntu-24.04-arm` hosted runner is available; `macos-15` is an arm64 image
 and the x64 image is `macos-15-intel`, so each Apple leg builds and smokes
 NATIVELY (no cross-compilation, no Rosetta dependency); `--verify-tag`
-prevents releasing an unpushed tag; nothing is published on
-`workflow_dispatch` runs; write permission is scoped to the release job. The
-per-leg smoke verifies packaging/extraction against a self-computed checksum,
-so it is NOT checksum-path validation — the unit test
+prevents releasing an unpushed tag; the draft-release step requires both a
+`push` event and a tag ref, so `workflow_dispatch` never creates a release,
+even when dispatched against a tag ref (for example,
+`gh workflow run release --ref v0.1.1`); write permission is scoped to the
+release job. The per-leg smoke verifies packaging/extraction against a
+self-computed checksum, so it is NOT checksum-path validation — the unit test
 `i7_checksum_mismatch_fails_and_installs_nothing_and_keeps_the_source`
 covers that. The `macos-15-intel` label is exercised for the first time by
 the Phase R dry run; if GitHub rejects it, stop and re-plan that leg rather

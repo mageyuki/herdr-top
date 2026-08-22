@@ -191,14 +191,45 @@ Review tooling:
    reviewed protocol: the bundled socket-API JSON schema of the herdr release
    that introduced it (herdr 0.8.2, protocol 20), plus a small manifest noting
    version, protocol, and extraction provenance.
-2. `scripts/review-herdr-protocol.sh` extracts the bundled schema from a
-   candidate herdr binary (the extraction mechanism must be re-verified
-   against the installed herdr 0.8.2 during planning — it is an external
-   fact), diffs its key-path set against the committed baseline, prints added
-   and removed key-paths, and exits nonzero when any key-path is removed or
-   when the candidate protocol is already reviewed but its schema differs from
-   the baseline. Intended procedure when herdr ships protocol N+1: run the
-   script, review the reported delta, then in one change add N+1 to
+2. `scripts/review-herdr-protocol.sh` accepts either
+   `--candidate-file SCHEMA_JSON` or a herdr binary path; the binary form runs
+   `<binary> api schema --json`, and no argument is an input error. Before
+   comparison it exports `LC_ALL=C`, ensuring that `sort` and `comm` agree on
+   byte collation even where a UTF-8 locale would make `comm` reject `sort`'s
+   output. Candidate and baseline `protocol` values must both match
+   `^[0-9]+$`; malformed or attacker-controlled values therefore fail closed
+   before Bash arithmetic.
+
+   The script compares schema-record multisets. At every JSON path it emits
+   `<path>` TAB `type:<jq type>` and, for non-array, non-object values,
+   `<path>` TAB `value:<json>`. Top-level `.protocol` is excluded from value
+   records because it is compared explicitly and a legitimate bump must not
+   appear to remove a record. Every array member that is itself an object or
+   array also produces `<path>` TAB `member:<canonical json>` for the whole
+   member. Record paths render every array index as `[]`, so a member's
+   position is not part of its records; together with the sorted multiset
+   comparison, this makes member reordering invisible. Recursive object-key
+   sorting instead normalizes key order inside each member's JSON, so differing
+   key order does not create a difference. Index elision can produce identical
+   records, so every record in the sorted stream receives a trailing
+   `occurrence:N` suffix, numbered per distinct record text (first instance
+   `occurrence:1`, repeats `occurrence:2`, and so on); this per-record numbering
+   makes the comparison a multiset comparison, so record order is ignored but
+   removing one of several identical records is detected.
+
+   Added and removed sets are produced with `comm -13` and `comm -23`. The
+   script prints `added schema records:` and `removed schema records:` counts
+   and their nonempty record lists. Records longer than 200 characters are
+   truncated to the first 200 characters plus `...` for display only; the full
+   records are compared. Exit 0 means additive or identical. Exit 1 requires
+   review for removed or changed records, or when a candidate protocol less
+   than or equal to the baseline protocol has a different canonicalized whole
+   document. Exit 2 covers extraction, parse, and invalid-input failures:
+   unreadable candidate files, binary extraction failure, missing baseline,
+   invalid JSON, and missing or non-integer protocols.
+
+   Intended procedure when herdr ships protocol N+1: run the script, review
+   the reported delta, then in one change add N+1 to
    `REVIEWED_HERDR_PROTOCOLS`, update the baseline fixture, and record the
    review in the commit.
 3. Additive-tolerance pins covering BOTH inbound surfaces, because tier 3's
@@ -257,7 +288,7 @@ binary versions, which continue to match).
 2. The release workflow publishes nothing when any leg fails; a draft release
    is only created when all four archives and `SHA256SUMS` exist.
 3. `review-herdr-protocol.sh` treats schema extraction failure as a hard error
-   distinct from "removed key-paths found", with distinct exit codes.
+   distinct from "removed schema records found", with distinct exit codes.
 4. The doctor Warning tier changes no runtime behavior; degraded and error
    paths of the collector are untouched by this increment.
 
@@ -274,7 +305,7 @@ binary versions, which continue to match).
    fixtures updated for the observation addition and the new Warning code.
 3. The additive-tolerance pin test (component 4).
 4. `review-herdr-protocol.sh` self-check: baseline vs itself reports no
-   removals and exits zero; a mutated copy with a removed key-path exits
+   removals and exits zero; a mutated copy with a removed schema record exits
    nonzero (exercised by a repository test or CI step).
 5. The release workflow dry run (`workflow_dispatch`) is the integration test
    for component 1, and every matrix leg's local-source install smoke is the
