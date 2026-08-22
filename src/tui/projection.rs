@@ -188,18 +188,21 @@ pub(crate) fn project_rows(
 }
 
 fn next_live_duration_expiry_ms(model: &DomainModel, rows: &[TreeRow], now_ms: i64) -> Option<i64> {
-    rows.iter()
+    let renders_live_duration = rows
+        .iter()
         .filter_map(|row| row.key.run_id())
         .filter_map(|run_id| model.task_run(&run_id))
         .filter(|run| !run.state.is_terminal())
         .filter_map(|run| run.created_at_ms)
         .filter_map(|created_at_ms| now_ms.checked_sub(created_at_ms))
-        .filter(|elapsed_ms| *elapsed_ms >= 0)
-        .filter_map(|elapsed_ms| {
-            let until_next_second_ms = 1_000 - elapsed_ms.rem_euclid(1_000);
-            now_ms.checked_add(until_next_second_ms)
-        })
-        .min()
+        .any(|elapsed_ms| elapsed_ms >= 0);
+    if !renders_live_duration {
+        return None;
+    }
+
+    now_ms
+        .checked_sub(now_ms.rem_euclid(1_000))?
+        .checked_add(1_000)
 }
 
 fn retain_tree_matches(rows: &[TreeRow], direct: &[usize]) -> Vec<TreeRow> {
@@ -1098,6 +1101,46 @@ mod tests {
     }
 
     #[test]
+    fn hook_only_and_live_duration_deadlines_choose_the_minimum_in_both_directions() {
+        let mut hook_only = run("hook-only", 1, TaskState::Running);
+        hook_only.created_at_ms = Some(0);
+        hook_only.updated_at_ms = Some(1);
+        let mut model = DomainModel::default();
+        model.insert_task_run(hook_only.clone());
+        let rows = vec![row(
+            NodeKey::Run {
+                run_id: hook_only.run_id,
+                pane_id: None,
+            },
+            0,
+            "Task Run: hook-only [running]",
+        )];
+        let operator = operator(Vec::new(), HashMap::new());
+
+        let duration_first = project_rows(
+            &model,
+            &rows,
+            &operator,
+            "",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            500,
+        );
+        assert_eq!(duration_first.next_expiry_ms, Some(1_000));
+
+        let hook_only_first = project_rows(
+            &model,
+            &rows,
+            &operator,
+            "",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            86_400_000,
+        );
+        assert_eq!(hook_only_first.next_expiry_ms, Some(86_400_001));
+    }
+
+    #[test]
     fn projection_uses_earliest_terminal_or_hook_only_expiry() {
         let mut hook_only = run("hook-only", 1, TaskState::Running);
         hook_only.updated_at_ms = Some(16_000_001);
@@ -1159,7 +1202,7 @@ mod tests {
             500,
         );
         assert_eq!(filtered_visible.rows.len(), 1);
-        assert_eq!(filtered_visible.next_expiry_ms, Some(1_100));
+        assert_eq!(filtered_visible.next_expiry_ms, Some(1_000));
 
         let filtered_out = project_rows(
             &model,
@@ -1185,6 +1228,51 @@ mod tests {
         );
         assert_eq!(collapsed.rows.len(), 1);
         assert_eq!(collapsed.next_expiry_ms, None);
+    }
+
+    #[test]
+    fn phase_distinct_live_runs_share_one_wall_aligned_duration_deadline() {
+        let mut model = DomainModel::default();
+        let runs = [
+            ("phase-zero", 0),
+            ("phase-quarter", 250),
+            ("phase-nine-hundred", 900),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (label, created_at_ms))| {
+            let mut live = run(label, index as i64 + 1, TaskState::Running);
+            live.created_at_ms = Some(created_at_ms);
+            model.insert_task_run(live.clone());
+            live
+        })
+        .collect::<Vec<_>>();
+        let rows = runs
+            .iter()
+            .map(|live| {
+                row(
+                    NodeKey::Run {
+                        run_id: live.run_id,
+                        pane_id: None,
+                    },
+                    0,
+                    "live row",
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let projection = project_rows(
+            &model,
+            &rows,
+            &operator(Vec::new(), HashMap::new()),
+            "",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            1_500,
+        );
+
+        assert_eq!(projection.rows.len(), 3);
+        assert_eq!(projection.next_expiry_ms, Some(2_000));
     }
 
     #[test]
@@ -1282,7 +1370,14 @@ mod tests {
             model.insert_agent_node(agent);
         }
 
-        let label = crate::tui::view::task_run_label(&model, &selected, false, 9_000);
+        let newest_agents = crate::tui::view::newest_agent_nodes(&model);
+        let label = crate::tui::view::task_run_label(
+            &model,
+            &selected,
+            false,
+            9_000,
+            newest_agents.get(&selected.run_id).copied(),
+        );
         assert!(!label.contains(full_key));
         let selected_row = row(
             NodeKey::Run {
@@ -1642,10 +1737,11 @@ mod tests {
             dependent_run_id: child.run_id,
         });
 
-        let tree_label = crate::tui::view::task_run_label(&model, &child, false, 0);
+        let tree_label = crate::tui::view::task_run_label(&model, &child, false, 0, None);
         let mut dag_order = crate::tui::dag::DagOrder::default();
         dag_order.recompute(&model);
-        let dag_text = crate::tui::dag::build_rows(&model, &dag_order, 0)
+        let newest_agents = crate::tui::view::newest_agent_nodes(&model);
+        let dag_text = crate::tui::dag::build_rows(&model, &dag_order, 0, &newest_agents)
             .into_iter()
             .flat_map(|row| {
                 std::iter::once(row.label)
@@ -1666,7 +1762,7 @@ mod tests {
                 pane_id: Some("pane".to_owned()),
             },
             0,
-            &crate::tui::view::task_run_label(&model, &child, false, 0),
+            &crate::tui::view::task_run_label(&model, &child, false, 0, None),
         );
         let tied = operator(
             vec![

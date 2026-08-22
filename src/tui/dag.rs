@@ -6,7 +6,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use crate::model::{DomainModel, RunId};
 
 use super::app::NodeKey;
-use super::view::{TreeRow, short_run_name, task_run_label};
+use super::view::{NewestAgentNodes, TreeRow, short_run_name, task_run_label};
 
 /// Session-local dependency order derived from the last displayed DAG.
 #[derive(Debug, Default)]
@@ -142,7 +142,12 @@ impl DagOrder {
     }
 }
 
-pub(crate) fn build_rows(model: &DomainModel, order: &DagOrder, now_ms: i64) -> Vec<TreeRow> {
+pub(crate) fn build_rows(
+    model: &DomainModel,
+    order: &DagOrder,
+    now_ms: i64,
+    newest_agents: &NewestAgentNodes<'_>,
+) -> Vec<TreeRow> {
     let mut prerequisites = HashMap::<RunId, Vec<RunId>>::new();
     let mut dependents = HashMap::<RunId, Vec<RunId>>::new();
     for edge in model.dependency_edges() {
@@ -182,7 +187,13 @@ pub(crate) fn build_rows(model: &DomainModel, order: &DagOrder, now_ms: i64) -> 
                 pane_id: None,
             },
             depth: 0,
-            label: task_run_label(model, run, false, now_ms),
+            label: task_run_label(
+                model,
+                run,
+                false,
+                now_ms,
+                newest_agents.get(&run.run_id).copied(),
+            ),
             prerequisites: neighbor_names(prerequisites.get(&run.run_id)),
             dependents: neighbor_names(dependents.get(&run.run_id)),
         })
@@ -502,7 +513,8 @@ mod tests {
         let mut order = DagOrder::default();
         order.recompute(&model);
 
-        let rows = super::build_rows(&model, &order, 0);
+        let newest_agents = crate::tui::view::newest_agent_nodes(&model);
+        let rows = super::build_rows(&model, &order, 0, &newest_agents);
 
         assert_eq!(rows.len(), model.task_runs().count());
         assert!(

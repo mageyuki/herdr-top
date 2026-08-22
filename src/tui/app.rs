@@ -573,11 +573,17 @@ impl App {
             next_expiry_ms: None,
         };
         app.state.adopt_model(app.model.as_ref());
-        let projection = view::build_projection(app.model.as_ref(), &app.state);
-        app.next_expiry_ms = projection.next_expiry_ms;
-        let last = projection.rows.last().map(|row| row.key.clone());
+        let rows = app.rebuild_rows();
+        let last = rows.last().map(|row| row.key.clone());
         app.set_selection(last);
         app
+    }
+
+    fn rebuild_rows(&mut self) -> Vec<TreeRow> {
+        self.state.now_ms = self.clock.now_ms();
+        let projection = view::build_projection(self.model.as_ref(), &self.state);
+        self.next_expiry_ms = projection.next_expiry_ms;
+        projection.rows
     }
 
     /// Refreshes the cached coherent model and performance publication.
@@ -587,6 +593,8 @@ impl App {
 
     fn refresh_cached(&mut self, recompute_projection: bool) {
         let old_rows = if recompute_projection && !self.state.follow {
+            // Keep the cached time for historical disappearance classification. This lookup does
+            // not become the visible row set and must not replace the pending visible deadline.
             view::build_rows(self.model.as_ref(), &self.state)
         } else {
             Vec::new()
@@ -602,12 +610,9 @@ impl App {
         self.state.operator_activity = Arc::clone(&operator.activity);
         self.state.terminal_times = Arc::clone(&operator.terminal_times);
         drop(operator);
-        self.state.now_ms = self.clock.now_ms();
         self.state.adopt_model(new_model.as_ref());
         self.model = new_model;
-        let projection = view::build_projection(self.model.as_ref(), &self.state);
-        self.next_expiry_ms = projection.next_expiry_ms;
-        let new_rows = projection.rows;
+        let new_rows = self.rebuild_rows();
         if self.state.follow {
             self.state.selection_reason = None;
             self.set_selection(new_rows.last().map(|row| row.key.clone()));
@@ -855,7 +860,7 @@ impl App {
     }
 
     fn commit_filter(&mut self) {
-        let old_rows = view::build_rows(self.model.as_ref(), &self.state);
+        let old_rows = self.rebuild_rows();
         let query = self
             .state
             .filter_draft
@@ -865,10 +870,7 @@ impl App {
             .to_owned();
         self.state.filter_query = query;
         self.state.follow = false;
-        self.state.now_ms = self.clock.now_ms();
-        let projection = view::build_projection(self.model.as_ref(), &self.state);
-        self.next_expiry_ms = projection.next_expiry_ms;
-        let new_rows = projection.rows;
+        let new_rows = self.rebuild_rows();
         self.recover_selection(&old_rows, &new_rows, Some(SelectionReason::Filtered));
     }
 
@@ -880,7 +882,7 @@ impl App {
         if !self.collapse_available() {
             return;
         }
-        let old_rows = view::build_rows(self.model.as_ref(), &self.state);
+        let old_rows = self.rebuild_rows();
         let full_rows = view::build_uncollapsed_rows(self.model.as_ref(), &self.state);
         let Some(index) = full_rows.iter().position(|row| row.key == key) else {
             return;
@@ -894,9 +896,14 @@ impl App {
         }
         self.state.follow = false;
         self.state.selection_reason = None;
-        if !self.state.collapsed.remove(&key) {
+        let collapsed = if self.state.collapsed.remove(&key) {
+            false
+        } else {
             self.state.collapsed.insert(key);
-            let new_rows = view::build_rows(self.model.as_ref(), &self.state);
+            true
+        };
+        let new_rows = self.rebuild_rows();
+        if collapsed {
             self.recover_selection(&old_rows, &new_rows, Some(SelectionReason::Collapsed));
         }
     }
@@ -912,7 +919,7 @@ impl App {
             self.toggle_collapse(selected);
             return;
         }
-        let rows = view::build_rows(self.model.as_ref(), &self.state);
+        let rows = self.rebuild_rows();
         let Some(index) = rows.iter().position(|row| row.key == selected) else {
             return;
         };
@@ -934,7 +941,7 @@ impl App {
         let Some(selected) = self.state.selected.clone() else {
             return;
         };
-        let rows = view::build_rows(self.model.as_ref(), &self.state);
+        let rows = self.rebuild_rows();
         let Some(index) = rows.iter().position(|row| row.key == selected) else {
             return;
         };
@@ -971,7 +978,7 @@ impl App {
     fn move_selection(&mut self, down: bool) {
         self.state.follow = false;
         self.state.selection_reason = None;
-        let rows = view::build_rows(self.model.as_ref(), &self.state);
+        let rows = self.rebuild_rows();
         if rows.is_empty() {
             self.set_selection(None);
             return;
@@ -993,15 +1000,13 @@ impl App {
     fn resume_follow(&mut self) {
         self.state.follow = true;
         self.state.selection_reason = None;
-        let selected = view::build_rows(self.model.as_ref(), &self.state)
-            .last()
-            .map(|row| row.key.clone());
+        let selected = self.rebuild_rows().last().map(|row| row.key.clone());
         self.set_selection(selected);
     }
 
     fn toggle_view(&mut self) {
         let previous = self.state.selected.clone();
-        let old_rows = view::build_rows(self.model.as_ref(), &self.state);
+        let old_rows = self.rebuild_rows();
         let was_following = self.state.follow;
         let semantic_run_id = previous.as_ref().and_then(|selected| {
             selected.run_id().or_else(|| match selected {
@@ -1014,7 +1019,7 @@ impl App {
         });
         self.state.view_mode = self.state.view_mode.toggled();
         self.state.selection_reason = None;
-        let rows = view::build_rows(self.model.as_ref(), &self.state);
+        let rows = self.rebuild_rows();
         if was_following {
             self.set_selection(rows.last().map(|row| row.key.clone()));
             return;
@@ -2845,6 +2850,120 @@ mod tests {
             app.poll_duration(&FrameLimiter::default(), false, Duration::ZERO) > Duration::ZERO,
             "the refreshed duration deadline must be strictly in the future"
         );
+    }
+
+    #[test]
+    fn expanding_collapsed_live_run_rearms_duration_without_watch_traffic() {
+        let live = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut model = model_with_runs(&[(live, "live", 1, TaskState::Running)]);
+        let mut timed = model.task_run(&live).unwrap().clone();
+        timed.created_at_ms = Some(0);
+        timed.updated_at_ms = Some(0);
+        timed.subject = Some("Visible work".to_owned());
+        model.insert_task_run(timed);
+        let clock = TestClock::at(7_000);
+        let (mut app, _senders) = app_with_runtime(
+            model,
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+        let pane = NodeKey::Pane("pane".to_owned());
+
+        app.toggle_collapse(pane.clone());
+        assert_eq!(app.next_expiry_ms(), None);
+
+        app.toggle_collapse(pane);
+        assert_eq!(app.next_expiry_ms(), Some(8_000));
+        let label = view::build_rows(app.model(), app.state())
+            .into_iter()
+            .find(|row| row.key.run_id() == Some(live))
+            .unwrap()
+            .label;
+        assert!(label.contains(" · 07s"));
+
+        clock.set(8_000);
+        assert!(app.refresh_if_changed().unwrap());
+        let label = view::build_rows(app.model(), app.state())
+            .into_iter()
+            .find(|row| row.key.run_id() == Some(live))
+            .unwrap()
+            .label;
+        assert!(label.contains(" · 08s"));
+    }
+
+    #[test]
+    fn toggling_view_to_reveal_live_run_rearms_duration_without_watch_traffic() {
+        let live = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut model = model_with_runs(&[(live, "live", 1, TaskState::Running)]);
+        let mut timed = model.task_run(&live).unwrap().clone();
+        timed.created_at_ms = Some(0);
+        timed.updated_at_ms = Some(0);
+        timed.subject = Some("Visible work".to_owned());
+        model.insert_task_run(timed);
+        let clock = TestClock::at(7_000);
+        let (mut app, _senders) = app_with_runtime(
+            model,
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+
+        app.toggle_collapse(NodeKey::Pane("pane".to_owned()));
+        assert_eq!(app.next_expiry_ms(), None);
+
+        app.toggle_view();
+        assert_eq!(app.next_expiry_ms(), Some(8_000));
+        let label = view::build_rows(app.model(), app.state())
+            .into_iter()
+            .find(|row| row.key.run_id() == Some(live))
+            .unwrap()
+            .label;
+        assert!(label.contains(" · 07s"));
+
+        clock.set(8_000);
+        assert!(app.refresh_if_changed().unwrap());
+        let label = view::build_rows(app.model(), app.state())
+            .into_iter()
+            .find(|row| row.key.run_id() == Some(live))
+            .unwrap()
+            .label;
+        assert!(label.contains(" · 08s"));
+    }
+
+    #[test]
+    fn phase_distinct_live_runs_refresh_once_per_wall_aligned_second() {
+        let first = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let second = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let third = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        let mut model = model_with_runs(&[
+            (first, "first", 1, TaskState::Running),
+            (second, "second", 2, TaskState::Running),
+            (third, "third", 3, TaskState::Running),
+        ]);
+        for (run_id, created_at_ms) in [(first, 0), (second, 250), (third, 900)] {
+            let mut timed = model.task_run(&run_id).unwrap().clone();
+            timed.created_at_ms = Some(created_at_ms);
+            timed.updated_at_ms = Some(created_at_ms);
+            model.insert_task_run(timed);
+        }
+        let clock = TestClock::at(1_500);
+        let (mut app, _senders) = app_with_runtime(
+            model,
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+        assert_eq!(app.next_expiry_ms(), Some(2_000));
+
+        let mut refreshes = 0;
+        for now_ms in (1_600..=2_500).step_by(100) {
+            clock.set(now_ms);
+            refreshes += usize::from(app.refresh_if_changed().unwrap());
+        }
+
+        assert_eq!(refreshes, 1);
+        assert_eq!(app.next_expiry_ms(), Some(3_000));
     }
 
     #[test]

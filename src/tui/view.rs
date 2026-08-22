@@ -1,5 +1,7 @@
 //! T10 execution-tree rendering and truncation rules.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use ratatui::Frame;
@@ -31,6 +33,27 @@ const MIN_WIDTH: u16 = 48;
 const MIN_HEIGHT: u16 = 14;
 type RunPlacement = (RunId, bool);
 type PaneRuns = HashMap<String, Vec<RunPlacement>>;
+pub(crate) type NewestAgentNodes<'a> = HashMap<RunId, &'a AgentNode>;
+
+#[cfg(test)]
+thread_local! {
+    static NEWEST_AGENT_SCAN_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_newest_agent_scan() {
+    NEWEST_AGENT_SCAN_COUNT.set(NEWEST_AGENT_SCAN_COUNT.get().saturating_add(1));
+}
+
+#[cfg(test)]
+fn reset_newest_agent_scan_count() {
+    NEWEST_AGENT_SCAN_COUNT.set(0);
+}
+
+#[cfg(test)]
+fn newest_agent_scan_count() -> usize {
+    NEWEST_AGENT_SCAN_COUNT.get()
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TreeRow {
@@ -813,7 +836,11 @@ fn quality_style(quality: ObservationQuality) -> Style {
     Style::default().fg(color).add_modifier(Modifier::BOLD)
 }
 
-pub(crate) fn build_tree_rows(model: &DomainModel, state: &AppState) -> Vec<TreeRow> {
+pub(crate) fn build_tree_rows(
+    model: &DomainModel,
+    state: &AppState,
+    newest_agents: &NewestAgentNodes<'_>,
+) -> Vec<TreeRow> {
     let mut rows = vec![TreeRow {
         key: NodeKey::Session,
         depth: 0,
@@ -821,7 +848,7 @@ pub(crate) fn build_tree_rows(model: &DomainModel, state: &AppState) -> Vec<Tree
         prerequisites: Vec::new(),
         dependents: Vec::new(),
     }];
-    append_execution_tree_rows(&mut rows, model, state);
+    append_execution_tree_rows(&mut rows, model, state, newest_agents);
     rows
 }
 
@@ -861,13 +888,21 @@ pub(crate) fn build_uncollapsed_rows(model: &DomainModel, state: &AppState) -> V
 }
 
 fn build_full_rows(model: &DomainModel, state: &AppState) -> Vec<TreeRow> {
+    let newest_agents = newest_agent_nodes(model);
     match state.view_mode() {
-        ViewMode::ExecutionTree => build_tree_rows(model, state),
-        ViewMode::DependencyDag => dag::build_rows(model, state.dag_order(), state.now_ms()),
+        ViewMode::ExecutionTree => build_tree_rows(model, state, &newest_agents),
+        ViewMode::DependencyDag => {
+            dag::build_rows(model, state.dag_order(), state.now_ms(), &newest_agents)
+        }
     }
 }
 
-fn append_execution_tree_rows(rows: &mut Vec<TreeRow>, model: &DomainModel, state: &AppState) {
+fn append_execution_tree_rows(
+    rows: &mut Vec<TreeRow>,
+    model: &DomainModel,
+    state: &AppState,
+    newest_agents: &NewestAgentNodes<'_>,
+) {
     let (mut pane_runs, unattached) = place_runs(model, state);
 
     let mut workspaces = model.workspaces().collect::<Vec<_>>();
@@ -933,7 +968,15 @@ fn append_execution_tree_rows(rows: &mut Vec<TreeRow>, model: &DomainModel, stat
                     dependents: Vec::new(),
                 });
                 if let Some(runs) = pane_runs.remove(&pane.pane_id) {
-                    append_run_rows(rows, model, runs, Some(&pane.pane_id), 4, state.now_ms());
+                    append_run_rows(
+                        rows,
+                        model,
+                        runs,
+                        Some(&pane.pane_id),
+                        4,
+                        state.now_ms(),
+                        newest_agents,
+                    );
                 }
             }
         }
@@ -951,7 +994,7 @@ fn append_execution_tree_rows(rows: &mut Vec<TreeRow>, model: &DomainModel, stat
             .into_iter()
             .map(|run_id| (run_id, false))
             .collect();
-        append_run_rows(rows, model, runs, None, 2, state.now_ms());
+        append_run_rows(rows, model, runs, None, 2, state.now_ms(), newest_agents);
     }
 }
 
@@ -1029,6 +1072,7 @@ fn append_run_rows(
     pane_id: Option<&str>,
     depth: usize,
     now_ms: i64,
+    newest_agents: &NewestAgentNodes<'_>,
 ) {
     for (run_id, shared) in runs {
         let Some(run) = model.task_run(&run_id) else {
@@ -1040,7 +1084,13 @@ fn append_run_rows(
                 pane_id: pane_id.map(str::to_owned),
             },
             depth,
-            label: task_run_label(model, run, shared, now_ms),
+            label: task_run_label(
+                model,
+                run,
+                shared,
+                now_ms,
+                newest_agents.get(&run_id).copied(),
+            ),
             prerequisites: Vec::new(),
             dependents: Vec::new(),
         });
@@ -1155,8 +1205,9 @@ pub(crate) fn task_run_label(
     run: &TaskRun,
     shared: bool,
     now_ms: i64,
+    newest_agent: Option<&AgentNode>,
 ) -> String {
-    let mut label = run_row_label(model, run, now_ms);
+    let mut label = run_row_label_with_agent(run, newest_agent, now_ms);
     if shared {
         label.push_str(" [shared]");
     }
@@ -1197,28 +1248,51 @@ fn worker_kind_label(run: &TaskRun) -> String {
     }
 }
 
-fn newest_agent_node(model: &DomainModel, run_id: RunId) -> Option<&AgentNode> {
-    model
-        .agent_nodes()
-        .filter(|agent| agent.task_run_id == run_id)
-        .max_by(|left, right| {
-            (left.last_activity_at_ms, left.agent_node_id.as_str())
-                .cmp(&(right.last_activity_at_ms, right.agent_node_id.as_str()))
-        })
+pub(crate) fn newest_agent_nodes(model: &DomainModel) -> NewestAgentNodes<'_> {
+    #[cfg(test)]
+    record_newest_agent_scan();
+    let mut newest = NewestAgentNodes::new();
+    for agent in model.agent_nodes() {
+        newest
+            .entry(agent.task_run_id)
+            .and_modify(|current| {
+                if (current.last_activity_at_ms, current.agent_node_id.as_str())
+                    < (agent.last_activity_at_ms, agent.agent_node_id.as_str())
+                {
+                    *current = agent;
+                }
+            })
+            .or_insert(agent);
+    }
+    newest
 }
 
+#[cfg(test)]
+fn newest_agent_node(model: &DomainModel, run_id: RunId) -> Option<&AgentNode> {
+    newest_agent_nodes(model).get(&run_id).copied()
+}
+
+#[cfg(test)]
 fn run_row_label(model: &DomainModel, run: &TaskRun, now_ms: i64) -> String {
+    let newest_agent = newest_agent_node(model, run.run_id);
+    run_row_label_with_agent(run, newest_agent, now_ms)
+}
+
+fn run_row_label_with_agent(
+    run: &TaskRun,
+    newest_agent: Option<&AgentNode>,
+    now_ms: i64,
+) -> String {
     let mut label = worker_kind_label(run);
     let subject = run
         .subject
         .as_deref()
-        .map_or_else(|| run_name(run), safe_text);
+        .map_or_else(|| run_subject_fallback(run), safe_text);
     if !subject.is_empty() {
         label.push(' ');
         label.push_str(&subject);
     }
 
-    let newest_agent = newest_agent_node(model, run.run_id);
     if !run.state.is_terminal()
         && let Some(event_kind) = newest_agent.and_then(|agent| agent.last_event_kind.as_deref())
     {
@@ -1251,6 +1325,19 @@ fn run_row_label(model: &DomainModel, run: &TaskRun, now_ms: i64) -> String {
         label.push_str(&format_duration(elapsed_ms));
     }
     label
+}
+
+fn run_subject_fallback(run: &TaskRun) -> String {
+    match &run.key {
+        RunKey::Controller(_) => run_name(run),
+        RunKey::Native { sid, .. } => safe_text(sid),
+        RunKey::NativePath { .. } => run.run_id.to_string(),
+        RunKey::Provisional {
+            terminal_id,
+            start_ms,
+            seq,
+        } => format!("{}:{start_ms}:{seq}", safe_text(terminal_id)),
+    }
 }
 
 fn format_duration(elapsed_ms: i64) -> String {
@@ -1681,6 +1768,44 @@ mod tests {
     }
 
     #[test]
+    fn full_projection_indexes_newest_agent_nodes_once() {
+        let mut model = DomainModel::default();
+        for (index, label) in ["first", "second", "third"].into_iter().enumerate() {
+            let run_id = RunId::new();
+            let run = label_run(
+                run_id,
+                RunKey::Controller(label.to_owned()),
+                TaskState::Running,
+                None,
+                None,
+                Some(label),
+            );
+            model.insert_task_run(run);
+            model.insert_agent_node(label_agent(
+                &format!("agent-{index}"),
+                run_id,
+                Some(index as i64),
+                Some("message"),
+                None,
+                Some("model"),
+            ));
+        }
+
+        reset_newest_agent_scan_count();
+        let projection = build_projection(&model, &AppState::default());
+
+        assert_eq!(
+            projection
+                .rows
+                .iter()
+                .filter(|row| row.key.run_id().is_some())
+                .count(),
+            3
+        );
+        assert_eq!(newest_agent_scan_count(), 1);
+    }
+
+    #[test]
     fn task_run_annotations_follow_the_new_head_in_existing_order() {
         let parent_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let child_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
@@ -1719,11 +1844,11 @@ mod tests {
         });
 
         assert_eq!(
-            task_run_label(&model, &child, true, 10),
+            task_run_label(&model, &child, true, 10, None),
             "claude-code Shared child [running] [shared] [dispatched by: Parent]"
         );
         assert_eq!(
-            task_run_label(&model, &orphan, false, 10),
+            task_run_label(&model, &orphan, false, 10, None),
             "codex Orphan [queued] [unlinked]"
         );
     }
@@ -1739,6 +1864,45 @@ mod tests {
             (443_100_000, "123h05m"),
         ] {
             assert_eq!(format_duration(elapsed_ms), expected);
+        }
+    }
+
+    #[test]
+    fn key_fallback_subject_does_not_repeat_native_or_provisional_worker_kind() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        for (key, expected) in [
+            (
+                RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: "native-session".to_owned(),
+                },
+                "Codex native-session [running]",
+            ),
+            (
+                RunKey::NativePath {
+                    provider: Provider::Codex,
+                    path: "/private/session.jsonl".to_owned(),
+                },
+                "Codex 01ARZ3NDEKTSV4RRFFQ69G5FAV [running]",
+            ),
+            (
+                RunKey::Provisional {
+                    terminal_id: "terminal".to_owned(),
+                    start_ms: 1,
+                    seq: 2,
+                },
+                "provisional terminal:1:2 [running]",
+            ),
+            (
+                RunKey::Controller("hook:claude-code:S:task:T".to_owned()),
+                "claude-code hook:claude-code:S:task:T [running]",
+            ),
+        ] {
+            let run = label_run(run_id, key, TaskState::Running, None, None, None);
+            let mut model = DomainModel::default();
+            model.insert_task_run(run.clone());
+
+            assert_eq!(run_row_label(&model, &run, 0), expected);
         }
     }
 
@@ -1997,9 +2161,9 @@ mod tests {
             .unwrap();
         let run_x = rows
             .iter()
-            .find(|row| row.contains("Codex Codex controller"))
+            .find(|row| row.contains("Codex controller"))
             .unwrap()
-            .find("Codex Codex controller")
+            .find("Codex controller")
             .unwrap();
         let agent_x = rows
             .iter()
@@ -2196,7 +2360,8 @@ mod tests {
             model.set_pane_ordinal(pane_id.to_owned(), DisplayOrdinal::new(ordinal));
         }
 
-        let rows = build_tree_rows(&model, &AppState::default());
+        let newest_agents = newest_agent_nodes(&model);
+        let rows = build_tree_rows(&model, &AppState::default(), &newest_agents);
         let topology = rows
             .iter()
             .filter_map(|row| match &row.key {
@@ -2274,7 +2439,8 @@ mod tests {
 
         model_sender.send(Arc::new(refreshed)).unwrap();
         app.refresh();
-        let rows = build_tree_rows(app.model(), app.state());
+        let newest_agents = newest_agent_nodes(app.model());
+        let rows = build_tree_rows(app.model(), app.state(), &newest_agents);
         let hosting_pane = rows.iter().find_map(|row| match &row.key {
             NodeKey::Run {
                 run_id: actual,
@@ -2324,7 +2490,8 @@ mod tests {
         });
         let app = app(model, ObservationQuality::Live, "demo");
 
-        let rows = build_tree_rows(app.model(), app.state());
+        let newest_agents = newest_agent_nodes(app.model());
+        let rows = build_tree_rows(app.model(), app.state(), &newest_agents);
         let agent_rows = rows
             .iter()
             .filter(|row| matches!(row.key, NodeKey::Agent { .. }))
@@ -2428,7 +2595,8 @@ mod tests {
             child_run_id: shared,
         });
         let app = app(model, ObservationQuality::Live, "session");
-        let rows = build_tree_rows(app.model(), app.state());
+        let newest_agents = newest_agent_nodes(app.model());
+        let rows = build_tree_rows(app.model(), app.state(), &newest_agents);
         let labels = rows
             .iter()
             .map(|row| row.label.as_str())
@@ -2713,14 +2881,14 @@ mod tests {
                     assert!(
                         rows[4..=6]
                             .iter()
-                            .any(|row| row.contains("Codex Codex controller")),
+                            .any(|row| row.contains("Codex controller")),
                         "the 48x14 tree body must contain its known Task Run row"
                     );
                 }
                 ViewMode::DependencyDag => {
                     assert!(rows[4].contains("Task Run"));
                     assert!(
-                        rows[5].contains("Codex Codex c"),
+                        rows[5].contains("Codex controller"),
                         "the 48x14 DAG data coordinate must contain its known Task Run"
                     );
                 }
