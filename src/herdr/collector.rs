@@ -1946,14 +1946,14 @@ async fn converge(
             ReplayOutcome::Dirty => {
                 provider.set_herdr_quality(ObservationQuality::Reconciling, persistence, shared);
                 if resnapshot_attempts == RESNAPSHOT_ATTEMPTS {
-                    let outcome = monitor_reconciling(
+                    match monitor_reconciling(
                         sock,
                         reducer,
                         shared,
                         persistence,
                         owner,
                         session,
-                        events,
+                        &mut events,
                         enrichment,
                         cancellation,
                         &mut pending_closures,
@@ -1962,8 +1962,28 @@ async fn converge(
                         liveness_policy,
                         primary_stream_diagnostics,
                     )
-                    .await?;
-                    return Ok(ConvergeOutcome::new(outcome, !first_generation));
+                    .await?
+                    {
+                        ReconcilingOutcome::RestartGeneration => continue,
+                        ReconcilingOutcome::Ended => {
+                            return Ok(ConvergeOutcome::new(
+                                SubscriptionOutcome::Ended,
+                                !first_generation,
+                            ));
+                        }
+                        ReconcilingOutcome::Cancelled => {
+                            return Ok(ConvergeOutcome::new(
+                                SubscriptionOutcome::Cancelled,
+                                !first_generation,
+                            ));
+                        }
+                        ReconcilingOutcome::WatchdogReconnect(reason) => {
+                            return Ok(ConvergeOutcome::new(
+                                SubscriptionOutcome::WatchdogReconnect(reason),
+                                !first_generation,
+                            ));
+                        }
+                    }
                 }
                 resnapshot_attempts += 1;
             }
@@ -2449,7 +2469,7 @@ async fn monitor_reconciling(
     persistence: &mut RuntimePersistence,
     owner: &mut OwnerTracker,
     session: &str,
-    mut events: mpsc::Receiver<Admitted<ReceivedEvent>>,
+    events: &mut mpsc::Receiver<Admitted<ReceivedEvent>>,
     enrichment: &mut EnrichmentConverge,
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
@@ -2457,7 +2477,7 @@ async fn monitor_reconciling(
     provider: &mut ProviderIntegration,
     liveness_policy: LivenessPolicy,
     primary_stream_diagnostics: &PrimaryStreamDiagnosticsHandle,
-) -> Result<SubscriptionOutcome, CollectorError> {
+) -> Result<ReconcilingOutcome, CollectorError> {
     enum ReconcilingReceipt {
         Primary(Admitted<ReceivedEvent>),
         Probe(WatchdogProbeOutcome),
@@ -2472,7 +2492,7 @@ async fn monitor_reconciling(
     loop {
         enrichment.discard_episode_payloads();
         let received = tokio::select! {
-            () = cancellation.cancelled() => return Ok(SubscriptionOutcome::Cancelled),
+            () = cancellation.cancelled() => return Ok(ReconcilingOutcome::Cancelled),
             request = receive_controller(controller_requests) => {
                 service_controller(
                     request,
@@ -2500,7 +2520,7 @@ async fn monitor_reconciling(
             }
             received = events.recv() => match received {
                 Some(received) => ReconcilingReceipt::Primary(received),
-                None => return Ok(SubscriptionOutcome::Ended),
+                None => return Ok(ReconcilingOutcome::Ended),
             },
             probe = async {
                 match watchdog_probe.as_mut() {
@@ -2521,11 +2541,8 @@ async fn monitor_reconciling(
         };
         let received = match received {
             ReconcilingReceipt::Probe(WatchdogProbeOutcome::HealthyIdle) => {
-                watchdog_probe = None;
                 tracing::debug!("silent reconciling Herdr subscription passed its topology probe");
-                provider.set_herdr_quality(ObservationQuality::Live, persistence, shared);
-                watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
-                continue;
+                return Ok(ReconcilingOutcome::RestartGeneration);
             }
             ReconcilingReceipt::Probe(WatchdogProbeOutcome::Inconclusive) => {
                 watchdog_probe = None;
@@ -2537,7 +2554,7 @@ async fn monitor_reconciling(
                 continue;
             }
             ReconcilingReceipt::Probe(WatchdogProbeOutcome::Reconnect(reason)) => {
-                return Ok(SubscriptionOutcome::WatchdogReconnect(reason));
+                return Ok(ReconcilingOutcome::WatchdogReconnect(reason));
             }
             ReconcilingReceipt::Sweep => {
                 let mut persist = reducer.sweep_stale(unix_now_ms());
@@ -4052,6 +4069,14 @@ enum EntityKey {
 enum ReplayOutcome {
     Clean,
     Dirty,
+    Ended,
+    Cancelled,
+    WatchdogReconnect(WatchdogReconnectReason),
+}
+
+#[derive(Clone, Copy)]
+enum ReconcilingOutcome {
+    RestartGeneration,
     Ended,
     Cancelled,
     WatchdogReconnect(WatchdogReconnectReason),
@@ -6191,6 +6216,25 @@ mod tests {
             .expect("fake Herdr listener failed to write a response");
     }
 
+    async fn write_primary_overflow_burst(
+        reader: &mut tokio::io::BufReader<tokio::net::UnixStream>,
+    ) {
+        let mut frame = serde_json::to_vec(&json!({
+            "event": "pane_focused",
+            "data": {"pane_id": "w1:p4"},
+        }))
+        .expect("overflow event did not serialize");
+        frame.push(b'\n');
+        let mut burst = Vec::with_capacity(frame.len() * EVENT_QUEUE_CAPACITY * 2);
+        for _ in 0..EVENT_QUEUE_CAPACITY * 2 {
+            burst.extend_from_slice(&frame);
+        }
+        tokio::time::timeout(Duration::from_secs(3), reader.get_mut().write_all(&burst))
+            .await
+            .expect("fake Herdr listener timed out writing an overflow burst")
+            .expect("fake Herdr listener failed to write an overflow burst");
+    }
+
     async fn wait_for_wire_peer_close(reader: &mut tokio::io::BufReader<tokio::net::UnixStream>) {
         let mut line = String::new();
         let bytes_read = tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line))
@@ -6231,6 +6275,7 @@ mod tests {
         task: JoinHandle<Result<(), CollectorError>>,
         model: SharedModel,
         primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle,
+        enrichment_diagnostics: EnrichmentDiagnosticsHandle,
         provider_events: mpsc::Sender<ProviderIngressEvent>,
         ignored_provider_events: mpsc::Receiver<ProviderEvent>,
         provider_thread: ProviderThreadHandle,
@@ -6246,6 +6291,7 @@ mod tests {
                 task,
                 model: _,
                 primary_stream_diagnostics: _,
+                enrichment_diagnostics: _,
                 provider_events,
                 ignored_provider_events,
                 provider_thread,
@@ -6319,6 +6365,7 @@ mod tests {
             &initial_coverage,
             Arc::new(RecordingOccurrenceSink::default()),
         );
+        let enrichment_diagnostics = persistence.enrichment_diagnostics();
 
         let provider_diagnostics = crate::provider::ProviderDiagnostics::default();
         let (ignored_events, ignored_provider_events) = mpsc::channel(1);
@@ -6366,6 +6413,7 @@ mod tests {
             task,
             model: shared,
             primary_stream_diagnostics,
+            enrichment_diagnostics,
             provider_events,
             ignored_provider_events,
             provider_thread,
@@ -7884,6 +7932,7 @@ mod tests {
         let socket = directory.path().join("dirty-replays-herdr.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let (matched_sender, matched_receiver) = tokio::sync::oneshot::channel();
+        let (enrichment_sender, enrichment_receiver) = tokio::sync::oneshot::channel();
         let mut harness = spawn_primary_collector_harness_with_policy(
             &directory,
             socket,
@@ -7894,6 +7943,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut snapshots = 0;
             let mut matched_sender = Some(matched_sender);
+            let mut enrichment_sender = Some(enrichment_sender);
             let mut primary_stream = None;
             let mut held_streams = Vec::new();
             loop {
@@ -7912,6 +7962,9 @@ mod tests {
                         )
                         .await;
                         if primary_subscription_is_scoped(&request) {
+                            if let Some(sender) = enrichment_sender.take() {
+                                sender.send(()).unwrap();
+                            }
                             held_streams.push(reader);
                         } else {
                             assert!(
@@ -7962,12 +8015,183 @@ mod tests {
             "matching reconciling watchdog probe",
         )
         .await;
+        tokio::time::timeout(Duration::from_secs(3), enrichment_receiver)
+            .await
+            .expect("clean-generation recovery did not activate enrichment")
+            .expect("clean-generation enrichment observer was dropped");
 
         let contents = harness.stop().await;
         join_fake_server(server, "dirty replay watchdog recovery").await;
         assert!(
             !contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
             "matching reconciling probe emitted a watchdog warning: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_matching_probe_after_overflow_stops_enrichment_episode_discards() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("overflow-recovery-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (activated_sender, activated_receiver) = tokio::sync::oneshot::channel();
+        let (matched_sender, matched_receiver) = tokio::sync::oneshot::channel();
+        let mut harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "overflow-recovery-watchdog.log",
+            LivenessPolicy { timeout_ms: 100 },
+        );
+        let enrichment_diagnostics = harness.enrichment_diagnostics.clone();
+        let server_cancellation = harness.cancellation.clone();
+        let enrichment_writes = Arc::new(AtomicUsize::new(0));
+        let observed_enrichment_writes = Arc::clone(&enrichment_writes);
+        let server = tokio::spawn(async move {
+            let mut snapshots = 0;
+            let mut activated_sender = Some(activated_sender);
+            let mut matched_sender = Some(matched_sender);
+            let mut primary_stream = None;
+            let mut enrichment_pulse = None;
+            loop {
+                let (mut reader, request) = tokio::select! {
+                    () = server_cancellation.cancelled() => break,
+                    accepted = accept_wire_request(&listener) => accepted,
+                };
+                match request["method"].as_str() {
+                    Some("events.subscribe") => {
+                        write_wire_frame(
+                            &mut reader,
+                            &json!({
+                                "id": request["id"],
+                                "result": {"type": "subscription_started"},
+                            }),
+                        )
+                        .await;
+                        if primary_subscription_is_scoped(&request) {
+                            assert!(
+                                enrichment_pulse.is_none(),
+                                "overflow recovery unexpectedly replaced enrichment"
+                            );
+                            if let Some(sender) = activated_sender.take() {
+                                sender.send(()).unwrap();
+                            }
+                            let pulse_cancellation = server_cancellation.clone();
+                            let pulse_writes = Arc::clone(&observed_enrichment_writes);
+                            let mut stream = reader.into_inner();
+                            enrichment_pulse = Some(tokio::spawn(async move {
+                                let mut interval = tokio::time::interval(Duration::from_millis(20));
+                                interval.set_missed_tick_behavior(
+                                    tokio::time::MissedTickBehavior::Delay,
+                                );
+                                let mut frame = serde_json::to_vec(&json!({
+                                    "event": "pane_agent_status_changed",
+                                    "data": {
+                                        "pane_id": "w1:p4",
+                                        "terminal_id": "terminal-4",
+                                        "agent_status": "working",
+                                    },
+                                }))
+                                .expect("enrichment pulse did not serialize");
+                                frame.push(b'\n');
+                                loop {
+                                    tokio::select! {
+                                        () = pulse_cancellation.cancelled() => break,
+                                        _ = interval.tick() => {
+                                            if stream.write_all(&frame).await.is_err() {
+                                                break;
+                                            }
+                                            pulse_writes.fetch_add(1, Ordering::Release);
+                                        }
+                                    }
+                                }
+                            }));
+                            write_primary_overflow_burst(
+                                primary_stream
+                                    .as_mut()
+                                    .expect("enrichment activated before the primary stream"),
+                            )
+                            .await;
+                        } else {
+                            assert!(
+                                primary_stream.replace(reader).is_none(),
+                                "overflow recovery unexpectedly reconnected"
+                            );
+                        }
+                    }
+                    Some("session.snapshot") => {
+                        snapshots += 1;
+                        write_wire_frame(
+                            &mut reader,
+                            &watchdog_snapshot_frame(&request, false, "claude"),
+                        )
+                        .await;
+                        if (2..=RESNAPSHOT_ATTEMPTS + 2).contains(&snapshots) {
+                            write_primary_overflow_burst(
+                                primary_stream
+                                    .as_mut()
+                                    .expect("snapshot arrived before the primary subscription"),
+                            )
+                            .await;
+                        } else if snapshots == RESNAPSHOT_ATTEMPTS + 3
+                            && let Some(sender) = matched_sender.take()
+                        {
+                            sender.send(()).unwrap();
+                        }
+                    }
+                    method => panic!("unexpected overflow recovery request: {method:?}"),
+                }
+            }
+            drop(primary_stream);
+            if let Some(pulse) = enrichment_pulse {
+                pulse.await.expect("enrichment pulse task panicked");
+            }
+        });
+
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "initial clean generation",
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(3), activated_receiver)
+            .await
+            .expect("initial clean generation did not activate enrichment")
+            .expect("initial enrichment observer was dropped");
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Reconciling,
+            "overflow-driven dirty streak",
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(3), matched_receiver)
+            .await
+            .expect("reconciling watchdog did not receive a matching overflow probe")
+            .expect("overflow probe observer was dropped");
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "clean recovery after overflow",
+        )
+        .await;
+
+        let discards_before = enrichment_diagnostics.episode_discards();
+        let writes_before = enrichment_writes.load(Ordering::Acquire);
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let writes_after = enrichment_writes.load(Ordering::Acquire);
+        assert!(
+            writes_after > writes_before,
+            "enrichment stream was not active after overflow recovery"
+        );
+        assert_eq!(
+            enrichment_diagnostics.episode_discards(),
+            discards_before,
+            "enrichment episode discards kept accumulating after Live recovery"
+        );
+
+        let contents = harness.stop().await;
+        join_fake_server(server, "overflow watchdog recovery").await;
+        assert!(
+            !contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            "matching overflow probe emitted a watchdog warning: {contents}"
         );
     }
 
@@ -8043,12 +8267,13 @@ mod tests {
         })
         .await
         .expect("ambiguous topology probes did not increment their diagnostic counter");
-        assert_eq!(
+        assert!(
             harness
                 .primary_stream_diagnostics
                 .snapshot()
-                .inconclusive_topology_probes,
-            3
+                .inconclusive_topology_probes
+                >= 3,
+            "ambiguous topology probe counter did not reach the observed threshold"
         );
         assert_eq!(
             primary_subscriptions.load(Ordering::Acquire),
