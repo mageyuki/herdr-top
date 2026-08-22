@@ -105,9 +105,9 @@ impl EventStream {
                 "event push must be a JSON object".into(),
             ));
         };
-        if object.len() != 2 || !object.contains_key("event") || !object.contains_key("data") {
+        if !object.contains_key("event") || !object.contains_key("data") {
             return Err(WireError::MalformedFrame(
-                "event push must contain exactly event and data".into(),
+                "event push must contain event and data".into(),
             ));
         }
         let event = object
@@ -294,6 +294,37 @@ mod tests {
             .expect("response should write");
         drop(server);
         read_response(&mut BufReader::new(client), expected_id).await
+    }
+
+    async fn decode_event(frame: Value) -> Result<Option<(String, Value)>, WireError> {
+        let (mut server, client) = UnixStream::pair().expect("Unix stream pair should open");
+        let mut bytes = serde_json::to_vec(&frame).expect("event should encode");
+        bytes.push(b'\n');
+        server.write_all(&bytes).await.expect("event should write");
+        drop(server);
+        EventStream {
+            reader: BufReader::new(client),
+        }
+        .next_event()
+        .await
+    }
+
+    #[tokio::test]
+    async fn next_event_tolerates_extra_envelope_keys() {
+        let event = decode_event(json!({"event": "pane.updated", "data": {}, "seq": 7}))
+            .await
+            .expect("event with an extra key should decode");
+
+        assert_eq!(event, Some(("pane.updated".to_owned(), json!({}))));
+    }
+
+    #[tokio::test]
+    async fn next_event_rejects_missing_data() {
+        let error = decode_event(json!({"event": "pane.updated"}))
+            .await
+            .expect_err("event without data must be rejected");
+
+        assert!(matches!(error, WireError::MalformedFrame(_)));
     }
 
     #[tokio::test]
