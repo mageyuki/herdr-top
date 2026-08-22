@@ -101,7 +101,7 @@ jobs:
           name: SHA256SUMS
           path: artifacts/SHA256SUMS
       - name: Draft release (tags only)
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
