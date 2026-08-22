@@ -2140,7 +2140,19 @@ async fn probe_primary_topology(
 }
 
 fn probe_topology_matches_model(probed: TopologySnapshot, current: TopologySnapshot) -> bool {
-    canonical_topology(probed) == canonical_topology(current)
+    let mut probed = canonical_topology(probed);
+    let current = canonical_topology(current);
+    for (probed, current) in probed.tabs.iter_mut().zip(&current.tabs) {
+        if probed.tab_id == current.tab_id && probed.label.is_none() {
+            probed.label.clone_from(&current.label);
+        }
+    }
+    for (probed, current) in probed.panes.iter_mut().zip(&current.panes) {
+        if probed.pane_id == current.pane_id && probed.display_name.is_none() {
+            probed.display_name.clone_from(&current.display_name);
+        }
+    }
+    probed == current
 }
 
 fn canonical_topology(mut topology: TopologySnapshot) -> TopologySnapshot {
@@ -4395,6 +4407,23 @@ fn normalize_event(
                 ));
             }
         }
+        "tab_renamed" => {
+            if let (Some(tab_id), Some(label)) = (
+                string_field(&received.data, "tab_id"),
+                string_field(&received.data, "label"),
+            ) && let Some(tab) = shared.borrow().tab(&tab_id).cloned()
+            {
+                events.push(topology_upsert(
+                    session,
+                    &received.event,
+                    TopologyEntity::Tab(Tab {
+                        tab_id,
+                        workspace_id: tab.workspace_id,
+                        label: sanitized_name(&label),
+                    }),
+                ));
+            }
+        }
         "tab_closed" => {
             if let Some(tab_id) = string_field(&received.data, "tab_id") {
                 events.push(topology_closure(
@@ -5078,6 +5107,7 @@ fn subscriptions() -> Vec<Subscription> {
         "workspace.closed",
         "workspace.focused",
         "tab.created",
+        "tab.renamed",
         "tab.closed",
         "tab.focused",
         "pane.created",
@@ -5728,6 +5758,7 @@ fn updated_entity(received: &ReceivedEvent) -> Option<EntityKey> {
         "workspace_focused" => {
             string_field(&received.data, "workspace_id").map(EntityKey::Workspace)
         }
+        "tab_renamed" => string_field(&received.data, "tab_id").map(EntityKey::Tab),
         "tab_focused" => string_field(&received.data, "tab_id").map(EntityKey::Tab),
         "pane_updated" | "pane_agent_detected" => nested_string(&received.data, "pane", "pane_id")
             .or_else(|| string_field(&received.data, "pane_id"))
@@ -7533,6 +7564,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn watchdog_probe_name_comparison_matches_retention_and_detects_non_null_changes() {
+        let mut current = watchdog_probe_topology(None, None);
+        current.tabs[0].label = Some("stored tab".to_owned());
+        current.panes[0].display_name = Some("stored pane".to_owned());
+
+        let mut nameless_probe = current.clone();
+        nameless_probe.tabs[0].label = None;
+        nameless_probe.panes[0].display_name = None;
+        assert!(probe_topology_matches_model(
+            nameless_probe.clone(),
+            current.clone()
+        ));
+
+        let mut changed_tab = nameless_probe.clone();
+        changed_tab.tabs[0].label = Some("renamed tab".to_owned());
+        assert!(!probe_topology_matches_model(changed_tab, current.clone()));
+
+        let mut changed_pane = nameless_probe;
+        changed_pane.panes[0].display_name = Some("renamed pane".to_owned());
+        assert!(!probe_topology_matches_model(changed_pane, current));
     }
 
     #[test]
@@ -9560,6 +9614,79 @@ mod tests {
         )));
     }
 
+    fn tab_renamed_event(tab_id: &str, label: &str) -> ReceivedEvent {
+        ReceivedEvent {
+            event: "tab_renamed".to_owned(),
+            data: json!({
+                "type": "tab_renamed",
+                "tab_id": tab_id,
+                "workspace_id": "untrusted-workspace",
+                "label": label,
+            }),
+            primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
+        }
+    }
+
+    #[test]
+    fn tab_renamed_updates_existing_label_clears_empty_and_ignores_unknown_tabs() {
+        let mut model = DomainModel::default();
+        model.insert_workspace(Workspace {
+            workspace_id: "w1".to_owned(),
+        });
+        model.insert_tab(Tab {
+            tab_id: "w1:t1".to_owned(),
+            workspace_id: "w1".to_owned(),
+            label: Some("old".to_owned()),
+        });
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model,
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+
+        let normalized = normalize_event(
+            &shared,
+            "rename-session",
+            &tab_renamed_event("w1:t1", "レビュー"),
+        )
+        .unwrap();
+        let persist = apply_collector_observation(&mut reducer, normalized)
+            .unwrap()
+            .expect("known tab rename should apply");
+        assert_eq!(
+            shared.borrow().tab("w1:t1").unwrap().label.as_deref(),
+            Some("レビュー")
+        );
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertTab { tab, .. }
+                if tab.tab_id == "w1:t1"
+                    && tab.workspace_id == "w1"
+                    && tab.label.as_deref() == Some("レビュー")
+        )));
+
+        let normalized =
+            normalize_event(&shared, "rename-session", &tab_renamed_event("w1:t1", "")).unwrap();
+        let persist = apply_collector_observation(&mut reducer, normalized)
+            .unwrap()
+            .expect("empty known tab rename should apply");
+        assert_eq!(shared.borrow().tab("w1:t1").unwrap().label, None);
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertTab { tab, .. }
+                if tab.tab_id == "w1:t1" && tab.workspace_id == "w1" && tab.label.is_none()
+        )));
+
+        let normalized = normalize_event(
+            &shared,
+            "rename-session",
+            &tab_renamed_event("unknown-tab", "ignored"),
+        )
+        .unwrap();
+        assert!(normalized.is_empty());
+    }
+
     fn snapshot_with_names() -> Snapshot {
         Snapshot {
             version: "test".to_owned(),
@@ -9651,6 +9778,36 @@ mod tests {
             PersistOp::UpsertPane { pane, .. }
                 if pane.display_name.as_deref() == Some("UI修正")
         )));
+    }
+
+    #[test]
+    fn tab_rename_keeps_watchdog_topology_probe_in_sync() {
+        let probed = topology_from_snapshot(&snapshot_with_names()).unwrap();
+        let mut initial = probed.clone();
+        initial.tabs[0].label = Some("old label".to_owned());
+        let (mut reducer, shared) = empty_reducer();
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: initial,
+                gap_kind: GapKind::Startup,
+            })
+            .unwrap();
+
+        let stale = current_model_topology(&shared, &PendingTopologyClosures::default()).unwrap();
+        assert!(!probe_topology_matches_model(probed.clone(), stale));
+
+        let normalized = normalize_event(
+            &shared,
+            "rename-session",
+            &tab_renamed_event("w1:t1", "レビュー"),
+        )
+        .unwrap();
+        apply_collector_observation(&mut reducer, normalized)
+            .unwrap()
+            .expect("known tab rename should apply");
+
+        let current = current_model_topology(&shared, &PendingTopologyClosures::default()).unwrap();
+        assert!(probe_topology_matches_model(probed, current));
     }
 
     #[test]

@@ -415,6 +415,7 @@ async fn scoped_subscription_keeps_primary_unscoped_and_enriches_each_snapshot_p
             {"type":"workspace.closed"},
             {"type":"workspace.focused"},
             {"type":"tab.created"},
+            {"type":"tab.renamed"},
             {"type":"tab.closed"},
             {"type":"tab.focused"},
             {"type":"pane.created"},

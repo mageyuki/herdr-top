@@ -1672,6 +1672,24 @@ impl Reducer {
                     .map(|ordinal| (pane.pane_id.clone(), ordinal))
             })
             .collect::<Vec<_>>();
+        let retained_tab_labels = topology
+            .tabs
+            .iter()
+            .filter_map(|tab| {
+                self.model
+                    .tab(&tab.tab_id)
+                    .map(|current| (tab.tab_id.clone(), current.label.clone()))
+            })
+            .collect::<HashMap<_, _>>();
+        let retained_pane_display_names = topology
+            .panes
+            .iter()
+            .filter_map(|pane| {
+                self.model
+                    .pane(&pane.pane_id)
+                    .map(|current| (pane.pane_id.clone(), current.display_name.clone()))
+            })
+            .collect::<HashMap<_, _>>();
         let workspace_ids: Vec<_> = self
             .model
             .workspaces()
@@ -1718,10 +1736,14 @@ impl Reducer {
             });
         }
         for tab in &topology.tabs {
+            let mut tab = tab.clone();
+            if tab.label.is_none() {
+                tab.label = retained_tab_labels.get(&tab.tab_id).cloned().flatten();
+            }
             let display_ordinal = self.tab_ordinal_or_allocate(&tab.tab_id)?;
             self.model.insert_tab(tab.clone());
             persist.push(PersistOp::UpsertTab {
-                tab: tab.clone(),
+                tab,
                 display_ordinal,
             });
         }
@@ -1731,7 +1753,12 @@ impl Reducer {
                 workspace_id: pane.workspace_id.clone(),
                 tab_id: pane.tab_id.clone(),
                 terminal_id: pane.terminal_id.clone(),
-                display_name: pane.display_name.clone(),
+                display_name: pane.display_name.clone().or_else(|| {
+                    retained_pane_display_names
+                        .get(&pane.pane_id)
+                        .cloned()
+                        .flatten()
+                }),
             };
             let display_ordinal = self.pane_ordinal_or_allocate(&pane.pane_id)?;
             self.model.insert_pane(pane.clone());
@@ -3807,6 +3834,141 @@ mod tests {
         );
         assert_eq!(restored.model.tab_ordinal("tab"), Some(expected.1));
         assert_eq!(restored.model.pane_ordinal("pane"), Some(expected.2));
+    }
+
+    #[test]
+    fn reconcile_gap_retains_or_overwrites_topology_names_end_to_end() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let restored_state = store.load_restored_state().unwrap();
+        let (mut reducer, shared) = Reducer::new(restored_state);
+
+        for (event_id, entity) in [
+            (
+                "named-workspace",
+                TopologyEntity::Workspace(Workspace {
+                    workspace_id: "workspace".to_owned(),
+                }),
+            ),
+            (
+                "named-tab",
+                TopologyEntity::Tab(Tab {
+                    tab_id: "tab".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    label: Some("stored tab".to_owned()),
+                }),
+            ),
+            (
+                "named-pane",
+                TopologyEntity::Pane(Pane {
+                    pane_id: "pane".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    tab_id: "tab".to_owned(),
+                    terminal_id: "terminal".to_owned(),
+                    display_name: Some("stored pane".to_owned()),
+                }),
+            ),
+        ] {
+            let ApplyOutcome::Applied(batch) = reducer
+                .apply(topology_entity_event(event_id, entity))
+                .unwrap()
+            else {
+                panic!("topology event should apply");
+            };
+            store.apply_batch(batch).unwrap();
+        }
+
+        let batch = reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: topology_snapshot(
+                    &["workspace"],
+                    &[("tab", "workspace")],
+                    &[("pane", "workspace", "tab")],
+                ),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let delete_tab = batch
+            .iter()
+            .position(
+                |operation| matches!(operation, PersistOp::DeleteTab { tab_id } if tab_id == "tab"),
+            )
+            .unwrap();
+        let upsert_tab = batch
+            .iter()
+            .position(|operation| matches!(operation, PersistOp::UpsertTab { tab, .. } if tab.tab_id == "tab"))
+            .unwrap();
+        let delete_pane = batch
+            .iter()
+            .position(|operation| matches!(operation, PersistOp::DeletePane { pane_id } if pane_id == "pane"))
+            .unwrap();
+        let upsert_pane = batch
+            .iter()
+            .position(|operation| matches!(operation, PersistOp::UpsertPane { pane, .. } if pane.pane_id == "pane"))
+            .unwrap();
+        assert!(delete_tab < upsert_tab);
+        assert!(delete_pane < upsert_pane);
+        assert_eq!(
+            shared.borrow().tab("tab").unwrap().label.as_deref(),
+            Some("stored tab")
+        );
+        assert_eq!(
+            shared
+                .borrow()
+                .pane("pane")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("stored pane")
+        );
+        store.apply_batch(batch).unwrap();
+        let restored = store.load_restored_state().unwrap();
+        assert_eq!(
+            restored.model.tab("tab").unwrap().label.as_deref(),
+            Some("stored tab")
+        );
+        assert_eq!(
+            restored.model.pane("pane").unwrap().display_name.as_deref(),
+            Some("stored pane")
+        );
+
+        let mut named_topology = topology_snapshot(
+            &["workspace"],
+            &[("tab", "workspace")],
+            &[("pane", "workspace", "tab")],
+        );
+        named_topology.tabs[0].label = Some("snapshot tab".to_owned());
+        named_topology.panes[0].display_name = Some("snapshot pane".to_owned());
+        let batch = reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: named_topology,
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        assert_eq!(
+            shared.borrow().tab("tab").unwrap().label.as_deref(),
+            Some("snapshot tab")
+        );
+        assert_eq!(
+            shared
+                .borrow()
+                .pane("pane")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("snapshot pane")
+        );
+        store.apply_batch(batch).unwrap();
+        let restored = store.load_restored_state().unwrap();
+        assert_eq!(
+            restored.model.tab("tab").unwrap().label.as_deref(),
+            Some("snapshot tab")
+        );
+        assert_eq!(
+            restored.model.pane("pane").unwrap().display_name.as_deref(),
+            Some("snapshot pane")
+        );
     }
 
     fn native_snapshot(sid: &str) -> TopologySnapshot {
