@@ -15,7 +15,7 @@ Repository: [mageyuki/herdr-top](https://github.com/mageyuki/herdr-top)
 | Product name | Herdr Top |
 | Repository and binary | `herdr-top` |
 | Runtime | A regular Herdr-managed pane or tab inside the target named session |
-| Required platform | Herdr 0.8.0 or newer; initial development and test baseline: Herdr 0.8.0, socket protocol 19; reviewed socket-protocol set: {19, 20} (Herdr 0.8.2 adds protocol 20 with an additive-only bundled schema change) |
+| Required platform | Herdr 0.8.0 or newer; initial development and test baseline: Herdr 0.8.0, socket protocol 19; protocol compatibility is three-tiered: below 19 is a doctor Error, the reviewed set {19, 20} is compatible, newer than the reviewed set is a doctor Warning |
 | Agent providers | Claude Code and Codex |
 | Superpowers | Not required and not used as a required data source |
 | Primary view | Fixed-screen, htop-style live TUI |
@@ -548,7 +548,7 @@ Reinstallation replaces the managed checkout. Databases live under the Herdr Top
 
 ### 12.2 Release artifacts and Marketplace
 
-Tagged releases provide checksum-verified binaries for macOS arm64/x86_64 and Linux arm64/x86_64. The manifest `[[build]]` command selects and verifies the matching artifact without requiring Rust.
+Tagged releases provide checksum-verified binaries for macOS arm64/x86_64 and Linux arm64/x86_64. Artifact checksums are pinned in `scripts/release-pins.env` by a follow-up commit after each published release, so the build command trusts repository content rather than the download source; the release procedure is documented in `docs/guides/release-process.md`. The manifest `[[build]]` command selects and verifies the matching artifact without requiring Rust.
 
 After the first usable release, add the `herdr-plugin` GitHub topic for Marketplace discovery.
 
@@ -571,7 +571,7 @@ Herdr logs remain available through:
 herdr plugin log list --plugin mageyuki.herdr-top
 ```
 
-`doctor` checks Herdr socket, session key and its resolver source (flag, environment, or `default`), breadcrumb validity, the state-root `session-name.txt` record, the runtime sentinel, current Controller-socket availability and its reason, socket-path length, lock, database schema, provider discovery, Herdr official-integration versions, plugin/CLI compatibility, native-session coverage, and log locations without printing prompts or responses. Every executable, integration, or protocol version `doctor` reports is queried from the relevant binary or server — and reported as unavailable when that source cannot answer — never inferred from an installation path; self-updating installs make path-derived versions lie. For Herdr 0.8.0 native session restore, it compares legacy integer versions against the Claude Code integration version 6 and Codex integration version 5 minimums, while accepting date-era dot-separated all-digit versions such as `2026.08.12.1` as current without a floor comparison. Missing or older integrations do not block Herdr-only monitoring, but diagnostics explain the unavailable `agent_session` and restore coverage.
+`doctor` checks Herdr socket, session key and its resolver source (flag, environment, or `default`), breadcrumb validity, the state-root `session-name.txt` record, the runtime sentinel, current Controller-socket availability and its reason, socket-path length, lock, database schema, provider discovery, Herdr official-integration versions, plugin/CLI compatibility, native-session coverage, and log locations without printing prompts or responses. Protocol compatibility is three-tiered: protocols below the minimum are an Error (`herdr_protocol_mismatch`), protocols in the reviewed set are compatible, and protocols newer than every reviewed one are a Warning (`herdr_protocol_newer_unreviewed`) — monitoring continues because every inbound wire surface, the event-push envelope included, tolerates additive fields. The reviewed set is extended only through `scripts/review-herdr-protocol.sh`, which diffs a candidate herdr's bundled schema against the committed baseline in `tests/fixtures/herdr-schema/`. No newer-protocol socket feature is used anywhere; any future use must be gated on the handshake protocol at the call site. Every executable, integration, or protocol version `doctor` reports is queried from the relevant binary or server — and reported as unavailable when that source cannot answer — never inferred from an installation path; self-updating installs make path-derived versions lie. For Herdr 0.8.0 native session restore, it compares legacy integer versions against the Claude Code integration version 6 and Codex integration version 5 minimums, while accepting date-era dot-separated all-digit versions such as `2026.08.12.1` as current without a floor comparison. Missing or older integrations do not block Herdr-only monitoring, but diagnostics explain the unavailable `agent_session` and restore coverage.
 
 ## 13. Technology stack
 
@@ -765,7 +765,8 @@ Use `docs/adr/` when recording an individual decision that has meaningful altern
 - Controller-event transport and compatibility policy;
 - session identity and pane-move reconciliation;
 - SQLite retention and migration policy;
-- release binary and plugin installation strategy.
+- release binary and plugin installation strategy;
+- static linking (musl) for Linux release artifacts.
 
 ADRs should reference this design rather than duplicate it.
 
