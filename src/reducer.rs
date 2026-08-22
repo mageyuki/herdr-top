@@ -2147,7 +2147,7 @@ fn next_execution_state(
 }
 
 fn provisional_key(terminal_id: &str, timestamp_ms: i64, ordinal: DisplayOrdinal) -> RunKey {
-    let seq = u64::try_from(ordinal.get()).map_or(0, |value| value);
+    let seq = u64::try_from(ordinal.get()).unwrap_or(0);
     RunKey::Provisional {
         terminal_id: terminal_id.to_owned(),
         start_ms: timestamp_ms,

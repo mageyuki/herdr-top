@@ -10071,7 +10071,9 @@ fn marker_bounded_production_diff(
         return Err(format!("{path} did not contain paired harness markers"));
     }
     let ranges = markers
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| pair[0]..=pair[1])
         .collect::<Vec<_>>();
     let diff = String::from_utf8(run_closed_git(
