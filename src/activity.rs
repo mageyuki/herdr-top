@@ -68,6 +68,7 @@ pub fn runs_with_executions(model: &crate::model::DomainModel) -> HashSet<RunId>
         .collect()
 }
 
+/// `runs_with_executions` must be derived from the same model snapshot as `run`.
 #[must_use]
 pub fn is_default_visible_task_run(
     run: &crate::model::TaskRun,
