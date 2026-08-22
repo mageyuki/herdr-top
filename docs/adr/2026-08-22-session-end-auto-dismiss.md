@@ -18,7 +18,7 @@ The earlier no-op behavior avoided making the run terminal. A session can later 
 
 Introduce a dedicated, non-terminal Controller `dismiss` event and map provider `SessionEnd` hooks to it. The event sets the run's persisted `dismissed_at_ms` without changing task state or advancing its activity timestamp. Dismissed runs are hidden from the default view, persist across restart, and remain available through filtering.
 
-Any later non-terminal mutation clears `dismissed_at_ms`, so a resumed session reappears when its `SessionStart` produces `task_started`; no resume-specific reducer path is required. A `dismiss` for an unknown run is a true no-op and does not create a forward-reference placeholder.
+Non-terminal run mutations that go through the shared bookkeeping helper `TaskRun::touch` clear `dismissed_at_ms`. The `task_started` path uses that helper, so a resumed session reappears when its `SessionStart` produces `task_started`; no resume-specific reducer path is required. A `dismiss` for an unknown run is a true no-op and does not create a forward-reference placeholder.
 
 ## Alternatives considered
 

@@ -564,6 +564,9 @@ impl Reducer {
             next_ingest_seq: self.next_ingest_seq,
             event_ledger: Vec::new(),
         });
+        if matches!(event.event, ControllerEventKind::Dismiss) && subject_was_unknown {
+            metadata.task_run_id = None;
+        }
         let normalized = NormalizedEvent::ControllerEvent {
             metadata: metadata.clone(),
             event: event.event.clone(),
@@ -2660,6 +2663,15 @@ mod tests {
                     && value.task_run.updated_at_ms == Some(7)
                     && value.updated_at_ms == 7
         )));
+        let recorded = delta
+            .batch
+            .iter()
+            .find_map(|operation| match operation {
+                PersistOp::RecordEvent { event, .. } => Some(super::event_metadata(event)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(recorded.task_run_id, Some(run_id));
     }
 
     #[test]
@@ -2689,6 +2701,15 @@ mod tests {
                 .iter()
                 .all(|operation| !matches!(operation, PersistOp::UpsertTaskRun(_)))
         );
+        let recorded = delta
+            .batch
+            .iter()
+            .find_map(|operation| match operation {
+                PersistOp::RecordEvent { event, .. } => Some(super::event_metadata(event)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(recorded.task_run_id, None);
     }
 
     #[tokio::test]

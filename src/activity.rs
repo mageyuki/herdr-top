@@ -1,6 +1,6 @@
 //! Immutable operator activity and terminal-visibility read models.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::model::{Provider, RunId, RunKey, TaskState};
@@ -61,19 +61,25 @@ pub struct OperatorSnapshot {
 }
 
 #[must_use]
+pub fn runs_with_executions(model: &crate::model::DomainModel) -> HashSet<RunId> {
+    model
+        .executions()
+        .map(|execution| execution.task_run_id)
+        .collect()
+}
+
+#[must_use]
 pub fn is_default_visible_task_run(
-    model: &crate::model::DomainModel,
     run: &crate::model::TaskRun,
     operator: &OperatorSnapshot,
+    runs_with_executions: &HashSet<RunId>,
     now_ms: i64,
 ) -> bool {
     if run.dismissed_at_ms.is_some() {
         return false;
     }
-    let hook_only = matches!(run.key, RunKey::Controller(_))
-        && !model
-            .executions()
-            .any(|execution| execution.task_run_id == run.run_id);
+    let hook_only =
+        matches!(run.key, RunKey::Controller(_)) && !runs_with_executions.contains(&run.run_id);
     if hook_only
         && run.updated_at_ms.is_some_and(|updated_at_ms| {
             now_ms >= updated_at_ms.saturating_add(HOOK_ONLY_STALE_VISIBILITY_MS)
@@ -96,9 +102,10 @@ pub fn default_visible_task_run_count(
     operator: &OperatorSnapshot,
     now_ms: i64,
 ) -> usize {
+    let execution_run_ids = runs_with_executions(model);
     model
         .task_runs()
-        .filter(|run| is_default_visible_task_run(model, run, operator, now_ms))
+        .filter(|run| is_default_visible_task_run(run, operator, &execution_run_ids, now_ms))
         .count()
 }
 
@@ -175,6 +182,55 @@ mod tests {
     }
 
     #[test]
+    fn runs_with_executions_collects_distinct_run_ids() {
+        let first = RunId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        let second = RunId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAW").unwrap();
+        let mut model = DomainModel::default();
+        for (execution_id, task_run_id) in
+            [("first", first), ("duplicate", first), ("second", second)]
+        {
+            model.insert_execution(Execution {
+                execution_id: execution_id.to_owned(),
+                pane_id: "pane".to_owned(),
+                terminal_id: "terminal".to_owned(),
+                task_run_id,
+                state: ExecState::Working,
+            });
+        }
+
+        assert_eq!(
+            runs_with_executions(&model),
+            std::collections::HashSet::from([first, second])
+        );
+    }
+
+    #[test]
+    fn precomputed_execution_membership_controls_hook_only_expiry() {
+        let run = task_run(
+            RunKey::Controller("membership".to_owned()),
+            TaskState::Running,
+            Some(100),
+        );
+        let mut model = DomainModel::default();
+        model.insert_task_run(run.clone());
+        let now_ms = 100 + HOOK_ONLY_STALE_VISIBILITY_MS;
+
+        assert!(is_default_visible_task_run(
+            &run,
+            &empty_operator(),
+            &std::collections::HashSet::from([run.run_id]),
+            now_ms,
+        ));
+        assert!(!is_default_visible_task_run(
+            &run,
+            &empty_operator(),
+            &std::collections::HashSet::new(),
+            now_ms,
+        ));
+        assert_eq!(model.executions().count(), 0);
+    }
+
+    #[test]
     fn hook_only_run_expires_at_exactly_twenty_four_hours() {
         let updated_at_ms = 100;
         let run = task_run(
@@ -185,17 +241,18 @@ mod tests {
         let mut model = DomainModel::default();
         model.insert_task_run(run.clone());
         let operator = empty_operator();
+        let execution_run_ids = runs_with_executions(&model);
 
         assert!(is_default_visible_task_run(
-            &model,
             &run,
             &operator,
+            &execution_run_ids,
             updated_at_ms + 86_400_000 - 1,
         ));
         assert!(!is_default_visible_task_run(
-            &model,
             &run,
             &operator,
+            &execution_run_ids,
             updated_at_ms + 86_400_000,
         ));
 
@@ -203,9 +260,9 @@ mod tests {
         fresh.updated_at_ms = Some(updated_at_ms + 86_400_000);
         model.insert_task_run(fresh.clone());
         assert!(is_default_visible_task_run(
-            &model,
             &fresh,
             &operator,
+            &execution_run_ids,
             updated_at_ms + 86_400_000,
         ));
     }
@@ -222,11 +279,12 @@ mod tests {
         );
         let mut model = DomainModel::default();
         model.insert_task_run(run.clone());
+        let execution_run_ids = runs_with_executions(&model);
 
         assert!(is_default_visible_task_run(
-            &model,
             &run,
             &empty_operator(),
+            &execution_run_ids,
             86_400_100,
         ));
     }
@@ -247,11 +305,12 @@ mod tests {
             task_run_id: run.run_id,
             state: ExecState::Working,
         });
+        let execution_run_ids = runs_with_executions(&model);
 
         assert!(is_default_visible_task_run(
-            &model,
             &run,
             &empty_operator(),
+            &execution_run_ids,
             i64::MAX,
         ));
     }
@@ -266,11 +325,12 @@ mod tests {
         run.dismissed_at_ms = Some(101);
         let mut model = DomainModel::default();
         model.insert_task_run(run.clone());
+        let execution_run_ids = runs_with_executions(&model);
 
         assert!(!is_default_visible_task_run(
-            &model,
             &run,
             &empty_operator(),
+            &execution_run_ids,
             101,
         ));
     }
@@ -284,11 +344,12 @@ mod tests {
         );
         let mut model = DomainModel::default();
         model.insert_task_run(run.clone());
+        let execution_run_ids = runs_with_executions(&model);
 
         assert!(is_default_visible_task_run(
-            &model,
             &run,
             &empty_operator(),
+            &execution_run_ids,
             i64::MAX,
         ));
     }
@@ -309,12 +370,19 @@ mod tests {
             activity: Arc::from(Vec::new()),
             terminal_times: Arc::new(HashMap::from([(run.run_id, 100)])),
         };
+        let execution_run_ids = runs_with_executions(&model);
 
         assert!(is_default_visible_task_run(
-            &model, &run, &operator, 3_600_099,
+            &run,
+            &operator,
+            &execution_run_ids,
+            3_600_099,
         ));
         assert!(!is_default_visible_task_run(
-            &model, &run, &operator, 3_600_100,
+            &run,
+            &operator,
+            &execution_run_ids,
+            3_600_100,
         ));
     }
 }

@@ -8,6 +8,7 @@ use std::path::Path;
 use crate::activity::{
     ActivityDurability, ActivityItem, DEFAULT_TERMINAL_VISIBILITY_MS,
     HOOK_ONLY_STALE_VISIBILITY_MS, OperatorSnapshot, is_default_visible_task_run,
+    runs_with_executions,
 };
 use crate::diagnostics::{ControllerInputStatus, RuntimeDiagnosticsSnapshot};
 use crate::herdr::collector::ObservationQuality;
@@ -131,6 +132,7 @@ pub(crate) fn project_rows(
     let mut visible = Vec::with_capacity(full_rows.len());
     let mut hidden_subtree_depth = None;
     let mut next_expiry_ms: Option<i64> = None;
+    let execution_run_ids = runs_with_executions(model);
     for row in full_rows {
         if hidden_subtree_depth.is_some_and(|depth| row.depth > depth) {
             continue;
@@ -143,7 +145,7 @@ pub(crate) fn project_rows(
         let Some(run) = model.task_run(&run_id) else {
             continue;
         };
-        if is_default_visible_task_run(model, run, operator, now_ms) {
+        if is_default_visible_task_run(run, operator, &execution_run_ids, now_ms) {
             if run.state.is_terminal()
                 && let Some(first_terminal_ms) = operator.terminal_times.get(&run_id).copied()
             {
@@ -151,9 +153,7 @@ pub(crate) fn project_rows(
                 next_expiry_ms = Some(next_expiry_ms.map_or(expiry, |current| current.min(expiry)));
             }
             if matches!(run.key, RunKey::Controller(_))
-                && !model
-                    .executions()
-                    .any(|execution| execution.task_run_id == run.run_id)
+                && !execution_run_ids.contains(&run.run_id)
                 && let Some(updated_at_ms) = run.updated_at_ms
             {
                 let expiry = updated_at_ms.saturating_add(HOOK_ONLY_STALE_VISIBILITY_MS);

@@ -37,7 +37,6 @@ use super::view::{self, TreeRow};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(100);
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const CLOCK_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Injectable wall clock used by terminal-expiry and notice policy.
 pub trait Clock: Send + Sync {
@@ -587,7 +586,9 @@ impl App {
     }
 
     /// Advances presentation time and refreshes visibility when a deadline is due.
-    pub fn advance_clock(&mut self, now_ms: i64) -> bool {
+    // Retained as the live-duration refresh mechanism for future rendering.
+    #[allow(dead_code)]
+    pub(crate) fn advance_clock(&mut self, now_ms: i64) -> bool {
         if now_ms <= self.state.now_ms {
             return false;
         }
@@ -615,6 +616,8 @@ impl App {
         deadline_due || self.has_visible_non_terminal_run()
     }
 
+    // Retained to detect content that needs the future live-duration refresh.
+    #[allow(dead_code)]
     fn has_visible_non_terminal_run(&self) -> bool {
         view::build_rows(self.model.as_ref(), &self.state)
             .iter()
@@ -771,16 +774,11 @@ impl App {
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend)?;
         let started = Instant::now();
-        let mut last_clock_tick = started.elapsed();
         let mut limiter = FrameLimiter::default();
         let mut dirty = true;
         loop {
             dirty |= self.refresh_if_changed()?;
             let now = started.elapsed();
-            if now.saturating_sub(last_clock_tick) >= CLOCK_TICK_INTERVAL {
-                last_clock_tick = now;
-                dirty |= self.advance_clock(self.clock.now_ms());
-            }
             if limiter.ready(dirty, now) {
                 terminal.draw(|frame| self.render(frame))?;
                 limiter.record(now);
@@ -2923,6 +2921,45 @@ mod tests {
             let _ = app.poll_duration(&limiter, false, Duration::ZERO);
         }
         assert_eq!(app.projection_build_count(), deadline_builds);
+    }
+
+    #[test]
+    fn hook_only_expiry_uses_cached_deadline_without_advance_clock() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let updated_at_ms = 100;
+        let deadline = updated_at_ms + activity::HOOK_ONLY_STALE_VISIBILITY_MS;
+        let mut model = DomainModel::default();
+        model.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::Controller("hook-only".to_owned()),
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+            created_at_ms: Some(updated_at_ms),
+            updated_at_ms: Some(updated_at_ms),
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        let clock = TestClock::at(updated_at_ms);
+        let (mut app, _senders) = app_with_runtime(
+            model,
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+        assert_eq!(displayed_run_names(&app), ["hook-only"]);
+        assert_eq!(app.next_expiry_ms(), Some(deadline));
+
+        clock.set(deadline);
+        let limiter = FrameLimiter::default();
+        assert_eq!(
+            app.poll_duration(&limiter, false, Duration::ZERO),
+            Duration::ZERO
+        );
+        assert!(app.refresh_if_changed().unwrap());
+        assert!(displayed_run_names(&app).is_empty());
+        assert_eq!(app.next_expiry_ms(), None);
     }
 
     #[test]
