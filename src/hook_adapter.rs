@@ -29,7 +29,6 @@ pub const HOOK_IDENTIFIER_MAX_BYTES: usize = 128;
 
 /// Rejects hook payloads whose identifiers exceed the byte cap. The error
 /// names the field and length but never echoes identifier content.
-#[allow(clippy::collapsible_if)]
 pub fn validate_hook_identifiers(payload: &HookPayload) -> Result<(), String> {
     let fields = [
         ("session_id", Some(payload.session_id.as_str())),
@@ -37,13 +36,13 @@ pub fn validate_hook_identifiers(payload: &HookPayload) -> Result<(), String> {
         ("task_id", payload.task_id.as_deref()),
     ];
     for (name, value) in fields {
-        if let Some(value) = value {
-            if value.len() > HOOK_IDENTIFIER_MAX_BYTES {
-                return Err(format!(
-                    "hook {name} is {} bytes, exceeding the {HOOK_IDENTIFIER_MAX_BYTES}-byte cap",
-                    value.len()
-                ));
-            }
+        if let Some(value) = value
+            && value.len() > HOOK_IDENTIFIER_MAX_BYTES
+        {
+            return Err(format!(
+                "hook {name} is {} bytes, exceeding the {HOOK_IDENTIFIER_MAX_BYTES}-byte cap",
+                value.len()
+            ));
         }
     }
     Ok(())
