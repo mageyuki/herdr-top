@@ -105,9 +105,9 @@ impl EventStream {
                 "event push must be a JSON object".into(),
             ));
         };
-        if object.len() != 2 || !object.contains_key("event") || !object.contains_key("data") {
+        if !object.contains_key("event") || !object.contains_key("data") {
             return Err(WireError::MalformedFrame(
-                "event push must contain exactly event and data".into(),
+                "event push must contain event and data".into(),
             ));
         }
         let event = object
@@ -284,6 +284,26 @@ mod tests {
 
     use super::*;
 
+    fn inject_unknown_fields(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                for child in map.values_mut() {
+                    inject_unknown_fields(child);
+                }
+                map.insert(
+                    "herdr_top_tolerance_probe".to_owned(),
+                    json!({"future": [1, 2, 3]}),
+                );
+            }
+            Value::Array(items) => {
+                for item in items {
+                    inject_unknown_fields(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
     async fn decode_response(frame: Value, expected_id: &str) -> Result<WireResult, WireError> {
         let (mut server, client) = UnixStream::pair().expect("Unix stream pair should open");
         let mut bytes = serde_json::to_vec(&frame).expect("response should encode");
@@ -294,6 +314,75 @@ mod tests {
             .expect("response should write");
         drop(server);
         read_response(&mut BufReader::new(client), expected_id).await
+    }
+
+    async fn decode_event(frame: Value) -> Result<Option<(String, Value)>, WireError> {
+        let (mut server, client) = UnixStream::pair().expect("Unix stream pair should open");
+        let mut bytes = serde_json::to_vec(&frame).expect("event should encode");
+        bytes.push(b'\n');
+        server.write_all(&bytes).await.expect("event should write");
+        drop(server);
+        EventStream {
+            reader: BufReader::new(client),
+        }
+        .next_event()
+        .await
+    }
+
+    #[tokio::test]
+    async fn next_event_tolerates_extra_envelope_keys() {
+        let event = decode_event(json!({"event": "pane.updated", "data": {}, "seq": 7}))
+            .await
+            .expect("event with an extra key should decode");
+
+        assert_eq!(event, Some(("pane.updated".to_owned(), json!({}))));
+    }
+
+    #[tokio::test]
+    async fn next_event_rejects_missing_data() {
+        let error = decode_event(json!({"event": "pane.updated"}))
+            .await
+            .expect_err("event without data must be rejected");
+
+        assert!(matches!(error, WireError::MalformedFrame(_)));
+    }
+
+    #[tokio::test]
+    async fn i7_error_body_tolerates_unknown_fields() {
+        let mut frame = json!({
+            "id": "req",
+            "error": {"code": "pane_not_found", "message": "pane w9:p99 not found"}
+        });
+        assert!(frame["error"].is_object(), "error body must be present");
+        inject_unknown_fields(&mut frame["error"]);
+
+        let error = decode_response(frame, "req")
+            .await
+            .expect_err("error response should surface as a server error");
+        assert!(
+            matches!(
+                &error,
+                WireError::Server { code, message }
+                    if code == "pane_not_found" && message == "pane w9:p99 not found"
+            ),
+            "expected a pane_not_found server error, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn i7_response_envelope_tolerates_unknown_fields() {
+        let mut frame = json!({
+            "id": "req",
+            "result": {"type": "subscription_started"}
+        });
+        assert!(frame.is_object(), "response envelope must be present");
+        assert!(frame["result"].is_object(), "result body must be present");
+        inject_unknown_fields(&mut frame);
+
+        let response = decode_response(frame, "req")
+            .await
+            .expect("response envelope tolerates unknown fields");
+        assert_eq!(response.result_type(), "subscription_started");
     }
 
     #[tokio::test]

@@ -229,6 +229,7 @@ pub struct HerdrCompatibilityObservation {
     pub found_version: String,
     pub minimum_version: String,
     pub found_protocol: u32,
+    pub minimum_protocol: u32,
     pub supported_protocols: Vec<u32>,
 }
 
@@ -474,6 +475,7 @@ fn message(code: &str) -> &'static str {
         "herdr_compatible" => "Herdr is compatible",
         "herdr_below_floor" => "Herdr is below the minimum version",
         "herdr_protocol_mismatch" => "Herdr protocol differs",
+        "herdr_protocol_newer_unreviewed" => "Herdr protocol is newer than reviewed",
         "herdr_version_unparseable" => "Herdr version is unavailable",
         "integrations_current" => "provider integrations are current",
         "integration_missing" => "a provider integration is missing",
@@ -510,18 +512,25 @@ fn herdr_compatibility_check(pong: Option<&Pong>) -> Check<HerdrCompatibilityObs
     let assessment = remote::assess_herdr_compatibility(pong);
     let normalized = match &assessment {
         HerdrCompatibility::Compatible { version } => Some(version.clone()),
+        HerdrCompatibility::NewerUnreviewed { version } => Some(version.clone()),
         HerdrCompatibility::Unavailable { version, .. } => version.clone(),
     };
     let observed = normalized.map(|found_version| HerdrCompatibilityObservation {
         found_version,
         minimum_version: remote::MINIMUM_HERDR_VERSION.to_owned(),
         found_protocol: pong.protocol,
-        supported_protocols: remote::SUPPORTED_HERDR_PROTOCOLS.to_vec(),
+        minimum_protocol: remote::MINIMUM_HERDR_PROTOCOL,
+        supported_protocols: remote::REVIEWED_HERDR_PROTOCOLS.to_vec(),
     });
     match assessment {
         HerdrCompatibility::Compatible { .. } => {
             check(CheckStatus::Ok, "herdr_compatible", observed)
         }
+        HerdrCompatibility::NewerUnreviewed { .. } => check(
+            CheckStatus::Warning,
+            "herdr_protocol_newer_unreviewed",
+            observed,
+        ),
         HerdrCompatibility::Unavailable { reason, .. } => match reason {
             HerdrCompatibilityIssue::InvalidVersion => {
                 check(CheckStatus::Error, "herdr_version_unparseable", None)
@@ -2171,6 +2180,7 @@ mod tests {
             .observed
             .expect("compatible Herdr has a typed observation");
         assert_eq!(current_observed.found_protocol, 19_u32);
+        assert_eq!(current_observed.minimum_protocol, 19_u32);
         assert_eq!(current_observed.supported_protocols, vec![19, 20]);
 
         let old = herdr_compatibility_check(Some(&Pong {
@@ -2190,14 +2200,24 @@ mod tests {
         assert_eq!(protocol.code, "herdr_compatible");
         assert_eq!(protocol.observed.unwrap().found_protocol, 20_u32);
 
-        let protocol_mismatch = herdr_compatibility_check(Some(&Pong {
+        let newer = herdr_compatibility_check(Some(&Pong {
             result_type: "pong".to_owned(),
             version: "0.9.0".to_owned(),
             protocol: 21,
             capabilities: None,
         }));
-        assert_eq!(protocol_mismatch.code, "herdr_protocol_mismatch");
-        assert_eq!(protocol_mismatch.observed.unwrap().found_protocol, 21_u32);
+        assert_eq!(newer.status, CheckStatus::Warning);
+        assert_eq!(newer.code, "herdr_protocol_newer_unreviewed");
+        assert_eq!(newer.observed.unwrap().found_protocol, 21_u32);
+
+        let below = herdr_compatibility_check(Some(&Pong {
+            result_type: "pong".to_owned(),
+            version: "0.9.0".to_owned(),
+            protocol: 18,
+            capabilities: None,
+        }));
+        assert_eq!(below.status, CheckStatus::Error);
+        assert_eq!(below.code, "herdr_protocol_mismatch");
 
         let invalid = herdr_compatibility_check(Some(&Pong {
             result_type: "pong".to_owned(),

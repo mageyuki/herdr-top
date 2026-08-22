@@ -6995,6 +6995,7 @@ fn section15_selected_evidence_is_reopened_and_rederived() {
     );
 }
 
+#[cfg(feature = "workload-harness")]
 #[test]
 fn section15_selected_paths_reject_absolute_noncanonical_spelling() {
     // Break caught: `Path::components` normalizes `.` before the structural
@@ -10070,7 +10071,9 @@ fn marker_bounded_production_diff(
         return Err(format!("{path} did not contain paired harness markers"));
     }
     let ranges = markers
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| pair[0]..=pair[1])
         .collect::<Vec<_>>();
     let diff = String::from_utf8(run_closed_git(
