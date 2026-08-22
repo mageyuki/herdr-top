@@ -22,3 +22,6 @@ target
 
 # Cargo build directory (crate root)
 /target
+
+# Plugin build output
+/bin/
