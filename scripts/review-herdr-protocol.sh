@@ -43,7 +43,9 @@ records_of() {
       paths as $path
       | getpath($path) as $value
       | "\(path_name($path))\ttype:\($value | type)",
-        (if ($path[-1] | type) == "number"
+        # Protocol is compared explicitly below; recording its value would make
+        # every valid protocol bump look like a removed schema value.
+        (if $path != ["protocol"]
             and ($value | type) != "array"
             and ($value | type) != "object"
          then "\(path_name($path))\tvalue:\($value | tojson)"

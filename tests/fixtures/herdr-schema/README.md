@@ -32,3 +32,6 @@ replace `tests/fixtures/herdr-schema/baseline.json` with the new command's raw
 output, and update this README with the new protocol, version, and binary
 digest. The baseline filename is version-agnostic, so no other fixture path
 changes are required.
+
+Value and member changes inside array elements are compared as whole elements,
+so they require review even when otherwise additive.

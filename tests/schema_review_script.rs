@@ -45,6 +45,75 @@ fn i7_baseline_reviews_clean_against_itself() {
 }
 
 #[test]
+fn i7_protocol_bump_only_reviews_clean() {
+    let mut candidate: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(BASELINE).expect("read"))
+            .expect("baseline parses");
+    candidate["protocol"] = serde_json::json!(21);
+    let candidate = temp_candidate("protocol-bump-only", &candidate);
+    let out = run(&["--candidate-file", candidate.to_str().expect("utf-8")]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("verdict: additive or identical"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn i7_live_binary_invocation_reviews_clean_when_available() -> Result<(), Box<dyn std::error::Error>>
+{
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(binary) = std::env::var_os("HERDR_BINARY")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| std::path::PathBuf::from(home).join(".local/bin/herdr"))
+        })
+    else {
+        println!("skipping live herdr schema review: neither HERDR_BINARY nor HOME is set");
+        return Ok(());
+    };
+    let Ok(metadata) = std::fs::metadata(&binary) else {
+        println!(
+            "skipping live herdr schema review: {} is absent",
+            binary.display()
+        );
+        return Ok(());
+    };
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        println!(
+            "skipping live herdr schema review: {} is not executable",
+            binary.display()
+        );
+        return Ok(());
+    }
+    let Some(binary) = binary.to_str() else {
+        println!("skipping live herdr schema review: binary path is not UTF-8");
+        return Ok(());
+    };
+
+    // A future herdr schema that is not additive should fail here as intended signal.
+    let out = run(&[binary]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(())
+}
+
+#[test]
 fn i7_review_is_locale_independent() {
     // Guards the collation regression. Without ja_JP.UTF-8, glibc falls back to C,
     // so this degrades to a duplicate of the clean case instead of failing spuriously.
@@ -168,6 +237,65 @@ fn i7_newer_candidate_with_one_duplicate_removed_requires_review() {
 }
 
 #[test]
+fn i7_synthetic_root_duplicate_removal_requires_review() {
+    let root = std::env::temp_dir().join(format!(
+        "herdr-schema-review-{}-synthetic-root-duplicate",
+        std::process::id()
+    ));
+    let script_dir = root.join("scripts");
+    let fixture_dir = root.join("tests/fixtures/herdr-schema");
+    std::fs::create_dir_all(&script_dir).expect("script dir");
+    std::fs::create_dir_all(&fixture_dir).expect("fixture dir");
+
+    let script = script_dir.join("review-herdr-protocol.sh");
+    std::fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/review-herdr-protocol.sh"
+        ),
+        &script,
+    )
+    .expect("copy script");
+    let baseline = serde_json::json!({
+        "protocol": 20,
+        "schemas": {
+            "error_response": {
+                "anyOf": [{"type": "null"}, {"type": "null"}]
+            }
+        }
+    });
+    std::fs::write(fixture_dir.join("baseline.json"), baseline.to_string())
+        .expect("write synthetic baseline");
+    let mut candidate = baseline;
+    candidate["schemas"]["error_response"]["anyOf"]
+        .as_array_mut()
+        .expect("anyOf is an array")
+        .remove(1);
+    candidate["protocol"] = serde_json::json!(21);
+    let candidate_path = root.join("candidate.json");
+    std::fs::write(&candidate_path, candidate.to_string()).expect("write candidate");
+
+    let out = Command::new("bash")
+        .arg(&script)
+        .args(["--candidate-file", candidate_path.to_str().expect("utf-8")])
+        .output()
+        .expect("copied script runs");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("verdict: REVIEW REQUIRED"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn i7_newer_candidate_with_reordered_top_level_one_of_reviews_clean() {
     let baseline: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(BASELINE).expect("read"))
@@ -220,6 +348,32 @@ fn i7_reviewed_protocol_value_drift_requires_review() {
     );
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("baseline protocol:"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn i7_newer_candidate_with_plain_object_property_value_drift_requires_review() {
+    let baseline: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(BASELINE).expect("read"))
+            .expect("baseline parses");
+    let mut mutated = baseline.clone();
+    mutated["schemas"]["error_response"]["$defs"]["ErrorBody"]["properties"]["code"]["type"] =
+        serde_json::json!("integer");
+    mutated["protocol"] = serde_json::json!(21);
+    let candidate = temp_candidate("plain-object-property-value-drift", &mutated);
+    let out = run(&["--candidate-file", candidate.to_str().expect("utf-8")]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("verdict: REVIEW REQUIRED"),
         "stdout: {} stderr: {}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
