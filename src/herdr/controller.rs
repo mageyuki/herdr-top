@@ -969,6 +969,9 @@ fn decode_object(
         "cancelled" if parent_task_run_id.is_none() && depends_on_id.is_none() => {
             ControllerEventKind::Cancelled
         }
+        "dismiss" if parent_task_run_id.is_none() && depends_on_id.is_none() => {
+            ControllerEventKind::Dismiss
+        }
         _ => return Err(RejectReason::Invalid),
     };
     Ok(ControllerEvent {
@@ -1880,6 +1883,53 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn dismiss_decodes_as_fieldless_controller_event() {
+        let frame = serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "event_id": "dismiss",
+            "emitted_at_ms": 1,
+            "source": "test",
+            "event_type": "dismiss",
+            "task_run_id": "run"
+        }))
+        .unwrap();
+
+        let decoded = decode_envelope(&frame);
+        let event = decoded.decode_event(2, "session").unwrap();
+
+        assert_eq!(event.event, ControllerEventKind::Dismiss);
+    }
+
+    #[test]
+    fn dismiss_rejects_relationship_endpoints() {
+        for endpoint in [
+            json!({ "parent_task_run_id": "parent" }),
+            json!({ "depends_on_id": "prerequisite" }),
+        ] {
+            let mut object = json!({
+                "schema_version": 1,
+                "event_id": "dismiss",
+                "emitted_at_ms": 1,
+                "source": "test",
+                "event_type": "dismiss",
+                "task_run_id": "run"
+            });
+            object
+                .as_object_mut()
+                .unwrap()
+                .extend(endpoint.as_object().unwrap().clone());
+            let frame = serde_json::to_vec(&object).unwrap();
+
+            let decoded = decode_envelope(&frame);
+
+            assert!(matches!(
+                decoded.decode_event(2, "session"),
+                Err(RejectReason::Invalid)
+            ));
+        }
     }
 
     #[test]

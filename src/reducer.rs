@@ -554,7 +554,8 @@ impl Reducer {
             | ControllerEventKind::Progress
             | ControllerEventKind::Complete
             | ControllerEventKind::Failed
-            | ControllerEventKind::Cancelled => {}
+            | ControllerEventKind::Cancelled
+            | ControllerEventKind::Dismiss => {}
         }
 
         let (mut scratch, _scratch_shared) = Self::new(RestoredState {
@@ -568,6 +569,28 @@ impl Reducer {
             event: event.event.clone(),
         };
         let mut persist = Vec::new();
+        if matches!(event.event, ControllerEventKind::Dismiss) {
+            if let Some(mut task_run) = scratch.model.task_run(&subject).cloned() {
+                task_run.dismissed_at_ms = Some(metadata.receipt_time_ms);
+                scratch.model.insert_task_run(task_run.clone());
+                persist.push(scratch.persist_task_run(task_run, metadata.receipt_time_ms));
+            }
+            persist.push(PersistOp::RecordEvent {
+                event: Box::new(normalized),
+                seen_at_ms: metadata.receipt_time_ms,
+            });
+            let diagnostic_deltas = ControllerDiagnosticDeltas {
+                post_dangling_announcement_components:
+                    crate::model::graph::dangling_announcement_components(&scratch.model),
+                ..ControllerDiagnosticDeltas::default()
+            };
+            return Ok(MaterializedDelta {
+                post_model: scratch.model,
+                post_next_ordinal: scratch.next_ordinal,
+                diagnostic_deltas,
+                batch: persist,
+            });
+        }
         let initial_state = metadata.task_state.map_or(TaskState::Queued, |state| {
             initial_controller_state(&metadata.source_event_type, state)
         });
@@ -1955,6 +1978,7 @@ fn validate_controller_transition(
                 deltas.terminal_blocked_progress_noops = 1;
             }
         }
+        ControllerEventKind::Dismiss => {}
         ControllerEventKind::Complete
         | ControllerEventKind::Failed
         | ControllerEventKind::Cancelled => {
@@ -1994,12 +2018,15 @@ fn controller_kind_name(event: &ControllerEventKind) -> &'static str {
         ControllerEventKind::Complete => "complete",
         ControllerEventKind::Failed => "failed",
         ControllerEventKind::Cancelled => "cancelled",
+        ControllerEventKind::Dismiss => "dismiss",
     }
 }
 
 fn controller_target_state(event: &ControllerEventKind) -> Option<TaskState> {
     match event {
-        ControllerEventKind::Dispatch { .. } | ControllerEventKind::DependsOn { .. } => None,
+        ControllerEventKind::Dispatch { .. }
+        | ControllerEventKind::DependsOn { .. }
+        | ControllerEventKind::Dismiss => None,
         ControllerEventKind::TaskStarted => Some(TaskState::Running),
         ControllerEventKind::Blocked => Some(TaskState::Blocked),
         ControllerEventKind::Progress => Some(TaskState::Queued),
@@ -2596,6 +2623,106 @@ mod tests {
             state,
         ));
         (model, run_id)
+    }
+
+    #[test]
+    fn dismiss_known_run_sets_receipt_time_without_transition_or_touch() {
+        let run_id = RunId::new();
+        let mut task_run = run_with_controller_evidence(
+            run_id,
+            RunKey::Controller("run".to_owned()),
+            1,
+            TaskState::Running,
+        );
+        task_run.created_at_ms = Some(5);
+        task_run.updated_at_ms = Some(7);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        let (reducer, _) = Reducer::new(restored(model, 2));
+
+        let delta = reducer
+            .validate_controller_event(&controller_event(
+                "dismiss-known",
+                "run",
+                ControllerEventKind::Dismiss,
+            ))
+            .unwrap();
+
+        let dismissed = delta.post_model.task_run(&run_id).unwrap();
+        assert_eq!(dismissed.dismissed_at_ms, Some(20));
+        assert_eq!(dismissed.state, TaskState::Running);
+        assert_eq!(dismissed.updated_at_ms, Some(7));
+        assert!(delta.batch.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertTaskRun(value)
+                if value.task_run.run_id == run_id
+                    && value.task_run.dismissed_at_ms == Some(20)
+                    && value.task_run.updated_at_ms == Some(7)
+                    && value.updated_at_ms == 7
+        )));
+    }
+
+    #[test]
+    fn dismiss_unknown_run_is_true_noop_without_placeholder() {
+        let model = DomainModel::default();
+        let original_count = model.task_runs().count();
+        let (reducer, _) = Reducer::new(restored(model, 1));
+
+        let delta = reducer
+            .validate_controller_event(&controller_event(
+                "dismiss-unknown",
+                "unknown",
+                ControllerEventKind::Dismiss,
+            ))
+            .unwrap();
+
+        assert_eq!(delta.post_model.task_runs().count(), original_count);
+        assert!(
+            delta
+                .post_model
+                .task_run_by_key(&RunKey::Controller("unknown".to_owned()))
+                .is_none()
+        );
+        assert!(
+            delta
+                .batch
+                .iter()
+                .all(|operation| !matches!(operation, PersistOp::UpsertTaskRun(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn dismiss_then_task_started_resumes_and_clears_dismissal() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        commit_controller(
+            &mut reducer,
+            &mut writer,
+            controller_event("started", "run", ControllerEventKind::TaskStarted),
+        )
+        .await;
+        let mut dismiss = controller_event("dismiss", "run", ControllerEventKind::Dismiss);
+        dismiss.metadata.receipt_time_ms = 30;
+        commit_controller(&mut reducer, &mut writer, dismiss).await;
+        let run_id = reducer.resolve_controller_run("run").unwrap();
+        assert_eq!(
+            shared.borrow().task_run(&run_id).unwrap().dismissed_at_ms,
+            Some(30)
+        );
+
+        let mut resumed = controller_event("resumed", "run", ControllerEventKind::TaskStarted);
+        resumed.metadata.receipt_time_ms = 40;
+        commit_controller(&mut reducer, &mut writer, resumed).await;
+
+        let snapshot = shared.borrow();
+        let run = snapshot.task_run(&run_id).unwrap();
+        assert_eq!(run.dismissed_at_ms, None);
+        assert_eq!(run.state, TaskState::Running);
+        lifecycle.shutdown().await.unwrap();
     }
 
     fn run(run_id: RunId, key: RunKey, ordinal: i64, state: TaskState) -> TaskRun {

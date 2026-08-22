@@ -54,6 +54,18 @@ use herdr_top::reducer::{WorkloadTimingKind, WorkloadTimingObservation, Workload
 #[cfg(feature = "workload-harness")]
 use herdr_top::store::spawn_writer;
 
+/// Real-epoch base for synthetic receipts: 24-hour hook-only visibility expiry
+/// compares model `updated_at_ms` with the collector's real sampling clock.
+static WORKLOAD_RECEIPT_TIME_BASE_MS: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+});
+
 #[cfg(feature = "workload-harness")]
 fn frame_driver_for_times(
     millis: &[u64],
@@ -792,7 +804,7 @@ async fn run_schedule_through_real_queue_at(
             .controller
             .submit_workload_frame(
                 serde_json::to_vec(&wire).unwrap(),
-                i64::try_from(scheduled_ns / 1_000_000).unwrap(),
+                *WORKLOAD_RECEIPT_TIME_BASE_MS + i64::try_from(scheduled_ns / 1_000_000).unwrap(),
                 sequence,
                 scheduled_ns,
             )
@@ -3988,7 +4000,7 @@ fn prepare_startup_store(root: &StateRoot, retained_events: usize) -> Result<(),
                 metadata: EventMetadata {
                     event_id: format!("startup-retained-{index:06}"),
                     timestamp_ms: sequence,
-                    receipt_time_ms: sequence,
+                    receipt_time_ms: *WORKLOAD_RECEIPT_TIME_BASE_MS + sequence,
                     source: "workload".to_owned(),
                     source_event_type: "progress".to_owned(),
                     herdr_session: "workload-session".to_owned(),
@@ -4230,7 +4242,7 @@ fn run_schedule_with_one_frame_driver_stall(stall: Duration) -> CoalescingResult
                     metadata: EventMetadata {
                         event_id: event.event_id,
                         timestamp_ms: event.emitted_at_ms,
-                        receipt_time_ms: sequence as i64,
+                        receipt_time_ms: *WORKLOAD_RECEIPT_TIME_BASE_MS + sequence as i64,
                         source: event.source,
                         source_event_type: event.event_type,
                         herdr_session: "workload-session".to_owned(),
@@ -4258,7 +4270,7 @@ fn run_schedule_with_one_frame_driver_stall(stall: Duration) -> CoalescingResult
                     metadata: EventMetadata {
                         event_id: format!("probe-frontier-{sequence:04}"),
                         timestamp_ms: sequence as i64,
-                        receipt_time_ms: sequence as i64,
+                        receipt_time_ms: *WORKLOAD_RECEIPT_TIME_BASE_MS + sequence as i64,
                         source: "provider".to_owned(),
                         source_event_type: "probe_frontier".to_owned(),
                         herdr_session: "workload-session".to_owned(),

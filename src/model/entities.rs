@@ -866,7 +866,7 @@ pub struct ControllerEvent {
     pub event: ControllerEventKind,
 }
 
-/// The eight Controller event types with their required endpoint carried by the variant.
+/// The nine Controller event types with their required endpoint carried by the variant.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "event_type")]
 pub enum ControllerEventKind {
@@ -878,6 +878,7 @@ pub enum ControllerEventKind {
     Complete,
     Failed,
     Cancelled,
+    Dismiss,
 }
 
 /// Returned when a wire progress number is not finite or outside `0.0..=1.0`.

@@ -6,8 +6,8 @@ use std::ffi::OsStr;
 use std::path::Path;
 
 use crate::activity::{
-    ActivityDurability, ActivityItem, DEFAULT_TERMINAL_VISIBILITY_MS, OperatorSnapshot,
-    is_default_visible_task_run,
+    ActivityDurability, ActivityItem, DEFAULT_TERMINAL_VISIBILITY_MS,
+    HOOK_ONLY_STALE_VISIBILITY_MS, OperatorSnapshot, is_default_visible_task_run,
 };
 use crate::diagnostics::{ControllerInputStatus, RuntimeDiagnosticsSnapshot};
 use crate::herdr::collector::ObservationQuality;
@@ -143,11 +143,20 @@ pub(crate) fn project_rows(
         let Some(run) = model.task_run(&run_id) else {
             continue;
         };
-        if is_default_visible_task_run(run, operator, now_ms) {
+        if is_default_visible_task_run(model, run, operator, now_ms) {
             if run.state.is_terminal()
                 && let Some(first_terminal_ms) = operator.terminal_times.get(&run_id).copied()
             {
                 let expiry = first_terminal_ms.saturating_add(DEFAULT_TERMINAL_VISIBILITY_MS);
+                next_expiry_ms = Some(next_expiry_ms.map_or(expiry, |current| current.min(expiry)));
+            }
+            if matches!(run.key, RunKey::Controller(_))
+                && !model
+                    .executions()
+                    .any(|execution| execution.task_run_id == run.run_id)
+                && let Some(updated_at_ms) = run.updated_at_ms
+            {
+                let expiry = updated_at_ms.saturating_add(HOOK_ONLY_STALE_VISIBILITY_MS);
                 next_expiry_ms = Some(next_expiry_ms.map_or(expiry, |current| current.min(expiry)));
             }
             visible.push(row.clone());
@@ -975,6 +984,101 @@ mod tests {
             now + 1,
         );
         assert_eq!(restored.rows[0].key.run_id(), Some(live.run_id));
+    }
+
+    #[test]
+    fn hook_only_run_schedules_twenty_four_hour_expiry() {
+        let mut hook_only = run("hook-only", 1, TaskState::Running);
+        hook_only.updated_at_ms = Some(10);
+        let mut model = DomainModel::default();
+        model.insert_task_run(hook_only.clone());
+        let rows = vec![row(
+            NodeKey::Run {
+                run_id: hook_only.run_id,
+                pane_id: None,
+            },
+            0,
+            "Task Run: hook-only [running]",
+        )];
+
+        let projection = project_rows(
+            &model,
+            &rows,
+            &operator(Vec::new(), HashMap::new()),
+            "",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            20,
+        );
+
+        assert_eq!(projection.rows.len(), 1);
+        assert_eq!(projection.next_expiry_ms, Some(86_400_010));
+    }
+
+    #[test]
+    fn projection_uses_earliest_terminal_or_hook_only_expiry() {
+        let mut hook_only = run("hook-only", 1, TaskState::Running);
+        hook_only.updated_at_ms = Some(16_000_001);
+        let terminal = run("terminal", 2, TaskState::Completed);
+        let mut model = DomainModel::default();
+        model.insert_task_run(hook_only.clone());
+        model.insert_task_run(terminal.clone());
+        let rows = [&hook_only, &terminal]
+            .into_iter()
+            .map(|task_run| {
+                row(
+                    NodeKey::Run {
+                        run_id: task_run.run_id,
+                        pane_id: None,
+                    },
+                    0,
+                    "Task Run",
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let projection = project_rows(
+            &model,
+            &rows,
+            &operator(Vec::new(), HashMap::from([(terminal.run_id, 99_000_000)])),
+            "",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            100_000_000,
+        );
+
+        assert_eq!(projection.rows.len(), 2);
+        assert_eq!(projection.next_expiry_ms, Some(102_400_001));
+    }
+
+    #[test]
+    fn dismissed_run_contributes_no_projection_expiry() {
+        let mut dismissed = run("dismissed", 1, TaskState::Running);
+        dismissed.updated_at_ms = Some(10);
+        dismissed.dismissed_at_ms = Some(20);
+        let mut model = DomainModel::default();
+        model.insert_task_run(dismissed.clone());
+        let rows = vec![row(
+            NodeKey::Run {
+                run_id: dismissed.run_id,
+                pane_id: None,
+            },
+            0,
+            "Task Run: dismissed [running]",
+        )];
+
+        let projection = project_rows(
+            &model,
+            &rows,
+            &operator(Vec::new(), HashMap::new()),
+            "",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            20,
+        );
+
+        assert!(projection.rows.is_empty());
+        assert_eq!(projection.next_expiry_ms, None);
     }
 
     #[test]

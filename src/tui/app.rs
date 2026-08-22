@@ -37,6 +37,7 @@ use super::view::{self, TreeRow};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(100);
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const CLOCK_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Injectable wall clock used by terminal-expiry and notice policy.
 pub trait Clock: Send + Sync {
@@ -585,6 +586,46 @@ impl App {
         self.refresh_cached(true);
     }
 
+    /// Advances presentation time and refreshes visibility when a deadline is due.
+    pub fn advance_clock(&mut self, now_ms: i64) -> bool {
+        if now_ms <= self.state.now_ms {
+            return false;
+        }
+        let deadline_due = self
+            .next_expiry_ms
+            .is_some_and(|deadline| now_ms >= deadline);
+        let old_rows = if deadline_due && !self.state.follow {
+            view::build_rows(self.model.as_ref(), &self.state)
+        } else {
+            Vec::new()
+        };
+        self.state.now_ms = now_ms;
+        if deadline_due {
+            let projection = view::build_projection(self.model.as_ref(), &self.state);
+            self.next_expiry_ms = projection.next_expiry_ms;
+            let new_rows = projection.rows;
+            if self.state.follow {
+                self.state.selection_reason = None;
+                self.set_selection(new_rows.last().map(|row| row.key.clone()));
+            } else {
+                let hint = self.disappearance_reason(&old_rows, &new_rows);
+                self.recover_selection(&old_rows, &new_rows, hint);
+            }
+        }
+        deadline_due || self.has_visible_non_terminal_run()
+    }
+
+    fn has_visible_non_terminal_run(&self) -> bool {
+        view::build_rows(self.model.as_ref(), &self.state)
+            .iter()
+            .filter_map(|row| row.key.run_id())
+            .any(|run_id| {
+                self.model
+                    .task_run(&run_id)
+                    .is_some_and(|run| !run.state.is_terminal())
+            })
+    }
+
     fn refresh_cached(&mut self, recompute_projection: bool) {
         let old_rows = if recompute_projection && !self.state.follow {
             view::build_rows(self.model.as_ref(), &self.state)
@@ -730,11 +771,16 @@ impl App {
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend)?;
         let started = Instant::now();
+        let mut last_clock_tick = started.elapsed();
         let mut limiter = FrameLimiter::default();
         let mut dirty = true;
         loop {
             dirty |= self.refresh_if_changed()?;
             let now = started.elapsed();
+            if now.saturating_sub(last_clock_tick) >= CLOCK_TICK_INTERVAL {
+                last_clock_tick = now;
+                dirty |= self.advance_clock(self.clock.now_ms());
+            }
             if limiter.ready(dirty, now) {
                 terminal.draw(|frame| self.render(frame))?;
                 limiter.record(now);
@@ -2737,6 +2783,104 @@ mod tests {
                 "Ok skips post-publish inspection; Err inspects immediately"
             );
         }
+    }
+
+    #[test]
+    fn advance_clock_expires_terminal_run_and_refreshes_deadline() {
+        let terminal = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let terminal_at_ms = 100;
+        let deadline = terminal_at_ms + activity::DEFAULT_TERMINAL_VISIBILITY_MS;
+        let clock = TestClock::at(terminal_at_ms);
+        let (mut app, _) = app_with_runtime(
+            model_with_runs(&[(terminal, "terminal", 1, TaskState::Completed)]),
+            empty_operator(HashMap::from([(terminal, terminal_at_ms)])),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+        assert_eq!(app.next_expiry_ms(), Some(deadline));
+
+        clock.set(deadline);
+
+        assert!(app.advance_clock(clock.now_ms()));
+        assert!(displayed_run_names(&app).is_empty());
+        assert_eq!(app.next_expiry_ms(), None);
+        assert_eq!(app.state().now_ms(), deadline);
+    }
+
+    #[test]
+    fn advance_clock_expires_hook_only_run_and_refreshes_deadline() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let updated_at_ms = 100;
+        let deadline = updated_at_ms + activity::HOOK_ONLY_STALE_VISIBILITY_MS;
+        let mut model = DomainModel::default();
+        model.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::Controller("hook-only".to_owned()),
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+            created_at_ms: Some(updated_at_ms),
+            updated_at_ms: Some(updated_at_ms),
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        let clock = TestClock::at(updated_at_ms);
+        let (mut app, _) = app_with_runtime(
+            model,
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+        assert_eq!(app.next_expiry_ms(), Some(deadline));
+
+        clock.set(deadline);
+
+        assert!(app.advance_clock(clock.now_ms()));
+        assert!(displayed_run_names(&app).is_empty());
+        assert_eq!(app.next_expiry_ms(), None);
+        assert_eq!(app.state().now_ms(), deadline);
+    }
+
+    #[test]
+    fn advance_clock_without_deadline_still_moves_cached_time() {
+        let clock = TestClock::at(100);
+        let (mut app, _) = app_with_runtime(
+            DomainModel::default(),
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+
+        clock.set(200);
+
+        assert!(!app.advance_clock(clock.now_ms()));
+        assert_eq!(app.state().now_ms(), 200);
+    }
+
+    #[test]
+    fn advance_clock_marks_live_content_dirty_and_ignores_non_forward_time() {
+        let live = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut model = model_with_runs(&[(live, "live", 1, TaskState::Running)]);
+        let mut live_run = model.task_run(&live).unwrap().clone();
+        live_run.created_at_ms = Some(0);
+        live_run.updated_at_ms = Some(0);
+        model.insert_task_run(live_run);
+        let clock = TestClock::at(100);
+        let (mut app, _) = app_with_runtime(
+            model,
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+
+        clock.set(1_100);
+        assert!(app.advance_clock(clock.now_ms()));
+        assert_eq!(app.state().now_ms(), 1_100);
+
+        assert!(!app.advance_clock(1_100));
+        assert!(!app.advance_clock(1_099));
+        assert_eq!(app.state().now_ms(), 1_100);
     }
 
     #[test]
