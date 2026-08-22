@@ -27,7 +27,7 @@ herdr api schema --json > tests/fixtures/herdr-schema/baseline.json
 ## Extending the reviewed protocol set
 
 Run `scripts/review-herdr-protocol.sh` against the new herdr binary and review
-the printed key-path delta. In one change, extend `REVIEWED_HERDR_PROTOCOLS`,
+the printed schema-record delta. In one change, extend `REVIEWED_HERDR_PROTOCOLS`,
 replace `tests/fixtures/herdr-schema/baseline.json` with the new command's raw
 output, and update this README with the new protocol, version, and binary
 digest. The baseline filename is version-agnostic, so no other fixture path

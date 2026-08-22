@@ -35,6 +35,8 @@ export LC_ALL=C
 
 records_of() {
   jq -r '
+    def canon:
+      walk(if type == "object" then to_entries | sort_by(.key) | from_entries else . end);
     def path_name($path):
       $path | map(if type == "number" then "[]" else tostring end) | join(".");
     [
@@ -46,11 +48,26 @@ records_of() {
             and ($value | type) != "object"
          then "\(path_name($path))\tvalue:\($value | tojson)"
          else empty
+         end),
+        (if ($path[-1] | type) == "number"
+            and (($value | type) == "array" or ($value | type) == "object")
+         then "\(path_name($path))\tmember:\($value | canon | tojson)"
+         else empty
          end)
     ]
     | unique
     | .[]
   ' <<<"$1" 2>/dev/null
+}
+
+print_records() {
+  while IFS= read -r record; do
+    if (( ${#record} > 200 )); then
+      printf '%.200s...\n' "$record"
+    else
+      printf '%s\n' "$record"
+    fi
+  done <<<"$1"
 }
 
 candidate_protocol=$(jq -er '.protocol' <<<"$candidate_json" 2>/dev/null) || { echo "error: candidate has no protocol field" >&2; exit 2; }
@@ -69,8 +86,8 @@ echo "baseline protocol:  $baseline_protocol"
 echo "candidate protocol: $candidate_protocol"
 echo "added schema records:   $(grep -c . <<<"$added" || true)"
 echo "removed schema records: $(grep -c . <<<"$removed" || true)"
-[[ -z $added ]] || { echo "--- added ---"; echo "$added"; }
-[[ -z $removed ]] || { echo "--- removed ---"; echo "$removed"; }
+[[ -z $added ]] || { echo "--- added ---"; print_records "$added"; }
+[[ -z $removed ]] || { echo "--- removed ---"; print_records "$removed"; }
 
 if [[ -n $removed ]]; then
   echo "verdict: REVIEW REQUIRED (removed or changed schema records)" >&2

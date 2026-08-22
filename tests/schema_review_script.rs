@@ -97,6 +97,40 @@ fn i7_newer_candidate_with_removed_key_path_requires_review() {
 }
 
 #[test]
+fn i7_newer_candidate_with_removed_object_array_member_requires_review() {
+    let baseline: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(BASELINE).expect("read"))
+            .expect("baseline parses");
+    let mut mutated = baseline.clone();
+    mutated["schemas"]["event"]["$defs"]["EventData"]["oneOf"]
+        .as_array_mut()
+        .expect("oneOf is an array")
+        .remove(0);
+    mutated["protocol"] = serde_json::json!(21);
+    let candidate = temp_candidate("object-member-removal", &mutated);
+    let out = run(&["--candidate-file", candidate.to_str().expect("utf-8")]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("verdict: REVIEW REQUIRED"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("baseline protocol:"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn i7_reviewed_protocol_value_drift_requires_review() {
     // Same protocol number, changed VALUE (no key-path delta): must exit 1.
     let baseline: serde_json::Value =
@@ -223,6 +257,43 @@ fn i7_purely_additive_newer_candidate_reviews_clean() {
     );
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("baseline protocol:"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn i7_newer_candidate_with_appended_object_array_member_reviews_clean() {
+    let baseline: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(BASELINE).expect("read"))
+            .expect("baseline parses");
+    let mut mutated = baseline.clone();
+    mutated["schemas"]["event"]["$defs"]["EventData"]["oneOf"]
+        .as_array_mut()
+        .expect("oneOf is an array")
+        .push(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "type": {
+                    "const": "codex_test_event",
+                    "type": "string"
+                }
+            },
+            "required": ["type"]
+        }));
+    mutated["protocol"] = serde_json::json!(21);
+    let candidate = temp_candidate("object-member-append", &mutated);
+    let out = run(&["--candidate-file", candidate.to_str().expect("utf-8")]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("verdict: additive or identical"),
         "stdout: {} stderr: {}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
