@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Compares a candidate herdr bundled API schema against the committed
-# baseline and reports the key-path delta. Gate for extending
+# baseline and reports the schema-record delta. Gate for extending
 # REVIEWED_HERDR_PROTOCOLS (src/diagnostics/remote.rs).
 #
 # Usage:
 #   scripts/review-herdr-protocol.sh --candidate-file SCHEMA_JSON
 #   scripts/review-herdr-protocol.sh HERDR_BINARY
 #
-# Exit codes: 0 additive or identical; 1 review required (removed key-paths,
-# or an already-reviewed protocol whose canonicalized schema differs from the
-# baseline); 2 extraction or parse failure.
+# Exit codes: 0 additive or identical; 1 review required (removed or changed
+# schema records, or an already-reviewed protocol whose canonicalized schema
+# differs from the baseline); 2 extraction or parse failure.
 set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -33,29 +33,47 @@ esac
 # sort's own output.
 export LC_ALL=C
 
-paths_of() {
-  jq -r '[paths | map(if type == "number" then "[]" else tostring end) | join(".")] | unique | .[]' <<<"$1" 2>/dev/null
+records_of() {
+  jq -r '
+    def path_name($path):
+      $path | map(if type == "number" then "[]" else tostring end) | join(".");
+    [
+      paths as $path
+      | getpath($path) as $value
+      | "\(path_name($path))\ttype:\($value | type)",
+        (if ($path[-1] | type) == "number"
+            and ($value | type) != "array"
+            and ($value | type) != "object"
+         then "\(path_name($path))\tvalue:\($value | tojson)"
+         else empty
+         end)
+    ]
+    | unique
+    | .[]
+  ' <<<"$1" 2>/dev/null
 }
 
 candidate_protocol=$(jq -er '.protocol' <<<"$candidate_json" 2>/dev/null) || { echo "error: candidate has no protocol field" >&2; exit 2; }
 baseline_json=$(cat -- "$baseline") || { echo "error: baseline missing" >&2; exit 2; }
-baseline_protocol=$(jq -er '.protocol' <<<"$baseline_json")
+baseline_protocol=$(jq -er '.protocol' <<<"$baseline_json" 2>/dev/null) || { echo "error: baseline has no protocol field" >&2; exit 2; }
+[[ $candidate_protocol =~ ^[0-9]+$ ]] || { echo "error: candidate protocol must be a non-negative integer" >&2; exit 2; }
+[[ $baseline_protocol =~ ^[0-9]+$ ]] || { echo "error: baseline protocol must be a non-negative integer" >&2; exit 2; }
 
-candidate_paths=$(paths_of "$candidate_json") || { echo "error: candidate is not valid JSON" >&2; exit 2; }
-baseline_paths=$(paths_of "$baseline_json")
+candidate_records=$(records_of "$candidate_json") || { echo "error: candidate is not valid JSON" >&2; exit 2; }
+baseline_records=$(records_of "$baseline_json") || { echo "error: baseline is not valid JSON" >&2; exit 2; }
 
-added=$(comm -13 <(sort <<<"$baseline_paths") <(sort <<<"$candidate_paths"))
-removed=$(comm -23 <(sort <<<"$baseline_paths") <(sort <<<"$candidate_paths"))
+added=$(comm -13 <(sort <<<"$baseline_records") <(sort <<<"$candidate_records"))
+removed=$(comm -23 <(sort <<<"$baseline_records") <(sort <<<"$candidate_records"))
 
 echo "baseline protocol:  $baseline_protocol"
 echo "candidate protocol: $candidate_protocol"
-echo "added key-paths:    $(grep -c . <<<"$added" || true)"
-echo "removed key-paths:  $(grep -c . <<<"$removed" || true)"
+echo "added schema records:   $(grep -c . <<<"$added" || true)"
+echo "removed schema records: $(grep -c . <<<"$removed" || true)"
 [[ -z $added ]] || { echo "--- added ---"; echo "$added"; }
 [[ -z $removed ]] || { echo "--- removed ---"; echo "$removed"; }
 
 if [[ -n $removed ]]; then
-  echo "verdict: REVIEW REQUIRED (removed key-paths)" >&2
+  echo "verdict: REVIEW REQUIRED (removed or changed schema records)" >&2
   exit 1
 fi
 if [[ $candidate_protocol -le $baseline_protocol ]]; then

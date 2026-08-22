@@ -75,7 +75,25 @@ fn i7_newer_candidate_with_removed_key_path_requires_review() {
     mutated["protocol"] = serde_json::json!(21);
     let candidate = temp_candidate("removed", &mutated);
     let out = run(&["--candidate-file", candidate.to_str().expect("utf-8")]);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("verdict: REVIEW REQUIRED"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("baseline protocol:"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -88,7 +106,185 @@ fn i7_reviewed_protocol_value_drift_requires_review() {
     mutated["title"] = serde_json::json!("drifted-title-value");
     let candidate = temp_candidate("drift", &mutated);
     let out = run(&["--candidate-file", candidate.to_str().expect("utf-8")]);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("verdict: REVIEW REQUIRED"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("baseline protocol:"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn i7_newer_candidate_with_required_array_removal_requires_review() {
+    let baseline: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(BASELINE).expect("read"))
+            .expect("baseline parses");
+    let mut mutated = baseline.clone();
+    mutated["schemas"]["event"]["required"]
+        .as_array_mut()
+        .expect("required is an array")
+        .remove(0);
+    mutated["protocol"] = serde_json::json!(21);
+    let candidate = temp_candidate("required-removal", &mutated);
+    let out = run(&["--candidate-file", candidate.to_str().expect("utf-8")]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("verdict: REVIEW REQUIRED"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("baseline protocol:"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn i7_newer_candidate_with_type_change_requires_review() {
+    let baseline: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(BASELINE).expect("read"))
+            .expect("baseline parses");
+    let mut mutated = baseline.clone();
+    mutated["title"] = serde_json::json!(12345);
+    mutated["protocol"] = serde_json::json!(21);
+    let candidate = temp_candidate("type-change", &mutated);
+    let out = run(&["--candidate-file", candidate.to_str().expect("utf-8")]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("verdict: REVIEW REQUIRED"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("baseline protocol:"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn i7_purely_additive_newer_candidate_reviews_clean() {
+    let baseline: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(BASELINE).expect("read"))
+            .expect("baseline parses");
+    let mut mutated = baseline.clone();
+    mutated["schemas"]
+        .as_object_mut()
+        .expect("schemas is an object")
+        .insert(
+            "brand_new_thing".to_owned(),
+            serde_json::json!({"type": "object"}),
+        );
+    mutated["protocol"] = serde_json::json!(21);
+    let candidate = temp_candidate("additive", &mutated);
+    let out = run(&["--candidate-file", candidate.to_str().expect("utf-8")]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("verdict: additive or identical"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("baseline protocol:"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn i7_non_integer_protocol_is_invalid_input() {
+    let baseline: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(BASELINE).expect("read"))
+            .expect("baseline parses");
+    let mut mutated = baseline.clone();
+    mutated["protocol"] = serde_json::json!(20.5);
+    mutated["title"] = serde_json::json!("drifted");
+    mutated["schema_version"] = serde_json::json!("drifted");
+    let candidate = temp_candidate("non-integer-protocol", &mutated);
+    let out = run(&["--candidate-file", candidate.to_str().expect("utf-8")]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn i7_protocol_arithmetic_injection_is_invalid_without_execution() {
+    let baseline: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(BASELINE).expect("read"))
+            .expect("baseline parses");
+    let mut mutated = baseline.clone();
+    let candidate = temp_candidate("arithmetic-injection", &mutated);
+    let marker = candidate
+        .parent()
+        .expect("candidate directory")
+        .join("PWNED");
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("remove stale marker: {error}"),
+    }
+    mutated["protocol"] = serde_json::Value::String(format!(
+        "baseline[$(touch {})]",
+        marker.to_str().expect("utf-8")
+    ));
+    std::fs::write(&candidate, mutated.to_string()).expect("rewrite candidate");
+    let out = run(&["--candidate-file", candidate.to_str().expect("utf-8")]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "stdout: {} stderr: {} marker: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+        marker.display()
+    );
 }
 
 #[test]
