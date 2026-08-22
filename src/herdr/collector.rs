@@ -4408,10 +4408,8 @@ fn normalize_event(
             }
         }
         "tab_renamed" => {
-            if let (Some(tab_id), Some(label)) = (
-                string_field(&received.data, "tab_id"),
-                string_field(&received.data, "label"),
-            ) && let Some(tab) = shared.borrow().tab(&tab_id).cloned()
+            if let Some(tab_id) = string_field(&received.data, "tab_id")
+                && let Some(tab) = shared.borrow().tab(&tab_id).cloned()
             {
                 events.push(topology_upsert(
                     session,
@@ -4419,7 +4417,9 @@ fn normalize_event(
                     TopologyEntity::Tab(Tab {
                         tab_id,
                         workspace_id: tab.workspace_id,
-                        label: sanitized_name(&label),
+                        label: string_field(&received.data, "label")
+                            .as_deref()
+                            .and_then(sanitized_name),
                     }),
                 ));
             }
@@ -9614,17 +9614,71 @@ mod tests {
         )));
     }
 
-    fn tab_renamed_event(tab_id: &str, label: &str) -> ReceivedEvent {
+    fn tab_renamed_event(tab_id: &str, label: Option<&str>) -> ReceivedEvent {
+        let mut data = json!({
+            "type": "tab_renamed",
+            "tab_id": tab_id,
+            "workspace_id": "untrusted-workspace",
+        });
+        if let Some(label) = label {
+            data["label"] = Value::String(label.to_owned());
+        }
         ReceivedEvent {
             event: "tab_renamed".to_owned(),
-            data: json!({
-                "type": "tab_renamed",
-                "tab_id": tab_id,
-                "workspace_id": "untrusted-workspace",
-                "label": label,
-            }),
+            data,
             primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
         }
+    }
+
+    fn assert_authoritative_tab_clear_survives_restart(label: Option<&str>) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        store
+            .apply_batch(vec![
+                PersistOp::UpsertWorkspace {
+                    workspace: Workspace {
+                        workspace_id: "w1".to_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(1),
+                },
+                PersistOp::UpsertTab {
+                    tab: Tab {
+                        tab_id: "w1:t1".to_owned(),
+                        workspace_id: "w1".to_owned(),
+                        label: Some("persisted label".to_owned()),
+                    },
+                    display_ordinal: DisplayOrdinal::new(2),
+                },
+            ])
+            .unwrap();
+        let restored = store.load_restored_state().unwrap();
+        let (mut reducer, shared) = Reducer::new(restored);
+
+        let normalized = normalize_event(
+            &shared,
+            "authoritative-clear-session",
+            &tab_renamed_event("w1:t1", label),
+        )
+        .unwrap();
+        let persist = apply_collector_observation(&mut reducer, normalized)
+            .unwrap()
+            .expect("known tab rename should apply");
+        assert_eq!(shared.borrow().tab("w1:t1").unwrap().label, None);
+
+        store.apply_batch(persist).unwrap();
+        let restored = store.load_restored_state().unwrap();
+        assert_eq!(restored.model.tab("w1:t1").unwrap().label, None);
+    }
+
+    #[test]
+    fn tab_rename_with_empty_label_clears_store_across_restart() {
+        assert_authoritative_tab_clear_survives_restart(Some(""));
+    }
+
+    #[test]
+    fn tab_rename_without_label_clears_store_across_restart() {
+        assert_authoritative_tab_clear_survives_restart(None);
     }
 
     #[test]
@@ -9648,7 +9702,7 @@ mod tests {
         let normalized = normalize_event(
             &shared,
             "rename-session",
-            &tab_renamed_event("w1:t1", "レビュー"),
+            &tab_renamed_event("w1:t1", Some("レビュー")),
         )
         .unwrap();
         let persist = apply_collector_observation(&mut reducer, normalized)
@@ -9666,8 +9720,12 @@ mod tests {
                     && tab.label.as_deref() == Some("レビュー")
         )));
 
-        let normalized =
-            normalize_event(&shared, "rename-session", &tab_renamed_event("w1:t1", "")).unwrap();
+        let normalized = normalize_event(
+            &shared,
+            "rename-session",
+            &tab_renamed_event("w1:t1", Some("")),
+        )
+        .unwrap();
         let persist = apply_collector_observation(&mut reducer, normalized)
             .unwrap()
             .expect("empty known tab rename should apply");
@@ -9681,7 +9739,32 @@ mod tests {
         let normalized = normalize_event(
             &shared,
             "rename-session",
-            &tab_renamed_event("unknown-tab", "ignored"),
+            &tab_renamed_event("w1:t1", Some("before absent")),
+        )
+        .unwrap();
+        apply_collector_observation(&mut reducer, normalized)
+            .unwrap()
+            .expect("known tab rename should apply");
+        assert_eq!(
+            shared.borrow().tab("w1:t1").unwrap().label.as_deref(),
+            Some("before absent")
+        );
+        let normalized =
+            normalize_event(&shared, "rename-session", &tab_renamed_event("w1:t1", None)).unwrap();
+        let persist = apply_collector_observation(&mut reducer, normalized)
+            .unwrap()
+            .expect("absent-label known tab rename should apply");
+        assert_eq!(shared.borrow().tab("w1:t1").unwrap().label, None);
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertTab { tab, .. }
+                if tab.tab_id == "w1:t1" && tab.workspace_id == "w1" && tab.label.is_none()
+        )));
+
+        let normalized = normalize_event(
+            &shared,
+            "rename-session",
+            &tab_renamed_event("unknown-tab", Some("ignored")),
         )
         .unwrap();
         assert!(normalized.is_empty());
@@ -9799,7 +9882,7 @@ mod tests {
         let normalized = normalize_event(
             &shared,
             "rename-session",
-            &tab_renamed_event("w1:t1", "レビュー"),
+            &tab_renamed_event("w1:t1", Some("レビュー")),
         )
         .unwrap();
         apply_collector_observation(&mut reducer, normalized)
@@ -9808,6 +9891,25 @@ mod tests {
 
         let current = current_model_topology(&shared, &PendingTopologyClosures::default()).unwrap();
         assert!(probe_topology_matches_model(probed, current));
+
+        let normalized = normalize_event(
+            &shared,
+            "rename-session",
+            &tab_renamed_event("w1:t1", Some("")),
+        )
+        .unwrap();
+        let persist = apply_collector_observation(&mut reducer, normalized)
+            .unwrap()
+            .expect("empty-label known tab rename should apply");
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::ClearTabLabel { tab_id } if tab_id == "w1:t1"
+        )));
+        assert_eq!(shared.borrow().tab("w1:t1").unwrap().label, None);
+        let mut cleared_probe = topology_from_snapshot(&snapshot_with_names()).unwrap();
+        cleared_probe.tabs[0].label = None;
+        let current = current_model_topology(&shared, &PendingTopologyClosures::default()).unwrap();
+        assert!(probe_topology_matches_model(cleared_probe, current));
     }
 
     #[test]

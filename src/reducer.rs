@@ -206,6 +206,7 @@ struct WorkloadObservationTiming {
 // increment5-workload-harness: end reducer timing callback ABI
 
 const STALE_GRACE_MS: i64 = 30_000;
+const TAB_RENAMED_EVENT: &str = "tab_renamed";
 
 /// Errors that reject a reducer transition before any model or persistence mutation escapes.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -1136,6 +1137,11 @@ impl Reducer {
                         tab: tab.clone(),
                         display_ordinal,
                     });
+                    if tab.label.is_none() && metadata.source_event_type == TAB_RENAMED_EVENT {
+                        persist.push(PersistOp::ClearTabLabel {
+                            tab_id: tab.tab_id.clone(),
+                        });
+                    }
                 }
                 TopologyEntity::Pane(pane) => {
                     let display_ordinal = self.pane_ordinal_or_allocate(&pane.pane_id)?;
@@ -3595,6 +3601,58 @@ mod tests {
             PersistOp::UpsertPane { pane, .. }
                 if pane.display_name.as_deref() == Some("UI修正")
         )));
+    }
+
+    #[test]
+    fn observational_nameless_tab_upsert_preserves_store_label_without_clear() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        store
+            .apply_batch(vec![
+                PersistOp::UpsertWorkspace {
+                    workspace: Workspace {
+                        workspace_id: "workspace".to_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(1),
+                },
+                PersistOp::UpsertTab {
+                    tab: Tab {
+                        tab_id: "tab".to_owned(),
+                        workspace_id: "workspace".to_owned(),
+                        label: Some("observed name".to_owned()),
+                    },
+                    display_ordinal: DisplayOrdinal::new(2),
+                },
+            ])
+            .unwrap();
+        let restored = store.load_restored_state().unwrap();
+        let (mut reducer, _shared) = Reducer::new(restored);
+
+        let ApplyOutcome::Applied(batch) = reducer
+            .apply(topology_entity_event(
+                "observational-tab",
+                TopologyEntity::Tab(Tab {
+                    tab_id: "tab".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    label: None,
+                }),
+            ))
+            .unwrap()
+        else {
+            panic!("observational tab upsert should apply");
+        };
+        assert!(!batch.iter().any(|operation| matches!(
+            operation,
+            PersistOp::ClearTabLabel { tab_id } if tab_id == "tab"
+        )));
+
+        store.apply_batch(batch).unwrap();
+        let restored = store.load_restored_state().unwrap();
+        assert_eq!(
+            restored.model.tab("tab").unwrap().label.as_deref(),
+            Some("observed name")
+        );
     }
 
     #[test]

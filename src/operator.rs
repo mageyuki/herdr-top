@@ -94,6 +94,7 @@ impl OperatorProjection {
                 | PersistOp::UpsertPane { .. }
                 | PersistOp::DeleteWorkspace { .. }
                 | PersistOp::DeleteTab { .. }
+                | PersistOp::ClearTabLabel { .. }
                 | PersistOp::DeletePane { .. }
                 | PersistOp::UpsertExecution(_)
                 | PersistOp::UpsertAgentNode(_)

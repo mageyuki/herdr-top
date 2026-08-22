@@ -213,6 +213,11 @@ pub enum PersistOp {
         /// The tab identity to remove.
         tab_id: String,
     },
+    /// Clear a tab's captured label on authoritative user intent.
+    ClearTabLabel {
+        /// The tab whose label is explicitly removed.
+        tab_id: String,
+    },
     /// Delete a physical pane.
     DeletePane {
         /// The pane identity to remove.
@@ -1199,6 +1204,9 @@ fn apply_operation(transaction: &Transaction<'_>, operation: PersistOp) -> Resul
         PersistOp::DeleteTab { tab_id } => {
             transaction.execute("DELETE FROM tabs WHERE tab_id = ?1", [&tab_id])?;
             delete_display_ordinal(transaction, "tab", &tab_id)?;
+        }
+        PersistOp::ClearTabLabel { tab_id } => {
+            transaction.execute("UPDATE tabs SET label = NULL WHERE tab_id = ?1", [&tab_id])?;
         }
         PersistOp::DeletePane { pane_id } => {
             transaction.execute("DELETE FROM panes WHERE pane_id = ?1", [&pane_id])?;
