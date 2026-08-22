@@ -131,6 +131,71 @@ fn i7_newer_candidate_with_removed_object_array_member_requires_review() {
 }
 
 #[test]
+fn i7_newer_candidate_with_one_duplicate_removed_requires_review() {
+    // This is already caught through the enclosing oneOf variant's member record;
+    // it pins behavior but does not discriminate the multiset comparison change.
+    let baseline: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(BASELINE).expect("read"))
+            .expect("baseline parses");
+    let mut mutated = baseline.clone();
+    mutated["schemas"]["event"]["$defs"]["EventData"]["oneOf"][3]["properties"]["workspace"]
+        ["anyOf"]
+        .as_array_mut()
+        .expect("anyOf is an array")
+        .remove(1);
+    mutated["protocol"] = serde_json::json!(21);
+    let candidate = temp_candidate("one-duplicate-removed", &mutated);
+    let out = run(&["--candidate-file", candidate.to_str().expect("utf-8")]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("verdict: REVIEW REQUIRED"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("baseline protocol:"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn i7_newer_candidate_with_reordered_top_level_one_of_reviews_clean() {
+    let baseline: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(BASELINE).expect("read"))
+            .expect("baseline parses");
+    let mut mutated = baseline.clone();
+    mutated["schemas"]["event"]["$defs"]["EventData"]["oneOf"]
+        .as_array_mut()
+        .expect("oneOf is an array")
+        .reverse();
+    mutated["protocol"] = serde_json::json!(21);
+    let candidate = temp_candidate("top-level-one-of-reordered", &mutated);
+    let out = run(&["--candidate-file", candidate.to_str().expect("utf-8")]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("verdict: additive or identical"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn i7_reviewed_protocol_value_drift_requires_review() {
     // Same protocol number, changed VALUE (no key-path delta): must exit 1.
     let baseline: serde_json::Value =

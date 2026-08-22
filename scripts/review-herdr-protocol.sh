@@ -55,9 +55,14 @@ records_of() {
          else empty
          end)
     ]
-    | unique
     | .[]
-  ' <<<"$1" 2>/dev/null
+  ' <<<"$1" 2>/dev/null \
+    | sort \
+    | awk '
+        NR == 1 || $0 != previous { occurrence = 0 }
+        { previous = $0; occurrence++; print $0 "\toccurrence:" occurrence }
+      ' \
+    | sort
 }
 
 print_records() {
