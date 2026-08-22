@@ -58,6 +58,11 @@ impl Clock for SystemClock {
     }
 }
 
+fn next_wall_second_ms(now_ms: i64) -> i64 {
+    let until_next = 1_000_i64.saturating_sub(now_ms.rem_euclid(1_000));
+    now_ms.checked_add(until_next).unwrap_or(i64::MAX)
+}
+
 trait NoticePublicationBoundary: fmt::Debug + Send + Sync {
     fn inspect(&self, state_base: &Path, package_version: &str) -> NoticeVerdict;
     fn publish(
@@ -274,6 +279,7 @@ pub(crate) enum Overlay {
     Notice,
     Help,
     Detail,
+    Summary,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -528,7 +534,10 @@ pub struct App {
     state: AppState,
     setup: TuiSetup,
     clock: Arc<dyn Clock>,
+    rows: Vec<TreeRow>,
+    app_started_at_ms: i64,
     next_expiry_ms: Option<i64>,
+    next_paint_ms: i64,
 }
 
 impl App {
@@ -585,7 +594,10 @@ impl App {
             },
             setup,
             clock,
+            rows: Vec::new(),
+            app_started_at_ms: now_ms,
             next_expiry_ms: None,
+            next_paint_ms: next_wall_second_ms(now_ms),
         };
         app.state.adopt_model(app.model.as_ref());
         let rows = app.rebuild_rows();
@@ -598,7 +610,8 @@ impl App {
         self.state.now_ms = self.clock.now_ms();
         let projection = view::build_projection(self.model.as_ref(), &self.state);
         self.next_expiry_ms = projection.next_expiry_ms;
-        projection.rows
+        self.rows = projection.rows;
+        self.rows.clone()
     }
 
     /// Refreshes the cached coherent model and performance publication.
@@ -692,6 +705,11 @@ impl App {
                 self.state.reset_overlay_scroll();
                 LoopControl::Continue
             }
+            KeyCode::Char('s') => {
+                self.state.overlay = Some(Overlay::Summary);
+                self.state.reset_overlay_scroll();
+                LoopControl::Continue
+            }
             KeyCode::Char('?') => {
                 self.state.overlay = Some(Overlay::Help);
                 self.state.reset_overlay_scroll();
@@ -733,12 +751,13 @@ impl App {
 
     /// Renders the current cached state into one frame.
     pub fn render(&self, frame: &mut Frame<'_>) {
+        let now_ms = self.clock.now_ms();
         view::render(
             frame,
             self.model.as_ref(),
             &self.performance,
             &self.header,
-            &self.state,
+            view::PaintSnapshot::new(&self.state, &self.rows, now_ms, self.session_start_ms()),
             &self.diagnostics,
             &self.setup,
         );
@@ -754,6 +773,7 @@ impl App {
         let mut dirty = true;
         loop {
             dirty |= self.refresh_if_changed()?;
+            dirty |= self.paint_tick_due();
             let now = started.elapsed();
             if limiter.ready(dirty, now) {
                 terminal.draw(|frame| self.render(frame))?;
@@ -811,6 +831,23 @@ impl App {
         self.state.projection_build_count()
     }
 
+    fn session_start_ms(&self) -> i64 {
+        self.model
+            .task_runs()
+            .filter_map(|run| run.created_at_ms)
+            .min()
+            .unwrap_or(self.app_started_at_ms)
+    }
+
+    fn paint_tick_due(&mut self) -> bool {
+        let now_ms = self.clock.now_ms();
+        if now_ms < self.next_paint_ms {
+            return false;
+        }
+        self.next_paint_ms = next_wall_second_ms(now_ms);
+        true
+    }
+
     fn handle_overlay_key(&mut self, overlay: Overlay, code: KeyCode) -> LoopControl {
         match overlay {
             Overlay::Notice if matches!(code, KeyCode::Enter | KeyCode::Esc) => {
@@ -845,7 +882,10 @@ impl App {
             Overlay::Detail if matches!(code, KeyCode::Esc | KeyCode::Char('i')) => {
                 self.state.overlay = None;
             }
-            Overlay::Help | Overlay::Detail => match code {
+            Overlay::Summary if matches!(code, KeyCode::Esc | KeyCode::Char('s')) => {
+                self.state.overlay = None;
+            }
+            Overlay::Help | Overlay::Detail | Overlay::Summary => match code {
                 KeyCode::Up => self.state.scroll_overlay_up(),
                 KeyCode::Down => self.state.scroll_overlay_down(),
                 _ => {}
@@ -987,7 +1027,11 @@ impl App {
         let until_expiry = self
             .next_expiry_ms
             .map(|deadline| Duration::from_millis(deadline.saturating_sub(now_ms).max(0) as u64));
-        until_expiry.map_or(base, |expiry| base.min(expiry))
+        let until_paint =
+            Duration::from_millis(next_wall_second_ms(now_ms).saturating_sub(now_ms).max(0) as u64);
+        until_expiry
+            .map_or(base, |expiry| base.min(expiry))
+            .min(until_paint)
     }
 
     fn move_selection(&mut self, down: bool) {
@@ -1280,12 +1324,18 @@ impl WorkloadFrameDriver {
             let projection = self.header_projection;
             match self.terminal.draw(|frame| {
                 if projection.omit_performance_label {
+                    let now_ms = self.app.clock.now_ms();
                     view::workload_header_projection::render_with_workload_projection(
                         frame,
                         self.app.model.as_ref(),
                         &publication,
                         &self.app.header,
-                        &self.app.state,
+                        view::PaintSnapshot::new(
+                            &self.app.state,
+                            &self.app.rows,
+                            now_ms,
+                            self.app.session_start_ms(),
+                        ),
                         &self.app.diagnostics,
                         &self.app.setup,
                         projection,
@@ -1721,6 +1771,124 @@ mod tests {
             );
             assert_eq!(app.performance, publication);
         }
+    }
+
+    #[test]
+    fn summary_overlay_opens_closes_and_scrolls_with_its_keys() {
+        let run = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let (mut app, _senders) = app_with_runtime(
+            model_with_runs(&[(run, "run", 1, TaskState::Running)]),
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            TestClock::at(0),
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.state().overlay(), Some(Overlay::Summary));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.state().overlay_scroll(), 1);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.state().overlay_scroll(), 0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.state().overlay(), None);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.state().overlay(), Some(Overlay::Summary));
+        assert_eq!(app.state().overlay_scroll(), 0);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.state().overlay(), None);
+    }
+
+    #[test]
+    fn summary_overlay_renders_header_and_one_placeholder_row_per_group() {
+        let first = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let second = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let mut model = model_with_runs(&[
+            (first, "hook:claude-code:S:task:A", 1, TaskState::Completed),
+            (second, "native", 2, TaskState::Running),
+        ]);
+        let mut terminal = model.task_run(&first).unwrap().clone();
+        terminal.created_at_ms = Some(1_000);
+        terminal.finished_at_ms = Some(61_000);
+        model.insert_task_run(terminal);
+        let mut native = model.task_run(&second).unwrap().clone();
+        native.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "native".to_owned(),
+        };
+        model.insert_task_run(native);
+        for (run_id, agent_node_id, model_id, activity_at) in [
+            (first, "agent-alpha", "model-alpha", 10),
+            (second, "agent-beta", "model-beta", 20),
+        ] {
+            model.insert_agent_node(AgentNode {
+                agent_node_id: agent_node_id.to_owned(),
+                provider: Provider::Codex,
+                native_session_id: Some(agent_node_id.to_owned()),
+                task_run_id: run_id,
+                display_ordinal: DisplayOrdinal::new(activity_at),
+                parent_agent_node_id: None,
+                state: Some(ExecState::Working),
+                model_id: Some(model_id.to_owned()),
+                last_event_kind: None,
+                last_tool_name: None,
+                last_item_count: None,
+                last_byte_count: None,
+                last_activity_at_ms: Some(activity_at),
+                session_file: None,
+            });
+        }
+        let (mut app, _senders) = app_with_runtime(
+            model,
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            TestClock::at(80_000),
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        let lines = render_lines(&app, 160, 18);
+        let screen = lines.join("\n");
+        assert!(screen.contains(" Summary "));
+        assert!(screen.contains("worker kind | model | runs | live | total | mean | tok | tok/s"));
+        let data_rows = lines
+            .iter()
+            .filter(|line| line.contains("model-alpha") || line.contains("model-beta"))
+            .collect::<Vec<_>>();
+        assert_eq!(data_rows.len(), 2, "{screen}");
+        assert!(data_rows.iter().all(|line| line.contains(" | - | -")));
+        assert!(screen.contains("claude-code | model-alpha | 1 | 0 | 01m00s | 01m00s | - | -"));
+        assert!(screen.contains("Codex | model-beta | 1 | 1 | 00s | - | - | -"));
+    }
+
+    #[test]
+    fn session_elapsed_header_uses_earliest_run_start_and_repaints_from_clock() {
+        let run = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut model = model_with_runs(&[(run, "run", 1, TaskState::Completed)]);
+        let mut timed = model.task_run(&run).unwrap().clone();
+        timed.created_at_ms = Some(5_000);
+        timed.finished_at_ms = Some(6_000);
+        model.insert_task_run(timed);
+        let clock = TestClock::at(3_605_000);
+        let (app, _senders) = app_with_runtime(
+            model,
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+
+        let initial = render_lines(&app, 180, 18)
+            .into_iter()
+            .find(|line| line.contains("session:"))
+            .unwrap();
+        assert!(initial.contains(" | up:01:00:00 | "), "{initial}");
+
+        clock.set(3_666_000);
+        let repainted = render_lines(&app, 180, 18)
+            .into_iter()
+            .find(|line| line.contains("session:"))
+            .unwrap();
+        assert!(repainted.contains(" | up:01:01:01 | "), "{repainted}");
+        assert!(!repainted.contains("up:01:00:00"));
     }
 
     fn render(app: &App) -> String {
@@ -2826,6 +2994,32 @@ mod tests {
             clock.set(now_ms);
             assert!(!app.refresh_if_changed().unwrap());
             assert!(app.poll_duration(&limiter, false, Duration::ZERO) > Duration::ZERO);
+        }
+        assert_eq!(app.projection_build_count(), 0);
+    }
+
+    #[test]
+    fn paint_ticks_advance_elapsed_without_rebuilding_rows_when_no_live_duration_exists() {
+        let terminal = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let clock = TestClock::at(1_000);
+        let (mut app, _senders) = app_with_runtime(
+            model_with_runs(&[(terminal, "terminal", 1, TaskState::Completed)]),
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+        assert_eq!(app.next_expiry_ms(), None);
+        app.reset_projection_build_count();
+
+        for (now_ms, expected) in [
+            (2_000, "up:00:00:01"),
+            (3_000, "up:00:00:02"),
+            (4_000, "up:00:00:03"),
+        ] {
+            clock.set(now_ms);
+            assert!(app.paint_tick_due());
+            assert!(!app.refresh_if_changed().unwrap());
+            assert!(render_at_width(&app, 160).contains(expected));
         }
         assert_eq!(app.projection_build_count(), 0);
     }

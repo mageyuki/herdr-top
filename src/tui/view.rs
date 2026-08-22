@@ -64,16 +64,42 @@ pub(crate) struct TreeRow {
     pub(crate) dependents: Vec<String>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct PaintSnapshot<'a> {
+    state: &'a AppState,
+    rows: &'a [TreeRow],
+    now_ms: i64,
+    session_start_ms: i64,
+}
+
+impl<'a> PaintSnapshot<'a> {
+    pub(super) const fn new(
+        state: &'a AppState,
+        rows: &'a [TreeRow],
+        now_ms: i64,
+        session_start_ms: i64,
+    ) -> Self {
+        Self {
+            state,
+            rows,
+            now_ms,
+            session_start_ms,
+        }
+    }
+}
+
 /// Draws a complete fixed-screen frame from immutable model and UI snapshots.
 pub(super) fn render(
     frame: &mut Frame<'_>,
     model: &DomainModel,
     performance: &PerformancePublication,
     header: &HeaderInputs,
-    state: &AppState,
+    paint: PaintSnapshot<'_>,
     diagnostics: &RuntimeDiagnosticsSnapshot,
     setup: &TuiSetup,
 ) {
+    let state = paint.state;
+    let rows = paint.rows;
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         let message = format!("Terminal too small (minimum {MIN_WIDTH}x{MIN_HEIGHT})");
@@ -105,21 +131,20 @@ pub(super) fn render(
         strip.quality,
         performance,
         header,
+        paint.now_ms.saturating_sub(paint.session_start_ms).max(0),
     );
-    let projection = build_projection(model, state);
-    let rows = projection.rows;
     match state.view_mode() {
         ViewMode::ExecutionTree => {
-            render_tree(frame, tree_area, &rows, state, setup.ascii_tree());
+            render_tree(frame, tree_area, rows, state, setup.ascii_tree());
         }
-        ViewMode::DependencyDag => render_dag(frame, tree_area, &rows, state),
+        ViewMode::DependencyDag => render_dag(frame, tree_area, rows, state),
     }
-    render_activity(frame, activity_area, model, &rows, state, diagnostics);
+    render_activity(frame, activity_area, model, rows, state, diagnostics);
     frame.render_widget(
         Paragraph::new(footer_line(usize::from(footer_area.width))),
         footer_area,
     );
-    render_interaction_layer(frame, area, model, state, diagnostics, setup);
+    render_interaction_layer(frame, area, model, paint, diagnostics, setup);
 }
 
 // increment5-workload-header-projection-begin
@@ -141,7 +166,7 @@ pub(super) mod workload_header_projection {
         model: &DomainModel,
         performance: &PerformancePublication,
         header: &HeaderInputs,
-        state: &AppState,
+        paint: PaintSnapshot<'_>,
         diagnostics: &RuntimeDiagnosticsSnapshot,
         setup: &TuiSetup,
         projection: WorkloadHeaderProjection,
@@ -153,7 +178,7 @@ pub(super) mod workload_header_projection {
                 .reasons
                 .remove(&PerformanceDegradationReason::EventsSixtySeconds);
         }
-        super::render(frame, model, &projected, header, state, diagnostics, setup);
+        super::render(frame, model, &projected, header, paint, diagnostics, setup);
     }
 }
 // increment5-workload-header-projection-end
@@ -165,10 +190,19 @@ fn render_header(
     quality: ObservationQuality,
     performance: &PerformancePublication,
     inputs: &HeaderInputs,
+    session_elapsed_ms: i64,
 ) {
     let block = Block::default().borders(Borders::ALL).title(" Herdr Top ");
     let inner_width = usize::from(area.width.saturating_sub(2));
-    let line = header_line(area.width, inner_width, model, quality, performance, inputs);
+    let line = header_line(
+        area.width,
+        inner_width,
+        model,
+        quality,
+        performance,
+        inputs,
+        session_elapsed_ms,
+    );
     frame.render_widget(Paragraph::new(line).block(block), area);
 }
 
@@ -414,6 +448,7 @@ fn footer_line(width: usize) -> String {
         "f/End follow",
         "tab view",
         "/ filter",
+        "s summary",
         "? help",
     ];
     const COMPACT: &[&str] = &["q:stop Top; agents continue", "detach:Top runs"];
@@ -436,10 +471,11 @@ fn render_interaction_layer(
     frame: &mut Frame<'_>,
     area: Rect,
     model: &DomainModel,
-    state: &AppState,
+    paint: PaintSnapshot<'_>,
     diagnostics: &RuntimeDiagnosticsSnapshot,
     setup: &TuiSetup,
 ) {
+    let state = paint.state;
     if let Some(draft) = state.filter_draft() {
         let line = truncate_to_width(&format!("/ filter: {draft}"), usize::from(area.width));
         frame.render_widget(
@@ -467,8 +503,8 @@ fn render_interaction_layer(
     let (title, lines) = match overlay {
         Overlay::Notice => (" Setup notice ", notice_lines(setup)),
         Overlay::Help => (" Help ", help_lines(diagnostics, setup)),
+        Overlay::Summary => (" Summary ", summary_lines(model, paint.now_ms)),
         Overlay::Detail => {
-            let displayed_rows = build_rows(model, state);
             let detail = state.selected().map_or_else(
                 || projection::DetailProjection {
                     entity: projection::DetailEntity::Missing,
@@ -483,7 +519,7 @@ fn render_interaction_layer(
                 |selected| {
                     projection::detail_projection(
                         model,
-                        &displayed_rows,
+                        paint.rows,
                         &state.operator_snapshot(),
                         selected,
                         state.view_mode(),
@@ -509,6 +545,25 @@ fn render_interaction_layer(
     frame.render_widget(Paragraph::new(visible).block(block), modal);
 }
 
+fn summary_lines(model: &DomainModel, now_ms: i64) -> Vec<String> {
+    let mut lines =
+        vec!["worker kind | model | runs | live | total | mean | tok | tok/s".to_owned()];
+    lines.extend(summary_rows(model, now_ms).into_iter().map(|row| {
+        let mean = row
+            .mean_duration_ms
+            .map_or_else(|| "-".to_owned(), format_duration);
+        format!(
+            "{} | {} | {} | {} | {} | {mean} | - | -",
+            row.worker_kind,
+            row.model,
+            row.run_count,
+            row.live_count,
+            format_duration(row.total_duration_ms),
+        )
+    }));
+    lines
+}
+
 fn notice_lines(setup: &TuiSetup) -> Vec<String> {
     vec![
         "Standalone herdr-top does not exactly match this package.".to_owned(),
@@ -528,7 +583,7 @@ fn help_lines(diagnostics: &RuntimeDiagnosticsSnapshot, setup: &TuiSetup) -> Vec
         "Tree: Left collapse/parent; Right expand/child; Enter toggles branch".to_owned(),
         "Collapse is ignored while filtering and in DAG; stored state survives view toggles"
             .to_owned(),
-        "i detail; ? help; Esc/opening key closes; Up/Down scrolls overlays".to_owned(),
+        "i detail; s summary; ? help; Esc/opening key closes; Up/Down scrolls overlays".to_owned(),
         "Follow pins selection and viewport to newest; manual navigation disables it".to_owned(),
         "Recovery: ancestor, stable neighbor, first; reasons are typed".to_owned(),
         "Controller input is optional capability; standalone setup is optional".to_owned(),
@@ -745,6 +800,7 @@ fn header_line(
     quality: ObservationQuality,
     performance: &PerformancePublication,
     inputs: &HeaderInputs,
+    session_elapsed_ms: i64,
 ) -> Line<'static> {
     let mut fields = Vec::new();
     if screen_width >= 60 {
@@ -758,6 +814,11 @@ fn header_line(
         prefix: "session:",
         value: safe_text(&inputs.session),
         shrinkable: true,
+    });
+    fields.push(HeaderField {
+        prefix: "up:",
+        value: format_session_elapsed(session_elapsed_ms),
+        shrinkable: false,
     });
     if screen_width >= 72 {
         fields.push(HeaderField {
@@ -822,6 +883,14 @@ fn header_line(
         vec![Span::raw(text)]
     };
     Line::from(spans)
+}
+
+fn format_session_elapsed(elapsed_ms: i64) -> String {
+    let total_seconds = elapsed_ms.max(0) / 1_000;
+    let hours = total_seconds / 3_600;
+    let minutes = total_seconds % 3_600 / 60;
+    let seconds = total_seconds % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
 fn shrink_header_fields(fields: &mut [HeaderField], available_width: usize) {
@@ -1322,6 +1391,69 @@ fn worker_kind_label(run: &TaskRun) -> String {
     }
 }
 
+pub(crate) struct SummaryRow {
+    pub(crate) worker_kind: String,
+    pub(crate) model: String,
+    pub(crate) run_count: usize,
+    pub(crate) live_count: usize,
+    pub(crate) total_duration_ms: i64,
+    pub(crate) mean_duration_ms: Option<i64>,
+}
+
+/// Aggregates runs for the Summary overlay; `_now_ms` is reserved for Increment 9 rates.
+pub(crate) fn summary_rows(model: &DomainModel, _now_ms: i64) -> Vec<SummaryRow> {
+    let newest_agents = newest_agent_nodes(model);
+    let mut groups = HashMap::<(String, String), (usize, usize, i64, i64)>::new();
+    for run in model.task_runs() {
+        let worker_kind = worker_kind_label(run);
+        let model = newest_agents
+            .get(&run.run_id)
+            .and_then(|agent| agent.model_id.as_deref())
+            .unwrap_or("unknown")
+            .to_owned();
+        let group = groups.entry((worker_kind, model)).or_default();
+        group.0 = group.0.saturating_add(1);
+        if !run.state.is_terminal() {
+            group.1 = group.1.saturating_add(1);
+            continue;
+        }
+        let Some(duration) = run
+            .finished_at_ms
+            .zip(run.created_at_ms)
+            .and_then(|(finished, created)| finished.checked_sub(created))
+            .filter(|duration| *duration >= 0)
+        else {
+            continue;
+        };
+        group.2 = group.2.saturating_add(duration);
+        group.3 = group.3.saturating_add(1);
+    }
+
+    let mut rows = groups
+        .into_iter()
+        .map(
+            |((worker_kind, model), (run_count, live_count, total_duration_ms, timed_count))| {
+                SummaryRow {
+                    worker_kind,
+                    model,
+                    run_count,
+                    live_count,
+                    total_duration_ms,
+                    mean_duration_ms: (timed_count > 0).then(|| total_duration_ms / timed_count),
+                }
+            },
+        )
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .total_duration_ms
+            .cmp(&left.total_duration_ms)
+            .then_with(|| left.worker_kind.cmp(&right.worker_kind))
+            .then_with(|| left.model.cmp(&right.model))
+    });
+    rows
+}
+
 pub(crate) fn newest_agent_nodes(model: &DomainModel) -> NewestAgentNodes<'_> {
     #[cfg(test)]
     record_newest_agent_scan();
@@ -1666,6 +1798,178 @@ mod tests {
             last_activity_at_ms,
             session_file: None,
         }
+    }
+
+    #[test]
+    fn summary_rows_group_all_runs_and_count_only_valid_terminal_durations() {
+        let mut model = DomainModel::default();
+        let fixtures = [
+            (
+                "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                RunKey::Controller("hook:claude-code:S:task:A".to_owned()),
+                TaskState::Completed,
+                Some(1_000),
+                Some(10_000),
+                Some("model-a"),
+            ),
+            (
+                "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+                RunKey::Controller("hook:claude-code:S:task:B".to_owned()),
+                TaskState::Running,
+                Some(2_000),
+                Some(99_000),
+                Some("model-a"),
+            ),
+            (
+                "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+                RunKey::Controller("hook:claude-code:S:task:C".to_owned()),
+                TaskState::Failed,
+                None,
+                None,
+                Some("model-a"),
+            ),
+            (
+                "01ARZ3NDEKTSV4RRFFQ69G5FAY",
+                RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: "codex-b".to_owned(),
+                },
+                TaskState::Completed,
+                Some(1_000),
+                Some(8_000),
+                Some("model-b"),
+            ),
+            (
+                "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+                RunKey::Controller("hook:claude-code:S:task:D".to_owned()),
+                TaskState::Cancelled,
+                Some(4_000),
+                Some(11_000),
+                Some("model-b"),
+            ),
+            (
+                "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+                RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: "codex-a-terminal".to_owned(),
+                },
+                TaskState::EndedUnknown,
+                Some(4_000),
+                Some(11_000),
+                Some("model-a"),
+            ),
+            (
+                "01ARZ3NDEKTSV4RRFFQ69G5FB1",
+                RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: "codex-a-live".to_owned(),
+                },
+                TaskState::Blocked,
+                Some(2_000),
+                Some(90_000),
+                Some("model-a"),
+            ),
+            (
+                "01ARZ3NDEKTSV4RRFFQ69G5FB2",
+                RunKey::Provisional {
+                    terminal_id: "unknown-model".to_owned(),
+                    start_ms: 1,
+                    seq: 1,
+                },
+                TaskState::Completed,
+                Some(9_000),
+                Some(8_000),
+                None,
+            ),
+        ];
+
+        for (index, (id, key, state, created, finished, model_id)) in
+            fixtures.into_iter().enumerate()
+        {
+            let run_id = run_id(id);
+            model.insert_task_run(label_run(run_id, key, state, created, finished, None));
+            if let Some(model_id) = model_id {
+                model.insert_agent_node(label_agent(
+                    &format!("agent-{index}"),
+                    run_id,
+                    Some(index as i64),
+                    None,
+                    None,
+                    Some(model_id),
+                ));
+            }
+        }
+        let first_run = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        model.insert_agent_node(label_agent(
+            "agent-older",
+            first_run,
+            Some(-1),
+            None,
+            None,
+            Some("model-b"),
+        ));
+
+        reset_newest_agent_scan_count();
+        let actual = summary_rows(&model, 123_456)
+            .into_iter()
+            .map(|row| {
+                (
+                    row.worker_kind,
+                    row.model,
+                    row.run_count,
+                    row.live_count,
+                    row.total_duration_ms,
+                    row.mean_duration_ms,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(newest_agent_scan_count(), 1);
+
+        assert_eq!(
+            actual,
+            [
+                (
+                    "claude-code".to_owned(),
+                    "model-a".to_owned(),
+                    3,
+                    1,
+                    9_000,
+                    Some(9_000)
+                ),
+                (
+                    "Codex".to_owned(),
+                    "model-a".to_owned(),
+                    2,
+                    1,
+                    7_000,
+                    Some(7_000)
+                ),
+                (
+                    "Codex".to_owned(),
+                    "model-b".to_owned(),
+                    1,
+                    0,
+                    7_000,
+                    Some(7_000)
+                ),
+                (
+                    "claude-code".to_owned(),
+                    "model-b".to_owned(),
+                    1,
+                    0,
+                    7_000,
+                    Some(7_000)
+                ),
+                (
+                    "provisional".to_owned(),
+                    "unknown".to_owned(),
+                    1,
+                    0,
+                    0,
+                    None
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -2138,7 +2442,7 @@ mod tests {
                 PerformanceDegradationReason::DependencyEdges,
             ],
         );
-        let line = rendered_header(snapshot, 140);
+        let line = rendered_header(snapshot, 160);
         assert!(line.contains("lag:1234ms"));
         assert!(line.contains("perf:dependency_edges+events_60s"));
     }
@@ -2395,10 +2699,11 @@ mod tests {
             "f/End follow",
             "tab view",
             "/ filter",
+            "s summary",
             "? help",
         ];
         let compact = ["q:stop Top; agents continue", "detach:Top runs"];
-        assert_eq!(footer_line(120), full.join(" | "));
+        assert_eq!(footer_line(140), full.join(" | "));
 
         for width in [100, 72, 69, 45, 27] {
             let rendered = footer_line(width);
@@ -2415,6 +2720,21 @@ mod tests {
         assert_eq!(Span::raw(FLOOR).width(), 27);
         assert_eq!(footer_line(27), FLOOR);
         assert_eq!(footer_line(26), truncate_to_width(FLOOR, 26));
+    }
+
+    #[test]
+    fn summary_is_discoverable_in_full_footer_and_help() {
+        let mut app = app(
+            DomainModel::default(),
+            ObservationQuality::Live,
+            "summary-help",
+        );
+        let footer = render(&app, 160, 18).pop().unwrap();
+        assert!(footer.contains("s summary"), "{footer}");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        let help = render(&app, 160, 18).join("\n");
+        assert!(help.contains("s summary"), "{help}");
     }
 
     #[test]
