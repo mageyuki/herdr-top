@@ -22,9 +22,9 @@ use crate::activity::{OperatorSnapshot, RestoredOperatorState};
 use crate::diagnostics::{
     ControllerInputStatus, ControllerInputUnavailableReason, DiagnosticSource,
     EnrichmentCounterSnapshot, InputAvailability, OccurrenceLogStatus, OwnerFreshness,
-    PersistenceCounters, PersistenceOccurrenceSink, RuntimeDiagnosticsSnapshot,
-    RuntimeWriteOutcome, SourceCoverageSnapshot, controller_counter_snapshot,
-    encode_persistence_occurrence,
+    PersistenceCounters, PersistenceOccurrenceSink, PrimaryStreamCounterSnapshot,
+    PrimaryStreamDiagnosticsHandle, RuntimeDiagnosticsSnapshot, RuntimeWriteOutcome,
+    SourceCoverageSnapshot, controller_counter_snapshot, encode_persistence_occurrence,
 };
 use crate::lockfile::OwnerRecord;
 use crate::model::{
@@ -69,6 +69,53 @@ const DRAIN_QUIET_PERIOD: Duration = Duration::from_millis(5);
 const STALE_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const PERFORMANCE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LivenessPolicy {
+    timeout_ms: i64,
+}
+
+impl Default for LivenessPolicy {
+    fn default() -> Self {
+        Self { timeout_ms: 30_000 }
+    }
+}
+
+fn silence_deadline(last_event_at_ms: i64, policy: &LivenessPolicy) -> i64 {
+    last_event_at_ms.saturating_add(policy.timeout_ms)
+}
+
+fn remaining_until(deadline_ms: i64) -> Duration {
+    let remaining_ms = deadline_ms.saturating_sub(unix_now_ms()).max(0);
+    Duration::from_millis(u64::try_from(remaining_ms).unwrap_or(0))
+}
+
+fn backoff_delay_ms(consecutive_failures: u32) -> u64 {
+    if consecutive_failures >= 6 {
+        60_000
+    } else {
+        1_000_u64
+            .saturating_mul(1_u64 << consecutive_failures)
+            .min(60_000)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ReconnectBackoff {
+    consecutive_failures: u32,
+}
+
+impl ReconnectBackoff {
+    fn on_watchdog_silence(&mut self) -> u64 {
+        let delay_ms = backoff_delay_ms(self.consecutive_failures);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        delay_ms
+    }
+
+    fn on_event(&mut self) {
+        self.consecutive_failures = 0;
+    }
+}
 
 #[derive(Default)]
 struct HealthEdge {
@@ -957,6 +1004,7 @@ pub struct CollectorHandle {
     pub operator: watch::Receiver<OperatorSnapshot>,
     /// Coherent reducer-owned domain snapshots.
     pub model: SharedModel,
+    primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle,
     cancellation: CancellationToken,
     task: JoinHandle<Result<(), CollectorError>>,
     performance_monitor: JoinHandle<()>,
@@ -965,6 +1013,12 @@ pub struct CollectorHandle {
 }
 
 impl CollectorHandle {
+    /// Returns primary-stream tolerance counters for this collector process.
+    #[must_use]
+    pub fn primary_stream_counters(&self) -> PrimaryStreamCounterSnapshot {
+        self.primary_stream_diagnostics.snapshot()
+    }
+
     /// Cancels the collector and waits for its subscription task to exit.
     pub async fn stop(self) -> Result<(), CollectorError> {
         self.stop_with_timeout(STOP_TIMEOUT).await
@@ -1125,6 +1179,8 @@ pub async fn spawn_workload_collector(
     );
     let task_cancellation = cancellation.clone();
     let task_model = model.clone();
+    let primary_stream_diagnostics = PrimaryStreamDiagnosticsHandle::default();
+    let task_primary_stream_diagnostics = primary_stream_diagnostics.clone();
     let performance_observer = config.performance_observer;
     let performance_monitor = spawn_performance_monitor(
         performance_sampler,
@@ -1148,6 +1204,8 @@ pub async fn spawn_workload_collector(
             owner,
             Some(controller_requests),
             provider_integration,
+            LivenessPolicy::default(),
+            task_primary_stream_diagnostics,
         )
         .await
     });
@@ -1158,6 +1216,7 @@ pub async fn spawn_workload_collector(
         diagnostics,
         operator,
         model,
+        primary_stream_diagnostics,
         cancellation,
         task,
         performance_monitor,
@@ -1445,6 +1504,8 @@ async fn spawn_configured_inner(
     );
     let task_cancellation = cancellation.clone();
     let task_model = model.clone();
+    let primary_stream_diagnostics = PrimaryStreamDiagnosticsHandle::default();
+    let task_primary_stream_diagnostics = primary_stream_diagnostics.clone();
     let performance_monitor = spawn_performance_monitor(
         performance_sampler,
         model.clone(),
@@ -1468,6 +1529,8 @@ async fn spawn_configured_inner(
             owner,
             controller_requests,
             provider_integration,
+            LivenessPolicy::default(),
+            task_primary_stream_diagnostics,
         )
         .await
     });
@@ -1479,6 +1542,7 @@ async fn spawn_configured_inner(
         diagnostics,
         operator,
         model,
+        primary_stream_diagnostics,
         cancellation,
         task,
         performance_monitor,
@@ -1499,9 +1563,12 @@ async fn run_collector(
     mut owner: OwnerTracker,
     mut controller_requests: Option<ControllerRequestReceiver>,
     mut provider: ProviderIntegration,
+    liveness_policy: LivenessPolicy,
+    primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle,
 ) -> Result<(), CollectorError> {
     let mut first_subscription = true;
     let mut previous_socket = None;
+    let mut reconnect_backoff = ReconnectBackoff::default();
     let subscription_health = HealthEdge::default();
     // Keep this outside the primary retry loop. spawn_enrichment_reader runs once per
     // primary subscription generation, so this one shared value preserves its
@@ -1603,8 +1670,13 @@ async fn run_collector(
         provider.set_herdr_quality(ObservationQuality::Reconciling, &mut persistence, &shared);
 
         let reader_cancellation = cancellation.child_token();
-        let (events, overflowed, reader) =
-            spawn_event_reader(stream, reader_cancellation.clone(), performance.clone());
+        let (events, overflowed, reader) = spawn_event_reader(
+            stream,
+            reader_cancellation.clone(),
+            performance.clone(),
+            liveness_policy,
+            primary_stream_diagnostics.clone(),
+        );
         let enrichment_cancellation = cancellation.child_token();
         let (target_publisher, target_receiver) = watch::channel(BTreeSet::new());
         let (enrichment_sender, enrichment_events) = mpsc::channel(ENRICHMENT_QUEUE_CAPACITY);
@@ -1647,7 +1719,7 @@ async fn run_collector(
 
         reader_cancellation.cancel();
         enrichment_cancellation.cancel();
-        let reader_result = reader
+        let reader_report = reader
             .await
             .map_err(|error| CollectorError::Task(error.to_string()))?;
         enrichment_reader
@@ -1658,12 +1730,51 @@ async fn run_collector(
             first_subscription = false;
             previous_socket = socket_identity;
         }
-        if let Err(error) = reader_result {
-            provider.set_herdr_quality(ObservationQuality::Disconnected, &mut persistence, &shared);
-            if matches!(outcome.outcome, SubscriptionOutcome::Cancelled) {
-                return Ok(());
+        if reader_report.received_event {
+            reconnect_backoff.on_event();
+        }
+        match reader_report.reason {
+            EventReaderExitReason::WatchdogSilence => {
+                provider.set_herdr_quality(
+                    ObservationQuality::Disconnected,
+                    &mut persistence,
+                    &shared,
+                );
+                if matches!(outcome.outcome, SubscriptionOutcome::Cancelled) {
+                    return Ok(());
+                }
+                tracing::warn!(
+                    warning_code = "herdr_primary_stream_watchdog_silence",
+                    "Herdr event subscription became silent; reconnecting"
+                );
+                let delay = Duration::from_millis(reconnect_backoff.on_watchdog_silence());
+                if wait_or_service_controller(
+                    &cancellation,
+                    delay,
+                    &mut controller_requests,
+                    &session,
+                    &mut reducer,
+                    &mut persistence,
+                    &shared,
+                    &mut provider,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
             }
-            let _ = error;
+            EventReaderExitReason::WireError(error) => {
+                provider.set_herdr_quality(
+                    ObservationQuality::Disconnected,
+                    &mut persistence,
+                    &shared,
+                );
+                if matches!(outcome.outcome, SubscriptionOutcome::Cancelled) {
+                    return Ok(());
+                }
+                let _ = error;
+            }
+            EventReaderExitReason::Clean => {}
         }
         match outcome.outcome {
             SubscriptionOutcome::Cancelled => return Ok(()),
@@ -2168,8 +2279,30 @@ async fn monitor_reconciling(
 type EventReader = (
     mpsc::Receiver<Admitted<ReceivedEvent>>,
     Arc<AtomicBool>,
-    JoinHandle<Result<(), WireError>>,
+    JoinHandle<EventReaderReport>,
 );
+
+#[derive(Debug)]
+enum EventReaderExitReason {
+    Clean,
+    WatchdogSilence,
+    WireError(WireError),
+}
+
+#[derive(Debug)]
+struct EventReaderReport {
+    reason: EventReaderExitReason,
+    received_event: bool,
+}
+
+impl EventReaderReport {
+    const fn new(reason: EventReaderExitReason, received_event: bool) -> Self {
+        Self {
+            reason,
+            received_event,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct EnrichmentPayload {
@@ -2570,34 +2703,73 @@ fn spawn_event_reader(
     mut stream: EventStream,
     cancellation: CancellationToken,
     performance: PerformanceIngress,
+    liveness_policy: LivenessPolicy,
+    diagnostics: PrimaryStreamDiagnosticsHandle,
 ) -> EventReader {
     let (sender, receiver) = admitted_channel(EVENT_QUEUE_CAPACITY, performance);
     let overflowed = Arc::new(AtomicBool::new(false));
     let reader_overflowed = Arc::clone(&overflowed);
     let task = tokio::spawn(async move {
+        let mut last_event_at_ms = unix_now_ms();
+        let mut received_event = false;
         loop {
+            let deadline = silence_deadline(last_event_at_ms, &liveness_policy);
+            let watchdog = tokio::time::sleep(remaining_until(deadline));
+            tokio::pin!(watchdog);
             let received = tokio::select! {
-                () = cancellation.cancelled() => return Ok(()),
-                received = stream.next_event() => received?,
+                () = cancellation.cancelled() => {
+                    return EventReaderReport::new(EventReaderExitReason::Clean, received_event);
+                }
+                () = &mut watchdog => {
+                    return EventReaderReport::new(
+                        EventReaderExitReason::WatchdogSilence,
+                        received_event,
+                    );
+                }
+                received = stream.next_event() => match received {
+                    Ok(received) => received,
+                    Err(error) => {
+                        return EventReaderReport::new(
+                            EventReaderExitReason::WireError(error),
+                            received_event,
+                        );
+                    }
+                },
             };
             let Some((event, data)) = received else {
-                return Ok(());
+                return EventReaderReport::new(EventReaderExitReason::Clean, received_event);
             };
-            let received = ReceivedEvent { event, data };
+            last_event_at_ms = unix_now_ms();
+            received_event = true;
+            let received = ReceivedEvent {
+                event,
+                data,
+                primary_stream_diagnostics: diagnostics.clone(),
+            };
             match sender.try_send(received) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(received)) => {
                     reader_overflowed.store(true, Ordering::Release);
                     tokio::select! {
-                        () = cancellation.cancelled() => return Ok(()),
+                        () = cancellation.cancelled() => {
+                            return EventReaderReport::new(
+                                EventReaderExitReason::Clean,
+                                received_event,
+                            );
+                        }
                         result = sender.send(received) => {
                             if result.is_err() {
-                                return Ok(());
+                                return EventReaderReport::new(
+                                    EventReaderExitReason::Clean,
+                                    received_event,
+                                );
                             }
                         }
                     }
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return EventReaderReport::new(EventReaderExitReason::Clean, received_event);
+                }
             }
         }
     });
@@ -2607,6 +2779,7 @@ fn spawn_event_reader(
 struct ReceivedEvent {
     event: String,
     data: Value,
+    primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle,
 }
 
 #[derive(Debug)]
@@ -3916,6 +4089,12 @@ fn normalize_event(
                 if shared.borrow().pane(&pane.pane_id).is_some() {
                     append_pane_upsert(shared, session, &received.event, pane, &mut events)?;
                 }
+            } else if received.event == "pane_agent_detected"
+                && string_field(&received.data, "pane_id").is_some()
+            {
+                received
+                    .primary_stream_diagnostics
+                    .record_flat_pane_agent_detected();
             }
         }
         "pane_closed" => {
@@ -5205,9 +5384,9 @@ fn updated_entity(received: &ReceivedEvent) -> Option<EntityKey> {
             string_field(&received.data, "workspace_id").map(EntityKey::Workspace)
         }
         "tab_focused" => string_field(&received.data, "tab_id").map(EntityKey::Tab),
-        "pane_updated" | "pane_agent_detected" => {
-            nested_string(&received.data, "pane", "pane_id").map(EntityKey::Pane)
-        }
+        "pane_updated" | "pane_agent_detected" => nested_string(&received.data, "pane", "pane_id")
+            .or_else(|| string_field(&received.data, "pane_id"))
+            .map(EntityKey::Pane),
         "pane_focused" | "pane_agent_status_changed" => string_field(&received.data, "pane_id")
             .or_else(|| nested_string(&received.data, "pane", "pane_id"))
             .map(EntityKey::Pane),
@@ -5529,6 +5708,45 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn watchdog_backoff_uses_exponential_delays_with_a_hard_cap() {
+        let expected = [
+            1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000, 60_000,
+        ];
+        for (consecutive_failures, expected_ms) in expected.into_iter().enumerate() {
+            assert_eq!(
+                backoff_delay_ms(u32::try_from(consecutive_failures).unwrap()),
+                expected_ms
+            );
+        }
+        assert_eq!(backoff_delay_ms(u32::MAX), 60_000);
+    }
+
+    #[test]
+    fn watchdog_silence_deadline_uses_saturating_receipt_time_arithmetic() {
+        let policy = LivenessPolicy { timeout_ms: 30_000 };
+
+        assert_eq!(silence_deadline(1_000, &policy), 31_000);
+        assert_eq!(silence_deadline(0, &policy), 30_000);
+        assert_eq!(silence_deadline(-40_000, &policy), -10_000);
+        assert_eq!(silence_deadline(i64::MAX - 1, &policy), i64::MAX);
+    }
+
+    #[test]
+    fn watchdog_backoff_resets_after_the_first_reconnected_event() {
+        let mut backoff = ReconnectBackoff::default();
+
+        assert_eq!(backoff.on_watchdog_silence(), 1_000);
+        assert_eq!(backoff.consecutive_failures, 1);
+        assert_eq!(backoff.on_watchdog_silence(), 2_000);
+        assert_eq!(backoff.consecutive_failures, 2);
+
+        backoff.on_event();
+        assert_eq!(backoff.consecutive_failures, 0);
+        assert_eq!(backoff.on_watchdog_silence(), 1_000);
+        assert_eq!(backoff.consecutive_failures, 1);
+    }
+
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     use tracing::instrument::WithSubscriber;
 
@@ -5705,6 +5923,7 @@ mod tests {
     struct PrimaryCollectorHarness {
         cancellation: CancellationToken,
         task: JoinHandle<Result<(), CollectorError>>,
+        model: SharedModel,
         provider_events: mpsc::Sender<ProviderIngressEvent>,
         ignored_provider_events: mpsc::Receiver<ProviderEvent>,
         provider_thread: ProviderThreadHandle,
@@ -5718,6 +5937,7 @@ mod tests {
             let Self {
                 cancellation,
                 task,
+                model: _,
                 provider_events,
                 ignored_provider_events,
                 provider_thread,
@@ -5747,6 +5967,20 @@ mod tests {
         socket: PathBuf,
         log_name: &str,
     ) -> PrimaryCollectorHarness {
+        spawn_primary_collector_harness_with_policy(
+            directory,
+            socket,
+            log_name,
+            LivenessPolicy::default(),
+        )
+    }
+
+    fn spawn_primary_collector_harness_with_policy(
+        directory: &tempfile::TempDir,
+        socket: PathBuf,
+        log_name: &str,
+        liveness_policy: LivenessPolicy,
+    ) -> PrimaryCollectorHarness {
         let log_path = directory.path().join(log_name);
         let log = std::fs::File::create(&log_path).unwrap();
         let subscriber = tracing_subscriber::fmt()
@@ -5756,8 +5990,10 @@ mod tests {
             .with_writer(log)
             .finish();
         let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
-        let store = open_writer(&root).unwrap();
+        let mut store = open_writer(&root).unwrap();
         let restored = store.load_restored_state().unwrap();
+        let owner = OwnerTracker::from_environment();
+        store.replace_owner(&owner.record()).unwrap();
         let (lifecycle, writer) = spawn_writer(store).unwrap();
         let (reducer, shared) = Reducer::new(restored);
         let initial_coverage = SourceCoverageRegistry::new(SourceAvailability::NotApplicable);
@@ -5796,18 +6032,21 @@ mod tests {
         let task_cancellation = cancellation.clone();
         let (performance, _sampler) =
             performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
+        let task_model = shared.clone();
         let task = tokio::spawn(
             run_collector(
                 socket,
                 "health-edge-session".to_owned(),
                 persistence,
                 reducer,
-                shared,
+                task_model,
                 performance,
                 task_cancellation,
-                OwnerTracker::from_environment(),
+                owner,
                 None,
                 provider,
+                liveness_policy,
+                PrimaryStreamDiagnosticsHandle::default(),
             )
             .with_subscriber(subscriber),
         );
@@ -5815,6 +6054,7 @@ mod tests {
         PrimaryCollectorHarness {
             cancellation,
             task,
+            model: shared,
             provider_events,
             ignored_provider_events,
             provider_thread,
@@ -6823,6 +7063,256 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn watchdog_silence_reports_and_reconnects_with_a_reconciled_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut reader, request) = accept_wire_request(&listener).await;
+            assert_eq!(request["method"], "events.subscribe");
+            write_wire_frame(
+                &mut reader,
+                &json!({
+                    "id": request["id"],
+                    "result": {"type": "subscription_started"},
+                }),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            write_wire_frame(
+                &mut reader,
+                &json!({
+                    "event": "pane_agent_detected",
+                    "data": {
+                        "agent": "claude",
+                        "pane_id": "w1:p4",
+                        "type": "pane_agent_detected",
+                        "workspace_id": "w1",
+                    },
+                }),
+            )
+            .await;
+            wait_for_wire_peer_close(&mut reader).await;
+        });
+
+        let stream = wire::subscribe(&socket, &subscriptions()).await.unwrap();
+        let cancellation = CancellationToken::new();
+        let (performance, _sampler) =
+            performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
+        let reader_started = Instant::now();
+        let (mut events, _overflowed, reader) = spawn_event_reader(
+            stream,
+            cancellation,
+            performance,
+            LivenessPolicy { timeout_ms: 40 },
+            PrimaryStreamDiagnosticsHandle::default(),
+        );
+
+        let received = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("primary reader did not deliver the scripted event")
+            .expect("primary reader event channel closed before delivery");
+        let (received, admission) = received.into_parts();
+        assert_eq!(received.event, "pane_agent_detected");
+        admission.complete();
+        let report = tokio::time::timeout(Duration::from_secs(2), reader)
+            .await
+            .expect("primary reader did not enforce its silence deadline")
+            .expect("primary reader task panicked");
+        assert!(matches!(
+            report.reason,
+            EventReaderExitReason::WatchdogSilence
+        ));
+        assert!(report.received_event);
+        assert!(
+            reader_started.elapsed() >= Duration::from_millis(45),
+            "the event did not move the watchdog deadline: {:?}",
+            reader_started.elapsed()
+        );
+        join_fake_server(server, "primary watchdog silence").await;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("reconnecting-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (second_subscribe_sender, second_subscribe_receiver) = tokio::sync::oneshot::channel();
+        let harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "primary-watchdog.log",
+            LivenessPolicy { timeout_ms: 40 },
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let server = tokio::spawn(async move {
+            let mut primary_subscriptions = 0;
+            let mut snapshots = 0;
+            let mut first_subscription_at = None;
+            let mut second_subscribe_sender = Some(second_subscribe_sender);
+            let mut held_streams = Vec::new();
+            while primary_subscriptions < 2 || snapshots < 2 {
+                let (mut reader, request) = accept_wire_request(&listener).await;
+                match request["method"].as_str() {
+                    Some("events.subscribe") => {
+                        write_wire_frame(
+                            &mut reader,
+                            &json!({
+                                "id": request["id"],
+                                "result": {"type": "subscription_started"},
+                            }),
+                        )
+                        .await;
+                        let scoped = request["params"]["subscriptions"].as_array().is_some_and(
+                            |subscriptions| {
+                                subscriptions
+                                    .iter()
+                                    .any(|subscription| subscription.get("pane_id").is_some())
+                            },
+                        );
+                        if !scoped {
+                            primary_subscriptions += 1;
+                            if primary_subscriptions == 1 {
+                                first_subscription_at = Some(Instant::now());
+                            } else if let Some(sender) = second_subscribe_sender.take() {
+                                sender
+                                    .send(first_subscription_at.unwrap().elapsed())
+                                    .expect("watchdog test stopped before the second subscribe");
+                            }
+                            write_wire_frame(
+                                &mut reader,
+                                &json!({
+                                    "event": "pane_agent_detected",
+                                    "data": {
+                                        "agent": "claude",
+                                        "pane_id": "w1:p4",
+                                        "type": "pane_agent_detected",
+                                        "workspace_id": "w1",
+                                    },
+                                }),
+                            )
+                            .await;
+                        }
+                        held_streams.push(reader);
+                    }
+                    Some("session.snapshot") => {
+                        snapshots += 1;
+                        let pane = if snapshots == 1 {
+                            json!({
+                                "pane_id": "w1:p4",
+                                "terminal_id": "terminal-4",
+                                "workspace_id": "w1",
+                                "tab_id": "w1:t1",
+                                "agent": "claude",
+                                "agent_status": "working",
+                                "agent_session": {
+                                    "source": "herdr:claude",
+                                    "agent": "claude",
+                                    "kind": "id",
+                                    "value": "watchdog-session",
+                                },
+                            })
+                        } else {
+                            json!({
+                                "pane_id": "w1:p4",
+                                "terminal_id": "terminal-4",
+                                "workspace_id": "w1",
+                                "tab_id": "w1:t1",
+                                "agent_status": "unknown",
+                            })
+                        };
+                        write_wire_frame(
+                            &mut reader,
+                            &json!({
+                                "id": request["id"],
+                                "result": {
+                                    "type": "session_snapshot",
+                                    "snapshot": {
+                                        "version": "0.8.0",
+                                        "protocol": 19,
+                                        "focused_workspace_id": "w1",
+                                        "focused_tab_id": "w1:t1",
+                                        "focused_pane_id": "w1:p4",
+                                        "workspaces": [{"workspace_id": "w1"}],
+                                        "tabs": [{
+                                            "tab_id": "w1:t1",
+                                            "workspace_id": "w1",
+                                        }],
+                                        "panes": [pane],
+                                        "layouts": [],
+                                        "agents": [],
+                                    },
+                                },
+                            }),
+                        )
+                        .await;
+                    }
+                    method => panic!("unexpected watchdog test request: {method:?}"),
+                }
+            }
+            wait_for_server_cancellation(&server_cancellation).await;
+            drop(held_streams);
+        });
+
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if harness
+                    .model
+                    .borrow()
+                    .executions()
+                    .any(|execution| !execution.state.is_terminal())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the initial snapshot did not create a live execution");
+
+        let reconnect_elapsed =
+            tokio::time::timeout(Duration::from_secs(2), second_subscribe_receiver)
+                .await
+                .expect("the watchdog did not trigger a second subscription")
+                .expect("the scripted server dropped the second-subscribe observation");
+        assert!(
+            reconnect_elapsed >= Duration::from_millis(900),
+            "the watchdog reconnect skipped exponential backoff: {reconnect_elapsed:?}"
+        );
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let model = harness.model.borrow();
+                let has_execution = model.executions().next().is_some();
+                let all_terminal = model
+                    .executions()
+                    .all(|execution| execution.state.is_terminal());
+                drop(model);
+                if has_execution && all_terminal {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the reconnect snapshot did not retire the prior execution");
+
+        let contents = harness.stop().await;
+        join_fake_server(server, "primary watchdog reconnect").await;
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let connection = rusqlite::Connection::open(crate::store::database_path(&root)).unwrap();
+        let reconnect_gaps: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE gap_kind = 'reconnect'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reconnect_gaps, 1, "collector log: {contents}");
+
+        assert!(
+            contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            "the supervisor did not observe the watchdog exit reason: {contents}"
+        );
+    }
+
     async fn capture_primary_subscribe_recovery(log_name: &str) -> String {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("herdr.sock");
@@ -7623,6 +8113,113 @@ mod tests {
         watch::channel(Arc::new(model)).1
     }
 
+    fn known_pane_model() -> SharedModel {
+        let mut model = DomainModel::default();
+        model.insert_workspace(Workspace {
+            workspace_id: "w1".to_owned(),
+        });
+        model.insert_tab(Tab {
+            tab_id: "w1:t1".to_owned(),
+            workspace_id: "w1".to_owned(),
+            label: None,
+        });
+        model.insert_pane(Pane {
+            pane_id: "w1:p4".to_owned(),
+            workspace_id: "w1".to_owned(),
+            tab_id: "w1:t1".to_owned(),
+            terminal_id: "terminal-4".to_owned(),
+            display_name: None,
+        });
+        watch::channel(Arc::new(model)).1
+    }
+
+    fn flat_pane_agent_detected(
+        pane_id: &str,
+        diagnostics: PrimaryStreamDiagnosticsHandle,
+    ) -> ReceivedEvent {
+        ReceivedEvent {
+            event: "pane_agent_detected".to_owned(),
+            data: json!({
+                "agent": "claude",
+                "pane_id": pane_id,
+                "type": "pane_agent_detected",
+                "workspace_id": "w1",
+            }),
+            primary_stream_diagnostics: diagnostics,
+        }
+    }
+
+    fn nested_pane_agent_detected(diagnostics: PrimaryStreamDiagnosticsHandle) -> ReceivedEvent {
+        ReceivedEvent {
+            event: "pane_agent_detected".to_owned(),
+            data: json!({
+                "type": "pane_agent_detected",
+                "pane": {
+                    "agent": "claude",
+                    "agent_status": "working",
+                    "pane_id": "w1:p4",
+                    "tab_id": "w1:t1",
+                    "terminal_id": "terminal-4",
+                    "workspace_id": "w1",
+                },
+            }),
+            primary_stream_diagnostics: diagnostics,
+        }
+    }
+
+    #[test]
+    fn flat_pane_agent_detected_counts_without_topology_mutation() {
+        let shared = known_pane_model();
+        let flat_diagnostics = PrimaryStreamDiagnosticsHandle::default();
+        let flat = flat_pane_agent_detected("w1:p4", flat_diagnostics.clone());
+
+        let normalized = normalize_event(&shared, "flat-frame-session", &flat)
+            .expect("flat pane_agent_detected should be tolerated");
+        assert!(
+            normalized.is_empty(),
+            "flat pane_agent_detected must not produce topology or persistence operations"
+        );
+        assert_eq!(flat_diagnostics.snapshot().flat_pane_agent_detected, 1);
+
+        let nested_diagnostics = PrimaryStreamDiagnosticsHandle::default();
+        let nested = nested_pane_agent_detected(nested_diagnostics.clone());
+        let normalized = normalize_event(&shared, "nested-frame-session", &nested)
+            .expect("nested pane_agent_detected should still normalize");
+        assert!(normalized.iter().any(|event| matches!(
+            event,
+            NormalizedEvent::TopologyUpsert {
+                entity: TopologyEntity::Pane(pane),
+                ..
+            } if pane.pane_id == "w1:p4"
+        )));
+        assert_eq!(nested_diagnostics.snapshot().flat_pane_agent_detected, 0);
+    }
+
+    #[test]
+    fn flat_pane_agent_detected_participates_in_resync_admission() {
+        let diagnostics = PrimaryStreamDiagnosticsHandle::default();
+        let flat_known = flat_pane_agent_detected("w1:p4", diagnostics.clone());
+        let flat_unknown = flat_pane_agent_detected("w1:p9", diagnostics.clone());
+        let nested = nested_pane_agent_detected(diagnostics);
+
+        assert_eq!(
+            updated_entity(&flat_known),
+            Some(EntityKey::Pane("w1:p4".to_owned()))
+        );
+        assert_eq!(
+            updated_entity(&nested),
+            Some(EntityKey::Pane("w1:p4".to_owned()))
+        );
+
+        let shared = known_pane_model();
+        assert!(
+            !updated_entity(&flat_known).is_some_and(|entity| !entity_exists(&shared, &entity))
+        );
+        assert!(
+            updated_entity(&flat_unknown).is_some_and(|entity| !entity_exists(&shared, &entity))
+        );
+    }
+
     fn status_received(status: &str) -> ReceivedEvent {
         ReceivedEvent {
             event: "pane_agent_status_changed".to_owned(),
@@ -7631,6 +8228,7 @@ mod tests {
                 "terminal_id": "terminal-1",
                 "agent_status": status,
             }),
+            primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
         }
     }
 
@@ -8014,6 +8612,8 @@ mod tests {
                 OwnerTracker::from_environment(),
                 None,
                 provider,
+                LivenessPolicy::default(),
+                PrimaryStreamDiagnosticsHandle::default(),
             )
             .with_subscriber(subscriber),
         );
@@ -10452,6 +11052,7 @@ mod provider_integration_tests {
                     diagnostics: test_diagnostics(),
                     operator,
                     model,
+                    primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
                     cancellation: CancellationToken::new(),
                     task: tokio::spawn(async {
                         Err(CollectorError::Task(
@@ -10507,6 +11108,7 @@ mod provider_integration_tests {
             diagnostics: test_diagnostics(),
             operator,
             model,
+            primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
             cancellation: CancellationToken::new(),
             task: tokio::spawn(async {
                 std::future::pending::<()>().await;
