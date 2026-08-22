@@ -2693,10 +2693,7 @@ mod tests {
         let mut model = DomainModel::default();
         model.insert_task_run(run(
             first_run_id,
-            RunKey::NativePath {
-                provider: Provider::Codex,
-                path: "/tmp/first-owner.jsonl".to_owned(),
-            },
+            RunKey::Controller("ambiguous-first-owner".to_owned()),
             1,
             TaskState::Queued,
         ));
