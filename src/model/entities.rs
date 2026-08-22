@@ -998,6 +998,8 @@ pub struct PaneSnapshot {
     pub workspace_id: String,
     pub tab_id: String,
     pub terminal_id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
     pub agent: Option<SnapshotAgent>,
     pub agent_session: Option<AgentSessionReference>,
 }
@@ -1175,6 +1177,7 @@ mod tests {
                 workspace_id: "workspace-1".to_owned(),
                 tab_id: "tab-1".to_owned(),
                 terminal_id: "terminal-1".to_owned(),
+                display_name: Some("Build".to_owned()),
                 agent: Some(SnapshotAgent {
                     agent_name: "codex".to_owned(),
                     state: ExecState::Working,
@@ -1193,6 +1196,21 @@ mod tests {
             serde_json::from_str::<TopologySnapshot>(&encoded).unwrap(),
             snapshot
         );
+    }
+
+    #[test]
+    fn pane_snapshot_display_name_defaults_to_none_when_absent() {
+        let pane = serde_json::from_value::<PaneSnapshot>(serde_json::json!({
+            "pane_id": "pane-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "terminal_id": "terminal-1",
+            "agent": null,
+            "agent_session": null,
+        }))
+        .unwrap();
+
+        assert_eq!(pane.display_name, None);
     }
 
     #[test]

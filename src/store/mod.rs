@@ -1163,7 +1163,7 @@ fn apply_operation(transaction: &Transaction<'_>, operation: PersistOp) -> Resul
                 "INSERT INTO tabs(tab_id, workspace_id, label) VALUES (?1, ?2, ?3) \
                  ON CONFLICT(tab_id) DO UPDATE SET \
                      workspace_id = excluded.workspace_id, \
-                     label = excluded.label",
+                     label = COALESCE(excluded.label, tabs.label)",
                 (&tab.tab_id, &tab.workspace_id, &tab.label),
             )?;
         }
@@ -1179,7 +1179,7 @@ fn apply_operation(transaction: &Transaction<'_>, operation: PersistOp) -> Resul
                      workspace_id = excluded.workspace_id, \
                      tab_id = excluded.tab_id, \
                      terminal_id = excluded.terminal_id, \
-                     display_name = excluded.display_name",
+                     display_name = COALESCE(excluded.display_name, panes.display_name)",
                 params![
                     pane.pane_id,
                     pane.workspace_id,
@@ -2809,6 +2809,108 @@ mod tests {
                 .display_name
                 .as_deref(),
             Some("Tests")
+        );
+    }
+
+    #[test]
+    fn topology_names_preserve_on_null_and_overwrite_on_some() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let tab = |label| Tab {
+            tab_id: "tab-name-policy".to_owned(),
+            workspace_id: "workspace-name-policy".to_owned(),
+            label,
+        };
+        let pane = |display_name| Pane {
+            pane_id: "pane-name-policy".to_owned(),
+            workspace_id: "workspace-name-policy".to_owned(),
+            tab_id: "tab-name-policy".to_owned(),
+            terminal_id: "terminal-name-policy".to_owned(),
+            display_name,
+        };
+
+        store
+            .apply_batch(vec![
+                PersistOp::UpsertWorkspace {
+                    workspace: Workspace {
+                        workspace_id: "workspace-name-policy".to_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(1),
+                },
+                PersistOp::UpsertTab {
+                    tab: tab(Some("name".to_owned())),
+                    display_ordinal: DisplayOrdinal::new(2),
+                },
+                PersistOp::UpsertPane {
+                    pane: pane(Some("name".to_owned())),
+                    display_ordinal: DisplayOrdinal::new(3),
+                },
+            ])
+            .unwrap();
+        store
+            .apply_batch(vec![
+                PersistOp::UpsertTab {
+                    tab: tab(None),
+                    display_ordinal: DisplayOrdinal::new(2),
+                },
+                PersistOp::UpsertPane {
+                    pane: pane(None),
+                    display_ordinal: DisplayOrdinal::new(3),
+                },
+            ])
+            .unwrap();
+
+        let restored = store.load_restored_state().unwrap();
+        assert_eq!(
+            restored
+                .model
+                .tab("tab-name-policy")
+                .unwrap()
+                .label
+                .as_deref(),
+            Some("name")
+        );
+        assert_eq!(
+            restored
+                .model
+                .pane("pane-name-policy")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("name")
+        );
+
+        store
+            .apply_batch(vec![
+                PersistOp::UpsertTab {
+                    tab: tab(Some("other".to_owned())),
+                    display_ordinal: DisplayOrdinal::new(2),
+                },
+                PersistOp::UpsertPane {
+                    pane: pane(Some("other".to_owned())),
+                    display_ordinal: DisplayOrdinal::new(3),
+                },
+            ])
+            .unwrap();
+
+        let restored = store.load_restored_state().unwrap();
+        assert_eq!(
+            restored
+                .model
+                .tab("tab-name-policy")
+                .unwrap()
+                .label
+                .as_deref(),
+            Some("other")
+        );
+        assert_eq!(
+            restored
+                .model
+                .pane("pane-name-policy")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("other")
         );
     }
 

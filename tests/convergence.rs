@@ -3404,6 +3404,7 @@ fn topology_with_session(
             workspace_id: "w1".to_owned(),
             tab_id: "w1:t1".to_owned(),
             terminal_id: "new-terminal".to_owned(),
+            display_name: None,
             agent: Some(SnapshotAgent {
                 agent_name: "codex".to_owned(),
                 state: match status {

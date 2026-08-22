@@ -1731,7 +1731,7 @@ impl Reducer {
                 workspace_id: pane.workspace_id.clone(),
                 tab_id: pane.tab_id.clone(),
                 terminal_id: pane.terminal_id.clone(),
-                display_name: None,
+                display_name: pane.display_name.clone(),
             };
             let display_ordinal = self.pane_ordinal_or_allocate(&pane.pane_id)?;
             self.model.insert_pane(pane.clone());
@@ -3529,11 +3529,45 @@ mod tests {
                     workspace_id: (*workspace_id).to_owned(),
                     tab_id: (*tab_id).to_owned(),
                     terminal_id: format!("terminal-{pane_id}"),
+                    display_name: None,
                     agent: None,
                     agent_session: None,
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn reconcile_gap_propagates_pane_snapshot_display_name() {
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let mut topology = topology_snapshot(
+            &["workspace"],
+            &[("tab", "workspace")],
+            &[("pane", "workspace", "tab")],
+        );
+        topology.panes[0].display_name = Some("UI修正".to_owned());
+
+        let persist = reducer
+            .reconcile_gap(ReconcileBatch {
+                topology,
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+
+        assert_eq!(
+            shared
+                .borrow()
+                .pane("pane")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("UI修正")
+        );
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertPane { pane, .. }
+                if pane.display_name.as_deref() == Some("UI修正")
+        )));
     }
 
     #[test]
@@ -3786,6 +3820,7 @@ mod tests {
                 workspace_id: "workspace-1".to_owned(),
                 tab_id: "tab-1".to_owned(),
                 terminal_id: "terminal-1".to_owned(),
+                display_name: None,
                 agent: Some(SnapshotAgent {
                     agent_name: "codex".to_owned(),
                     state: ExecState::Working,

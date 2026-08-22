@@ -453,7 +453,9 @@ async fn run_monitor(cli: &Cli, plugin_state_dir: Option<&OsStr>) -> Result<(), 
         env::var_os("HOME").as_deref(),
     )?;
     let version_runner = DoctorVersionRunner::from_environment();
-    let tui_setup = TuiSetup::for_owner(state_base, env::var_os("HOME"), &version_runner);
+    let ascii_tree = ascii_tree_enabled(env::var_os("HERDR_TOP_ASCII_TREE").as_deref());
+    let tui_setup = TuiSetup::for_owner(state_base, env::var_os("HOME"), &version_runner)
+        .with_ascii_tree(ascii_tree);
     let mut app = App::with_inputs(
         collector.model.clone(),
         HeaderInputs {
@@ -485,6 +487,10 @@ fn resolve_hostname() -> String {
     rendezvous::gethostname()
         .or_else(|| env::var("HOSTNAME").ok().filter(|value| !value.is_empty()))
         .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn ascii_tree_enabled(value: Option<&OsStr>) -> bool {
+    value == Some(OsStr::new("1"))
 }
 
 fn tracing_log_path(root: &StateRoot) -> PathBuf {
@@ -685,6 +691,15 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn ascii_tree_flag_requires_exact_one() {
+        assert!(!ascii_tree_enabled(None));
+        assert!(ascii_tree_enabled(Some(OsStr::new("1"))));
+        for value in ["", "0", "true", " 1", "1 "] {
+            assert!(!ascii_tree_enabled(Some(OsStr::new(value))));
+        }
     }
 
     #[test]

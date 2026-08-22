@@ -33,7 +33,7 @@ use crate::model::{
     ControllerDiagnosticsHandle, DomainModel, EnrichmentDiagnosticsHandle, EventMetadata,
     ExecState, Execution, GapKind, MinimalProviderMetadata, NormalizedEvent, Pane, PaneSnapshot,
     Provider, ReconcileBatch, RunId, RunKey, SharedModel, SnapshotAgent, SourceCoverage, Tab,
-    TopologyEntity, TopologyEntityId, TopologySnapshot, Workspace,
+    TopologyEntity, TopologyEntityId, TopologySnapshot, Workspace, sanitize_controller_text,
 };
 use crate::performance::{
     Admission, Admitted, PerformanceClock, PerformanceIngress, PerformanceSampler,
@@ -2227,6 +2227,7 @@ fn current_model_topology(
                 workspace_id: pane.workspace_id.clone(),
                 tab_id: pane.tab_id.clone(),
                 terminal_id: pane.terminal_id.clone(),
+                display_name: pane.display_name.clone(),
                 agent,
                 agent_session,
             })
@@ -4390,11 +4391,7 @@ fn normalize_event(
                 events.push(topology_upsert(
                     session,
                     &received.event,
-                    TopologyEntity::Tab(Tab {
-                        tab_id: tab.tab_id,
-                        workspace_id: tab.workspace_id,
-                        label: None,
-                    }),
+                    TopologyEntity::Tab(tab_entity(tab)),
                 ));
             }
         }
@@ -4452,11 +4449,7 @@ fn normalize_event(
                 events.push(topology_upsert(
                     session,
                     &received.event,
-                    TopologyEntity::Tab(Tab {
-                        tab_id: tab.tab_id,
-                        workspace_id: tab.workspace_id,
-                        label: None,
-                    }),
+                    TopologyEntity::Tab(tab_entity(tab)),
                 ));
             }
             if let Some(value) = received.data.get("pane") {
@@ -4752,7 +4745,7 @@ fn apply_snapshot_in_place(
                 workspace_id: pane.workspace_id.clone(),
                 tab_id: pane.tab_id.clone(),
                 terminal_id: pane.terminal_id.clone(),
-                display_name: None,
+                display_name: pane.display_name.clone(),
             }),
         )];
         let provider = pane.agent.as_ref().and_then(|agent| {
@@ -5046,15 +5039,7 @@ fn topology_from_snapshot(snapshot: &Snapshot) -> Result<TopologySnapshot, Colle
             workspace_id: workspace.workspace_id.clone(),
         })
         .collect();
-    let tabs = snapshot
-        .tabs
-        .iter()
-        .map(|tab| Tab {
-            tab_id: tab.tab_id.clone(),
-            workspace_id: tab.workspace_id.clone(),
-            label: None,
-        })
-        .collect();
+    let tabs = snapshot.tabs.iter().cloned().map(tab_entity).collect();
     let panes = snapshot
         .panes
         .iter()
@@ -5070,6 +5055,7 @@ fn topology_from_snapshot(snapshot: &Snapshot) -> Result<TopologySnapshot, Colle
                 workspace_id: pane.workspace_id.clone(),
                 tab_id,
                 terminal_id: pane.terminal_id.clone(),
+                display_name: pane_display_name(pane),
                 agent: pane.agent.as_ref().map(|agent| SnapshotAgent {
                     agent_name: agent.clone(),
                     state: status_from_str(pane.agent_status.as_deref()),
@@ -5550,8 +5536,37 @@ fn pane_entity(pane: &PaneInfo) -> Result<Pane, CollectorError> {
                 pane_id: pane.pane_id.clone(),
             })?,
         terminal_id: pane.terminal_id.clone(),
-        display_name: None,
+        display_name: pane_display_name(pane),
     })
+}
+
+fn tab_entity(tab: TabInfo) -> Tab {
+    Tab {
+        tab_id: tab.tab_id,
+        workspace_id: tab.workspace_id,
+        label: tab
+            .label
+            .as_deref()
+            .filter(|label| !label.is_empty())
+            .and_then(sanitized_name),
+    }
+}
+
+fn pane_display_name(pane: &PaneInfo) -> Option<String> {
+    pane.label
+        .as_deref()
+        .filter(|label| !label.is_empty())
+        .or_else(|| {
+            pane.terminal_title_stripped
+                .as_deref()
+                .filter(|title| !title.is_empty())
+        })
+        .and_then(sanitized_name)
+}
+
+fn sanitized_name(value: &str) -> Option<String> {
+    let value = sanitize_controller_text(value);
+    (!value.is_empty()).then_some(value)
 }
 
 fn agent_session_reference(reference: &super::types::AgentSessionInfo) -> AgentSessionReference {
@@ -7440,6 +7455,7 @@ mod tests {
                 workspace_id: "w1".to_owned(),
                 tab_id: "w1:t1".to_owned(),
                 terminal_id: "terminal-4".to_owned(),
+                display_name: None,
                 agent: agent_name.map(|name| SnapshotAgent {
                     agent_name: name.to_owned(),
                     state: ExecState::Working,
@@ -9433,6 +9449,231 @@ mod tests {
             display_name: None,
         });
         watch::channel(Arc::new(model)).1
+    }
+
+    fn pane_created_with_names(
+        label: Option<&str>,
+        terminal_title_stripped: Option<&str>,
+    ) -> ReceivedEvent {
+        ReceivedEvent {
+            event: "pane_created".to_owned(),
+            data: json!({
+                "pane": {
+                    "pane_id": "w1:p4",
+                    "terminal_id": "terminal-4",
+                    "workspace_id": "w1",
+                    "tab_id": "w1:t1",
+                    "terminal_title_stripped": terminal_title_stripped,
+                    "label": label,
+                },
+            }),
+            primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
+        }
+    }
+
+    fn normalized_pane_display_name(
+        label: Option<&str>,
+        terminal_title_stripped: Option<&str>,
+    ) -> Option<String> {
+        let shared = watch::channel(Arc::new(DomainModel::default())).1;
+        let normalized = normalize_event(
+            &shared,
+            "name-session",
+            &pane_created_with_names(label, terminal_title_stripped),
+        )
+        .expect("pane_created should normalize");
+        let Some(NormalizedEvent::TopologyUpsert {
+            entity: TopologyEntity::Pane(pane),
+            ..
+        }) = normalized.first()
+        else {
+            panic!("pane_created must emit a pane topology upsert first");
+        };
+        pane.display_name.clone()
+    }
+
+    #[test]
+    fn live_pane_upserts_capture_sanitized_display_names() {
+        assert_eq!(
+            normalized_pane_display_name(Some("UI修正"), None).as_deref(),
+            Some("UI修正")
+        );
+        assert_eq!(
+            normalized_pane_display_name(None, Some("build")).as_deref(),
+            Some("build")
+        );
+        assert_eq!(
+            normalized_pane_display_name(Some("label wins"), Some("ignored title")).as_deref(),
+            Some("label wins")
+        );
+        assert_eq!(
+            normalized_pane_display_name(Some(""), Some("fallback title")).as_deref(),
+            Some("fallback title")
+        );
+        assert_eq!(normalized_pane_display_name(None, None), None);
+
+        let long_name = "界".repeat(100);
+        let captured = normalized_pane_display_name(Some(&long_name), None)
+            .expect("a non-empty pane label should be captured");
+        assert!(captured.len() <= 256);
+        assert!(std::str::from_utf8(captured.as_bytes()).is_ok());
+        assert!(captured.chars().all(|character| character == '界'));
+    }
+
+    #[test]
+    fn tab_created_captures_sanitized_label() {
+        let mut model = DomainModel::default();
+        model.insert_workspace(Workspace {
+            workspace_id: "w1".to_owned(),
+        });
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model,
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let received = ReceivedEvent {
+            event: "tab_created".to_owned(),
+            data: json!({
+                "tab": {
+                    "tab_id": "w1:t1",
+                    "workspace_id": "w1",
+                    "label": "レビュー",
+                },
+            }),
+            primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
+        };
+
+        let normalized = normalize_event(&shared, "name-session", &received).unwrap();
+        let persist = apply_collector_observation(&mut reducer, normalized)
+            .unwrap()
+            .expect("tab upsert should apply");
+
+        assert_eq!(
+            shared.borrow().tab("w1:t1").unwrap().label.as_deref(),
+            Some("レビュー")
+        );
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertTab { tab, .. }
+                if tab.tab_id == "w1:t1" && tab.label.as_deref() == Some("レビュー")
+        )));
+    }
+
+    fn snapshot_with_names() -> Snapshot {
+        Snapshot {
+            version: "test".to_owned(),
+            protocol: 1,
+            focused_workspace_id: Some("w1".to_owned()),
+            focused_tab_id: Some("w1:t1".to_owned()),
+            focused_pane_id: Some("w1:p4".to_owned()),
+            workspaces: vec![WorkspaceInfo {
+                workspace_id: "w1".to_owned(),
+                number: Some(1),
+                label: None,
+                focused: Some(true),
+                pane_count: Some(1),
+                tab_count: Some(1),
+                active_tab_id: Some("w1:t1".to_owned()),
+                agent_status: None,
+            }],
+            tabs: vec![TabInfo {
+                tab_id: "w1:t1".to_owned(),
+                workspace_id: "w1".to_owned(),
+                number: Some(1),
+                label: Some("レビュー".to_owned()),
+                focused: Some(true),
+                pane_count: Some(1),
+                agent_status: None,
+            }],
+            panes: vec![PaneInfo {
+                pane_id: "w1:p4".to_owned(),
+                terminal_id: "terminal-4".to_owned(),
+                workspace_id: "w1".to_owned(),
+                tab_id: Some("w1:t1".to_owned()),
+                focused: Some(true),
+                cwd: None,
+                foreground_cwd: None,
+                terminal_title: None,
+                terminal_title_stripped: Some("build".to_owned()),
+                label: Some("UI修正".to_owned()),
+                agent: None,
+                agent_status: None,
+                scroll: None,
+                revision: None,
+                agent_session: None,
+            }],
+            layouts: Vec::new(),
+            agents: Vec::new(),
+        }
+    }
+
+    fn empty_reducer() -> (Reducer, SharedModel) {
+        Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        })
+    }
+
+    fn assert_named_topology(model: &DomainModel) {
+        assert_eq!(
+            model.tab("w1:t1").unwrap().label.as_deref(),
+            Some("レビュー")
+        );
+        assert_eq!(
+            model.pane("w1:p4").unwrap().display_name.as_deref(),
+            Some("UI修正")
+        );
+    }
+
+    #[test]
+    fn snapshot_reconciliation_preserves_captured_tab_and_pane_names() {
+        let topology = topology_from_snapshot(&snapshot_with_names()).unwrap();
+        let (mut reducer, shared) = empty_reducer();
+
+        let persist = reducer
+            .reconcile_gap(ReconcileBatch {
+                topology,
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+
+        assert_named_topology(&shared.borrow());
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertTab { tab, .. }
+                if tab.label.as_deref() == Some("レビュー")
+        )));
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertPane { pane, .. }
+                if pane.display_name.as_deref() == Some("UI修正")
+        )));
+    }
+
+    #[test]
+    fn in_place_snapshot_preserves_captured_tab_and_pane_names() {
+        let topology = topology_from_snapshot(&snapshot_with_names()).unwrap();
+        let (mut reducer, shared) = empty_reducer();
+        let mut pending = PendingTopologyClosures::default();
+
+        let persist = apply_snapshot_in_place(
+            &mut reducer,
+            &shared,
+            topology,
+            "snapshot-session",
+            &mut pending,
+        )
+        .unwrap();
+
+        assert_named_topology(&shared.borrow());
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertPane { pane, .. }
+                if pane.display_name.as_deref() == Some("UI修正")
+        )));
     }
 
     fn flat_pane_agent_detected(

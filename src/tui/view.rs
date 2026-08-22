@@ -109,7 +109,9 @@ pub(super) fn render(
     let projection = build_projection(model, state);
     let rows = projection.rows;
     match state.view_mode() {
-        ViewMode::ExecutionTree => render_tree(frame, tree_area, &rows, state),
+        ViewMode::ExecutionTree => {
+            render_tree(frame, tree_area, &rows, state, setup.ascii_tree());
+        }
         ViewMode::DependencyDag => render_dag(frame, tree_area, &rows, state),
     }
     render_activity(frame, activity_area, model, &rows, state, diagnostics);
@@ -170,7 +172,7 @@ fn render_header(
     frame.render_widget(Paragraph::new(line).block(block), area);
 }
 
-fn render_tree(frame: &mut Frame<'_>, area: Rect, rows: &[TreeRow], state: &AppState) {
+fn render_tree(frame: &mut Frame<'_>, area: Rect, rows: &[TreeRow], state: &AppState, ascii: bool) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Execution tree ");
@@ -182,15 +184,16 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, rows: &[TreeRow], state: &AppS
     }
     let start = viewport_start(rows, state, viewport_height);
     let width = usize::from(inner.width);
+    let prefixes = tree_connector_prefixes(rows, ascii);
     let lines = rows
         .iter()
+        .zip(prefixes.iter())
         .skip(start)
         .take(viewport_height)
-        .map(|row| {
+        .map(|(row, prefix)| {
             let selected = state.selected() == Some(&row.key);
             let marker = if selected { "> " } else { "  " };
-            let indent = "  ".repeat(row.depth);
-            let text = truncate_to_width(&format!("{marker}{indent}{}", row.label), width);
+            let text = truncate_to_width(&format!("{marker}{prefix}{}", row.label), width);
             let style = if selected {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
@@ -202,6 +205,45 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, rows: &[TreeRow], state: &AppS
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+fn tree_connector_prefixes(rows: &[TreeRow], ascii: bool) -> Vec<String> {
+    let mut last_child = vec![false; rows.len()];
+    let mut next_at_depth = Vec::<Option<usize>>::new();
+    for (index, row) in rows.iter().enumerate().rev() {
+        if next_at_depth.len() <= row.depth {
+            next_at_depth.resize(row.depth.saturating_add(1), None);
+        }
+        last_child[index] = next_at_depth[row.depth].is_none();
+        next_at_depth.truncate(row.depth.saturating_add(1));
+        next_at_depth[row.depth] = Some(index);
+    }
+
+    let (branch, last, vertical) = if ascii {
+        ("|-- ", "`-- ", "|   ")
+    } else {
+        ("├── ", "└── ", "│   ")
+    };
+    let mut ancestors = Vec::<Option<usize>>::new();
+    let mut prefixes = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        ancestors.truncate(row.depth);
+        ancestors.resize(row.depth, None);
+        let mut prefix = String::with_capacity(row.depth.saturating_mul(4));
+        for ancestor in ancestors.iter().take(row.depth).skip(1) {
+            if ancestor.is_some_and(|ancestor| !last_child[ancestor]) {
+                prefix.push_str(vertical);
+            } else {
+                prefix.push_str("    ");
+            }
+        }
+        if row.depth > 0 {
+            prefix.push_str(if last_child[index] { last } else { branch });
+        }
+        prefixes.push(prefix);
+        ancestors.push(Some(index));
+    }
+    prefixes
+}
+
 fn render_dag(frame: &mut Frame<'_>, area: Rect, rows: &[TreeRow], state: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -209,6 +251,14 @@ fn render_dag(frame: &mut Frame<'_>, area: Rect, rows: &[TreeRow], state: &AppSt
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    if rows
+        .iter()
+        .all(|row| row.prerequisites.is_empty() && row.dependents.is_empty())
+    {
+        frame.render_widget(Paragraph::new("no dependency edges recorded"), inner);
         return;
     }
 
@@ -357,13 +407,29 @@ fn render_activity(
 }
 
 fn footer_line(width: usize) -> String {
-    let full = "q: stop Top only; agents continue | detach: Top runs | ↑↓ select | f/End follow | tab view | / filter | ? help";
-    let compact = "q:stop Top; agents continue | detach:Top runs";
-    if width >= 70 {
-        truncate_to_width(full, width)
-    } else {
-        truncate_to_width(compact, width)
+    const FULL: &[&str] = &[
+        "q: stop Top only; agents continue",
+        "detach: Top runs",
+        "↑↓ select",
+        "f/End follow",
+        "tab view",
+        "/ filter",
+        "? help",
+    ];
+    const COMPACT: &[&str] = &["q:stop Top; agents continue", "detach:Top runs"];
+    let floor = COMPACT[0];
+    if Span::raw(floor).width() > width {
+        return truncate_to_width(floor, width);
     }
+
+    let hints = if width >= 70 { FULL } else { COMPACT };
+    for hint_count in (1..=hints.len()).rev() {
+        let candidate = hints[..hint_count].join(" | ");
+        if Span::raw(candidate.as_str()).width() <= width {
+            return candidate;
+        }
+    }
+    floor.to_owned()
 }
 
 fn render_interaction_layer(
@@ -940,7 +1006,7 @@ fn append_execution_tree_rows(
             rows.push(TreeRow {
                 key: NodeKey::Tab(tab.tab_id.clone()),
                 depth: 2,
-                label: format!("Tab: {}", safe_text(&tab.tab_id)),
+                label: topology_row_label("Tab", &tab.tab_id, tab.label.as_deref()),
                 prerequisites: Vec::new(),
                 dependents: Vec::new(),
             });
@@ -963,7 +1029,7 @@ fn append_execution_tree_rows(
                 rows.push(TreeRow {
                     key: NodeKey::Pane(pane.pane_id.clone()),
                     depth: 3,
-                    label: format!("Pane: {}", safe_text(&pane.pane_id)),
+                    label: topology_row_label("Pane", &pane.pane_id, pane.display_name.as_deref()),
                     prerequisites: Vec::new(),
                     dependents: Vec::new(),
                 });
@@ -1063,6 +1129,14 @@ fn pane_is_renderable(model: &DomainModel, pane_id: &str) -> bool {
         && model
             .tab(&pane.tab_id)
             .is_some_and(|tab| tab.workspace_id == pane.workspace_id)
+}
+
+fn topology_row_label(kind: &str, id: &str, name: Option<&str>) -> String {
+    let id = safe_text(id);
+    match name {
+        Some(name) => format!("{kind}: {id} ({})", safe_text(name)),
+        None => format!("{kind}: {id}"),
+    }
 }
 
 fn append_run_rows(
@@ -2135,47 +2209,212 @@ mod tests {
         assert!(screen.contains("detach: Top runs"));
         assert!(screen.contains("tab view"));
 
-        let session_x = rows
-            .iter()
-            .find(|row| row.contains("Session: demo"))
-            .unwrap()
-            .find("Session: demo")
+        let label_column = |label: &str| {
+            let row = rows.iter().find(|row| row.contains(label)).unwrap();
+            let byte_offset = row.find(label).unwrap();
+            Span::raw(&row[..byte_offset]).width()
+        };
+        let session_x = label_column("Session: demo");
+        let workspace_x = label_column("Workspace: api");
+        let tab_x = label_column("Tab: implementation");
+        let pane_x = label_column("Pane: w1:p1");
+        let run_x = label_column("Codex controller");
+        let agent_x = label_column("Codex native agent: investigate");
+        assert_eq!(workspace_x, session_x + 4);
+        assert_eq!(tab_x, workspace_x + 4);
+        assert_eq!(pane_x, tab_x + 4);
+        assert_eq!(run_x, pane_x + 4);
+        assert_eq!(agent_x, run_x + 4);
+    }
+
+    #[test]
+    fn tree_rows_append_safe_optional_tab_and_pane_names() {
+        let unnamed = populated_model();
+        let unnamed_rows = build_rows(&unnamed, &AppState::default());
+        assert!(
+            unnamed_rows
+                .iter()
+                .any(|row| row.label == "Tab: implementation")
+        );
+        assert!(unnamed_rows.iter().any(|row| row.label == "Pane: w1:p1"));
+
+        let mut named = populated_model();
+        named.insert_tab(Tab {
+            tab_id: "implementation".to_owned(),
+            workspace_id: "api".to_owned(),
+            label: Some("レビュー\n".to_owned()),
+        });
+        named.insert_pane(Pane {
+            pane_id: "w1:p1".to_owned(),
+            workspace_id: "api".to_owned(),
+            tab_id: "implementation".to_owned(),
+            terminal_id: "terminal-1".to_owned(),
+            display_name: Some("UI修正\t".to_owned()),
+        });
+        let named_rows = build_rows(&named, &AppState::default());
+        assert!(
+            named_rows
+                .iter()
+                .any(|row| row.label == "Tab: implementation (レビュー\\n)")
+        );
+        assert!(
+            named_rows
+                .iter()
+                .any(|row| row.label == "Pane: w1:p1 (UI修正\\t)")
+        );
+    }
+
+    fn connector_fixture_rows() -> Vec<TreeRow> {
+        [
+            (NodeKey::Session, 0, "root"),
+            (NodeKey::Workspace("a".to_owned()), 1, "a"),
+            (NodeKey::Tab("a1".to_owned()), 2, "a1"),
+            (NodeKey::Pane("a1x".to_owned()), 3, "a1x"),
+            (NodeKey::Tab("a2".to_owned()), 2, "a2"),
+            (NodeKey::Workspace("b".to_owned()), 1, "b"),
+            (NodeKey::Tab("b1".to_owned()), 2, "b1"),
+        ]
+        .into_iter()
+        .map(|(key, depth, label)| TreeRow {
+            key,
+            depth,
+            label: label.to_owned(),
+            prerequisites: Vec::new(),
+            dependents: Vec::new(),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn tree_connector_prefixes_render_exact_utf8_structure() {
+        assert_eq!(
+            tree_connector_prefixes(&connector_fixture_rows(), false),
+            [
+                "",
+                "├── ",
+                "│   ├── ",
+                "│   │   └── ",
+                "│   └── ",
+                "└── ",
+                "    └── ",
+            ]
+        );
+    }
+
+    #[test]
+    fn tree_connector_prefixes_render_exact_ascii_structure() {
+        assert_eq!(
+            tree_connector_prefixes(&connector_fixture_rows(), true),
+            [
+                "",
+                "|-- ",
+                "|   |-- ",
+                "|   |   `-- ",
+                "|   `-- ",
+                "`-- ",
+                "    `-- ",
+            ]
+        );
+    }
+
+    #[test]
+    fn execution_tree_row_depths_remain_unchanged() {
+        let rows = build_rows(&populated_model(), &AppState::default());
+        assert_eq!(
+            rows.iter().map(|row| row.depth).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5]
+        );
+    }
+
+    fn render_dag_fixture(rows: &[TreeRow], width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_dag(
+                    frame,
+                    Rect::new(0, 0, width, height),
+                    rows,
+                    &AppState::default(),
+                );
+            })
             .unwrap();
-        let workspace_x = rows
+        buffer_rows(terminal.backend().buffer())
+    }
+
+    fn dag_inner_content(rows: &[String], width: usize) -> Vec<String> {
+        rows[1..rows.len().saturating_sub(1)]
             .iter()
-            .find(|row| row.contains("Workspace: api"))
-            .unwrap()
-            .find("Workspace: api")
-            .unwrap();
-        let tab_x = rows
-            .iter()
-            .find(|row| row.contains("Tab: implementation"))
-            .unwrap()
-            .find("Tab: implementation")
-            .unwrap();
-        let pane_x = rows
-            .iter()
-            .find(|row| row.contains("Pane: w1:p1"))
-            .unwrap()
-            .find("Pane: w1:p1")
-            .unwrap();
-        let run_x = rows
-            .iter()
-            .find(|row| row.contains("Codex controller"))
-            .unwrap()
-            .find("Codex controller")
-            .unwrap();
-        let agent_x = rows
-            .iter()
-            .find(|row| row.contains("Codex native agent: investigate"))
-            .unwrap()
-            .find("Codex native agent: investigate")
-            .unwrap();
-        assert_eq!(workspace_x, session_x + 2);
-        assert_eq!(tab_x, workspace_x + 2);
-        assert_eq!(pane_x, tab_x + 2);
-        assert_eq!(run_x, pane_x + 2);
-        assert_eq!(agent_x, run_x + 2);
+            .map(|row| {
+                row.chars()
+                    .skip(1)
+                    .take(width.saturating_sub(2))
+                    .collect::<String>()
+                    .trim()
+                    .to_owned()
+            })
+            .filter(|row| !row.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn dag_zero_edges_renders_exact_one_placeholder_line() {
+        let rendered = render_dag_fixture(&connector_fixture_rows(), 60, 7);
+        assert_eq!(
+            dag_inner_content(&rendered, 60),
+            ["no dependency edges recorded"]
+        );
+        let screen = rendered.join("\n");
+        assert!(!screen.contains("Task Run"));
+        assert!(!screen.contains("Prereqs"));
+        assert!(!screen.contains("Dependents"));
+    }
+
+    #[test]
+    fn dag_with_edges_keeps_heading_and_rows() {
+        let mut rows = connector_fixture_rows()[..2].to_vec();
+        rows[0].dependents = vec!["a".to_owned()];
+        rows[1].prerequisites = vec!["root".to_owned()];
+
+        let rendered = render_dag_fixture(&rows, 60, 7).join("\n");
+
+        assert!(rendered.contains("Task Run"));
+        assert!(rendered.contains("Prereqs"));
+        assert!(rendered.contains("Dependents"));
+        assert!(rendered.contains("root"));
+        assert!(rendered.contains("a"));
+        assert!(!rendered.contains("no dependency edges recorded"));
+    }
+
+    #[test]
+    fn footer_drops_only_whole_trailing_hints() {
+        let full = [
+            "q: stop Top only; agents continue",
+            "detach: Top runs",
+            "↑↓ select",
+            "f/End follow",
+            "tab view",
+            "/ filter",
+            "? help",
+        ];
+        let compact = ["q:stop Top; agents continue", "detach:Top runs"];
+        assert_eq!(footer_line(120), full.join(" | "));
+
+        for width in [100, 72, 69, 45, 27] {
+            let rendered = footer_line(width);
+            let expected_tier = if width >= 70 { &full[..] } else { &compact[..] };
+            let pieces = rendered.split(" | ").collect::<Vec<_>>();
+            assert_eq!(pieces, expected_tier[..pieces.len()], "width {width}");
+            assert!(Span::raw(rendered.as_str()).width() <= width);
+        }
+    }
+
+    #[test]
+    fn footer_preserves_mandated_floor() {
+        const FLOOR: &str = "q:stop Top; agents continue";
+        assert_eq!(Span::raw(FLOOR).width(), 27);
+        assert_eq!(footer_line(27), FLOOR);
+        assert_eq!(footer_line(26), truncate_to_width(FLOOR, 26));
     }
 
     #[test]
@@ -2886,11 +3125,11 @@ mod tests {
                     );
                 }
                 ViewMode::DependencyDag => {
-                    assert!(rows[4].contains("Task Run"));
                     assert!(
-                        rows[5].contains("Codex controller"),
-                        "the 48x14 DAG data coordinate must contain its known Task Run"
+                        rows[4].contains("no dependency edges recorded"),
+                        "the 48x14 DAG data coordinate must contain the zero-edge placeholder"
                     );
+                    assert!(!screen.contains("Task Run"));
                 }
             }
             for row in rows {

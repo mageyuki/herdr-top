@@ -93,6 +93,7 @@ pub struct TuiSetup {
     notice_state_base: Option<PathBuf>,
     home: Option<OsString>,
     notice_visible: bool,
+    ascii_tree: bool,
     notice_publication: Arc<dyn NoticePublicationBoundary>,
 }
 
@@ -103,6 +104,7 @@ impl Default for TuiSetup {
             notice_state_base: None,
             home: None,
             notice_visible: false,
+            ascii_tree: false,
             notice_publication: Arc::new(LocalNoticePublication),
         }
     }
@@ -139,13 +141,26 @@ impl TuiSetup {
             notice_state_base: Some(state_base),
             home,
             notice_visible: !compatible && !dismissed,
+            ascii_tree: false,
             notice_publication,
         }
+    }
+
+    /// Selects ASCII connector glyphs for execution-tree rendering.
+    #[must_use]
+    pub const fn with_ascii_tree(mut self, ascii_tree: bool) -> Self {
+        self.ascii_tree = ascii_tree;
+        self
     }
 
     #[must_use]
     pub const fn notice_visible(&self) -> bool {
         self.notice_visible
+    }
+
+    #[must_use]
+    pub const fn ascii_tree(&self) -> bool {
+        self.ascii_tree
     }
 
     pub(super) fn standalone_status(&self) -> Option<&StandaloneVersionStatus> {
@@ -2695,6 +2710,13 @@ mod tests {
     }
 
     #[test]
+    fn tui_setup_ascii_tree_defaults_false_and_can_be_enabled() {
+        let setup = TuiSetup::default();
+        assert!(!setup.ascii_tree());
+        assert!(setup.with_ascii_tree(true).ascii_tree());
+    }
+
+    #[test]
     fn i4_notice_post_publish_sync_unknown_and_pre_publish_failure() {
         let runner = RecordingVersionRunner::new(VersionProbeResult::Available {
             version: "9.9.9".to_owned(),
@@ -3479,7 +3501,18 @@ mod tests {
             .map(|(run_id, label, ordinal)| (*run_id, label.as_str(), *ordinal, TaskState::Running))
             .collect::<Vec<_>>();
 
-        let (mut following, _sender) = app_with_model(model_with_runs(&input));
+        let edgeful_model = || {
+            let mut model = model_with_runs(&input);
+            for pair in ids.windows(2) {
+                model.insert_dependency_edge(DependencyEdge {
+                    prerequisite_run_id: pair[0],
+                    dependent_run_id: pair[1],
+                });
+            }
+            model
+        };
+
+        let (mut following, _sender) = app_with_model(edgeful_model());
         following.set_selection(Some(NodeKey::Run {
             run_id: ids[0],
             pane_id: Some("pane".to_owned()),
@@ -3492,7 +3525,7 @@ mod tests {
         assert!(!following_view.contains("> run-0 run-0"));
         assert!(following_view.contains("run-7 run-7"));
 
-        let (mut manual, _sender) = app_with_model(model_with_runs(&input));
+        let (mut manual, _sender) = app_with_model(edgeful_model());
         manual.state.follow = false;
         manual.set_selection(Some(NodeKey::Run {
             run_id: ids[0],
