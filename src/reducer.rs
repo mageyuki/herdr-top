@@ -947,13 +947,19 @@ impl Reducer {
             Some(key) if self.model.task_run_by_key(&key).is_none() => key,
             _ => provisional_key(&execution.terminal_id, metadata.receipt_time_ms, ordinal),
         };
-        let task_run = TaskRun {
+        let mut task_run = TaskRun {
             run_id: execution.task_run_id,
             key,
             display_ordinal: ordinal,
             state: TaskState::Running,
             has_controller_task_state_event: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         };
+        Self::stamp_new_task_run(&mut task_run, metadata.receipt_time_ms);
         self.model.insert_task_run(task_run.clone());
         persist.push(self.persist_task_run(task_run, metadata.receipt_time_ms));
         Ok(())
@@ -995,13 +1001,19 @@ impl Reducer {
                 ),
             }
         };
-        let task_run = TaskRun {
+        let mut task_run = TaskRun {
             run_id,
             key,
             display_ordinal: ordinal,
             state: initial_state,
             has_controller_task_state_event: metadata.task_state.is_some(),
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         };
+        Self::stamp_new_task_run(&mut task_run, metadata.receipt_time_ms);
         self.model.insert_task_run(task_run.clone());
         persist.push(self.persist_task_run(task_run, metadata.receipt_time_ms));
         Ok(())
@@ -1018,7 +1030,7 @@ impl Reducer {
             return Ok(());
         }
         let ordinal = self.allocate_ordinal()?;
-        let task_run = TaskRun {
+        let mut task_run = TaskRun {
             run_id,
             key: RunKey::Controller(
                 controller_key.map_or_else(|| run_id.to_string(), ToOwned::to_owned),
@@ -1026,7 +1038,13 @@ impl Reducer {
             display_ordinal: ordinal,
             state: TaskState::Queued,
             has_controller_task_state_event: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         };
+        Self::stamp_new_task_run(&mut task_run, timestamp_ms);
         self.model.insert_task_run(task_run.clone());
         persist.push(self.persist_task_run(task_run, timestamp_ms));
         Ok(())
@@ -1039,6 +1057,12 @@ impl Reducer {
             task_run.has_controller_task_state_event = true;
             task_run.state =
                 controller_task_transition(task_run.state, &metadata.source_event_type, target);
+            if task_run.subject.is_none()
+                && let Some(label) = metadata.label.as_ref().filter(|label| !label.is_empty())
+            {
+                task_run.subject = Some(label.clone());
+            }
+            Self::touch_task_run(&mut task_run, metadata.receipt_time_ms);
             self.model.insert_task_run(task_run.clone());
             persist.push(self.persist_task_run(task_run, metadata.receipt_time_ms));
         }
@@ -1565,6 +1589,7 @@ impl Reducer {
             return;
         }
         task_run.state = TaskState::EndedUnknown;
+        Self::touch_task_run(&mut task_run, timestamp_ms);
         self.model.insert_task_run(task_run.clone());
         persist.push(self.persist_task_run(task_run, timestamp_ms));
     }
@@ -1584,6 +1609,7 @@ impl Reducer {
             return;
         }
         task_run.state = TaskState::Running;
+        Self::touch_task_run(&mut task_run, timestamp_ms);
         self.model.insert_task_run(task_run.clone());
         persist.push(self.persist_task_run(task_run, timestamp_ms));
     }
@@ -1679,6 +1705,7 @@ impl Reducer {
                 workspace_id: pane.workspace_id.clone(),
                 tab_id: pane.tab_id.clone(),
                 terminal_id: pane.terminal_id.clone(),
+                display_name: None,
             };
             let display_ordinal = self.pane_ordinal_or_allocate(&pane.pane_id)?;
             self.model.insert_pane(pane.clone());
@@ -1712,13 +1739,19 @@ impl Reducer {
             },
             _ => provisional_key(terminal_id, timestamp_ms, ordinal),
         };
-        let task_run = TaskRun {
+        let mut task_run = TaskRun {
             run_id,
             key,
             display_ordinal: ordinal,
             state: TaskState::Running,
             has_controller_task_state_event: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         };
+        Self::stamp_new_task_run(&mut task_run, timestamp_ms);
         self.model.insert_task_run(task_run.clone());
         persist.push(self.persist_task_run(task_run, timestamp_ms));
         Ok(run_id)
@@ -1750,14 +1783,31 @@ impl Reducer {
 
     fn persist_task_run(&self, task_run: TaskRun, timestamp_ms: i64) -> PersistOp {
         let native_session = native_binding(&self.model, task_run.run_id);
-        let finished_at_ms = task_run.state.is_terminal().then_some(timestamp_ms);
+        let created_at_ms = task_run.created_at_ms.unwrap_or(timestamp_ms);
+        let updated_at_ms = task_run.updated_at_ms.unwrap_or(timestamp_ms);
+        let finished_at_ms = task_run.finished_at_ms;
         PersistOp::UpsertTaskRun(PersistTaskRun {
             task_run,
             native_session,
-            created_at_ms: timestamp_ms,
-            updated_at_ms: timestamp_ms,
+            created_at_ms,
+            updated_at_ms,
             finished_at_ms,
         })
+    }
+
+    fn stamp_new_task_run(task_run: &mut TaskRun, timestamp_ms: i64) {
+        task_run.created_at_ms.get_or_insert(timestamp_ms);
+        Self::touch_task_run(task_run, timestamp_ms);
+    }
+
+    fn touch_task_run(task_run: &mut TaskRun, timestamp_ms: i64) {
+        task_run.updated_at_ms = Some(timestamp_ms);
+        if task_run.state.is_terminal() {
+            task_run.finished_at_ms.get_or_insert(timestamp_ms);
+        } else {
+            task_run.finished_at_ms = None;
+            task_run.dismissed_at_ms = None;
+        }
     }
 
     fn allocate_ordinal(&mut self) -> Result<DisplayOrdinal, ReducerError> {
@@ -2554,6 +2604,11 @@ mod tests {
             display_ordinal: DisplayOrdinal::new(ordinal),
             state,
             has_controller_task_state_event: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         }
     }
 
@@ -2566,6 +2621,264 @@ mod tests {
         let mut task_run = run(run_id, key, ordinal, state);
         task_run.has_controller_task_state_event = true;
         task_run
+    }
+
+    #[test]
+    fn execution_run_construction_uses_receipt_time_for_bookkeeping() {
+        let run_id = RunId::new();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let mut event_metadata = metadata("execution-created", 10);
+        event_metadata.receipt_time_ms = 25;
+
+        reducer
+            .apply(NormalizedEvent::ExecutionBegin {
+                metadata: event_metadata,
+                execution: execution(run_id, "execution-created", ExecState::Working),
+            })
+            .unwrap();
+
+        let model = shared.borrow();
+        let task_run = model.task_run(&run_id).unwrap();
+        assert_eq!(task_run.created_at_ms, Some(25));
+        assert_eq!(task_run.updated_at_ms, Some(25));
+        assert_eq!(task_run.finished_at_ms, None);
+    }
+
+    #[test]
+    fn non_controller_run_creation_sites_stamp_updated_at() {
+        for (site, now_ms) in [("metadata", 30), ("placeholder", 40), ("snapshot", 50)] {
+            let (mut reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+            let mut persist = Vec::new();
+            let run_id = match site {
+                "metadata" => {
+                    let run_id = RunId::new();
+                    let mut event_metadata = metadata("metadata-created", 10);
+                    event_metadata.receipt_time_ms = now_ms;
+                    reducer
+                        .ensure_metadata_run(
+                            run_id,
+                            &event_metadata,
+                            false,
+                            None,
+                            TaskState::Running,
+                            &mut persist,
+                        )
+                        .unwrap();
+                    run_id
+                }
+                "placeholder" => {
+                    let run_id = RunId::new();
+                    reducer
+                        .ensure_controller_placeholder(run_id, None, now_ms, &mut persist)
+                        .unwrap();
+                    run_id
+                }
+                "snapshot" => reducer
+                    .insert_snapshot_run(
+                        None,
+                        None,
+                        None,
+                        "snapshot-terminal",
+                        now_ms,
+                        &mut persist,
+                    )
+                    .unwrap(),
+                _ => unreachable!(),
+            };
+
+            let task_run = reducer.model.task_run(&run_id).unwrap();
+            assert_eq!(task_run.created_at_ms, Some(now_ms), "site: {site}");
+            assert_eq!(task_run.updated_at_ms, Some(now_ms), "site: {site}");
+        }
+    }
+
+    #[test]
+    fn non_controller_state_mutations_advance_updated_at_and_clear_dismissal() {
+        let close_run_id = RunId::new();
+        let mut close_run = run(
+            close_run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "close-run".to_owned(),
+            },
+            1,
+            TaskState::Running,
+        );
+        close_run.created_at_ms = Some(1);
+        close_run.updated_at_ms = Some(2);
+        close_run.dismissed_at_ms = Some(3);
+        let mut close_model = DomainModel::default();
+        close_model.insert_task_run(close_run);
+        close_model.insert_execution(execution(close_run_id, "close-ended", ExecState::Ended));
+        let (mut close_reducer, _shared) = Reducer::new(restored(close_model, 2));
+        let mut close_persist = Vec::new();
+
+        close_reducer.close_run_without_live_execution(close_run_id, 30, &mut close_persist);
+
+        let closed = close_reducer.model.task_run(&close_run_id).unwrap();
+        assert_eq!(closed.state, TaskState::EndedUnknown);
+        assert_eq!(closed.updated_at_ms, Some(30));
+        assert_eq!(closed.finished_at_ms, Some(30));
+        assert_eq!(closed.dismissed_at_ms, Some(3));
+
+        let activate_run_id = RunId::new();
+        let mut activate_run = run(
+            activate_run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "activate-run".to_owned(),
+            },
+            1,
+            TaskState::EndedUnknown,
+        );
+        activate_run.created_at_ms = Some(1);
+        activate_run.updated_at_ms = Some(10);
+        activate_run.finished_at_ms = Some(10);
+        activate_run.dismissed_at_ms = Some(12);
+        let mut activate_model = DomainModel::default();
+        activate_model.insert_task_run(activate_run);
+        activate_model.insert_execution(execution(
+            activate_run_id,
+            "activate-ended",
+            ExecState::Ended,
+        ));
+        let (mut activate_reducer, _shared) = Reducer::new(restored(activate_model, 2));
+        let mut activate_persist = Vec::new();
+
+        activate_reducer.activate_for_live_execution(activate_run_id, 40, &mut activate_persist);
+
+        let activated = activate_reducer.model.task_run(&activate_run_id).unwrap();
+        assert_eq!(activated.state, TaskState::Running);
+        assert_eq!(activated.updated_at_ms, Some(40));
+        assert_eq!(activated.finished_at_ms, None);
+        assert_eq!(activated.dismissed_at_ms, None);
+    }
+
+    #[test]
+    fn controller_mutations_advance_updated_at_capture_subject_and_clear_dismissal() {
+        let (reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let started = reducer
+            .validate_controller_event(&controller_event(
+                "subject-started",
+                "subject-run",
+                ControllerEventKind::TaskStarted,
+            ))
+            .unwrap();
+        let run_id = started
+            .post_model
+            .task_run_by_key(&RunKey::Controller("subject-run".to_owned()))
+            .unwrap()
+            .run_id;
+        let mut task_run = started.post_model.task_run(&run_id).unwrap().clone();
+        assert_eq!(task_run.created_at_ms, Some(20));
+        assert_eq!(task_run.updated_at_ms, Some(20));
+        task_run.dismissed_at_ms = Some(25);
+        let mut model = started.post_model;
+        model.insert_task_run(task_run);
+        let (reducer, _shared) = Reducer::new(RestoredState {
+            model,
+            next_ordinal: started.post_next_ordinal,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let mut progress = controller_event(
+            "subject-progress",
+            "subject-run",
+            ControllerEventKind::Progress,
+        );
+        progress.metadata.receipt_time_ms = 30;
+        progress.metadata.label = Some("Map hook payloads".to_owned());
+
+        let progressed = reducer.validate_controller_event(&progress).unwrap();
+        let task_run = progressed.post_model.task_run(&run_id).unwrap();
+        assert_eq!(task_run.updated_at_ms, Some(30));
+        assert_eq!(task_run.subject.as_deref(), Some("Map hook payloads"));
+        assert_eq!(task_run.dismissed_at_ms, None);
+
+        let (reducer, _shared) = Reducer::new(RestoredState {
+            model: progressed.post_model,
+            next_ordinal: progressed.post_next_ordinal,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let mut no_label = controller_event(
+            "subject-progress-no-label",
+            "subject-run",
+            ControllerEventKind::Progress,
+        );
+        no_label.metadata.receipt_time_ms = 40;
+        let progressed = reducer.validate_controller_event(&no_label).unwrap();
+        let task_run = progressed.post_model.task_run(&run_id).unwrap();
+        assert_eq!(task_run.updated_at_ms, Some(40));
+        assert_eq!(task_run.subject.as_deref(), Some("Map hook payloads"));
+    }
+
+    #[test]
+    fn first_terminal_transition_stamps_finished_at_once() {
+        let (reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let started = reducer
+            .validate_controller_event(&controller_event(
+                "terminal-started",
+                "terminal-run",
+                ControllerEventKind::TaskStarted,
+            ))
+            .unwrap();
+        let run_id = started
+            .post_model
+            .task_run_by_key(&RunKey::Controller("terminal-run".to_owned()))
+            .unwrap()
+            .run_id;
+        let (reducer, _shared) = Reducer::new(RestoredState {
+            model: started.post_model,
+            next_ordinal: started.post_next_ordinal,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let mut complete = controller_event(
+            "terminal-complete",
+            "terminal-run",
+            ControllerEventKind::Complete,
+        );
+        complete.metadata.receipt_time_ms = 30;
+        let completed = reducer.validate_controller_event(&complete).unwrap();
+        let task_run = completed.post_model.task_run(&run_id).unwrap();
+        assert_eq!(task_run.updated_at_ms, Some(30));
+        assert_eq!(task_run.finished_at_ms, Some(30));
+
+        let (reducer, _shared) = Reducer::new(RestoredState {
+            model: completed.post_model,
+            next_ordinal: completed.post_next_ordinal,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        complete.metadata.event_id = "terminal-complete-duplicate".to_owned();
+        complete.metadata.receipt_time_ms = 40;
+        let duplicate = reducer.validate_controller_event(&complete).unwrap();
+        let task_run = duplicate.post_model.task_run(&run_id).unwrap();
+        assert_eq!(task_run.updated_at_ms, Some(40));
+        assert_eq!(task_run.finished_at_ms, Some(30));
+    }
+
+    #[test]
+    fn persist_task_run_passes_model_bookkeeping_through() {
+        let (reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let mut task_run = run(
+            RunId::new(),
+            RunKey::Controller("persist-bookkeeping".to_owned()),
+            1,
+            TaskState::Completed,
+        );
+        task_run.created_at_ms = Some(5);
+        task_run.updated_at_ms = Some(7);
+        task_run.finished_at_ms = Some(6);
+
+        let PersistOp::UpsertTaskRun(persisted) = reducer.persist_task_run(task_run, 99) else {
+            unreachable!();
+        };
+
+        assert_eq!(persisted.created_at_ms, 5);
+        assert_eq!(persisted.updated_at_ms, 7);
+        assert_eq!(persisted.finished_at_ms, Some(6));
     }
 
     fn execution(run_id: RunId, execution_id: &str, state: ExecState) -> Execution {
@@ -2920,6 +3233,7 @@ mod tests {
                 .map(|(tab_id, workspace_id)| Tab {
                     tab_id: (*tab_id).to_owned(),
                     workspace_id: (*workspace_id).to_owned(),
+                    label: None,
                 })
                 .collect(),
             panes: panes
@@ -3033,6 +3347,7 @@ mod tests {
                 TopologyEntity::Tab(Tab {
                     tab_id: "tab-keep".to_owned(),
                     workspace_id: "workspace-keep".to_owned(),
+                    label: None,
                 }),
             ),
             (
@@ -3042,6 +3357,7 @@ mod tests {
                     workspace_id: "workspace-keep".to_owned(),
                     tab_id: "tab-keep".to_owned(),
                     terminal_id: "terminal-keep".to_owned(),
+                    display_name: None,
                 }),
             ),
         ] {
@@ -3094,6 +3410,7 @@ mod tests {
                     workspace_id: "workspace-keep".to_owned(),
                     tab_id: "tab-keep".to_owned(),
                     terminal_id: "terminal-keep".to_owned(),
+                    display_name: None,
                 }),
             ))
             .unwrap();
@@ -3120,6 +3437,7 @@ mod tests {
                 TopologyEntity::Tab(Tab {
                     tab_id: "tab".to_owned(),
                     workspace_id: "workspace".to_owned(),
+                    label: None,
                 }),
             ),
             (
@@ -3129,6 +3447,7 @@ mod tests {
                     workspace_id: "workspace".to_owned(),
                     tab_id: "tab".to_owned(),
                     terminal_id: "terminal".to_owned(),
+                    display_name: None,
                 }),
             ),
         ] {
@@ -3874,6 +4193,7 @@ mod tests {
                     tab: crate::model::Tab {
                         tab_id: "orphan-tab".to_owned(),
                         workspace_id: "missing-workspace".to_owned(),
+                        label: None,
                     },
                     display_ordinal: DisplayOrdinal::new(1),
                 }])

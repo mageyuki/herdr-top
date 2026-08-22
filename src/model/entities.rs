@@ -19,6 +19,8 @@ pub struct Workspace {
 pub struct Tab {
     pub tab_id: String,
     pub workspace_id: String,
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -27,6 +29,8 @@ pub struct Pane {
     pub workspace_id: String,
     pub tab_id: String,
     pub terminal_id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -45,6 +49,16 @@ pub struct TaskRun {
     pub display_ordinal: DisplayOrdinal,
     pub state: TaskState,
     pub has_controller_task_state_event: bool,
+    #[serde(default)]
+    pub created_at_ms: Option<i64>,
+    #[serde(default)]
+    pub updated_at_ms: Option<i64>,
+    #[serde(default)]
+    pub finished_at_ms: Option<i64>,
+    #[serde(default)]
+    pub subject: Option<String>,
+    #[serde(default)]
+    pub dismissed_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1017,12 +1031,14 @@ mod tests {
         model.insert_tab(Tab {
             tab_id: "tab-1".to_owned(),
             workspace_id: "workspace-1".to_owned(),
+            label: None,
         });
         model.insert_pane(Pane {
             pane_id: "pane-1".to_owned(),
             workspace_id: "workspace-1".to_owned(),
             tab_id: "tab-1".to_owned(),
             terminal_id: "terminal-1".to_owned(),
+            display_name: None,
         });
         model.insert_task_run(TaskRun {
             run_id,
@@ -1030,6 +1046,11 @@ mod tests {
             display_ordinal: DisplayOrdinal::new(3),
             state: TaskState::Running,
             has_controller_task_state_event: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         });
         model.insert_task_run(TaskRun {
             run_id: dependency_id,
@@ -1037,6 +1058,11 @@ mod tests {
             display_ordinal: DisplayOrdinal::new(4),
             state: TaskState::Queued,
             has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         });
         model.insert_execution(Execution {
             execution_id: "execution-1".to_owned(),
@@ -1128,6 +1154,7 @@ mod tests {
             tabs: vec![Tab {
                 tab_id: "tab-1".to_owned(),
                 workspace_id: "workspace-1".to_owned(),
+                label: None,
             }],
             panes: vec![PaneSnapshot {
                 pane_id: "pane-1".to_owned(),

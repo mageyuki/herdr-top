@@ -1497,12 +1497,14 @@ mod tests {
         model.insert_tab(Tab {
             tab_id: "tab".to_owned(),
             workspace_id: "workspace".to_owned(),
+            label: None,
         });
         model.insert_pane(Pane {
             pane_id: "pane".to_owned(),
             workspace_id: "workspace".to_owned(),
             tab_id: "tab".to_owned(),
             terminal_id: "terminal".to_owned(),
+            display_name: None,
         });
         for (run_id, label, ordinal, state) in runs {
             model.insert_task_run(TaskRun {
@@ -1511,6 +1513,11 @@ mod tests {
                 display_ordinal: DisplayOrdinal::new(*ordinal),
                 state: *state,
                 has_controller_task_state_event: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             });
             model.insert_execution(Execution {
                 execution_id: format!("execution-{label}"),
@@ -1536,6 +1543,7 @@ mod tests {
         model.insert_tab(Tab {
             tab_id: "tab".to_owned(),
             workspace_id: "workspace".to_owned(),
+            label: None,
         });
         for pane_id in ["pane-1", "pane-2"] {
             model.insert_pane(Pane {
@@ -1543,6 +1551,7 @@ mod tests {
                 workspace_id: "workspace".to_owned(),
                 tab_id: "tab".to_owned(),
                 terminal_id: format!("terminal-{pane_id}"),
+                display_name: None,
             });
         }
         model.insert_task_run(TaskRun {
@@ -1551,6 +1560,11 @@ mod tests {
             display_ordinal: DisplayOrdinal::new(1),
             state: shared_state,
             has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         });
         model.insert_task_run(TaskRun {
             run_id: sibling,
@@ -1558,6 +1572,11 @@ mod tests {
             display_ordinal: DisplayOrdinal::new(2),
             state: TaskState::Running,
             has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         });
         if include_pane_one_occurrence {
             model.insert_execution(Execution {
@@ -1941,6 +1960,11 @@ mod tests {
             display_ordinal: DisplayOrdinal::new(2),
             state: TaskState::Running,
             has_controller_task_state_event: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         });
         model.insert_agent_node(AgentNode {
             agent_node_id: "agent-safe".to_owned(),
@@ -2992,6 +3016,7 @@ mod tests {
             workspace_id: "workspace".to_owned(),
             tab_id: "tab".to_owned(),
             terminal_id: "terminal-2".to_owned(),
+            display_name: None,
         });
         model.insert_execution(Execution {
             execution_id: "execution-shared-2".to_owned(),

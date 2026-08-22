@@ -249,6 +249,11 @@ mod tests {
                 display_ordinal: DisplayOrdinal::new(*ordinal),
                 state: TaskState::Queued,
                 has_controller_task_state_event: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             });
         }
         for (prerequisite, dependent) in edges {
@@ -292,6 +297,11 @@ mod tests {
                 display_ordinal: DisplayOrdinal::new(*ordinal),
                 state: TaskState::Queued,
                 has_controller_task_state_event: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             });
         }
         for (prerequisite, dependent) in edges {
@@ -431,6 +441,11 @@ mod tests {
                 display_ordinal: DisplayOrdinal::new(index as i64),
                 state: TaskState::Queued,
                 has_controller_task_state_event: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             });
         }
         for pair in ids.windows(2) {

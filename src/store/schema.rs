@@ -1,4 +1,4 @@
-//! SQLite schema v4, read-only preflight, online backup, and migration support.
+//! SQLite schema v5, read-only preflight, online backup, and migration support.
 
 use std::ffi::OsString;
 use std::fs::{self, Metadata, OpenOptions, Permissions};
@@ -14,7 +14,7 @@ use rusqlite::{Connection, MAIN_DB, OpenFlags, OptionalExtension, params};
 use super::StoreError;
 use crate::lockfile::StateRoot;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 5;
 pub(super) const DATABASE_FILE: &str = "herdr-top.sqlite3";
 const FILE_MODE: u32 = 0o600;
 
@@ -353,6 +353,14 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), St
             "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (4, ?1)",
             [now_ms],
         )?;
+        version = 4;
+    }
+    if version < 5 {
+        transaction.execute_batch(SCHEMA_V5)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (5, ?1)",
+            [now_ms],
+        )?;
     }
     transaction.commit()?;
     Ok(())
@@ -400,7 +408,7 @@ ALTER TABLE events ADD COLUMN provider_parent_agent_id TEXT;
 ALTER TABLE events ADD COLUMN source_coverage TEXT;
 "#;
 
-const SCHEMA_V4: &str = r#"
+pub(super) const SCHEMA_V4: &str = r#"
 INSERT INTO display_ordinals(entity_kind, entity_id, ordinal)
 SELECT
     'workspace',
@@ -436,6 +444,13 @@ FROM (
         ROW_NUMBER() OVER (ORDER BY workspace_id, tab_id, pane_id) AS row_number
     FROM panes
 ) AS ordered;
+"#;
+
+const SCHEMA_V5: &str = r#"
+ALTER TABLE task_runs ADD COLUMN subject TEXT;
+ALTER TABLE task_runs ADD COLUMN dismissed_at_ms INTEGER;
+ALTER TABLE tabs ADD COLUMN label TEXT;
+ALTER TABLE panes ADD COLUMN display_name TEXT;
 "#;
 
 pub(super) const SCHEMA_V1: &str = r#"

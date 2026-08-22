@@ -3890,6 +3890,7 @@ fn normalize_event(
                     TopologyEntity::Tab(Tab {
                         tab_id: tab.tab_id,
                         workspace_id: tab.workspace_id,
+                        label: None,
                     }),
                 ));
             }
@@ -3945,6 +3946,7 @@ fn normalize_event(
                     TopologyEntity::Tab(Tab {
                         tab_id: tab.tab_id,
                         workspace_id: tab.workspace_id,
+                        label: None,
                     }),
                 ));
             }
@@ -4241,6 +4243,7 @@ fn apply_snapshot_in_place(
                 workspace_id: pane.workspace_id.clone(),
                 tab_id: pane.tab_id.clone(),
                 terminal_id: pane.terminal_id.clone(),
+                display_name: None,
             }),
         )];
         let provider = pane.agent.as_ref().and_then(|agent| {
@@ -4540,6 +4543,7 @@ fn topology_from_snapshot(snapshot: &Snapshot) -> Result<TopologySnapshot, Colle
         .map(|tab| Tab {
             tab_id: tab.tab_id.clone(),
             workspace_id: tab.workspace_id.clone(),
+            label: None,
         })
         .collect();
     let panes = snapshot
@@ -5037,6 +5041,7 @@ fn pane_entity(pane: &PaneInfo) -> Result<Pane, CollectorError> {
                 pane_id: pane.pane_id.clone(),
             })?,
         terminal_id: pane.terminal_id.clone(),
+        display_name: None,
     })
 }
 
@@ -5898,6 +5903,7 @@ mod tests {
         model.insert_tab(Tab {
             tab_id: "tab-0001".to_owned(),
             workspace_id: "workspace-0001".to_owned(),
+            label: None,
         });
         for index in 1..=50 {
             model.insert_pane(Pane {
@@ -5905,6 +5911,7 @@ mod tests {
                 workspace_id: "workspace-0001".to_owned(),
                 tab_id: "tab-0001".to_owned(),
                 terminal_id: format!("terminal-{index:04}"),
+                display_name: None,
             });
         }
 
@@ -5918,6 +5925,11 @@ mod tests {
                 display_ordinal: DisplayOrdinal::new(index as i64 + 1),
                 state: TaskState::Running,
                 has_controller_task_state_event: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             });
         }
 
@@ -7594,6 +7606,11 @@ mod tests {
                 display_ordinal: DisplayOrdinal::new(i64::try_from(index + 1).unwrap()),
                 state: TaskState::Running,
                 has_controller_task_state_event: false,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             });
             model.insert_execution(Execution {
                 execution_id: (*execution_id).to_owned(),
@@ -7697,6 +7714,11 @@ mod tests {
             display_ordinal: DisplayOrdinal::new(4),
             state: TaskState::Running,
             has_controller_task_state_event: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         };
         let executions = ["live", "stale"].map(|execution_id| Execution {
             execution_id: execution_id.to_owned(),
@@ -7722,6 +7744,7 @@ mod tests {
                         tab: Tab {
                             tab_id: "w1:t1".to_owned(),
                             workspace_id: "w1".to_owned(),
+                            label: None,
                         },
                         display_ordinal: DisplayOrdinal::new(2),
                     },
@@ -7731,6 +7754,7 @@ mod tests {
                             workspace_id: "w1".to_owned(),
                             tab_id: "w1:t1".to_owned(),
                             terminal_id: "terminal-1".to_owned(),
+                            display_name: None,
                         },
                         display_ordinal: DisplayOrdinal::new(3),
                     },
@@ -10310,6 +10334,11 @@ mod provider_integration_tests {
             display_ordinal: DisplayOrdinal::new(1),
             state: TaskState::Running,
             has_controller_task_state_event: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         });
         let (_sender, shared) = watch::channel(Arc::new(model));
         let event = ProviderEvent::SessionResolved {
@@ -10511,6 +10540,11 @@ mod provider_integration_tests {
             display_ordinal: DisplayOrdinal::new(1),
             state: TaskState::EndedUnknown,
             has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         };
         let mut store = open_writer(&root).unwrap();
         store
@@ -10651,6 +10685,11 @@ mod provider_integration_tests {
             display_ordinal: DisplayOrdinal::new(1),
             state: TaskState::Running,
             has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         };
         let agent_node = AgentNode {
             agent_node_id: "gap-agent-herdr".to_owned(),
@@ -10753,6 +10792,11 @@ mod provider_integration_tests {
                 display_ordinal: DisplayOrdinal::new(1),
                 state: TaskState::Running,
                 has_controller_task_state_event: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             },
             TaskRun {
                 run_id: path_run,
@@ -10763,6 +10807,11 @@ mod provider_integration_tests {
                 display_ordinal: DisplayOrdinal::new(2),
                 state: TaskState::Running,
                 has_controller_task_state_event: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             },
             TaskRun {
                 run_id: first_parent,
@@ -10770,6 +10819,11 @@ mod provider_integration_tests {
                 display_ordinal: DisplayOrdinal::new(3),
                 state: TaskState::Running,
                 has_controller_task_state_event: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             },
             TaskRun {
                 run_id: second_parent,
@@ -10777,6 +10831,11 @@ mod provider_integration_tests {
                 display_ordinal: DisplayOrdinal::new(4),
                 state: TaskState::Running,
                 has_controller_task_state_event: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             },
         ] {
             model.insert_task_run(task_run);
@@ -10861,6 +10920,11 @@ mod provider_integration_tests {
                     display_ordinal: DisplayOrdinal::new(1),
                     state: TaskState::EndedUnknown,
                     has_controller_task_state_event: true,
+                    created_at_ms: None,
+                    updated_at_ms: None,
+                    finished_at_ms: None,
+                    subject: None,
+                    dismissed_at_ms: None,
                 },
                 native_session: None,
                 created_at_ms: 1,

@@ -552,6 +552,7 @@ mod tests {
                 workspace_id: "workspace-000".to_owned(),
                 tab_id: "tab-000".to_owned(),
                 terminal_id: format!("terminal-{index:03}"),
+                display_name: None,
             });
         }
 
@@ -565,6 +566,11 @@ mod tests {
                 display_ordinal: DisplayOrdinal::new(index as i64 + 1),
                 state: TaskState::Running,
                 has_controller_task_state_event: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             });
         }
 

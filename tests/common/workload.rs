@@ -145,6 +145,7 @@ pub fn target_model() -> DomainModel {
     model.insert_tab(Tab {
         tab_id: "tab-0001".to_owned(),
         workspace_id: "workspace-0001".to_owned(),
+        label: None,
     });
     for index in 1..=50 {
         model.insert_pane(Pane {
@@ -152,6 +153,7 @@ pub fn target_model() -> DomainModel {
             workspace_id: "workspace-0001".to_owned(),
             tab_id: "tab-0001".to_owned(),
             terminal_id: format!("terminal-{index:04}"),
+            display_name: None,
         });
     }
 
@@ -164,6 +166,11 @@ pub fn target_model() -> DomainModel {
             display_ordinal: DisplayOrdinal::new(ordinal as i64),
             state: TaskState::Running,
             has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         });
     }
     for pair in run_ids.windows(2) {

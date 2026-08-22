@@ -807,7 +807,7 @@ impl Store {
 
     fn restore_tabs(&self, model: &mut crate::model::DomainModel) -> Result<(), StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT tab.tab_id, tab.workspace_id, ordinal.ordinal \
+            "SELECT tab.tab_id, tab.workspace_id, tab.label, ordinal.ordinal \
              FROM tabs AS tab \
              LEFT JOIN display_ordinals AS ordinal \
                ON ordinal.entity_kind = 'tab' \
@@ -816,10 +816,11 @@ impl Store {
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let tab_id: String = row.get(0)?;
-            let ordinal = required_topology_ordinal(row.get(2)?, "tab", &tab_id)?;
+            let ordinal = required_topology_ordinal(row.get(3)?, "tab", &tab_id)?;
             model.insert_tab(Tab {
                 tab_id: tab_id.clone(),
                 workspace_id: row.get(1)?,
+                label: row.get(2)?,
             });
             model.set_tab_ordinal(tab_id, ordinal);
         }
@@ -829,7 +830,7 @@ impl Store {
     fn restore_panes(&self, model: &mut crate::model::DomainModel) -> Result<(), StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT pane.pane_id, pane.workspace_id, pane.tab_id, pane.terminal_id, \
-                    ordinal.ordinal \
+                    pane.display_name, ordinal.ordinal \
              FROM panes AS pane \
              LEFT JOIN display_ordinals AS ordinal \
                ON ordinal.entity_kind = 'pane' \
@@ -838,12 +839,13 @@ impl Store {
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let pane_id: String = row.get(0)?;
-            let ordinal = required_topology_ordinal(row.get(4)?, "pane", &pane_id)?;
+            let ordinal = required_topology_ordinal(row.get(5)?, "pane", &pane_id)?;
             model.insert_pane(Pane {
                 pane_id: pane_id.clone(),
                 workspace_id: row.get(1)?,
                 tab_id: row.get(2)?,
                 terminal_id: row.get(3)?,
+                display_name: row.get(4)?,
             });
             model.set_pane_ordinal(pane_id, ordinal);
         }
@@ -855,7 +857,8 @@ impl Store {
             "SELECT run_id, key_kind, key_controller_id, key_provider, key_native_sid, \
                     key_native_path, key_terminal_id, key_start_ms, key_seq, \
                     display_ordinal, task_state, has_controller_task_state_event, merged_into, \
-                    native_provider, native_session_id \
+                    native_provider, native_session_id, created_at_ms, updated_at_ms, \
+                    finished_at_ms, subject, dismissed_at_ms \
              FROM task_runs",
         )?;
         let mut rows = statement.query([])?;
@@ -883,6 +886,11 @@ impl Store {
                     display_ordinal: DisplayOrdinal::new(row.get(9)?),
                     state: parse_task_state(&state_text)?,
                     has_controller_task_state_event: row.get::<_, i64>(11)? != 0,
+                    created_at_ms: Some(row.get(15)?),
+                    updated_at_ms: Some(row.get(16)?),
+                    finished_at_ms: row.get(17)?,
+                    subject: row.get(18)?,
+                    dismissed_at_ms: row.get(19)?,
                 },
                 merged_into: merged_into_text.as_deref().map(parse_run_id).transpose()?,
                 native_binding: match (
@@ -1152,9 +1160,11 @@ fn apply_operation(transaction: &Transaction<'_>, operation: PersistOp) -> Resul
         } => {
             upsert_display_ordinal(transaction, "tab", &tab.tab_id, display_ordinal)?;
             transaction.execute(
-                "INSERT INTO tabs(tab_id, workspace_id) VALUES (?1, ?2) \
-                 ON CONFLICT(tab_id) DO UPDATE SET workspace_id = excluded.workspace_id",
-                (&tab.tab_id, &tab.workspace_id),
+                "INSERT INTO tabs(tab_id, workspace_id, label) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(tab_id) DO UPDATE SET \
+                     workspace_id = excluded.workspace_id, \
+                     label = excluded.label",
+                (&tab.tab_id, &tab.workspace_id, &tab.label),
             )?;
         }
         PersistOp::UpsertPane {
@@ -1163,17 +1173,19 @@ fn apply_operation(transaction: &Transaction<'_>, operation: PersistOp) -> Resul
         } => {
             upsert_display_ordinal(transaction, "pane", &pane.pane_id, display_ordinal)?;
             transaction.execute(
-                "INSERT INTO panes(pane_id, workspace_id, tab_id, terminal_id) \
-                 VALUES (?1, ?2, ?3, ?4) \
+                "INSERT INTO panes(pane_id, workspace_id, tab_id, terminal_id, display_name) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
                  ON CONFLICT(pane_id) DO UPDATE SET \
                      workspace_id = excluded.workspace_id, \
                      tab_id = excluded.tab_id, \
-                     terminal_id = excluded.terminal_id",
+                     terminal_id = excluded.terminal_id, \
+                     display_name = excluded.display_name",
                 params![
                     pane.pane_id,
                     pane.workspace_id,
                     pane.tab_id,
-                    pane.terminal_id
+                    pane.terminal_id,
+                    pane.display_name
                 ],
             )?;
         }
@@ -1688,9 +1700,11 @@ fn upsert_task_run(
              run_id, key_kind, key_controller_id, key_provider, key_native_sid, \
              key_native_path, key_terminal_id, key_start_ms, key_seq, \
              display_ordinal, task_state, has_controller_task_state_event, \
-             native_provider, native_session_id, created_at_ms, updated_at_ms, finished_at_ms\
+             native_provider, native_session_id, created_at_ms, updated_at_ms, finished_at_ms, \
+             subject, dismissed_at_ms\
          ) VALUES (\
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17\
+             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+             ?18, ?19\
          ) \
          ON CONFLICT(run_id) DO UPDATE SET \
              key_kind = excluded.key_kind, \
@@ -1710,7 +1724,9 @@ fn upsert_task_run(
              finished_at_ms = CASE \
                  WHEN excluded.finished_at_ms IS NULL THEN NULL \
                  ELSE COALESCE(task_runs.finished_at_ms, excluded.finished_at_ms) \
-             END",
+             END, \
+             subject = excluded.subject, \
+             dismissed_at_ms = excluded.dismissed_at_ms",
         params![
             run_id,
             encoded_key.kind,
@@ -1728,7 +1744,9 @@ fn upsert_task_run(
             native_session_id,
             persisted.created_at_ms,
             persisted.updated_at_ms,
-            finished_at_ms
+            finished_at_ms,
+            task_run.subject,
+            task_run.dismissed_at_ms
         ],
     )?;
     Ok(())
@@ -2277,7 +2295,7 @@ mod tests {
 
         assert!(database_path(&root).is_file());
         assert!(backup_files(directory.path()).is_empty());
-        assert_eq!(schema_version(&store.connection), 4);
+        assert_eq!(schema_version(&store.connection), 5);
         for (table, column) in [
             ("agent_nodes", "parent_agent_node_id"),
             ("agent_nodes", "state"),
@@ -2344,7 +2362,7 @@ mod tests {
                     "CREATE TABLE schema_migrations(\
                          version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL\
                      );\
-                     INSERT INTO schema_migrations(version, applied_at_ms) VALUES (5, 0);",
+                     INSERT INTO schema_migrations(version, applied_at_ms) VALUES (6, 0);",
                 )
                 .unwrap();
         }
@@ -2353,15 +2371,15 @@ mod tests {
         assert!(matches!(
             preflight_schema(&root),
             Err(StoreError::NewerSchema {
-                found: 5,
-                supported: 4
+                found: 6,
+                supported: 5
             })
         ));
         assert!(matches!(
             open_writer(&root),
             Err(StoreError::NewerSchema {
-                found: 5,
-                supported: 4
+                found: 6,
+                supported: 5
             })
         ));
 
@@ -2390,7 +2408,7 @@ mod tests {
         let backups = backup_files(directory.path());
 
         assert_eq!(backups.len(), 1);
-        assert_eq!(schema_version(&store.connection), 4);
+        assert_eq!(schema_version(&store.connection), 5);
         let backup = Connection::open_with_flags(
             &backups[0],
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -2421,7 +2439,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_to_v4_migration() {
+    fn schema_v1_to_v5_migration() {
         let (_directory, root) = test_root();
         let database = database_path(&root);
         {
@@ -2437,7 +2455,7 @@ mod tests {
 
         assert_eq!(preflight_schema(&root).unwrap(), SchemaVerdict::Migratable);
         let store = open_writer(&root).unwrap();
-        assert_eq!(schema_version(&store.connection), 4);
+        assert_eq!(schema_version(&store.connection), 5);
         let has_ingest_seq: bool = store
             .connection
             .query_row(
@@ -2463,7 +2481,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v2_to_v4_backfills_agent_ordinals_by_run_ordinal_then_node_id() {
+    fn schema_v2_to_v5_backfills_agent_ordinals_by_run_ordinal_then_node_id() {
         let (_directory, root) = test_root();
         let database = database_path(&root);
         let first_run = RunId::new();
@@ -2481,16 +2499,8 @@ mod tests {
                 )
                 .unwrap();
             let transaction = connection.transaction().unwrap();
-            upsert_task_run(
-                &transaction,
-                &persisted_run(first_run, 3, TaskState::Running, 1, false),
-            )
-            .unwrap();
-            upsert_task_run(
-                &transaction,
-                &persisted_run(second_run, 7, TaskState::Running, 1, false),
-            )
-            .unwrap();
+            insert_pre_v5_task_run(&transaction, first_run, 3);
+            insert_pre_v5_task_run(&transaction, second_run, 7);
             for (node_id, run_id) in [
                 ("gap-agent-z", second_run),
                 ("gap-agent-a", second_run),
@@ -2509,7 +2519,7 @@ mod tests {
         }
 
         let store = open_writer(&root).unwrap();
-        assert_eq!(schema_version(&store.connection), 4);
+        assert_eq!(schema_version(&store.connection), 5);
         let ordinals = ["gap-agent-m", "gap-agent-a", "gap-agent-z"].map(|node_id| {
             store
                 .connection
@@ -2567,16 +2577,12 @@ mod tests {
                 )
                 .unwrap();
             let transaction = connection.transaction().unwrap();
-            upsert_task_run(
-                &transaction,
-                &persisted_run(existing_run, 20, TaskState::Running, 1, false),
-            )
-            .unwrap();
+            insert_pre_v5_task_run(&transaction, existing_run, 20);
             transaction.commit().unwrap();
         }
 
         let mut store = open_writer(&root).unwrap();
-        assert_eq!(schema_version(&store.connection), 4);
+        assert_eq!(schema_version(&store.connection), 5);
         let topology_ordinals = [
             ("workspace", "workspace-a", 21),
             ("workspace", "workspace-z", 22),
@@ -2618,6 +2624,192 @@ mod tests {
             1
         );
         assert_eq!(count(&store.connection, "display_ordinals"), 10);
+    }
+
+    #[test]
+    fn schema_v4_to_v5_migration_restores_nullable_fields_as_none() {
+        let (_directory, root) = test_root();
+        let database = database_path(&root);
+        let run_id = RunId::new();
+        {
+            let connection = Connection::open(&database).unwrap();
+            connection.execute_batch(schema::SCHEMA_V1).unwrap();
+            connection.execute_batch(schema::SCHEMA_V2).unwrap();
+            connection.execute_batch(schema::SCHEMA_V3).unwrap();
+            connection.execute_batch(schema::SCHEMA_V4).unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (1, 1);\
+                     INSERT INTO schema_migrations(version, applied_at_ms) VALUES (2, 2);\
+                     INSERT INTO schema_migrations(version, applied_at_ms) VALUES (3, 3);\
+                     INSERT INTO schema_migrations(version, applied_at_ms) VALUES (4, 4);\
+                     INSERT INTO workspaces(workspace_id) VALUES ('workspace-v4');\
+                     INSERT INTO tabs(tab_id, workspace_id) VALUES ('tab-v4', 'workspace-v4');\
+                     INSERT INTO panes(pane_id, workspace_id, tab_id, terminal_id)\
+                         VALUES ('pane-v4', 'workspace-v4', 'tab-v4', 'terminal-v4');\
+                     INSERT INTO display_ordinals(entity_kind, entity_id, ordinal) VALUES\
+                         ('workspace', 'workspace-v4', 1),\
+                         ('tab', 'tab-v4', 2),\
+                         ('pane', 'pane-v4', 3);",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO display_ordinals(entity_kind, entity_id, ordinal)\
+                     VALUES ('task_run', ?1, 4)",
+                    [run_id.to_string()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO task_runs(\
+                         run_id, key_kind, key_controller_id, display_ordinal, task_state,\
+                         has_controller_task_state_event, created_at_ms, updated_at_ms,\
+                         finished_at_ms\
+                     ) VALUES (?1, 'controller', 'controller-v4', 4, 'running', 1, 10, 20, NULL)",
+                    [run_id.to_string()],
+                )
+                .unwrap();
+        }
+
+        let store = open_writer(&root).unwrap();
+        assert_eq!(schema_version(&store.connection), 5);
+        let restored = store.load_restored_state().unwrap();
+        let run = restored.model.task_run(&run_id).unwrap();
+        assert_eq!(run.created_at_ms, Some(10));
+        assert_eq!(run.updated_at_ms, Some(20));
+        assert_eq!(run.finished_at_ms, None);
+        assert_eq!(run.subject, None);
+        assert_eq!(run.dismissed_at_ms, None);
+        assert_eq!(restored.model.tab("tab-v4").unwrap().label, None);
+        assert_eq!(restored.model.pane("pane-v4").unwrap().display_name, None);
+    }
+
+    #[test]
+    fn fresh_database_applies_v5_columns_once() {
+        let (_directory, root) = test_root();
+
+        let store = open_writer(&root).unwrap();
+
+        assert_eq!(schema_version(&store.connection), 5);
+        for (table, column) in [
+            ("task_runs", "subject"),
+            ("task_runs", "dismissed_at_ms"),
+            ("tabs", "label"),
+            ("panes", "display_name"),
+        ] {
+            let present: bool = store
+                .connection
+                .query_row(
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1)"
+                    ),
+                    [column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "missing {table}.{column}");
+        }
+    }
+
+    #[test]
+    fn task_run_and_topology_names_round_trip_with_earliest_created_time() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let run_id = RunId::new();
+        let mut task_run = TaskRun {
+            run_id,
+            key: RunKey::Controller("controller-round-trip".to_owned()),
+            display_ordinal: DisplayOrdinal::new(4),
+            state: TaskState::Completed,
+            has_controller_task_state_event: true,
+            created_at_ms: Some(1_000),
+            updated_at_ms: Some(1_500),
+            finished_at_ms: Some(1_400),
+            subject: Some("Map hook payloads".to_owned()),
+            dismissed_at_ms: Some(1_450),
+        };
+        store
+            .apply_batch(vec![
+                PersistOp::UpsertWorkspace {
+                    workspace: Workspace {
+                        workspace_id: "workspace-round-trip".to_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(1),
+                },
+                PersistOp::UpsertTab {
+                    tab: Tab {
+                        tab_id: "tab-round-trip".to_owned(),
+                        workspace_id: "workspace-round-trip".to_owned(),
+                        label: Some("Implementation".to_owned()),
+                    },
+                    display_ordinal: DisplayOrdinal::new(2),
+                },
+                PersistOp::UpsertPane {
+                    pane: Pane {
+                        pane_id: "pane-round-trip".to_owned(),
+                        workspace_id: "workspace-round-trip".to_owned(),
+                        tab_id: "tab-round-trip".to_owned(),
+                        terminal_id: "terminal-round-trip".to_owned(),
+                        display_name: Some("Tests".to_owned()),
+                    },
+                    display_ordinal: DisplayOrdinal::new(3),
+                },
+                PersistOp::UpsertTaskRun(PersistTaskRun {
+                    task_run: task_run.clone(),
+                    native_session: None,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 1_500,
+                    finished_at_ms: Some(1_400),
+                }),
+            ])
+            .unwrap();
+        task_run.created_at_ms = Some(900);
+        task_run.updated_at_ms = Some(1_600);
+        store
+            .apply_batch(vec![PersistOp::UpsertTaskRun(PersistTaskRun {
+                task_run,
+                native_session: None,
+                created_at_ms: 900,
+                updated_at_ms: 1_600,
+                finished_at_ms: Some(1_400),
+            })])
+            .unwrap();
+
+        let restored = store.load_restored_state().unwrap();
+        assert_eq!(
+            restored.model.task_run(&run_id),
+            Some(&TaskRun {
+                run_id,
+                key: RunKey::Controller("controller-round-trip".to_owned()),
+                display_ordinal: DisplayOrdinal::new(4),
+                state: TaskState::Completed,
+                has_controller_task_state_event: true,
+                created_at_ms: Some(900),
+                updated_at_ms: Some(1_600),
+                finished_at_ms: Some(1_400),
+                subject: Some("Map hook payloads".to_owned()),
+                dismissed_at_ms: Some(1_450),
+            })
+        );
+        assert_eq!(
+            restored
+                .model
+                .tab("tab-round-trip")
+                .unwrap()
+                .label
+                .as_deref(),
+            Some("Implementation")
+        );
+        assert_eq!(
+            restored
+                .model
+                .pane("pane-round-trip")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("Tests")
+        );
     }
 
     #[test]
@@ -2851,6 +3043,7 @@ mod tests {
                     tab: Tab {
                         tab_id: "tab-1".to_owned(),
                         workspace_id: "workspace-1".to_owned(),
+                        label: None,
                     },
                     display_ordinal: DisplayOrdinal::new(2),
                 },
@@ -2860,6 +3053,7 @@ mod tests {
                         workspace_id: "workspace-1".to_owned(),
                         tab_id: "tab-1".to_owned(),
                         terminal_id: "terminal-1".to_owned(),
+                        display_name: None,
                     },
                     display_ordinal: DisplayOrdinal::new(4),
                 },
@@ -2954,12 +3148,14 @@ mod tests {
         let tab = Tab {
             tab_id: "tab".to_owned(),
             workspace_id: workspace.workspace_id.clone(),
+            label: None,
         };
         let pane = Pane {
             pane_id: "pane".to_owned(),
             workspace_id: workspace.workspace_id.clone(),
             tab_id: tab.tab_id.clone(),
             terminal_id: "terminal".to_owned(),
+            display_name: None,
         };
         let upserts = || {
             vec![
@@ -3089,6 +3285,7 @@ mod tests {
                     tab: Tab {
                         tab_id: "tab-z".to_owned(),
                         workspace_id: "workspace-z".to_owned(),
+                        label: None,
                     },
                     display_ordinal: DisplayOrdinal::new(3),
                 },
@@ -3096,6 +3293,7 @@ mod tests {
                     tab: Tab {
                         tab_id: "tab-a".to_owned(),
                         workspace_id: "workspace-z".to_owned(),
+                        label: None,
                     },
                     display_ordinal: DisplayOrdinal::new(4),
                 },
@@ -3105,6 +3303,7 @@ mod tests {
                         workspace_id: "workspace-z".to_owned(),
                         tab_id: "tab-z".to_owned(),
                         terminal_id: "terminal-z".to_owned(),
+                        display_name: None,
                     },
                     display_ordinal: DisplayOrdinal::new(5),
                 },
@@ -3114,6 +3313,7 @@ mod tests {
                         workspace_id: "workspace-z".to_owned(),
                         tab_id: "tab-z".to_owned(),
                         terminal_id: "terminal-a".to_owned(),
+                        display_name: None,
                     },
                     display_ordinal: DisplayOrdinal::new(6),
                 },
@@ -3333,6 +3533,7 @@ mod tests {
                     tab: Tab {
                         tab_id: "tab-1".to_owned(),
                         workspace_id: "workspace-1".to_owned(),
+                        label: None,
                     },
                     display_ordinal: DisplayOrdinal::new(7),
                 },
@@ -3342,6 +3543,7 @@ mod tests {
                         workspace_id: "workspace-1".to_owned(),
                         tab_id: "tab-1".to_owned(),
                         terminal_id: "terminal-1".to_owned(),
+                        display_name: None,
                     },
                     display_ordinal: DisplayOrdinal::new(8),
                 },
@@ -4249,6 +4451,26 @@ mod tests {
         (directory, root)
     }
 
+    fn insert_pre_v5_task_run(transaction: &Transaction<'_>, run_id: RunId, ordinal: i64) {
+        let run_id = run_id.to_string();
+        transaction
+            .execute(
+                "INSERT INTO display_ordinals(entity_kind, entity_id, ordinal) \
+                 VALUES ('task_run', ?1, ?2)",
+                (&run_id, ordinal),
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO task_runs(\
+                     run_id, key_kind, key_controller_id, display_ordinal, task_state, \
+                     has_controller_task_state_event, created_at_ms, updated_at_ms\
+                 ) VALUES (?1, 'controller', ?2, ?3, 'running', 0, 1, 1)",
+                (&run_id, format!("controller-{run_id}"), ordinal),
+            )
+            .unwrap();
+    }
+
     fn run_op(
         run_id: RunId,
         ordinal: i64,
@@ -4265,19 +4487,6 @@ mod tests {
             controller_flag,
             None,
         )
-    }
-
-    fn persisted_run(
-        run_id: RunId,
-        ordinal: i64,
-        state: TaskState,
-        state_at_ms: i64,
-        controller_flag: bool,
-    ) -> PersistTaskRun {
-        match run_op(run_id, ordinal, state, state_at_ms, controller_flag) {
-            PersistOp::UpsertTaskRun(run) => run,
-            _ => unreachable!(),
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4297,6 +4506,11 @@ mod tests {
                 display_ordinal: DisplayOrdinal::new(ordinal),
                 state,
                 has_controller_task_state_event: controller_flag,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             },
             native_session,
             created_at_ms: state_at_ms,

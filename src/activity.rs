@@ -112,6 +112,11 @@ mod tests {
                 display_ordinal: DisplayOrdinal::new(index as i64 + 1),
                 state,
                 has_controller_task_state_event: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             });
         }
         let operator = OperatorSnapshot {
