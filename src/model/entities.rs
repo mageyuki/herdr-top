@@ -61,6 +61,19 @@ pub struct TaskRun {
     pub dismissed_at_ms: Option<i64>,
 }
 
+impl TaskRun {
+    /// Advances bookkeeping for a mutation observed at `timestamp_ms` receipt time.
+    pub fn touch(&mut self, timestamp_ms: i64) {
+        self.updated_at_ms = Some(timestamp_ms);
+        if self.state.is_terminal() {
+            self.finished_at_ms.get_or_insert(timestamp_ms);
+        } else {
+            self.finished_at_ms = None;
+            self.dismissed_at_ms = None;
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentNode {
     pub agent_node_id: String,

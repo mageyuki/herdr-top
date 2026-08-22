@@ -1801,13 +1801,7 @@ impl Reducer {
     }
 
     fn touch_task_run(task_run: &mut TaskRun, timestamp_ms: i64) {
-        task_run.updated_at_ms = Some(timestamp_ms);
-        if task_run.state.is_terminal() {
-            task_run.finished_at_ms.get_or_insert(timestamp_ms);
-        } else {
-            task_run.finished_at_ms = None;
-            task_run.dismissed_at_ms = None;
-        }
+        task_run.touch(timestamp_ms);
     }
 
     fn allocate_ordinal(&mut self) -> Result<DisplayOrdinal, ReducerError> {
