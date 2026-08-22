@@ -142,7 +142,7 @@ impl DagOrder {
     }
 }
 
-pub(crate) fn build_rows(model: &DomainModel, order: &DagOrder) -> Vec<TreeRow> {
+pub(crate) fn build_rows(model: &DomainModel, order: &DagOrder, now_ms: i64) -> Vec<TreeRow> {
     let mut prerequisites = HashMap::<RunId, Vec<RunId>>::new();
     let mut dependents = HashMap::<RunId, Vec<RunId>>::new();
     for edge in model.dependency_edges() {
@@ -182,7 +182,7 @@ pub(crate) fn build_rows(model: &DomainModel, order: &DagOrder) -> Vec<TreeRow> 
                 pane_id: None,
             },
             depth: 0,
-            label: task_run_label(model, run, false),
+            label: task_run_label(model, run, false, now_ms),
             prerequisites: neighbor_names(prerequisites.get(&run.run_id)),
             dependents: neighbor_names(dependents.get(&run.run_id)),
         })
@@ -502,7 +502,7 @@ mod tests {
         let mut order = DagOrder::default();
         order.recompute(&model);
 
-        let rows = super::build_rows(&model, &order);
+        let rows = super::build_rows(&model, &order, 0);
 
         assert_eq!(rows.len(), model.task_runs().count());
         assert!(
@@ -518,10 +518,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(
-            dependent.label,
-            "Task Run: D [queued] [dispatched by: Dispatcher]"
-        );
+        assert_eq!(dependent.label, "D D [queued] [dispatched by: Dispatcher]");
         assert_eq!(dependent.prerequisites, ["Q", "P"]);
         assert_eq!(dependent.dependents, ["Z1", "Z2"]);
         let second_hop = rows
@@ -555,7 +552,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(unlinked.label, "Task Run: U [queued] [unlinked]");
+        assert_eq!(unlinked.label, "U U [queued] [unlinked]");
     }
 
     #[test]

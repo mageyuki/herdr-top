@@ -863,7 +863,7 @@ pub(crate) fn build_uncollapsed_rows(model: &DomainModel, state: &AppState) -> V
 fn build_full_rows(model: &DomainModel, state: &AppState) -> Vec<TreeRow> {
     match state.view_mode() {
         ViewMode::ExecutionTree => build_tree_rows(model, state),
-        ViewMode::DependencyDag => dag::build_rows(model, state.dag_order()),
+        ViewMode::DependencyDag => dag::build_rows(model, state.dag_order(), state.now_ms()),
     }
 }
 
@@ -933,7 +933,7 @@ fn append_execution_tree_rows(rows: &mut Vec<TreeRow>, model: &DomainModel, stat
                     dependents: Vec::new(),
                 });
                 if let Some(runs) = pane_runs.remove(&pane.pane_id) {
-                    append_run_rows(rows, model, runs, Some(&pane.pane_id), 4);
+                    append_run_rows(rows, model, runs, Some(&pane.pane_id), 4, state.now_ms());
                 }
             }
         }
@@ -951,7 +951,7 @@ fn append_execution_tree_rows(rows: &mut Vec<TreeRow>, model: &DomainModel, stat
             .into_iter()
             .map(|run_id| (run_id, false))
             .collect();
-        append_run_rows(rows, model, runs, None, 2);
+        append_run_rows(rows, model, runs, None, 2, state.now_ms());
     }
 }
 
@@ -1028,6 +1028,7 @@ fn append_run_rows(
     runs: Vec<RunPlacement>,
     pane_id: Option<&str>,
     depth: usize,
+    now_ms: i64,
 ) {
     for (run_id, shared) in runs {
         let Some(run) = model.task_run(&run_id) else {
@@ -1039,7 +1040,7 @@ fn append_run_rows(
                 pane_id: pane_id.map(str::to_owned),
             },
             depth,
-            label: task_run_label(model, run, shared),
+            label: task_run_label(model, run, shared, now_ms),
             prerequisites: Vec::new(),
             dependents: Vec::new(),
         });
@@ -1149,12 +1150,13 @@ fn agent_node_label(agent: &AgentNode) -> String {
     )
 }
 
-pub(crate) fn task_run_label(model: &DomainModel, run: &TaskRun, shared: bool) -> String {
-    let mut label = format!(
-        "Task Run: {} [{}]",
-        run_name(run),
-        task_state_label(run.state)
-    );
+pub(crate) fn task_run_label(
+    model: &DomainModel,
+    run: &TaskRun,
+    shared: bool,
+    now_ms: i64,
+) -> String {
+    let mut label = run_row_label(model, run, now_ms);
     if shared {
         label.push_str(" [shared]");
     }
@@ -1177,6 +1179,93 @@ pub(crate) fn task_run_label(model: &DomainModel, run: &TaskRun, shared: bool) -
         label.push_str(" [unlinked]");
     }
     label
+}
+
+fn worker_kind_label(run: &TaskRun) -> String {
+    match &run.key {
+        RunKey::Native { provider, .. } | RunKey::NativePath { provider, .. } => {
+            provider_label(*provider).to_owned()
+        }
+        RunKey::Controller(name) => {
+            let label = name
+                .strip_prefix("hook:")
+                .and_then(|suffix| suffix.split_once(':').map(|(selector, _)| selector))
+                .unwrap_or(name);
+            safe_text(label)
+        }
+        RunKey::Provisional { .. } => "provisional".to_owned(),
+    }
+}
+
+fn newest_agent_node(model: &DomainModel, run_id: RunId) -> Option<&AgentNode> {
+    model
+        .agent_nodes()
+        .filter(|agent| agent.task_run_id == run_id)
+        .max_by(|left, right| {
+            (left.last_activity_at_ms, left.agent_node_id.as_str())
+                .cmp(&(right.last_activity_at_ms, right.agent_node_id.as_str()))
+        })
+}
+
+fn run_row_label(model: &DomainModel, run: &TaskRun, now_ms: i64) -> String {
+    let mut label = worker_kind_label(run);
+    let subject = run
+        .subject
+        .as_deref()
+        .map_or_else(|| run_name(run), safe_text);
+    if !subject.is_empty() {
+        label.push(' ');
+        label.push_str(&subject);
+    }
+
+    let newest_agent = newest_agent_node(model, run.run_id);
+    if !run.state.is_terminal()
+        && let Some(event_kind) = newest_agent.and_then(|agent| agent.last_event_kind.as_deref())
+    {
+        label.push_str(" — ");
+        label.push_str(&safe_text(event_kind));
+        if let Some(tool_name) = newest_agent.and_then(|agent| agent.last_tool_name.as_deref()) {
+            label.push_str(": ");
+            label.push_str(&safe_text(tool_name));
+        }
+    }
+    if let Some(model_id) = newest_agent.and_then(|agent| agent.model_id.as_deref()) {
+        label.push_str(" [model:");
+        label.push_str(&safe_text(model_id));
+        label.push(']');
+    }
+    label.push_str(&format!(" [{}]", task_state_label(run.state)));
+
+    let elapsed_ms = run.created_at_ms.and_then(|created_at_ms| {
+        let end_ms = if run.state.is_terminal() {
+            run.finished_at_ms?
+        } else {
+            now_ms
+        };
+        end_ms
+            .checked_sub(created_at_ms)
+            .filter(|elapsed_ms| *elapsed_ms >= 0)
+    });
+    if let Some(elapsed_ms) = elapsed_ms {
+        label.push_str(" · ");
+        label.push_str(&format_duration(elapsed_ms));
+    }
+    label
+}
+
+fn format_duration(elapsed_ms: i64) -> String {
+    let total_seconds = elapsed_ms / 1_000;
+    if total_seconds >= 3_600 {
+        let hours = total_seconds / 3_600;
+        let minutes = total_seconds % 3_600 / 60;
+        format!("{hours}h{minutes:02}m")
+    } else if total_seconds >= 60 {
+        let minutes = total_seconds / 60;
+        let seconds = total_seconds % 60;
+        format!("{minutes:02}m{seconds:02}s")
+    } else {
+        format!("{total_seconds:02}s")
+    }
 }
 
 fn run_name(run: &TaskRun) -> String {
@@ -1368,6 +1457,333 @@ mod tests {
             session_file: None,
         });
         model
+    }
+
+    fn label_run(
+        run_id: RunId,
+        key: RunKey,
+        state: TaskState,
+        created_at_ms: Option<i64>,
+        finished_at_ms: Option<i64>,
+        subject: Option<&str>,
+    ) -> TaskRun {
+        TaskRun {
+            run_id,
+            key,
+            display_ordinal: DisplayOrdinal::new(1),
+            state,
+            has_controller_task_state_event: true,
+            created_at_ms,
+            updated_at_ms: created_at_ms,
+            finished_at_ms,
+            subject: subject.map(str::to_owned),
+            dismissed_at_ms: None,
+        }
+    }
+
+    fn label_agent(
+        agent_node_id: &str,
+        run_id: RunId,
+        last_activity_at_ms: Option<i64>,
+        last_event_kind: Option<&str>,
+        last_tool_name: Option<&str>,
+        model_id: Option<&str>,
+    ) -> AgentNode {
+        AgentNode {
+            agent_node_id: agent_node_id.to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some(format!("native-{agent_node_id}")),
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(2),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Working),
+            model_id: model_id.map(str::to_owned),
+            last_event_kind: last_event_kind.map(str::to_owned),
+            last_tool_name: last_tool_name.map(str::to_owned),
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms,
+            session_file: None,
+        }
+    }
+
+    #[test]
+    fn task_run_rows_use_readable_fixed_time_grammar() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let cases = [
+            (
+                label_run(
+                    run_id,
+                    RunKey::Controller("hook:claude-code:S:task:T".to_owned()),
+                    TaskState::Running,
+                    Some(10_000),
+                    None,
+                    Some("Implement I7 Task 2 wire tolerance"),
+                ),
+                Some(label_agent(
+                    "agent-a",
+                    run_id,
+                    Some(1_032_000),
+                    Some("tool_use"),
+                    Some("Bash"),
+                    Some("gpt-5.6-sol"),
+                )),
+                1_033_000,
+                "claude-code Implement I7 Task 2 wire tolerance — tool_use: Bash [model:gpt-5.6-sol] [running] · 17m03s",
+            ),
+            (
+                label_run(
+                    run_id,
+                    RunKey::Controller("hook:claude-code:S:task:T".to_owned()),
+                    TaskState::Queued,
+                    None,
+                    None,
+                    None,
+                ),
+                None,
+                5_000,
+                "claude-code hook:claude-code:S:task:T [queued]",
+            ),
+            (
+                label_run(
+                    run_id,
+                    RunKey::Controller("hook:claude-code:S:task:T".to_owned()),
+                    TaskState::Completed,
+                    Some(10_000),
+                    Some(3_671_000),
+                    Some("Finish work"),
+                ),
+                Some(label_agent(
+                    "agent-a",
+                    run_id,
+                    Some(3_670_000),
+                    Some("tool_use"),
+                    Some("Bash"),
+                    Some("gpt-terminal"),
+                )),
+                9_000_000,
+                "claude-code Finish work [model:gpt-terminal] [completed] · 1h01m",
+            ),
+            (
+                label_run(
+                    run_id,
+                    RunKey::Controller("hook:claude-code:S:task:T".to_owned()),
+                    TaskState::Running,
+                    None,
+                    None,
+                    Some("No timing"),
+                ),
+                Some(label_agent(
+                    "agent-a",
+                    run_id,
+                    Some(5_000),
+                    Some("message"),
+                    None,
+                    None,
+                )),
+                5_000,
+                "claude-code No timing — message [running]",
+            ),
+            (
+                label_run(
+                    run_id,
+                    RunKey::Controller("hook:claude-code:S:task:T".to_owned()),
+                    TaskState::Running,
+                    Some(5_001),
+                    None,
+                    Some("Clock skew"),
+                ),
+                None,
+                5_000,
+                "claude-code Clock skew [running]",
+            ),
+        ];
+
+        for (run, agent, now_ms, expected) in cases {
+            let mut model = DomainModel::default();
+            model.insert_task_run(run.clone());
+            if let Some(agent) = agent {
+                model.insert_agent_node(agent);
+            }
+            assert_eq!(run_row_label(&model, &run, now_ms), expected);
+        }
+    }
+
+    #[test]
+    fn newest_agent_activity_and_model_use_deterministic_recency_order() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let run = label_run(
+            run_id,
+            RunKey::Controller("hook:claude-code:S:task:T".to_owned()),
+            TaskState::Running,
+            None,
+            None,
+            Some("Tie break"),
+        );
+        let older = label_agent(
+            "agent-z",
+            run_id,
+            Some(99),
+            Some("older"),
+            None,
+            Some("model-older"),
+        );
+        let newer = label_agent(
+            "agent-a",
+            run_id,
+            Some(100),
+            Some("newer"),
+            Some("Read"),
+            Some("model-newer"),
+        );
+        let tied_low = label_agent(
+            "agent-a",
+            run_id,
+            Some(100),
+            Some("tie-low"),
+            None,
+            Some("model-low"),
+        );
+        let tied_high = label_agent(
+            "agent-z",
+            run_id,
+            Some(100),
+            Some("tie-high"),
+            Some("Bash"),
+            Some("model-high"),
+        );
+
+        let mut recency_model = DomainModel::default();
+        recency_model.insert_task_run(run.clone());
+        recency_model.insert_agent_node(older);
+        recency_model.insert_agent_node(newer);
+        assert_eq!(
+            run_row_label(&recency_model, &run, 1_000),
+            "claude-code Tie break — newer: Read [model:model-newer] [running]"
+        );
+
+        for agents in [
+            [tied_low.clone(), tied_high.clone()],
+            [tied_high.clone(), tied_low.clone()],
+        ] {
+            let mut tie_model = DomainModel::default();
+            tie_model.insert_task_run(run.clone());
+            for agent in agents {
+                tie_model.insert_agent_node(agent);
+            }
+            for _ in 0..8 {
+                assert_eq!(
+                    run_row_label(&tie_model, &run, 1_000),
+                    "claude-code Tie break — tie-high: Bash [model:model-high] [running]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn task_run_annotations_follow_the_new_head_in_existing_order() {
+        let parent_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let child_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let orphan_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        let parent = label_run(
+            parent_id,
+            RunKey::Controller("Parent".to_owned()),
+            TaskState::Running,
+            None,
+            None,
+            Some("Parent subject"),
+        );
+        let child = label_run(
+            child_id,
+            RunKey::Controller("hook:claude-code:S:task:T".to_owned()),
+            TaskState::Running,
+            None,
+            None,
+            Some("Shared child"),
+        );
+        let orphan = label_run(
+            orphan_id,
+            RunKey::Controller("hook:codex:S:task:U".to_owned()),
+            TaskState::Queued,
+            None,
+            None,
+            Some("Orphan"),
+        );
+        let mut model = DomainModel::default();
+        for run in [&parent, &child, &orphan] {
+            model.insert_task_run(run.clone());
+        }
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: parent_id,
+            child_run_id: child_id,
+        });
+
+        assert_eq!(
+            task_run_label(&model, &child, true, 10),
+            "claude-code Shared child [running] [shared] [dispatched by: Parent]"
+        );
+        assert_eq!(
+            task_run_label(&model, &orphan, false, 10),
+            "codex Orphan [queued] [unlinked]"
+        );
+    }
+
+    #[test]
+    fn duration_formatter_uses_fixed_boundaries() {
+        for (elapsed_ms, expected) in [
+            (7_000, "07s"),
+            (59_000, "59s"),
+            (60_000, "01m00s"),
+            (3_599_000, "59m59s"),
+            (3_600_000, "1h00m"),
+            (443_100_000, "123h05m"),
+        ] {
+            assert_eq!(format_duration(elapsed_ms), expected);
+        }
+    }
+
+    #[test]
+    fn worker_kind_labels_follow_key_variants_and_escape_controller_text() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        for (key, expected) in [
+            (
+                RunKey::Native {
+                    provider: Provider::Claude,
+                    sid: "native".to_owned(),
+                },
+                "Claude",
+            ),
+            (
+                RunKey::NativePath {
+                    provider: Provider::Codex,
+                    path: "/private/path".to_owned(),
+                },
+                "Codex",
+            ),
+            (
+                RunKey::Controller("hook:claude-code:S:task:T".to_owned()),
+                "claude-code",
+            ),
+            (
+                RunKey::Controller("not-a-hook\nname".to_owned()),
+                "not-a-hook\\nname",
+            ),
+            (
+                RunKey::Controller("hook:missing-second-colon".to_owned()),
+                "hook:missing-second-colon",
+            ),
+            (
+                RunKey::Provisional {
+                    terminal_id: "terminal".to_owned(),
+                    start_ms: 1,
+                    seq: 2,
+                },
+                "provisional",
+            ),
+        ] {
+            let run = label_run(run_id, key, TaskState::Running, None, None, None);
+            assert_eq!(worker_kind_label(&run), expected);
+        }
     }
 
     fn app(model: DomainModel, quality: ObservationQuality, session: &str) -> App {
@@ -1581,9 +1997,9 @@ mod tests {
             .unwrap();
         let run_x = rows
             .iter()
-            .find(|row| row.contains("Task Run: Codex controller"))
+            .find(|row| row.contains("Codex Codex controller"))
             .unwrap()
-            .find("Task Run: Codex controller")
+            .find("Codex Codex controller")
             .unwrap();
         let agent_x = rows
             .iter()
@@ -1715,9 +2131,9 @@ mod tests {
         rows[tree_start..activity_start]
             .iter()
             .filter_map(|row| {
-                if row.contains("Task Run:") && row.contains("ordinal-first") {
+                if row.contains("ordinal-first ordinal-first") {
                     Some("ordinal-first")
-                } else if row.contains("Task Run:") && row.contains("lexical-first") {
+                } else if row.contains("lexical-first lexical-first") {
                     Some("lexical-first")
                 } else {
                     None
@@ -2082,11 +2498,11 @@ mod tests {
         };
         let prerequisite_row = rows
             .iter()
-            .find(|row| row.contains("Task Run: 前提🙂"))
+            .find(|row| row.contains("前提🙂 前提🙂"))
             .unwrap();
         let dependent_row = rows
             .iter()
-            .find(|row| row.contains("Task Run: 依存先🙂with-a-long-tail"))
+            .find(|row| row.contains("依存先🙂with-a-long-tail 依存先🙂with-a-long-tail"))
             .unwrap();
         let prerequisite_columns = columns(prerequisite_row);
         let dependent_columns = columns(dependent_row);
@@ -2099,8 +2515,8 @@ mod tests {
         assert!(!dependent_columns[2].contains("前提"));
 
         let initial_activity = rows.iter().find(|row| row.contains("Selected:")).unwrap();
-        assert!(initial_activity.contains("Selected: Task Run: 依存先🙂with-a-long-tail"));
-        assert!(!initial_activity.contains("Selected: Task Run: 前提🙂"));
+        assert!(initial_activity.contains("Selected: 依存先🙂with-a-long-tail"));
+        assert!(!initial_activity.contains("Selected: 前提🙂"));
 
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(
@@ -2115,8 +2531,8 @@ mod tests {
             .iter()
             .find(|row| row.contains("Selected:"))
             .unwrap();
-        assert!(moved_activity.contains("Selected: Task Run: 前提🙂"));
-        assert!(!moved_activity.contains("Selected: Task Run: 依存先"));
+        assert!(moved_activity.contains("Selected: 前提🙂"));
+        assert!(!moved_activity.contains("Selected: 依存先"));
 
         let minimum_rows = render(&app, 48, 18);
         let screen = minimum_rows.join("\n");
@@ -2126,7 +2542,7 @@ mod tests {
         assert!(screen.contains("Prereqs"));
         assert!(screen.contains("Dependents"));
         assert!(screen.contains("前提"));
-        assert!(screen.contains("Selected: Task Run: 前提"));
+        assert!(screen.contains("Selected: 前提"));
         for row in &minimum_rows {
             assert!(
                 Line::raw(row.as_str()).width() <= 48,
@@ -2166,8 +2582,10 @@ mod tests {
         let visible_run_names = |rows: &[String]| {
             rows[3..9]
                 .iter()
-                .filter_map(|row| row.split("Task Run: ").nth(1))
-                .filter_map(|suffix| suffix.split_whitespace().next())
+                .filter_map(|row| {
+                    row.split_whitespace()
+                        .find(|field| field.starts_with("run-"))
+                })
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         };
@@ -2291,18 +2709,18 @@ mod tests {
             assert!(screen.contains("D4:0"));
             match mode {
                 ViewMode::ExecutionTree => {
-                    assert!(screen.contains("native agent") || screen.contains("Task Run:"));
+                    assert!(screen.contains("native agent") || screen.contains("[running]"));
                     assert!(
                         rows[4..=6]
                             .iter()
-                            .any(|row| row.contains("Task Run: Codex controller")),
+                            .any(|row| row.contains("Codex Codex controller")),
                         "the 48x14 tree body must contain its known Task Run row"
                     );
                 }
                 ViewMode::DependencyDag => {
                     assert!(rows[4].contains("Task Run"));
                     assert!(
-                        rows[5].contains("Task Run: Codex c"),
+                        rows[5].contains("Codex Codex c"),
                         "the 48x14 DAG data coordinate must contain its known Task Run"
                     );
                 }

@@ -2782,6 +2782,105 @@ mod tests {
     }
 
     #[test]
+    fn idle_without_visible_live_duration_never_rebuilds_or_zero_polls() {
+        let live = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let clock = TestClock::at(0);
+        let (mut app, _senders) = app_with_runtime(
+            model_with_runs(&[(live, "live", 1, TaskState::Running)]),
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+        assert_eq!(app.next_expiry_ms(), None);
+        app.reset_projection_build_count();
+        let limiter = FrameLimiter::default();
+
+        for now_ms in (1..=25).map(|seconds| seconds * 1_000) {
+            clock.set(now_ms);
+            assert!(!app.refresh_if_changed().unwrap());
+            assert!(app.poll_duration(&limiter, false, Duration::ZERO) > Duration::ZERO);
+        }
+        assert_eq!(app.projection_build_count(), 0);
+    }
+
+    #[test]
+    fn live_duration_deadline_refreshes_through_cached_watch_path_and_advances_label() {
+        let live = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut model = model_with_runs(&[(live, "live", 1, TaskState::Running)]);
+        let mut timed = model.task_run(&live).unwrap().clone();
+        timed.created_at_ms = Some(0);
+        timed.updated_at_ms = Some(0);
+        timed.subject = Some("Visible work".to_owned());
+        model.insert_task_run(timed);
+        let clock = TestClock::at(7_000);
+        let (mut app, senders) = app_with_runtime(
+            model,
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+        let run_label = |app: &App| {
+            view::build_rows(app.model(), app.state())
+                .into_iter()
+                .find(|row| row.key.run_id() == Some(live))
+                .unwrap()
+                .label
+        };
+        assert!(run_label(&app).contains(" · 07s"));
+        assert_eq!(app.next_expiry_ms(), Some(8_000));
+        app.reset_projection_build_count();
+
+        senders
+            .operator
+            .send(empty_operator(HashMap::new()))
+            .unwrap();
+        assert!(app.operator_receiver.has_changed().unwrap());
+        clock.set(8_000);
+        assert!(app.refresh_if_changed().unwrap());
+        assert_eq!(app.projection_build_count(), 1);
+        assert!(!app.operator_receiver.has_changed().unwrap());
+        assert!(run_label(&app).contains(" · 08s"));
+        assert_eq!(app.next_expiry_ms(), Some(9_000));
+        assert!(
+            app.poll_duration(&FrameLimiter::default(), false, Duration::ZERO) > Duration::ZERO,
+            "the refreshed duration deadline must be strictly in the future"
+        );
+    }
+
+    #[test]
+    fn live_duration_bounds_poll_and_terminal_transition_disarms_cadence() {
+        let live = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut live_model = model_with_runs(&[(live, "live", 1, TaskState::Running)]);
+        let mut timed = live_model.task_run(&live).unwrap().clone();
+        timed.created_at_ms = Some(0);
+        timed.updated_at_ms = Some(0);
+        live_model.insert_task_run(timed);
+        let clock = TestClock::at(7_000);
+        let (mut app, senders) = app_with_runtime(
+            live_model.clone(),
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+        let limiter = FrameLimiter::default();
+
+        assert_eq!(app.next_expiry_ms(), Some(8_000));
+        let poll = app.poll_duration(&limiter, false, Duration::ZERO);
+        assert!(poll > Duration::ZERO);
+        assert!(poll <= Duration::from_secs(1));
+
+        let mut terminal = live_model.task_run(&live).unwrap().clone();
+        terminal.state = TaskState::Completed;
+        terminal.updated_at_ms = Some(8_000);
+        terminal.finished_at_ms = Some(8_000);
+        live_model.insert_task_run(terminal);
+        senders.model.send(Arc::new(live_model)).unwrap();
+        clock.set(8_000);
+        assert!(app.refresh_if_changed().unwrap());
+        assert_eq!(app.next_expiry_ms(), None);
+    }
+
+    #[test]
     fn hook_only_expiry_uses_cached_deadline_without_advance_clock() {
         let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let updated_at_ms = 100;
@@ -2793,7 +2892,7 @@ mod tests {
             display_ordinal: DisplayOrdinal::new(1),
             state: TaskState::Running,
             has_controller_task_state_event: true,
-            created_at_ms: Some(updated_at_ms),
+            created_at_ms: None,
             updated_at_ms: Some(updated_at_ms),
             finished_at_ms: None,
             subject: None,
@@ -3032,7 +3131,7 @@ mod tests {
                 pane_id: None,
             })
         );
-        assert!(render(&app).contains("Selected: Task Run: first"));
+        assert!(render(&app).contains("Selected: first first"));
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.state().view_mode(), ViewMode::ExecutionTree);
@@ -3271,8 +3370,8 @@ mod tests {
         let following_rows = render_lines(&following, 100, 14);
         let following_view = following_rows[3..9].join("\n");
         assert!(following_view.contains("Dependency DAG"));
-        assert!(!following_view.contains("> Task Run: run-0"));
-        assert!(following_view.contains("Task Run: run-7"));
+        assert!(!following_view.contains("> run-0 run-0"));
+        assert!(following_view.contains("run-7 run-7"));
 
         let (mut manual, _sender) = app_with_model(model_with_runs(&input));
         manual.state.follow = false;
@@ -3283,7 +3382,7 @@ mod tests {
         manual.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let manual_rows = render_lines(&manual, 100, 14);
         let manual_view = manual_rows[3..9].join("\n");
-        assert!(manual_view.contains("> Task Run: run-0"));
+        assert!(manual_view.contains("> run-0 run-0"));
     }
 
     #[test]
