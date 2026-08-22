@@ -30,6 +30,8 @@ jobs:
         run: cargo +stable fmt --all -- --check
       - name: Run Clippy
         run: cargo +stable clippy --locked --all-targets --all-features -- -D warnings
+      - name: Featureless check (no default or optional features)
+        run: cargo +stable check --locked --all-targets
 
   test:
     name: test (${{ matrix.os }})

@@ -6995,6 +6995,7 @@ fn section15_selected_evidence_is_reopened_and_rederived() {
     );
 }
 
+#[cfg(feature = "workload-harness")]
 #[test]
 fn section15_selected_paths_reject_absolute_noncanonical_spelling() {
     // Break caught: `Path::components` normalizes `.` before the structural

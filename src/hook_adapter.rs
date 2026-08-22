@@ -22,6 +22,33 @@ pub struct HookPayload {
     pub task_subject: Option<String>,
 }
 
+/// Longest accepted hook-provided identifier, in bytes. Observed provider
+/// identifiers (UUIDs, prefixed hex ids) stay far below this; the cap bounds
+/// run-id, event-id, and log growth from a misbehaving hook caller.
+pub const HOOK_IDENTIFIER_MAX_BYTES: usize = 128;
+
+/// Rejects hook payloads whose identifiers exceed the byte cap. The error
+/// names the field and length but never echoes identifier content.
+#[allow(clippy::collapsible_if)]
+pub fn validate_hook_identifiers(payload: &HookPayload) -> Result<(), String> {
+    let fields = [
+        ("session_id", Some(payload.session_id.as_str())),
+        ("agent_id", payload.agent_id.as_deref()),
+        ("task_id", payload.task_id.as_deref()),
+    ];
+    for (name, value) in fields {
+        if let Some(value) = value {
+            if value.len() > HOOK_IDENTIFIER_MAX_BYTES {
+                return Err(format!(
+                    "hook {name} is {} bytes, exceeding the {HOOK_IDENTIFIER_MAX_BYTES}-byte cap",
+                    value.len()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn map_hook_payload(
     provider: HookProvider,
     payload: &HookPayload,
@@ -156,7 +183,10 @@ pub fn map_hook_payload(
 
 #[cfg(test)]
 mod tests {
-    use super::{HookPayload, HookProvider, map_hook_payload};
+    use super::{
+        HOOK_IDENTIFIER_MAX_BYTES, HookPayload, HookProvider, map_hook_payload,
+        validate_hook_identifiers,
+    };
     use crate::herdr::controller::ControllerEnvelope;
     use crate::model::sanitize_controller_text;
     use serde_json::json;
@@ -170,6 +200,49 @@ mod tests {
             "session_id": "session-123"
         }))
         .expect("test hook payload should deserialize")
+    }
+
+    fn payload_with(session: &str, agent: Option<&str>, task: Option<&str>) -> HookPayload {
+        HookPayload {
+            hook_event_name: "SessionStart".to_owned(),
+            session_id: session.to_owned(),
+            source: None,
+            agent_id: agent.map(str::to_owned),
+            agent_type: None,
+            task_id: task.map(str::to_owned),
+            task_subject: None,
+        }
+    }
+
+    #[test]
+    fn i7_identifiers_at_the_cap_are_accepted() {
+        let max = "a".repeat(HOOK_IDENTIFIER_MAX_BYTES);
+        let payload = payload_with(&max, Some(&max), Some(&max));
+        assert_eq!(validate_hook_identifiers(&payload), Ok(()));
+    }
+
+    #[test]
+    fn i7_oversized_identifiers_are_rejected_per_field() {
+        let over = "a".repeat(HOOK_IDENTIFIER_MAX_BYTES + 1);
+        let session = payload_with(&over, None, None);
+        let error = validate_hook_identifiers(&session).unwrap_err();
+        assert!(error.contains("session_id"), "{error}");
+        assert!(error.contains("129"), "{error}");
+        assert!(!error.contains(&over), "must not echo the identifier");
+
+        let agent = payload_with("s", Some(&over), None);
+        assert!(
+            validate_hook_identifiers(&agent)
+                .unwrap_err()
+                .contains("agent_id")
+        );
+
+        let task = payload_with("s", None, Some(&over));
+        assert!(
+            validate_hook_identifiers(&task)
+                .unwrap_err()
+                .contains("task_id")
+        );
     }
 
     fn envelope(

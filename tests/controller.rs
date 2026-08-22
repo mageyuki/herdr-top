@@ -1555,6 +1555,39 @@ async fn emit_from_hook_continues_after_stale_event_with_fresh_invocation_metada
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn emit_from_hook_oversized_identifier_is_ignored_without_delivery() {
+    let (runtime_base, _runtime, listener) = scripted_emit_listener();
+    let (done_sender, done_receiver) = oneshot::channel();
+    let server = tokio::spawn(serve_captured_responses_until_done(
+        listener,
+        Vec::new(),
+        done_receiver,
+    ));
+    let runtime_path = runtime_base.path().to_path_buf();
+    let payload = serde_json::to_vec(&json!({
+        "hook_event_name": "SessionStart",
+        "session_id": "a".repeat(129)
+    }))
+    .unwrap();
+    let output = tokio::task::spawn_blocking(move || {
+        hook_emit_command(&runtime_path, false, "claude-code", payload)
+    })
+    .await
+    .unwrap();
+    done_sender.send(()).unwrap();
+
+    assert!(output.status.success(), "{}", output_text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("exceeding the 128-byte cap"), "{stderr}");
+
+    let envelopes = server.await.unwrap();
+    assert!(
+        envelopes.is_empty(),
+        "oversized identifier must not be sent"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn emit_from_hook_malformed_or_oversized_input_is_ignored_without_delivery() {
     let cases = [
         ("non-json", b"not-json".to_vec()),

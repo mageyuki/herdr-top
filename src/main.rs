@@ -202,6 +202,10 @@ async fn run_emit(cli: &Cli, args: &EmitArgs) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
         };
+        if let Err(reason) = hook_adapter::validate_hook_identifiers(&payload) {
+            eprintln!("herdr-top emit: warning: {reason}; ignored");
+            return ExitCode::SUCCESS;
+        }
         let emitted_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
