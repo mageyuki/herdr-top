@@ -30,7 +30,7 @@ For scripted or automated use, download the installer first so a failed
 download is detectable:
 
 ```sh
-f=$(mktemp) && curl --fail --location --silent --show-error https://raw.githubusercontent.com/mageyuki/herdr-top/main/install.sh -o "$f" && bash "$f"; rm -f "$f"
+(f=$(mktemp) && curl --fail --location --silent --show-error https://raw.githubusercontent.com/mageyuki/herdr-top/main/install.sh -o "$f" && bash "$f"; rc=$?; rm -f "$f"; exit "$rc")
 ```
 
 Then, from a pane inside the Herdr session you want to inspect:
@@ -120,10 +120,11 @@ build command is `scripts/fetch-release.sh`; its `top` pane is a tab titled
 
 - [TUI guide](docs/tui.md)
 - [CLI reference](docs/cli.md)
-- [Controller emit setup](docs/guides/controller-emit-setup.md) -- required for
-  task-level monitoring: the live tree of agent tasks, including headless
-  sub-agents, needs this integration; without it herdr-top shows the session
-  topology and pane-visible agents only.
+- [Controller emit setup](docs/guides/controller-emit-setup.md) -- adds
+  Controller task semantics to the tree: dispatch lineage (which session
+  launched which task), task subjects, and explicit lifecycle states. Without
+  it, herdr-top still shows the session topology, pane-visible agents, natively
+  discovered task runs, and provider-discovered sub-agent nodes.
 - [Release process](docs/guides/release-process.md)
 - [MVP design](docs/design/herdr-top-mvp.md)
 - [Design records (ADRs)](docs/adr/)
