@@ -23,6 +23,7 @@ use herdr_top::herdr::wire;
 use herdr_top::hook_adapter::{self, HookPayload};
 use herdr_top::lockfile::{self, LockError, OwnerRecord, StateRoot};
 use herdr_top::model::OperatorCommand;
+use herdr_top::provider::lane::parse_backfill_window_ms;
 use herdr_top::rendezvous::{self, RvError};
 use herdr_top::session_key::{self, ResolvedSession, SessionKeyError};
 use herdr_top::store::{self, StoreError, WriterError};
@@ -385,6 +386,12 @@ async fn run_monitor(cli: &Cli, plugin_state_dir: Option<&OsStr>) -> Result<(), 
     let resolved = resolve_session(cli)?;
     let root = lockfile::state_root(resolved.session_key())?;
     let occurrence_sink = initialize_tracing(&root)?;
+    let backfill_window_ms =
+        parse_backfill_window_ms(env::var_os("HERDR_TOP_BACKFILL_WINDOW_MS").as_deref());
+    tracing::info!(
+        backfill_window_ms,
+        "resolved provider log lane startup configuration"
+    );
     let (owner_lock, breadcrumb_status) =
         acquire_monitor_lock_with_plugin_dir(&root, plugin_state_dir)?;
     if let BreadcrumbLaunchStatus::Failed(error) = breadcrumb_status {

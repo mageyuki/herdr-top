@@ -26,6 +26,7 @@ pub mod claude_facts;
 pub mod codex;
 pub mod codex_facts;
 pub mod facts;
+pub mod lane;
 pub mod tail;
 
 pub use tail::{
@@ -629,7 +630,7 @@ fn discover_artifacts(root: &Path) -> io::Result<ArtifactDiscovery> {
                     continue;
                 }
             };
-            if kind.is_dir() {
+            if kind.is_dir() && entry.file_name() != OsStr::new("tool-results") {
                 directories.push(relative);
             } else if kind.is_file() && is_provider_artifact(&relative) {
                 found.push(relative);
@@ -1042,6 +1043,10 @@ impl ProviderDiagnostics {
     pub(crate) fn record_baseline_approximation(&self) {
         self.0.record_baseline_approximation();
     }
+    #[cfg(any(test, feature = "workload-harness"))]
+    pub(crate) fn record_admission_open_attempt(&self) {
+        self.0.record_admission_open_attempt();
+    }
     fn record_notify_creation_failure(&self) {
         self.0.record_notify_creation_failure();
     }
@@ -1091,6 +1096,11 @@ impl ProviderDiagnostics {
     #[must_use]
     pub fn baseline_approximations(&self) -> u64 {
         self.0.baseline_approximations()
+    }
+    #[cfg(any(test, feature = "workload-harness"))]
+    #[must_use]
+    pub fn admission_open_attempts(&self) -> u64 {
+        self.0.admission_open_attempts()
     }
     #[must_use]
     pub fn notify_creation_failures(&self) -> u64 {
@@ -1776,6 +1786,23 @@ fn open_contained_regular_file(root: &Path, relative: &Path) -> io::Result<File>
         ));
     }
     Ok(File::from(file))
+}
+
+/// Admission seam that Task 5 routes the existing provider worker through before opening.
+pub(crate) fn open_admitted_regular_file(
+    root: &Path,
+    relative: &Path,
+    admission: &lane::Admission,
+    diagnostics: &ProviderDiagnostics,
+) -> io::Result<Option<File>> {
+    if !admission.is_admitted_path(&root.join(relative)) {
+        return Ok(None);
+    }
+    #[cfg(any(test, feature = "workload-harness"))]
+    diagnostics.record_admission_open_attempt();
+    #[cfg(not(any(test, feature = "workload-harness")))]
+    let _ = diagnostics;
+    open_contained_regular_file(root, relative).map(Some)
 }
 
 fn path_cstring(path: &Path) -> io::Result<CString> {

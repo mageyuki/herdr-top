@@ -306,6 +306,13 @@ impl ProviderDiagnostics {
         self.handle.baseline_approximations()
     }
 
+    /// Admission-approved provider file opens attempted by instrumented builds.
+    #[cfg(any(test, feature = "workload-harness"))]
+    #[must_use]
+    pub fn admission_open_attempts(&self) -> u64 {
+        self.handle.admission_open_attempts()
+    }
+
     /// Notify backends that failed creation and fell back to periodic polling.
     #[must_use]
     pub fn notify_creation_failures(&self) -> u64 {
@@ -342,6 +349,8 @@ pub struct ProviderDiagnosticsHandle {
     malformed_records: Arc<AtomicU64>,
     watch_cap_fallbacks: Arc<AtomicU64>,
     baseline_approximations: Arc<AtomicU64>,
+    #[cfg(any(test, feature = "workload-harness"))]
+    admission_open_attempts: Arc<AtomicU64>,
     notify_creation_failures: Arc<AtomicU64>,
     provider_cycles: Arc<AtomicU64>,
     provider_io_errors: Arc<AtomicU64>,
@@ -393,6 +402,12 @@ impl ProviderDiagnosticsHandle {
     /// Records one late or first-scan-approximated root baseline.
     pub fn record_baseline_approximation(&self) {
         Self::increment(&self.baseline_approximations);
+    }
+
+    /// Records one admission-approved attempt to open a provider artifact.
+    #[cfg(any(test, feature = "workload-harness"))]
+    pub fn record_admission_open_attempt(&self) {
+        Self::increment(&self.admission_open_attempts);
     }
 
     /// Records one notify backend creation failure handled by polling fallback.
@@ -456,6 +471,12 @@ impl ProviderDiagnosticsHandle {
     #[must_use]
     pub fn baseline_approximations(&self) -> u64 {
         self.baseline_approximations.load(Ordering::Relaxed)
+    }
+
+    #[cfg(any(test, feature = "workload-harness"))]
+    #[must_use]
+    pub fn admission_open_attempts(&self) -> u64 {
+        self.admission_open_attempts.load(Ordering::Relaxed)
     }
 
     #[must_use]
