@@ -18,14 +18,16 @@ use herdr_top::model::{
 use herdr_top::reducer::{ApplyOutcome, Reducer};
 use herdr_top::store::{PersistOp, RestoredState, open_reader, open_writer};
 #[cfg(feature = "workload-harness")]
-use herdr_top::tui::app::{App, HeaderInputs, WorkloadFrameDriver, WorkloadFrameObservation};
+use herdr_top::tui::app::{
+    App, Clock, HeaderInputs, WorkloadFrameDriver, WorkloadFrameObservation,
+};
 #[cfg(feature = "workload-harness")]
 use ratatui::Terminal;
 #[cfg(feature = "workload-harness")]
 use ratatui::backend::TestBackend;
 
 #[cfg(feature = "workload-harness")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 #[cfg(feature = "workload-harness")]
 use std::sync::{Arc, Mutex};
 
@@ -67,6 +69,18 @@ static WORKLOAD_RECEIPT_TIME_BASE_MS: std::sync::LazyLock<i64> = std::sync::Lazy
 });
 
 #[cfg(feature = "workload-harness")]
+struct AtomicEpochClock {
+    milliseconds: Arc<AtomicI64>,
+}
+
+#[cfg(feature = "workload-harness")]
+impl Clock for AtomicEpochClock {
+    fn now_ms(&self) -> i64 {
+        self.milliseconds.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(feature = "workload-harness")]
 fn frame_driver_for_times(
     millis: &[u64],
 ) -> (
@@ -79,22 +93,31 @@ fn frame_driver_for_times(
         .flat_map(|millis| [Duration::from_millis(*millis); 2])
         .collect::<Vec<_>>();
     let mut clock_values = clock_values.into_iter();
+    let epoch_milliseconds = Arc::new(AtomicI64::new(0));
     let (model_sender, model_receiver) =
         tokio::sync::watch::channel(std::sync::Arc::new(DomainModel::default()));
     let (performance_sender, performance) =
         tokio::sync::watch::channel(stamped_publication(0, 0, ObservationQuality::Live, []));
-    let app = App::new(
+    let app = App::with_clock(
         model_receiver,
         HeaderInputs {
             performance,
             ..HeaderInputs::default()
         },
+        Arc::new(AtomicEpochClock {
+            milliseconds: Arc::clone(&epoch_milliseconds),
+        }),
     );
     let terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     let driver = WorkloadFrameDriver::new(app, terminal, move || {
-        clock_values
+        let now = clock_values
             .next()
-            .expect("fixed workload clock must cover every limiter read")
+            .expect("fixed workload clock must cover every limiter read");
+        epoch_milliseconds.store(
+            i64::try_from(now.as_millis()).unwrap_or(i64::MAX),
+            Ordering::SeqCst,
+        );
+        now
     });
     (driver, model_sender, performance_sender)
 }

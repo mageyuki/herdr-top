@@ -554,6 +554,30 @@ impl App {
         Self::with_operator_commands(model_receiver, operator_commands, header)
     }
 
+    /// Creates an application with an injectable clock and no collector command path.
+    #[must_use]
+    pub fn with_clock(
+        model_receiver: SharedModel,
+        header: HeaderInputs,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        let (operator_commands, operator_command_receiver) = tokio::sync::mpsc::channel(1);
+        drop(operator_command_receiver);
+        debug_assert!(operator_commands.is_closed());
+        let (_diagnostics_sender, diagnostics_receiver) =
+            tokio::sync::watch::channel(default_diagnostics());
+        let (_operator_sender, operator_receiver) = tokio::sync::watch::channel(default_operator());
+        Self::with_operator_commands_and_inputs(
+            model_receiver,
+            operator_commands,
+            header,
+            diagnostics_receiver,
+            operator_receiver,
+            TuiSetup::default(),
+            clock,
+        )
+    }
+
     /// Creates an application with a bounded command path to the collector.
     #[must_use]
     pub fn with_operator_commands(
