@@ -19,6 +19,13 @@ curl --fail --location --silent --show-error \
   https://raw.githubusercontent.com/mageyuki/herdr-top/main/install.sh | bash
 ```
 
+For scripted or automated use, download the installer first so a failed
+download is detectable:
+
+```sh
+curl --fail --location --silent --show-error https://raw.githubusercontent.com/mageyuki/herdr-top/main/install.sh -o /tmp/herdr-top-install.sh && bash /tmp/herdr-top-install.sh
+```
+
 Then, from a pane inside the Herdr session you want to inspect:
 
 ```sh

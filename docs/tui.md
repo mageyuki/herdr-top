@@ -22,7 +22,8 @@ The normal screen has four regions:
   selected row, selection recovery status, and the newest normalized activity
   item in the selected scope.
   Its first line uses `p:` for persistence, `ctl:` for Controller input, and
-  `D4:` for the dangling announcement count.
+  `D4:` for the count of dangling relationship-only components (a single
+  component may span several runs).
 - **Footer.** Shows controls that fit the current terminal width. Its wording
   distinguishes stopping herdr-top with `q` from detaching the Herdr client.
 
