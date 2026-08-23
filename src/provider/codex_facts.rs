@@ -14,14 +14,13 @@ use crate::model::sanitize_controller_text;
 
 use super::claude_facts::{parse_decimal, parse_timestamp_ms};
 use super::facts::{
-    CodexInternal, LogFact, SessionScope, repo_relative, sanitize_command_script, scan_raw_ids,
-    truncate_60,
+    ActivitySource, CodexInternal, LogFact, SessionScope, repo_relative, sanitize_command_script,
+    scan_raw_ids, truncate_60,
 };
 
 #[derive(Debug, Deserialize)]
 struct RecordEnvelope {
     timestamp: Option<String>,
-    ordinal: Option<u64>,
     #[serde(rename = "type")]
     record_type: Option<String>,
 }
@@ -33,7 +32,6 @@ struct SessionMetaEnvelope {
 
 #[derive(Debug, Deserialize)]
 struct SessionMetaPayload {
-    id: Option<String>,
     cwd: Option<String>,
     originator: Option<String>,
     cli_version: Option<String>,
@@ -204,7 +202,6 @@ struct TokenCountInfo {
 #[derive(Debug, Deserialize)]
 struct LastTokenUsage {
     output_tokens: Option<u64>,
-    reasoning_output_tokens: Option<u64>,
 }
 
 impl SessionSource {
@@ -274,9 +271,11 @@ impl<'de> Visitor<'de> for FirstAgentContentVisitor {
 /// Extracts allowlisted facts from one Codex rollout JSONL line.
 ///
 /// This function is stateless. It emits metadata for each `session_meta`
-/// record so a file-order consumer can retain the first record as identity.
+/// record so the Task 5 file-order consumer can retain the first record as
+/// identity. `record_ordinal` is the caller-maintained zero-based record index
+/// within the artifact.
 #[must_use]
-pub fn extract_codex_line(rollout_id: &str, line: &str) -> Vec<LogFact> {
+pub fn extract_codex_line(rollout_id: &str, record_ordinal: u64, line: &str) -> Vec<LogFact> {
     let scope = SessionScope::Codex {
         rollout_id: rollout_id.to_owned(),
     };
@@ -303,7 +302,7 @@ pub fn extract_codex_line(rollout_id: &str, line: &str) -> Vec<LogFact> {
         Some("session_meta") => extract_session_meta(rollout_id, line, &mut facts),
         Some("turn_context") => extract_turn_context(rollout_id, line, &mut facts),
         Some("event_msg") => {
-            extract_event(rollout_id, &scope, line, at_ms, record.ordinal, &mut facts)
+            extract_event(rollout_id, &scope, line, at_ms, record_ordinal, &mut facts)
         }
         _ => {}
     }
@@ -325,7 +324,7 @@ fn extract_session_meta(rollout_id: &str, line: &str, facts: &mut Vec<LogFact>) 
     let internal = payload.source.and_then(SessionSource::into_internal);
 
     facts.push(LogFact::CodexMeta {
-        rollout_id: payload.id.unwrap_or_else(|| rollout_id.to_owned()),
+        rollout_id: rollout_id.to_owned(),
         cwd,
         originator,
         internal,
@@ -361,7 +360,7 @@ fn extract_event(
     scope: &SessionScope,
     line: &str,
     at_ms: Option<i64>,
-    ordinal: Option<u64>,
+    record_ordinal: u64,
     facts: &mut Vec<LogFact>,
 ) {
     let Ok(envelope) = serde_json::from_str::<EventTypeEnvelope>(line) else {
@@ -375,7 +374,7 @@ fn extract_event(
         "task_started" => push_lifecycle(rollout_id, at_ms, facts, Lifecycle::Started),
         "task_complete" => push_lifecycle(rollout_id, at_ms, facts, Lifecycle::Complete),
         "turn_aborted" => push_lifecycle(rollout_id, at_ms, facts, Lifecycle::Aborted),
-        "token_count" => extract_token_count(scope, line, at_ms, ordinal, facts),
+        "token_count" => extract_token_count(scope, line, at_ms, record_ordinal, facts),
         "item_completed" => extract_item_completed(rollout_id, scope, line, at_ms, facts),
         _ => {}
     }
@@ -418,10 +417,10 @@ fn extract_token_count(
     scope: &SessionScope,
     line: &str,
     at_ms: Option<i64>,
-    ordinal: Option<u64>,
+    record_ordinal: u64,
     facts: &mut Vec<LogFact>,
 ) {
-    let (Some(at_ms), Some(ordinal)) = (at_ms, ordinal) else {
+    let Some(at_ms) = at_ms else {
         return;
     };
     let Ok(envelope) = serde_json::from_str::<TokenCountEnvelope>(line) else {
@@ -434,17 +433,14 @@ fn extract_token_count(
     else {
         return;
     };
-    let output_tokens = usage
-        .output_tokens
-        .unwrap_or_default()
-        .saturating_add(usage.reasoning_output_tokens.unwrap_or_default());
+    let output_tokens = usage.output_tokens.unwrap_or_default();
 
-    // Codex token_count records carry no turn_id. Ordinal is unique within the
-    // rollout and the SessionScope supplies the remaining sample identity.
+    // The caller-maintained record ordinal is unique only within this artifact;
+    // SessionScope supplies the remaining sample identity.
     facts.push(LogFact::Usage {
         scope: scope.clone(),
         at_ms,
-        sample_id: ordinal.to_string(),
+        sample_id: record_ordinal.to_string(),
         output_tokens,
         model: None,
         effort: None,
@@ -515,6 +511,7 @@ fn extract_agent_message(
     facts.push(LogFact::Activity {
         scope: scope.clone(),
         at_ms,
+        source: ActivitySource::Commentary,
         line: truncate_60(&sanitize_controller_text(&text)),
     });
 }
@@ -553,6 +550,7 @@ fn extract_command_execution(
         facts.push(LogFact::Activity {
             scope: scope.clone(),
             at_ms,
+            source: ActivitySource::Command,
             line,
         });
     }
@@ -595,9 +593,11 @@ mod tests {
     use serde::de::DeserializeOwned;
 
     use super::*;
-    use crate::provider::facts::{CodexInternal, LogFact, SessionScope};
+    use crate::provider::facts::{ActivitySource, CodexInternal, LogFact, SessionScope};
 
     const ROLLOUT: &str = "6f9bdfa0-1502-4a37-97aa-c45591141130";
+    const COMMENTARY_LINE: &str = "Cache report boundaries are under review.";
+    const NON_COMMENTARY_BODY_MARKER: &str = "Synthetic non-commentary cache report body marker";
 
     fn fixture(name: &str) -> String {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -609,7 +609,8 @@ mod tests {
     fn fixture_facts(name: &str, rollout_id: &str) -> Vec<LogFact> {
         fixture(name)
             .lines()
-            .flat_map(|line| extract_codex_line(rollout_id, line))
+            .enumerate()
+            .flat_map(|(index, line)| extract_codex_line(rollout_id, index as u64, line))
             .collect()
     }
 
@@ -617,11 +618,35 @@ mod tests {
     where
         T: Debug + DeserializeOwned,
     {
-        assert!(source.len() > 500, "source was only {} bytes", source.len());
+        assert_bounded_debug_with_min::<T>(source, 500, body_markers);
+    }
+
+    fn assert_bounded_debug_with_min<T>(
+        source: &str,
+        minimum_source_len: usize,
+        body_markers: &[&str],
+    ) where
+        T: Debug + DeserializeOwned,
+    {
         for marker in body_markers {
             assert!(source.contains(marker), "source lacks marker {marker:?}");
         }
 
+        let debug = debug_envelope_with_min::<T>(source, minimum_source_len);
+        for marker in body_markers {
+            assert!(!debug.contains(marker), "debug retained marker {marker:?}");
+        }
+    }
+
+    fn debug_envelope_with_min<T>(source: &str, minimum_source_len: usize) -> String
+    where
+        T: Debug + DeserializeOwned,
+    {
+        assert!(
+            source.len() > minimum_source_len,
+            "source was only {} bytes, expected more than {minimum_source_len}",
+            source.len()
+        );
         let envelope: T =
             serde_json::from_str(source).expect("allowlisted envelope must deserialize");
         let debug = format!("{envelope:?}");
@@ -631,13 +656,11 @@ mod tests {
             "debug representation was {} bytes",
             debug.len()
         );
-        for marker in body_markers {
-            assert!(!debug.contains(marker), "debug retained marker {marker:?}");
-        }
+        debug
     }
 
     #[test]
-    fn first_session_meta_wins_second_ignored() {
+    fn session_meta_records_surface_in_file_order() {
         let metas = fixture_facts("codex-internal-subagents.jsonl", "discovered-rollout")
             .into_iter()
             .filter(|fact| matches!(fact, LogFact::CodexMeta { .. }))
@@ -647,7 +670,7 @@ mod tests {
         assert_eq!(
             metas.first(),
             Some(&LogFact::CodexMeta {
-                rollout_id: "273e0c2b-4af4-4014-b24c-8b0d03ba8905".to_owned(),
+                rollout_id: "discovered-rollout".to_owned(),
                 cwd: "/home/user/git/example/herdr-top".to_owned(),
                 originator: "codex".to_owned(),
                 internal: Some(CodexInternal::ThreadSpawn {
@@ -658,9 +681,11 @@ mod tests {
                 cli_version: "0.149.0".to_owned(),
             })
         );
+        // The stateless extractor surfaces both; Task 5 enforces first-wins.
         assert!(matches!(
             metas.get(1),
-            Some(LogFact::CodexMeta { originator, .. }) if originator == "codex_cli"
+            Some(LogFact::CodexMeta { rollout_id, originator, .. })
+                if rollout_id == "discovered-rollout" && originator == "codex_cli"
         ));
     }
 
@@ -697,7 +722,7 @@ mod tests {
         let activities = fixture_facts("codex-exec.jsonl", ROLLOUT)
             .into_iter()
             .filter_map(|fact| match fact {
-                LogFact::Activity { line, .. } => Some(line),
+                LogFact::Activity { source, line, .. } => Some((source, line)),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -705,8 +730,14 @@ mod tests {
         assert_eq!(
             activities,
             vec![
-                "Cache report boundaries are under review.",
-                "cargo test --locked --test fictional_cache_report",
+                (
+                    ActivitySource::Commentary,
+                    "Cache report boundaries are under review.".to_owned(),
+                ),
+                (
+                    ActivitySource::Command,
+                    "cargo test --locked --test fictional_cache_report".to_owned(),
+                ),
             ]
         );
     }
@@ -746,8 +777,9 @@ mod tests {
         assert_eq!(
             usage,
             vec![
-                ("3".to_owned(), 150, None, None),
-                ("8".to_owned(), 350, None, None),
+                ("3".to_owned(), 120, None, None),
+                ("4".to_owned(), 80, None, None),
+                ("9".to_owned(), 250, None, None),
             ]
         );
         let total = usage.iter().map(|(_, tokens, _, _)| tokens).sum::<u64>();
@@ -760,9 +792,32 @@ mod tests {
             .last()
             .map(|(_, tokens, _, _)| *tokens)
             .expect("fixture has a last usage sample");
-        assert_eq!(total, 500);
+        assert_eq!(total, 450);
+        assert_ne!(total, 570);
         assert_ne!(total, max_sample);
         assert_ne!(total, last_sample);
+    }
+
+    #[test]
+    fn token_count_without_provider_ordinal_uses_record_ordinal() {
+        let line = r#"{"timestamp":"2026-08-24T03:00:00.100Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":120,"reasoning_output_tokens":30}}}}"#;
+        let usage = extract_codex_line(ROLLOUT, 41, line)
+            .into_iter()
+            .find(|fact| matches!(fact, LogFact::Usage { .. }));
+
+        assert_eq!(
+            usage,
+            Some(LogFact::Usage {
+                scope: SessionScope::Codex {
+                    rollout_id: ROLLOUT.to_owned(),
+                },
+                at_ms: 1_787_540_400_100,
+                sample_id: "41".to_owned(),
+                output_tokens: 120,
+                model: None,
+                effort: None,
+            })
+        );
     }
 
     #[test]
@@ -802,7 +857,7 @@ mod tests {
         let line = r#"{"timestamp":"2026-08-24T06:00:00.123Z","ordinal":14,"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"49986dbe-bd02-4b81-b8c5-91d5d0b2830c"}}"#;
 
         assert!(
-            extract_codex_line(ROLLOUT, line).contains(&LogFact::CodexTurnAborted {
+            extract_codex_line(ROLLOUT, 14, line).contains(&LogFact::CodexTurnAborted {
                 rollout_id: ROLLOUT.to_owned(),
                 at_ms: 1_787_551_200_123,
             })
@@ -814,11 +869,12 @@ mod tests {
         let line = r#"{"timestamp":"2026-08-24T02:00:02.000Z","ordinal":9,"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","process_id":"7","command":["/bin/bash","-lc","cargo test /home/user/git/example/herdr-top/src/provider/facts.rs"],"cwd":"file:///home/user/git/example/herdr-top"}}}"#;
 
         assert!(
-            extract_codex_line(ROLLOUT, line).contains(&LogFact::Activity {
+            extract_codex_line(ROLLOUT, 9, line).contains(&LogFact::Activity {
                 scope: SessionScope::Codex {
                     rollout_id: ROLLOUT.to_owned(),
                 },
                 at_ms: 1_787_536_802_000,
+                source: ActivitySource::Command,
                 line: "cargo test src/provider/facts.rs".to_owned(),
             })
         );
@@ -826,14 +882,21 @@ mod tests {
 
     #[test]
     fn bodies_never_enter_facts() {
-        let facts = [
+        let inputs = [
             "codex-exec.jsonl",
             "codex-exec-resume-appended.jsonl",
             "codex-internal-subagents.jsonl",
         ]
-        .into_iter()
-        .flat_map(|name| fixture_facts(name, ROLLOUT))
-        .collect::<Vec<_>>();
+        .map(fixture);
+        let facts = inputs
+            .iter()
+            .flat_map(|input| {
+                input
+                    .lines()
+                    .enumerate()
+                    .flat_map(|(index, line)| extract_codex_line(ROLLOUT, index as u64, line))
+            })
+            .collect::<Vec<_>>();
         let debug = format!("{facts:?}");
         let forbidden = [
             "cache_report_orders_normalized_names",
@@ -845,9 +908,14 @@ mod tests {
             "Synthetic fixture skill text",
             "Review the fictional cache report using only invented metadata",
             "Synthetic cache probe output: atlas fresh",
+            NON_COMMENTARY_BODY_MARKER,
         ];
 
         for marker in forbidden {
+            assert!(
+                inputs.iter().any(|input| input.contains(marker)),
+                "raw fixture input lacks body marker {marker:?}"
+            );
             assert!(
                 !debug.contains(marker),
                 "fact retained body marker {marker:?}"
@@ -893,7 +961,7 @@ mod tests {
 
         for line in [wrong_phase, multiline, overlong.as_str()] {
             assert!(
-                extract_codex_line(ROLLOUT, line)
+                extract_codex_line(ROLLOUT, 8, line)
                     .into_iter()
                     .all(|fact| !matches!(fact, LogFact::Activity { .. }))
             );
@@ -902,12 +970,12 @@ mod tests {
 
     #[test]
     fn unknown_and_malformed_records_skip_silently() {
-        let malformed = extract_codex_line(ROLLOUT, "not json");
+        let malformed = extract_codex_line(ROLLOUT, 0, "not json");
         assert!(malformed.is_empty());
 
         let unknown = r#"{"timestamp":"2026-08-24T02:00:00.005Z","ordinal":1,"type":"future_record","payload":{"private":"body"}}"#;
         assert_eq!(
-            extract_codex_line(ROLLOUT, unknown),
+            extract_codex_line(ROLLOUT, 1, unknown),
             vec![LogFact::Append {
                 scope: SessionScope::Codex {
                     rollout_id: ROLLOUT.to_owned(),
@@ -920,11 +988,18 @@ mod tests {
     #[test]
     fn record_envelope_debug_excludes_response_item_bodies() {
         let input = fixture("codex-exec.jsonl");
-        let line = input.lines().nth(10).expect("fixture has tool output");
+        let line = input.lines().nth(11).expect("fixture has tool output");
         assert_bounded_debug::<RecordEnvelope>(
             line,
             &["Synthetic cache probe output: atlas fresh"],
         );
+    }
+
+    #[test]
+    fn world_state_envelope_debug_stays_type_tag_only() {
+        let input = fixture("codex-exec.jsonl");
+        let line = input.lines().nth(1).expect("fixture has world state");
+        assert_bounded_debug::<RecordEnvelope>(line, &["Synthetic fixture skill text"]);
     }
 
     #[test]
@@ -947,35 +1022,74 @@ mod tests {
     #[test]
     fn event_type_envelope_debug_excludes_item_body() {
         let input = fixture("codex-exec.jsonl");
-        let line = input.lines().nth(9).expect("fixture has command output");
+        let line = input.lines().nth(10).expect("fixture has command output");
         assert_bounded_debug::<EventTypeEnvelope>(line, &["Synthetic diagnostic table"]);
     }
 
     #[test]
     fn item_type_envelope_debug_excludes_command_output() {
         let input = fixture("codex-exec.jsonl");
-        let line = input.lines().nth(9).expect("fixture has command output");
+        let line = input.lines().nth(10).expect("fixture has command output");
         assert_bounded_debug::<ItemTypeEnvelope>(line, &["Synthetic warning stream"]);
     }
 
     #[test]
     fn agent_message_envelope_debug_excludes_non_agent_item_body() {
         let input = fixture("codex-exec.jsonl");
-        let line = input.lines().nth(9).expect("fixture has command output");
-        assert_bounded_debug::<AgentMessageEnvelope>(line, &["Synthetic diagnostic table"]);
+        let line = input
+            .lines()
+            .nth(9)
+            .expect("fixture has non-commentary agent message");
+        assert_bounded_debug::<AgentMessageEnvelope>(line, &[NON_COMMENTARY_BODY_MARKER]);
     }
 
     #[test]
     fn agent_commentary_envelope_debug_excludes_non_agent_item_body() {
         let input = fixture("codex-exec.jsonl");
-        let line = input.lines().nth(9).expect("fixture has command output");
-        assert_bounded_debug::<AgentCommentaryEnvelope>(line, &["Synthetic diagnostic table"]);
+        let line = input.lines().nth(8).expect("fixture has commentary");
+        let debug = debug_envelope_with_min::<AgentCommentaryEnvelope>(line, 400);
+        assert!(
+            debug.contains(COMMENTARY_LINE),
+            "debug omitted authorized commentary {COMMENTARY_LINE:?}"
+        );
+        for marker in [
+            "cache_report_orders_normalized_names",
+            "Synthetic warning stream",
+            "summary: fresh=1 approaching=1 expired=1",
+            "Synthetic cache-report tests passed",
+            "Q2FjaGVSZXBvcnRTdGF0",
+            "Evaluate invented metadata for deterministic ordering",
+            "Synthetic fixture skill text",
+            "Review the fictional cache report using only invented metadata",
+            "Synthetic cache probe output: atlas fresh",
+            NON_COMMENTARY_BODY_MARKER,
+        ] {
+            assert!(!debug.contains(marker), "debug retained marker {marker:?}");
+        }
+    }
+
+    #[test]
+    fn non_commentary_agent_message_body_never_becomes_activity() {
+        let input = fixture("codex-exec.jsonl");
+        let line = input
+            .lines()
+            .nth(9)
+            .expect("fixture has non-commentary agent message");
+        assert!(line.contains(NON_COMMENTARY_BODY_MARKER));
+
+        let facts = extract_codex_line(ROLLOUT, 9, line);
+        assert!(
+            facts
+                .iter()
+                .all(|fact| !matches!(fact, LogFact::Activity { .. }))
+        );
+        assert!(!format!("{facts:?}").contains(NON_COMMENTARY_BODY_MARKER));
     }
 
     #[test]
     fn command_execution_envelope_debug_excludes_command_output() {
         let input = fixture("codex-exec.jsonl");
-        let line = input.lines().nth(9).expect("fixture has command output");
+        let line = input.lines().nth(10).expect("fixture has command output");
         assert_bounded_debug::<CommandExecutionEnvelope>(
             line,
             &[
@@ -989,7 +1103,7 @@ mod tests {
     #[test]
     fn token_count_envelope_debug_excludes_rate_limits() {
         let input = fixture("codex-exec.jsonl");
-        let line = input.lines().nth(11).expect("fixture has token count");
+        let line = input.lines().nth(12).expect("fixture has token count");
         assert_bounded_debug::<TokenCountEnvelope>(line, &["Synthetic cache review", "73.00"]);
     }
 }

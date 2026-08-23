@@ -5,7 +5,7 @@
     {
       "scope": "event_msg",
       "type": "item_completed",
-      "occurrences": 7
+      "occurrences": 8
     },
     {
       "scope": "event_msg",
@@ -20,12 +20,12 @@
     {
       "scope": "event_msg",
       "type": "token_count",
-      "occurrences": 3
+      "occurrences": 4
     },
     {
       "scope": "item_completed",
       "type": "AgentMessage",
-      "occurrences": 2
+      "occurrences": 3
     },
     {
       "scope": "item_completed",
@@ -55,7 +55,7 @@
     {
       "scope": "item_content",
       "type": "Text",
-      "occurrences": 2
+      "occurrences": 3
     },
     {
       "scope": "item_content",
@@ -65,7 +65,7 @@
     {
       "scope": "record",
       "type": "event_msg",
-      "occurrences": 18
+      "occurrences": 20
     },
     {
       "scope": "record",

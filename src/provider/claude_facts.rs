@@ -4,7 +4,9 @@ use serde::Deserialize;
 
 use crate::model::sanitize_controller_text;
 
-use super::facts::{LogFact, SessionScope, repo_relative, scan_raw_ids, truncate_60};
+use super::facts::{
+    ActivitySource, LogFact, SessionScope, repo_relative, scan_raw_ids, truncate_60,
+};
 
 #[derive(Deserialize)]
 struct RecordType {
@@ -166,6 +168,7 @@ fn extract_assistant(scope: &SessionScope, line: &str, facts: &mut Vec<LogFact>)
             facts.push(LogFact::Activity {
                 scope: scope.clone(),
                 at_ms,
+                source: ActivitySource::ToolUse,
                 line,
             });
         }
@@ -539,6 +542,7 @@ mod tests {
         assert!(facts.contains(&LogFact::Activity {
             scope: root_scope(),
             at_ms: 1_787_533_203_000,
+            source: ActivitySource::ToolUse,
             line: "Edit src/provider/facts.rs".to_owned(),
         }));
         assert_eq!(

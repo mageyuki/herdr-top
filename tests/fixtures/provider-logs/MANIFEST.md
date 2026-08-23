@@ -80,10 +80,11 @@ Mirrors one Codex exec rollout. It exercises the Codex read list:
 - per-turn `turn_context` model, effort, and sandbox policy;
 - `task_started`, `token_count`, and `task_complete` lifecycle and token
   records, including `last_token_usage` numerics; and
-- `item_completed` timing plus `UserMessage`, `Reasoning`, `AgentMessage`, and
-  `CommandExecution` item types.
+- `item_completed` timing plus `UserMessage`, `Reasoning`, commentary and
+  non-commentary `AgentMessage`, and `CommandExecution` item types.
 
-The commentary AgentMessage is a single 41-character line. The
+The commentary AgentMessage is a single 41-character line. A separate
+non-commentary AgentMessage carries a multi-kilobyte synthetic final body. The
 `item_completed` Reasoning item has the real tiny shape with empty
 `summary_text` and `raw_content` arrays. Separate `response_item` records carry
 the realistic multi-kilobyte reasoning `encrypted_content`, multi-kilobyte
@@ -107,7 +108,7 @@ model `gpt-5.6-terra` at effort `low`; the appended turn context uses model
 `gpt-5.6-sol` at effort `xhigh`. Each turn has its own `last_token_usage`, so a
 consumer can test per-turn token deltas and closure at `task_complete`.
 
-All three fixture `token_count` records carry a synthetic `rate_limits` subtree
+All four fixture `token_count` records carry a synthetic `rate_limits` subtree
 with plan, limit, credit, spend-control, primary, and secondary fields. The
 subtree is deliberately non-allowlisted so fixtures pin that rate-limit account
 state is never materialized.
@@ -130,12 +131,12 @@ rollout identity.
 
 The typed read fields above are the only fields intended for ordinary parsing.
 The fixtures also contain fields that must never be materialized: Claude user,
-assistant, thinking, prompt, command, and tool-result bodies; Codex user and
-reasoning bodies; `response_item` reasoning, custom-tool-output, and message
-bodies; `world_state`; the token-count `rate_limits` subtree; Codex command
-scripts; and CommandExecution `stdout`, `stderr`, `aggregated_output`, and
-formatted output. Files under `tool-results/` are outside this fixture set
-because those directories must never be opened.
+assistant, thinking, prompt, command, and tool-result bodies; Codex user,
+non-commentary AgentMessage, and reasoning bodies; `response_item` reasoning,
+custom-tool-output, and message bodies; `world_state`; the token-count
+`rate_limits` subtree; Codex command scripts; and CommandExecution `stdout`,
+`stderr`, `aggregated_output`, and formatted output. Files under `tool-results/`
+are outside this fixture set because those directories must never be opened.
 
 Three narrowly bounded pattern-only cases are present: discovered-id and
 `CLAUDE_CONFIG_DIR=` extraction from raw Claude lines, `task-id` and `status`

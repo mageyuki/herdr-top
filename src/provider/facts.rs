@@ -41,7 +41,7 @@ pub enum LogFact {
     },
     /// Identity metadata reported by a Codex rollout.
     CodexMeta {
-        /// Rollout ID named by the metadata record.
+        /// Rollout ID of the artifact being read.
         rollout_id: String,
         /// Raw Codex working directory, which may be a `file://` URI.
         cwd: String,
@@ -115,22 +115,27 @@ pub enum LogFact {
         /// Whether the reported status was not completed.
         failed: bool,
     },
-    /// Sanitized short activity evidenced by a tool-use block.
+    /// Sanitized short activity evidenced by a provider event.
     Activity {
         /// Session that performed the activity.
         scope: SessionScope,
         /// Provider timestamp in Unix epoch milliseconds.
         at_ms: i64,
+        /// Provider event family that supplied the activity.
+        source: ActivitySource,
         /// Sanitized activity text of at most 60 characters.
         line: String,
     },
     /// One provider-reported output-token usage sample.
+    ///
+    /// Downstream deduplication uses `(scope, sample_id)`, never `sample_id`
+    /// alone, because sample IDs are unique only within one session or artifact.
     Usage {
         /// Session charged for the sample.
         scope: SessionScope,
         /// Provider timestamp in Unix epoch milliseconds.
         at_ms: i64,
-        /// Provider sample identity used for downstream deduplication.
+        /// Scope-local sample identity used for downstream deduplication.
         sample_id: String,
         /// Output tokens only.
         output_tokens: u64,
@@ -149,6 +154,20 @@ pub enum LogFact {
         /// Extracted identifier token.
         id: EvidenceId,
     },
+}
+
+/// Typed activity provenance for turn-scoped display policy.
+///
+/// The Task 5 consumer prefers the latest commentary in the current turn,
+/// falling back to the latest command; this extractor only records provenance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActivitySource {
+    /// A Codex commentary message.
+    Commentary,
+    /// A Codex command execution.
+    Command,
+    /// A Claude tool-use block.
+    ToolUse,
 }
 
 /// Typed source of a Codex internal-agent rollout.

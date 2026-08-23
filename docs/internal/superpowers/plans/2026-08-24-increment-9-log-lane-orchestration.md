@@ -188,10 +188,10 @@ LogFact::CodexTurnComplete { rollout_id: String, at_ms: i64 },
 LogFact::CodexTurnAborted { rollout_id: String, at_ms: i64 },
 LogFact::CodexPid { rollout_id: String, pid: u32 },           // parsed from JSON STRING
 pub enum CodexInternal { Named { name: String }, ThreadSpawn { parent_thread_id: String, nickname: Option<String>, role: Option<String> } }
-pub fn extract_codex_line(rollout_id: &str, line: &str) -> Vec<LogFact>;
+pub fn extract_codex_line(rollout_id: &str, record_ordinal: u64, line: &str) -> Vec<LogFact>;
 ```
 Usage for codex: per-turn deltas from `last_token_usage.output_tokens`
-(+ reasoning_output_tokens), `sample_id` = turn_id + ordinal; turns close
+with `sample_id` = the caller-maintained record ordinal; turns close
 at `CodexTurnComplete`. Activity: commentary at `item.content[0].text`
 (phase == "commentary") preferred; else CommandExecution — sanitize the
 SCRIPT ELEMENT of the argv array. Only the FIRST `session_meta` is
