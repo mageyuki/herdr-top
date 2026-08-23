@@ -41,35 +41,6 @@ const SOURCE_FIXTURE_ROLES: [&str; 16] = [
     "unlink",
 ];
 
-const AUTHORITATIVE_REQUESTED_PATHS: [&str; 26] = [
-    "/home/mageyuki/.cargo/bin/rustup",
-    "/usr/bin/awk",
-    "/usr/bin/bash",
-    "/usr/bin/env",
-    "/usr/bin/findmnt",
-    "/usr/bin/git",
-    "/usr/bin/id",
-    "/usr/bin/jq",
-    "/usr/bin/lsblk",
-    "/usr/bin/lscpu",
-    "/usr/bin/mkdir",
-    "/usr/bin/mktemp",
-    "/usr/bin/mv",
-    "/usr/bin/pidstat",
-    "/usr/bin/prlimit",
-    "/usr/bin/readlink",
-    "/usr/bin/rg",
-    "/usr/bin/rmdir",
-    "/usr/bin/setsid",
-    "/usr/bin/sha256sum",
-    "/usr/bin/sleep",
-    "/usr/bin/stat",
-    "/usr/bin/taskset",
-    "/usr/bin/time",
-    "/usr/bin/uname",
-    "/usr/bin/unlink",
-];
-
 const CALLER_KEYS: [&str; 7] = [
     "CARGO_HOME",
     "HERDR_INCREMENT5_ATTEMPT_ID",
@@ -112,8 +83,59 @@ enum LaunchMode {
     SourceFixture,
 }
 
+fn developer_home_text(developer_home: &Path) -> Result<&str, &'static str> {
+    developer_home
+        .to_str()
+        .ok_or("developer home was not valid UTF-8")
+}
+
+fn developer_home_path(developer_home: &Path, relative: &str) -> Result<String, &'static str> {
+    developer_home
+        .join(relative)
+        .into_os_string()
+        .into_string()
+        .map_err(|_| "developer home path was not valid UTF-8")
+}
+
+fn authoritative_requested_paths(developer_home: &Path) -> Result<Vec<String>, &'static str> {
+    let mut paths = vec![developer_home_path(developer_home, ".cargo/bin/rustup")?];
+    paths.extend(
+        [
+            "/usr/bin/awk",
+            "/usr/bin/bash",
+            "/usr/bin/env",
+            "/usr/bin/findmnt",
+            "/usr/bin/git",
+            "/usr/bin/id",
+            "/usr/bin/jq",
+            "/usr/bin/lsblk",
+            "/usr/bin/lscpu",
+            "/usr/bin/mkdir",
+            "/usr/bin/mktemp",
+            "/usr/bin/mv",
+            "/usr/bin/pidstat",
+            "/usr/bin/prlimit",
+            "/usr/bin/readlink",
+            "/usr/bin/rg",
+            "/usr/bin/rmdir",
+            "/usr/bin/setsid",
+            "/usr/bin/sha256sum",
+            "/usr/bin/sleep",
+            "/usr/bin/stat",
+            "/usr/bin/taskset",
+            "/usr/bin/time",
+            "/usr/bin/uname",
+            "/usr/bin/unlink",
+        ]
+        .into_iter()
+        .map(str::to_owned),
+    );
+    Ok(paths)
+}
+
 #[derive(Debug)]
 struct LaunchRequest {
+    developer_home: PathBuf,
     self_identity: IdentityArgument,
     mode: LaunchMode,
     runner_identity: Option<IdentityArgument>,
@@ -195,6 +217,8 @@ fn run() -> Result<i32, &'static str> {
 
 fn parse_request(arguments: Vec<String>) -> Result<LaunchRequest, &'static str> {
     let mut cursor = Cursor::new(arguments);
+    cursor.expect("--developer-home")?;
+    let developer_home = PathBuf::from(cursor.take()?);
     let self_identity = parse_identity(&mut cursor, "self")?;
     let mode = match cursor.take()?.as_str() {
         "launch" => LaunchMode::Launch,
@@ -238,6 +262,7 @@ fn parse_request(arguments: Vec<String>) -> Result<LaunchRequest, &'static str> 
     }
     cursor.finish()?;
     Ok(LaunchRequest {
+        developer_home,
         self_identity,
         mode,
         runner_identity,
@@ -275,6 +300,7 @@ fn parse_identity(
 }
 
 fn execute(mut request: LaunchRequest) -> Result<i32, &'static str> {
+    validate_developer_home(&request.developer_home)?;
     let self_derived = validate_identity(&request.self_identity)?;
     let current = fs::canonicalize(env::current_exe().map_err(|_| "current executable failed")?)
         .map_err(|_| "current executable canonicalization failed")?;
@@ -297,18 +323,25 @@ fn execute(mut request: LaunchRequest) -> Result<i32, &'static str> {
                 .ok_or("runner identity was missing")?;
             let runner = validate_identity(runner_argument)?;
             validate_bash_program(&request.program_identity, &program)?;
-            validate_runner_environment(request.mode, &request.environment)?;
+            validate_runner_environment(
+                request.mode,
+                &request.environment,
+                &request.developer_home,
+            )?;
             let manifest = match request.mode {
                 LaunchMode::Runner => {
                     if !request.fixture_tools.is_empty() {
                         return Err("authoritative launch carried fixture tools");
                     }
                     validate_runner_argv(&request.argv, &runner.canonical)?;
-                    serialize_authoritative_manifest()?
+                    serialize_authoritative_manifest(&request.developer_home)?
                 }
                 LaunchMode::SourceFixture => {
                     validate_source_fixture_argv(&request.argv, &runner.canonical)?;
-                    serialize_source_fixture_manifest(&request.fixture_tools)?
+                    serialize_source_fixture_manifest(
+                        &request.fixture_tools,
+                        &request.developer_home,
+                    )?
                 }
                 LaunchMode::Launch => unreachable!(),
             };
@@ -365,6 +398,21 @@ fn validate_identity(argument: &IdentityArgument) -> Result<DerivedIdentity, &'s
         canonical,
         sha256,
     })
+}
+
+fn validate_developer_home(path: &Path) -> Result<(), &'static str> {
+    validate_path_text(path)?;
+    if !path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err("developer home was not a normalized absolute path");
+    }
+    Ok(())
 }
 
 fn derive_identity(requested: &Path) -> Result<DerivedIdentity, &'static str> {
@@ -474,7 +522,10 @@ fn validate_canonical_root(path: &Path) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn serialize_source_fixture_manifest(tools: &[(String, PathBuf)]) -> Result<String, &'static str> {
+fn serialize_source_fixture_manifest(
+    tools: &[(String, PathBuf)],
+    developer_home: &Path,
+) -> Result<String, &'static str> {
     if tools.len() != SOURCE_FIXTURE_ROLES.len() {
         return Err("source fixture role count was invalid");
     }
@@ -483,14 +534,14 @@ fn serialize_source_fixture_manifest(tools: &[(String, PathBuf)]) -> Result<Stri
         if role != expected_role {
             return Err("source fixture role ordering was invalid");
         }
-        if requested.starts_with("/home/mageyuki") {
+        if requested.starts_with(developer_home) {
             return Err("source fixture tool used a workstation path");
         }
         if requested.file_name() != Some(std::ffi::OsStr::new(expected_role)) {
             return Err("source fixture tool basename disagreed with role");
         }
         let identity = derive_identity(requested)?;
-        if identity.canonical.starts_with("/home/mageyuki") {
+        if identity.canonical.starts_with(developer_home) {
             return Err("source fixture tool used a workstation path");
         }
         identities.push(identity);
@@ -498,10 +549,11 @@ fn serialize_source_fixture_manifest(tools: &[(String, PathBuf)]) -> Result<Stri
     serialize_manifest(&identities)
 }
 
-fn serialize_authoritative_manifest() -> Result<String, &'static str> {
-    let mut identities = Vec::with_capacity(AUTHORITATIVE_REQUESTED_PATHS.len());
-    for requested in AUTHORITATIVE_REQUESTED_PATHS {
-        let identity = derive_identity(Path::new(requested))?;
+fn serialize_authoritative_manifest(developer_home: &Path) -> Result<String, &'static str> {
+    let requested_paths = authoritative_requested_paths(developer_home)?;
+    let mut identities = Vec::with_capacity(requested_paths.len());
+    for requested in requested_paths {
+        let identity = derive_identity(Path::new(&requested))?;
         if requested.ends_with("/rustup")
             && identity
                 .canonical
@@ -542,6 +594,7 @@ fn serialize_manifest(identities: &[DerivedIdentity]) -> Result<String, &'static
 fn validate_runner_environment(
     mode: LaunchMode,
     environment: &BTreeMap<String, String>,
+    developer_home: &Path,
 ) -> Result<(), &'static str> {
     let expected_keys = match mode {
         LaunchMode::Runner => CALLER_KEYS.as_slice(),
@@ -551,16 +604,19 @@ fn validate_runner_environment(
     if environment.keys().map(String::as_str).collect::<Vec<_>>() != expected_keys {
         return Err("runner caller environment keys were invalid");
     }
-    let expected_values = [
-        ("CARGO_HOME", "/home/mageyuki/.cargo"),
-        ("HOME", "/home/mageyuki"),
-        ("LC_ALL", "C"),
-        ("PATH", "/usr/bin:/bin"),
-        ("RUSTUP_HOME", "/home/mageyuki/.rustup"),
-        ("TZ", "UTC"),
-    ];
+    let expected_values = BTreeMap::from([
+        ("CARGO_HOME", developer_home_path(developer_home, ".cargo")?),
+        ("HOME", developer_home_text(developer_home)?.to_owned()),
+        ("LC_ALL", "C".to_owned()),
+        ("PATH", "/usr/bin:/bin".to_owned()),
+        (
+            "RUSTUP_HOME",
+            developer_home_path(developer_home, ".rustup")?,
+        ),
+        ("TZ", "UTC".to_owned()),
+    ]);
     for (key, expected) in expected_values {
-        if environment.get(key).map(String::as_str) != Some(expected) {
+        if environment.get(key).map(String::as_str) != Some(expected.as_str()) {
             return Err("runner caller environment value was invalid");
         }
     }

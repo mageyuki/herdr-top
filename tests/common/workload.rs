@@ -1,10 +1,25 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use herdr_top::model::{
     DependencyEdge, DisplayOrdinal, DomainModel, ExecutionEdge, Pane, RunId, RunKey, Tab, TaskRun,
     TaskState, Workspace,
 };
+
+fn developer_home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .expect("HOME must be set for the reference workload")
+}
+
+fn developer_home_path(relative: &str) -> String {
+    developer_home()
+        .join(relative)
+        .into_os_string()
+        .into_string()
+        .expect("HOME must be valid UTF-8 for the reference workload")
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkloadProfile {
@@ -1400,6 +1415,7 @@ fn validate_run_controls(controls: &RunControlsV1) -> Result<(), ResultError> {
         .into_iter()
         .map(|identity| identity.requested_path)
         .collect::<Vec<_>>();
+    let rustup_requested = developer_home_path(".cargo/bin/rustup");
     if controls
         .authoritative_executables
         .iter()
@@ -1407,7 +1423,7 @@ fn validate_run_controls(controls: &RunControlsV1) -> Result<(), ResultError> {
         .ne(expected_requested.iter())
         || controls.authoritative_executables.iter().any(|identity| {
             !executable_identity_is_well_formed(identity)
-                || identity.requested_path == "/home/mageyuki/.cargo/bin/rustup"
+                || identity.requested_path == rustup_requested
                     && std::path::Path::new(&identity.canonical_path)
                         .components()
                         .any(|component| component.as_os_str() == "mise")
@@ -1451,8 +1467,8 @@ fn cargo_configuration_candidates(
         }
     }
     for candidate in [
-        std::path::PathBuf::from("/home/mageyuki/.cargo/config"),
-        std::path::PathBuf::from("/home/mageyuki/.cargo/config.toml"),
+        developer_home().join(".cargo/config"),
+        developer_home().join(".cargo/config.toml"),
     ] {
         if seen.insert(candidate.clone()) {
             candidates.push(candidate);
@@ -4256,37 +4272,42 @@ fn synthetic_executable(path: &str, byte: char) -> ExecutableIdentityV1 {
 }
 
 fn authoritative_executables() -> Vec<ExecutableIdentityV1> {
-    [
-        ("/home/mageyuki/.cargo/bin/rustup", '1'),
-        ("/usr/bin/awk", '2'),
-        ("/usr/bin/bash", '2'),
-        ("/usr/bin/env", '3'),
-        ("/usr/bin/findmnt", '3'),
-        ("/usr/bin/git", '4'),
-        ("/usr/bin/id", '4'),
-        ("/usr/bin/jq", '5'),
-        ("/usr/bin/lsblk", '5'),
-        ("/usr/bin/lscpu", '5'),
-        ("/usr/bin/mkdir", '5'),
-        ("/usr/bin/mktemp", '5'),
-        ("/usr/bin/mv", '5'),
-        ("/usr/bin/pidstat", '5'),
-        ("/usr/bin/prlimit", '5'),
-        ("/usr/bin/readlink", '6'),
-        ("/usr/bin/rg", '6'),
-        ("/usr/bin/rmdir", '6'),
-        ("/usr/bin/setsid", '6'),
-        ("/usr/bin/sha256sum", '6'),
-        ("/usr/bin/sleep", '6'),
-        ("/usr/bin/stat", '6'),
-        ("/usr/bin/taskset", '6'),
-        ("/usr/bin/time", '7'),
-        ("/usr/bin/uname", '8'),
-        ("/usr/bin/unlink", '8'),
-    ]
-    .into_iter()
-    .map(|(path, byte)| synthetic_executable(path, byte))
-    .collect()
+    let mut executables = vec![(developer_home_path(".cargo/bin/rustup"), '1')];
+    executables.extend(
+        [
+            ("/usr/bin/awk", '2'),
+            ("/usr/bin/bash", '2'),
+            ("/usr/bin/env", '3'),
+            ("/usr/bin/findmnt", '3'),
+            ("/usr/bin/git", '4'),
+            ("/usr/bin/id", '4'),
+            ("/usr/bin/jq", '5'),
+            ("/usr/bin/lsblk", '5'),
+            ("/usr/bin/lscpu", '5'),
+            ("/usr/bin/mkdir", '5'),
+            ("/usr/bin/mktemp", '5'),
+            ("/usr/bin/mv", '5'),
+            ("/usr/bin/pidstat", '5'),
+            ("/usr/bin/prlimit", '5'),
+            ("/usr/bin/readlink", '6'),
+            ("/usr/bin/rg", '6'),
+            ("/usr/bin/rmdir", '6'),
+            ("/usr/bin/setsid", '6'),
+            ("/usr/bin/sha256sum", '6'),
+            ("/usr/bin/sleep", '6'),
+            ("/usr/bin/stat", '6'),
+            ("/usr/bin/taskset", '6'),
+            ("/usr/bin/time", '7'),
+            ("/usr/bin/uname", '8'),
+            ("/usr/bin/unlink", '8'),
+        ]
+        .into_iter()
+        .map(|(path, byte)| (path.to_owned(), byte)),
+    );
+    executables
+        .into_iter()
+        .map(|(path, byte)| synthetic_executable(&path, byte))
+        .collect()
 }
 
 fn synthetic_run_controls() -> RunControlsV1 {
@@ -4299,17 +4320,7 @@ fn synthetic_run_controls() -> RunControlsV1 {
         toolchain_name: "1.97.1".to_owned(),
         rustc_version: "rustc 1.97.1 (synthetic)".to_owned(),
         cargo_version: "cargo 1.97.1 (synthetic)".to_owned(),
-        build_environment: [
-            ("CARGO_HOME", "/home/mageyuki/.cargo"),
-            ("HOME", "/home/mageyuki"),
-            ("LC_ALL", "C"),
-            ("PATH", "/usr/bin:/bin"),
-            ("RUSTUP_HOME", "/home/mageyuki/.rustup"),
-            ("TZ", "UTC"),
-        ]
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value.to_owned()))
-        .collect(),
+        build_environment: invariant_environment(),
         cargo_configuration: CargoConfigurationPolicyV1 {
             policy_version: 1,
             invocation_cwd: "/src/herdr-top".to_owned(),
@@ -4320,8 +4331,8 @@ fn synthetic_run_controls() -> RunControlsV1 {
                 "/src/.cargo/config.toml".to_owned(),
                 "/.cargo/config".to_owned(),
                 "/.cargo/config.toml".to_owned(),
-                "/home/mageyuki/.cargo/config".to_owned(),
-                "/home/mageyuki/.cargo/config.toml".to_owned(),
+                developer_home_path(".cargo/config"),
+                developer_home_path(".cargo/config.toml"),
             ],
         },
         measured_binary: synthetic_executable(
@@ -4336,17 +4347,20 @@ fn synthetic_run_controls() -> RunControlsV1 {
 }
 
 fn invariant_environment() -> std::collections::BTreeMap<String, String> {
-    [
-        ("CARGO_HOME", "/home/mageyuki/.cargo"),
-        ("HOME", "/home/mageyuki"),
-        ("LC_ALL", "C"),
-        ("PATH", "/usr/bin:/bin"),
-        ("RUSTUP_HOME", "/home/mageyuki/.rustup"),
-        ("TZ", "UTC"),
-    ]
-    .into_iter()
-    .map(|(key, value)| (key.to_owned(), value.to_owned()))
-    .collect()
+    BTreeMap::from([
+        ("CARGO_HOME".to_owned(), developer_home_path(".cargo")),
+        (
+            "HOME".to_owned(),
+            developer_home()
+                .into_os_string()
+                .into_string()
+                .expect("HOME must be valid UTF-8 for the reference workload"),
+        ),
+        ("LC_ALL".to_owned(), "C".to_owned()),
+        ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+        ("RUSTUP_HOME".to_owned(), developer_home_path(".rustup")),
+        ("TZ".to_owned(), "UTC".to_owned()),
+    ])
 }
 
 fn run_environment(
@@ -5491,9 +5505,10 @@ pub fn record_runner_control_evidence_from_environment() -> Result<(), HarnessEr
         .map_err(|_| HarnessError::Invalid("Cargo configuration candidates were invalid"))?;
     cargo_configuration_candidates_are_absent(&absent_candidates)
         .map_err(|_| HarnessError::Invalid("Cargo configuration was present"))?;
+    let rustup_requested = developer_home_path(".cargo/bin/rustup");
     let rustup = authoritative
         .first()
-        .filter(|identity| identity.requested_path == "/home/mageyuki/.cargo/bin/rustup")
+        .filter(|identity| identity.requested_path == rustup_requested)
         .ok_or(HarnessError::Invalid("rustup identity was absent"))?;
     let rustc_version = run_closed_command(
         &rustup.canonical_path,
