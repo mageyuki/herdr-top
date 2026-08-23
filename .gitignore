@@ -25,3 +25,6 @@ target
 
 # Plugin build output
 /bin/
+
+# Local Superpowers working state
+.superpowers/
