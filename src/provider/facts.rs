@@ -146,8 +146,8 @@ pub enum LogFact {
     },
     /// Identifier found by the bounded raw-line evidence scan.
     ///
-    /// The raw scanner intentionally over-emits UUIDs. Synthesis in Task 5, where the
-    /// discovery set lives, filters unmatched UUIDs as required by the ADR.
+    /// The raw scanner intentionally over-emits UUIDs. `lane::Admission::on_evidence`
+    /// exact-matches them against `AdmissionIndex`; synthesis discards unmatched IDs.
     EvidenceId {
         /// Session whose raw line contained the identifier.
         parent: SessionScope,

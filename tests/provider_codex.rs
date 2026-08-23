@@ -95,7 +95,11 @@ fn event_id(event: &ProviderEvent) -> Option<&str> {
         ProviderEvent::SessionResolved { event_id, .. }
         | ProviderEvent::AgentUpsert { event_id, .. }
         | ProviderEvent::Activity { event_id, .. } => Some(event_id),
-        ProviderEvent::SourceState { .. } | ProviderEvent::Malformed { .. } => None,
+        ProviderEvent::Synthesized(_)
+        | ProviderEvent::RunLiveness { .. }
+        | ProviderEvent::Telemetry { .. }
+        | ProviderEvent::SourceState { .. }
+        | ProviderEvent::Malformed { .. } => None,
     }
 }
 

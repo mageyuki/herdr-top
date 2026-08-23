@@ -14,12 +14,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
-use crate::model::{ExecState, MinimalProviderMetadata, Provider, ProviderDiagnosticsHandle};
+use crate::model::{
+    ControllerEvent, ExecState, MinimalProviderMetadata, Provider, ProviderDiagnosticsHandle,
+    RunKey,
+};
 
 pub mod claude;
 pub mod claude_facts;
@@ -67,8 +70,21 @@ pub enum ProviderSourceState {
 }
 
 /// Allowlisted event emitted by a provider adapter.
+// The plan intentionally carries the existing public `ControllerEvent` by value.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderEvent {
+    /// Controller-compatible lifecycle event synthesized from an admitted provider log.
+    Synthesized(ControllerEvent),
+    /// Append-time signal consumed by the lifecycle lane in Increment 9 Task 6.
+    RunLiveness { key: RunKey, at_ms: i64 },
+    /// Allowlisted usage sample consumed by telemetry in Increment 9 Task 7.
+    Telemetry {
+        key: RunKey,
+        output_tokens: u64,
+        model: Option<String>,
+        effort: Option<String>,
+    },
     SessionResolved {
         provider: Provider,
         agent_thread_id: String,
@@ -136,7 +152,11 @@ impl ProviderEvent {
                 provider: *provider,
                 thread_id: agent_thread_id.clone(),
             }),
-            Self::SourceState { .. } | Self::Malformed { .. } => None,
+            Self::Synthesized(_)
+            | Self::RunLiveness { .. }
+            | Self::Telemetry { .. }
+            | Self::SourceState { .. }
+            | Self::Malformed { .. } => None,
         }
     }
 
@@ -160,7 +180,11 @@ impl ProviderEvent {
                 position,
                 ..
             } => Some((event_id, *observed_at_ms, *position)),
-            Self::SourceState { .. } | Self::Malformed { .. } => None,
+            Self::Synthesized(_)
+            | Self::RunLiveness { .. }
+            | Self::Telemetry { .. }
+            | Self::SourceState { .. }
+            | Self::Malformed { .. } => None,
         }
     }
 }
@@ -199,7 +223,10 @@ impl ProviderEventSender {
                 };
                 let admission = matches!(
                     &event,
-                    ProviderEvent::SessionResolved { .. }
+                    ProviderEvent::Synthesized(_)
+                        | ProviderEvent::RunLiveness { .. }
+                        | ProviderEvent::Telemetry { .. }
+                        | ProviderEvent::SessionResolved { .. }
                         | ProviderEvent::AgentUpsert { .. }
                         | ProviderEvent::Activity { .. }
                 )
@@ -284,6 +311,8 @@ pub struct DiscoveredFile {
     pub provider: Provider,
     pub root: PathBuf,
     pub relative_path: PathBuf,
+    /// File mtime captured during directory discovery, before any descriptor is opened.
+    pub modified_ms: i64,
     pub path_id: u32,
     pub bootstrap: Option<BootstrapIdentity>,
 }
@@ -356,12 +385,12 @@ impl DiscoveryIndex {
     pub fn new(roots: Vec<DiscoveryRoot>) -> io::Result<Self> {
         let mut baseline = FirstSeenBaseline::default();
         for root in &roots {
-            let discovery = discover_artifacts(&root.path)?;
+            let discovery = discover_artifacts(&root.path, false)?;
             if discovery.had_errors {
                 return Err(io::Error::other("provider baseline discovery incomplete"));
             }
-            for relative in discovery.paths {
-                baseline.record(root.path.join(relative));
+            for artifact in discovery.artifacts {
+                baseline.record(root.path.join(artifact.relative_path));
             }
         }
         Ok(Self {
@@ -384,17 +413,19 @@ impl DiscoveryIndex {
         let mut outcome = DiscoveryScanOutcome::default();
         for root in self.roots.clone() {
             let mut root_seen = HashSet::new();
-            let discovery = discover_artifacts(&root.path)?;
+            let discovery = discover_artifacts(&root.path, false)?;
             outcome.file_io_error |= discovery.had_errors;
             if discovery.had_errors {
                 dirty_roots.insert(root.path.clone());
             }
-            for relative in discovery.paths {
+            for artifact in discovery.artifacts {
+                let relative = artifact.relative_path;
                 let absolute = root.path.join(&relative);
                 let file_key = (root.provider, absolute.clone());
                 root_seen.insert(absolute.clone());
                 seen.insert(file_key.clone());
-                if self.files.contains_key(&file_key) {
+                if let Some(existing) = self.files.get_mut(&file_key) {
+                    existing.modified_ms = artifact.modified_ms;
                     continue;
                 }
                 let path_id = match interner.intern(&absolute) {
@@ -432,6 +463,7 @@ impl DiscoveryIndex {
                         provider: root.provider,
                         root: root.path.clone(),
                         relative_path: relative,
+                        modified_ms: artifact.modified_ms,
                         path_id,
                         bootstrap,
                     },
@@ -526,12 +558,149 @@ impl DiscoveryIndex {
     }
 }
 
+impl DiscoveryIndex {
+    /// Production provider-lane rescan. Identity inventory is built from names only;
+    /// admission and mtime are checked before structural bootstrap opens a descriptor.
+    pub(crate) fn scan_admitted(
+        &mut self,
+        parser: &mut impl BootstrapParser,
+        interner: &mut PathInterner,
+        admission: &lane::Admission,
+        admission_index: &mut lane::AdmissionIndex,
+        diagnostics: &ProviderDiagnostics,
+    ) -> io::Result<DiscoveryScanOutcome> {
+        let mut seen = HashSet::new();
+        let mut dirty_roots = HashSet::new();
+        let mut outcome = DiscoveryScanOutcome::default();
+        for root in self.roots.clone() {
+            let mut root_seen = HashSet::new();
+            let discovery = discover_artifacts(&root.path, true)?;
+            outcome.file_io_error |= discovery.had_errors;
+            if discovery.had_errors {
+                dirty_roots.insert(root.path.clone());
+            }
+
+            let mut newest_pane_artifact: HashMap<(Provider, String), (i64, PathBuf)> =
+                HashMap::new();
+            for artifact in &discovery.artifacts {
+                let absolute = root.path.join(&artifact.relative_path);
+                admission_index.observe_discovered_path(root.provider, &absolute);
+                if let Some(identity) = admission.pane_root_identity(root.provider, &absolute) {
+                    let candidate = (artifact.modified_ms, absolute);
+                    newest_pane_artifact
+                        .entry((root.provider, identity))
+                        .and_modify(|current| {
+                            if candidate > *current {
+                                *current = candidate.clone();
+                            }
+                        })
+                        .or_insert(candidate);
+                }
+            }
+
+            for artifact in discovery.artifacts {
+                let relative = artifact.relative_path;
+                let absolute = root.path.join(&relative);
+                if !admission.is_admitted_file(&absolute, artifact.modified_ms) {
+                    continue;
+                }
+                if let Some(identity) = admission.pane_root_identity(root.provider, &absolute)
+                    && newest_pane_artifact
+                        .get(&(root.provider, identity))
+                        .is_some_and(|(_, newest)| newest != &absolute)
+                {
+                    continue;
+                }
+                let file_key = (root.provider, absolute.clone());
+                root_seen.insert(absolute.clone());
+                seen.insert(file_key.clone());
+                if let Some(existing) = self.files.get_mut(&file_key) {
+                    existing.modified_ms = artifact.modified_ms;
+                    continue;
+                }
+                let path_id = match interner.intern(&absolute) {
+                    Ok(path_id) => path_id,
+                    Err(_) => {
+                        outcome.file_io_error = true;
+                        continue;
+                    }
+                };
+                let is_meta = relative
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.ends_with(".meta.json"));
+                let bootstrap = if is_meta {
+                    None
+                } else {
+                    match bootstrap_file_admitted(&root, &relative, parser, admission, diagnostics)
+                    {
+                        Ok(bootstrap) => bootstrap,
+                        Err(_) => {
+                            outcome.file_io_error = true;
+                            continue;
+                        }
+                    }
+                };
+                self.files.insert(
+                    file_key,
+                    DiscoveredFile {
+                        provider: root.provider,
+                        root: root.path.clone(),
+                        relative_path: relative,
+                        modified_ms: artifact.modified_ms,
+                        path_id,
+                        bootstrap,
+                    },
+                );
+            }
+            if !discovery.had_errors {
+                self.baseline.retain_existing(&root.path, &root_seen);
+            }
+        }
+        self.files.retain(|key, file| {
+            if seen.contains(key) || dirty_roots.contains(&file.root) {
+                true
+            } else {
+                outcome.removed_path_ids.push(file.path_id);
+                false
+            }
+        });
+        outcome.removed_path_ids.sort_unstable();
+        outcome.removed_path_ids.dedup();
+        self.rebuild_identities();
+        Ok(outcome)
+    }
+}
+
 fn bootstrap_file(
     root: &DiscoveryRoot,
     relative: &Path,
     parser: &mut impl BootstrapParser,
 ) -> io::Result<Option<BootstrapIdentity>> {
     let mut file = open_contained_regular_file(&root.path, relative)?;
+    parse_bootstrap_prefix(root, relative, parser, &mut file)
+}
+
+fn bootstrap_file_admitted(
+    root: &DiscoveryRoot,
+    relative: &Path,
+    parser: &mut impl BootstrapParser,
+    admission: &lane::Admission,
+    diagnostics: &ProviderDiagnostics,
+) -> io::Result<Option<BootstrapIdentity>> {
+    let Some(mut file) = open_admitted_regular_file(&root.path, relative, admission, diagnostics)?
+    else {
+        return Ok(None);
+    };
+    parse_bootstrap_prefix(root, relative, parser, &mut file)
+}
+
+fn parse_bootstrap_prefix(
+    root: &DiscoveryRoot,
+    relative: &Path,
+    parser: &mut impl BootstrapParser,
+    file: &mut File,
+) -> io::Result<Option<BootstrapIdentity>> {
     let mut bytes = Vec::new();
     file.by_ref()
         .take(BOOTSTRAP_MAX_BYTES as u64)
@@ -559,8 +728,14 @@ fn bootstrap_file(
 
 #[derive(Debug, Default)]
 struct ArtifactDiscovery {
-    paths: Vec<PathBuf>,
+    artifacts: Vec<DiscoveredArtifactEntry>,
     had_errors: bool,
+}
+
+#[derive(Debug)]
+struct DiscoveredArtifactEntry {
+    relative_path: PathBuf,
+    modified_ms: i64,
 }
 
 #[cfg(test)]
@@ -592,7 +767,7 @@ fn discovery_file_type(entry: &fs::DirEntry, path: &Path) -> io::Result<fs::File
     entry.file_type()
 }
 
-fn discover_artifacts(root: &Path) -> io::Result<ArtifactDiscovery> {
+fn discover_artifacts(root: &Path, include_meta: bool) -> io::Result<ArtifactDiscovery> {
     let mut found = Vec::new();
     let mut had_errors = false;
     let mut directories = vec![PathBuf::new()];
@@ -632,16 +807,41 @@ fn discover_artifacts(root: &Path) -> io::Result<ArtifactDiscovery> {
             };
             if kind.is_dir() && entry.file_name() != OsStr::new("tool-results") {
                 directories.push(relative);
-            } else if kind.is_file() && is_provider_artifact(&relative) {
-                found.push(relative);
+            } else if kind.is_file()
+                && (is_provider_artifact(&relative)
+                    || include_meta
+                        && relative
+                            .file_name()
+                            .and_then(OsStr::to_str)
+                            .is_some_and(|name| name.ends_with(".meta.json")))
+            {
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(_) => {
+                        had_errors = true;
+                        continue;
+                    }
+                };
+                found.push(DiscoveredArtifactEntry {
+                    relative_path: relative,
+                    modified_ms: system_time_ms(metadata.modified().unwrap_or(UNIX_EPOCH)),
+                });
             }
         }
     }
-    found.sort();
+    found.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(ArtifactDiscovery {
-        paths: found,
+        artifacts: found,
         had_errors,
     })
+}
+
+fn system_time_ms(time: SystemTime) -> i64 {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
+        Err(error) => -i64::try_from(error.duration().as_millis()).unwrap_or(i64::MAX),
+    }
 }
 
 /// Returns whether a discovered entry is an adapter input artifact.
@@ -698,6 +898,7 @@ pub enum MergeOutcome {
 #[derive(Clone, Debug)]
 enum PendingToken {
     Source(Provider),
+    Lane,
     Identity(EntityKey),
     Upsert(EntityKey),
     Activity(EntityKey),
@@ -709,6 +910,7 @@ enum PendingToken {
 pub struct PendingEvents {
     capacity: usize,
     sources: HashMap<Provider, ProviderEvent>,
+    lane: VecDeque<ProviderEvent>,
     entities: HashMap<EntityKey, PendingEntity>,
     malformed: HashMap<MalformedKey, PendingMalformed>,
     diagnostics: ProviderDiagnostics,
@@ -721,6 +923,7 @@ impl PendingEvents {
         Self {
             capacity: PENDING_ENTITY_CAPACITY,
             sources: HashMap::new(),
+            lane: VecDeque::new(),
             entities: HashMap::new(),
             malformed: HashMap::new(),
             diagnostics,
@@ -732,6 +935,7 @@ impl PendingEvents {
         Self {
             capacity,
             sources: HashMap::new(),
+            lane: VecDeque::new(),
             entities: HashMap::new(),
             malformed: HashMap::new(),
             diagnostics,
@@ -774,6 +978,16 @@ impl PendingEvents {
                     MergeOutcome::Coalesced
                 }
             }
+            event @ (ProviderEvent::Synthesized(_)
+            | ProviderEvent::RunLiveness { .. }
+            | ProviderEvent::Telemetry { .. }) => {
+                if self.lane.len() >= self.capacity {
+                    MergeOutcome::AtCapacity(Box::new(event))
+                } else {
+                    self.lane.push_back(event);
+                    MergeOutcome::Accepted
+                }
+            }
             event => self.merge_entity(event),
         }
     }
@@ -788,7 +1002,11 @@ impl PendingEvents {
             ProviderEvent::SessionResolved { .. } => entity.identity.as_ref(),
             ProviderEvent::AgentUpsert { .. } => entity.upsert.as_ref(),
             ProviderEvent::Activity { .. } => entity.activity.as_ref(),
-            ProviderEvent::SourceState { .. } | ProviderEvent::Malformed { .. } => unreachable!(),
+            ProviderEvent::Synthesized(_)
+            | ProviderEvent::RunLiveness { .. }
+            | ProviderEvent::Telemetry { .. }
+            | ProviderEvent::SourceState { .. }
+            | ProviderEvent::Malformed { .. } => unreachable!(),
         };
         if existing_slot.is_some_and(|stored| {
             stored.event.slot_details().map(|details| details.0)
@@ -826,7 +1044,11 @@ impl PendingEvents {
                 }
                 activity.parent_agent_id.clone()
             }
-            ProviderEvent::SourceState { .. } | ProviderEvent::Malformed { .. } => None,
+            ProviderEvent::Synthesized(_)
+            | ProviderEvent::RunLiveness { .. }
+            | ProviderEvent::Telemetry { .. }
+            | ProviderEvent::SourceState { .. }
+            | ProviderEvent::Malformed { .. } => None,
         };
         if incoming_parent.is_some() {
             entity.parent = incoming_parent;
@@ -836,7 +1058,11 @@ impl PendingEvents {
             ProviderEvent::SessionResolved { .. } => &mut entity.identity,
             ProviderEvent::AgentUpsert { .. } => &mut entity.upsert,
             ProviderEvent::Activity { .. } => &mut entity.activity,
-            ProviderEvent::SourceState { .. } | ProviderEvent::Malformed { .. } => unreachable!(),
+            ProviderEvent::Synthesized(_)
+            | ProviderEvent::RunLiveness { .. }
+            | ProviderEvent::Telemetry { .. }
+            | ProviderEvent::SourceState { .. }
+            | ProviderEvent::Malformed { .. } => unreachable!(),
         };
         merge_slot(slot, event, &self.diagnostics)
     }
@@ -879,6 +1105,10 @@ impl PendingEvents {
             if let Some(event) = self.sources.get(&provider) {
                 return Some((PendingToken::Source(provider), event.clone()));
             }
+        }
+
+        if let Some(event) = self.lane.front() {
+            return Some((PendingToken::Lane, event.clone()));
         }
 
         let mut keys = self.entities.keys().collect::<Vec<_>>();
@@ -924,6 +1154,9 @@ impl PendingEvents {
         match token {
             PendingToken::Source(provider) => {
                 self.sources.remove(&provider);
+            }
+            PendingToken::Lane => {
+                self.lane.pop_front();
             }
             PendingToken::Identity(key) => {
                 if let Some(entity) = self.entities.get_mut(&key) {
@@ -2165,6 +2398,9 @@ mod tests {
 
     fn event_kind(event: ProviderEvent) -> String {
         match event {
+            ProviderEvent::Synthesized(_) => "synthesized".to_owned(),
+            ProviderEvent::RunLiveness { .. } => "liveness".to_owned(),
+            ProviderEvent::Telemetry { .. } => "telemetry".to_owned(),
             ProviderEvent::Activity { activity, .. } => activity.event_kind.unwrap(),
             ProviderEvent::SessionResolved {
                 agent_thread_id, ..

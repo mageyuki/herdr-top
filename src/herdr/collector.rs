@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::ffi::OsStr;
 use std::future::{Future, pending};
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -49,7 +49,7 @@ use crate::provider::{
     ProviderThreadError, ProviderThreadHandle, ProviderWorker, RecommendedNotifyFactory, TailFile,
     TargetSet, spawn_provider_thread_with_diagnostics_and_performance,
 };
-use crate::reducer::{ApplyOutcome, Reducer, ReducerError};
+use crate::reducer::{ApplyOutcome, CommitStagedError, Reducer, ReducerError};
 use crate::store::writer::{
     DurabilityDisposition, PendingEnqueue, PersistenceFailure, PersistenceStatus, WriterClient,
     WriterError,
@@ -3367,6 +3367,11 @@ struct AdapterProviderWorker {
     interner: PathInterner,
     tails: HashMap<u32, TailFile>,
     bootstrap_emitted: HashSet<u32>,
+    meta_emitted: HashSet<u32>,
+    record_ordinals: HashMap<u32, (u64, u64)>,
+    log_admission: crate::provider::lane::Admission,
+    admission_index: crate::provider::lane::AdmissionIndex,
+    synthesis: crate::provider::lane::Synthesis,
     /// Highest generation observed per absolute path. Tombstones live for the whole run.
     generations: HashMap<PathBuf, u64>,
     deferred: VecDeque<ProviderEvent>,
@@ -3385,11 +3390,23 @@ impl AdapterProviderWorker {
         standard_roots: Vec<DiscoveryRoot>,
         diagnostics: crate::provider::ProviderDiagnostics,
     ) -> Self {
+        let anchor_ms = crate::provider::lane::backfill_anchor_ms(
+            None,
+            unix_now_ms(),
+            crate::provider::lane::parse_backfill_window_ms(
+                env::var_os("HERDR_TOP_LOG_BACKFILL_MS").as_deref(),
+            ),
+        );
         Self {
             roots: HashMap::new(),
             interner: PathInterner::default(),
             tails: HashMap::new(),
             bootstrap_emitted: HashSet::new(),
+            meta_emitted: HashSet::new(),
+            record_ordinals: HashMap::new(),
+            log_admission: crate::provider::lane::Admission::new(anchor_ms),
+            admission_index: crate::provider::lane::AdmissionIndex::new(),
+            synthesis: crate::provider::lane::Synthesis::default(),
             generations: HashMap::new(),
             deferred: VecDeque::new(),
             standard_roots,
@@ -3533,6 +3550,70 @@ impl AdapterProviderWorker {
             sweep.failure = None;
         }
     }
+
+    fn parse_record(
+        &mut self,
+        item: &AdapterWorkItem,
+        record: &crate::provider::TailRecord,
+    ) -> Vec<ProviderEvent> {
+        let mut events = {
+            let discovery = &self
+                .roots
+                .get(&(item.provider, item.root.clone()))
+                .expect("work root remains while parsing")
+                .discovery;
+            parse_adapter_record(item.provider, discovery, &item.file, record)
+        };
+        if record.error_code.is_some() {
+            return events;
+        }
+        let ordinal = {
+            let state = self
+                .record_ordinals
+                .entry(item.file.path_id)
+                .or_insert((record.generation, 0));
+            if state.0 != record.generation {
+                *state = (record.generation, 0);
+            }
+            let ordinal = state.1;
+            state.1 = state.1.saturating_add(1);
+            ordinal
+        };
+        let Ok(line) = std::str::from_utf8(&record.bytes) else {
+            return events;
+        };
+        let facts = match item.provider {
+            Provider::Claude => {
+                let scope = match crate::provider::claude::path_topology(&item.file.relative_path) {
+                    Some(crate::provider::claude::ClaudePathTopology::Main { thread_id }) => {
+                        crate::provider::facts::SessionScope::ClaudeRoot(thread_id)
+                    }
+                    Some(crate::provider::claude::ClaudePathTopology::Subagent {
+                        parent_session,
+                        agent_id,
+                    }) => crate::provider::facts::SessionScope::ClaudeSubagent {
+                        parent: parent_session,
+                        agent_id,
+                    },
+                    _ => return events,
+                };
+                crate::provider::claude_facts::extract_claude_line(&scope, line)
+            }
+            Provider::Codex => {
+                let Some(rollout_id) = codex_rollout_id(&item.file.relative_path) else {
+                    return events;
+                };
+                crate::provider::codex_facts::extract_codex_line(&rollout_id, ordinal, line)
+            }
+        };
+        events.extend(self.synthesis.synthesize_batch(
+            &item.file.root.join(&item.file.relative_path),
+            facts.into_iter().map(|fact| (ordinal, fact)),
+            &mut self.log_admission,
+            &self.admission_index,
+        ));
+        events
+    }
 }
 
 impl Default for AdapterProviderWorker {
@@ -3545,11 +3626,14 @@ impl ProviderWorker for AdapterProviderWorker {
     fn process(&mut self, cycle: &mut ProviderCycle<'_>) -> io::Result<()> {
         let baseline_failures = self.initialize_standard_baselines();
         let mut targets_by_root: HashMap<(Provider, PathBuf), HashSet<PathBuf>> = HashMap::new();
+        self.log_admission.begin_pane_cycle();
         for target in cycle.targets.iter() {
             let Ok(root) = provider_root_for_target(target.provider, &target.path) else {
                 self.diagnostics.record_invalid_target();
                 continue;
             };
+            self.log_admission
+                .admit_pane_artifact(target.provider, &target.path);
             targets_by_root
                 .entry((target.provider, root))
                 .or_default()
@@ -3573,7 +3657,7 @@ impl ProviderWorker for AdapterProviderWorker {
         });
         let mut universes: HashMap<Provider, HashSet<AvailabilitySweepMember>> = HashMap::new();
         let mut work = Vec::new();
-        for ((provider, root), targets) in roots {
+        for ((provider, root), _targets) in roots {
             let root_member = AvailabilitySweepMember::Root(root.clone());
             universes
                 .entry(provider)
@@ -3636,7 +3720,13 @@ impl ProviderWorker for AdapterProviderWorker {
                     .get_mut(&root_key)
                     .expect("root state inserted before scan");
                 let mut parser = AdapterBootstrapParser::default();
-                state.discovery.scan(&mut parser, &mut self.interner)
+                state.discovery.scan_admitted(
+                    &mut parser,
+                    &mut self.interner,
+                    &self.log_admission,
+                    &mut self.admission_index,
+                    &self.diagnostics,
+                )
             };
             let scan_outcome = match scan_result {
                 Ok(outcome) => outcome,
@@ -3666,6 +3756,8 @@ impl ProviderWorker for AdapterProviderWorker {
                         .or_insert(tail.generation());
                 }
                 self.bootstrap_emitted.remove(path_id);
+                self.meta_emitted.remove(path_id);
+                self.record_ordinals.remove(path_id);
             }
             self.visit_sweep_member(provider, root_member);
             let state = self
@@ -3678,18 +3770,11 @@ impl ProviderWorker for AdapterProviderWorker {
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            let owner_sessions = target_owner_sessions(&files, &targets);
             let mut relevant = files
                 .into_iter()
                 .filter(|file| {
-                    let absolute = file.root.join(&file.relative_path);
-                    targets.contains(&absolute)
-                        || file.bootstrap.as_ref().is_some_and(|identity| {
-                            identity.owner_session_id.as_ref().map_or_else(
-                                || owner_sessions.contains(&identity.thread_id),
-                                |id| owner_sessions.contains(id),
-                            )
-                        })
+                    self.log_admission
+                        .is_admitted_file(&file.root.join(&file.relative_path), file.modified_ms)
                 })
                 .collect::<Vec<_>>();
             relevant.sort_by_key(|file| file.path_id);
@@ -3747,9 +3832,82 @@ impl ProviderWorker for AdapterProviderWorker {
             {
                 cycle.request_watch(parent.to_path_buf());
             }
+            let absolute = file.root.join(&file.relative_path);
+            if !self
+                .log_admission
+                .is_admitted_file(&absolute, file.modified_ms)
+            {
+                continue;
+            }
+            if let Some(crate::provider::claude::ClaudePathTopology::SubagentMeta {
+                parent_session,
+                agent_id,
+            }) = (provider == Provider::Claude)
+                .then(|| crate::provider::claude::path_topology(&file.relative_path))
+                .flatten()
+            {
+                if !self.meta_emitted.contains(&file.path_id) {
+                    let mut meta_io_error = false;
+                    let fact = match crate::provider::open_admitted_regular_file(
+                        &file.root,
+                        &file.relative_path,
+                        &self.log_admission,
+                        &self.diagnostics,
+                    ) {
+                        Ok(Some(file_handle)) => {
+                            let mut bytes = Vec::new();
+                            match file_handle
+                                .take(crate::provider::BOOTSTRAP_MAX_BYTES as u64)
+                                .read_to_end(&mut bytes)
+                            {
+                                Ok(_) => crate::provider::claude_facts::extract_meta_json(
+                                    &parent_session,
+                                    &agent_id,
+                                    &bytes,
+                                ),
+                                Err(_) => {
+                                    meta_io_error = true;
+                                    None
+                                }
+                            }
+                        }
+                        Ok(None) => None,
+                        Err(_) => {
+                            meta_io_error = true;
+                            None
+                        }
+                    };
+                    if meta_io_error {
+                        self.availability_sweeps
+                            .entry(provider)
+                            .or_default()
+                            .failure
+                            .get_or_insert(AvailabilitySweepFailure::FileIoError);
+                    }
+                    if let Some(fact) = fact {
+                        self.meta_emitted.insert(file.path_id);
+                        let events = self.synthesis.synthesize_batch(
+                            &absolute,
+                            [(0, fact)],
+                            &mut self.log_admission,
+                            &self.admission_index,
+                        );
+                        if !merge_adapter_events(events, cycle.pending, &mut self.deferred) {
+                            self.resume_cursor = Some(cursor_for_work(item));
+                            self.finish_completed_sweeps(&universes, cycle.pending);
+                            return Ok(());
+                        }
+                    }
+                }
+                self.availability_sweeps
+                    .entry(provider)
+                    .or_default()
+                    .visited
+                    .insert(AvailabilitySweepMember::File(file.path_id));
+                continue;
+            }
             if !self.tails.contains_key(&file.path_id) {
                 let mut boundary = FsReadBoundary;
-                let absolute = file.root.join(&file.relative_path);
                 let generation = self
                     .generations
                     .get(&absolute)
@@ -3782,6 +3940,29 @@ impl ProviderWorker for AdapterProviderWorker {
                         continue;
                     }
                 };
+                let ordinal = if tail.offset() == 0 {
+                    0
+                } else {
+                    match crate::provider::lane::record_ordinal_at_offset(
+                        &file.root,
+                        &file.relative_path,
+                        tail.offset(),
+                        &self.log_admission,
+                        &self.diagnostics,
+                    ) {
+                        Ok(ordinal) => ordinal,
+                        Err(_) => {
+                            self.availability_sweeps
+                                .entry(provider)
+                                .or_default()
+                                .failure
+                                .get_or_insert(AvailabilitySweepFailure::FileIoError);
+                            continue;
+                        }
+                    }
+                };
+                self.record_ordinals
+                    .insert(file.path_id, (tail.generation(), ordinal));
                 self.tails.insert(file.path_id, tail);
             }
             let mut boundary = FsReadBoundary;
@@ -3886,18 +4067,12 @@ impl ProviderWorker for AdapterProviderWorker {
                     }
                 };
                 while let Some(record) = records.next() {
-                    let discovery = &self
-                        .roots
-                        .get(&(provider, item.root.clone()))
-                        .expect("work root remains after tail poll")
-                        .discovery;
-                    let events = parse_adapter_record(provider, discovery, file, &record);
+                    let events = self.parse_record(item, &record);
                     if !merge_adapter_events(events, cycle.pending, &mut self.deferred) {
-                        let remaining = records
-                            .flat_map(|record| {
-                                parse_adapter_record(provider, discovery, file, &record)
-                            })
-                            .collect::<Vec<_>>();
+                        let mut remaining = Vec::new();
+                        for record in records {
+                            remaining.extend(self.parse_record(item, &record));
+                        }
                         self.deferred.extend(remaining);
                         let next = if index + 1 < work.len() {
                             &work[index + 1]
@@ -3964,21 +4139,15 @@ fn parse_adapter_record(
     }
 }
 
-fn target_owner_sessions(
-    files: &[crate::provider::DiscoveredFile],
-    targets: &HashSet<PathBuf>,
-) -> HashSet<String> {
-    files
-        .iter()
-        .filter(|file| targets.contains(&file.root.join(&file.relative_path)))
-        .filter_map(|file| file.bootstrap.as_ref())
-        .map(|identity| {
-            identity
-                .owner_session_id
-                .clone()
-                .unwrap_or_else(|| identity.thread_id.clone())
+fn codex_rollout_id(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    crate::provider::facts::scan_raw_ids(file_name)
+        .into_iter()
+        .filter_map(|id| match id {
+            crate::provider::facts::EvidenceId::Uuid(uuid) => Some(uuid),
+            crate::provider::facts::EvidenceId::ConfigDir(_) => None,
         })
-        .collect()
+        .next_back()
 }
 
 fn drain_deferred_provider_events(
@@ -4429,6 +4598,87 @@ async fn apply_provider_event(
 
 #[allow(clippy::too_many_arguments)]
 async fn apply_provider_event_with_admission(
+    event: ProviderEvent,
+    mut admission: Option<Admission>,
+    session: &str,
+    reducer: &mut Reducer,
+    shared: &SharedModel,
+    persistence: &mut RuntimePersistence,
+    coverage: &SourceCoverageRegistry,
+) -> Result<(), CollectorError> {
+    match event {
+        ProviderEvent::Synthesized(mut event) => {
+            event.metadata.herdr_session = session.to_owned();
+            event.metadata.receipt_time_ms = unix_now_ms();
+            event.metadata.source_coverage = coverage.provider_metadata();
+            if persistence.is_duplicate(&event.metadata.event_id) {
+                if let Some(admission) = admission.take() {
+                    admission.complete();
+                }
+                return Ok(());
+            }
+            let delta = match reducer.validate_controller_event(&event) {
+                Ok(delta) => delta,
+                Err(reason) => {
+                    tracing::warn!(
+                        warning_code = "provider_synthesized_event_rejected",
+                        event_id = event.metadata.event_id,
+                        ?reason,
+                        "rejected provider-log synthesized event"
+                    );
+                    if let Some(admission) = admission.take() {
+                        admission.complete();
+                    }
+                    return Ok(());
+                }
+            };
+            let Some(permit) = persistence.reserve_enqueue() else {
+                if let Some(admission) = admission.take() {
+                    admission.complete();
+                }
+                return Ok(());
+            };
+            let pending = match reducer.commit_staged(delta, permit) {
+                Ok(pending) => pending,
+                Err(CommitStagedError::IngestSequenceExhausted) => {
+                    if let Some(admission) = admission.take() {
+                        admission.complete();
+                    }
+                    return Ok(());
+                }
+            };
+            if let Some(admission) = admission.take() {
+                admission.complete();
+            }
+            let outcome = persistence.finish_pending(pending).await?;
+            reducer.complete_operator_submission(outcome);
+            Ok(())
+        }
+        // Task 6 and Task 7 own these consumers. Keeping explicit no-op routes here
+        // makes their admission and delivery semantics real without implementing them early.
+        ProviderEvent::RunLiveness { .. } | ProviderEvent::Telemetry { .. } => {
+            if let Some(admission) = admission.take() {
+                admission.complete();
+            }
+            Ok(())
+        }
+        event => {
+            apply_normalized_provider_event(
+                event,
+                admission,
+                session,
+                reducer,
+                shared,
+                persistence,
+                coverage,
+            )
+            .await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_normalized_provider_event(
     event: ProviderEvent,
     mut admission: Option<Admission>,
     session: &str,
@@ -5607,12 +5857,14 @@ fn normalize_provider_event(
                 identity_disagreement: false,
             }
         }
-        ProviderEvent::SourceState { .. } | ProviderEvent::Malformed { .. } => {
-            NormalizedProviderObservation {
-                events: Vec::new(),
-                identity_disagreement: false,
-            }
-        }
+        ProviderEvent::Synthesized(_)
+        | ProviderEvent::RunLiveness { .. }
+        | ProviderEvent::Telemetry { .. }
+        | ProviderEvent::SourceState { .. }
+        | ProviderEvent::Malformed { .. } => NormalizedProviderObservation {
+            events: Vec::new(),
+            identity_disagreement: false,
+        },
     }
 }
 
@@ -11135,6 +11387,273 @@ mod provider_integration_tests {
         events
     }
 
+    #[test]
+    fn worker_admission_gates_bootstrap_and_tail_before_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.claude/projects");
+        let target = root.join(format!(
+            "project/{0}.jsonl",
+            "11111111-1111-4111-8111-111111111111"
+        ));
+        let stranger = root.join(format!(
+            "project/{0}.jsonl",
+            "33333333-3333-4333-8333-333333333333"
+        ));
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let record = |session: &str| {
+            format!(
+                "{{\"type\":\"assistant\",\"uuid\":\"record-{session}\",\"timestamp\":\"2026-08-24T00:00:00Z\",\"sessionId\":\"{session}\",\"isSidechain\":false}}\n"
+            )
+        };
+        std::fs::write(&target, record("11111111-1111-4111-8111-111111111111")).unwrap();
+        std::fs::write(&stranger, record("33333333-3333-4333-8333-333333333333")).unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Claude,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Claude,
+            path: target.clone(),
+        }]);
+        let mut pending = PendingEvents::new(diagnostics.clone());
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+
+        let state = worker
+            .roots
+            .get(&(Provider::Claude, root))
+            .expect("target root should be scanned");
+        assert_eq!(state.discovery.files().len(), 1);
+        assert_eq!(
+            state.discovery.files()[0]
+                .root
+                .join(&state.discovery.files()[0].relative_path),
+            target
+        );
+        assert_eq!(worker.tails.len(), 1);
+        assert!(diagnostics.admission_open_attempts() > 0);
+        assert_eq!(tail_count_for_absolute(&worker, &stranger), 0);
+    }
+
+    #[test]
+    fn admitted_meta_sidecar_synthesizes_dispatch_and_started() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.claude/projects");
+        let session = "11111111-1111-4111-8111-111111111111";
+        let target = root.join(format!("project/{session}.jsonl"));
+        let subagents = root.join(format!("project/{session}/subagents"));
+        let transcript = subagents.join("agent-child.jsonl");
+        let meta = subagents.join("agent-child.meta.json");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(
+            &target,
+            format!(
+                "{{\"type\":\"assistant\",\"timestamp\":\"2026-08-24T00:00:00Z\",\"sessionId\":\"{session}\"}}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(&transcript, "").unwrap();
+        std::fs::write(
+            &meta,
+            format!(
+                "{{\"agentType\":\"reviewer\",\"description\":\"Review lane synthesis\",\"agentId\":\"child\",\"sessionId\":\"{session}\"}}"
+            ),
+        )
+        .unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Claude,
+                path: root,
+            }],
+            diagnostics.clone(),
+        );
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Claude,
+            path: target,
+        }]);
+        let mut pending = PendingEvents::new(diagnostics);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let synthesized = drain_pending(&mut pending)
+            .into_iter()
+            .filter_map(|event| match event {
+                ProviderEvent::Synthesized(event) => Some(event),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(synthesized.len(), 2);
+        assert!(matches!(
+            synthesized[0].event,
+            crate::model::ControllerEventKind::Dispatch { .. }
+        ));
+        assert!(matches!(
+            synthesized[1].event,
+            crate::model::ControllerEventKind::TaskStarted
+        ));
+        assert_eq!(
+            synthesized[0].metadata.event_id,
+            "log:agent-child.meta.json:0"
+        );
+        assert_eq!(synthesized[1].metadata.event_id, "log:agent-child.jsonl:0");
+    }
+
+    #[test]
+    fn pane_root_basename_twins_open_only_single_newest_artifact() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.claude/projects");
+        let session = "11111111-1111-4111-8111-111111111111";
+        let older = root.join(format!("project-a/{session}.jsonl"));
+        let newer = root.join(format!("project-b/{session}.jsonl"));
+        for path in [&older, &newer] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                path,
+                format!(
+                    "{{\"type\":\"assistant\",\"uuid\":\"record-{session}\",\"timestamp\":\"2026-08-24T00:00:00Z\",\"sessionId\":\"{session}\",\"isSidechain\":false}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let old_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let new_time = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&older)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&newer)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(new_time))
+            .unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Claude,
+                path: root,
+            }],
+            diagnostics.clone(),
+        );
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Claude,
+            path: older.clone(),
+        }]);
+        let mut pending = PendingEvents::new(diagnostics);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+
+        assert_eq!(tail_count_for_absolute(&worker, &older), 0);
+        assert_eq!(tail_count_for_absolute(&worker, &newer), 1);
+        assert_eq!(worker.tails.len(), 1);
+    }
+
+    #[test]
+    fn wired_worker_record_ordinal_is_restart_stable_at_nonzero_offset() {
+        use std::io::Write;
+
+        let directory = tempfile::tempdir().unwrap();
+        let rollout = "22222222-2222-4222-8222-222222222222";
+        let root = directory.path().join("home/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(format!("rollout-2026-08-24T00-00-00-{rollout}.jsonl"));
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"timestamp\":\"2026-08-24T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{rollout}\",\"session_id\":\"{rollout}\",\"cwd\":\"/repo\",\"originator\":\"codex\",\"cli_version\":\"0.149.0\"}}}}\n{{\"timestamp\":\"2026-08-24T00:00:01Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root,
+            }],
+            diagnostics.clone(),
+        );
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path: path.clone(),
+        }]);
+        let mut pending = PendingEvents::new(diagnostics);
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let _ = drain_pending(&mut pending);
+
+        writeln!(
+            std::fs::OpenOptions::new().append(true).open(&path).unwrap(),
+            "{{\"timestamp\":\"2026-08-24T00:00:02Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"turn_aborted\"}}}}"
+        )
+        .unwrap();
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let events = drain_pending(&mut pending);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::Synthesized(controller)
+                if controller.metadata.event_id == format!("log:{}:2", path.file_name().unwrap().to_string_lossy())
+        )));
+    }
+
+    #[tokio::test]
+    async fn event_ids_deterministic_across_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut persistence = test_runtime(writer);
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let mut synthesis = crate::provider::lane::Synthesis::default();
+        let events = synthesis.synthesize_batch(
+            Path::new("session.jsonl"),
+            [(
+                7,
+                crate::provider::facts::LogFact::Append {
+                    scope: crate::provider::facts::SessionScope::ClaudeRoot(
+                        "11111111-1111-4111-8111-111111111111".to_owned(),
+                    ),
+                    at_ms: 100,
+                },
+            )],
+            &mut crate::provider::lane::Admission::new(0),
+            &crate::provider::lane::AdmissionIndex::new(),
+        );
+        let event = events
+            .into_iter()
+            .find(|event| matches!(event, ProviderEvent::Synthesized(_)))
+            .expect("append should synthesize task_started");
+        for replay in [event.clone(), event] {
+            apply_provider_event(
+                replay,
+                "session",
+                &mut reducer,
+                &shared,
+                &mut persistence,
+                &SourceCoverageRegistry::new(SourceAvailability::Available),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(shared.borrow().task_runs().count(), 1);
+        lifecycle.shutdown().await.unwrap();
+        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+        assert_eq!(restored.event_ledger.len(), 1);
+        assert_eq!(restored.event_ledger[0].event_id, "log:session.jsonl:7");
+    }
+
     fn codex_records(owner: &str, agent: &str, event: &str) -> String {
         format!(
             "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{owner}\",\"session_id\":\"{owner}\"}}}}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"sub_agent_activity\",\"event_id\":\"{event}\",\"occurred_at_ms\":1,\"agent_thread_id\":\"{agent}\",\"agent_path\":\"/root/{agent}\",\"kind\":\"interacted\"}}}}\n"
@@ -12381,6 +12900,25 @@ mod provider_integration_tests {
         .unwrap();
         let diagnostics = crate::provider::ProviderDiagnostics::default();
         let mut worker = AdapterProviderWorker::new(Vec::new(), diagnostics.clone());
+        let evidence_parent = crate::provider::facts::SessionScope::Codex {
+            rollout_id: "pane-owner".to_owned(),
+        };
+        worker
+            .log_admission
+            .admit_pane_session(Provider::Codex, "pane-owner");
+        worker
+            .admission_index
+            .insert_codex_rollout("shared-owner", shared.clone());
+        assert!(
+            worker
+                .log_admission
+                .on_evidence(
+                    &evidence_parent,
+                    &crate::provider::facts::EvidenceId::Uuid("shared-owner".to_owned()),
+                    &worker.admission_index,
+                )
+                .is_some()
+        );
         let mut pending = PendingEvents::new(diagnostics.clone());
         let outer_only = TargetSet::new([ProviderTarget {
             provider: Provider::Codex,
