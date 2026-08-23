@@ -6,6 +6,8 @@ const BASELINE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/herdr-schema/baseline.json"
 );
+const PROVIDER_LOG_FIXTURES: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/provider-logs");
 
 fn run(args: &[&str]) -> std::process::Output {
     run_with_env(args, &[])
@@ -30,6 +32,80 @@ fn temp_candidate(name: &str, value: &serde_json::Value) -> std::path::PathBuf {
     let path = dir.join("candidate.json");
     std::fs::write(&path, value.to_string()).expect("write candidate");
     path
+}
+
+fn temp_provider_log_fixtures() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("temp provider-log directory");
+    for entry in std::fs::read_dir(PROVIDER_LOG_FIXTURES).expect("read provider-log fixtures") {
+        let entry = entry.expect("provider-log fixture entry");
+        if entry
+            .file_type()
+            .expect("provider-log fixture type")
+            .is_file()
+        {
+            std::fs::copy(entry.path(), directory.path().join(entry.file_name()))
+                .expect("copy provider-log fixture");
+        }
+    }
+    directory
+}
+
+#[test]
+fn log_baselines_cover_fixture_record_types() {
+    let out = run(&["--log-baselines", PROVIDER_LOG_FIXTURES]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("verdict: provider log baselines match"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn log_baseline_detects_novel_record_type() {
+    use std::io::Write as _;
+
+    let fixtures = temp_provider_log_fixtures();
+    let mut transcript = std::fs::OpenOptions::new()
+        .append(true)
+        .open(fixtures.path().join("claude-session.jsonl"))
+        .expect("open copied Claude transcript");
+    writeln!(
+        transcript,
+        r#"{{"type":"future-provider-record","timestamp":"2026-08-24T06:00:00.000Z","sessionId":"13f03635-c1f6-46e2-8e52-83d217b6f01c","cwd":"/home/user/git/example/herdr-top","version":"2.1.239"}}"#
+    )
+    .expect("append novel record");
+
+    let out = run(&[
+        "--log-baselines",
+        fixtures.path().to_str().expect("UTF-8 fixture path"),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("future-provider-record"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("verdict: REVIEW REQUIRED"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

@@ -1,0 +1,81 @@
+{
+  "description": "Pins the multiset of Codex fixture record/event/item types and the reviewed 0.149.x CLI version prefix. Regenerate from tests/fixtures/provider-logs as documented in README.md.",
+  "version_prefix": "0.149.",
+  "record_types": [
+    {
+      "scope": "event_msg",
+      "type": "item_completed",
+      "occurrences": 7
+    },
+    {
+      "scope": "event_msg",
+      "type": "task_complete",
+      "occurrences": 4
+    },
+    {
+      "scope": "event_msg",
+      "type": "task_started",
+      "occurrences": 4
+    },
+    {
+      "scope": "event_msg",
+      "type": "token_count",
+      "occurrences": 3
+    },
+    {
+      "scope": "item_completed",
+      "type": "AgentMessage",
+      "occurrences": 2
+    },
+    {
+      "scope": "item_completed",
+      "type": "CollabAgentToolCall",
+      "occurrences": 1
+    },
+    {
+      "scope": "item_completed",
+      "type": "CommandExecution",
+      "occurrences": 1
+    },
+    {
+      "scope": "item_completed",
+      "type": "Reasoning",
+      "occurrences": 1
+    },
+    {
+      "scope": "item_completed",
+      "type": "SubAgentActivity",
+      "occurrences": 1
+    },
+    {
+      "scope": "item_completed",
+      "type": "UserMessage",
+      "occurrences": 1
+    },
+    {
+      "scope": "item_content",
+      "type": "Text",
+      "occurrences": 2
+    },
+    {
+      "scope": "item_content",
+      "type": "text",
+      "occurrences": 1
+    },
+    {
+      "scope": "record",
+      "type": "event_msg",
+      "occurrences": 18
+    },
+    {
+      "scope": "record",
+      "type": "session_meta",
+      "occurrences": 4
+    },
+    {
+      "scope": "record",
+      "type": "turn_context",
+      "occurrences": 4
+    }
+  ]
+}
