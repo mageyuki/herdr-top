@@ -24,7 +24,7 @@ sysstat `pidstat`, and jq 1.8.1.
 ## Global Constraints
 
 - The approved design is
-  `docs/superpowers/specs/2026-08-12-increment-5-reliability-performance-design.md`
+  `docs/internal/superpowers/specs/2026-08-12-increment-5-reliability-performance-design.md`
   at commit `fb4c651ca60471de5e399e8e1e161d0f0507ea5e`.
 - Production subject for the untouched baseline is
   `9cd98131038a53b6dd36ff53e9b89825acba70ae`.
@@ -3433,9 +3433,9 @@ After building the test executable, run its ignored
 declared Task 1A.1/1A.2 common-test, fixture/MANIFEST, workload test,
 `tests/support/reference_profile_controller.rs`, script, and CI paths, the
 two exact non-production planning paths
-`docs/superpowers/specs/2026-08-12-increment-5-reliability-performance-design.md`
+`docs/internal/superpowers/specs/2026-08-12-increment-5-reliability-performance-design.md`
 and
-`docs/superpowers/plans/2026-08-12-increment-5-reliability-performance.md`, and
+`docs/internal/superpowers/plans/2026-08-12-increment-5-reliability-performance.md`, and
 feature-only hunks wholly bounded by named `increment5-workload-harness` markers
 in controller/collector/reducer/operator/store-mod/app. All added state/calls are compiled only
 under that feature, and the no-feature path retains the same call order and

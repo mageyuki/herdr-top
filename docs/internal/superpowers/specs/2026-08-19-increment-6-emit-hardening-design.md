@@ -4,7 +4,7 @@
 **Baseline:** `main = 5a0eab7` (Increment 5 merged as PR #4; real-herdr
 subscription hotfix merged as PR #5).
 **Design references:** `docs/design/herdr-top-mvp.md` sections 5.4, 7.3, 12.3,
-14, and 20; `docs/superpowers/plans/2026-08-12-increment-5-reliability-performance.md`
+14, and 20; `docs/internal/superpowers/plans/2026-08-12-increment-5-reliability-performance.md`
 (the frozen Increment 5 plan, called "the Increment 5 plan" below).
 
 ## Summary

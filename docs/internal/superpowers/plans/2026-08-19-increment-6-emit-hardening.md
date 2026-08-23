@@ -19,9 +19,9 @@ incrementalization.
 **Tech Stack:** Rust (existing crate layout), tokio, clap, serde; bash only
 inside the existing reference-profile runner.
 
-**Spec:** `docs/superpowers/specs/2026-08-19-increment-6-emit-hardening-design.md`
+**Spec:** `docs/internal/superpowers/specs/2026-08-19-increment-6-emit-hardening-design.md`
 (commit `464464c` includes the event-identifier amendment). The frozen
-Increment 5 plan `docs/superpowers/plans/2026-08-12-increment-5-reliability-performance.md`
+Increment 5 plan `docs/internal/superpowers/plans/2026-08-12-increment-5-reliability-performance.md`
 is referenced read-only and is never edited.
 
 ## Global Constraints

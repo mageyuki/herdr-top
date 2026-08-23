@@ -10186,8 +10186,8 @@ fn verify_subject_diff_is_harness_only_impl(
     let allowed = [
         ".github/workflows/ci.yml",
         "Cargo.toml",
-        "docs/superpowers/plans/2026-08-12-increment-5-reliability-performance.md",
-        "docs/superpowers/specs/2026-08-12-increment-5-reliability-performance-design.md",
+        "docs/internal/superpowers/plans/2026-08-12-increment-5-reliability-performance.md",
+        "docs/internal/superpowers/specs/2026-08-12-increment-5-reliability-performance-design.md",
         "scripts/run-reference-profile.sh",
         "tests/common/mod.rs",
         "tests/common/workload.rs",
@@ -10232,12 +10232,12 @@ fn verify_subject_diff_is_harness_only_impl(
     }
     for (path, expected) in [
         (
-            "docs/superpowers/specs/2026-08-12-increment-5-reliability-performance-design.md",
+            "docs/internal/superpowers/specs/2026-08-12-increment-5-reliability-performance-design.md",
             "17dfeb91a2ce0efeff7a6c79bcac345e7ca051f268ed0c39c57ad297e38035f4",
         ),
         (
-            "docs/superpowers/plans/2026-08-12-increment-5-reliability-performance.md",
-            "dd70fd70bca4e6fd1762e9b37f877deb3c830e7c38a0da054eb1a78434e28799",
+            "docs/internal/superpowers/plans/2026-08-12-increment-5-reliability-performance.md",
+            "2dfd93ecce75c817e2e11cc6de54933857f5095eaf43f60ae36b429b21eb2dab",
         ),
     ] {
         let bytes = std::fs::read(cwd.join(path)).map_err(|error| error.to_string())?;
