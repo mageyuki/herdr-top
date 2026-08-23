@@ -194,17 +194,19 @@ Usage for codex: per-turn deltas from `last_token_usage.output_tokens`
 with `sample_id` = the caller-maintained record ordinal; turns close
 at `CodexTurnComplete`. Activity: commentary at `item.content[0].text`
 (phase == "commentary") preferred; else CommandExecution — sanitize the
-SCRIPT ELEMENT of the argv array. Only the FIRST `session_meta` is
-identity; a second is ignored.
+SCRIPT ELEMENT of the argv array. `session_meta` records surface as facts
+in file order; the Task 5 consumer retains the FIRST as identity
+(first-wins enforcement and its test are a Task 5 obligation).
 
 - [ ] **Step 1: Failing tests:**
-  `first_session_meta_wins_second_ignored`;
+  `session_meta_records_surface_in_file_order`;
   `turn_context_per_turn_model_and_effort` (resume fixture: two differing
   contexts both surface with their turn ids);
   `commentary_preferred_then_sanitized_argv_script`;
   `pid_parses_from_json_string`;
-  `usage_is_turn_delta_not_total_sum` (resume fixture: expected =
-  turn1_last + turn2_last, NOT sum of totals, NOT max);
+  `usage_is_turn_delta_not_total_sum` (resume fixture: expected = sum of
+  every per-record `last_token_usage.output_tokens` — 120+80+250 = 450;
+  NOT sum of totals (570), NOT max or last (250));
   `internal_subagent_both_shapes`;
   `turn_aborted_maps_to_cancelled_fact`;
   `file_uri_cwd_relativizes`;
