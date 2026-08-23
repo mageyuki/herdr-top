@@ -7,10 +7,21 @@ use herdr_top::model::{
     TaskState, Workspace,
 };
 
-fn developer_home() -> PathBuf {
-    std::env::var_os("HOME")
+fn resolve_developer_home(
+    perf: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    perf.filter(|value| !value.is_empty())
+        .or_else(|| home.filter(|value| !value.is_empty()))
         .map(PathBuf::from)
-        .expect("HOME must be set for the reference workload")
+}
+
+fn developer_home() -> PathBuf {
+    resolve_developer_home(
+        std::env::var_os("HERDR_PERF_DEVELOPER_HOME"),
+        std::env::var_os("HOME"),
+    )
+    .expect("HERDR_PERF_DEVELOPER_HOME or HOME must be set for the reference workload")
 }
 
 fn developer_home_path(relative: &str) -> String {
@@ -18,7 +29,26 @@ fn developer_home_path(relative: &str) -> String {
         .join(relative)
         .into_os_string()
         .into_string()
-        .expect("HOME must be valid UTF-8 for the reference workload")
+        .expect("HERDR_PERF_DEVELOPER_HOME or HOME must be valid UTF-8 for the reference workload")
+}
+
+#[test]
+fn developer_home_resolution_prefers_nonempty_perf_override_and_falls_back() {
+    use std::ffi::OsString;
+
+    assert_eq!(
+        resolve_developer_home(
+            Some(OsString::from("/perf-home")),
+            Some(OsString::from("/home")),
+        ),
+        Some(PathBuf::from("/perf-home"))
+    );
+    assert_eq!(
+        resolve_developer_home(Some(OsString::new()), Some(OsString::from("/home"))),
+        Some(PathBuf::from("/home"))
+    );
+    assert_eq!(resolve_developer_home(None, Some(OsString::new())), None);
+    assert_eq!(resolve_developer_home(None, None), None);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

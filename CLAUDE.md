@@ -11,7 +11,7 @@ herdr-top is a terminal monitor for herdr-managed Claude and Codex agent session
 
 ## Source layout
 
-- `src/main.rs` parses the CLI and coordinates monitor, doctor, hook, and emit commands.
+- `src/main.rs` parses the CLI and coordinates the default monitor mode plus the `doctor` and `emit` subcommands, including `emit --from-hook`.
 - `src/lib.rs` exposes the library modules used by the binary and integration tests.
 - `src/activity.rs` defines immutable operator activity and terminal-visibility read models.
 - `src/doctor.rs` builds deterministic, non-mutating diagnostic reports and renderers.

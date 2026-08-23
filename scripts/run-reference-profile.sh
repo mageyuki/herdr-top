@@ -6,6 +6,10 @@ case $- in
   *) builtin printf '%s\n' 'error: protected Bash mode is required' >&2; exit 20 ;;
 esac
 
+normalized_developer_home=${HOME-}
+normalized_developer_home=${normalized_developer_home%/}
+readonly normalized_developer_home
+
 bootstrap_source_fixture() {
   [[ ${source_fixture_bootstrap_parsed-} != 1 ]] || return 0
   [[ ${HERDR_INCREMENT5_BOOTSTRAP_TOOLS_V1+x} != x ]] || return 20
@@ -1013,7 +1017,7 @@ run_orchestration_fixture() {
       [[ $baseline_validator == /* && -f $baseline_validator && -x $baseline_validator ]] || return 20
       set +e
       "$source_env_executable" -i \
-        HOME="$HOME" \
+        HERDR_PERF_DEVELOPER_HOME="$normalized_developer_home" \
         HERDR_PERF_VALIDATE_BASELINE_RESULTS_ROOT="$baseline_root" \
         "$baseline_validator" validate_reference_baseline_set --exact --ignored --test-threads=1
       baseline_status=$?
@@ -1098,7 +1102,7 @@ bootstrap_authoritative_manifest() {
     time uname unlink
   )
   local -ar expected_requested=(
-    "$HOME/.cargo/bin/rustup"
+    "$normalized_developer_home/.cargo/bin/rustup"
     /usr/bin/awk /usr/bin/bash /usr/bin/env /usr/bin/findmnt /usr/bin/git
     /usr/bin/id /usr/bin/jq /usr/bin/lsblk /usr/bin/lscpu /usr/bin/mkdir
     /usr/bin/mktemp /usr/bin/mv /usr/bin/pidstat /usr/bin/prlimit
@@ -2267,6 +2271,7 @@ validate_baseline_layout_up_front() {
     [[ -d $runner_baseline_root/$mapped/trial-0001 ]] || return 20
   done
   "$auth_env_executable" -i \
+    HERDR_PERF_DEVELOPER_HOME="$normalized_developer_home" \
     HERDR_PERF_VALIDATE_BASELINE_RESULTS_ROOT="$runner_baseline_root" \
     "$test_binary" validate_reference_baseline_set --exact --ignored --test-threads=1 \
     || return 20
