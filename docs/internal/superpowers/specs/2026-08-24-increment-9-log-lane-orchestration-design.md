@@ -82,9 +82,9 @@ test against `src/hook_adapter.rs`). Codex sessions synthesize
 `RunKey::Native { provider: Codex, sid: <rollout-id> }` claims through the
 existing native-binding path (herdr pane detection already produces these
 sids for pane roots — verified identical format). Synthesized event ids
-are DETERMINISTIC — session-scoped events use
-`log:<artifact-basename>:` + `<record-ordinal>:<kind-slug>`, while agent-scoped
-events append `:<agent-id>` — so the existing durable event ledger
+are DETERMINISTIC —
+`log:<artifact-basename>:<record-ordinal>:<kind-slug>[:<agent-id>]` — so the
+existing durable event ledger
 deduplicates re-reads across restarts. The semantic discriminator remains
 stable if fact types are added or reordered; repeated instances of the same
 target and kind within one record are the same event by definition. Ids never

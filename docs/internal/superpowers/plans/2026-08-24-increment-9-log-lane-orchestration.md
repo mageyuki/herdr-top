@@ -40,9 +40,9 @@ no new dependencies.
   `hook:claude-code:<uuid>:agent:<agentId>` — pin against
   `src/hook_adapter.rs`); codex sessions claim
   `RunKey::Native { Codex, <rollout-id> }`. Synthesized event ids use the
-  semantic forms `log:<artifact-basename>:` + `<record-ordinal>:<kind-slug>` for
-  session-scoped events and the same form plus `:<agent-id>` for agent-scoped
-  events. This avoids positional-id drift when fact types are added or
+  semantic form
+  `log:<artifact-basename>:<record-ordinal>:<kind-slug>[:<agent-id>]`. This
+  avoids positional-id drift when fact types are added or
   reordered; the same target and kind repeated within one record is one
   semantic event. Ids are never `prov:`-prefixed (`src/reducer.rs:496`
   rejects that prefix).
@@ -278,9 +278,9 @@ diagnostics counters).
 - Key recipes (pinned against `src/hook_adapter.rs` constants):
   `hook:claude-code:<uuid>` / `hook:claude-code:<uuid>:agent:<agentId>`;
   codex native claim `RunKey::Native { Codex, rollout_id }`.
-- Event ids: `log:<artifact-basename>:` + `<record-ordinal>:<kind-slug>` for
-  session-scoped events, with `:<agent-id>` appended for agent-scoped events;
-  the semantic discriminator is order-independent and the durable event ledger
+- Event ids:
+  `log:<artifact-basename>:<record-ordinal>:<kind-slug>[:<agent-id>]`; the
+  semantic discriminator is order-independent and the durable event ledger
   dedupes replays across restarts.
 - Mapping: SubagentAppeared → Dispatch + TaskStarted (label =
   description, agent type in metadata); SubagentEnded → Complete/Failed;
