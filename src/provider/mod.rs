@@ -24,6 +24,7 @@ use crate::model::{ExecState, MinimalProviderMetadata, Provider, ProviderDiagnos
 pub mod claude;
 pub mod claude_facts;
 pub mod codex;
+pub mod codex_facts;
 pub mod facts;
 pub mod tail;
 

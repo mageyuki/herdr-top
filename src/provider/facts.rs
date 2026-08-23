@@ -39,6 +39,60 @@ pub enum LogFact {
         /// Generated session title.
         title: String,
     },
+    /// Identity metadata reported by a Codex rollout.
+    CodexMeta {
+        /// Rollout ID named by the metadata record.
+        rollout_id: String,
+        /// Raw Codex working directory, which may be a `file://` URI.
+        cwd: String,
+        /// Codex process that originated the rollout.
+        originator: String,
+        /// Typed Codex internal-agent source, when recognized.
+        internal: Option<CodexInternal>,
+        /// Codex CLI version that created the rollout.
+        cli_version: String,
+    },
+    /// Per-turn Codex execution context.
+    CodexTurn {
+        /// Rollout that owns the turn.
+        rollout_id: String,
+        /// Provider turn ID.
+        turn_id: String,
+        /// Model selected for the turn.
+        model: String,
+        /// Reasoning effort selected for the turn, when present.
+        effort: Option<String>,
+        /// Sandbox policy mode selected for the turn, when present.
+        sandbox: Option<String>,
+    },
+    /// Evidence that a Codex turn started.
+    CodexTurnStarted {
+        /// Rollout that owns the turn.
+        rollout_id: String,
+        /// Provider timestamp in Unix epoch milliseconds.
+        at_ms: i64,
+    },
+    /// Evidence that a Codex turn completed.
+    CodexTurnComplete {
+        /// Rollout that owns the turn.
+        rollout_id: String,
+        /// Provider timestamp in Unix epoch milliseconds.
+        at_ms: i64,
+    },
+    /// Evidence that a Codex turn was aborted.
+    CodexTurnAborted {
+        /// Rollout that owns the turn.
+        rollout_id: String,
+        /// Provider timestamp in Unix epoch milliseconds.
+        at_ms: i64,
+    },
+    /// Process ID reported by a Codex command execution.
+    CodexPid {
+        /// Rollout that owns the process.
+        rollout_id: String,
+        /// Decimal process ID parsed from the provider's JSON string.
+        pid: u32,
+    },
     /// Evidence that a Claude subagent appeared.
     SubagentAppeared {
         /// Owning root Claude session ID.
@@ -94,6 +148,25 @@ pub enum LogFact {
         parent: SessionScope,
         /// Extracted identifier token.
         id: EvidenceId,
+    },
+}
+
+/// Typed source of a Codex internal-agent rollout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CodexInternal {
+    /// A provider-defined named internal agent.
+    Named {
+        /// Provider-defined internal-agent name.
+        name: String,
+    },
+    /// An internal agent created by spawning a child thread.
+    ThreadSpawn {
+        /// Parent Codex thread ID.
+        parent_thread_id: String,
+        /// Optional provider-assigned agent nickname.
+        nickname: Option<String>,
+        /// Optional provider-assigned agent role.
+        role: Option<String>,
     },
 }
 
