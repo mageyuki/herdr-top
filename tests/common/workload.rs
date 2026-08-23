@@ -4381,10 +4381,9 @@ fn invariant_environment() -> std::collections::BTreeMap<String, String> {
         ("CARGO_HOME".to_owned(), developer_home_path(".cargo")),
         (
             "HOME".to_owned(),
-            developer_home()
-                .into_os_string()
-                .into_string()
-                .expect("HOME must be valid UTF-8 for the reference workload"),
+            developer_home().into_os_string().into_string().expect(
+                "HERDR_PERF_DEVELOPER_HOME or HOME must be valid UTF-8 for the reference workload",
+            ),
         ),
         ("LC_ALL".to_owned(), "C".to_owned()),
         ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
