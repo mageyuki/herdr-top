@@ -27,7 +27,7 @@ use crate::diagnostics::{
 #[cfg(any(test, feature = "workload-harness"))]
 use crate::herdr::collector::ObservationQuality;
 use crate::herdr::collector::{PerformancePublication, SourceCoverageRegistry};
-use crate::model::{DomainModel, RunId, RunKey, SharedModel};
+use crate::model::{DomainModel, OperatorCommand, RunId, RunKey, SharedModel};
 #[cfg(any(test, feature = "workload-harness"))]
 use crate::performance::PerformanceSnapshot;
 use crate::store::writer::PersistenceStatus;
@@ -525,6 +525,7 @@ fn default_operator() -> OperatorSnapshot {
 /// Fixed-screen monitor state backed by coherent model and performance publications.
 pub struct App {
     model_receiver: SharedModel,
+    operator_commands: tokio::sync::mpsc::Sender<OperatorCommand>,
     diagnostics_receiver: tokio::sync::watch::Receiver<RuntimeDiagnosticsSnapshot>,
     operator_receiver: tokio::sync::watch::Receiver<OperatorSnapshot>,
     model: Arc<DomainModel>,
@@ -544,11 +545,23 @@ impl App {
     /// Creates an application from observation receivers and display-only header inputs.
     #[must_use]
     pub fn new(model_receiver: SharedModel, header: HeaderInputs) -> Self {
+        let (operator_commands, _operator_command_receiver) = tokio::sync::mpsc::channel(1);
+        Self::with_operator_commands(model_receiver, operator_commands, header)
+    }
+
+    /// Creates an application with a bounded command path to the collector.
+    #[must_use]
+    pub fn with_operator_commands(
+        model_receiver: SharedModel,
+        operator_commands: tokio::sync::mpsc::Sender<OperatorCommand>,
+        header: HeaderInputs,
+    ) -> Self {
         let (_diagnostics_sender, diagnostics_receiver) =
             tokio::sync::watch::channel(default_diagnostics());
         let (_operator_sender, operator_receiver) = tokio::sync::watch::channel(default_operator());
-        Self::with_inputs(
+        Self::with_operator_commands_and_inputs(
             model_receiver,
+            operator_commands,
             header,
             diagnostics_receiver,
             operator_receiver,
@@ -567,6 +580,29 @@ impl App {
         setup: TuiSetup,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        let (operator_commands, _operator_command_receiver) = tokio::sync::mpsc::channel(1);
+        Self::with_operator_commands_and_inputs(
+            model_receiver,
+            operator_commands,
+            header,
+            diagnostics_receiver,
+            operator_receiver,
+            setup,
+            clock,
+        )
+    }
+
+    /// Creates an application with every observation input plus the collector command path.
+    #[must_use]
+    pub fn with_operator_commands_and_inputs(
+        model_receiver: SharedModel,
+        operator_commands: tokio::sync::mpsc::Sender<OperatorCommand>,
+        header: HeaderInputs,
+        diagnostics_receiver: tokio::sync::watch::Receiver<RuntimeDiagnosticsSnapshot>,
+        operator_receiver: tokio::sync::watch::Receiver<OperatorSnapshot>,
+        setup: TuiSetup,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         let model = Arc::clone(&model_receiver.borrow());
         let performance = header.performance.borrow().clone();
         let diagnostics = diagnostics_receiver.borrow().clone();
@@ -577,6 +613,7 @@ impl App {
         let session_display_name = super::projection::escape_controls(&header.session);
         let mut app = Self {
             model_receiver,
+            operator_commands,
             diagnostics_receiver,
             operator_receiver,
             model,
@@ -683,7 +720,7 @@ impl App {
         }
     }
 
-    /// Applies one keyboard event without touching the collector, writer, or monitored agents.
+    /// Applies one keyboard event, sending only bounded operator intent to the collector.
     pub fn handle_key(&mut self, key: KeyEvent) -> LoopControl {
         if key.kind == KeyEventKind::Release {
             return LoopControl::Continue;
@@ -698,6 +735,12 @@ impl App {
             KeyCode::Char('q') => LoopControl::Exit,
             KeyCode::Char('/') => {
                 self.state.filter_draft = Some(self.state.filter_query.clone());
+                LoopControl::Continue
+            }
+            KeyCode::Char('c') => {
+                let _ = self
+                    .operator_commands
+                    .try_send(OperatorCommand::DismissClearable);
                 LoopControl::Continue
             }
             KeyCode::Char('i') => {
@@ -1546,8 +1589,8 @@ mod tests {
         SourceCoverageRegistry,
     };
     use crate::model::{
-        AgentNode, DependencyEdge, DisplayOrdinal, DomainModel, ExecState, Execution, Pane,
-        Provider, RunId, RunKey, Tab, TaskRun, TaskState, Workspace,
+        AgentNode, DependencyEdge, DisplayOrdinal, DomainModel, ExecState, Execution,
+        OperatorCommand, Pane, Provider, RunId, RunKey, Tab, TaskRun, TaskState, Workspace,
     };
     use crate::performance::{PerformanceDegradationReason, PerformanceSnapshot};
     use crate::store::writer::{
@@ -3877,6 +3920,45 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(app.model().task_runs().count(), expected_run_count);
+    }
+
+    #[test]
+    fn c_sends_exactly_one_dismiss_clearable_command() {
+        let (_model_sender, model_receiver) = watch::channel(Arc::new(DomainModel::default()));
+        let (command_sender, mut command_receiver) = tokio::sync::mpsc::channel(2);
+        let mut app =
+            App::with_operator_commands(model_receiver, command_sender, HeaderInputs::default());
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            LoopControl::Continue
+        );
+
+        assert_eq!(
+            command_receiver.try_recv(),
+            Ok(OperatorCommand::DismissClearable)
+        );
+        assert!(matches!(
+            command_receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn c_in_filter_draft_is_text_and_sends_no_command() {
+        let (_model_sender, model_receiver) = watch::channel(Arc::new(DomainModel::default()));
+        let (command_sender, mut command_receiver) = tokio::sync::mpsc::channel(2);
+        let mut app =
+            App::with_operator_commands(model_receiver, command_sender, HeaderInputs::default());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+
+        assert_eq!(app.state().filter_draft(), Some("c"));
+        assert!(matches!(
+            command_receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]

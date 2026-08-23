@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::model::{Provider, RunId, RunKey, TaskState};
+use crate::model::{Provider, RunId, RunKey, TaskRun, TaskState};
 
 pub const DEFAULT_TERMINAL_VISIBILITY_MS: i64 = 60 * 60 * 1_000;
 pub const HOOK_ONLY_STALE_VISIBILITY_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -68,6 +68,21 @@ pub fn runs_with_executions(model: &crate::model::DomainModel) -> HashSet<RunId>
         .collect()
 }
 
+/// Returns whether a Controller-keyed run without an execution reached its visibility deadline.
+#[must_use]
+pub fn is_hook_only_stale_task_run(
+    run: &TaskRun,
+    runs_with_executions: &HashSet<RunId>,
+    now_ms: i64,
+) -> bool {
+    let hook_only =
+        matches!(run.key, RunKey::Controller(_)) && !runs_with_executions.contains(&run.run_id);
+    hook_only
+        && run.updated_at_ms.is_some_and(|updated_at_ms| {
+            now_ms >= updated_at_ms.saturating_add(HOOK_ONLY_STALE_VISIBILITY_MS)
+        })
+}
+
 /// `runs_with_executions` must be derived from the same model snapshot as `run`.
 #[must_use]
 pub fn is_default_visible_task_run(
@@ -79,13 +94,7 @@ pub fn is_default_visible_task_run(
     if run.dismissed_at_ms.is_some() {
         return false;
     }
-    let hook_only =
-        matches!(run.key, RunKey::Controller(_)) && !runs_with_executions.contains(&run.run_id);
-    if hook_only
-        && run.updated_at_ms.is_some_and(|updated_at_ms| {
-            now_ms >= updated_at_ms.saturating_add(HOOK_ONLY_STALE_VISIBILITY_MS)
-        })
-    {
+    if is_hook_only_stale_task_run(run, runs_with_executions, now_ms) {
         return false;
     }
     !run.state.is_terminal()

@@ -448,6 +448,7 @@ fn footer_line(width: usize) -> String {
         "f/End follow",
         "tab view",
         "/ filter",
+        "c clear",
         "s summary",
         "? help",
     ];
@@ -578,6 +579,7 @@ fn help_lines(diagnostics: &RuntimeDiagnosticsSnapshot, setup: &TuiSetup) -> Vec
         "q stop Top only; monitored agents continue; detach also leaves Top running".to_owned(),
         "Up/Down select; f or End resumes follow; Tab toggles tree/DAG".to_owned(),
         "/ edits a draft; Enter trims/commits; Esc cancels; empty clears".to_owned(),
+        "c persistently clears terminal and hook-only stale runs".to_owned(),
         "Filter: literal Unicode lowercase substring; interior whitespace is literal".to_owned(),
         "Filter excludes paths, activity, Controller free text, content, and raw events".to_owned(),
         "Tree: Left collapse/parent; Right expand/child; Enter toggles branch".to_owned(),
@@ -2699,6 +2701,7 @@ mod tests {
             "f/End follow",
             "tab view",
             "/ filter",
+            "c clear",
             "s summary",
             "? help",
         ];

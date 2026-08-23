@@ -22,6 +22,7 @@ use herdr_top::herdr::controller::{
 use herdr_top::herdr::wire;
 use herdr_top::hook_adapter::{self, HookPayload};
 use herdr_top::lockfile::{self, LockError, OwnerRecord, StateRoot};
+use herdr_top::model::OperatorCommand;
 use herdr_top::rendezvous::{self, RvError};
 use herdr_top::session_key::{self, ResolvedSession, SessionKeyError};
 use herdr_top::store::{self, StoreError, WriterError};
@@ -34,6 +35,7 @@ const OWNER_STARTING_DELAY: Duration = Duration::from_millis(200);
 const LOG_FILE: &str = "herdr-top.log";
 const LOG_FILE_MODE: u32 = 0o600;
 const MAX_HOOK_PAYLOAD_BYTES: usize = 1024 * 1024;
+const OPERATOR_COMMAND_QUEUE_CAPACITY: usize = 1;
 
 #[derive(Debug, Parser)]
 #[command(name = "herdr-top", version)]
@@ -423,6 +425,8 @@ async fn run_monitor(cli: &Cli, plugin_state_dir: Option<&OsStr>) -> Result<(), 
     let restored_operator = store.load_restored_operator_state()?;
     let (lifecycle, writer) = store::spawn_writer(store)?;
     let session_name = resolved.session_key().name().to_owned();
+    let (operator_commands, operator_command_receiver) =
+        tokio::sync::mpsc::channel::<OperatorCommand>(OPERATOR_COMMAND_QUEUE_CAPACITY);
     let collector =
         match collector::spawn_with_controller_coverage_occurrence_sink_and_operator_seed(
             socket,
@@ -433,6 +437,7 @@ async fn run_monitor(cli: &Cli, plugin_state_dir: Option<&OsStr>) -> Result<(), 
             controller_coverage,
             occurrence_sink,
             restored_operator,
+            operator_command_receiver,
         )
         .await
         {
@@ -456,8 +461,9 @@ async fn run_monitor(cli: &Cli, plugin_state_dir: Option<&OsStr>) -> Result<(), 
     let ascii_tree = ascii_tree_enabled(env::var_os("HERDR_TOP_ASCII_TREE").as_deref());
     let tui_setup = TuiSetup::for_owner(state_base, env::var_os("HOME"), &version_runner)
         .with_ascii_tree(ascii_tree);
-    let mut app = App::with_inputs(
+    let mut app = App::with_operator_commands_and_inputs(
         collector.model.clone(),
+        operator_commands,
         HeaderInputs {
             host: resolve_hostname(),
             session: session_name,

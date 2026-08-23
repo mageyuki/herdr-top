@@ -31,9 +31,10 @@ use crate::lockfile::OwnerRecord;
 use crate::model::{
     AgentNodeObservation, AgentSessionReference, AgentSessionReferenceKind,
     ControllerDiagnosticsHandle, DomainModel, EnrichmentDiagnosticsHandle, EventMetadata,
-    ExecState, Execution, GapKind, MinimalProviderMetadata, NormalizedEvent, Pane, PaneSnapshot,
-    Provider, ReconcileBatch, RunId, RunKey, SharedModel, SnapshotAgent, SourceCoverage, Tab,
-    TopologyEntity, TopologyEntityId, TopologySnapshot, Workspace, sanitize_controller_text,
+    ExecState, Execution, GapKind, MinimalProviderMetadata, NormalizedEvent, OperatorCommand, Pane,
+    PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SharedModel, SnapshotAgent,
+    SourceCoverage, Tab, TopologyEntity, TopologyEntityId, TopologySnapshot, Workspace,
+    sanitize_controller_text,
 };
 use crate::performance::{
     Admission, Admitted, PerformanceClock, PerformanceIngress, PerformanceSampler,
@@ -1203,6 +1204,7 @@ pub async fn spawn_workload_collector(
             task_cancellation,
             owner,
             Some(controller_requests),
+            None,
             provider_integration,
             LivenessPolicy::default(),
             task_primary_stream_diagnostics,
@@ -1246,6 +1248,7 @@ pub async fn spawn(
         SourceAvailability::NotApplicable,
         Arc::new(UnavailableOccurrenceSink),
         empty_operator_seed(),
+        None,
     )
     .await
 }
@@ -1274,6 +1277,7 @@ pub async fn spawn_with_controller(
         controller_coverage,
         Arc::new(UnavailableOccurrenceSink),
         empty_operator_seed(),
+        None,
     )
     .await
 }
@@ -1307,6 +1311,7 @@ pub async fn spawn_with_controller_and_performance_clock(
         controller_coverage,
         Arc::new(UnavailableOccurrenceSink),
         empty_operator_seed(),
+        None,
         performance_clock,
         Some(performance_observer),
     )
@@ -1331,6 +1336,7 @@ pub async fn spawn_with_controller_coverage(
         controller_coverage,
         Arc::new(UnavailableOccurrenceSink),
         empty_operator_seed(),
+        None,
     )
     .await
 }
@@ -1354,6 +1360,7 @@ pub async fn spawn_with_controller_coverage_and_occurrence_sink(
         controller_coverage,
         occurrence_sink,
         empty_operator_seed(),
+        None,
     )
     .await
 }
@@ -1369,6 +1376,7 @@ pub async fn spawn_with_controller_coverage_occurrence_sink_and_operator_seed(
     controller_coverage: SourceAvailability,
     occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
     restored_operator: RestoredOperatorState,
+    operator_commands: mpsc::Receiver<OperatorCommand>,
 ) -> Result<CollectorHandle, CollectorError> {
     spawn_configured(
         sock,
@@ -1379,6 +1387,7 @@ pub async fn spawn_with_controller_coverage_occurrence_sink_and_operator_seed(
         controller_coverage,
         occurrence_sink,
         restored_operator,
+        Some(operator_commands),
     )
     .await
 }
@@ -1400,6 +1409,7 @@ async fn spawn_configured(
     controller_coverage: SourceAvailability,
     occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
     restored_operator: RestoredOperatorState,
+    operator_commands: Option<mpsc::Receiver<OperatorCommand>>,
 ) -> Result<CollectorHandle, CollectorError> {
     spawn_configured_inner(
         sock,
@@ -1410,6 +1420,7 @@ async fn spawn_configured(
         controller_coverage,
         occurrence_sink,
         restored_operator,
+        operator_commands,
         Arc::new(SystemPerformanceClock::new()),
         #[cfg(feature = "workload-harness")]
         None,
@@ -1427,6 +1438,7 @@ async fn spawn_configured_inner(
     controller_coverage: SourceAvailability,
     occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
     restored_operator: RestoredOperatorState,
+    operator_commands: Option<mpsc::Receiver<OperatorCommand>>,
     performance_clock: Arc<dyn PerformanceClock>,
     #[cfg(feature = "workload-harness")] performance_observer: Option<WorkloadPerformanceObserver>,
 ) -> Result<CollectorHandle, CollectorError> {
@@ -1528,6 +1540,7 @@ async fn spawn_configured_inner(
             task_cancellation,
             owner,
             controller_requests,
+            operator_commands,
             provider_integration,
             LivenessPolicy::default(),
             task_primary_stream_diagnostics,
@@ -1562,6 +1575,7 @@ async fn run_collector(
     cancellation: CancellationToken,
     mut owner: OwnerTracker,
     mut controller_requests: Option<ControllerRequestReceiver>,
+    mut operator_commands: Option<mpsc::Receiver<OperatorCommand>>,
     mut provider: ProviderIntegration,
     liveness_policy: LivenessPolicy,
     primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle,
@@ -1712,6 +1726,7 @@ async fn run_collector(
             Arc::clone(&overflowed),
             &mut enrichment,
             &mut controller_requests,
+            &mut operator_commands,
             &mut provider,
             liveness_policy,
             &primary_stream_diagnostics,
@@ -1802,6 +1817,7 @@ async fn converge(
     overflowed: Arc<AtomicBool>,
     enrichment: &mut EnrichmentConverge,
     controller_requests: &mut Option<ControllerRequestReceiver>,
+    operator_commands: &mut Option<mpsc::Receiver<OperatorCommand>>,
     provider: &mut ProviderIntegration,
     liveness_policy: LivenessPolicy,
     primary_stream_diagnostics: &PrimaryStreamDiagnosticsHandle,
@@ -1908,6 +1924,7 @@ async fn converge(
                     cancellation,
                     &mut pending_closures,
                     controller_requests,
+                    operator_commands,
                     provider,
                     liveness_policy,
                     primary_stream_diagnostics,
@@ -1958,6 +1975,7 @@ async fn converge(
                         cancellation,
                         &mut pending_closures,
                         controller_requests,
+                        operator_commands,
                         provider,
                         liveness_policy,
                         primary_stream_diagnostics,
@@ -2316,6 +2334,7 @@ async fn monitor_live(
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
     controller_requests: &mut Option<ControllerRequestReceiver>,
+    operator_commands: &mut Option<mpsc::Receiver<OperatorCommand>>,
     provider: &mut ProviderIntegration,
     liveness_policy: LivenessPolicy,
     primary_stream_diagnostics: &PrimaryStreamDiagnosticsHandle,
@@ -2348,6 +2367,19 @@ async fn monitor_live(
                     &provider.coverage.registry,
                 ).await;
                 provider.publish_targets(shared);
+                continue;
+            }
+            command = receive_operator_command(operator_commands) => {
+                if service_operator_command(
+                    command,
+                    operator_commands,
+                    reducer,
+                    persistence,
+                    shared,
+                    &provider.coverage.registry,
+                ).await? {
+                    provider.publish_targets(shared);
+                }
                 continue;
             }
             event = receive_provider(&mut provider.events) => {
@@ -2487,6 +2519,7 @@ async fn monitor_reconciling(
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
     controller_requests: &mut Option<ControllerRequestReceiver>,
+    operator_commands: &mut Option<mpsc::Receiver<OperatorCommand>>,
     provider: &mut ProviderIntegration,
     liveness_policy: LivenessPolicy,
     primary_stream_diagnostics: &PrimaryStreamDiagnosticsHandle,
@@ -2517,6 +2550,19 @@ async fn monitor_reconciling(
                     &provider.coverage.registry,
                 ).await;
                 provider.publish_targets(shared);
+                continue;
+            }
+            command = receive_operator_command(operator_commands) => {
+                if service_operator_command(
+                    command,
+                    operator_commands,
+                    reducer,
+                    persistence,
+                    shared,
+                    &provider.coverage.registry,
+                ).await? {
+                    provider.publish_targets(shared);
+                }
                 continue;
             }
             event = receive_provider(&mut provider.events) => {
@@ -5920,6 +5966,36 @@ async fn receive_controller(
     }
 }
 
+async fn receive_operator_command(
+    receiver: &mut Option<mpsc::Receiver<OperatorCommand>>,
+) -> Option<OperatorCommand> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => pending().await,
+    }
+}
+
+async fn service_operator_command(
+    command: Option<OperatorCommand>,
+    receiver: &mut Option<mpsc::Receiver<OperatorCommand>>,
+    reducer: &mut Reducer,
+    persistence: &mut RuntimePersistence,
+    shared: &SharedModel,
+    coverage: &SourceCoverageRegistry,
+) -> Result<bool, CollectorError> {
+    let Some(command) = command else {
+        *receiver = None;
+        return Ok(false);
+    };
+    let persist = reducer.apply_operator_command(command, unix_now_ms());
+    let changed = !persist.is_empty();
+    if changed {
+        let _ = persist_submission(persistence, reducer, persist).await?;
+    }
+    persistence.refresh_snapshot(&shared.borrow(), coverage);
+    Ok(changed)
+}
+
 async fn receive_provider(
     receiver: &mut Option<mpsc::Receiver<ProviderIngressEvent>>,
 ) -> Option<ProviderIngressEvent> {
@@ -6131,7 +6207,8 @@ mod tests {
     use crate::activity::OperatorSnapshot;
     use crate::diagnostics::{OccurrenceLogStatus, RuntimeWriteOutcome};
     use crate::model::{
-        DependencyEdge, DisplayOrdinal, ExecutionEdge, TaskRun, TaskState, Workspace,
+        DependencyEdge, DisplayOrdinal, ExecutionEdge, OperatorCommand, TaskRun, TaskState,
+        Workspace,
     };
     use crate::performance::{
         PerformanceDegradationReason, PerformanceSnapshot, TestPerformanceClock,
@@ -6446,6 +6523,7 @@ mod tests {
                 performance,
                 task_cancellation,
                 owner,
+                None,
                 None,
                 provider,
                 liveness_policy,
@@ -7219,6 +7297,71 @@ mod tests {
             1
         );
         assert!(!model.has_changed().unwrap());
+
+        drop(receiver);
+        drop(runtime);
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn operator_command_receiver_publishes_dismissed_snapshot() {
+        let sink = Arc::new(RecordingOccurrenceSink::default());
+        let (_directory, lifecycle, mut runtime, _diagnostics) = runtime_with_sink(sink);
+        let run_id = RunId::new();
+        let mut domain = DomainModel::default();
+        domain.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::Controller("clearable".to_owned()),
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Completed,
+            has_controller_task_state_event: true,
+            created_at_ms: Some(10),
+            updated_at_ms: Some(20),
+            finished_at_ms: Some(20),
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        let (mut reducer, mut model) = Reducer::new(RestoredState {
+            model: domain,
+            next_ordinal: 2,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let coverage = SourceCoverageRegistry::default();
+        let (sender, receiver) = mpsc::channel(1);
+        let mut receiver = Some(receiver);
+        let _ = model.borrow_and_update();
+        sender
+            .send(OperatorCommand::DismissClearable)
+            .await
+            .unwrap();
+
+        let command = receive_operator_command(&mut receiver).await;
+        assert!(
+            service_operator_command(
+                command,
+                &mut receiver,
+                &mut reducer,
+                &mut runtime,
+                &model,
+                &coverage,
+            )
+            .await
+            .unwrap()
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), model.changed())
+            .await
+            .expect("operator command did not publish a model snapshot")
+            .unwrap();
+        assert!(
+            model
+                .borrow_and_update()
+                .task_run(&run_id)
+                .unwrap()
+                .dismissed_at_ms
+                .is_some()
+        );
 
         drop(receiver);
         drop(runtime);
@@ -10412,6 +10555,7 @@ mod tests {
                 performance,
                 task_cancellation,
                 OwnerTracker::from_environment(),
+                None,
                 None,
                 provider,
                 LivenessPolicy::default(),

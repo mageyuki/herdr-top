@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::watch;
 
-use crate::activity::{OperatorSnapshot, RestoredOperatorState};
+use crate::activity::{self, OperatorSnapshot, RestoredOperatorState};
 use crate::diagnostics::RuntimeWriteOutcome;
 use crate::identity::{
     BindingEvidence, MergeConflict, apply_binding_plan_at, plan_binding, preflight_dependency_edge,
@@ -17,8 +17,8 @@ use crate::model::{
     AgentNode, AgentNodeObservation, AgentSessionReferenceKind, ControllerDiagnosticsHandle,
     ControllerEvent, ControllerEventKind, DependencyEdge, DisplayOrdinal, DomainModel,
     EventMetadata, ExecState, Execution, ExecutionEdge, MinimalProviderMetadata, NormalizedEvent,
-    Pane, Provider, ProviderDiagnosticsHandle, ReconcileBatch, RunId, RunKey, SharedModel, TaskRun,
-    TaskState, TopologyEntity, TopologyEntityId, sanitize_controller_text,
+    OperatorCommand, Pane, Provider, ProviderDiagnosticsHandle, ReconcileBatch, RunId, RunKey,
+    SharedModel, TaskRun, TaskState, TopologyEntity, TopologyEntityId, sanitize_controller_text,
 };
 use crate::operator::OperatorProjection;
 use crate::store::{
@@ -1937,6 +1937,44 @@ impl Reducer {
         persist
     }
 
+    /// Applies one operator command at collector receipt time.
+    pub fn apply_operator_command(
+        &mut self,
+        command: OperatorCommand,
+        now_ms: i64,
+    ) -> PersistBatch {
+        let runs_with_executions = activity::runs_with_executions(&self.model);
+        let run_ids: Vec<_> = self
+            .model
+            .task_runs()
+            .filter(|run| run.dismissed_at_ms.is_none())
+            .filter(|run| match command {
+                OperatorCommand::DismissClearable => {
+                    run.state.is_terminal()
+                        || activity::is_hook_only_stale_task_run(run, &runs_with_executions, now_ms)
+                }
+            })
+            .map(|run| run.run_id)
+            .collect();
+        if run_ids.is_empty() {
+            return Vec::new();
+        }
+        let mut persist = Vec::with_capacity(run_ids.len());
+        for run_id in run_ids {
+            let mut task_run = self
+                .model
+                .task_run(&run_id)
+                .cloned()
+                .expect("collected task run must remain present");
+            task_run.dismissed_at_ms = Some(now_ms);
+            self.model.insert_task_run(task_run.clone());
+            persist.push(self.persist_task_run(task_run, now_ms));
+        }
+        self.operator.apply_submission(&persist);
+        self.publish();
+        persist
+    }
+
     fn recompute_dangling_announcement_components(&mut self) {
         // increment5-workload-harness: begin reducer D4 timing start
         #[cfg(feature = "workload-harness")]
@@ -2348,9 +2386,9 @@ mod tests {
         AgentNode, AgentNodeObservation, AgentSessionReference, AgentSessionReferenceKind,
         ControllerEvent, ControllerEventKind, DependencyEdge, DisplayOrdinal, DomainModel,
         EventMetadata, ExecState, Execution, ExecutionEdge, GapKind, MinimalProviderMetadata,
-        NormalizedEvent, Pane, PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SharedModel,
-        SnapshotAgent, Tab, TaskRun, TaskState, TopologyEntity, TopologyEntityId, TopologySnapshot,
-        Workspace,
+        NormalizedEvent, OperatorCommand, Pane, PaneSnapshot, Provider, ReconcileBatch, RunId,
+        RunKey, SharedModel, SnapshotAgent, Tab, TaskRun, TaskState, TopologyEntity,
+        TopologyEntityId, TopologySnapshot, Workspace,
     };
     use crate::store::{
         NativeSessionBinding, PersistOp, PersistTaskRun, RestoredState, WriterClient,
@@ -4467,6 +4505,155 @@ mod tests {
         assert_eq!(
             shared.borrow().execution("stale-execution").unwrap().state,
             ExecState::Ended
+        );
+    }
+
+    #[test]
+    fn operator_command_dismisses_terminal_runs_inside_visibility_window() {
+        let now_ms = 3_600_000;
+        let run_id = RunId::new();
+        let mut terminal = run_with_controller_evidence(
+            run_id,
+            RunKey::Controller("recent-terminal".to_owned()),
+            1,
+            TaskState::Completed,
+        );
+        terminal.updated_at_ms = Some(now_ms - 60_000);
+        terminal.finished_at_ms = Some(now_ms - 60_000);
+        let mut model = DomainModel::default();
+        model.insert_task_run(terminal);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        let persist = reducer.apply_operator_command(OperatorCommand::DismissClearable, now_ms);
+
+        assert_eq!(
+            shared.borrow().task_run(&run_id).unwrap().dismissed_at_ms,
+            Some(now_ms)
+        );
+        assert_eq!(persist.len(), 1);
+        assert!(matches!(
+            &persist[0],
+            PersistOp::UpsertTaskRun(value)
+                if value.task_run.run_id == run_id
+                    && value.task_run.dismissed_at_ms == Some(now_ms)
+        ));
+    }
+
+    #[test]
+    fn operator_command_dismisses_hook_only_at_boundary_but_not_attached_controller_run() {
+        let updated_at_ms = 100;
+        let now_ms = updated_at_ms + crate::activity::HOOK_ONLY_STALE_VISIBILITY_MS;
+        let hook_only = RunId::new();
+        let attached = RunId::new();
+        let mut model = DomainModel::default();
+        for (run_id, key) in [(hook_only, "hook-only"), (attached, "attached")] {
+            let mut task_run = run_with_controller_evidence(
+                run_id,
+                RunKey::Controller(key.to_owned()),
+                if run_id == hook_only { 1 } else { 2 },
+                TaskState::Running,
+            );
+            task_run.updated_at_ms = Some(updated_at_ms);
+            model.insert_task_run(task_run);
+        }
+        model.insert_execution(execution(
+            attached,
+            "attached-execution",
+            ExecState::Working,
+        ));
+        let (mut reducer, shared) = Reducer::new(restored(model, 3));
+
+        let persist = reducer.apply_operator_command(OperatorCommand::DismissClearable, now_ms);
+
+        assert_eq!(
+            shared
+                .borrow()
+                .task_run(&hook_only)
+                .unwrap()
+                .dismissed_at_ms,
+            Some(now_ms)
+        );
+        assert_eq!(
+            shared.borrow().task_run(&attached).unwrap().dismissed_at_ms,
+            None
+        );
+        assert_eq!(persist.len(), 1);
+        assert!(matches!(
+            &persist[0],
+            PersistOp::UpsertTaskRun(value) if value.task_run.run_id == hook_only
+        ));
+    }
+
+    #[test]
+    fn operator_command_leaves_live_and_already_dismissed_runs_byte_identical_without_persisting() {
+        let live = RunId::new();
+        let dismissed = RunId::new();
+        let mut live_run = run(
+            live,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "live".to_owned(),
+            },
+            1,
+            TaskState::Running,
+        );
+        live_run.updated_at_ms = Some(10);
+        let mut dismissed_run = run_with_controller_evidence(
+            dismissed,
+            RunKey::Controller("dismissed".to_owned()),
+            2,
+            TaskState::Failed,
+        );
+        dismissed_run.updated_at_ms = Some(20);
+        dismissed_run.finished_at_ms = Some(20);
+        dismissed_run.dismissed_at_ms = Some(25);
+        let expected_live = live_run.clone();
+        let expected_dismissed = dismissed_run.clone();
+        let mut model = DomainModel::default();
+        model.insert_task_run(live_run);
+        model.insert_task_run(dismissed_run);
+        model.insert_execution(execution(live, "live-execution", ExecState::Working));
+        let (mut reducer, shared) = Reducer::new(restored(model, 3));
+
+        let persist = reducer.apply_operator_command(OperatorCommand::DismissClearable, 86_400_100);
+
+        let snapshot = shared.borrow();
+        assert_eq!(snapshot.task_run(&live), Some(&expected_live));
+        assert_eq!(snapshot.task_run(&dismissed), Some(&expected_dismissed));
+        assert_eq!(
+            snapshot.task_run(&dismissed).unwrap().dismissed_at_ms,
+            Some(25)
+        );
+        assert!(persist.is_empty());
+    }
+
+    #[test]
+    fn operator_command_dismissal_survives_store_restore() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let run_id = RunId::new();
+        let mut terminal = run_with_controller_evidence(
+            run_id,
+            RunKey::Controller("restart-clearable".to_owned()),
+            1,
+            TaskState::Completed,
+        );
+        terminal.created_at_ms = Some(10);
+        terminal.updated_at_ms = Some(20);
+        terminal.finished_at_ms = Some(20);
+        let mut model = DomainModel::default();
+        model.insert_task_run(terminal);
+        let (mut reducer, _shared) = Reducer::new(restored(model, 2));
+
+        let persist = reducer.apply_operator_command(OperatorCommand::DismissClearable, 30);
+        store.apply_batch(persist).unwrap();
+        drop(store);
+
+        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+        assert_eq!(
+            restored.model.task_run(&run_id).unwrap().dismissed_at_ms,
+            Some(30)
         );
     }
 

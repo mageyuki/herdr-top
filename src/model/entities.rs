@@ -10,6 +10,13 @@ use serde::{Deserialize, Serialize};
 use super::ids::{DisplayOrdinal, Provider, RunId, RunKey};
 use super::state::{ExecState, TaskState};
 
+/// Operator intent delivered to the collector-owned reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperatorCommand {
+    /// Persistently dismisses every currently clearable task run.
+    DismissClearable,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Workspace {
     pub workspace_id: String,
