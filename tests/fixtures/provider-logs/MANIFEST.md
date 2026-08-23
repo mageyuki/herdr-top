@@ -61,8 +61,9 @@ Mirrors main-session `queue-operation` records. One `enqueue` contains a
 multi-kilobyte ordinary user prompt. Two more contain the real
 `<task-notification>` tag layout: `task-id`, `tool-use-id`, `output-file`,
 `status`, and `summary`. The statuses include both `completed` and `failed`.
-One `dequeue` and one `remove` record omit the optional `content` field. Only
-the task identifier and `status` are privacy-carve-in outputs.
+The `dequeue` record omits `content`, matching 973/973 observed real records;
+the `remove` record carries `content`, matching 397/397. Only the task
+identifier and `status` are privacy-carve-in outputs.
 
 Every record in each Claude JSONL fixture uses session id
 `13f03635-c1f6-46e2-8e52-83d217b6f01c`.

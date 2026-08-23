@@ -63,12 +63,15 @@ jq -s --arg description 'Pins the multiset of Claude fixture record/content type
 Regenerate the Codex inventory with:
 
 ```bash
-jq -s --arg description 'Pins the multiset of Codex fixture record/event/item types and the reviewed 0.149.x CLI version prefix. Regenerate from tests/fixtures/provider-logs as documented in README.md.' '
+jq -s --arg description 'Pins the multiset of Codex fixture record/response/event/item types and the reviewed 0.149.x CLI version prefix. Regenerate from tests/fixtures/provider-logs as documented in README.md.' '
   {
     description: $description,
     version_prefix: "0.149.",
     record_types: ([.[]
       | {scope: "record", type: .type},
+        (if .type == "response_item" then
+           {scope: "response_item", type: .payload.type}
+         else empty end),
         (if .type == "event_msg" then
            {scope: "event_msg", type: .payload.type},
            (if .payload.type == "item_completed" then

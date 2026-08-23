@@ -133,6 +133,13 @@ codex_log_records() {
       error("Codex record has no string type")
     else
       "record\t" + .type,
+      (if .type == "response_item" then
+         if (.payload.type | type) != "string" then
+           error("Codex response_item has no string payload type")
+         else
+           "response_item\t" + .payload.type
+         end
+       else empty end),
       (if .type == "event_msg" then
          if (.payload.type | type) != "string" then
            error("Codex event_msg has no string payload type")
@@ -182,8 +189,8 @@ review_log_baselines() {
   claude_prefix=$(jq -er '.version_prefix | select(type == "string" and length > 0)' "$claude_log_baseline" 2>/dev/null) || { echo "error: invalid Claude version prefix" >&2; return 2; }
   codex_prefix=$(jq -er '.version_prefix | select(type == "string" and length > 0)' "$codex_log_baseline" 2>/dev/null) || { echo "error: invalid Codex version prefix" >&2; return 2; }
 
-  local claude_versions="" codex_versions
-  local claude_file file_versions
+  local claude_versions="" codex_versions=""
+  local claude_file codex_file file_versions
   for claude_file in "${claude_files[@]}"; do
     jq -se 'all(.[] | select(has("version")); (.version | type) == "string")' \
       "$claude_file" >/dev/null 2>&1 \
@@ -203,13 +210,24 @@ review_log_baselines() {
   done
   claude_versions=$(sort -u <<<"${claude_versions%$'\n'}")
 
-  jq -se '
-    all(.[]
-      | select(.type == "session_meta" and (.payload | has("cli_version")));
-      (.payload.cli_version | type) == "string")
-  ' "${codex_files[@]}" >/dev/null 2>&1 \
-    || { echo "error: Codex cli_version must be a string" >&2; return 2; }
-  codex_versions=$(jq -er 'select(.type == "session_meta") | .payload.cli_version | select(type == "string")' "${codex_files[@]}" 2>/dev/null | sort -u) || { echo "error: invalid Codex cli_version" >&2; return 2; }
+  for codex_file in "${codex_files[@]}"; do
+    jq -se '
+      all(.[]
+        | select(.type == "session_meta" and (.payload | has("cli_version")));
+        (.payload.cli_version | type) == "string")
+    ' "$codex_file" >/dev/null 2>&1 \
+      || { echo "error: Codex cli_version must be a string" >&2; return 2; }
+    file_versions=$(jq -r 'select(.type == "session_meta") | .payload.cli_version | select(type == "string")' "$codex_file" 2>/dev/null | sort -u) \
+      || { echo "error: invalid Codex cli_version" >&2; return 2; }
+    if jq -se 'any(.[]; .type == "session_meta")' \
+        "$codex_file" >/dev/null 2>&1 \
+        && [[ -z $file_versions ]]; then
+      echo "error: no Codex cli_version found in ${codex_file##*/}" >&2
+      return 2
+    fi
+    [[ -z $file_versions ]] || codex_versions+="$file_versions"$'\n'
+  done
+  codex_versions=$(sort -u <<<"${codex_versions%$'\n'}")
   [[ -n $claude_versions ]] || { echo "error: no Claude transcript version found" >&2; return 2; }
   [[ -n $codex_versions ]] || { echo "error: no Codex cli_version found" >&2; return 2; }
 

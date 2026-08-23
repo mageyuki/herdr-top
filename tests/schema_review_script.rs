@@ -182,6 +182,38 @@ fn log_baseline_rejects_non_string_codex_cli_version() {
 }
 
 #[test]
+fn log_baseline_requires_cli_version_in_every_codex_file_with_session_meta() {
+    let fixtures = temp_provider_log_fixtures();
+    mutate_jsonl(&fixtures.path().join("codex-exec.jsonl"), |record| {
+        if record["type"] == "session_meta" {
+            record["payload"]
+                .as_object_mut()
+                .expect("Codex session_meta payload is an object")
+                .remove("cli_version");
+        }
+    });
+
+    let out = run(&[
+        "--log-baselines",
+        fixtures.path().to_str().expect("UTF-8 fixture path"),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("error: no Codex cli_version found in codex-exec.jsonl"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn log_baseline_requires_version_in_every_claude_file() {
     let fixtures = temp_provider_log_fixtures();
     mutate_jsonl(&fixtures.path().join("claude-subagent.jsonl"), |record| {
@@ -207,6 +239,38 @@ fn log_baseline_requires_version_in_every_claude_file() {
             .contains("error: no Claude transcript version found in claude-subagent.jsonl"),
         "stdout: {} stderr: {}",
         String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn log_baseline_detects_response_item_payload_type_drift() {
+    let fixtures = temp_provider_log_fixtures();
+    mutate_jsonl(&fixtures.path().join("codex-exec.jsonl"), |record| {
+        if record["type"] == "response_item" && record["payload"]["type"] == "message" {
+            record["payload"]["type"] = serde_json::json!("function_call");
+        }
+    });
+
+    let out = run(&[
+        "--log-baselines",
+        fixtures.path().to_str().expect("UTF-8 fixture path"),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout: {stdout} stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("response_item\tfunction_call"),
+        "stdout: {stdout} stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("verdict: REVIEW REQUIRED"),
+        "stdout: {stdout} stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }

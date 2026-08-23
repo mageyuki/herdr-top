@@ -1,5 +1,5 @@
 {
-  "description": "Pins the multiset of Codex fixture record/event/item types and the reviewed 0.149.x CLI version prefix. Regenerate from tests/fixtures/provider-logs as documented in README.md.",
+  "description": "Pins the multiset of Codex fixture record/response/event/item types and the reviewed 0.149.x CLI version prefix. Regenerate from tests/fixtures/provider-logs as documented in README.md.",
   "version_prefix": "0.149.",
   "record_types": [
     {
@@ -85,6 +85,21 @@
     {
       "scope": "record",
       "type": "world_state",
+      "occurrences": 1
+    },
+    {
+      "scope": "response_item",
+      "type": "custom_tool_call_output",
+      "occurrences": 1
+    },
+    {
+      "scope": "response_item",
+      "type": "message",
+      "occurrences": 1
+    },
+    {
+      "scope": "response_item",
+      "type": "reasoning",
       "occurrences": 1
     }
   ]

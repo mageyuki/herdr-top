@@ -125,6 +125,10 @@ non-qualifying AgentMessage text, CommandExecution `stdout`, `stderr`,
 `aggregated_output`, or formatted output, MCP arguments or results, file-change
 output, extension results, or unknown item bodies.
 
+The categorical exclusion also names `response_item` bodies (reasoning
+`encrypted_content`, `custom_tool_call_output` `output`, and message content),
+`world_state` records, and `token_count` `rate_limits` as never-read data.
+
 `tool-results/` directories are never opened, enumerated, tailed, or used for
 fallback extraction.
 
