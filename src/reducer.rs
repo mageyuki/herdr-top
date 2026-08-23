@@ -1131,6 +1131,13 @@ impl Reducer {
                     });
                 }
                 TopologyEntity::Tab(tab) => {
+                    let mut tab = tab.clone();
+                    if tab.label.is_none() && metadata.source_event_type != TAB_RENAMED_EVENT {
+                        tab.label = self
+                            .model
+                            .tab(&tab.tab_id)
+                            .and_then(|current| current.label.clone());
+                    }
                     let display_ordinal = self.tab_ordinal_or_allocate(&tab.tab_id)?;
                     self.model.insert_tab(tab.clone());
                     persist.push(PersistOp::UpsertTab {
@@ -1144,10 +1151,17 @@ impl Reducer {
                     }
                 }
                 TopologyEntity::Pane(pane) => {
+                    let mut pane = pane.clone();
+                    if pane.display_name.is_none() {
+                        pane.display_name = self
+                            .model
+                            .pane(&pane.pane_id)
+                            .and_then(|current| current.display_name.clone());
+                    }
                     let display_ordinal = self.pane_ordinal_or_allocate(&pane.pane_id)?;
                     self.model.insert_pane(pane.clone());
                     persist.push(PersistOp::UpsertPane {
-                        pane: pane.clone(),
+                        pane,
                         display_ordinal,
                     });
                 }
@@ -3643,7 +3657,7 @@ mod tests {
     }
 
     #[test]
-    fn observational_nameless_tab_upsert_preserves_store_label_without_clear() {
+    fn observational_nameless_tab_upsert_preserves_live_and_store_label_without_clear() {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let mut store = open_writer(&root).unwrap();
@@ -3666,7 +3680,7 @@ mod tests {
             ])
             .unwrap();
         let restored = store.load_restored_state().unwrap();
-        let (mut reducer, _shared) = Reducer::new(restored);
+        let (mut reducer, shared) = Reducer::new(restored);
 
         let ApplyOutcome::Applied(batch) = reducer
             .apply(topology_entity_event(
@@ -3685,6 +3699,10 @@ mod tests {
             operation,
             PersistOp::ClearTabLabel { tab_id } if tab_id == "tab"
         )));
+        assert_eq!(
+            shared.borrow().tab("tab").unwrap().label.as_deref(),
+            Some("observed name")
+        );
 
         store.apply_batch(batch).unwrap();
         let restored = store.load_restored_state().unwrap();

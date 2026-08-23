@@ -2332,9 +2332,44 @@ fn current_execution_identity(
         })
         .or_else(|| {
             model
+                .task_run_bindings()
+                .filter_map(|(key, owner)| {
+                    if *owner != execution.task_run_id {
+                        return None;
+                    }
+                    match key {
+                        RunKey::Native { provider, sid } => Some((
+                            0_u8,
+                            provider_name(*provider),
+                            sid.clone(),
+                            *provider,
+                            AgentSessionReferenceKind::Id,
+                        )),
+                        RunKey::NativePath { provider, path } => Some((
+                            1_u8,
+                            provider_name(*provider),
+                            path.clone(),
+                            *provider,
+                            AgentSessionReferenceKind::Path,
+                        )),
+                        RunKey::Controller(_) | RunKey::Provisional { .. } => None,
+                    }
+                })
+                .min_by(|left, right| {
+                    (&left.0, left.1, &left.2).cmp(&(&right.0, right.1, &right.2))
+                })
+                .map(|(_, _, value, provider, kind)| (provider, Some((kind, value))))
+        })
+        .or_else(|| {
+            model
                 .agent_nodes()
                 .filter(|node| node.task_run_id == execution.task_run_id)
-                .min_by(|left, right| left.agent_node_id.cmp(&right.agent_node_id))
+                .min_by(|left, right| {
+                    left.parent_agent_node_id
+                        .is_some()
+                        .cmp(&right.parent_agent_node_id.is_some())
+                        .then_with(|| left.agent_node_id.cmp(&right.agent_node_id))
+                })
                 .map(|node| {
                     let session = node
                         .native_session_id
@@ -6263,8 +6298,8 @@ mod tests {
     use crate::activity::OperatorSnapshot;
     use crate::diagnostics::{OccurrenceLogStatus, RuntimeWriteOutcome};
     use crate::model::{
-        DependencyEdge, DisplayOrdinal, ExecutionEdge, OperatorCommand, TaskRun, TaskState,
-        Workspace,
+        AgentNode, DependencyEdge, DisplayOrdinal, ExecutionEdge, OperatorCommand, TaskRun,
+        TaskState, Workspace,
     };
     use crate::performance::{
         PerformanceDegradationReason, PerformanceSnapshot, TestPerformanceClock,
@@ -7983,6 +8018,185 @@ mod tests {
             changed.panes[0].terminal_id = terminal_id.to_owned();
             assert_probe_comparison_diverges(&projected, changed, scenario);
         }
+    }
+
+    #[test]
+    fn watchdog_agent_node_fallback_prefers_root_session() {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::Controller("unbound-controller-run".to_owned()),
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "gap-agent-root".to_owned(),
+            provider: Provider::Claude,
+            native_session_id: Some("R".to_owned()),
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(2),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Working),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
+        });
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "agent:claude:C".to_owned(),
+            provider: Provider::Claude,
+            native_session_id: Some("C".to_owned()),
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(3),
+            parent_agent_node_id: Some("gap-agent-root".to_owned()),
+            state: Some(ExecState::Working),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
+        });
+        let execution = Execution {
+            execution_id: "live-execution".to_owned(),
+            pane_id: "w1:p4".to_owned(),
+            terminal_id: "terminal-4".to_owned(),
+            task_run_id: run_id,
+            state: ExecState::Working,
+        };
+
+        let (_, session) = current_execution_identity(&model, &execution);
+
+        assert_eq!(
+            session.as_ref().map(|session| session.value.as_str()),
+            Some("R")
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_controller_native_alias_projects_root_session_and_stays_healthy() {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_workspace(Workspace {
+            workspace_id: "w1".to_owned(),
+        });
+        model.insert_tab(Tab {
+            tab_id: "w1:t1".to_owned(),
+            workspace_id: "w1".to_owned(),
+            label: None,
+        });
+        model.insert_pane(Pane {
+            pane_id: "w1:p4".to_owned(),
+            workspace_id: "w1".to_owned(),
+            tab_id: "w1:t1".to_owned(),
+            terminal_id: "terminal-4".to_owned(),
+            display_name: None,
+        });
+        model.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::Controller("controller-run".to_owned()),
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        model.insert_task_run_alias(
+            RunKey::Native {
+                provider: Provider::Claude,
+                sid: "R".to_owned(),
+            },
+            run_id,
+        );
+        model.insert_execution(Execution {
+            execution_id: "live-execution".to_owned(),
+            pane_id: "w1:p4".to_owned(),
+            terminal_id: "terminal-4".to_owned(),
+            task_run_id: run_id,
+            state: ExecState::Working,
+        });
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "gap-agent-root".to_owned(),
+            provider: Provider::Claude,
+            native_session_id: None,
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(2),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Working),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
+        });
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "agent:claude:C".to_owned(),
+            provider: Provider::Claude,
+            native_session_id: Some("C".to_owned()),
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(3),
+            parent_agent_node_id: Some("gap-agent-root".to_owned()),
+            state: Some(ExecState::Working),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
+        });
+        let shared = watch::channel(Arc::new(model)).1;
+
+        let projected = current_model_topology(&shared, &PendingTopologyClosures::default())
+            .expect("Controller alias topology should project unambiguously");
+        let projected_session = projected.panes[0]
+            .agent_session
+            .as_ref()
+            .map(|session| session.value.as_str());
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("controller-alias-projection.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut reader, request) = accept_wire_request(&listener).await;
+            let mut frame = watchdog_snapshot_frame(&request, false, "claude");
+            frame["result"]["snapshot"]["panes"][0]["agent_session"]["value"] =
+                Value::String("R".to_owned());
+            write_wire_frame(&mut reader, &frame).await;
+        });
+
+        let outcome = probe_primary_topology(
+            &socket,
+            &shared,
+            PendingTopologyClosures::default(),
+            LivenessPolicy { timeout_ms: 500 },
+        )
+        .await;
+
+        let healthy = matches!(outcome, WatchdogProbeOutcome::HealthyIdle);
+        assert_eq!(
+            projected_session,
+            Some("R"),
+            "watchdog healthy outcome: {healthy}"
+        );
+        assert!(healthy);
+        join_fake_server(server, "Controller alias topology probe").await;
     }
 
     #[tokio::test]
@@ -10187,8 +10401,17 @@ mod tests {
 
     #[test]
     fn in_place_snapshot_preserves_captured_tab_and_pane_names() {
-        let topology = topology_from_snapshot(&snapshot_with_names()).unwrap();
+        let named_topology = topology_from_snapshot(&snapshot_with_names()).unwrap();
         let (mut reducer, shared) = empty_reducer();
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: named_topology.clone(),
+                gap_kind: GapKind::Startup,
+            })
+            .unwrap();
+        let mut topology = named_topology;
+        topology.tabs[0].label = None;
+        topology.panes[0].display_name = None;
         let mut pending = PendingTopologyClosures::default();
 
         let persist = apply_snapshot_in_place(
@@ -10240,6 +10463,80 @@ mod tests {
             }),
             primary_stream_diagnostics: diagnostics,
         }
+    }
+
+    fn nameless_pane_updated() -> ReceivedEvent {
+        ReceivedEvent {
+            event: "pane_updated".to_owned(),
+            data: json!({
+                "type": "pane_updated",
+                "pane": {
+                    "pane_id": "w1:p4",
+                    "tab_id": "w1:t1",
+                    "terminal_id": "terminal-4",
+                    "workspace_id": "w1",
+                },
+            }),
+            primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
+        }
+    }
+
+    fn named_reducer() -> (Reducer, SharedModel) {
+        let topology = topology_from_snapshot(&snapshot_with_names()).unwrap();
+        let (mut reducer, shared) = empty_reducer();
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology,
+                gap_kind: GapKind::Startup,
+            })
+            .unwrap();
+        (reducer, shared)
+    }
+
+    #[test]
+    fn nameless_nested_pane_agent_detected_retains_live_display_name() {
+        let (mut reducer, shared) = named_reducer();
+        let normalized = normalize_event(
+            &shared,
+            "nested-frame-session",
+            &nested_pane_agent_detected(PrimaryStreamDiagnosticsHandle::default()),
+        )
+        .unwrap();
+
+        apply_collector_observation(&mut reducer, normalized)
+            .unwrap()
+            .expect("nested pane_agent_detected should apply");
+
+        assert_eq!(
+            shared
+                .borrow()
+                .pane("w1:p4")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("UI修正")
+        );
+    }
+
+    #[test]
+    fn nameless_pane_updated_retains_live_display_name() {
+        let (mut reducer, shared) = named_reducer();
+        let normalized =
+            normalize_event(&shared, "pane-updated-session", &nameless_pane_updated()).unwrap();
+
+        apply_collector_observation(&mut reducer, normalized)
+            .unwrap()
+            .expect("pane_updated should apply");
+
+        assert_eq!(
+            shared
+                .borrow()
+                .pane("w1:p4")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("UI修正")
+        );
     }
 
     #[test]

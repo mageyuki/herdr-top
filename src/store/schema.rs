@@ -361,7 +361,9 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), St
             "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (5, ?1)",
             [now_ms],
         )?;
+        version = 5;
     }
+    debug_assert_eq!(version, CURRENT_SCHEMA_VERSION);
     transaction.commit()?;
     Ok(())
 }
