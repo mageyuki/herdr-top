@@ -448,9 +448,9 @@ fn footer_line(width: usize) -> String {
         "f/End follow",
         "tab view",
         "/ filter",
-        "c clear",
         "s summary",
         "? help",
+        "c clear",
     ];
     const COMPACT: &[&str] = &["q:stop Top; agents continue", "detach:Top runs"];
     let floor = COMPACT[0];
@@ -2701,12 +2701,17 @@ mod tests {
             "f/End follow",
             "tab view",
             "/ filter",
-            "c clear",
             "s summary",
             "? help",
+            "c clear",
         ];
         let compact = ["q:stop Top; agents continue", "detach:Top runs"];
         assert_eq!(footer_line(140), full.join(" | "));
+        let without_clear = full[..full.len() - 1].join(" | ");
+        assert_eq!(
+            footer_line(Span::raw(without_clear.as_str()).width()),
+            without_clear
+        );
 
         for width in [100, 72, 69, 45, 27] {
             let rendered = footer_line(width);

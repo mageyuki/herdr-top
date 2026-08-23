@@ -35,6 +35,8 @@ const OWNER_STARTING_DELAY: Duration = Duration::from_millis(200);
 const LOG_FILE: &str = "herdr-top.log";
 const LOG_FILE_MODE: u32 = 0o600;
 const MAX_HOOK_PAYLOAD_BYTES: usize = 1024 * 1024;
+// The TUI drops commands when this queue is full or closed: it must not block, a pending
+// receipt-time dismissal covers repeat presses, and a closed collector cannot service them.
 const OPERATOR_COMMAND_QUEUE_CAPACITY: usize = 1;
 
 #[derive(Debug, Parser)]

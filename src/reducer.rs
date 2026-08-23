@@ -1967,6 +1967,7 @@ impl Reducer {
                 .cloned()
                 .expect("collected task run must remain present");
             task_run.dismissed_at_ms = Some(now_ms);
+            // Deliberately leave updated_at_ms unchanged: it clocks hook-only staleness, not operator activity.
             self.model.insert_task_run(task_run.clone());
             persist.push(self.persist_task_run(task_run, now_ms));
         }

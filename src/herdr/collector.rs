@@ -1628,6 +1628,19 @@ async fn run_collector(
                 provider.publish_targets(&shared);
                 continue;
             }
+            command = receive_operator_command(&mut operator_commands) => {
+                if service_operator_command(
+                    command,
+                    &mut operator_commands,
+                    &mut reducer,
+                    &mut persistence,
+                    &shared,
+                    &provider.coverage.registry,
+                ).await? {
+                    provider.publish_targets(&shared);
+                }
+                continue;
+            }
             result = wire::subscribe(&sock, &subscriptions) => result,
         } {
             Ok(stream) => {
@@ -1661,6 +1674,7 @@ async fn run_collector(
                     &cancellation,
                     RECONNECT_DELAY,
                     &mut controller_requests,
+                    &mut operator_commands,
                     &session,
                     &mut reducer,
                     &mut persistence,
@@ -1781,6 +1795,7 @@ async fn run_collector(
                     &cancellation,
                     delay,
                     &mut controller_requests,
+                    &mut operator_commands,
                     &session,
                     &mut reducer,
                     &mut persistence,
@@ -1844,6 +1859,19 @@ async fn converge(
                 provider.publish_targets(shared);
                 continue;
             }
+            command = receive_operator_command(operator_commands) => {
+                if service_operator_command(
+                    command,
+                    operator_commands,
+                    reducer,
+                    persistence,
+                    shared,
+                    &provider.coverage.registry,
+                ).await? {
+                    provider.publish_targets(shared);
+                }
+                continue;
+            }
             result = wire::request(sock, "session.snapshot", json!({})) => {
                 match result.and_then(|value| value.into_snapshot()) {
                     Ok(snapshot) => snapshot,
@@ -1891,6 +1919,7 @@ async fn converge(
             cancellation,
             &mut pending_closures,
             controller_requests,
+            operator_commands,
             provider,
         )
         .await?;
@@ -2029,6 +2058,7 @@ async fn replay_generation(
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
     controller_requests: &mut Option<ControllerRequestReceiver>,
+    operator_commands: &mut Option<mpsc::Receiver<OperatorCommand>>,
     provider: &mut ProviderIntegration,
 ) -> Result<ReplayOutcome, CollectorError> {
     let snapshot_entities = snapshot_entity_keys(snapshot);
@@ -2084,6 +2114,19 @@ async fn replay_generation(
                     &provider.coverage.registry,
                 ).await;
                 provider.publish_targets(shared);
+                continue;
+            }
+            command = receive_operator_command(operator_commands) => {
+                if service_operator_command(
+                    command,
+                    operator_commands,
+                    reducer,
+                    persistence,
+                    shared,
+                    &provider.coverage.registry,
+                ).await? {
+                    provider.publish_targets(shared);
+                }
                 continue;
             }
             result = tokio::time::timeout(DRAIN_QUIET_PERIOD, events.recv()) => result,
@@ -6105,6 +6148,7 @@ async fn wait_or_service_controller(
     cancellation: &CancellationToken,
     duration: Duration,
     receiver: &mut Option<ControllerRequestReceiver>,
+    operator_commands: &mut Option<mpsc::Receiver<OperatorCommand>>,
     session: &str,
     reducer: &mut Reducer,
     persistence: &mut RuntimePersistence,
@@ -6128,6 +6172,18 @@ async fn wait_or_service_controller(
                     &provider.coverage.registry,
                 ).await;
                 provider.publish_targets(shared);
+            }
+            command = receive_operator_command(operator_commands) => {
+                if service_operator_command(
+                    command,
+                    operator_commands,
+                    reducer,
+                    persistence,
+                    shared,
+                    &provider.coverage.registry,
+                ).await? {
+                    provider.publish_targets(shared);
+                }
             }
             event = receive_provider(&mut provider.events) => {
                 service_provider_event(
@@ -7364,6 +7420,80 @@ mod tests {
         );
 
         drop(receiver);
+        drop(runtime);
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn reconnect_wait_services_operator_command_before_delay_elapses() {
+        let sink = Arc::new(RecordingOccurrenceSink::default());
+        let (_directory, lifecycle, mut runtime, _diagnostics) = runtime_with_sink(sink);
+        let run_id = RunId::new();
+        let mut domain = DomainModel::default();
+        domain.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::Controller("clearable-while-down".to_owned()),
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Completed,
+            has_controller_task_state_event: true,
+            created_at_ms: Some(10),
+            updated_at_ms: Some(20),
+            finished_at_ms: Some(20),
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        let (mut reducer, model) = Reducer::new(RestoredState {
+            model: domain,
+            next_ordinal: 2,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let cancellation = CancellationToken::new();
+        let mut controller_requests = None;
+        let (command_sender, operator_commands) = mpsc::channel(1);
+        let mut operator_commands = Some(operator_commands);
+        let (provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+        let mut observed = model.clone();
+        let _ = observed.borrow_and_update();
+        command_sender
+            .send(OperatorCommand::DismissClearable)
+            .await
+            .unwrap();
+
+        {
+            let wait = wait_or_service_controller(
+                &cancellation,
+                Duration::from_secs(1),
+                &mut controller_requests,
+                &mut operator_commands,
+                "subscription-down",
+                &mut reducer,
+                &mut runtime,
+                &model,
+                &mut provider,
+            );
+            tokio::pin!(wait);
+            tokio::select! {
+                result = &mut wait => {
+                    panic!("reconnect wait completed before publishing the dismissal: {result:?}");
+                }
+                result = observed.changed() => {
+                    result.expect("operator command must publish before the reconnect delay");
+                }
+            }
+        }
+
+        assert!(
+            observed
+                .borrow_and_update()
+                .task_run(&run_id)
+                .unwrap()
+                .dismissed_at_ms
+                .is_some()
+        );
+
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
         drop(runtime);
         shutdown_writer(lifecycle).await;
     }

@@ -543,9 +543,14 @@ pub struct App {
 
 impl App {
     /// Creates an application from observation receivers and display-only header inputs.
+    ///
+    /// This convenience constructor discards the command receiver, so `c` is inert. Use
+    /// [`Self::with_operator_commands`] when the application needs a live collector command path.
     #[must_use]
     pub fn new(model_receiver: SharedModel, header: HeaderInputs) -> Self {
-        let (operator_commands, _operator_command_receiver) = tokio::sync::mpsc::channel(1);
+        let (operator_commands, operator_command_receiver) = tokio::sync::mpsc::channel(1);
+        drop(operator_command_receiver);
+        debug_assert!(operator_commands.is_closed());
         Self::with_operator_commands(model_receiver, operator_commands, header)
     }
 
@@ -571,6 +576,9 @@ impl App {
     }
 
     /// Creates an application with every read-only diagnostic, operator, setup, and time input.
+    ///
+    /// This convenience constructor discards the command receiver, so `c` is inert. Use
+    /// [`Self::with_operator_commands_and_inputs`] for a live collector command path.
     #[must_use]
     pub fn with_inputs(
         model_receiver: SharedModel,
@@ -580,7 +588,9 @@ impl App {
         setup: TuiSetup,
         clock: Arc<dyn Clock>,
     ) -> Self {
-        let (operator_commands, _operator_command_receiver) = tokio::sync::mpsc::channel(1);
+        let (operator_commands, operator_command_receiver) = tokio::sync::mpsc::channel(1);
+        drop(operator_command_receiver);
+        debug_assert!(operator_commands.is_closed());
         Self::with_operator_commands_and_inputs(
             model_receiver,
             operator_commands,
@@ -737,7 +747,9 @@ impl App {
                 self.state.filter_draft = Some(self.state.filter_query.clone());
                 LoopControl::Continue
             }
-            KeyCode::Char('c') => {
+            KeyCode::Char('c') if key.modifiers.is_empty() => {
+                // Never block the UI: a full queue already has a receipt-time dismissal pending,
+                // while a closed queue has no collector that could service another command.
                 let _ = self
                     .operator_commands
                     .try_send(OperatorCommand::DismissClearable);
@@ -748,7 +760,7 @@ impl App {
                 self.state.reset_overlay_scroll();
                 LoopControl::Continue
             }
-            KeyCode::Char('s') => {
+            KeyCode::Char('s') if key.modifiers.is_empty() => {
                 self.state.overlay = Some(Overlay::Summary);
                 self.state.reset_overlay_scroll();
                 LoopControl::Continue
@@ -926,6 +938,7 @@ impl App {
                 self.state.overlay = None;
             }
             Overlay::Summary if matches!(code, KeyCode::Esc | KeyCode::Char('s')) => {
+                // Modifier-blind closing stays local because it is a reversible UI-only toggle.
                 self.state.overlay = None;
             }
             Overlay::Help | Overlay::Detail | Overlay::Summary => match code {
@@ -3942,6 +3955,96 @@ mod tests {
             command_receiver.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn control_c_sends_no_command_and_leaves_app_state_unchanged() {
+        let (_model_sender, model_receiver) = watch::channel(Arc::new(DomainModel::default()));
+        let (command_sender, mut command_receiver) = tokio::sync::mpsc::channel(1);
+        let mut app =
+            App::with_operator_commands(model_receiver, command_sender, HeaderInputs::default());
+        let before = (
+            app.state.selected.clone(),
+            app.state.follow,
+            app.state.view_mode,
+            app.state.filter_query.clone(),
+            app.state.filter_draft.clone(),
+            app.state.overlay,
+        );
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            LoopControl::Continue
+        );
+
+        assert!(matches!(
+            command_receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            (
+                app.state.selected.clone(),
+                app.state.follow,
+                app.state.view_mode,
+                app.state.filter_query.clone(),
+                app.state.filter_draft.clone(),
+                app.state.overlay,
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn control_s_does_not_open_summary_overlay() {
+        let (_model_sender, model_receiver) = watch::channel(Arc::new(DomainModel::default()));
+        let mut app = App::new(model_receiver, HeaderInputs::default());
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            LoopControl::Continue
+        );
+
+        assert_eq!(app.state().overlay(), None);
+    }
+
+    #[test]
+    fn c_silently_drops_when_operator_command_queue_is_full() {
+        let (_model_sender, model_receiver) = watch::channel(Arc::new(DomainModel::default()));
+        let (command_sender, mut command_receiver) = tokio::sync::mpsc::channel(1);
+        command_sender
+            .try_send(OperatorCommand::DismissClearable)
+            .unwrap();
+        let mut app =
+            App::with_operator_commands(model_receiver, command_sender, HeaderInputs::default());
+        let before = (
+            app.state.selected.clone(),
+            app.state.follow,
+            app.state.filter_draft.clone(),
+            app.state.overlay,
+        );
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            LoopControl::Continue
+        );
+
+        assert_eq!(
+            command_receiver.try_recv(),
+            Ok(OperatorCommand::DismissClearable)
+        );
+        assert!(matches!(
+            command_receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            (
+                app.state.selected.clone(),
+                app.state.follow,
+                app.state.filter_draft.clone(),
+                app.state.overlay,
+            ),
+            before
+        );
     }
 
     #[test]
