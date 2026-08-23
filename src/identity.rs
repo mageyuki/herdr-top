@@ -252,11 +252,13 @@ pub fn apply_binding_plan_at(
         BindingPlan::Bind { run, key } => apply_bind(model, run, key, receipt_time_ms),
         BindingPlan::Merge { survivor, absorbed } => {
             let contracted = preflight_merge(model, survivor, absorbed)?;
-            merge_in_memory(model, survivor, absorbed, contracted);
-            let task_run = model
+            merge_in_memory(model, survivor, absorbed, contracted, receipt_time_ms);
+            let mut task_run = model
                 .task_run(&survivor)
                 .cloned()
                 .ok_or(MergeConflict::MissingRun { run: survivor })?;
+            task_run.touch(receipt_time_ms);
+            model.insert_task_run(task_run.clone());
             let native_session =
                 single_native_binding(model, survivor)?.map(|(provider, native_session_id)| {
                     NativeSessionBinding {
@@ -264,14 +266,16 @@ pub fn apply_binding_plan_at(
                         native_session_id,
                     }
                 });
-            let finished_at_ms = task_run.state.is_terminal().then_some(receipt_time_ms);
+            let created_at_ms = task_run.created_at_ms.unwrap_or(receipt_time_ms);
+            let updated_at_ms = task_run.updated_at_ms.unwrap_or(receipt_time_ms);
+            let finished_at_ms = task_run.finished_at_ms;
             Ok(vec![
                 PersistOp::MergeTaskRuns { survivor, absorbed },
                 PersistOp::UpsertTaskRun(PersistTaskRun {
                     task_run,
                     native_session,
-                    created_at_ms: receipt_time_ms,
-                    updated_at_ms: receipt_time_ms,
+                    created_at_ms,
+                    updated_at_ms,
                     finished_at_ms,
                 }),
             ])
@@ -510,7 +514,7 @@ fn apply_bind(
     }
 
     let mut promoted_from = None;
-    let persisted_task_run = match &task_run.key {
+    let mut persisted_task_run = match &task_run.key {
         RunKey::Controller(_) => {
             model.insert_task_run_alias(key, run);
             task_run
@@ -526,21 +530,27 @@ fn apply_bind(
             let old_key = task_run.key.clone();
             let mut promoted = task_run;
             promoted.key = key.clone();
-            model.insert_task_run(promoted.clone());
-            model.insert_task_run_alias(old_key.clone(), run);
             promoted_from = Some(old_key);
             promoted
         }
     };
+    persisted_task_run.touch(receipt_time_ms);
+    model.insert_task_run(persisted_task_run.clone());
+    if let Some(old_key) = promoted_from.as_ref() {
+        model.insert_task_run_alias(old_key.clone(), run);
+    }
+    let created_at_ms = persisted_task_run.created_at_ms.unwrap_or(receipt_time_ms);
+    let updated_at_ms = persisted_task_run.updated_at_ms.unwrap_or(receipt_time_ms);
+    let finished_at_ms = persisted_task_run.finished_at_ms;
     let persisted = PersistTaskRun {
         task_run: persisted_task_run,
         native_session: Some(NativeSessionBinding {
             provider,
             native_session_id: sid,
         }),
-        created_at_ms: receipt_time_ms,
-        updated_at_ms: receipt_time_ms,
-        finished_at_ms: None,
+        created_at_ms,
+        updated_at_ms,
+        finished_at_ms,
     };
     Ok(match promoted_from {
         Some(old_key @ RunKey::NativePath { .. }) => vec![PersistOp::PromoteTaskRunKey {
@@ -759,6 +769,7 @@ fn merge_in_memory(
     survivor: RunId,
     absorbed: RunId,
     contracted: ContractedGraphs,
+    receipt_time_ms: i64,
 ) {
     let absorbed_has_controller_evidence = model
         .task_run(&absorbed)
@@ -767,6 +778,7 @@ fn merge_in_memory(
         && let Some(mut task_run) = model.task_run(&survivor).cloned()
     {
         task_run.has_controller_task_state_event = true;
+        task_run.touch(receipt_time_ms);
         model.insert_task_run(task_run);
     }
     let mut aliases: Vec<_> = model
@@ -833,6 +845,11 @@ mod tests {
             display_ordinal: DisplayOrdinal::new(ordinal),
             state: TaskState::Running,
             has_controller_task_state_event: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         });
         run_id
     }
@@ -843,6 +860,116 @@ mod tests {
             provider: Provider::Codex,
             sid: sid.to_owned(),
         }
+    }
+
+    #[test]
+    fn merge_controller_evidence_flag_flip_touches_survivor_bookkeeping() {
+        let mut model = DomainModel::default();
+        let survivor = insert_run(
+            &mut model,
+            RunKey::Controller("controller-survivor".to_owned()),
+            1,
+        );
+        let absorbed = insert_run(&mut model, native(Provider::Codex, "absorbed-sid"), 2);
+        let mut survivor_run = model.task_run(&survivor).cloned().unwrap();
+        survivor_run.created_at_ms = Some(100);
+        survivor_run.updated_at_ms = Some(500);
+        survivor_run.dismissed_at_ms = Some(750);
+        model.insert_task_run(survivor_run);
+        let mut absorbed_run = model.task_run(&absorbed).cloned().unwrap();
+        absorbed_run.has_controller_task_state_event = true;
+        model.insert_task_run(absorbed_run);
+
+        let batch =
+            apply_binding_plan_at(&mut model, BindingPlan::Merge { survivor, absorbed }, 2_000)
+                .unwrap();
+
+        let survivor_run = model.task_run(&survivor).unwrap();
+        assert!(survivor_run.has_controller_task_state_event);
+        assert_eq!(survivor_run.created_at_ms, Some(100));
+        assert_eq!(survivor_run.updated_at_ms, Some(2_000));
+        assert_eq!(survivor_run.finished_at_ms, None);
+        assert_eq!(survivor_run.dismissed_at_ms, None);
+        let PersistOp::UpsertTaskRun(persisted) = &batch[1] else {
+            panic!("expected survivor task-run persistence after merge");
+        };
+        assert_eq!(&persisted.task_run, survivor_run);
+        assert_eq!(persisted.created_at_ms, 100);
+        assert_eq!(persisted.updated_at_ms, 2_000);
+        assert_eq!(persisted.finished_at_ms, None);
+    }
+
+    #[test]
+    fn merge_survivor_persist_touches_bookkeeping_without_flag_flip() {
+        let mut model = DomainModel::default();
+        let survivor = insert_run(&mut model, native(Provider::Codex, "survivor-sid"), 1);
+        let absorbed = insert_run(&mut model, provisional("absorbed-terminal", 2), 2);
+        let mut survivor_run = model.task_run(&survivor).cloned().unwrap();
+        survivor_run.created_at_ms = Some(125);
+        survivor_run.updated_at_ms = Some(600);
+        survivor_run.dismissed_at_ms = Some(800);
+        model.insert_task_run(survivor_run);
+
+        let batch =
+            apply_binding_plan_at(&mut model, BindingPlan::Merge { survivor, absorbed }, 2_500)
+                .unwrap();
+
+        let survivor_run = model.task_run(&survivor).unwrap();
+        assert!(!survivor_run.has_controller_task_state_event);
+        assert_eq!(survivor_run.created_at_ms, Some(125));
+        assert_eq!(survivor_run.updated_at_ms, Some(2_500));
+        assert_eq!(survivor_run.finished_at_ms, None);
+        assert_eq!(survivor_run.dismissed_at_ms, None);
+        let PersistOp::UpsertTaskRun(persisted) = &batch[1] else {
+            panic!("expected survivor task-run persistence after merge");
+        };
+        assert_eq!(&persisted.task_run, survivor_run);
+        assert_eq!(persisted.created_at_ms, 125);
+        assert_eq!(persisted.updated_at_ms, 2_500);
+        assert_eq!(persisted.finished_at_ms, None);
+    }
+
+    #[test]
+    fn native_path_key_promotion_touches_run_bookkeeping() {
+        let mut model = DomainModel::default();
+        let run = insert_run(
+            &mut model,
+            RunKey::NativePath {
+                provider: Provider::Codex,
+                path: "/sessions/pending.jsonl".to_owned(),
+            },
+            1,
+        );
+        let mut task_run = model.task_run(&run).cloned().unwrap();
+        task_run.created_at_ms = Some(150);
+        task_run.updated_at_ms = Some(700);
+        task_run.dismissed_at_ms = Some(900);
+        model.insert_task_run(task_run);
+        let native_key = native(Provider::Codex, "resolved-sid");
+
+        let batch = apply_binding_plan_at(
+            &mut model,
+            BindingPlan::Bind {
+                run,
+                key: native_key.clone(),
+            },
+            3_000,
+        )
+        .unwrap();
+
+        let task_run = model.task_run(&run).unwrap();
+        assert_eq!(task_run.key, native_key);
+        assert_eq!(task_run.created_at_ms, Some(150));
+        assert_eq!(task_run.updated_at_ms, Some(3_000));
+        assert_eq!(task_run.finished_at_ms, None);
+        assert_eq!(task_run.dismissed_at_ms, None);
+        let PersistOp::PromoteTaskRunKey { promoted, .. } = &batch[0] else {
+            panic!("expected native-path task-run key promotion");
+        };
+        assert_eq!(&promoted.task_run, task_run);
+        assert_eq!(promoted.created_at_ms, 150);
+        assert_eq!(promoted.updated_at_ms, 3_000);
+        assert_eq!(promoted.finished_at_ms, None);
     }
 
     #[test]
@@ -951,6 +1078,11 @@ mod tests {
                 display_ordinal: DisplayOrdinal::new(ordinal),
                 state: TaskState::Running,
                 has_controller_task_state_event: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             },
             native_session: Some(NativeSessionBinding {
                 provider: Provider::Codex,
@@ -1473,6 +1605,11 @@ mod tests {
             display_ordinal: DisplayOrdinal::new(1),
             state: TaskState::Queued,
             has_controller_task_state_event: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         };
         let absorbed_run = TaskRun {
             run_id: absorbed,
@@ -1480,6 +1617,11 @@ mod tests {
             display_ordinal: DisplayOrdinal::new(2),
             state: TaskState::Running,
             has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         };
         let native_session = NativeSessionBinding {
             provider: Provider::Codex,

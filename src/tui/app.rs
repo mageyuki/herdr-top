@@ -27,7 +27,7 @@ use crate::diagnostics::{
 #[cfg(any(test, feature = "workload-harness"))]
 use crate::herdr::collector::ObservationQuality;
 use crate::herdr::collector::{PerformancePublication, SourceCoverageRegistry};
-use crate::model::{DomainModel, RunId, RunKey, SharedModel};
+use crate::model::{DomainModel, OperatorCommand, RunId, RunKey, SharedModel};
 #[cfg(any(test, feature = "workload-harness"))]
 use crate::performance::PerformanceSnapshot;
 use crate::store::writer::PersistenceStatus;
@@ -56,6 +56,11 @@ impl Clock for SystemClock {
             .try_into()
             .unwrap_or(i64::MAX)
     }
+}
+
+fn next_wall_second_ms(now_ms: i64) -> i64 {
+    let until_next = 1_000_i64.saturating_sub(now_ms.rem_euclid(1_000));
+    now_ms.checked_add(until_next).unwrap_or(i64::MAX)
 }
 
 trait NoticePublicationBoundary: fmt::Debug + Send + Sync {
@@ -93,6 +98,7 @@ pub struct TuiSetup {
     notice_state_base: Option<PathBuf>,
     home: Option<OsString>,
     notice_visible: bool,
+    ascii_tree: bool,
     notice_publication: Arc<dyn NoticePublicationBoundary>,
 }
 
@@ -103,6 +109,7 @@ impl Default for TuiSetup {
             notice_state_base: None,
             home: None,
             notice_visible: false,
+            ascii_tree: false,
             notice_publication: Arc::new(LocalNoticePublication),
         }
     }
@@ -139,13 +146,26 @@ impl TuiSetup {
             notice_state_base: Some(state_base),
             home,
             notice_visible: !compatible && !dismissed,
+            ascii_tree: false,
             notice_publication,
         }
+    }
+
+    /// Selects ASCII connector glyphs for execution-tree rendering.
+    #[must_use]
+    pub const fn with_ascii_tree(mut self, ascii_tree: bool) -> Self {
+        self.ascii_tree = ascii_tree;
+        self
     }
 
     #[must_use]
     pub const fn notice_visible(&self) -> bool {
         self.notice_visible
+    }
+
+    #[must_use]
+    pub const fn ascii_tree(&self) -> bool {
+        self.ascii_tree
     }
 
     pub(super) fn standalone_status(&self) -> Option<&StandaloneVersionStatus> {
@@ -259,6 +279,7 @@ pub(crate) enum Overlay {
     Notice,
     Help,
     Detail,
+    Summary,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -504,6 +525,7 @@ fn default_operator() -> OperatorSnapshot {
 /// Fixed-screen monitor state backed by coherent model and performance publications.
 pub struct App {
     model_receiver: SharedModel,
+    operator_commands: tokio::sync::mpsc::Sender<OperatorCommand>,
     diagnostics_receiver: tokio::sync::watch::Receiver<RuntimeDiagnosticsSnapshot>,
     operator_receiver: tokio::sync::watch::Receiver<OperatorSnapshot>,
     model: Arc<DomainModel>,
@@ -513,18 +535,62 @@ pub struct App {
     state: AppState,
     setup: TuiSetup,
     clock: Arc<dyn Clock>,
+    rows: Vec<TreeRow>,
+    app_started_at_ms: i64,
     next_expiry_ms: Option<i64>,
+    next_paint_ms: i64,
 }
 
 impl App {
     /// Creates an application from observation receivers and display-only header inputs.
+    ///
+    /// This convenience constructor discards the command receiver, so `c` is inert. Use
+    /// [`Self::with_operator_commands`] when the application needs a live collector command path.
     #[must_use]
     pub fn new(model_receiver: SharedModel, header: HeaderInputs) -> Self {
+        let (operator_commands, operator_command_receiver) = tokio::sync::mpsc::channel(1);
+        drop(operator_command_receiver);
+        debug_assert!(operator_commands.is_closed());
+        Self::with_operator_commands(model_receiver, operator_commands, header)
+    }
+
+    /// Creates an application with an injectable clock and no collector command path.
+    #[must_use]
+    pub fn with_clock(
+        model_receiver: SharedModel,
+        header: HeaderInputs,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        let (operator_commands, operator_command_receiver) = tokio::sync::mpsc::channel(1);
+        drop(operator_command_receiver);
+        debug_assert!(operator_commands.is_closed());
         let (_diagnostics_sender, diagnostics_receiver) =
             tokio::sync::watch::channel(default_diagnostics());
         let (_operator_sender, operator_receiver) = tokio::sync::watch::channel(default_operator());
-        Self::with_inputs(
+        Self::with_operator_commands_and_inputs(
             model_receiver,
+            operator_commands,
+            header,
+            diagnostics_receiver,
+            operator_receiver,
+            TuiSetup::default(),
+            clock,
+        )
+    }
+
+    /// Creates an application with a bounded command path to the collector.
+    #[must_use]
+    pub fn with_operator_commands(
+        model_receiver: SharedModel,
+        operator_commands: tokio::sync::mpsc::Sender<OperatorCommand>,
+        header: HeaderInputs,
+    ) -> Self {
+        let (_diagnostics_sender, diagnostics_receiver) =
+            tokio::sync::watch::channel(default_diagnostics());
+        let (_operator_sender, operator_receiver) = tokio::sync::watch::channel(default_operator());
+        Self::with_operator_commands_and_inputs(
+            model_receiver,
+            operator_commands,
             header,
             diagnostics_receiver,
             operator_receiver,
@@ -534,9 +600,37 @@ impl App {
     }
 
     /// Creates an application with every read-only diagnostic, operator, setup, and time input.
+    ///
+    /// This convenience constructor discards the command receiver, so `c` is inert. Use
+    /// [`Self::with_operator_commands_and_inputs`] for a live collector command path.
     #[must_use]
     pub fn with_inputs(
         model_receiver: SharedModel,
+        header: HeaderInputs,
+        diagnostics_receiver: tokio::sync::watch::Receiver<RuntimeDiagnosticsSnapshot>,
+        operator_receiver: tokio::sync::watch::Receiver<OperatorSnapshot>,
+        setup: TuiSetup,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        let (operator_commands, operator_command_receiver) = tokio::sync::mpsc::channel(1);
+        drop(operator_command_receiver);
+        debug_assert!(operator_commands.is_closed());
+        Self::with_operator_commands_and_inputs(
+            model_receiver,
+            operator_commands,
+            header,
+            diagnostics_receiver,
+            operator_receiver,
+            setup,
+            clock,
+        )
+    }
+
+    /// Creates an application with every observation input plus the collector command path.
+    #[must_use]
+    pub fn with_operator_commands_and_inputs(
+        model_receiver: SharedModel,
+        operator_commands: tokio::sync::mpsc::Sender<OperatorCommand>,
         header: HeaderInputs,
         diagnostics_receiver: tokio::sync::watch::Receiver<RuntimeDiagnosticsSnapshot>,
         operator_receiver: tokio::sync::watch::Receiver<OperatorSnapshot>,
@@ -553,6 +647,7 @@ impl App {
         let session_display_name = super::projection::escape_controls(&header.session);
         let mut app = Self {
             model_receiver,
+            operator_commands,
             diagnostics_receiver,
             operator_receiver,
             model,
@@ -570,14 +665,24 @@ impl App {
             },
             setup,
             clock,
+            rows: Vec::new(),
+            app_started_at_ms: now_ms,
             next_expiry_ms: None,
+            next_paint_ms: next_wall_second_ms(now_ms),
         };
         app.state.adopt_model(app.model.as_ref());
-        let projection = view::build_projection(app.model.as_ref(), &app.state);
-        app.next_expiry_ms = projection.next_expiry_ms;
-        let last = projection.rows.last().map(|row| row.key.clone());
+        let rows = app.rebuild_rows();
+        let last = rows.last().map(|row| row.key.clone());
         app.set_selection(last);
         app
+    }
+
+    fn rebuild_rows(&mut self) -> Vec<TreeRow> {
+        self.state.now_ms = self.clock.now_ms();
+        let projection = view::build_projection(self.model.as_ref(), &self.state);
+        self.next_expiry_ms = projection.next_expiry_ms;
+        self.rows = projection.rows;
+        self.rows.clone()
     }
 
     /// Refreshes the cached coherent model and performance publication.
@@ -587,6 +692,8 @@ impl App {
 
     fn refresh_cached(&mut self, recompute_projection: bool) {
         let old_rows = if recompute_projection && !self.state.follow {
+            // Keep the cached time for historical disappearance classification. This lookup does
+            // not become the visible row set and must not replace the pending visible deadline.
             view::build_rows(self.model.as_ref(), &self.state)
         } else {
             Vec::new()
@@ -602,12 +709,9 @@ impl App {
         self.state.operator_activity = Arc::clone(&operator.activity);
         self.state.terminal_times = Arc::clone(&operator.terminal_times);
         drop(operator);
-        self.state.now_ms = self.clock.now_ms();
         self.state.adopt_model(new_model.as_ref());
         self.model = new_model;
-        let projection = view::build_projection(self.model.as_ref(), &self.state);
-        self.next_expiry_ms = projection.next_expiry_ms;
-        let new_rows = projection.rows;
+        let new_rows = self.rebuild_rows();
         if self.state.follow {
             self.state.selection_reason = None;
             self.set_selection(new_rows.last().map(|row| row.key.clone()));
@@ -650,7 +754,7 @@ impl App {
         }
     }
 
-    /// Applies one keyboard event without touching the collector, writer, or monitored agents.
+    /// Applies one keyboard event, sending only bounded operator intent to the collector.
     pub fn handle_key(&mut self, key: KeyEvent) -> LoopControl {
         if key.kind == KeyEventKind::Release {
             return LoopControl::Continue;
@@ -667,8 +771,21 @@ impl App {
                 self.state.filter_draft = Some(self.state.filter_query.clone());
                 LoopControl::Continue
             }
+            KeyCode::Char('c') if key.modifiers.is_empty() => {
+                // Never block the UI: a full queue already has a receipt-time dismissal pending,
+                // while a closed queue has no collector that could service another command.
+                let _ = self
+                    .operator_commands
+                    .try_send(OperatorCommand::DismissClearable);
+                LoopControl::Continue
+            }
             KeyCode::Char('i') => {
                 self.state.overlay = Some(Overlay::Detail);
+                self.state.reset_overlay_scroll();
+                LoopControl::Continue
+            }
+            KeyCode::Char('s') if key.modifiers.is_empty() => {
+                self.state.overlay = Some(Overlay::Summary);
                 self.state.reset_overlay_scroll();
                 LoopControl::Continue
             }
@@ -713,12 +830,13 @@ impl App {
 
     /// Renders the current cached state into one frame.
     pub fn render(&self, frame: &mut Frame<'_>) {
+        let now_ms = self.clock.now_ms();
         view::render(
             frame,
             self.model.as_ref(),
             &self.performance,
             &self.header,
-            &self.state,
+            view::PaintSnapshot::new(&self.state, &self.rows, now_ms, self.session_start_ms()),
             &self.diagnostics,
             &self.setup,
         );
@@ -734,6 +852,7 @@ impl App {
         let mut dirty = true;
         loop {
             dirty |= self.refresh_if_changed()?;
+            dirty |= self.paint_tick_due();
             let now = started.elapsed();
             if limiter.ready(dirty, now) {
                 terminal.draw(|frame| self.render(frame))?;
@@ -791,6 +910,23 @@ impl App {
         self.state.projection_build_count()
     }
 
+    fn session_start_ms(&self) -> i64 {
+        self.model
+            .task_runs()
+            .filter_map(|run| run.created_at_ms)
+            .min()
+            .unwrap_or(self.app_started_at_ms)
+    }
+
+    fn paint_tick_due(&mut self) -> bool {
+        let now_ms = self.clock.now_ms();
+        if now_ms < self.next_paint_ms {
+            return false;
+        }
+        self.next_paint_ms = next_wall_second_ms(now_ms);
+        true
+    }
+
     fn handle_overlay_key(&mut self, overlay: Overlay, code: KeyCode) -> LoopControl {
         match overlay {
             Overlay::Notice if matches!(code, KeyCode::Enter | KeyCode::Esc) => {
@@ -825,7 +961,11 @@ impl App {
             Overlay::Detail if matches!(code, KeyCode::Esc | KeyCode::Char('i')) => {
                 self.state.overlay = None;
             }
-            Overlay::Help | Overlay::Detail => match code {
+            Overlay::Summary if matches!(code, KeyCode::Esc | KeyCode::Char('s')) => {
+                // Modifier-blind closing stays local because it is a reversible UI-only toggle.
+                self.state.overlay = None;
+            }
+            Overlay::Help | Overlay::Detail | Overlay::Summary => match code {
                 KeyCode::Up => self.state.scroll_overlay_up(),
                 KeyCode::Down => self.state.scroll_overlay_down(),
                 _ => {}
@@ -855,7 +995,7 @@ impl App {
     }
 
     fn commit_filter(&mut self) {
-        let old_rows = view::build_rows(self.model.as_ref(), &self.state);
+        let old_rows = self.rebuild_rows();
         let query = self
             .state
             .filter_draft
@@ -865,10 +1005,7 @@ impl App {
             .to_owned();
         self.state.filter_query = query;
         self.state.follow = false;
-        self.state.now_ms = self.clock.now_ms();
-        let projection = view::build_projection(self.model.as_ref(), &self.state);
-        self.next_expiry_ms = projection.next_expiry_ms;
-        let new_rows = projection.rows;
+        let new_rows = self.rebuild_rows();
         self.recover_selection(&old_rows, &new_rows, Some(SelectionReason::Filtered));
     }
 
@@ -880,7 +1017,7 @@ impl App {
         if !self.collapse_available() {
             return;
         }
-        let old_rows = view::build_rows(self.model.as_ref(), &self.state);
+        let old_rows = self.rebuild_rows();
         let full_rows = view::build_uncollapsed_rows(self.model.as_ref(), &self.state);
         let Some(index) = full_rows.iter().position(|row| row.key == key) else {
             return;
@@ -894,9 +1031,14 @@ impl App {
         }
         self.state.follow = false;
         self.state.selection_reason = None;
-        if !self.state.collapsed.remove(&key) {
+        let collapsed = if self.state.collapsed.remove(&key) {
+            false
+        } else {
             self.state.collapsed.insert(key);
-            let new_rows = view::build_rows(self.model.as_ref(), &self.state);
+            true
+        };
+        let new_rows = self.rebuild_rows();
+        if collapsed {
             self.recover_selection(&old_rows, &new_rows, Some(SelectionReason::Collapsed));
         }
     }
@@ -912,7 +1054,7 @@ impl App {
             self.toggle_collapse(selected);
             return;
         }
-        let rows = view::build_rows(self.model.as_ref(), &self.state);
+        let rows = self.rebuild_rows();
         let Some(index) = rows.iter().position(|row| row.key == selected) else {
             return;
         };
@@ -934,7 +1076,7 @@ impl App {
         let Some(selected) = self.state.selected.clone() else {
             return;
         };
-        let rows = view::build_rows(self.model.as_ref(), &self.state);
+        let rows = self.rebuild_rows();
         let Some(index) = rows.iter().position(|row| row.key == selected) else {
             return;
         };
@@ -965,13 +1107,17 @@ impl App {
         let until_expiry = self
             .next_expiry_ms
             .map(|deadline| Duration::from_millis(deadline.saturating_sub(now_ms).max(0) as u64));
-        until_expiry.map_or(base, |expiry| base.min(expiry))
+        let until_paint =
+            Duration::from_millis(next_wall_second_ms(now_ms).saturating_sub(now_ms).max(0) as u64);
+        until_expiry
+            .map_or(base, |expiry| base.min(expiry))
+            .min(until_paint)
     }
 
     fn move_selection(&mut self, down: bool) {
         self.state.follow = false;
         self.state.selection_reason = None;
-        let rows = view::build_rows(self.model.as_ref(), &self.state);
+        let rows = self.rebuild_rows();
         if rows.is_empty() {
             self.set_selection(None);
             return;
@@ -993,15 +1139,13 @@ impl App {
     fn resume_follow(&mut self) {
         self.state.follow = true;
         self.state.selection_reason = None;
-        let selected = view::build_rows(self.model.as_ref(), &self.state)
-            .last()
-            .map(|row| row.key.clone());
+        let selected = self.rebuild_rows().last().map(|row| row.key.clone());
         self.set_selection(selected);
     }
 
     fn toggle_view(&mut self) {
         let previous = self.state.selected.clone();
-        let old_rows = view::build_rows(self.model.as_ref(), &self.state);
+        let old_rows = self.rebuild_rows();
         let was_following = self.state.follow;
         let semantic_run_id = previous.as_ref().and_then(|selected| {
             selected.run_id().or_else(|| match selected {
@@ -1014,7 +1158,7 @@ impl App {
         });
         self.state.view_mode = self.state.view_mode.toggled();
         self.state.selection_reason = None;
-        let rows = view::build_rows(self.model.as_ref(), &self.state);
+        let rows = self.rebuild_rows();
         if was_following {
             self.set_selection(rows.last().map(|row| row.key.clone()));
             return;
@@ -1260,12 +1404,18 @@ impl WorkloadFrameDriver {
             let projection = self.header_projection;
             match self.terminal.draw(|frame| {
                 if projection.omit_performance_label {
+                    let now_ms = self.app.clock.now_ms();
                     view::workload_header_projection::render_with_workload_projection(
                         frame,
                         self.app.model.as_ref(),
                         &publication,
                         &self.app.header,
-                        &self.app.state,
+                        view::PaintSnapshot::new(
+                            &self.app.state,
+                            &self.app.rows,
+                            now_ms,
+                            self.app.session_start_ms(),
+                        ),
                         &self.app.diagnostics,
                         &self.app.setup,
                         projection,
@@ -1476,8 +1626,8 @@ mod tests {
         SourceCoverageRegistry,
     };
     use crate::model::{
-        AgentNode, DependencyEdge, DisplayOrdinal, DomainModel, ExecState, Execution, Pane,
-        Provider, RunId, RunKey, Tab, TaskRun, TaskState, Workspace,
+        AgentNode, DependencyEdge, DisplayOrdinal, DomainModel, ExecState, Execution,
+        OperatorCommand, Pane, Provider, RunId, RunKey, Tab, TaskRun, TaskState, Workspace,
     };
     use crate::performance::{PerformanceDegradationReason, PerformanceSnapshot};
     use crate::store::writer::{
@@ -1497,12 +1647,14 @@ mod tests {
         model.insert_tab(Tab {
             tab_id: "tab".to_owned(),
             workspace_id: "workspace".to_owned(),
+            label: None,
         });
         model.insert_pane(Pane {
             pane_id: "pane".to_owned(),
             workspace_id: "workspace".to_owned(),
             tab_id: "tab".to_owned(),
             terminal_id: "terminal".to_owned(),
+            display_name: None,
         });
         for (run_id, label, ordinal, state) in runs {
             model.insert_task_run(TaskRun {
@@ -1511,6 +1663,11 @@ mod tests {
                 display_ordinal: DisplayOrdinal::new(*ordinal),
                 state: *state,
                 has_controller_task_state_event: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             });
             model.insert_execution(Execution {
                 execution_id: format!("execution-{label}"),
@@ -1536,6 +1693,7 @@ mod tests {
         model.insert_tab(Tab {
             tab_id: "tab".to_owned(),
             workspace_id: "workspace".to_owned(),
+            label: None,
         });
         for pane_id in ["pane-1", "pane-2"] {
             model.insert_pane(Pane {
@@ -1543,6 +1701,7 @@ mod tests {
                 workspace_id: "workspace".to_owned(),
                 tab_id: "tab".to_owned(),
                 terminal_id: format!("terminal-{pane_id}"),
+                display_name: None,
             });
         }
         model.insert_task_run(TaskRun {
@@ -1551,6 +1710,11 @@ mod tests {
             display_ordinal: DisplayOrdinal::new(1),
             state: shared_state,
             has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         });
         model.insert_task_run(TaskRun {
             run_id: sibling,
@@ -1558,6 +1722,11 @@ mod tests {
             display_ordinal: DisplayOrdinal::new(2),
             state: TaskState::Running,
             has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         });
         if include_pane_one_occurrence {
             model.insert_execution(Execution {
@@ -1682,6 +1851,124 @@ mod tests {
             );
             assert_eq!(app.performance, publication);
         }
+    }
+
+    #[test]
+    fn summary_overlay_opens_closes_and_scrolls_with_its_keys() {
+        let run = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let (mut app, _senders) = app_with_runtime(
+            model_with_runs(&[(run, "run", 1, TaskState::Running)]),
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            TestClock::at(0),
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.state().overlay(), Some(Overlay::Summary));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.state().overlay_scroll(), 1);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.state().overlay_scroll(), 0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.state().overlay(), None);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.state().overlay(), Some(Overlay::Summary));
+        assert_eq!(app.state().overlay_scroll(), 0);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.state().overlay(), None);
+    }
+
+    #[test]
+    fn summary_overlay_renders_header_and_one_placeholder_row_per_group() {
+        let first = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let second = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let mut model = model_with_runs(&[
+            (first, "hook:claude-code:S:task:A", 1, TaskState::Completed),
+            (second, "native", 2, TaskState::Running),
+        ]);
+        let mut terminal = model.task_run(&first).unwrap().clone();
+        terminal.created_at_ms = Some(1_000);
+        terminal.finished_at_ms = Some(61_000);
+        model.insert_task_run(terminal);
+        let mut native = model.task_run(&second).unwrap().clone();
+        native.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "native".to_owned(),
+        };
+        model.insert_task_run(native);
+        for (run_id, agent_node_id, model_id, activity_at) in [
+            (first, "agent-alpha", "model-alpha", 10),
+            (second, "agent-beta", "model-beta", 20),
+        ] {
+            model.insert_agent_node(AgentNode {
+                agent_node_id: agent_node_id.to_owned(),
+                provider: Provider::Codex,
+                native_session_id: Some(agent_node_id.to_owned()),
+                task_run_id: run_id,
+                display_ordinal: DisplayOrdinal::new(activity_at),
+                parent_agent_node_id: None,
+                state: Some(ExecState::Working),
+                model_id: Some(model_id.to_owned()),
+                last_event_kind: None,
+                last_tool_name: None,
+                last_item_count: None,
+                last_byte_count: None,
+                last_activity_at_ms: Some(activity_at),
+                session_file: None,
+            });
+        }
+        let (mut app, _senders) = app_with_runtime(
+            model,
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            TestClock::at(80_000),
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        let lines = render_lines(&app, 160, 18);
+        let screen = lines.join("\n");
+        assert!(screen.contains(" Summary "));
+        assert!(screen.contains("worker kind | model | runs | live | total | mean | tok | tok/s"));
+        let data_rows = lines
+            .iter()
+            .filter(|line| line.contains("model-alpha") || line.contains("model-beta"))
+            .collect::<Vec<_>>();
+        assert_eq!(data_rows.len(), 2, "{screen}");
+        assert!(data_rows.iter().all(|line| line.contains(" | - | -")));
+        assert!(screen.contains("claude-code | model-alpha | 1 | 0 | 01m00s | 01m00s | - | -"));
+        assert!(screen.contains("Codex | model-beta | 1 | 1 | 00s | - | - | -"));
+    }
+
+    #[test]
+    fn session_elapsed_header_uses_earliest_run_start_and_repaints_from_clock() {
+        let run = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut model = model_with_runs(&[(run, "run", 1, TaskState::Completed)]);
+        let mut timed = model.task_run(&run).unwrap().clone();
+        timed.created_at_ms = Some(5_000);
+        timed.finished_at_ms = Some(6_000);
+        model.insert_task_run(timed);
+        let clock = TestClock::at(3_605_000);
+        let (app, _senders) = app_with_runtime(
+            model,
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+
+        let initial = render_lines(&app, 180, 18)
+            .into_iter()
+            .find(|line| line.contains("session:"))
+            .unwrap();
+        assert!(initial.contains(" | up:01:00:00 | "), "{initial}");
+
+        clock.set(3_666_000);
+        let repainted = render_lines(&app, 180, 18)
+            .into_iter()
+            .find(|line| line.contains("session:"))
+            .unwrap();
+        assert!(repainted.contains(" | up:01:01:01 | "), "{repainted}");
+        assert!(!repainted.contains("up:01:00:00"));
     }
 
     fn render(app: &App) -> String {
@@ -1941,6 +2228,11 @@ mod tests {
             display_ordinal: DisplayOrdinal::new(2),
             state: TaskState::Running,
             has_controller_task_state_event: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         });
         model.insert_agent_node(AgentNode {
             agent_node_id: "agent-safe".to_owned(),
@@ -2666,6 +2958,13 @@ mod tests {
     }
 
     #[test]
+    fn tui_setup_ascii_tree_defaults_false_and_can_be_enabled() {
+        let setup = TuiSetup::default();
+        assert!(!setup.ascii_tree());
+        assert!(setup.with_ascii_tree(true).ascii_tree());
+    }
+
+    #[test]
     fn i4_notice_post_publish_sync_unknown_and_pre_publish_failure() {
         let runner = RecordingVersionRunner::new(VersionProbeResult::Available {
             version: "9.9.9".to_owned(),
@@ -2755,6 +3054,284 @@ mod tests {
             let _ = app.poll_duration(&limiter, false, Duration::ZERO);
         }
         assert_eq!(app.projection_build_count(), deadline_builds);
+    }
+
+    #[test]
+    fn idle_without_visible_live_duration_never_rebuilds_or_zero_polls() {
+        let live = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let clock = TestClock::at(0);
+        let (mut app, _senders) = app_with_runtime(
+            model_with_runs(&[(live, "live", 1, TaskState::Running)]),
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+        assert_eq!(app.next_expiry_ms(), None);
+        app.reset_projection_build_count();
+        let limiter = FrameLimiter::default();
+
+        for now_ms in (1..=25).map(|seconds| seconds * 1_000) {
+            clock.set(now_ms);
+            assert!(!app.refresh_if_changed().unwrap());
+            assert!(app.poll_duration(&limiter, false, Duration::ZERO) > Duration::ZERO);
+        }
+        assert_eq!(app.projection_build_count(), 0);
+    }
+
+    #[test]
+    fn paint_ticks_advance_elapsed_without_rebuilding_rows_when_no_live_duration_exists() {
+        let terminal = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let clock = TestClock::at(1_000);
+        let (mut app, _senders) = app_with_runtime(
+            model_with_runs(&[(terminal, "terminal", 1, TaskState::Completed)]),
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+        assert_eq!(app.next_expiry_ms(), None);
+        app.reset_projection_build_count();
+
+        for (now_ms, expected) in [
+            (2_000, "up:00:00:01"),
+            (3_000, "up:00:00:02"),
+            (4_000, "up:00:00:03"),
+        ] {
+            clock.set(now_ms);
+            assert!(app.paint_tick_due());
+            assert!(!app.refresh_if_changed().unwrap());
+            assert!(render_at_width(&app, 160).contains(expected));
+        }
+        assert_eq!(app.projection_build_count(), 0);
+    }
+
+    #[test]
+    fn live_duration_deadline_refreshes_through_cached_watch_path_and_advances_label() {
+        let live = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut model = model_with_runs(&[(live, "live", 1, TaskState::Running)]);
+        let mut timed = model.task_run(&live).unwrap().clone();
+        timed.created_at_ms = Some(0);
+        timed.updated_at_ms = Some(0);
+        timed.subject = Some("Visible work".to_owned());
+        model.insert_task_run(timed);
+        let clock = TestClock::at(7_000);
+        let (mut app, senders) = app_with_runtime(
+            model,
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+        let run_label = |app: &App| {
+            view::build_rows(app.model(), app.state())
+                .into_iter()
+                .find(|row| row.key.run_id() == Some(live))
+                .unwrap()
+                .label
+        };
+        assert!(run_label(&app).contains(" · 07s"));
+        assert_eq!(app.next_expiry_ms(), Some(8_000));
+        app.reset_projection_build_count();
+
+        senders
+            .operator
+            .send(empty_operator(HashMap::new()))
+            .unwrap();
+        assert!(app.operator_receiver.has_changed().unwrap());
+        clock.set(8_000);
+        assert!(app.refresh_if_changed().unwrap());
+        assert_eq!(app.projection_build_count(), 1);
+        assert!(!app.operator_receiver.has_changed().unwrap());
+        assert!(run_label(&app).contains(" · 08s"));
+        assert_eq!(app.next_expiry_ms(), Some(9_000));
+        assert!(
+            app.poll_duration(&FrameLimiter::default(), false, Duration::ZERO) > Duration::ZERO,
+            "the refreshed duration deadline must be strictly in the future"
+        );
+    }
+
+    #[test]
+    fn expanding_collapsed_live_run_rearms_duration_without_watch_traffic() {
+        let live = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut model = model_with_runs(&[(live, "live", 1, TaskState::Running)]);
+        let mut timed = model.task_run(&live).unwrap().clone();
+        timed.created_at_ms = Some(0);
+        timed.updated_at_ms = Some(0);
+        timed.subject = Some("Visible work".to_owned());
+        model.insert_task_run(timed);
+        let clock = TestClock::at(7_000);
+        let (mut app, _senders) = app_with_runtime(
+            model,
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+        let pane = NodeKey::Pane("pane".to_owned());
+
+        app.toggle_collapse(pane.clone());
+        assert_eq!(app.next_expiry_ms(), None);
+
+        app.toggle_collapse(pane);
+        assert_eq!(app.next_expiry_ms(), Some(8_000));
+        let label = view::build_rows(app.model(), app.state())
+            .into_iter()
+            .find(|row| row.key.run_id() == Some(live))
+            .unwrap()
+            .label;
+        assert!(label.contains(" · 07s"));
+
+        clock.set(8_000);
+        assert!(app.refresh_if_changed().unwrap());
+        let label = view::build_rows(app.model(), app.state())
+            .into_iter()
+            .find(|row| row.key.run_id() == Some(live))
+            .unwrap()
+            .label;
+        assert!(label.contains(" · 08s"));
+    }
+
+    #[test]
+    fn toggling_view_to_reveal_live_run_rearms_duration_without_watch_traffic() {
+        let live = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut model = model_with_runs(&[(live, "live", 1, TaskState::Running)]);
+        let mut timed = model.task_run(&live).unwrap().clone();
+        timed.created_at_ms = Some(0);
+        timed.updated_at_ms = Some(0);
+        timed.subject = Some("Visible work".to_owned());
+        model.insert_task_run(timed);
+        let clock = TestClock::at(7_000);
+        let (mut app, _senders) = app_with_runtime(
+            model,
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+
+        app.toggle_collapse(NodeKey::Pane("pane".to_owned()));
+        assert_eq!(app.next_expiry_ms(), None);
+
+        app.toggle_view();
+        assert_eq!(app.next_expiry_ms(), Some(8_000));
+        let label = view::build_rows(app.model(), app.state())
+            .into_iter()
+            .find(|row| row.key.run_id() == Some(live))
+            .unwrap()
+            .label;
+        assert!(label.contains(" · 07s"));
+
+        clock.set(8_000);
+        assert!(app.refresh_if_changed().unwrap());
+        let label = view::build_rows(app.model(), app.state())
+            .into_iter()
+            .find(|row| row.key.run_id() == Some(live))
+            .unwrap()
+            .label;
+        assert!(label.contains(" · 08s"));
+    }
+
+    #[test]
+    fn phase_distinct_live_runs_refresh_once_per_wall_aligned_second() {
+        let first = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let second = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let third = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        let mut model = model_with_runs(&[
+            (first, "first", 1, TaskState::Running),
+            (second, "second", 2, TaskState::Running),
+            (third, "third", 3, TaskState::Running),
+        ]);
+        for (run_id, created_at_ms) in [(first, 0), (second, 250), (third, 900)] {
+            let mut timed = model.task_run(&run_id).unwrap().clone();
+            timed.created_at_ms = Some(created_at_ms);
+            timed.updated_at_ms = Some(created_at_ms);
+            model.insert_task_run(timed);
+        }
+        let clock = TestClock::at(1_500);
+        let (mut app, _senders) = app_with_runtime(
+            model,
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+        assert_eq!(app.next_expiry_ms(), Some(2_000));
+
+        let mut refreshes = 0;
+        for now_ms in (1_600..=2_500).step_by(100) {
+            clock.set(now_ms);
+            refreshes += usize::from(app.refresh_if_changed().unwrap());
+        }
+
+        assert_eq!(refreshes, 1);
+        assert_eq!(app.next_expiry_ms(), Some(3_000));
+    }
+
+    #[test]
+    fn live_duration_bounds_poll_and_terminal_transition_disarms_cadence() {
+        let live = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut live_model = model_with_runs(&[(live, "live", 1, TaskState::Running)]);
+        let mut timed = live_model.task_run(&live).unwrap().clone();
+        timed.created_at_ms = Some(0);
+        timed.updated_at_ms = Some(0);
+        live_model.insert_task_run(timed);
+        let clock = TestClock::at(7_000);
+        let (mut app, senders) = app_with_runtime(
+            live_model.clone(),
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+        let limiter = FrameLimiter::default();
+
+        assert_eq!(app.next_expiry_ms(), Some(8_000));
+        let poll = app.poll_duration(&limiter, false, Duration::ZERO);
+        assert!(poll > Duration::ZERO);
+        assert!(poll <= Duration::from_secs(1));
+
+        let mut terminal = live_model.task_run(&live).unwrap().clone();
+        terminal.state = TaskState::Completed;
+        terminal.updated_at_ms = Some(8_000);
+        terminal.finished_at_ms = Some(8_000);
+        live_model.insert_task_run(terminal);
+        senders.model.send(Arc::new(live_model)).unwrap();
+        clock.set(8_000);
+        assert!(app.refresh_if_changed().unwrap());
+        assert_eq!(app.next_expiry_ms(), None);
+    }
+
+    #[test]
+    fn hook_only_expiry_uses_cached_deadline_without_advance_clock() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let updated_at_ms = 100;
+        let deadline = updated_at_ms + activity::HOOK_ONLY_STALE_VISIBILITY_MS;
+        let mut model = DomainModel::default();
+        model.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::Controller("hook-only".to_owned()),
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: Some(updated_at_ms),
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        let clock = TestClock::at(updated_at_ms);
+        let (mut app, _senders) = app_with_runtime(
+            model,
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+        assert_eq!(displayed_run_names(&app), ["hook-only"]);
+        assert_eq!(app.next_expiry_ms(), Some(deadline));
+
+        clock.set(deadline);
+        let limiter = FrameLimiter::default();
+        assert_eq!(
+            app.poll_duration(&limiter, false, Duration::ZERO),
+            Duration::ZERO
+        );
+        assert!(app.refresh_if_changed().unwrap());
+        assert!(displayed_run_names(&app).is_empty());
+        assert_eq!(app.next_expiry_ms(), None);
     }
 
     #[test]
@@ -2969,7 +3546,7 @@ mod tests {
                 pane_id: None,
             })
         );
-        assert!(render(&app).contains("Selected: Task Run: first"));
+        assert!(render(&app).contains("Selected: first first"));
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.state().view_mode(), ViewMode::ExecutionTree);
@@ -2992,6 +3569,7 @@ mod tests {
             workspace_id: "workspace".to_owned(),
             tab_id: "tab".to_owned(),
             terminal_id: "terminal-2".to_owned(),
+            display_name: None,
         });
         model.insert_execution(Execution {
             execution_id: "execution-shared-2".to_owned(),
@@ -3197,7 +3775,18 @@ mod tests {
             .map(|(run_id, label, ordinal)| (*run_id, label.as_str(), *ordinal, TaskState::Running))
             .collect::<Vec<_>>();
 
-        let (mut following, _sender) = app_with_model(model_with_runs(&input));
+        let edgeful_model = || {
+            let mut model = model_with_runs(&input);
+            for pair in ids.windows(2) {
+                model.insert_dependency_edge(DependencyEdge {
+                    prerequisite_run_id: pair[0],
+                    dependent_run_id: pair[1],
+                });
+            }
+            model
+        };
+
+        let (mut following, _sender) = app_with_model(edgeful_model());
         following.set_selection(Some(NodeKey::Run {
             run_id: ids[0],
             pane_id: Some("pane".to_owned()),
@@ -3207,10 +3796,10 @@ mod tests {
         let following_rows = render_lines(&following, 100, 14);
         let following_view = following_rows[3..9].join("\n");
         assert!(following_view.contains("Dependency DAG"));
-        assert!(!following_view.contains("> Task Run: run-0"));
-        assert!(following_view.contains("Task Run: run-7"));
+        assert!(!following_view.contains("> run-0 run-0"));
+        assert!(following_view.contains("run-7 run-7"));
 
-        let (mut manual, _sender) = app_with_model(model_with_runs(&input));
+        let (mut manual, _sender) = app_with_model(edgeful_model());
         manual.state.follow = false;
         manual.set_selection(Some(NodeKey::Run {
             run_id: ids[0],
@@ -3219,7 +3808,7 @@ mod tests {
         manual.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let manual_rows = render_lines(&manual, 100, 14);
         let manual_view = manual_rows[3..9].join("\n");
-        assert!(manual_view.contains("> Task Run: run-0"));
+        assert!(manual_view.contains("> run-0 run-0"));
     }
 
     #[test]
@@ -3368,6 +3957,135 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(app.model().task_runs().count(), expected_run_count);
+    }
+
+    #[test]
+    fn c_sends_exactly_one_dismiss_clearable_command() {
+        let (_model_sender, model_receiver) = watch::channel(Arc::new(DomainModel::default()));
+        let (command_sender, mut command_receiver) = tokio::sync::mpsc::channel(2);
+        let mut app =
+            App::with_operator_commands(model_receiver, command_sender, HeaderInputs::default());
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            LoopControl::Continue
+        );
+
+        assert_eq!(
+            command_receiver.try_recv(),
+            Ok(OperatorCommand::DismissClearable)
+        );
+        assert!(matches!(
+            command_receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn control_c_sends_no_command_and_leaves_app_state_unchanged() {
+        let (_model_sender, model_receiver) = watch::channel(Arc::new(DomainModel::default()));
+        let (command_sender, mut command_receiver) = tokio::sync::mpsc::channel(1);
+        let mut app =
+            App::with_operator_commands(model_receiver, command_sender, HeaderInputs::default());
+        let before = (
+            app.state.selected.clone(),
+            app.state.follow,
+            app.state.view_mode,
+            app.state.filter_query.clone(),
+            app.state.filter_draft.clone(),
+            app.state.overlay,
+        );
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            LoopControl::Continue
+        );
+
+        assert!(matches!(
+            command_receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            (
+                app.state.selected.clone(),
+                app.state.follow,
+                app.state.view_mode,
+                app.state.filter_query.clone(),
+                app.state.filter_draft.clone(),
+                app.state.overlay,
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn control_s_does_not_open_summary_overlay() {
+        let (_model_sender, model_receiver) = watch::channel(Arc::new(DomainModel::default()));
+        let mut app = App::new(model_receiver, HeaderInputs::default());
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            LoopControl::Continue
+        );
+
+        assert_eq!(app.state().overlay(), None);
+    }
+
+    #[test]
+    fn c_silently_drops_when_operator_command_queue_is_full() {
+        let (_model_sender, model_receiver) = watch::channel(Arc::new(DomainModel::default()));
+        let (command_sender, mut command_receiver) = tokio::sync::mpsc::channel(1);
+        command_sender
+            .try_send(OperatorCommand::DismissClearable)
+            .unwrap();
+        let mut app =
+            App::with_operator_commands(model_receiver, command_sender, HeaderInputs::default());
+        let before = (
+            app.state.selected.clone(),
+            app.state.follow,
+            app.state.filter_draft.clone(),
+            app.state.overlay,
+        );
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            LoopControl::Continue
+        );
+
+        assert_eq!(
+            command_receiver.try_recv(),
+            Ok(OperatorCommand::DismissClearable)
+        );
+        assert!(matches!(
+            command_receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            (
+                app.state.selected.clone(),
+                app.state.follow,
+                app.state.filter_draft.clone(),
+                app.state.overlay,
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn c_in_filter_draft_is_text_and_sends_no_command() {
+        let (_model_sender, model_receiver) = watch::channel(Arc::new(DomainModel::default()));
+        let (command_sender, mut command_receiver) = tokio::sync::mpsc::channel(2);
+        let mut app =
+            App::with_operator_commands(model_receiver, command_sender, HeaderInputs::default());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+
+        assert_eq!(app.state().filter_draft(), Some("c"));
+        assert!(matches!(
+            command_receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]

@@ -96,6 +96,15 @@ pub fn map_hook_payload(
             "session",
             "started",
         )],
+        "SessionEnd" => vec![make_envelope(
+            "dismiss",
+            session_run_id,
+            None,
+            None,
+            Some(payload.session_id.clone()),
+            "session",
+            "ended",
+        )],
         "SubagentStart" => {
             let Some(agent_id) = payload.agent_id.as_deref() else {
                 return Vec::new();
@@ -482,16 +491,24 @@ mod tests {
     }
 
     #[test]
-    fn session_end_maps_to_empty() {
-        assert!(
-            map_hook_payload(
-                HookProvider::ClaudeCode,
-                &payload("SessionEnd"),
-                EMITTED_AT_MS,
-                NONCE,
-            )
-            .is_empty()
-        );
+    fn session_end_maps_to_one_dismiss_envelope_for_both_providers() {
+        for (provider, selector, wire_provider) in [
+            (HookProvider::ClaudeCode, "claude-code", "claude"),
+            (HookProvider::Codex, "codex", "codex"),
+        ] {
+            let actual = map_hook_payload(provider, &payload("SessionEnd"), EMITTED_AT_MS, NONCE);
+
+            assert_eq!(actual.len(), 1);
+            assert_eq!(actual[0].event_type, "dismiss");
+            assert_eq!(
+                actual[0].task_run_id,
+                format!("hook:{selector}:session-123")
+            );
+            assert_eq!(actual[0].native_session_id.as_deref(), Some("session-123"));
+            assert_eq!(actual[0].parent_task_run_id, None);
+            assert_eq!(actual[0].label, None);
+            assert_eq!(actual[0].provider.as_deref(), Some(wire_provider));
+        }
     }
 
     #[test]

@@ -415,6 +415,7 @@ async fn scoped_subscription_keeps_primary_unscoped_and_enriches_each_snapshot_p
             {"type":"workspace.closed"},
             {"type":"workspace.focused"},
             {"type":"tab.created"},
+            {"type":"tab.renamed"},
             {"type":"tab.closed"},
             {"type":"tab.focused"},
             {"type":"pane.created"},
@@ -2281,6 +2282,11 @@ fn binding_conflict_returns_typed_dropped_result() {
         display_ordinal: DisplayOrdinal::new(1),
         state: TaskState::Running,
         has_controller_task_state_event: true,
+        created_at_ms: None,
+        updated_at_ms: None,
+        finished_at_ms: None,
+        subject: None,
+        dismissed_at_ms: None,
     });
     model.insert_task_run_alias(
         RunKey::Native {
@@ -2463,6 +2469,11 @@ async fn different_sid_replacement_publishes_once() {
         display_ordinal: DisplayOrdinal::new(1),
         state: TaskState::Running,
         has_controller_task_state_event: false,
+        created_at_ms: None,
+        updated_at_ms: None,
+        finished_at_ms: None,
+        subject: None,
+        dismissed_at_ms: None,
     });
     model.insert_execution(Execution {
         execution_id: "publication-old-execution".to_owned(),
@@ -3028,6 +3039,7 @@ async fn gap_replacement_prunes_absent_topology_on_restore() {
             tab: Tab {
                 tab_id: "old-tab".to_owned(),
                 workspace_id: "old-workspace".to_owned(),
+                label: None,
             },
             display_ordinal: DisplayOrdinal::new(2),
         },
@@ -3037,6 +3049,7 @@ async fn gap_replacement_prunes_absent_topology_on_restore() {
                 workspace_id: "old-workspace".to_owned(),
                 tab_id: "old-tab".to_owned(),
                 terminal_id: "old-terminal".to_owned(),
+                display_name: None,
             },
             display_ordinal: DisplayOrdinal::new(3),
         },
@@ -3327,6 +3340,11 @@ fn persisted_native_restored(sid: &str) -> (RestoredState, Vec<PersistOp>, RunId
         display_ordinal: DisplayOrdinal::new(1),
         state: TaskState::Running,
         has_controller_task_state_event: false,
+        created_at_ms: None,
+        updated_at_ms: None,
+        finished_at_ms: None,
+        subject: None,
+        dismissed_at_ms: None,
     };
     let execution = Execution {
         execution_id: "pre-gap-execution".to_owned(),
@@ -3380,12 +3398,14 @@ fn topology_with_session(
         tabs: vec![herdr_top::model::Tab {
             tab_id: "w1:t1".to_owned(),
             workspace_id: "w1".to_owned(),
+            label: None,
         }],
         panes: vec![PaneSnapshot {
             pane_id: "w1:p1".to_owned(),
             workspace_id: "w1".to_owned(),
             tab_id: "w1:t1".to_owned(),
             terminal_id: "new-terminal".to_owned(),
+            display_name: None,
             agent: Some(SnapshotAgent {
                 agent_name: "codex".to_owned(),
                 state: match status {

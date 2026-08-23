@@ -3,10 +3,11 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::ffi::OsStr;
-use std::future::pending;
+use std::future::{Future, pending};
 use std::io;
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -22,17 +23,18 @@ use crate::activity::{OperatorSnapshot, RestoredOperatorState};
 use crate::diagnostics::{
     ControllerInputStatus, ControllerInputUnavailableReason, DiagnosticSource,
     EnrichmentCounterSnapshot, InputAvailability, OccurrenceLogStatus, OwnerFreshness,
-    PersistenceCounters, PersistenceOccurrenceSink, RuntimeDiagnosticsSnapshot,
-    RuntimeWriteOutcome, SourceCoverageSnapshot, controller_counter_snapshot,
-    encode_persistence_occurrence,
+    PersistenceCounters, PersistenceOccurrenceSink, PrimaryStreamCounterSnapshot,
+    PrimaryStreamDiagnosticsHandle, RuntimeDiagnosticsSnapshot, RuntimeWriteOutcome,
+    SourceCoverageSnapshot, controller_counter_snapshot, encode_persistence_occurrence,
 };
 use crate::lockfile::OwnerRecord;
 use crate::model::{
     AgentNodeObservation, AgentSessionReference, AgentSessionReferenceKind,
     ControllerDiagnosticsHandle, DomainModel, EnrichmentDiagnosticsHandle, EventMetadata,
-    ExecState, Execution, GapKind, MinimalProviderMetadata, NormalizedEvent, Pane, PaneSnapshot,
-    Provider, ReconcileBatch, RunId, RunKey, SharedModel, SnapshotAgent, SourceCoverage, Tab,
-    TopologyEntity, TopologyEntityId, TopologySnapshot, Workspace,
+    ExecState, Execution, GapKind, MinimalProviderMetadata, NormalizedEvent, OperatorCommand, Pane,
+    PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SharedModel, SnapshotAgent,
+    SourceCoverage, Tab, TopologyEntity, TopologyEntityId, TopologySnapshot, Workspace,
+    sanitize_controller_text,
 };
 use crate::performance::{
     Admission, Admitted, PerformanceClock, PerformanceIngress, PerformanceSampler,
@@ -69,6 +71,52 @@ const DRAIN_QUIET_PERIOD: Duration = Duration::from_millis(5);
 const STALE_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const PERFORMANCE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LivenessPolicy {
+    timeout_ms: i64,
+}
+
+impl Default for LivenessPolicy {
+    fn default() -> Self {
+        Self { timeout_ms: 30_000 }
+    }
+}
+
+fn liveness_timeout(policy: &LivenessPolicy) -> Duration {
+    Duration::from_millis(u64::try_from(policy.timeout_ms.max(0)).unwrap_or(0))
+}
+
+fn silence_deadline(last_event_at: Instant, policy: &LivenessPolicy) -> Instant {
+    last_event_at + liveness_timeout(policy)
+}
+
+fn backoff_delay_ms(consecutive_failures: u32) -> u64 {
+    if consecutive_failures >= 6 {
+        60_000
+    } else {
+        1_000_u64
+            .saturating_mul(1_u64 << consecutive_failures)
+            .min(60_000)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ReconnectBackoff {
+    consecutive_failures: u32,
+}
+
+impl ReconnectBackoff {
+    fn on_watchdog_silence(&mut self) -> u64 {
+        let delay_ms = backoff_delay_ms(self.consecutive_failures);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        delay_ms
+    }
+
+    fn on_event(&mut self) {
+        self.consecutive_failures = 0;
+    }
+}
 
 #[derive(Default)]
 struct HealthEdge {
@@ -957,6 +1005,7 @@ pub struct CollectorHandle {
     pub operator: watch::Receiver<OperatorSnapshot>,
     /// Coherent reducer-owned domain snapshots.
     pub model: SharedModel,
+    primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle,
     cancellation: CancellationToken,
     task: JoinHandle<Result<(), CollectorError>>,
     performance_monitor: JoinHandle<()>,
@@ -965,6 +1014,12 @@ pub struct CollectorHandle {
 }
 
 impl CollectorHandle {
+    /// Returns primary-stream tolerance counters for this collector process.
+    #[must_use]
+    pub fn primary_stream_counters(&self) -> PrimaryStreamCounterSnapshot {
+        self.primary_stream_diagnostics.snapshot()
+    }
+
     /// Cancels the collector and waits for its subscription task to exit.
     pub async fn stop(self) -> Result<(), CollectorError> {
         self.stop_with_timeout(STOP_TIMEOUT).await
@@ -1125,6 +1180,8 @@ pub async fn spawn_workload_collector(
     );
     let task_cancellation = cancellation.clone();
     let task_model = model.clone();
+    let primary_stream_diagnostics = PrimaryStreamDiagnosticsHandle::default();
+    let task_primary_stream_diagnostics = primary_stream_diagnostics.clone();
     let performance_observer = config.performance_observer;
     let performance_monitor = spawn_performance_monitor(
         performance_sampler,
@@ -1147,7 +1204,10 @@ pub async fn spawn_workload_collector(
             task_cancellation,
             owner,
             Some(controller_requests),
+            None,
             provider_integration,
+            LivenessPolicy::default(),
+            task_primary_stream_diagnostics,
         )
         .await
     });
@@ -1158,6 +1218,7 @@ pub async fn spawn_workload_collector(
         diagnostics,
         operator,
         model,
+        primary_stream_diagnostics,
         cancellation,
         task,
         performance_monitor,
@@ -1187,6 +1248,7 @@ pub async fn spawn(
         SourceAvailability::NotApplicable,
         Arc::new(UnavailableOccurrenceSink),
         empty_operator_seed(),
+        None,
     )
     .await
 }
@@ -1215,6 +1277,7 @@ pub async fn spawn_with_controller(
         controller_coverage,
         Arc::new(UnavailableOccurrenceSink),
         empty_operator_seed(),
+        None,
     )
     .await
 }
@@ -1248,6 +1311,7 @@ pub async fn spawn_with_controller_and_performance_clock(
         controller_coverage,
         Arc::new(UnavailableOccurrenceSink),
         empty_operator_seed(),
+        None,
         performance_clock,
         Some(performance_observer),
     )
@@ -1272,6 +1336,7 @@ pub async fn spawn_with_controller_coverage(
         controller_coverage,
         Arc::new(UnavailableOccurrenceSink),
         empty_operator_seed(),
+        None,
     )
     .await
 }
@@ -1295,6 +1360,7 @@ pub async fn spawn_with_controller_coverage_and_occurrence_sink(
         controller_coverage,
         occurrence_sink,
         empty_operator_seed(),
+        None,
     )
     .await
 }
@@ -1310,6 +1376,7 @@ pub async fn spawn_with_controller_coverage_occurrence_sink_and_operator_seed(
     controller_coverage: SourceAvailability,
     occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
     restored_operator: RestoredOperatorState,
+    operator_commands: mpsc::Receiver<OperatorCommand>,
 ) -> Result<CollectorHandle, CollectorError> {
     spawn_configured(
         sock,
@@ -1320,6 +1387,7 @@ pub async fn spawn_with_controller_coverage_occurrence_sink_and_operator_seed(
         controller_coverage,
         occurrence_sink,
         restored_operator,
+        Some(operator_commands),
     )
     .await
 }
@@ -1341,6 +1409,7 @@ async fn spawn_configured(
     controller_coverage: SourceAvailability,
     occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
     restored_operator: RestoredOperatorState,
+    operator_commands: Option<mpsc::Receiver<OperatorCommand>>,
 ) -> Result<CollectorHandle, CollectorError> {
     spawn_configured_inner(
         sock,
@@ -1351,6 +1420,7 @@ async fn spawn_configured(
         controller_coverage,
         occurrence_sink,
         restored_operator,
+        operator_commands,
         Arc::new(SystemPerformanceClock::new()),
         #[cfg(feature = "workload-harness")]
         None,
@@ -1368,6 +1438,7 @@ async fn spawn_configured_inner(
     controller_coverage: SourceAvailability,
     occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
     restored_operator: RestoredOperatorState,
+    operator_commands: Option<mpsc::Receiver<OperatorCommand>>,
     performance_clock: Arc<dyn PerformanceClock>,
     #[cfg(feature = "workload-harness")] performance_observer: Option<WorkloadPerformanceObserver>,
 ) -> Result<CollectorHandle, CollectorError> {
@@ -1445,6 +1516,8 @@ async fn spawn_configured_inner(
     );
     let task_cancellation = cancellation.clone();
     let task_model = model.clone();
+    let primary_stream_diagnostics = PrimaryStreamDiagnosticsHandle::default();
+    let task_primary_stream_diagnostics = primary_stream_diagnostics.clone();
     let performance_monitor = spawn_performance_monitor(
         performance_sampler,
         model.clone(),
@@ -1467,7 +1540,10 @@ async fn spawn_configured_inner(
             task_cancellation,
             owner,
             controller_requests,
+            operator_commands,
             provider_integration,
+            LivenessPolicy::default(),
+            task_primary_stream_diagnostics,
         )
         .await
     });
@@ -1479,6 +1555,7 @@ async fn spawn_configured_inner(
         diagnostics,
         operator,
         model,
+        primary_stream_diagnostics,
         cancellation,
         task,
         performance_monitor,
@@ -1498,10 +1575,14 @@ async fn run_collector(
     cancellation: CancellationToken,
     mut owner: OwnerTracker,
     mut controller_requests: Option<ControllerRequestReceiver>,
+    mut operator_commands: Option<mpsc::Receiver<OperatorCommand>>,
     mut provider: ProviderIntegration,
+    liveness_policy: LivenessPolicy,
+    primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle,
 ) -> Result<(), CollectorError> {
     let mut first_subscription = true;
     let mut previous_socket = None;
+    let mut reconnect_backoff = ReconnectBackoff::default();
     let subscription_health = HealthEdge::default();
     // Keep this outside the primary retry loop. spawn_enrichment_reader runs once per
     // primary subscription generation, so this one shared value preserves its
@@ -1547,6 +1628,19 @@ async fn run_collector(
                 provider.publish_targets(&shared);
                 continue;
             }
+            command = receive_operator_command(&mut operator_commands) => {
+                if service_operator_command(
+                    command,
+                    &mut operator_commands,
+                    &mut reducer,
+                    &mut persistence,
+                    &shared,
+                    &provider.coverage.registry,
+                ).await? {
+                    provider.publish_targets(&shared);
+                }
+                continue;
+            }
             result = wire::subscribe(&sock, &subscriptions) => result,
         } {
             Ok(stream) => {
@@ -1580,6 +1674,7 @@ async fn run_collector(
                     &cancellation,
                     RECONNECT_DELAY,
                     &mut controller_requests,
+                    &mut operator_commands,
                     &session,
                     &mut reducer,
                     &mut persistence,
@@ -1603,8 +1698,12 @@ async fn run_collector(
         provider.set_herdr_quality(ObservationQuality::Reconciling, &mut persistence, &shared);
 
         let reader_cancellation = cancellation.child_token();
-        let (events, overflowed, reader) =
-            spawn_event_reader(stream, reader_cancellation.clone(), performance.clone());
+        let (events, overflowed, reader) = spawn_event_reader(
+            stream,
+            reader_cancellation.clone(),
+            performance.clone(),
+            primary_stream_diagnostics.clone(),
+        );
         let enrichment_cancellation = cancellation.child_token();
         let (target_publisher, target_receiver) = watch::channel(BTreeSet::new());
         let (enrichment_sender, enrichment_events) = mpsc::channel(ENRICHMENT_QUEUE_CAPACITY);
@@ -1641,13 +1740,16 @@ async fn run_collector(
             Arc::clone(&overflowed),
             &mut enrichment,
             &mut controller_requests,
+            &mut operator_commands,
             &mut provider,
+            liveness_policy,
+            &primary_stream_diagnostics,
         )
         .await;
 
         reader_cancellation.cancel();
         enrichment_cancellation.cancel();
-        let reader_result = reader
+        let reader_report = reader
             .await
             .map_err(|error| CollectorError::Task(error.to_string()))?;
         enrichment_reader
@@ -1658,15 +1760,53 @@ async fn run_collector(
             first_subscription = false;
             previous_socket = socket_identity;
         }
-        if let Err(error) = reader_result {
-            provider.set_herdr_quality(ObservationQuality::Disconnected, &mut persistence, &shared);
-            if matches!(outcome.outcome, SubscriptionOutcome::Cancelled) {
-                return Ok(());
+        if reader_report.received_event {
+            reconnect_backoff.on_event();
+        }
+        match reader_report.reason {
+            EventReaderExitReason::WireError(error) => {
+                provider.set_herdr_quality(
+                    ObservationQuality::Disconnected,
+                    &mut persistence,
+                    &shared,
+                );
+                if matches!(outcome.outcome, SubscriptionOutcome::Cancelled) {
+                    return Ok(());
+                }
+                let _ = error;
             }
-            let _ = error;
+            EventReaderExitReason::Clean => {}
         }
         match outcome.outcome {
             SubscriptionOutcome::Cancelled => return Ok(()),
+            SubscriptionOutcome::WatchdogReconnect(reason) => {
+                provider.set_herdr_quality(
+                    ObservationQuality::Disconnected,
+                    &mut persistence,
+                    &shared,
+                );
+                tracing::warn!(
+                    warning_code = "herdr_primary_stream_watchdog_silence",
+                    reason = reason.as_str(),
+                    "Herdr event subscription failed its silence probe; reconnecting"
+                );
+                let delay = Duration::from_millis(reconnect_backoff.on_watchdog_silence());
+                if wait_or_service_controller(
+                    &cancellation,
+                    delay,
+                    &mut controller_requests,
+                    &mut operator_commands,
+                    &session,
+                    &mut reducer,
+                    &mut persistence,
+                    &shared,
+                    &mut provider,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+            }
             SubscriptionOutcome::Ended => {
                 provider.set_herdr_quality(
                     ObservationQuality::Disconnected,
@@ -1692,7 +1832,10 @@ async fn converge(
     overflowed: Arc<AtomicBool>,
     enrichment: &mut EnrichmentConverge,
     controller_requests: &mut Option<ControllerRequestReceiver>,
+    operator_commands: &mut Option<mpsc::Receiver<OperatorCommand>>,
     provider: &mut ProviderIntegration,
+    liveness_policy: LivenessPolicy,
+    primary_stream_diagnostics: &PrimaryStreamDiagnosticsHandle,
 ) -> Result<ConvergeOutcome, CollectorError> {
     let mut first_generation = true;
     let mut resnapshot_attempts = 0;
@@ -1714,6 +1857,19 @@ async fn converge(
                     &provider.coverage.registry,
                 ).await;
                 provider.publish_targets(shared);
+                continue;
+            }
+            command = receive_operator_command(operator_commands) => {
+                if service_operator_command(
+                    command,
+                    operator_commands,
+                    reducer,
+                    persistence,
+                    shared,
+                    &provider.coverage.registry,
+                ).await? {
+                    provider.publish_targets(shared);
+                }
                 continue;
             }
             result = wire::request(sock, "session.snapshot", json!({})) => {
@@ -1763,6 +1919,7 @@ async fn converge(
             cancellation,
             &mut pending_closures,
             controller_requests,
+            operator_commands,
             provider,
         )
         .await?;
@@ -1784,6 +1941,7 @@ async fn converge(
                 enrichment.activate();
                 provider.set_herdr_quality(ObservationQuality::Live, persistence, shared);
                 match monitor_live(
+                    sock,
                     reducer,
                     shared,
                     persistence,
@@ -1795,7 +1953,10 @@ async fn converge(
                     cancellation,
                     &mut pending_closures,
                     controller_requests,
+                    operator_commands,
                     provider,
+                    liveness_policy,
+                    primary_stream_diagnostics,
                 )
                 .await?
                 {
@@ -1819,29 +1980,65 @@ async fn converge(
                             !first_generation,
                         ));
                     }
+                    ReplayOutcome::WatchdogReconnect(reason) => {
+                        return Ok(ConvergeOutcome::new(
+                            SubscriptionOutcome::WatchdogReconnect(reason),
+                            !first_generation,
+                        ));
+                    }
                     ReplayOutcome::Clean => {}
                 }
             }
             ReplayOutcome::Dirty => {
                 provider.set_herdr_quality(ObservationQuality::Reconciling, persistence, shared);
                 if resnapshot_attempts == RESNAPSHOT_ATTEMPTS {
-                    let outcome = monitor_reconciling(
+                    match monitor_reconciling(
+                        sock,
                         reducer,
                         shared,
                         persistence,
                         owner,
                         session,
-                        events,
+                        &mut events,
                         enrichment,
                         cancellation,
                         &mut pending_closures,
                         controller_requests,
+                        operator_commands,
                         provider,
+                        liveness_policy,
+                        primary_stream_diagnostics,
                     )
-                    .await?;
-                    return Ok(ConvergeOutcome::new(outcome, !first_generation));
+                    .await?
+                    {
+                        ReconcilingOutcome::RestartGeneration => continue,
+                        ReconcilingOutcome::Ended => {
+                            return Ok(ConvergeOutcome::new(
+                                SubscriptionOutcome::Ended,
+                                !first_generation,
+                            ));
+                        }
+                        ReconcilingOutcome::Cancelled => {
+                            return Ok(ConvergeOutcome::new(
+                                SubscriptionOutcome::Cancelled,
+                                !first_generation,
+                            ));
+                        }
+                        ReconcilingOutcome::WatchdogReconnect(reason) => {
+                            return Ok(ConvergeOutcome::new(
+                                SubscriptionOutcome::WatchdogReconnect(reason),
+                                !first_generation,
+                            ));
+                        }
+                    }
                 }
                 resnapshot_attempts += 1;
+            }
+            ReplayOutcome::WatchdogReconnect(reason) => {
+                return Ok(ConvergeOutcome::new(
+                    SubscriptionOutcome::WatchdogReconnect(reason),
+                    !first_generation,
+                ));
             }
         }
     }
@@ -1861,6 +2058,7 @@ async fn replay_generation(
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
     controller_requests: &mut Option<ControllerRequestReceiver>,
+    operator_commands: &mut Option<mpsc::Receiver<OperatorCommand>>,
     provider: &mut ProviderIntegration,
 ) -> Result<ReplayOutcome, CollectorError> {
     let snapshot_entities = snapshot_entity_keys(snapshot);
@@ -1918,6 +2116,19 @@ async fn replay_generation(
                 provider.publish_targets(shared);
                 continue;
             }
+            command = receive_operator_command(operator_commands) => {
+                if service_operator_command(
+                    command,
+                    operator_commands,
+                    reducer,
+                    persistence,
+                    shared,
+                    &provider.coverage.registry,
+                ).await? {
+                    provider.publish_targets(shared);
+                }
+                continue;
+            }
             result = tokio::time::timeout(DRAIN_QUIET_PERIOD, events.recv()) => result,
         };
         match next_received {
@@ -1946,8 +2157,250 @@ async fn replay_generation(
     }
 }
 
+enum WatchdogProbeOutcome {
+    HealthyIdle,
+    Inconclusive,
+    Reconnect(WatchdogReconnectReason),
+}
+
+type WatchdogProbeFuture<'a> = Pin<Box<dyn Future<Output = WatchdogProbeOutcome> + Send + 'a>>;
+
+async fn probe_primary_topology(
+    sock: &Path,
+    shared: &SharedModel,
+    pending_closures: PendingTopologyClosures,
+    liveness_policy: LivenessPolicy,
+) -> WatchdogProbeOutcome {
+    let result = tokio::time::timeout(
+        liveness_timeout(&liveness_policy),
+        wire::request(sock, "session.snapshot", json!({})),
+    )
+    .await;
+    let snapshot = match result {
+        Ok(Ok(value)) => match value.into_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                return WatchdogProbeOutcome::Reconnect(WatchdogReconnectReason::ProbeFailed);
+            }
+        },
+        Ok(Err(_)) | Err(_) => {
+            return WatchdogProbeOutcome::Reconnect(WatchdogReconnectReason::ProbeFailed);
+        }
+    };
+    let Ok(probed) = topology_from_snapshot(&snapshot) else {
+        return WatchdogProbeOutcome::Reconnect(WatchdogReconnectReason::ProbeFailed);
+    };
+    let Some(current) = current_model_topology(shared, &pending_closures) else {
+        return WatchdogProbeOutcome::Inconclusive;
+    };
+    if probe_topology_matches_model(probed, current) {
+        WatchdogProbeOutcome::HealthyIdle
+    } else {
+        WatchdogProbeOutcome::Reconnect(WatchdogReconnectReason::TopologyDiverged)
+    }
+}
+
+fn probe_topology_matches_model(probed: TopologySnapshot, current: TopologySnapshot) -> bool {
+    let mut probed = canonical_topology(probed);
+    let current = canonical_topology(current);
+    for (probed, current) in probed.tabs.iter_mut().zip(&current.tabs) {
+        if probed.tab_id == current.tab_id && probed.label.is_none() {
+            probed.label.clone_from(&current.label);
+        }
+    }
+    for (probed, current) in probed.panes.iter_mut().zip(&current.panes) {
+        if probed.pane_id == current.pane_id && probed.display_name.is_none() {
+            probed.display_name.clone_from(&current.display_name);
+        }
+    }
+    probed == current
+}
+
+fn canonical_topology(mut topology: TopologySnapshot) -> TopologySnapshot {
+    for pane in &mut topology.panes {
+        let Some(agent) = &mut pane.agent else {
+            pane.agent_session = None;
+            continue;
+        };
+        // Reconciliation retains the resolved provider and non-empty native session identity,
+        // not Herdr's raw agent, session-source, or session-agent spellings.
+        let provider = snapshot_provider_name(
+            &agent.agent_name,
+            pane.agent_session
+                .as_ref()
+                .map(|session| session.agent.as_str()),
+        );
+        agent.agent_name = provider.map(provider_name).unwrap_or("unknown").to_owned();
+        pane.agent_session = match (provider, pane.agent_session.take()) {
+            (Some(_), Some(mut session)) if !session.value.is_empty() => {
+                session.source.clear();
+                session.agent.clear();
+                Some(session)
+            }
+            _ => None,
+        };
+    }
+    topology
+        .workspaces
+        .sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
+    topology
+        .tabs
+        .sort_by(|left, right| left.tab_id.cmp(&right.tab_id));
+    topology
+        .panes
+        .sort_by(|left, right| left.pane_id.cmp(&right.pane_id));
+    topology
+}
+
+fn current_model_topology(
+    shared: &SharedModel,
+    pending_closures: &PendingTopologyClosures,
+) -> Option<TopologySnapshot> {
+    let model = shared.borrow();
+    let workspaces = model
+        .workspaces()
+        .filter(|workspace| {
+            !pending_closures
+                .workspaces
+                .contains(&workspace.workspace_id)
+        })
+        .cloned()
+        .collect();
+    let tabs = model
+        .tabs()
+        .filter(|tab| !pending_closures.tabs.contains(&tab.tab_id))
+        .cloned()
+        .collect();
+    let panes = model
+        .panes()
+        .filter(|pane| !pending_closures.panes.contains(&pane.pane_id))
+        .map(|pane| {
+            let mut executions = model.executions().filter(|execution| {
+                execution.pane_id == pane.pane_id
+                    && execution.terminal_id == pane.terminal_id
+                    && !execution.state.is_terminal()
+                    && !matches!(execution.state, ExecState::Stale { .. })
+            });
+            let execution = executions.next();
+            if executions.next().is_some() {
+                return None;
+            }
+            let (agent, agent_session) = execution.map_or((None, None), |execution| {
+                let (agent_name, agent_session) = current_execution_identity(&model, execution);
+                (
+                    Some(SnapshotAgent {
+                        agent_name,
+                        state: execution.state.clone(),
+                    }),
+                    agent_session,
+                )
+            });
+            Some(PaneSnapshot {
+                pane_id: pane.pane_id.clone(),
+                workspace_id: pane.workspace_id.clone(),
+                tab_id: pane.tab_id.clone(),
+                terminal_id: pane.terminal_id.clone(),
+                display_name: pane.display_name.clone(),
+                agent,
+                agent_session,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(TopologySnapshot {
+        workspaces,
+        tabs,
+        panes,
+    })
+}
+
+fn current_execution_identity(
+    model: &DomainModel,
+    execution: &Execution,
+) -> (String, Option<AgentSessionReference>) {
+    let identity = model
+        .task_run(&execution.task_run_id)
+        .and_then(|run| match &run.key {
+            RunKey::Native { provider, sid } => Some((
+                *provider,
+                Some((AgentSessionReferenceKind::Id, sid.clone())),
+            )),
+            RunKey::NativePath { provider, path } => Some((
+                *provider,
+                Some((AgentSessionReferenceKind::Path, path.clone())),
+            )),
+            RunKey::Controller(_) | RunKey::Provisional { .. } => None,
+        })
+        .or_else(|| {
+            model
+                .task_run_bindings()
+                .filter_map(|(key, owner)| {
+                    if *owner != execution.task_run_id {
+                        return None;
+                    }
+                    match key {
+                        RunKey::Native { provider, sid } => Some((
+                            0_u8,
+                            provider_name(*provider),
+                            sid.clone(),
+                            *provider,
+                            AgentSessionReferenceKind::Id,
+                        )),
+                        RunKey::NativePath { provider, path } => Some((
+                            1_u8,
+                            provider_name(*provider),
+                            path.clone(),
+                            *provider,
+                            AgentSessionReferenceKind::Path,
+                        )),
+                        RunKey::Controller(_) | RunKey::Provisional { .. } => None,
+                    }
+                })
+                .min_by(|left, right| {
+                    (&left.0, left.1, &left.2).cmp(&(&right.0, right.1, &right.2))
+                })
+                .map(|(_, _, value, provider, kind)| (provider, Some((kind, value))))
+        })
+        .or_else(|| {
+            model
+                .agent_nodes()
+                .filter(|node| node.task_run_id == execution.task_run_id)
+                .min_by(|left, right| {
+                    left.parent_agent_node_id
+                        .is_some()
+                        .cmp(&right.parent_agent_node_id.is_some())
+                        .then_with(|| left.agent_node_id.cmp(&right.agent_node_id))
+                })
+                .map(|node| {
+                    let session = node
+                        .native_session_id
+                        .as_ref()
+                        .map(|sid| (AgentSessionReferenceKind::Id, sid.clone()))
+                        .or_else(|| {
+                            node.session_file
+                                .as_ref()
+                                .map(|path| (AgentSessionReferenceKind::Path, path.clone()))
+                        });
+                    (node.provider, session)
+                })
+        });
+    let Some((provider, session)) = identity else {
+        return ("unknown".to_owned(), None);
+    };
+    let name = provider_name(provider);
+    (
+        name.to_owned(),
+        session.map(|(kind, value)| AgentSessionReference {
+            source: format!("herdr:{name}"),
+            agent: name.to_owned(),
+            kind,
+            value,
+        }),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn monitor_live(
+    sock: &Path,
     reducer: &mut Reducer,
     shared: &SharedModel,
     persistence: &mut RuntimePersistence,
@@ -1959,17 +2412,23 @@ async fn monitor_live(
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
     controller_requests: &mut Option<ControllerRequestReceiver>,
+    operator_commands: &mut Option<mpsc::Receiver<OperatorCommand>>,
     provider: &mut ProviderIntegration,
+    liveness_policy: LivenessPolicy,
+    primary_stream_diagnostics: &PrimaryStreamDiagnosticsHandle,
 ) -> Result<ReplayOutcome, CollectorError> {
     enum LiveReceipt {
         Primary(Admitted<ReceivedEvent>),
         Enrichment(EnrichmentPayload),
+        Probe(WatchdogProbeOutcome),
         Sweep,
     }
 
     let mut stale_sweep = tokio::time::interval(STALE_SWEEP_INTERVAL);
     stale_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     stale_sweep.tick().await;
+    let mut watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
+    let mut watchdog_probe: Option<WatchdogProbeFuture<'_>> = None;
     let mut enrichment_events_open = true;
     let mut enrichment_prunes_open = true;
     loop {
@@ -1986,6 +2445,19 @@ async fn monitor_live(
                     &provider.coverage.registry,
                 ).await;
                 provider.publish_targets(shared);
+                continue;
+            }
+            command = receive_operator_command(operator_commands) => {
+                if service_operator_command(
+                    command,
+                    operator_commands,
+                    reducer,
+                    persistence,
+                    shared,
+                    &provider.coverage.registry,
+                ).await? {
+                    provider.publish_targets(shared);
+                }
                 continue;
             }
             event = receive_provider(&mut provider.events) => {
@@ -2019,9 +2491,40 @@ async fn monitor_live(
                 enrichment.apply_prune(prune);
                 continue;
             },
+            probe = async {
+                match watchdog_probe.as_mut() {
+                    Some(probe) => probe.await,
+                    None => pending().await,
+                }
+            } => LiveReceipt::Probe(probe),
+            () = tokio::time::sleep_until(watchdog_deadline), if watchdog_probe.is_none() => {
+                watchdog_probe = Some(Box::pin(probe_primary_topology(
+                    sock,
+                    shared,
+                    pending_closures.clone(),
+                    liveness_policy,
+                )));
+                continue;
+            },
             _ = stale_sweep.tick() => LiveReceipt::Sweep,
         };
         match received {
+            LiveReceipt::Probe(WatchdogProbeOutcome::HealthyIdle) => {
+                watchdog_probe = None;
+                tracing::debug!("silent Herdr event subscription passed its topology probe");
+                watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
+                continue;
+            }
+            LiveReceipt::Probe(WatchdogProbeOutcome::Inconclusive) => {
+                watchdog_probe = None;
+                primary_stream_diagnostics.record_inconclusive_topology_probe();
+                tracing::debug!("silent Herdr event subscription topology probe was inconclusive");
+                watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
+                continue;
+            }
+            LiveReceipt::Probe(WatchdogProbeOutcome::Reconnect(reason)) => {
+                return Ok(ReplayOutcome::WatchdogReconnect(reason));
+            }
             LiveReceipt::Sweep => {
                 let mut persist = reducer.sweep_stale(unix_now_ms());
                 persist.extend(apply_pending_topology_closures(
@@ -2054,6 +2557,8 @@ async fn monitor_live(
                 continue;
             }
             LiveReceipt::Primary(received) => {
+                watchdog_probe = None;
+                watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
                 let (received, admission) = received.into_parts();
                 let target_delta = enrichment_target_delta(&received, shared);
                 let anomalous =
@@ -2081,25 +2586,37 @@ async fn monitor_live(
 
 #[allow(clippy::too_many_arguments)]
 async fn monitor_reconciling(
+    sock: &Path,
     reducer: &mut Reducer,
     shared: &SharedModel,
     persistence: &mut RuntimePersistence,
     owner: &mut OwnerTracker,
     session: &str,
-    mut events: mpsc::Receiver<Admitted<ReceivedEvent>>,
+    events: &mut mpsc::Receiver<Admitted<ReceivedEvent>>,
     enrichment: &mut EnrichmentConverge,
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
     controller_requests: &mut Option<ControllerRequestReceiver>,
+    operator_commands: &mut Option<mpsc::Receiver<OperatorCommand>>,
     provider: &mut ProviderIntegration,
-) -> Result<SubscriptionOutcome, CollectorError> {
+    liveness_policy: LivenessPolicy,
+    primary_stream_diagnostics: &PrimaryStreamDiagnosticsHandle,
+) -> Result<ReconcilingOutcome, CollectorError> {
+    enum ReconcilingReceipt {
+        Primary(Admitted<ReceivedEvent>),
+        Probe(WatchdogProbeOutcome),
+        Sweep,
+    }
+
     let mut stale_sweep = tokio::time::interval(STALE_SWEEP_INTERVAL);
     stale_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     stale_sweep.tick().await;
+    let mut watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
+    let mut watchdog_probe: Option<WatchdogProbeFuture<'_>> = None;
     loop {
         enrichment.discard_episode_payloads();
         let received = tokio::select! {
-            () = cancellation.cancelled() => return Ok(SubscriptionOutcome::Cancelled),
+            () = cancellation.cancelled() => return Ok(ReconcilingOutcome::Cancelled),
             request = receive_controller(controller_requests) => {
                 service_controller(
                     request,
@@ -2111,6 +2628,19 @@ async fn monitor_reconciling(
                     &provider.coverage.registry,
                 ).await;
                 provider.publish_targets(shared);
+                continue;
+            }
+            command = receive_operator_command(operator_commands) => {
+                if service_operator_command(
+                    command,
+                    operator_commands,
+                    reducer,
+                    persistence,
+                    shared,
+                    &provider.coverage.registry,
+                ).await? {
+                    provider.publish_targets(shared);
+                }
                 continue;
             }
             event = receive_provider(&mut provider.events) => {
@@ -2126,27 +2656,63 @@ async fn monitor_reconciling(
                 continue;
             }
             received = events.recv() => match received {
-                Some(received) => Some(received),
-                None => return Ok(SubscriptionOutcome::Ended),
+                Some(received) => ReconcilingReceipt::Primary(received),
+                None => return Ok(ReconcilingOutcome::Ended),
             },
-            _ = stale_sweep.tick() => None,
+            probe = async {
+                match watchdog_probe.as_mut() {
+                    Some(probe) => probe.await,
+                    None => pending().await,
+                }
+            } => ReconcilingReceipt::Probe(probe),
+            () = tokio::time::sleep_until(watchdog_deadline), if watchdog_probe.is_none() => {
+                watchdog_probe = Some(Box::pin(probe_primary_topology(
+                    sock,
+                    shared,
+                    pending_closures.clone(),
+                    liveness_policy,
+                )));
+                continue;
+            },
+            _ = stale_sweep.tick() => ReconcilingReceipt::Sweep,
         };
-        let Some(received) = received else {
-            let mut persist = reducer.sweep_stale(unix_now_ms());
-            persist.extend(apply_pending_topology_closures(
-                reducer,
-                shared,
-                session,
-                pending_closures,
-            )?);
-            if !persist.is_empty() {
-                let _ = persist_submission(persistence, reducer, persist).await?;
-                provider.publish_targets(shared);
+        let received = match received {
+            ReconcilingReceipt::Probe(WatchdogProbeOutcome::HealthyIdle) => {
+                tracing::debug!("silent reconciling Herdr subscription passed its topology probe");
+                return Ok(ReconcilingOutcome::RestartGeneration);
             }
-            let _ = persistence.cleanup(unix_now_ms()).await?;
-            persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
-            continue;
+            ReconcilingReceipt::Probe(WatchdogProbeOutcome::Inconclusive) => {
+                watchdog_probe = None;
+                primary_stream_diagnostics.record_inconclusive_topology_probe();
+                tracing::debug!(
+                    "silent reconciling Herdr subscription topology probe was inconclusive"
+                );
+                watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
+                continue;
+            }
+            ReconcilingReceipt::Probe(WatchdogProbeOutcome::Reconnect(reason)) => {
+                return Ok(ReconcilingOutcome::WatchdogReconnect(reason));
+            }
+            ReconcilingReceipt::Sweep => {
+                let mut persist = reducer.sweep_stale(unix_now_ms());
+                persist.extend(apply_pending_topology_closures(
+                    reducer,
+                    shared,
+                    session,
+                    pending_closures,
+                )?);
+                if !persist.is_empty() {
+                    let _ = persist_submission(persistence, reducer, persist).await?;
+                    provider.publish_targets(shared);
+                }
+                let _ = persistence.cleanup(unix_now_ms()).await?;
+                persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
+                continue;
+            }
+            ReconcilingReceipt::Primary(received) => received,
         };
+        watchdog_probe = None;
+        watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
         let (received, admission) = received.into_parts();
         let target_delta = enrichment_target_delta(&received, shared);
         apply_received_event(
@@ -2168,8 +2734,29 @@ async fn monitor_reconciling(
 type EventReader = (
     mpsc::Receiver<Admitted<ReceivedEvent>>,
     Arc<AtomicBool>,
-    JoinHandle<Result<(), WireError>>,
+    JoinHandle<EventReaderReport>,
 );
+
+#[derive(Debug)]
+enum EventReaderExitReason {
+    Clean,
+    WireError(WireError),
+}
+
+#[derive(Debug)]
+struct EventReaderReport {
+    reason: EventReaderExitReason,
+    received_event: bool,
+}
+
+impl EventReaderReport {
+    const fn new(reason: EventReaderExitReason, received_event: bool) -> Self {
+        Self {
+            reason,
+            received_event,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct EnrichmentPayload {
@@ -2570,34 +3157,61 @@ fn spawn_event_reader(
     mut stream: EventStream,
     cancellation: CancellationToken,
     performance: PerformanceIngress,
+    diagnostics: PrimaryStreamDiagnosticsHandle,
 ) -> EventReader {
     let (sender, receiver) = admitted_channel(EVENT_QUEUE_CAPACITY, performance);
     let overflowed = Arc::new(AtomicBool::new(false));
     let reader_overflowed = Arc::clone(&overflowed);
     let task = tokio::spawn(async move {
+        let mut received_event = false;
         loop {
             let received = tokio::select! {
-                () = cancellation.cancelled() => return Ok(()),
-                received = stream.next_event() => received?,
+                () = cancellation.cancelled() => {
+                    return EventReaderReport::new(EventReaderExitReason::Clean, received_event);
+                }
+                received = stream.next_event() => match received {
+                    Ok(received) => received,
+                    Err(error) => {
+                        return EventReaderReport::new(
+                            EventReaderExitReason::WireError(error),
+                            received_event,
+                        );
+                    }
+                },
             };
             let Some((event, data)) = received else {
-                return Ok(());
+                return EventReaderReport::new(EventReaderExitReason::Clean, received_event);
             };
-            let received = ReceivedEvent { event, data };
+            received_event = true;
+            let received = ReceivedEvent {
+                event,
+                data,
+                primary_stream_diagnostics: diagnostics.clone(),
+            };
             match sender.try_send(received) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(received)) => {
                     reader_overflowed.store(true, Ordering::Release);
                     tokio::select! {
-                        () = cancellation.cancelled() => return Ok(()),
+                        () = cancellation.cancelled() => {
+                            return EventReaderReport::new(
+                                EventReaderExitReason::Clean,
+                                received_event,
+                            );
+                        }
                         result = sender.send(received) => {
                             if result.is_err() {
-                                return Ok(());
+                                return EventReaderReport::new(
+                                    EventReaderExitReason::Clean,
+                                    received_event,
+                                );
                             }
                         }
                     }
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return EventReaderReport::new(EventReaderExitReason::Clean, received_event);
+                }
             }
         }
     });
@@ -2607,6 +3221,7 @@ fn spawn_event_reader(
 struct ReceivedEvent {
     event: String,
     data: Value,
+    primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle,
 }
 
 #[derive(Debug)]
@@ -3593,12 +4208,37 @@ enum ReplayOutcome {
     Dirty,
     Ended,
     Cancelled,
+    WatchdogReconnect(WatchdogReconnectReason),
+}
+
+#[derive(Clone, Copy)]
+enum ReconcilingOutcome {
+    RestartGeneration,
+    Ended,
+    Cancelled,
+    WatchdogReconnect(WatchdogReconnectReason),
 }
 
 #[derive(Clone, Copy)]
 enum SubscriptionOutcome {
     Ended,
     Cancelled,
+    WatchdogReconnect(WatchdogReconnectReason),
+}
+
+#[derive(Clone, Copy)]
+enum WatchdogReconnectReason {
+    ProbeFailed,
+    TopologyDiverged,
+}
+
+impl WatchdogReconnectReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProbeFailed => "snapshot_probe_failed",
+            Self::TopologyDiverged => "topology_diverged",
+        }
+    }
 }
 
 struct ConvergeOutcome {
@@ -3606,7 +4246,7 @@ struct ConvergeOutcome {
     gap_committed: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct PendingTopologyClosures {
     workspaces: HashSet<String>,
     tabs: HashSet<String>,
@@ -3887,9 +4527,23 @@ fn normalize_event(
                 events.push(topology_upsert(
                     session,
                     &received.event,
+                    TopologyEntity::Tab(tab_entity(tab)),
+                ));
+            }
+        }
+        "tab_renamed" => {
+            if let Some(tab_id) = string_field(&received.data, "tab_id")
+                && let Some(tab) = shared.borrow().tab(&tab_id).cloned()
+            {
+                events.push(topology_upsert(
+                    session,
+                    &received.event,
                     TopologyEntity::Tab(Tab {
-                        tab_id: tab.tab_id,
+                        tab_id,
                         workspace_id: tab.workspace_id,
+                        label: string_field(&received.data, "label")
+                            .as_deref()
+                            .and_then(sanitized_name),
                     }),
                 ));
             }
@@ -3915,6 +4569,12 @@ fn normalize_event(
                 if shared.borrow().pane(&pane.pane_id).is_some() {
                     append_pane_upsert(shared, session, &received.event, pane, &mut events)?;
                 }
+            } else if received.event == "pane_agent_detected"
+                && string_field(&received.data, "pane_id").is_some()
+            {
+                received
+                    .primary_stream_diagnostics
+                    .record_flat_pane_agent_detected();
             }
         }
         "pane_closed" => {
@@ -3942,10 +4602,7 @@ fn normalize_event(
                 events.push(topology_upsert(
                     session,
                     &received.event,
-                    TopologyEntity::Tab(Tab {
-                        tab_id: tab.tab_id,
-                        workspace_id: tab.workspace_id,
-                    }),
+                    TopologyEntity::Tab(tab_entity(tab)),
                 ));
             }
             if let Some(value) = received.data.get("pane") {
@@ -4241,6 +4898,7 @@ fn apply_snapshot_in_place(
                 workspace_id: pane.workspace_id.clone(),
                 tab_id: pane.tab_id.clone(),
                 terminal_id: pane.terminal_id.clone(),
+                display_name: pane.display_name.clone(),
             }),
         )];
         let provider = pane.agent.as_ref().and_then(|agent| {
@@ -4534,14 +5192,7 @@ fn topology_from_snapshot(snapshot: &Snapshot) -> Result<TopologySnapshot, Colle
             workspace_id: workspace.workspace_id.clone(),
         })
         .collect();
-    let tabs = snapshot
-        .tabs
-        .iter()
-        .map(|tab| Tab {
-            tab_id: tab.tab_id.clone(),
-            workspace_id: tab.workspace_id.clone(),
-        })
-        .collect();
+    let tabs = snapshot.tabs.iter().cloned().map(tab_entity).collect();
     let panes = snapshot
         .panes
         .iter()
@@ -4557,6 +5208,7 @@ fn topology_from_snapshot(snapshot: &Snapshot) -> Result<TopologySnapshot, Colle
                 workspace_id: pane.workspace_id.clone(),
                 tab_id,
                 terminal_id: pane.terminal_id.clone(),
+                display_name: pane_display_name(pane),
                 agent: pane.agent.as_ref().map(|agent| SnapshotAgent {
                     agent_name: agent.clone(),
                     state: status_from_str(pane.agent_status.as_deref()),
@@ -4579,6 +5231,7 @@ fn subscriptions() -> Vec<Subscription> {
         "workspace.closed",
         "workspace.focused",
         "tab.created",
+        "tab.renamed",
         "tab.closed",
         "tab.focused",
         "pane.created",
@@ -5037,7 +5690,37 @@ fn pane_entity(pane: &PaneInfo) -> Result<Pane, CollectorError> {
                 pane_id: pane.pane_id.clone(),
             })?,
         terminal_id: pane.terminal_id.clone(),
+        display_name: pane_display_name(pane),
     })
+}
+
+fn tab_entity(tab: TabInfo) -> Tab {
+    Tab {
+        tab_id: tab.tab_id,
+        workspace_id: tab.workspace_id,
+        label: tab
+            .label
+            .as_deref()
+            .filter(|label| !label.is_empty())
+            .and_then(sanitized_name),
+    }
+}
+
+fn pane_display_name(pane: &PaneInfo) -> Option<String> {
+    pane.label
+        .as_deref()
+        .filter(|label| !label.is_empty())
+        .or_else(|| {
+            pane.terminal_title_stripped
+                .as_deref()
+                .filter(|title| !title.is_empty())
+        })
+        .and_then(sanitized_name)
+}
+
+fn sanitized_name(value: &str) -> Option<String> {
+    let value = sanitize_controller_text(value);
+    (!value.is_empty()).then_some(value)
 }
 
 fn agent_session_reference(reference: &super::types::AgentSessionInfo) -> AgentSessionReference {
@@ -5199,10 +5882,11 @@ fn updated_entity(received: &ReceivedEvent) -> Option<EntityKey> {
         "workspace_focused" => {
             string_field(&received.data, "workspace_id").map(EntityKey::Workspace)
         }
+        "tab_renamed" => string_field(&received.data, "tab_id").map(EntityKey::Tab),
         "tab_focused" => string_field(&received.data, "tab_id").map(EntityKey::Tab),
-        "pane_updated" | "pane_agent_detected" => {
-            nested_string(&received.data, "pane", "pane_id").map(EntityKey::Pane)
-        }
+        "pane_updated" | "pane_agent_detected" => nested_string(&received.data, "pane", "pane_id")
+            .or_else(|| string_field(&received.data, "pane_id"))
+            .map(EntityKey::Pane),
         "pane_focused" | "pane_agent_status_changed" => string_field(&received.data, "pane_id")
             .or_else(|| nested_string(&received.data, "pane", "pane_id"))
             .map(EntityKey::Pane),
@@ -5360,6 +6044,36 @@ async fn receive_controller(
     }
 }
 
+async fn receive_operator_command(
+    receiver: &mut Option<mpsc::Receiver<OperatorCommand>>,
+) -> Option<OperatorCommand> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => pending().await,
+    }
+}
+
+async fn service_operator_command(
+    command: Option<OperatorCommand>,
+    receiver: &mut Option<mpsc::Receiver<OperatorCommand>>,
+    reducer: &mut Reducer,
+    persistence: &mut RuntimePersistence,
+    shared: &SharedModel,
+    coverage: &SourceCoverageRegistry,
+) -> Result<bool, CollectorError> {
+    let Some(command) = command else {
+        *receiver = None;
+        return Ok(false);
+    };
+    let persist = reducer.apply_operator_command(command, unix_now_ms());
+    let changed = !persist.is_empty();
+    if changed {
+        let _ = persist_submission(persistence, reducer, persist).await?;
+    }
+    persistence.refresh_snapshot(&shared.borrow(), coverage);
+    Ok(changed)
+}
+
 async fn receive_provider(
     receiver: &mut Option<mpsc::Receiver<ProviderIngressEvent>>,
 ) -> Option<ProviderIngressEvent> {
@@ -5469,6 +6183,7 @@ async fn wait_or_service_controller(
     cancellation: &CancellationToken,
     duration: Duration,
     receiver: &mut Option<ControllerRequestReceiver>,
+    operator_commands: &mut Option<mpsc::Receiver<OperatorCommand>>,
     session: &str,
     reducer: &mut Reducer,
     persistence: &mut RuntimePersistence,
@@ -5492,6 +6207,18 @@ async fn wait_or_service_controller(
                     &provider.coverage.registry,
                 ).await;
                 provider.publish_targets(shared);
+            }
+            command = receive_operator_command(operator_commands) => {
+                if service_operator_command(
+                    command,
+                    operator_commands,
+                    reducer,
+                    persistence,
+                    shared,
+                    &provider.coverage.registry,
+                ).await? {
+                    provider.publish_targets(shared);
+                }
             }
             event = receive_provider(&mut provider.events) => {
                 service_provider_event(
@@ -5524,6 +6251,46 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn watchdog_backoff_uses_exponential_delays_with_a_hard_cap() {
+        let expected = [
+            1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000, 60_000,
+        ];
+        for (consecutive_failures, expected_ms) in expected.into_iter().enumerate() {
+            assert_eq!(
+                backoff_delay_ms(u32::try_from(consecutive_failures).unwrap()),
+                expected_ms
+            );
+        }
+        assert_eq!(backoff_delay_ms(u32::MAX), 60_000);
+    }
+
+    #[test]
+    fn watchdog_silence_deadline_uses_monotonic_time() {
+        let policy = LivenessPolicy { timeout_ms: 30_000 };
+        let last_event_at = Instant::now();
+
+        assert_eq!(
+            silence_deadline(last_event_at, &policy).duration_since(last_event_at),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn watchdog_backoff_resets_after_the_first_reconnected_event() {
+        let mut backoff = ReconnectBackoff::default();
+
+        assert_eq!(backoff.on_watchdog_silence(), 1_000);
+        assert_eq!(backoff.consecutive_failures, 1);
+        assert_eq!(backoff.on_watchdog_silence(), 2_000);
+        assert_eq!(backoff.consecutive_failures, 2);
+
+        backoff.on_event();
+        assert_eq!(backoff.consecutive_failures, 0);
+        assert_eq!(backoff.on_watchdog_silence(), 1_000);
+        assert_eq!(backoff.consecutive_failures, 1);
+    }
+
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     use tracing::instrument::WithSubscriber;
 
@@ -5531,7 +6298,8 @@ mod tests {
     use crate::activity::OperatorSnapshot;
     use crate::diagnostics::{OccurrenceLogStatus, RuntimeWriteOutcome};
     use crate::model::{
-        DependencyEdge, DisplayOrdinal, ExecutionEdge, TaskRun, TaskState, Workspace,
+        AgentNode, DependencyEdge, DisplayOrdinal, ExecutionEdge, OperatorCommand, TaskRun,
+        TaskState, Workspace,
     };
     use crate::performance::{
         PerformanceDegradationReason, PerformanceSnapshot, TestPerformanceClock,
@@ -5662,6 +6430,25 @@ mod tests {
             .expect("fake Herdr listener failed to write a response");
     }
 
+    async fn write_primary_overflow_burst(
+        reader: &mut tokio::io::BufReader<tokio::net::UnixStream>,
+    ) {
+        let mut frame = serde_json::to_vec(&json!({
+            "event": "pane_focused",
+            "data": {"pane_id": "w1:p4"},
+        }))
+        .expect("overflow event did not serialize");
+        frame.push(b'\n');
+        let mut burst = Vec::with_capacity(frame.len() * EVENT_QUEUE_CAPACITY * 2);
+        for _ in 0..EVENT_QUEUE_CAPACITY * 2 {
+            burst.extend_from_slice(&frame);
+        }
+        tokio::time::timeout(Duration::from_secs(3), reader.get_mut().write_all(&burst))
+            .await
+            .expect("fake Herdr listener timed out writing an overflow burst")
+            .expect("fake Herdr listener failed to write an overflow burst");
+    }
+
     async fn wait_for_wire_peer_close(reader: &mut tokio::io::BufReader<tokio::net::UnixStream>) {
         let mut line = String::new();
         let bytes_read = tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line))
@@ -5700,6 +6487,9 @@ mod tests {
     struct PrimaryCollectorHarness {
         cancellation: CancellationToken,
         task: JoinHandle<Result<(), CollectorError>>,
+        model: SharedModel,
+        primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle,
+        enrichment_diagnostics: EnrichmentDiagnosticsHandle,
         provider_events: mpsc::Sender<ProviderIngressEvent>,
         ignored_provider_events: mpsc::Receiver<ProviderEvent>,
         provider_thread: ProviderThreadHandle,
@@ -5713,6 +6503,9 @@ mod tests {
             let Self {
                 cancellation,
                 task,
+                model: _,
+                primary_stream_diagnostics: _,
+                enrichment_diagnostics: _,
                 provider_events,
                 ignored_provider_events,
                 provider_thread,
@@ -5742,6 +6535,20 @@ mod tests {
         socket: PathBuf,
         log_name: &str,
     ) -> PrimaryCollectorHarness {
+        spawn_primary_collector_harness_with_policy(
+            directory,
+            socket,
+            log_name,
+            LivenessPolicy::default(),
+        )
+    }
+
+    fn spawn_primary_collector_harness_with_policy(
+        directory: &tempfile::TempDir,
+        socket: PathBuf,
+        log_name: &str,
+        liveness_policy: LivenessPolicy,
+    ) -> PrimaryCollectorHarness {
         let log_path = directory.path().join(log_name);
         let log = std::fs::File::create(&log_path).unwrap();
         let subscriber = tracing_subscriber::fmt()
@@ -5751,8 +6558,10 @@ mod tests {
             .with_writer(log)
             .finish();
         let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
-        let store = open_writer(&root).unwrap();
+        let mut store = open_writer(&root).unwrap();
         let restored = store.load_restored_state().unwrap();
+        let owner = OwnerTracker::from_environment();
+        store.replace_owner(&owner.record()).unwrap();
         let (lifecycle, writer) = spawn_writer(store).unwrap();
         let (reducer, shared) = Reducer::new(restored);
         let initial_coverage = SourceCoverageRegistry::new(SourceAvailability::NotApplicable);
@@ -5770,6 +6579,7 @@ mod tests {
             &initial_coverage,
             Arc::new(RecordingOccurrenceSink::default()),
         );
+        let enrichment_diagnostics = persistence.enrichment_diagnostics();
 
         let provider_diagnostics = crate::provider::ProviderDiagnostics::default();
         let (ignored_events, ignored_provider_events) = mpsc::channel(1);
@@ -5791,18 +6601,24 @@ mod tests {
         let task_cancellation = cancellation.clone();
         let (performance, _sampler) =
             performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
+        let task_model = shared.clone();
+        let primary_stream_diagnostics = PrimaryStreamDiagnosticsHandle::default();
+        let task_primary_stream_diagnostics = primary_stream_diagnostics.clone();
         let task = tokio::spawn(
             run_collector(
                 socket,
                 "health-edge-session".to_owned(),
                 persistence,
                 reducer,
-                shared,
+                task_model,
                 performance,
                 task_cancellation,
-                OwnerTracker::from_environment(),
+                owner,
+                None,
                 None,
                 provider,
+                liveness_policy,
+                task_primary_stream_diagnostics,
             )
             .with_subscriber(subscriber),
         );
@@ -5810,6 +6626,9 @@ mod tests {
         PrimaryCollectorHarness {
             cancellation,
             task,
+            model: shared,
+            primary_stream_diagnostics,
+            enrichment_diagnostics,
             provider_events,
             ignored_provider_events,
             provider_thread,
@@ -5898,6 +6717,7 @@ mod tests {
         model.insert_tab(Tab {
             tab_id: "tab-0001".to_owned(),
             workspace_id: "workspace-0001".to_owned(),
+            label: None,
         });
         for index in 1..=50 {
             model.insert_pane(Pane {
@@ -5905,6 +6725,7 @@ mod tests {
                 workspace_id: "workspace-0001".to_owned(),
                 tab_id: "tab-0001".to_owned(),
                 terminal_id: format!("terminal-{index:04}"),
+                display_name: None,
             });
         }
 
@@ -5918,6 +6739,11 @@ mod tests {
                 display_ordinal: DisplayOrdinal::new(index as i64 + 1),
                 state: TaskState::Running,
                 has_controller_task_state_event: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             });
         }
 
@@ -6569,6 +7395,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn operator_command_receiver_publishes_dismissed_snapshot() {
+        let sink = Arc::new(RecordingOccurrenceSink::default());
+        let (_directory, lifecycle, mut runtime, _diagnostics) = runtime_with_sink(sink);
+        let run_id = RunId::new();
+        let mut domain = DomainModel::default();
+        domain.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::Controller("clearable".to_owned()),
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Completed,
+            has_controller_task_state_event: true,
+            created_at_ms: Some(10),
+            updated_at_ms: Some(20),
+            finished_at_ms: Some(20),
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        let (mut reducer, mut model) = Reducer::new(RestoredState {
+            model: domain,
+            next_ordinal: 2,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let coverage = SourceCoverageRegistry::default();
+        let (sender, receiver) = mpsc::channel(1);
+        let mut receiver = Some(receiver);
+        let _ = model.borrow_and_update();
+        sender
+            .send(OperatorCommand::DismissClearable)
+            .await
+            .unwrap();
+
+        let command = receive_operator_command(&mut receiver).await;
+        assert!(
+            service_operator_command(
+                command,
+                &mut receiver,
+                &mut reducer,
+                &mut runtime,
+                &model,
+                &coverage,
+            )
+            .await
+            .unwrap()
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), model.changed())
+            .await
+            .expect("operator command did not publish a model snapshot")
+            .unwrap();
+        assert!(
+            model
+                .borrow_and_update()
+                .task_run(&run_id)
+                .unwrap()
+                .dismissed_at_ms
+                .is_some()
+        );
+
+        drop(receiver);
+        drop(runtime);
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn reconnect_wait_services_operator_command_before_delay_elapses() {
+        let sink = Arc::new(RecordingOccurrenceSink::default());
+        let (_directory, lifecycle, mut runtime, _diagnostics) = runtime_with_sink(sink);
+        let run_id = RunId::new();
+        let mut domain = DomainModel::default();
+        domain.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::Controller("clearable-while-down".to_owned()),
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Completed,
+            has_controller_task_state_event: true,
+            created_at_ms: Some(10),
+            updated_at_ms: Some(20),
+            finished_at_ms: Some(20),
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        let (mut reducer, model) = Reducer::new(RestoredState {
+            model: domain,
+            next_ordinal: 2,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let cancellation = CancellationToken::new();
+        let mut controller_requests = None;
+        let (command_sender, operator_commands) = mpsc::channel(1);
+        let mut operator_commands = Some(operator_commands);
+        let (provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+        let mut observed = model.clone();
+        let _ = observed.borrow_and_update();
+        command_sender
+            .send(OperatorCommand::DismissClearable)
+            .await
+            .unwrap();
+
+        {
+            let wait = wait_or_service_controller(
+                &cancellation,
+                Duration::from_secs(1),
+                &mut controller_requests,
+                &mut operator_commands,
+                "subscription-down",
+                &mut reducer,
+                &mut runtime,
+                &model,
+                &mut provider,
+            );
+            tokio::pin!(wait);
+            tokio::select! {
+                result = &mut wait => {
+                    panic!("reconnect wait completed before publishing the dismissal: {result:?}");
+                }
+                result = observed.changed() => {
+                    result.expect("operator command must publish before the reconnect delay");
+                }
+            }
+        }
+
+        assert!(
+            observed
+                .borrow_and_update()
+                .task_run(&run_id)
+                .unwrap()
+                .dismissed_at_ms
+                .is_some()
+        );
+
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+        drop(runtime);
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
     async fn i4_d3_owner_update_failure_marks_stale_and_skips_later_writes() {
         let sink = Arc::new(RecordingOccurrenceSink::default());
         let (_directory, lifecycle, mut runtime, diagnostics) = runtime_with_sink(sink);
@@ -6808,6 +7773,1402 @@ mod tests {
                 subscription["type"].as_str() != Some("pane.agent_status_changed")
             }),
             "pane.agent_status_changed requires pane_id and must not be requested unscoped: {requested:?}"
+        );
+    }
+
+    fn watchdog_probe_topology(
+        agent_name: Option<&str>,
+        session: Option<(AgentSessionReferenceKind, &str, &str)>,
+    ) -> TopologySnapshot {
+        TopologySnapshot {
+            workspaces: vec![Workspace {
+                workspace_id: "w1".to_owned(),
+            }],
+            tabs: vec![Tab {
+                tab_id: "w1:t1".to_owned(),
+                workspace_id: "w1".to_owned(),
+                label: None,
+            }],
+            panes: vec![PaneSnapshot {
+                pane_id: "w1:p4".to_owned(),
+                workspace_id: "w1".to_owned(),
+                tab_id: "w1:t1".to_owned(),
+                terminal_id: "terminal-4".to_owned(),
+                display_name: None,
+                agent: agent_name.map(|name| SnapshotAgent {
+                    agent_name: name.to_owned(),
+                    state: ExecState::Working,
+                }),
+                agent_session: session.map(|(kind, source, value)| AgentSessionReference {
+                    source: source.to_owned(),
+                    agent: agent_name.unwrap_or("claude").to_owned(),
+                    kind,
+                    value: value.to_owned(),
+                }),
+            }],
+        }
+    }
+
+    fn reconciled_probe_topologies(
+        topology: TopologySnapshot,
+    ) -> (TopologySnapshot, TopologySnapshot) {
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let _ = reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: topology.clone(),
+                gap_kind: GapKind::Startup,
+            })
+            .unwrap();
+        let projected = current_model_topology(&shared, &PendingTopologyClosures::default())
+            .expect("reconciled topology had an ambiguous execution");
+        (projected, topology)
+    }
+
+    fn assert_probe_comparison_diverges(
+        projected: &TopologySnapshot,
+        probed: TopologySnapshot,
+        scenario: &str,
+    ) {
+        assert!(
+            !probe_topology_matches_model(probed, projected.clone()),
+            "probe comparison missed {scenario}"
+        );
+    }
+
+    #[test]
+    fn watchdog_probe_round_trips_all_retained_snapshot_shapes() {
+        let agent_names = [
+            Some("claude"),
+            Some("codex"),
+            Some("claude-code"),
+            Some("Claude"),
+            Some("aider"),
+            None,
+        ];
+        let sessions = [
+            None,
+            Some((AgentSessionReferenceKind::Id, "sid-1")),
+            Some((AgentSessionReferenceKind::Path, "/tmp/session.jsonl")),
+        ];
+        let sources = ["herdr:claude", "herdr", "arbitrary-source"];
+
+        for agent_name in agent_names {
+            for session in sessions {
+                for source in sources {
+                    let topology = watchdog_probe_topology(
+                        agent_name,
+                        session.map(|(kind, value)| (kind, source, value)),
+                    );
+                    let (projected, probed) = reconciled_probe_topologies(topology);
+                    assert!(
+                        probe_topology_matches_model(probed, projected),
+                        "probe round trip mismatched agent={agent_name:?}, session={session:?}, source={source:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn watchdog_probe_name_comparison_matches_retention_and_detects_non_null_changes() {
+        let mut current = watchdog_probe_topology(None, None);
+        current.tabs[0].label = Some("stored tab".to_owned());
+        current.panes[0].display_name = Some("stored pane".to_owned());
+
+        let mut nameless_probe = current.clone();
+        nameless_probe.tabs[0].label = None;
+        nameless_probe.panes[0].display_name = None;
+        assert!(probe_topology_matches_model(
+            nameless_probe.clone(),
+            current.clone()
+        ));
+
+        let mut changed_tab = nameless_probe.clone();
+        changed_tab.tabs[0].label = Some("renamed tab".to_owned());
+        assert!(!probe_topology_matches_model(changed_tab, current.clone()));
+
+        let mut changed_pane = nameless_probe;
+        changed_pane.panes[0].display_name = Some("renamed pane".to_owned());
+        assert!(!probe_topology_matches_model(changed_pane, current));
+    }
+
+    #[test]
+    fn watchdog_probe_detects_topology_membership_changes() {
+        let topology = watchdog_probe_topology(Some("claude"), None);
+        let (projected, probed) = reconciled_probe_topologies(topology);
+
+        let mut changed = probed.clone();
+        changed.workspaces.push(Workspace {
+            workspace_id: "w2".to_owned(),
+        });
+        assert_probe_comparison_diverges(&projected, changed, "added workspace");
+        let mut changed = probed.clone();
+        changed.workspaces.clear();
+        assert_probe_comparison_diverges(&projected, changed, "removed workspace");
+
+        let mut changed = probed.clone();
+        changed.tabs.push(Tab {
+            tab_id: "w1:t2".to_owned(),
+            workspace_id: "w1".to_owned(),
+            label: None,
+        });
+        assert_probe_comparison_diverges(&projected, changed, "added tab");
+        let mut changed = probed.clone();
+        changed.tabs.clear();
+        assert_probe_comparison_diverges(&projected, changed, "removed tab");
+
+        let mut changed = probed.clone();
+        let mut pane = changed.panes[0].clone();
+        pane.pane_id = "w1:p5".to_owned();
+        pane.terminal_id = "terminal-5".to_owned();
+        changed.panes.push(pane);
+        assert_probe_comparison_diverges(&projected, changed, "added pane");
+        let mut changed = probed;
+        changed.panes.clear();
+        assert_probe_comparison_diverges(&projected, changed, "removed pane");
+    }
+
+    #[test]
+    fn watchdog_probe_detects_agent_presence_state_and_provider_changes() {
+        let topology = watchdog_probe_topology(Some("claude"), None);
+        let (projected, probed) = reconciled_probe_topologies(topology);
+
+        let mut changed = probed.clone();
+        changed.panes[0].agent = None;
+        assert_probe_comparison_diverges(&projected, changed, "agent disappearance");
+
+        let no_agent = watchdog_probe_topology(None, None);
+        let (no_agent_projected, mut agent_appeared) = reconciled_probe_topologies(no_agent);
+        agent_appeared.panes[0].agent = Some(SnapshotAgent {
+            agent_name: "claude".to_owned(),
+            state: ExecState::Working,
+        });
+        assert_probe_comparison_diverges(&no_agent_projected, agent_appeared, "agent appearance");
+
+        let mut changed = probed.clone();
+        changed.panes[0].agent.as_mut().unwrap().state = ExecState::Idle;
+        assert_probe_comparison_diverges(&projected, changed, "execution state change");
+
+        let mut changed = probed;
+        changed.panes[0].agent.as_mut().unwrap().agent_name = "codex".to_owned();
+        assert_probe_comparison_diverges(&projected, changed, "resolved provider change");
+    }
+
+    #[test]
+    fn watchdog_probe_detects_session_kind_value_and_presence_changes() {
+        let topology = watchdog_probe_topology(
+            Some("claude"),
+            Some((AgentSessionReferenceKind::Id, "herdr:claude", "sid-1")),
+        );
+        let (projected, probed) = reconciled_probe_topologies(topology);
+
+        let mut changed = probed.clone();
+        changed.panes[0].agent_session.as_mut().unwrap().kind = AgentSessionReferenceKind::Path;
+        assert_probe_comparison_diverges(&projected, changed, "session kind change");
+
+        let mut changed = probed.clone();
+        changed.panes[0].agent_session.as_mut().unwrap().value = "sid-2".to_owned();
+        assert_probe_comparison_diverges(&projected, changed, "session value change");
+
+        let mut changed = probed.clone();
+        changed.panes[0].agent_session = None;
+        assert_probe_comparison_diverges(&projected, changed, "session disappearance");
+
+        let topology = watchdog_probe_topology(Some("claude"), None);
+        let (projected, mut changed) = reconciled_probe_topologies(topology);
+        changed.panes[0].agent_session = Some(AgentSessionReference {
+            source: "herdr".to_owned(),
+            agent: "claude".to_owned(),
+            kind: AgentSessionReferenceKind::Id,
+            value: "sid-1".to_owned(),
+        });
+        assert_probe_comparison_diverges(&projected, changed, "session appearance");
+
+        let topology = watchdog_probe_topology(
+            Some("claude"),
+            Some((AgentSessionReferenceKind::Id, "herdr", "sid-1")),
+        );
+        let (projected, mut changed) = reconciled_probe_topologies(topology);
+        changed.panes[0].agent_session.as_mut().unwrap().agent = "codex".to_owned();
+        assert_probe_comparison_diverges(
+            &projected,
+            changed,
+            "session agent resolved-provider change",
+        );
+    }
+
+    #[test]
+    fn watchdog_probe_detects_pane_location_changes() {
+        let topology = watchdog_probe_topology(Some("claude"), None);
+        let (projected, probed) = reconciled_probe_topologies(topology);
+
+        for (scenario, workspace_id, tab_id, terminal_id) in [
+            ("pane workspace move", "w2", "w1:t1", "terminal-4"),
+            ("pane tab move", "w1", "w1:t2", "terminal-4"),
+            ("pane terminal move", "w1", "w1:t1", "terminal-5"),
+        ] {
+            let mut changed = probed.clone();
+            changed.panes[0].workspace_id = workspace_id.to_owned();
+            changed.panes[0].tab_id = tab_id.to_owned();
+            changed.panes[0].terminal_id = terminal_id.to_owned();
+            assert_probe_comparison_diverges(&projected, changed, scenario);
+        }
+    }
+
+    #[test]
+    fn watchdog_agent_node_fallback_prefers_root_session() {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::Controller("unbound-controller-run".to_owned()),
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "gap-agent-root".to_owned(),
+            provider: Provider::Claude,
+            native_session_id: Some("R".to_owned()),
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(2),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Working),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
+        });
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "agent:claude:C".to_owned(),
+            provider: Provider::Claude,
+            native_session_id: Some("C".to_owned()),
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(3),
+            parent_agent_node_id: Some("gap-agent-root".to_owned()),
+            state: Some(ExecState::Working),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
+        });
+        let execution = Execution {
+            execution_id: "live-execution".to_owned(),
+            pane_id: "w1:p4".to_owned(),
+            terminal_id: "terminal-4".to_owned(),
+            task_run_id: run_id,
+            state: ExecState::Working,
+        };
+
+        let (_, session) = current_execution_identity(&model, &execution);
+
+        assert_eq!(
+            session.as_ref().map(|session| session.value.as_str()),
+            Some("R")
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_controller_native_alias_projects_root_session_and_stays_healthy() {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_workspace(Workspace {
+            workspace_id: "w1".to_owned(),
+        });
+        model.insert_tab(Tab {
+            tab_id: "w1:t1".to_owned(),
+            workspace_id: "w1".to_owned(),
+            label: None,
+        });
+        model.insert_pane(Pane {
+            pane_id: "w1:p4".to_owned(),
+            workspace_id: "w1".to_owned(),
+            tab_id: "w1:t1".to_owned(),
+            terminal_id: "terminal-4".to_owned(),
+            display_name: None,
+        });
+        model.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::Controller("controller-run".to_owned()),
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        model.insert_task_run_alias(
+            RunKey::Native {
+                provider: Provider::Claude,
+                sid: "R".to_owned(),
+            },
+            run_id,
+        );
+        model.insert_execution(Execution {
+            execution_id: "live-execution".to_owned(),
+            pane_id: "w1:p4".to_owned(),
+            terminal_id: "terminal-4".to_owned(),
+            task_run_id: run_id,
+            state: ExecState::Working,
+        });
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "gap-agent-root".to_owned(),
+            provider: Provider::Claude,
+            native_session_id: None,
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(2),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Working),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
+        });
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "agent:claude:C".to_owned(),
+            provider: Provider::Claude,
+            native_session_id: Some("C".to_owned()),
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(3),
+            parent_agent_node_id: Some("gap-agent-root".to_owned()),
+            state: Some(ExecState::Working),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
+        });
+        let shared = watch::channel(Arc::new(model)).1;
+
+        let projected = current_model_topology(&shared, &PendingTopologyClosures::default())
+            .expect("Controller alias topology should project unambiguously");
+        let projected_session = projected.panes[0]
+            .agent_session
+            .as_ref()
+            .map(|session| session.value.as_str());
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("controller-alias-projection.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut reader, request) = accept_wire_request(&listener).await;
+            let mut frame = watchdog_snapshot_frame(&request, false, "claude");
+            frame["result"]["snapshot"]["panes"][0]["agent_session"]["value"] =
+                Value::String("R".to_owned());
+            write_wire_frame(&mut reader, &frame).await;
+        });
+
+        let outcome = probe_primary_topology(
+            &socket,
+            &shared,
+            PendingTopologyClosures::default(),
+            LivenessPolicy { timeout_ms: 500 },
+        )
+        .await;
+
+        let healthy = matches!(outcome, WatchdogProbeOutcome::HealthyIdle);
+        assert_eq!(
+            projected_session,
+            Some("R"),
+            "watchdog healthy outcome: {healthy}"
+        );
+        assert!(healthy);
+        join_fake_server(server, "Controller alias topology probe").await;
+    }
+
+    #[tokio::test]
+    async fn watchdog_probe_treats_ambiguous_live_executions_as_inconclusive_until_reconciliation()
+    {
+        let topology = watchdog_probe_topology(
+            Some("claude"),
+            Some((
+                AgentSessionReferenceKind::Id,
+                "herdr:claude",
+                "watchdog-session",
+            )),
+        );
+        let mut model = DomainModel::default();
+        model.insert_workspace(topology.workspaces[0].clone());
+        model.insert_tab(topology.tabs[0].clone());
+        model.insert_pane(Pane {
+            pane_id: "w1:p4".to_owned(),
+            workspace_id: "w1".to_owned(),
+            tab_id: "w1:t1".to_owned(),
+            terminal_id: "terminal-4".to_owned(),
+            display_name: None,
+        });
+        for execution_id in ["live-execution-1", "live-execution-2"] {
+            model.insert_execution(Execution {
+                execution_id: execution_id.to_owned(),
+                pane_id: "w1:p4".to_owned(),
+                terminal_id: "terminal-4".to_owned(),
+                task_run_id: RunId::new(),
+                state: ExecState::Working,
+            });
+        }
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model,
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("ambiguous-projection.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut reader, request) = accept_wire_request(&listener).await;
+                write_wire_frame(
+                    &mut reader,
+                    &watchdog_snapshot_frame(&request, false, "claude"),
+                )
+                .await;
+            }
+        });
+
+        let ambiguous = probe_primary_topology(
+            &socket,
+            &shared,
+            PendingTopologyClosures::default(),
+            LivenessPolicy { timeout_ms: 500 },
+        )
+        .await;
+        assert!(matches!(ambiguous, WatchdogProbeOutcome::Inconclusive));
+
+        let _ = reducer
+            .reconcile_gap(ReconcileBatch {
+                topology,
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let reconciled = probe_primary_topology(
+            &socket,
+            &shared,
+            PendingTopologyClosures::default(),
+            LivenessPolicy { timeout_ms: 500 },
+        )
+        .await;
+        assert!(matches!(reconciled, WatchdogProbeOutcome::HealthyIdle));
+        join_fake_server(server, "ambiguous projection probes").await;
+    }
+
+    fn watchdog_snapshot_frame(
+        request: &Value,
+        include_second_pane: bool,
+        agent_name: &str,
+    ) -> Value {
+        let mut panes = vec![json!({
+            "pane_id": "w1:p4",
+            "terminal_id": "terminal-4",
+            "workspace_id": "w1",
+            "tab_id": "w1:t1",
+            "agent": agent_name,
+            "agent_status": "working",
+            "agent_session": {
+                "source": "herdr:claude",
+                "agent": "claude",
+                "kind": "id",
+                "value": "watchdog-session",
+            },
+        })];
+        if include_second_pane {
+            panes.push(json!({
+                "pane_id": "w1:p5",
+                "terminal_id": "terminal-5",
+                "workspace_id": "w1",
+                "tab_id": "w1:t1",
+                "agent_status": "unknown",
+            }));
+        }
+        json!({
+            "id": request["id"],
+            "result": {
+                "type": "session_snapshot",
+                "snapshot": {
+                    "version": "0.8.0",
+                    "protocol": 19,
+                    "focused_workspace_id": "w1",
+                    "focused_tab_id": "w1:t1",
+                    "focused_pane_id": "w1:p4",
+                    "workspaces": [{"workspace_id": "w1"}],
+                    "tabs": [{
+                        "tab_id": "w1:t1",
+                        "workspace_id": "w1",
+                    }],
+                    "panes": panes,
+                    "layouts": [],
+                    "agents": [],
+                },
+            },
+        })
+    }
+
+    fn watchdog_ambiguous_snapshot_frame(request: &Value) -> Value {
+        let mut frame = watchdog_snapshot_frame(request, false, "claude");
+        frame["result"]["snapshot"]["panes"]
+            .as_array_mut()
+            .expect("watchdog snapshot panes must be an array")
+            .push(json!({
+                "pane_id": "w1:p4",
+                "terminal_id": "terminal-4",
+                "workspace_id": "w1",
+                "tab_id": "w1:t1",
+                "agent": "codex",
+                "agent_status": "working",
+                "agent_session": {
+                    "source": "herdr:codex",
+                    "agent": "codex",
+                    "kind": "id",
+                    "value": "ambiguous-watchdog-session",
+                },
+            }));
+        frame
+    }
+
+    fn primary_subscription_is_scoped(request: &Value) -> bool {
+        request["params"]["subscriptions"]
+            .as_array()
+            .is_some_and(|subscriptions| {
+                subscriptions
+                    .iter()
+                    .any(|subscription| subscription.get("pane_id").is_some())
+            })
+    }
+
+    fn reconnect_gap_count(root: &crate::lockfile::StateRoot) -> i64 {
+        rusqlite::Connection::open(crate::store::database_path(root))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE gap_kind = 'reconnect'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn watchdog_matching_probes_keep_idle_subscription_and_model_stable() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let socket = directory.path().join("idle-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (probes_sender, probes_receiver) = tokio::sync::oneshot::channel();
+        let liveness_policy = LivenessPolicy { timeout_ms: 400 };
+        let mut harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "idle-watchdog.log",
+            liveness_policy,
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let primary_subscriptions = Arc::new(AtomicUsize::new(0));
+        let observed_primary_subscriptions = Arc::clone(&primary_subscriptions);
+        let server = tokio::spawn(async move {
+            let mut snapshot_instants = Vec::new();
+            let mut probes_sender = Some(probes_sender);
+            let mut held_streams = Vec::new();
+            loop {
+                let (mut reader, request) = tokio::select! {
+                    () = server_cancellation.cancelled() => break,
+                    accepted = accept_wire_request(&listener) => accepted,
+                };
+                match request["method"].as_str() {
+                    Some("events.subscribe") => {
+                        write_wire_frame(
+                            &mut reader,
+                            &json!({
+                                "id": request["id"],
+                                "result": {"type": "subscription_started"},
+                            }),
+                        )
+                        .await;
+                        if !primary_subscription_is_scoped(&request) {
+                            observed_primary_subscriptions.fetch_add(1, Ordering::Release);
+                        }
+                        held_streams.push(reader);
+                    }
+                    Some("session.snapshot") => {
+                        snapshot_instants.push(Instant::now());
+                        write_wire_frame(
+                            &mut reader,
+                            &watchdog_snapshot_frame(&request, false, "claude-code"),
+                        )
+                        .await;
+                        if snapshot_instants.len() == 3
+                            && let Some(sender) = probes_sender.take()
+                        {
+                            sender.send(snapshot_instants.clone()).unwrap();
+                        }
+                    }
+                    method => panic!("unexpected idle watchdog request: {method:?}"),
+                }
+            }
+            drop(held_streams);
+        });
+
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "initial idle subscription",
+        )
+        .await;
+        let before_model = harness.model.borrow().clone();
+        let database = rusqlite::Connection::open(crate::store::database_path(&root)).unwrap();
+        let before_data_version: i64 = database
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .unwrap();
+
+        let snapshot_instants = tokio::time::timeout(Duration::from_secs(3), probes_receiver)
+            .await
+            .expect("matching idle snapshot probes did not run twice")
+            .expect("idle snapshot probe observer was dropped");
+        assert_eq!(snapshot_instants.len(), 3);
+        assert!(
+            snapshot_instants[2].duration_since(snapshot_instants[1])
+                >= liveness_timeout(&liveness_policy),
+            "consecutive probes were not separated by a freshly stamped deadline"
+        );
+
+        assert_eq!(primary_subscriptions.load(Ordering::Acquire), 1);
+        assert_eq!(*harness.source_quality.borrow(), ObservationQuality::Live);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), harness.source_quality.changed())
+                .await
+                .is_err(),
+            "matching probes changed observation quality"
+        );
+        let after_model = harness.model.borrow().clone();
+        assert_eq!(
+            before_model.executions().collect::<Vec<_>>(),
+            after_model.executions().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            database
+                .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            before_data_version,
+            "matching probes persisted an operation"
+        );
+
+        let contents = harness.stop().await;
+        join_fake_server(server, "idle watchdog probes").await;
+        assert_eq!(reconnect_gap_count(&root), 0, "collector log: {contents}");
+        assert!(
+            !contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            "healthy idle subscription emitted a watchdog warning: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_matching_probe_recovers_live_quality_after_dirty_replays() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("dirty-replays-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (matched_sender, matched_receiver) = tokio::sync::oneshot::channel();
+        let (enrichment_sender, enrichment_receiver) = tokio::sync::oneshot::channel();
+        let mut harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "dirty-replays-watchdog.log",
+            LivenessPolicy { timeout_ms: 100 },
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let server = tokio::spawn(async move {
+            let mut snapshots = 0;
+            let mut matched_sender = Some(matched_sender);
+            let mut enrichment_sender = Some(enrichment_sender);
+            let mut primary_stream = None;
+            let mut held_streams = Vec::new();
+            loop {
+                let (mut reader, request) = tokio::select! {
+                    () = server_cancellation.cancelled() => break,
+                    accepted = accept_wire_request(&listener) => accepted,
+                };
+                match request["method"].as_str() {
+                    Some("events.subscribe") => {
+                        write_wire_frame(
+                            &mut reader,
+                            &json!({
+                                "id": request["id"],
+                                "result": {"type": "subscription_started"},
+                            }),
+                        )
+                        .await;
+                        if primary_subscription_is_scoped(&request) {
+                            if let Some(sender) = enrichment_sender.take() {
+                                sender.send(()).unwrap();
+                            }
+                            held_streams.push(reader);
+                        } else {
+                            assert!(
+                                primary_stream.replace(reader).is_none(),
+                                "dirty replay test unexpectedly reconnected"
+                            );
+                        }
+                    }
+                    Some("session.snapshot") => {
+                        snapshots += 1;
+                        write_wire_frame(
+                            &mut reader,
+                            &watchdog_snapshot_frame(&request, false, "claude"),
+                        )
+                        .await;
+                        if snapshots <= RESNAPSHOT_ATTEMPTS + 1 {
+                            let primary_stream = primary_stream
+                                .as_mut()
+                                .expect("snapshot arrived before the primary subscription");
+                            write_wire_frame(
+                                primary_stream,
+                                &json!({
+                                    "event": "pane_focused",
+                                    "data": {"pane_id": format!("missing-pane-{snapshots}")},
+                                }),
+                            )
+                            .await;
+                        } else if snapshots == RESNAPSHOT_ATTEMPTS + 2
+                            && let Some(sender) = matched_sender.take()
+                        {
+                            sender.send(()).unwrap();
+                        }
+                    }
+                    method => panic!("unexpected dirty replay watchdog request: {method:?}"),
+                }
+            }
+            drop(primary_stream);
+            drop(held_streams);
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), matched_receiver)
+            .await
+            .expect("reconciling watchdog probe did not receive a matching snapshot")
+            .expect("matching reconciling probe observer was dropped");
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "matching reconciling watchdog probe",
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(3), enrichment_receiver)
+            .await
+            .expect("clean-generation recovery did not activate enrichment")
+            .expect("clean-generation enrichment observer was dropped");
+
+        let contents = harness.stop().await;
+        join_fake_server(server, "dirty replay watchdog recovery").await;
+        assert!(
+            !contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            "matching reconciling probe emitted a watchdog warning: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_matching_probe_after_overflow_stops_enrichment_episode_discards() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("overflow-recovery-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (activated_sender, activated_receiver) = tokio::sync::oneshot::channel();
+        let (matched_sender, matched_receiver) = tokio::sync::oneshot::channel();
+        let mut harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "overflow-recovery-watchdog.log",
+            LivenessPolicy { timeout_ms: 100 },
+        );
+        let enrichment_diagnostics = harness.enrichment_diagnostics.clone();
+        let server_cancellation = harness.cancellation.clone();
+        let enrichment_writes = Arc::new(AtomicUsize::new(0));
+        let observed_enrichment_writes = Arc::clone(&enrichment_writes);
+        let server = tokio::spawn(async move {
+            let mut snapshots = 0;
+            let mut activated_sender = Some(activated_sender);
+            let mut matched_sender = Some(matched_sender);
+            let mut primary_stream = None;
+            let mut enrichment_pulse = None;
+            loop {
+                let (mut reader, request) = tokio::select! {
+                    () = server_cancellation.cancelled() => break,
+                    accepted = accept_wire_request(&listener) => accepted,
+                };
+                match request["method"].as_str() {
+                    Some("events.subscribe") => {
+                        write_wire_frame(
+                            &mut reader,
+                            &json!({
+                                "id": request["id"],
+                                "result": {"type": "subscription_started"},
+                            }),
+                        )
+                        .await;
+                        if primary_subscription_is_scoped(&request) {
+                            assert!(
+                                enrichment_pulse.is_none(),
+                                "overflow recovery unexpectedly replaced enrichment"
+                            );
+                            if let Some(sender) = activated_sender.take() {
+                                sender.send(()).unwrap();
+                            }
+                            let pulse_cancellation = server_cancellation.clone();
+                            let pulse_writes = Arc::clone(&observed_enrichment_writes);
+                            let mut stream = reader.into_inner();
+                            enrichment_pulse = Some(tokio::spawn(async move {
+                                let mut interval = tokio::time::interval(Duration::from_millis(20));
+                                interval.set_missed_tick_behavior(
+                                    tokio::time::MissedTickBehavior::Delay,
+                                );
+                                let mut frame = serde_json::to_vec(&json!({
+                                    "event": "pane_agent_status_changed",
+                                    "data": {
+                                        "pane_id": "w1:p4",
+                                        "terminal_id": "terminal-4",
+                                        "agent_status": "working",
+                                    },
+                                }))
+                                .expect("enrichment pulse did not serialize");
+                                frame.push(b'\n');
+                                loop {
+                                    tokio::select! {
+                                        () = pulse_cancellation.cancelled() => break,
+                                        _ = interval.tick() => {
+                                            if stream.write_all(&frame).await.is_err() {
+                                                break;
+                                            }
+                                            pulse_writes.fetch_add(1, Ordering::Release);
+                                        }
+                                    }
+                                }
+                            }));
+                            write_primary_overflow_burst(
+                                primary_stream
+                                    .as_mut()
+                                    .expect("enrichment activated before the primary stream"),
+                            )
+                            .await;
+                        } else {
+                            assert!(
+                                primary_stream.replace(reader).is_none(),
+                                "overflow recovery unexpectedly reconnected"
+                            );
+                        }
+                    }
+                    Some("session.snapshot") => {
+                        snapshots += 1;
+                        write_wire_frame(
+                            &mut reader,
+                            &watchdog_snapshot_frame(&request, false, "claude"),
+                        )
+                        .await;
+                        if (2..=RESNAPSHOT_ATTEMPTS + 2).contains(&snapshots) {
+                            write_primary_overflow_burst(
+                                primary_stream
+                                    .as_mut()
+                                    .expect("snapshot arrived before the primary subscription"),
+                            )
+                            .await;
+                        } else if snapshots == RESNAPSHOT_ATTEMPTS + 3
+                            && let Some(sender) = matched_sender.take()
+                        {
+                            sender.send(()).unwrap();
+                        }
+                    }
+                    method => panic!("unexpected overflow recovery request: {method:?}"),
+                }
+            }
+            drop(primary_stream);
+            if let Some(pulse) = enrichment_pulse {
+                pulse.await.expect("enrichment pulse task panicked");
+            }
+        });
+
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "initial clean generation",
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(3), activated_receiver)
+            .await
+            .expect("initial clean generation did not activate enrichment")
+            .expect("initial enrichment observer was dropped");
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Reconciling,
+            "overflow-driven dirty streak",
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(3), matched_receiver)
+            .await
+            .expect("reconciling watchdog did not receive a matching overflow probe")
+            .expect("overflow probe observer was dropped");
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "clean recovery after overflow",
+        )
+        .await;
+
+        let discards_before = enrichment_diagnostics.episode_discards();
+        let writes_before = enrichment_writes.load(Ordering::Acquire);
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let writes_after = enrichment_writes.load(Ordering::Acquire);
+        assert!(
+            writes_after > writes_before,
+            "enrichment stream was not active after overflow recovery"
+        );
+        assert_eq!(
+            enrichment_diagnostics.episode_discards(),
+            discards_before,
+            "enrichment episode discards kept accumulating after Live recovery"
+        );
+
+        let contents = harness.stop().await;
+        join_fake_server(server, "overflow watchdog recovery").await;
+        assert!(
+            !contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            "matching overflow probe emitted a watchdog warning: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_repeated_ambiguous_probes_do_not_reconnect_or_record_gaps() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let socket = directory.path().join("ambiguous-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (probed_sender, probed_receiver) = tokio::sync::oneshot::channel();
+        let harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "ambiguous-watchdog.log",
+            LivenessPolicy { timeout_ms: 100 },
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let primary_subscriptions = Arc::new(AtomicUsize::new(0));
+        let observed_primary_subscriptions = Arc::clone(&primary_subscriptions);
+        let server = tokio::spawn(async move {
+            let mut snapshots = 0;
+            let mut probed_sender = Some(probed_sender);
+            let mut held_streams = Vec::new();
+            loop {
+                let (mut reader, request) = tokio::select! {
+                    () = server_cancellation.cancelled() => break,
+                    accepted = accept_wire_request(&listener) => accepted,
+                };
+                match request["method"].as_str() {
+                    Some("events.subscribe") => {
+                        write_wire_frame(
+                            &mut reader,
+                            &json!({
+                                "id": request["id"],
+                                "result": {"type": "subscription_started"},
+                            }),
+                        )
+                        .await;
+                        if !primary_subscription_is_scoped(&request) {
+                            observed_primary_subscriptions.fetch_add(1, Ordering::Release);
+                        }
+                        held_streams.push(reader);
+                    }
+                    Some("session.snapshot") => {
+                        snapshots += 1;
+                        write_wire_frame(&mut reader, &watchdog_ambiguous_snapshot_frame(&request))
+                            .await;
+                        if snapshots == 4
+                            && let Some(sender) = probed_sender.take()
+                        {
+                            sender.send(()).unwrap();
+                        }
+                    }
+                    method => panic!("unexpected ambiguous watchdog request: {method:?}"),
+                }
+            }
+            drop(held_streams);
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), probed_receiver)
+            .await
+            .expect("ambiguous topology was not probed repeatedly")
+            .expect("ambiguous probe observer was dropped");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while harness
+                .primary_stream_diagnostics
+                .snapshot()
+                .inconclusive_topology_probes
+                < 3
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ambiguous topology probes did not increment their diagnostic counter");
+        assert!(
+            harness
+                .primary_stream_diagnostics
+                .snapshot()
+                .inconclusive_topology_probes
+                >= 3,
+            "ambiguous topology probe counter did not reach the observed threshold"
+        );
+        assert_eq!(
+            primary_subscriptions.load(Ordering::Acquire),
+            1,
+            "inconclusive probes must keep the primary subscription alive"
+        );
+        assert_eq!(reconnect_gap_count(&root), 0);
+
+        let contents = harness.stop().await;
+        join_fake_server(server, "ambiguous watchdog probes").await;
+        assert_eq!(reconnect_gap_count(&root), 0, "collector log: {contents}");
+        assert!(
+            !contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            "inconclusive probes emitted a watchdog warning: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_divergent_probe_reconnects_and_records_gap() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let socket = directory.path().join("starved-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (reconnected_sender, reconnected_receiver) = tokio::sync::oneshot::channel();
+        let harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "starved-watchdog.log",
+            LivenessPolicy { timeout_ms: 80 },
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let probe_preceded_reconnect = Arc::new(AtomicBool::new(false));
+        let observed_probe_order = Arc::clone(&probe_preceded_reconnect);
+        let primary_subscriptions = Arc::new(AtomicUsize::new(0));
+        let observed_primary_subscriptions = Arc::clone(&primary_subscriptions);
+        let server = tokio::spawn(async move {
+            let mut primary_subscription_count = 0;
+            let mut snapshots = 0;
+            let mut reconnected_sender = Some(reconnected_sender);
+            let mut held_streams = Vec::new();
+            loop {
+                let (mut reader, request) = tokio::select! {
+                    () = server_cancellation.cancelled() => break,
+                    accepted = accept_wire_request(&listener) => accepted,
+                };
+                match request["method"].as_str() {
+                    Some("events.subscribe") => {
+                        write_wire_frame(
+                            &mut reader,
+                            &json!({
+                                "id": request["id"],
+                                "result": {"type": "subscription_started"},
+                            }),
+                        )
+                        .await;
+                        if !primary_subscription_is_scoped(&request) {
+                            primary_subscription_count += 1;
+                            observed_primary_subscriptions
+                                .store(primary_subscription_count, Ordering::Release);
+                            if primary_subscription_count == 2
+                                && let Some(sender) = reconnected_sender.take()
+                            {
+                                sender.send(()).unwrap();
+                            }
+                        }
+                        held_streams.push(reader);
+                    }
+                    Some("session.snapshot") => {
+                        snapshots += 1;
+                        if snapshots == 2 && primary_subscription_count == 1 {
+                            observed_probe_order.store(true, Ordering::Release);
+                        }
+                        write_wire_frame(
+                            &mut reader,
+                            &watchdog_snapshot_frame(&request, snapshots >= 2, "claude"),
+                        )
+                        .await;
+                    }
+                    method => panic!("unexpected starved watchdog request: {method:?}"),
+                }
+            }
+            drop(held_streams);
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !probe_preceded_reconnect.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("divergent topology was not observed by a snapshot probe");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            primary_subscriptions.load(Ordering::Acquire),
+            1,
+            "divergent probe reconnect skipped the first backoff delay"
+        );
+        tokio::time::timeout(Duration::from_secs(3), reconnected_receiver)
+            .await
+            .expect("divergent snapshot probe did not trigger a reconnect")
+            .expect("starved reconnect observer was dropped");
+        assert!(
+            probe_preceded_reconnect.load(Ordering::Acquire),
+            "snapshot probe was not issued before reconnecting the silent subscription"
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while harness.model.borrow().pane("w1:p5").is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reconnect snapshot did not reconcile divergent topology");
+
+        let contents = harness.stop().await;
+        join_fake_server(server, "starved watchdog reconnect").await;
+        assert_eq!(reconnect_gap_count(&root), 1, "collector log: {contents}");
+        assert!(
+            contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            "starved subscription did not emit the watchdog warning: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_failed_probe_reconnects_and_records_gap() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let socket = directory.path().join("dead-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (reconnected_sender, reconnected_receiver) = tokio::sync::oneshot::channel();
+        let harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "dead-watchdog.log",
+            LivenessPolicy { timeout_ms: 80 },
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let failed_probe_preceded_reconnect = Arc::new(AtomicBool::new(false));
+        let observed_failed_probe = Arc::clone(&failed_probe_preceded_reconnect);
+        let server = tokio::spawn(async move {
+            let mut primary_subscriptions = 0;
+            let mut snapshots = 0;
+            let mut reconnected_sender = Some(reconnected_sender);
+            let mut held_streams = Vec::new();
+            loop {
+                let (mut reader, request) = tokio::select! {
+                    () = server_cancellation.cancelled() => break,
+                    accepted = accept_wire_request(&listener) => accepted,
+                };
+                match request["method"].as_str() {
+                    Some("events.subscribe") => {
+                        write_wire_frame(
+                            &mut reader,
+                            &json!({
+                                "id": request["id"],
+                                "result": {"type": "subscription_started"},
+                            }),
+                        )
+                        .await;
+                        if !primary_subscription_is_scoped(&request) {
+                            primary_subscriptions += 1;
+                            if primary_subscriptions == 2
+                                && let Some(sender) = reconnected_sender.take()
+                            {
+                                sender.send(()).unwrap();
+                            }
+                        }
+                        held_streams.push(reader);
+                    }
+                    Some("session.snapshot") => {
+                        snapshots += 1;
+                        if snapshots == 2 {
+                            if primary_subscriptions == 1 {
+                                observed_failed_probe.store(true, Ordering::Release);
+                            }
+                            write_wire_frame(
+                                &mut reader,
+                                &json!({
+                                    "id": request["id"],
+                                    "error": {
+                                        "code": "unavailable",
+                                        "message": "probe failed",
+                                    },
+                                }),
+                            )
+                            .await;
+                        } else {
+                            write_wire_frame(
+                                &mut reader,
+                                &watchdog_snapshot_frame(&request, false, "claude"),
+                            )
+                            .await;
+                        }
+                    }
+                    method => panic!("unexpected dead watchdog request: {method:?}"),
+                }
+            }
+            drop(held_streams);
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), reconnected_receiver)
+            .await
+            .expect("failed snapshot probe did not trigger a reconnect")
+            .expect("dead reconnect observer was dropped");
+        assert!(
+            failed_probe_preceded_reconnect.load(Ordering::Acquire),
+            "failed snapshot request was not a pre-reconnect probe"
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while reconnect_gap_count(&root) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed probe reconnect did not record a gap");
+
+        let contents = harness.stop().await;
+        join_fake_server(server, "dead watchdog reconnect").await;
+        assert_eq!(reconnect_gap_count(&root), 1, "collector log: {contents}");
+    }
+
+    #[tokio::test]
+    async fn watchdog_nonresponsive_probe_times_out_reconnects_and_records_one_gap() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let socket = directory.path().join("nonresponsive-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (reconnected_sender, reconnected_receiver) = tokio::sync::oneshot::channel();
+        let harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "nonresponsive-watchdog.log",
+            LivenessPolicy { timeout_ms: 120 },
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let pulse_cancellation = harness.cancellation.clone();
+        let provider_events = harness.provider_events.clone();
+        let pulse = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(25));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    () = pulse_cancellation.cancelled() => break,
+                    _ = interval.tick() => {
+                        let event = ProviderIngressEvent {
+                            event: ProviderEvent::SourceState {
+                                provider: Provider::Claude,
+                                state: ProviderSourceState::NotApplicable,
+                            },
+                            admission: None,
+                        };
+                        let sent = tokio::time::timeout(
+                            Duration::from_secs(1),
+                            provider_events.send(event),
+                        )
+                        .await;
+                        if !matches!(sent, Ok(Ok(()))) {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let server = tokio::spawn(async move {
+            let mut primary_subscriptions = 0;
+            let mut snapshots = 0;
+            let mut reconnected_sender = Some(reconnected_sender);
+            let mut held_streams = Vec::new();
+            let mut nonresponsive_probes = Vec::new();
+            loop {
+                let (mut reader, request) = tokio::select! {
+                    () = server_cancellation.cancelled() => break,
+                    accepted = accept_wire_request(&listener) => accepted,
+                };
+                match request["method"].as_str() {
+                    Some("events.subscribe") => {
+                        write_wire_frame(
+                            &mut reader,
+                            &json!({
+                                "id": request["id"],
+                                "result": {"type": "subscription_started"},
+                            }),
+                        )
+                        .await;
+                        if !primary_subscription_is_scoped(&request) {
+                            primary_subscriptions += 1;
+                            if primary_subscriptions == 2
+                                && let Some(sender) = reconnected_sender.take()
+                            {
+                                sender.send(()).unwrap();
+                            }
+                        }
+                        held_streams.push(reader);
+                    }
+                    Some("session.snapshot") => {
+                        snapshots += 1;
+                        if snapshots == 2 && primary_subscriptions == 1 {
+                            nonresponsive_probes.push(reader);
+                        } else {
+                            write_wire_frame(
+                                &mut reader,
+                                &watchdog_snapshot_frame(&request, false, "claude"),
+                            )
+                            .await;
+                        }
+                    }
+                    method => panic!("unexpected nonresponsive watchdog request: {method:?}"),
+                }
+            }
+            drop(nonresponsive_probes);
+            drop(held_streams);
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), reconnected_receiver)
+            .await
+            .expect("nonresponsive snapshot probe did not time out and reconnect")
+            .expect("nonresponsive reconnect observer was dropped");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while reconnect_gap_count(&root) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("nonresponsive probe reconnect did not record a gap");
+
+        let contents = harness.stop().await;
+        tokio::time::timeout(Duration::from_secs(3), pulse)
+            .await
+            .expect("provider pulse task did not stop")
+            .expect("provider pulse task panicked");
+        join_fake_server(server, "nonresponsive watchdog reconnect").await;
+        assert_eq!(reconnect_gap_count(&root), 1, "collector log: {contents}");
+        assert!(
+            contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            "nonresponsive subscription did not emit the watchdog warning: {contents}"
+        );
+        assert!(
+            contents.contains("reason=\"snapshot_probe_failed\""),
+            "nonresponsive warning did not report probe failure: {contents}"
         );
     }
 
@@ -7594,6 +9955,11 @@ mod tests {
                 display_ordinal: DisplayOrdinal::new(i64::try_from(index + 1).unwrap()),
                 state: TaskState::Running,
                 has_controller_task_state_event: false,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             });
             model.insert_execution(Execution {
                 execution_id: (*execution_id).to_owned(),
@@ -7606,6 +9972,626 @@ mod tests {
         watch::channel(Arc::new(model)).1
     }
 
+    fn known_pane_model() -> SharedModel {
+        let mut model = DomainModel::default();
+        model.insert_workspace(Workspace {
+            workspace_id: "w1".to_owned(),
+        });
+        model.insert_tab(Tab {
+            tab_id: "w1:t1".to_owned(),
+            workspace_id: "w1".to_owned(),
+            label: None,
+        });
+        model.insert_pane(Pane {
+            pane_id: "w1:p4".to_owned(),
+            workspace_id: "w1".to_owned(),
+            tab_id: "w1:t1".to_owned(),
+            terminal_id: "terminal-4".to_owned(),
+            display_name: None,
+        });
+        watch::channel(Arc::new(model)).1
+    }
+
+    fn pane_created_with_names(
+        label: Option<&str>,
+        terminal_title_stripped: Option<&str>,
+    ) -> ReceivedEvent {
+        ReceivedEvent {
+            event: "pane_created".to_owned(),
+            data: json!({
+                "pane": {
+                    "pane_id": "w1:p4",
+                    "terminal_id": "terminal-4",
+                    "workspace_id": "w1",
+                    "tab_id": "w1:t1",
+                    "terminal_title_stripped": terminal_title_stripped,
+                    "label": label,
+                },
+            }),
+            primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
+        }
+    }
+
+    fn normalized_pane_display_name(
+        label: Option<&str>,
+        terminal_title_stripped: Option<&str>,
+    ) -> Option<String> {
+        let shared = watch::channel(Arc::new(DomainModel::default())).1;
+        let normalized = normalize_event(
+            &shared,
+            "name-session",
+            &pane_created_with_names(label, terminal_title_stripped),
+        )
+        .expect("pane_created should normalize");
+        let Some(NormalizedEvent::TopologyUpsert {
+            entity: TopologyEntity::Pane(pane),
+            ..
+        }) = normalized.first()
+        else {
+            panic!("pane_created must emit a pane topology upsert first");
+        };
+        pane.display_name.clone()
+    }
+
+    #[test]
+    fn live_pane_upserts_capture_sanitized_display_names() {
+        assert_eq!(
+            normalized_pane_display_name(Some("UI修正"), None).as_deref(),
+            Some("UI修正")
+        );
+        assert_eq!(
+            normalized_pane_display_name(None, Some("build")).as_deref(),
+            Some("build")
+        );
+        assert_eq!(
+            normalized_pane_display_name(Some("label wins"), Some("ignored title")).as_deref(),
+            Some("label wins")
+        );
+        assert_eq!(
+            normalized_pane_display_name(Some(""), Some("fallback title")).as_deref(),
+            Some("fallback title")
+        );
+        assert_eq!(normalized_pane_display_name(None, None), None);
+
+        let long_name = "界".repeat(100);
+        let captured = normalized_pane_display_name(Some(&long_name), None)
+            .expect("a non-empty pane label should be captured");
+        assert!(captured.len() <= 256);
+        assert!(std::str::from_utf8(captured.as_bytes()).is_ok());
+        assert!(captured.chars().all(|character| character == '界'));
+    }
+
+    #[test]
+    fn tab_created_captures_sanitized_label() {
+        let mut model = DomainModel::default();
+        model.insert_workspace(Workspace {
+            workspace_id: "w1".to_owned(),
+        });
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model,
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let received = ReceivedEvent {
+            event: "tab_created".to_owned(),
+            data: json!({
+                "tab": {
+                    "tab_id": "w1:t1",
+                    "workspace_id": "w1",
+                    "label": "レビュー",
+                },
+            }),
+            primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
+        };
+
+        let normalized = normalize_event(&shared, "name-session", &received).unwrap();
+        let persist = apply_collector_observation(&mut reducer, normalized)
+            .unwrap()
+            .expect("tab upsert should apply");
+
+        assert_eq!(
+            shared.borrow().tab("w1:t1").unwrap().label.as_deref(),
+            Some("レビュー")
+        );
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertTab { tab, .. }
+                if tab.tab_id == "w1:t1" && tab.label.as_deref() == Some("レビュー")
+        )));
+    }
+
+    fn tab_renamed_event(tab_id: &str, label: Option<&str>) -> ReceivedEvent {
+        let mut data = json!({
+            "type": "tab_renamed",
+            "tab_id": tab_id,
+            "workspace_id": "untrusted-workspace",
+        });
+        if let Some(label) = label {
+            data["label"] = Value::String(label.to_owned());
+        }
+        ReceivedEvent {
+            event: "tab_renamed".to_owned(),
+            data,
+            primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
+        }
+    }
+
+    fn assert_authoritative_tab_clear_survives_restart(label: Option<&str>) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        store
+            .apply_batch(vec![
+                PersistOp::UpsertWorkspace {
+                    workspace: Workspace {
+                        workspace_id: "w1".to_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(1),
+                },
+                PersistOp::UpsertTab {
+                    tab: Tab {
+                        tab_id: "w1:t1".to_owned(),
+                        workspace_id: "w1".to_owned(),
+                        label: Some("persisted label".to_owned()),
+                    },
+                    display_ordinal: DisplayOrdinal::new(2),
+                },
+            ])
+            .unwrap();
+        let restored = store.load_restored_state().unwrap();
+        let (mut reducer, shared) = Reducer::new(restored);
+
+        let normalized = normalize_event(
+            &shared,
+            "authoritative-clear-session",
+            &tab_renamed_event("w1:t1", label),
+        )
+        .unwrap();
+        let persist = apply_collector_observation(&mut reducer, normalized)
+            .unwrap()
+            .expect("known tab rename should apply");
+        assert_eq!(shared.borrow().tab("w1:t1").unwrap().label, None);
+
+        store.apply_batch(persist).unwrap();
+        let restored = store.load_restored_state().unwrap();
+        assert_eq!(restored.model.tab("w1:t1").unwrap().label, None);
+    }
+
+    #[test]
+    fn tab_rename_with_empty_label_clears_store_across_restart() {
+        assert_authoritative_tab_clear_survives_restart(Some(""));
+    }
+
+    #[test]
+    fn tab_rename_without_label_clears_store_across_restart() {
+        assert_authoritative_tab_clear_survives_restart(None);
+    }
+
+    #[test]
+    fn tab_renamed_updates_existing_label_clears_empty_and_ignores_unknown_tabs() {
+        let mut model = DomainModel::default();
+        model.insert_workspace(Workspace {
+            workspace_id: "w1".to_owned(),
+        });
+        model.insert_tab(Tab {
+            tab_id: "w1:t1".to_owned(),
+            workspace_id: "w1".to_owned(),
+            label: Some("old".to_owned()),
+        });
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model,
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+
+        let normalized = normalize_event(
+            &shared,
+            "rename-session",
+            &tab_renamed_event("w1:t1", Some("レビュー")),
+        )
+        .unwrap();
+        let persist = apply_collector_observation(&mut reducer, normalized)
+            .unwrap()
+            .expect("known tab rename should apply");
+        assert_eq!(
+            shared.borrow().tab("w1:t1").unwrap().label.as_deref(),
+            Some("レビュー")
+        );
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertTab { tab, .. }
+                if tab.tab_id == "w1:t1"
+                    && tab.workspace_id == "w1"
+                    && tab.label.as_deref() == Some("レビュー")
+        )));
+
+        let normalized = normalize_event(
+            &shared,
+            "rename-session",
+            &tab_renamed_event("w1:t1", Some("")),
+        )
+        .unwrap();
+        let persist = apply_collector_observation(&mut reducer, normalized)
+            .unwrap()
+            .expect("empty known tab rename should apply");
+        assert_eq!(shared.borrow().tab("w1:t1").unwrap().label, None);
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertTab { tab, .. }
+                if tab.tab_id == "w1:t1" && tab.workspace_id == "w1" && tab.label.is_none()
+        )));
+
+        let normalized = normalize_event(
+            &shared,
+            "rename-session",
+            &tab_renamed_event("w1:t1", Some("before absent")),
+        )
+        .unwrap();
+        apply_collector_observation(&mut reducer, normalized)
+            .unwrap()
+            .expect("known tab rename should apply");
+        assert_eq!(
+            shared.borrow().tab("w1:t1").unwrap().label.as_deref(),
+            Some("before absent")
+        );
+        let normalized =
+            normalize_event(&shared, "rename-session", &tab_renamed_event("w1:t1", None)).unwrap();
+        let persist = apply_collector_observation(&mut reducer, normalized)
+            .unwrap()
+            .expect("absent-label known tab rename should apply");
+        assert_eq!(shared.borrow().tab("w1:t1").unwrap().label, None);
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertTab { tab, .. }
+                if tab.tab_id == "w1:t1" && tab.workspace_id == "w1" && tab.label.is_none()
+        )));
+
+        let normalized = normalize_event(
+            &shared,
+            "rename-session",
+            &tab_renamed_event("unknown-tab", Some("ignored")),
+        )
+        .unwrap();
+        assert!(normalized.is_empty());
+    }
+
+    fn snapshot_with_names() -> Snapshot {
+        Snapshot {
+            version: "test".to_owned(),
+            protocol: 1,
+            focused_workspace_id: Some("w1".to_owned()),
+            focused_tab_id: Some("w1:t1".to_owned()),
+            focused_pane_id: Some("w1:p4".to_owned()),
+            workspaces: vec![WorkspaceInfo {
+                workspace_id: "w1".to_owned(),
+                number: Some(1),
+                label: None,
+                focused: Some(true),
+                pane_count: Some(1),
+                tab_count: Some(1),
+                active_tab_id: Some("w1:t1".to_owned()),
+                agent_status: None,
+            }],
+            tabs: vec![TabInfo {
+                tab_id: "w1:t1".to_owned(),
+                workspace_id: "w1".to_owned(),
+                number: Some(1),
+                label: Some("レビュー".to_owned()),
+                focused: Some(true),
+                pane_count: Some(1),
+                agent_status: None,
+            }],
+            panes: vec![PaneInfo {
+                pane_id: "w1:p4".to_owned(),
+                terminal_id: "terminal-4".to_owned(),
+                workspace_id: "w1".to_owned(),
+                tab_id: Some("w1:t1".to_owned()),
+                focused: Some(true),
+                cwd: None,
+                foreground_cwd: None,
+                terminal_title: None,
+                terminal_title_stripped: Some("build".to_owned()),
+                label: Some("UI修正".to_owned()),
+                agent: None,
+                agent_status: None,
+                scroll: None,
+                revision: None,
+                agent_session: None,
+            }],
+            layouts: Vec::new(),
+            agents: Vec::new(),
+        }
+    }
+
+    fn empty_reducer() -> (Reducer, SharedModel) {
+        Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        })
+    }
+
+    fn assert_named_topology(model: &DomainModel) {
+        assert_eq!(
+            model.tab("w1:t1").unwrap().label.as_deref(),
+            Some("レビュー")
+        );
+        assert_eq!(
+            model.pane("w1:p4").unwrap().display_name.as_deref(),
+            Some("UI修正")
+        );
+    }
+
+    #[test]
+    fn snapshot_reconciliation_preserves_captured_tab_and_pane_names() {
+        let topology = topology_from_snapshot(&snapshot_with_names()).unwrap();
+        let (mut reducer, shared) = empty_reducer();
+
+        let persist = reducer
+            .reconcile_gap(ReconcileBatch {
+                topology,
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+
+        assert_named_topology(&shared.borrow());
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertTab { tab, .. }
+                if tab.label.as_deref() == Some("レビュー")
+        )));
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertPane { pane, .. }
+                if pane.display_name.as_deref() == Some("UI修正")
+        )));
+    }
+
+    #[test]
+    fn tab_rename_keeps_watchdog_topology_probe_in_sync() {
+        let probed = topology_from_snapshot(&snapshot_with_names()).unwrap();
+        let mut initial = probed.clone();
+        initial.tabs[0].label = Some("old label".to_owned());
+        let (mut reducer, shared) = empty_reducer();
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: initial,
+                gap_kind: GapKind::Startup,
+            })
+            .unwrap();
+
+        let stale = current_model_topology(&shared, &PendingTopologyClosures::default()).unwrap();
+        assert!(!probe_topology_matches_model(probed.clone(), stale));
+
+        let normalized = normalize_event(
+            &shared,
+            "rename-session",
+            &tab_renamed_event("w1:t1", Some("レビュー")),
+        )
+        .unwrap();
+        apply_collector_observation(&mut reducer, normalized)
+            .unwrap()
+            .expect("known tab rename should apply");
+
+        let current = current_model_topology(&shared, &PendingTopologyClosures::default()).unwrap();
+        assert!(probe_topology_matches_model(probed, current));
+
+        let normalized = normalize_event(
+            &shared,
+            "rename-session",
+            &tab_renamed_event("w1:t1", Some("")),
+        )
+        .unwrap();
+        let persist = apply_collector_observation(&mut reducer, normalized)
+            .unwrap()
+            .expect("empty-label known tab rename should apply");
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::ClearTabLabel { tab_id } if tab_id == "w1:t1"
+        )));
+        assert_eq!(shared.borrow().tab("w1:t1").unwrap().label, None);
+        let mut cleared_probe = topology_from_snapshot(&snapshot_with_names()).unwrap();
+        cleared_probe.tabs[0].label = None;
+        let current = current_model_topology(&shared, &PendingTopologyClosures::default()).unwrap();
+        assert!(probe_topology_matches_model(cleared_probe, current));
+    }
+
+    #[test]
+    fn in_place_snapshot_preserves_captured_tab_and_pane_names() {
+        let named_topology = topology_from_snapshot(&snapshot_with_names()).unwrap();
+        let (mut reducer, shared) = empty_reducer();
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: named_topology.clone(),
+                gap_kind: GapKind::Startup,
+            })
+            .unwrap();
+        let mut topology = named_topology;
+        topology.tabs[0].label = None;
+        topology.panes[0].display_name = None;
+        let mut pending = PendingTopologyClosures::default();
+
+        let persist = apply_snapshot_in_place(
+            &mut reducer,
+            &shared,
+            topology,
+            "snapshot-session",
+            &mut pending,
+        )
+        .unwrap();
+
+        assert_named_topology(&shared.borrow());
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertPane { pane, .. }
+                if pane.display_name.as_deref() == Some("UI修正")
+        )));
+    }
+
+    fn flat_pane_agent_detected(
+        pane_id: &str,
+        diagnostics: PrimaryStreamDiagnosticsHandle,
+    ) -> ReceivedEvent {
+        ReceivedEvent {
+            event: "pane_agent_detected".to_owned(),
+            data: json!({
+                "agent": "claude",
+                "pane_id": pane_id,
+                "type": "pane_agent_detected",
+                "workspace_id": "w1",
+            }),
+            primary_stream_diagnostics: diagnostics,
+        }
+    }
+
+    fn nested_pane_agent_detected(diagnostics: PrimaryStreamDiagnosticsHandle) -> ReceivedEvent {
+        ReceivedEvent {
+            event: "pane_agent_detected".to_owned(),
+            data: json!({
+                "type": "pane_agent_detected",
+                "pane": {
+                    "agent": "claude",
+                    "agent_status": "working",
+                    "pane_id": "w1:p4",
+                    "tab_id": "w1:t1",
+                    "terminal_id": "terminal-4",
+                    "workspace_id": "w1",
+                },
+            }),
+            primary_stream_diagnostics: diagnostics,
+        }
+    }
+
+    fn nameless_pane_updated() -> ReceivedEvent {
+        ReceivedEvent {
+            event: "pane_updated".to_owned(),
+            data: json!({
+                "type": "pane_updated",
+                "pane": {
+                    "pane_id": "w1:p4",
+                    "tab_id": "w1:t1",
+                    "terminal_id": "terminal-4",
+                    "workspace_id": "w1",
+                },
+            }),
+            primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
+        }
+    }
+
+    fn named_reducer() -> (Reducer, SharedModel) {
+        let topology = topology_from_snapshot(&snapshot_with_names()).unwrap();
+        let (mut reducer, shared) = empty_reducer();
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology,
+                gap_kind: GapKind::Startup,
+            })
+            .unwrap();
+        (reducer, shared)
+    }
+
+    #[test]
+    fn nameless_nested_pane_agent_detected_retains_live_display_name() {
+        let (mut reducer, shared) = named_reducer();
+        let normalized = normalize_event(
+            &shared,
+            "nested-frame-session",
+            &nested_pane_agent_detected(PrimaryStreamDiagnosticsHandle::default()),
+        )
+        .unwrap();
+
+        apply_collector_observation(&mut reducer, normalized)
+            .unwrap()
+            .expect("nested pane_agent_detected should apply");
+
+        assert_eq!(
+            shared
+                .borrow()
+                .pane("w1:p4")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("UI修正")
+        );
+    }
+
+    #[test]
+    fn nameless_pane_updated_retains_live_display_name() {
+        let (mut reducer, shared) = named_reducer();
+        let normalized =
+            normalize_event(&shared, "pane-updated-session", &nameless_pane_updated()).unwrap();
+
+        apply_collector_observation(&mut reducer, normalized)
+            .unwrap()
+            .expect("pane_updated should apply");
+
+        assert_eq!(
+            shared
+                .borrow()
+                .pane("w1:p4")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("UI修正")
+        );
+    }
+
+    #[test]
+    fn flat_pane_agent_detected_counts_without_topology_mutation() {
+        let shared = known_pane_model();
+        let flat_diagnostics = PrimaryStreamDiagnosticsHandle::default();
+        let flat = flat_pane_agent_detected("w1:p4", flat_diagnostics.clone());
+
+        let normalized = normalize_event(&shared, "flat-frame-session", &flat)
+            .expect("flat pane_agent_detected should be tolerated");
+        assert!(
+            normalized.is_empty(),
+            "flat pane_agent_detected must not produce topology or persistence operations"
+        );
+        assert_eq!(flat_diagnostics.snapshot().flat_pane_agent_detected, 1);
+
+        let nested_diagnostics = PrimaryStreamDiagnosticsHandle::default();
+        let nested = nested_pane_agent_detected(nested_diagnostics.clone());
+        let normalized = normalize_event(&shared, "nested-frame-session", &nested)
+            .expect("nested pane_agent_detected should still normalize");
+        assert!(normalized.iter().any(|event| matches!(
+            event,
+            NormalizedEvent::TopologyUpsert {
+                entity: TopologyEntity::Pane(pane),
+                ..
+            } if pane.pane_id == "w1:p4"
+        )));
+        assert_eq!(nested_diagnostics.snapshot().flat_pane_agent_detected, 0);
+    }
+
+    #[test]
+    fn flat_pane_agent_detected_participates_in_resync_admission() {
+        let diagnostics = PrimaryStreamDiagnosticsHandle::default();
+        let flat_known = flat_pane_agent_detected("w1:p4", diagnostics.clone());
+        let flat_unknown = flat_pane_agent_detected("w1:p9", diagnostics.clone());
+        let nested = nested_pane_agent_detected(diagnostics);
+
+        assert_eq!(
+            updated_entity(&flat_known),
+            Some(EntityKey::Pane("w1:p4".to_owned()))
+        );
+        assert_eq!(
+            updated_entity(&nested),
+            Some(EntityKey::Pane("w1:p4".to_owned()))
+        );
+
+        let shared = known_pane_model();
+        assert!(
+            !updated_entity(&flat_known).is_some_and(|entity| !entity_exists(&shared, &entity))
+        );
+        assert!(
+            updated_entity(&flat_unknown).is_some_and(|entity| !entity_exists(&shared, &entity))
+        );
+    }
+
     fn status_received(status: &str) -> ReceivedEvent {
         ReceivedEvent {
             event: "pane_agent_status_changed".to_owned(),
@@ -7614,6 +10600,7 @@ mod tests {
                 "terminal_id": "terminal-1",
                 "agent_status": status,
             }),
+            primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
         }
     }
 
@@ -7697,6 +10684,11 @@ mod tests {
             display_ordinal: DisplayOrdinal::new(4),
             state: TaskState::Running,
             has_controller_task_state_event: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         };
         let executions = ["live", "stale"].map(|execution_id| Execution {
             execution_id: execution_id.to_owned(),
@@ -7722,6 +10714,7 @@ mod tests {
                         tab: Tab {
                             tab_id: "w1:t1".to_owned(),
                             workspace_id: "w1".to_owned(),
+                            label: None,
                         },
                         display_ordinal: DisplayOrdinal::new(2),
                     },
@@ -7731,6 +10724,7 @@ mod tests {
                             workspace_id: "w1".to_owned(),
                             tab_id: "w1:t1".to_owned(),
                             terminal_id: "terminal-1".to_owned(),
+                            display_name: None,
                         },
                         display_ordinal: DisplayOrdinal::new(3),
                     },
@@ -7989,7 +10983,10 @@ mod tests {
                 task_cancellation,
                 OwnerTracker::from_environment(),
                 None,
+                None,
                 provider,
+                LivenessPolicy::default(),
+                PrimaryStreamDiagnosticsHandle::default(),
             )
             .with_subscriber(subscriber),
         );
@@ -10310,6 +13307,11 @@ mod provider_integration_tests {
             display_ordinal: DisplayOrdinal::new(1),
             state: TaskState::Running,
             has_controller_task_state_event: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         });
         let (_sender, shared) = watch::channel(Arc::new(model));
         let event = ProviderEvent::SessionResolved {
@@ -10423,6 +13425,7 @@ mod provider_integration_tests {
                     diagnostics: test_diagnostics(),
                     operator,
                     model,
+                    primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
                     cancellation: CancellationToken::new(),
                     task: tokio::spawn(async {
                         Err(CollectorError::Task(
@@ -10478,6 +13481,7 @@ mod provider_integration_tests {
             diagnostics: test_diagnostics(),
             operator,
             model,
+            primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
             cancellation: CancellationToken::new(),
             task: tokio::spawn(async {
                 std::future::pending::<()>().await;
@@ -10511,6 +13515,11 @@ mod provider_integration_tests {
             display_ordinal: DisplayOrdinal::new(1),
             state: TaskState::EndedUnknown,
             has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         };
         let mut store = open_writer(&root).unwrap();
         store
@@ -10651,6 +13660,11 @@ mod provider_integration_tests {
             display_ordinal: DisplayOrdinal::new(1),
             state: TaskState::Running,
             has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         };
         let agent_node = AgentNode {
             agent_node_id: "gap-agent-herdr".to_owned(),
@@ -10753,6 +13767,11 @@ mod provider_integration_tests {
                 display_ordinal: DisplayOrdinal::new(1),
                 state: TaskState::Running,
                 has_controller_task_state_event: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             },
             TaskRun {
                 run_id: path_run,
@@ -10763,6 +13782,11 @@ mod provider_integration_tests {
                 display_ordinal: DisplayOrdinal::new(2),
                 state: TaskState::Running,
                 has_controller_task_state_event: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             },
             TaskRun {
                 run_id: first_parent,
@@ -10770,6 +13794,11 @@ mod provider_integration_tests {
                 display_ordinal: DisplayOrdinal::new(3),
                 state: TaskState::Running,
                 has_controller_task_state_event: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             },
             TaskRun {
                 run_id: second_parent,
@@ -10777,6 +13806,11 @@ mod provider_integration_tests {
                 display_ordinal: DisplayOrdinal::new(4),
                 state: TaskState::Running,
                 has_controller_task_state_event: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             },
         ] {
             model.insert_task_run(task_run);
@@ -10861,6 +13895,11 @@ mod provider_integration_tests {
                     display_ordinal: DisplayOrdinal::new(1),
                     state: TaskState::EndedUnknown,
                     has_controller_task_state_event: true,
+                    created_at_ms: None,
+                    updated_at_ms: None,
+                    finished_at_ms: None,
+                    subject: None,
+                    dismissed_at_ms: None,
                 },
                 native_session: None,
                 created_at_ms: 1,

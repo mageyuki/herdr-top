@@ -18,14 +18,16 @@ use herdr_top::model::{
 use herdr_top::reducer::{ApplyOutcome, Reducer};
 use herdr_top::store::{PersistOp, RestoredState, open_reader, open_writer};
 #[cfg(feature = "workload-harness")]
-use herdr_top::tui::app::{App, HeaderInputs, WorkloadFrameDriver, WorkloadFrameObservation};
+use herdr_top::tui::app::{
+    App, Clock, HeaderInputs, WorkloadFrameDriver, WorkloadFrameObservation,
+};
 #[cfg(feature = "workload-harness")]
 use ratatui::Terminal;
 #[cfg(feature = "workload-harness")]
 use ratatui::backend::TestBackend;
 
 #[cfg(feature = "workload-harness")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 #[cfg(feature = "workload-harness")]
 use std::sync::{Arc, Mutex};
 
@@ -54,6 +56,38 @@ use herdr_top::reducer::{WorkloadTimingKind, WorkloadTimingObservation, Workload
 #[cfg(feature = "workload-harness")]
 use herdr_top::store::spawn_writer;
 
+/// Real-epoch base for synthetic receipts: 24-hour hook-only visibility expiry
+/// compares model `updated_at_ms` with the collector's real sampling clock.
+static WORKLOAD_RECEIPT_TIME_BASE_MS: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+});
+
+/// Whole-second real-epoch base for deterministic workload frame-driver clocks.
+#[cfg(feature = "workload-harness")]
+static WORKLOAD_FRAME_DRIVER_EPOCH_BASE_MS: std::sync::LazyLock<i64> =
+    std::sync::LazyLock::new(|| {
+        let receipt_time_base_ms = *WORKLOAD_RECEIPT_TIME_BASE_MS;
+        receipt_time_base_ms - receipt_time_base_ms.rem_euclid(1_000)
+    });
+
+#[cfg(feature = "workload-harness")]
+struct AtomicEpochClock {
+    milliseconds: Arc<AtomicI64>,
+}
+
+#[cfg(feature = "workload-harness")]
+impl Clock for AtomicEpochClock {
+    fn now_ms(&self) -> i64 {
+        self.milliseconds.load(Ordering::SeqCst)
+    }
+}
+
 #[cfg(feature = "workload-harness")]
 fn frame_driver_for_times(
     millis: &[u64],
@@ -67,22 +101,33 @@ fn frame_driver_for_times(
         .flat_map(|millis| [Duration::from_millis(*millis); 2])
         .collect::<Vec<_>>();
     let mut clock_values = clock_values.into_iter();
+    let epoch_base_ms = *WORKLOAD_FRAME_DRIVER_EPOCH_BASE_MS;
+    let epoch_milliseconds = Arc::new(AtomicI64::new(epoch_base_ms));
     let (model_sender, model_receiver) =
         tokio::sync::watch::channel(std::sync::Arc::new(DomainModel::default()));
     let (performance_sender, performance) =
         tokio::sync::watch::channel(stamped_publication(0, 0, ObservationQuality::Live, []));
-    let app = App::new(
+    let app = App::with_clock(
         model_receiver,
         HeaderInputs {
             performance,
             ..HeaderInputs::default()
         },
+        Arc::new(AtomicEpochClock {
+            milliseconds: Arc::clone(&epoch_milliseconds),
+        }),
     );
     let terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     let driver = WorkloadFrameDriver::new(app, terminal, move || {
-        clock_values
+        let now = clock_values
             .next()
-            .expect("fixed workload clock must cover every limiter read")
+            .expect("fixed workload clock must cover every limiter read");
+        epoch_milliseconds.store(
+            i64::try_from(now.as_millis())
+                .map_or(i64::MAX, |millis| epoch_base_ms.saturating_add(millis)),
+            Ordering::SeqCst,
+        );
+        now
     });
     (driver, model_sender, performance_sender)
 }
@@ -91,9 +136,9 @@ fn frame_driver_for_times(
 #[test]
 fn workload_frame_driver_matches_production_limiter_decisions() {
     let (mut driver, _model_sender, _quality_sender) =
-        frame_driver_for_times(&[0, 50, 99, 100, 200]);
+        frame_driver_for_times(&[0, 50, 99, 100, 200, 995]);
 
-    let observations = [false, false, true, false, true]
+    let observations = [false, false, true, false, true, false]
         .into_iter()
         .map(|dirty| driver.step(dirty).unwrap())
         .collect::<Vec<_>>();
@@ -103,7 +148,7 @@ fn workload_frame_driver_matches_production_limiter_decisions() {
             .iter()
             .map(|observation| observation.draw_ordinal)
             .collect::<Vec<_>>(),
-        vec![Some(0), None, None, Some(1), Some(2)]
+        vec![Some(0), None, None, Some(1), Some(2), None]
     );
     assert_eq!(
         observations
@@ -116,6 +161,7 @@ fn workload_frame_driver_matches_production_limiter_decisions() {
             Duration::from_millis(1),
             Duration::from_millis(10),
             Duration::from_millis(10),
+            Duration::from_millis(5),
         ]
     );
 }
@@ -792,7 +838,7 @@ async fn run_schedule_through_real_queue_at(
             .controller
             .submit_workload_frame(
                 serde_json::to_vec(&wire).unwrap(),
-                i64::try_from(scheduled_ns / 1_000_000).unwrap(),
+                *WORKLOAD_RECEIPT_TIME_BASE_MS + i64::try_from(scheduled_ns / 1_000_000).unwrap(),
                 sequence,
                 scheduled_ns,
             )
@@ -3988,7 +4034,7 @@ fn prepare_startup_store(root: &StateRoot, retained_events: usize) -> Result<(),
                 metadata: EventMetadata {
                     event_id: format!("startup-retained-{index:06}"),
                     timestamp_ms: sequence,
-                    receipt_time_ms: sequence,
+                    receipt_time_ms: *WORKLOAD_RECEIPT_TIME_BASE_MS + sequence,
                     source: "workload".to_owned(),
                     source_event_type: "progress".to_owned(),
                     herdr_session: "workload-session".to_owned(),
@@ -4230,7 +4276,7 @@ fn run_schedule_with_one_frame_driver_stall(stall: Duration) -> CoalescingResult
                     metadata: EventMetadata {
                         event_id: event.event_id,
                         timestamp_ms: event.emitted_at_ms,
-                        receipt_time_ms: sequence as i64,
+                        receipt_time_ms: *WORKLOAD_RECEIPT_TIME_BASE_MS + sequence as i64,
                         source: event.source,
                         source_event_type: event.event_type,
                         herdr_session: "workload-session".to_owned(),
@@ -4258,7 +4304,7 @@ fn run_schedule_with_one_frame_driver_stall(stall: Duration) -> CoalescingResult
                     metadata: EventMetadata {
                         event_id: format!("probe-frontier-{sequence:04}"),
                         timestamp_ms: sequence as i64,
-                        receipt_time_ms: sequence as i64,
+                        receipt_time_ms: *WORKLOAD_RECEIPT_TIME_BASE_MS + sequence as i64,
                         source: "provider".to_owned(),
                         source_event_type: "probe_frontier".to_owned(),
                         herdr_session: "workload-session".to_owned(),

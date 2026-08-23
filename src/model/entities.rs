@@ -10,6 +10,13 @@ use serde::{Deserialize, Serialize};
 use super::ids::{DisplayOrdinal, Provider, RunId, RunKey};
 use super::state::{ExecState, TaskState};
 
+/// Operator intent delivered to the collector-owned reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperatorCommand {
+    /// Persistently dismisses every currently clearable task run.
+    DismissClearable,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Workspace {
     pub workspace_id: String,
@@ -19,6 +26,8 @@ pub struct Workspace {
 pub struct Tab {
     pub tab_id: String,
     pub workspace_id: String,
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -27,6 +36,8 @@ pub struct Pane {
     pub workspace_id: String,
     pub tab_id: String,
     pub terminal_id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -45,6 +56,29 @@ pub struct TaskRun {
     pub display_ordinal: DisplayOrdinal,
     pub state: TaskState,
     pub has_controller_task_state_event: bool,
+    #[serde(default)]
+    pub created_at_ms: Option<i64>,
+    #[serde(default)]
+    pub updated_at_ms: Option<i64>,
+    #[serde(default)]
+    pub finished_at_ms: Option<i64>,
+    #[serde(default)]
+    pub subject: Option<String>,
+    #[serde(default)]
+    pub dismissed_at_ms: Option<i64>,
+}
+
+impl TaskRun {
+    /// Advances bookkeeping for a mutation observed at `timestamp_ms` receipt time.
+    pub fn touch(&mut self, timestamp_ms: i64) {
+        self.updated_at_ms = Some(timestamp_ms);
+        if self.state.is_terminal() {
+            self.finished_at_ms.get_or_insert(timestamp_ms);
+        } else {
+            self.finished_at_ms = None;
+            self.dismissed_at_ms = None;
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -839,7 +873,7 @@ pub struct ControllerEvent {
     pub event: ControllerEventKind,
 }
 
-/// The eight Controller event types with their required endpoint carried by the variant.
+/// The nine Controller event types with their required endpoint carried by the variant.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "event_type")]
 pub enum ControllerEventKind {
@@ -851,6 +885,7 @@ pub enum ControllerEventKind {
     Complete,
     Failed,
     Cancelled,
+    Dismiss,
 }
 
 /// Returned when a wire progress number is not finite or outside `0.0..=1.0`.
@@ -970,6 +1005,8 @@ pub struct PaneSnapshot {
     pub workspace_id: String,
     pub tab_id: String,
     pub terminal_id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
     pub agent: Option<SnapshotAgent>,
     pub agent_session: Option<AgentSessionReference>,
 }
@@ -1017,12 +1054,14 @@ mod tests {
         model.insert_tab(Tab {
             tab_id: "tab-1".to_owned(),
             workspace_id: "workspace-1".to_owned(),
+            label: None,
         });
         model.insert_pane(Pane {
             pane_id: "pane-1".to_owned(),
             workspace_id: "workspace-1".to_owned(),
             tab_id: "tab-1".to_owned(),
             terminal_id: "terminal-1".to_owned(),
+            display_name: None,
         });
         model.insert_task_run(TaskRun {
             run_id,
@@ -1030,6 +1069,11 @@ mod tests {
             display_ordinal: DisplayOrdinal::new(3),
             state: TaskState::Running,
             has_controller_task_state_event: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         });
         model.insert_task_run(TaskRun {
             run_id: dependency_id,
@@ -1037,6 +1081,11 @@ mod tests {
             display_ordinal: DisplayOrdinal::new(4),
             state: TaskState::Queued,
             has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         });
         model.insert_execution(Execution {
             execution_id: "execution-1".to_owned(),
@@ -1128,12 +1177,14 @@ mod tests {
             tabs: vec![Tab {
                 tab_id: "tab-1".to_owned(),
                 workspace_id: "workspace-1".to_owned(),
+                label: None,
             }],
             panes: vec![PaneSnapshot {
                 pane_id: "pane-1".to_owned(),
                 workspace_id: "workspace-1".to_owned(),
                 tab_id: "tab-1".to_owned(),
                 terminal_id: "terminal-1".to_owned(),
+                display_name: Some("Build".to_owned()),
                 agent: Some(SnapshotAgent {
                     agent_name: "codex".to_owned(),
                     state: ExecState::Working,
@@ -1152,6 +1203,21 @@ mod tests {
             serde_json::from_str::<TopologySnapshot>(&encoded).unwrap(),
             snapshot
         );
+    }
+
+    #[test]
+    fn pane_snapshot_display_name_defaults_to_none_when_absent() {
+        let pane = serde_json::from_value::<PaneSnapshot>(serde_json::json!({
+            "pane_id": "pane-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "terminal_id": "terminal-1",
+            "agent": null,
+            "agent_session": null,
+        }))
+        .unwrap();
+
+        assert_eq!(pane.display_name, None);
     }
 
     #[test]

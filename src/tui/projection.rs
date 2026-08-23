@@ -6,8 +6,9 @@ use std::ffi::OsStr;
 use std::path::Path;
 
 use crate::activity::{
-    ActivityDurability, ActivityItem, DEFAULT_TERMINAL_VISIBILITY_MS, OperatorSnapshot,
-    is_default_visible_task_run,
+    ActivityDurability, ActivityItem, DEFAULT_TERMINAL_VISIBILITY_MS,
+    HOOK_ONLY_STALE_VISIBILITY_MS, OperatorSnapshot, is_default_visible_task_run,
+    runs_with_executions,
 };
 use crate::diagnostics::{ControllerInputStatus, RuntimeDiagnosticsSnapshot};
 use crate::herdr::collector::ObservationQuality;
@@ -43,8 +44,14 @@ pub(crate) enum DetailEntity {
     },
     Run {
         run_id: RunId,
+        key: String,
         name: String,
+        native_session_id: Option<String>,
         state: TaskState,
+        created_at_ms: Option<i64>,
+        updated_at_ms: Option<i64>,
+        finished_at_ms: Option<i64>,
+        dismissed_at_ms: Option<i64>,
     },
     Agent {
         agent_node_id: String,
@@ -123,14 +130,15 @@ pub(crate) fn project_rows(
             }
         };
         return RowProjection {
+            next_expiry_ms: next_live_duration_expiry_ms(model, &rows, now_ms),
             rows,
-            next_expiry_ms: None,
         };
     }
 
     let mut visible = Vec::with_capacity(full_rows.len());
     let mut hidden_subtree_depth = None;
     let mut next_expiry_ms: Option<i64> = None;
+    let execution_run_ids = runs_with_executions(model);
     for row in full_rows {
         if hidden_subtree_depth.is_some_and(|depth| row.depth > depth) {
             continue;
@@ -143,11 +151,18 @@ pub(crate) fn project_rows(
         let Some(run) = model.task_run(&run_id) else {
             continue;
         };
-        if is_default_visible_task_run(run, operator, now_ms) {
+        if is_default_visible_task_run(run, operator, &execution_run_ids, now_ms) {
             if run.state.is_terminal()
                 && let Some(first_terminal_ms) = operator.terminal_times.get(&run_id).copied()
             {
                 let expiry = first_terminal_ms.saturating_add(DEFAULT_TERMINAL_VISIBILITY_MS);
+                next_expiry_ms = Some(next_expiry_ms.map_or(expiry, |current| current.min(expiry)));
+            }
+            if matches!(run.key, RunKey::Controller(_))
+                && !execution_run_ids.contains(&run.run_id)
+                && let Some(updated_at_ms) = run.updated_at_ms
+            {
+                let expiry = updated_at_ms.saturating_add(HOOK_ONLY_STALE_VISIBILITY_MS);
                 next_expiry_ms = Some(next_expiry_ms.map_or(expiry, |current| current.min(expiry)));
             }
             visible.push(row.clone());
@@ -161,10 +176,33 @@ pub(crate) fn project_rows(
     } else {
         visible
     };
+    if let Some(duration_expiry_ms) = next_live_duration_expiry_ms(model, &rows, now_ms) {
+        next_expiry_ms = Some(next_expiry_ms.map_or(duration_expiry_ms, |current| {
+            current.min(duration_expiry_ms)
+        }));
+    }
     RowProjection {
         rows,
         next_expiry_ms,
     }
+}
+
+fn next_live_duration_expiry_ms(model: &DomainModel, rows: &[TreeRow], now_ms: i64) -> Option<i64> {
+    let renders_live_duration = rows
+        .iter()
+        .filter_map(|row| row.key.run_id())
+        .filter_map(|run_id| model.task_run(&run_id))
+        .filter(|run| !run.state.is_terminal())
+        .filter_map(|run| run.created_at_ms)
+        .filter_map(|created_at_ms| now_ms.checked_sub(created_at_ms))
+        .any(|elapsed_ms| elapsed_ms >= 0);
+    if !renders_live_duration {
+        return None;
+    }
+
+    now_ms
+        .checked_sub(now_ms.rem_euclid(1_000))?
+        .checked_add(1_000)
 }
 
 fn retain_tree_matches(rows: &[TreeRow], direct: &[usize]) -> Vec<TreeRow> {
@@ -382,8 +420,14 @@ fn detail_entity(model: &DomainModel, selected: &NodeKey, home: Option<&OsStr>) 
                 .task_run(run_id)
                 .map_or(DetailEntity::Missing, |run| DetailEntity::Run {
                     run_id: *run_id,
+                    key: detail_run_key(run_id, &run.key),
                     name: safe_run_name(run_id, &run.key),
+                    native_session_id: bound_native_session_id(model, run_id, &run.key),
                     state: run.state,
+                    created_at_ms: run.created_at_ms,
+                    updated_at_ms: run.updated_at_ms,
+                    finished_at_ms: run.finished_at_ms,
+                    dismissed_at_ms: run.dismissed_at_ms,
                 })
         }
         NodeKey::Agent { agent_node_id, .. } => {
@@ -558,13 +602,28 @@ fn entity_lines(entity: &DetailEntity) -> Vec<String> {
         ],
         DetailEntity::Run {
             run_id,
+            key,
             name,
+            native_session_id,
             state,
+            created_at_ms,
+            updated_at_ms,
+            finished_at_ms,
+            dismissed_at_ms,
         } => vec![
             "entity: task_run".to_owned(),
+            format!("key: {key}"),
             format!("run_id: {run_id}"),
             format!("name: {name}"),
+            format!(
+                "native_session_id: {}",
+                native_session_id.as_deref().unwrap_or("unknown")
+            ),
             format!("state: {}", task_state_name(*state)),
+            format!("created_at_ms: {}", timestamp_text(*created_at_ms)),
+            format!("updated_at_ms: {}", timestamp_text(*updated_at_ms)),
+            format!("finished_at_ms: {}", timestamp_text(*finished_at_ms)),
+            format!("dismissed_at_ms: {}", timestamp_text(*dismissed_at_ms)),
             "scope: semantic run and agent descendants".to_owned(),
         ],
         DetailEntity::Agent {
@@ -676,6 +735,41 @@ pub(crate) fn safe_run_name(run_id: &RunId, key: &RunKey) -> String {
     }
 }
 
+fn detail_run_key(run_id: &RunId, key: &RunKey) -> String {
+    match key {
+        RunKey::Controller(name) => escape_controls(name),
+        RunKey::Native { .. } | RunKey::NativePath { .. } | RunKey::Provisional { .. } => {
+            safe_run_name(run_id, key)
+        }
+    }
+}
+
+/// Uses a native run's own session id; otherwise chooses the bound agent session with the
+/// greatest `(last_activity_at_ms, agent_node_id)` tuple so unordered model iteration is stable.
+fn bound_native_session_id(model: &DomainModel, run_id: &RunId, key: &RunKey) -> Option<String> {
+    if let RunKey::Native { sid, .. } = key {
+        return Some(escape_controls(sid));
+    }
+    model
+        .agent_nodes()
+        .filter(|agent| agent.task_run_id == *run_id)
+        .filter_map(|agent| {
+            agent
+                .native_session_id
+                .as_deref()
+                .map(|native_session_id| (agent, native_session_id))
+        })
+        .max_by(|(left, _), (right, _)| {
+            (left.last_activity_at_ms, left.agent_node_id.as_str())
+                .cmp(&(right.last_activity_at_ms, right.agent_node_id.as_str()))
+        })
+        .map(|(_, native_session_id)| escape_controls(native_session_id))
+}
+
+fn timestamp_text(timestamp_ms: Option<i64>) -> String {
+    timestamp_ms.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+}
+
 pub(crate) const fn provider_name(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "Claude",
@@ -754,6 +848,11 @@ mod tests {
             display_ordinal: DisplayOrdinal::new(ordinal),
             state,
             has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
         }
     }
 
@@ -970,6 +1069,397 @@ mod tests {
             now + 1,
         );
         assert_eq!(restored.rows[0].key.run_id(), Some(live.run_id));
+    }
+
+    #[test]
+    fn hook_only_run_schedules_twenty_four_hour_expiry() {
+        let mut hook_only = run("hook-only", 1, TaskState::Running);
+        hook_only.updated_at_ms = Some(10);
+        let mut model = DomainModel::default();
+        model.insert_task_run(hook_only.clone());
+        let rows = vec![row(
+            NodeKey::Run {
+                run_id: hook_only.run_id,
+                pane_id: None,
+            },
+            0,
+            "Task Run: hook-only [running]",
+        )];
+
+        let projection = project_rows(
+            &model,
+            &rows,
+            &operator(Vec::new(), HashMap::new()),
+            "",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            20,
+        );
+
+        assert_eq!(projection.rows.len(), 1);
+        assert_eq!(projection.next_expiry_ms, Some(86_400_010));
+    }
+
+    #[test]
+    fn hook_only_and_live_duration_deadlines_choose_the_minimum_in_both_directions() {
+        let mut hook_only = run("hook-only", 1, TaskState::Running);
+        hook_only.created_at_ms = Some(0);
+        hook_only.updated_at_ms = Some(1);
+        let mut model = DomainModel::default();
+        model.insert_task_run(hook_only.clone());
+        let rows = vec![row(
+            NodeKey::Run {
+                run_id: hook_only.run_id,
+                pane_id: None,
+            },
+            0,
+            "Task Run: hook-only [running]",
+        )];
+        let operator = operator(Vec::new(), HashMap::new());
+
+        let duration_first = project_rows(
+            &model,
+            &rows,
+            &operator,
+            "",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            500,
+        );
+        assert_eq!(duration_first.next_expiry_ms, Some(1_000));
+
+        let hook_only_first = project_rows(
+            &model,
+            &rows,
+            &operator,
+            "",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            86_400_000,
+        );
+        assert_eq!(hook_only_first.next_expiry_ms, Some(86_400_001));
+    }
+
+    #[test]
+    fn projection_uses_earliest_terminal_or_hook_only_expiry() {
+        let mut hook_only = run("hook-only", 1, TaskState::Running);
+        hook_only.updated_at_ms = Some(16_000_001);
+        let terminal = run("terminal", 2, TaskState::Completed);
+        let mut model = DomainModel::default();
+        model.insert_task_run(hook_only.clone());
+        model.insert_task_run(terminal.clone());
+        let rows = [&hook_only, &terminal]
+            .into_iter()
+            .map(|task_run| {
+                row(
+                    NodeKey::Run {
+                        run_id: task_run.run_id,
+                        pane_id: None,
+                    },
+                    0,
+                    "Task Run",
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let projection = project_rows(
+            &model,
+            &rows,
+            &operator(Vec::new(), HashMap::from([(terminal.run_id, 99_000_000)])),
+            "",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            100_000_000,
+        );
+
+        assert_eq!(projection.rows.len(), 2);
+        assert_eq!(projection.next_expiry_ms, Some(102_400_001));
+    }
+
+    #[test]
+    fn filtered_visible_live_duration_ticks_but_filtered_or_collapsed_rows_do_not() {
+        let mut live = run("live", 1, TaskState::Running);
+        live.created_at_ms = Some(100);
+        let mut model = DomainModel::default();
+        model.insert_task_run(live.clone());
+        let run_row = row(
+            NodeKey::Run {
+                run_id: live.run_id,
+                pane_id: None,
+            },
+            1,
+            "live row",
+        );
+        let operator = operator(Vec::new(), HashMap::new());
+
+        let filtered_visible = project_rows(
+            &model,
+            std::slice::from_ref(&run_row),
+            &operator,
+            &live.run_id.to_string(),
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            500,
+        );
+        assert_eq!(filtered_visible.rows.len(), 1);
+        assert_eq!(filtered_visible.next_expiry_ms, Some(1_000));
+
+        let filtered_out = project_rows(
+            &model,
+            std::slice::from_ref(&run_row),
+            &operator,
+            "no-match",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            500,
+        );
+        assert!(filtered_out.rows.is_empty());
+        assert_eq!(filtered_out.next_expiry_ms, None);
+
+        let parent = row(NodeKey::Pane("pane".to_owned()), 0, "pane");
+        let collapsed = project_rows(
+            &model,
+            &[parent.clone(), run_row],
+            &operator,
+            "",
+            &HashSet::from([parent.key]),
+            ViewMode::ExecutionTree,
+            500,
+        );
+        assert_eq!(collapsed.rows.len(), 1);
+        assert_eq!(collapsed.next_expiry_ms, None);
+    }
+
+    #[test]
+    fn phase_distinct_live_runs_share_one_wall_aligned_duration_deadline() {
+        let mut model = DomainModel::default();
+        let runs = [
+            ("phase-zero", 0),
+            ("phase-quarter", 250),
+            ("phase-nine-hundred", 900),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (label, created_at_ms))| {
+            let mut live = run(label, index as i64 + 1, TaskState::Running);
+            live.created_at_ms = Some(created_at_ms);
+            model.insert_task_run(live.clone());
+            live
+        })
+        .collect::<Vec<_>>();
+        let rows = runs
+            .iter()
+            .map(|live| {
+                row(
+                    NodeKey::Run {
+                        run_id: live.run_id,
+                        pane_id: None,
+                    },
+                    0,
+                    "live row",
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let projection = project_rows(
+            &model,
+            &rows,
+            &operator(Vec::new(), HashMap::new()),
+            "",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            1_500,
+        );
+
+        assert_eq!(projection.rows.len(), 3);
+        assert_eq!(projection.next_expiry_ms, Some(2_000));
+    }
+
+    #[test]
+    fn clock_skewed_live_duration_does_not_arm_a_deadline() {
+        let mut live = run("live", 1, TaskState::Running);
+        live.created_at_ms = Some(501);
+        let mut model = DomainModel::default();
+        model.insert_task_run(live.clone());
+        let rows = vec![row(
+            NodeKey::Run {
+                run_id: live.run_id,
+                pane_id: None,
+            },
+            0,
+            "live row",
+        )];
+
+        let projection = project_rows(
+            &model,
+            &rows,
+            &operator(Vec::new(), HashMap::new()),
+            "",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            500,
+        );
+
+        assert_eq!(projection.rows.len(), 1);
+        assert_eq!(projection.next_expiry_ms, None);
+    }
+
+    #[test]
+    fn dismissed_run_contributes_no_projection_expiry() {
+        let mut dismissed = run("dismissed", 1, TaskState::Running);
+        dismissed.updated_at_ms = Some(10);
+        dismissed.dismissed_at_ms = Some(20);
+        let mut model = DomainModel::default();
+        model.insert_task_run(dismissed.clone());
+        let rows = vec![row(
+            NodeKey::Run {
+                run_id: dismissed.run_id,
+                pane_id: None,
+            },
+            0,
+            "Task Run: dismissed [running]",
+        )];
+
+        let projection = project_rows(
+            &model,
+            &rows,
+            &operator(Vec::new(), HashMap::new()),
+            "",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            20,
+        );
+
+        assert!(projection.rows.is_empty());
+        assert_eq!(projection.next_expiry_ms, None);
+    }
+
+    #[test]
+    fn run_detail_carries_hidden_controller_identity_session_and_timestamps() {
+        let full_key = "hook:claude-code:session-42:task:T";
+        let mut selected = run(full_key, 1, TaskState::Completed);
+        selected.subject = Some("Readable subject".to_owned());
+        selected.created_at_ms = Some(1_000);
+        selected.updated_at_ms = Some(4_000);
+        selected.finished_at_ms = Some(5_000);
+        selected.dismissed_at_ms = None;
+        let lower = AgentNode {
+            agent_node_id: "agent-a".to_owned(),
+            provider: Provider::Claude,
+            native_session_id: Some("native-lower".to_owned()),
+            task_run_id: selected.run_id,
+            display_ordinal: DisplayOrdinal::new(2),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Ended),
+            model_id: Some("model-lower".to_owned()),
+            last_event_kind: Some("message".to_owned()),
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: Some(4_000),
+            session_file: None,
+        };
+        let higher = AgentNode {
+            agent_node_id: "agent-z".to_owned(),
+            native_session_id: Some("native-higher".to_owned()),
+            ..lower.clone()
+        };
+        let mut model = DomainModel::default();
+        model.insert_task_run(selected.clone());
+        for agent in [higher, lower] {
+            model.insert_agent_node(agent);
+        }
+
+        let newest_agents = crate::tui::view::newest_agent_nodes(&model);
+        let label = crate::tui::view::task_run_label(
+            &model,
+            &selected,
+            false,
+            9_000,
+            newest_agents.get(&selected.run_id).copied(),
+        );
+        assert!(!label.contains(full_key));
+        let selected_row = row(
+            NodeKey::Run {
+                run_id: selected.run_id,
+                pane_id: None,
+            },
+            0,
+            &label,
+        );
+        let detail = detail_projection(
+            &model,
+            std::slice::from_ref(&selected_row),
+            &operator(Vec::new(), HashMap::new()),
+            &selected_row.key,
+            ViewMode::DependencyDag,
+            None,
+        );
+        let lines = detail_lines(&detail);
+
+        assert!(lines.contains(&format!("key: {full_key}")));
+        assert!(lines.contains(&format!("run_id: {}", selected.run_id)));
+        assert!(lines.contains(&"native_session_id: native-higher".to_owned()));
+        assert!(lines.contains(&"created_at_ms: 1000".to_owned()));
+        assert!(lines.contains(&"updated_at_ms: 4000".to_owned()));
+        assert!(lines.contains(&"finished_at_ms: 5000".to_owned()));
+        assert!(lines.contains(&"dismissed_at_ms: unknown".to_owned()));
+    }
+
+    #[test]
+    fn native_run_detail_prefers_key_session_and_marks_missing_times_unknown() {
+        let mut selected = run("native", 1, TaskState::Running);
+        selected.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "key-native-session".to_owned(),
+        };
+        let agent = AgentNode {
+            agent_node_id: "agent-newer".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some("agent-native-session".to_owned()),
+            task_run_id: selected.run_id,
+            display_ordinal: DisplayOrdinal::new(2),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Working),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: Some(10),
+            session_file: None,
+        };
+        let mut model = DomainModel::default();
+        model.insert_task_run(selected.clone());
+        model.insert_agent_node(agent);
+        let selected_row = row(
+            NodeKey::Run {
+                run_id: selected.run_id,
+                pane_id: None,
+            },
+            0,
+            "native run",
+        );
+
+        let detail = detail_projection(
+            &model,
+            std::slice::from_ref(&selected_row),
+            &operator(Vec::new(), HashMap::new()),
+            &selected_row.key,
+            ViewMode::DependencyDag,
+            None,
+        );
+        let lines = detail_lines(&detail);
+
+        assert!(lines.contains(&"native_session_id: key-native-session".to_owned()));
+        for field in [
+            "created_at_ms: unknown",
+            "updated_at_ms: unknown",
+            "finished_at_ms: unknown",
+            "dismissed_at_ms: unknown",
+        ] {
+            assert!(lines.contains(&field.to_owned()));
+        }
     }
 
     #[test]
@@ -1247,10 +1737,11 @@ mod tests {
             dependent_run_id: child.run_id,
         });
 
-        let tree_label = crate::tui::view::task_run_label(&model, &child, false);
+        let tree_label = crate::tui::view::task_run_label(&model, &child, false, 0, None);
         let mut dag_order = crate::tui::dag::DagOrder::default();
         dag_order.recompute(&model);
-        let dag_text = crate::tui::dag::build_rows(&model, &dag_order)
+        let newest_agents = crate::tui::view::newest_agent_nodes(&model);
+        let dag_text = crate::tui::dag::build_rows(&model, &dag_order, 0, &newest_agents)
             .into_iter()
             .flat_map(|row| {
                 std::iter::once(row.label)
@@ -1271,7 +1762,7 @@ mod tests {
                 pane_id: Some("pane".to_owned()),
             },
             0,
-            &crate::tui::view::task_run_label(&model, &child, false),
+            &crate::tui::view::task_run_label(&model, &child, false, 0, None),
         );
         let tied = operator(
             vec![

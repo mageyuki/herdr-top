@@ -629,6 +629,11 @@ fn render_new_tui_surfaces(collector: &collector::CollectorHandle) -> Vec<(&'sta
         display_ordinal: DisplayOrdinal::new(i64::MAX),
         state: TaskState::Running,
         has_controller_task_state_event: true,
+        created_at_ms: None,
+        updated_at_ms: None,
+        finished_at_ms: None,
+        subject: None,
+        dismissed_at_ms: None,
     });
     let (_model_sender, model_receiver) =
         tokio::sync::watch::channel(std::sync::Arc::new(tui_model));

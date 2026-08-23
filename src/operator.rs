@@ -94,6 +94,7 @@ impl OperatorProjection {
                 | PersistOp::UpsertPane { .. }
                 | PersistOp::DeleteWorkspace { .. }
                 | PersistOp::DeleteTab { .. }
+                | PersistOp::ClearTabLabel { .. }
                 | PersistOp::DeletePane { .. }
                 | PersistOp::UpsertExecution(_)
                 | PersistOp::UpsertAgentNode(_)
@@ -397,6 +398,11 @@ mod tests {
                 display_ordinal: DisplayOrdinal::new(ordinal),
                 state,
                 has_controller_task_state_event: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
             },
             native_session: None,
             created_at_ms: updated_at_ms,

@@ -42,7 +42,7 @@ providers use the same case-sensitive PascalCase event names.
 | `SubagentStop` | both | `complete` | subagent run |
 | `TaskCreated` | Claude Code only | `dispatch`, then `progress`; label is the task subject | task run |
 | `TaskCompleted` | Claude Code only | `complete` | task run |
-| `SessionEnd` | both | nothing | none |
+| `SessionEnd` | both | `dismiss` | session run |
 | any other event | both | nothing | none |
 
 Codex has no `TaskCreated` or `TaskCompleted` equivalent, so task runs appear
@@ -71,6 +71,8 @@ permission-guard hooks, and those handlers must remain present.
   "hooks": {
     "SessionStart": [{"hooks": [{"type": "command",
       "command": "herdr-top emit --from-hook claude-code"}]}],
+    "SessionEnd": [{"hooks": [{"type": "command",
+      "command": "herdr-top emit --from-hook claude-code"}]}],
     "SubagentStart": [{"hooks": [{"type": "command",
       "command": "herdr-top emit --from-hook claude-code"}]}],
     "SubagentStop": [{"hooks": [{"type": "command",
@@ -94,6 +96,8 @@ contain Herdr's own integration hooks and guard hooks; preserve all of them.
 {
   "hooks": {
     "SessionStart": [{"hooks": [{"type": "command",
+      "command": "herdr-top emit --from-hook codex"}]}],
+    "SessionEnd": [{"hooks": [{"type": "command",
       "command": "herdr-top emit --from-hook codex"}]}],
     "SubagentStart": [{"hooks": [{"type": "command",
       "command": "herdr-top emit --from-hook codex"}]}],
@@ -253,11 +257,13 @@ controller rejects it with reason `stale_event`. The adapter treats that reason
 as benign: it logs it to standard error, continues delivery, and does not count
 it as a delivery failure or a `--strict` failure.
 
-`SessionEnd` is deliberately mapped to nothing. The adapter exits 0 silently for
-that event. Sessions routinely resume, while a resumed `task_started` would be
-rejected as `stale_event` if the session run had already been made terminal.
-Session-run liveness instead follows observed executions. Do not register
-`SessionEnd`; it delivers nothing, and its silence is not a failure.
+`SessionEnd` maps to the non-terminal `dismiss` event. The session run disappears
+from the default view immediately without changing its task state. If the
+provider later resumes the session, `SessionStart` emits `task_started`; that
+activity clears the dismissal and makes the run visible again. An unknown
+session run is left untouched rather than being created solely for dismissal.
+The decision and rejected terminal-state alternative are documented in
+[Session end auto-dismiss](../adr/2026-08-22-session-end-auto-dismiss.md).
 
 When no Herdr session can be resolved, the adapter delivers nothing, warns on
 standard error, and exits 0. This is the expected outcome for an agent session
