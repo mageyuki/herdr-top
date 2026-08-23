@@ -402,91 +402,6 @@ impl DiscoveryIndex {
         })
     }
 
-    /// Rescans roots, bootstrapping only newly discovered allowlisted files.
-    pub fn scan(
-        &mut self,
-        parser: &mut impl BootstrapParser,
-        interner: &mut PathInterner,
-    ) -> io::Result<DiscoveryScanOutcome> {
-        let mut seen = HashSet::new();
-        let mut dirty_roots = HashSet::new();
-        let mut outcome = DiscoveryScanOutcome::default();
-        for root in self.roots.clone() {
-            let mut root_seen = HashSet::new();
-            let discovery = discover_artifacts(&root.path, false)?;
-            outcome.file_io_error |= discovery.had_errors;
-            if discovery.had_errors {
-                dirty_roots.insert(root.path.clone());
-            }
-            for artifact in discovery.artifacts {
-                let relative = artifact.relative_path;
-                let absolute = root.path.join(&relative);
-                let file_key = (root.provider, absolute.clone());
-                root_seen.insert(absolute.clone());
-                seen.insert(file_key.clone());
-                if let Some(existing) = self.files.get_mut(&file_key) {
-                    existing.modified_ms = artifact.modified_ms;
-                    continue;
-                }
-                let path_id = match interner.intern(&absolute) {
-                    Ok(path_id) => path_id,
-                    Err(_) => {
-                        outcome.file_io_error = true;
-                        continue;
-                    }
-                };
-                let bootstrap = match bootstrap_file(&root, &relative, parser) {
-                    Ok(bootstrap) => bootstrap,
-                    Err(_) => {
-                        outcome.file_io_error = true;
-                        continue;
-                    }
-                };
-                if let Some(identity) = bootstrap.as_ref()
-                    && valid_native_id(&identity.thread_id)
-                    && identity
-                        .parent_thread_id
-                        .as_deref()
-                        .is_none_or(valid_native_id)
-                {
-                    self.identities.insert(
-                        (root.provider, identity.thread_id.clone()),
-                        DiscoveredIdentity {
-                            path: absolute.clone(),
-                            parent_thread_id: identity.parent_thread_id.clone(),
-                        },
-                    );
-                }
-                self.files.insert(
-                    file_key,
-                    DiscoveredFile {
-                        provider: root.provider,
-                        root: root.path.clone(),
-                        relative_path: relative,
-                        modified_ms: artifact.modified_ms,
-                        path_id,
-                        bootstrap,
-                    },
-                );
-            }
-            if !discovery.had_errors {
-                self.baseline.retain_existing(&root.path, &root_seen);
-            }
-        }
-        self.files.retain(|key, file| {
-            if seen.contains(key) || dirty_roots.contains(&file.root) {
-                true
-            } else {
-                outcome.removed_path_ids.push(file.path_id);
-                false
-            }
-        });
-        outcome.removed_path_ids.sort_unstable();
-        outcome.removed_path_ids.dedup();
-        self.rebuild_identities();
-        Ok(outcome)
-    }
-
     fn rebuild_identities(&mut self) {
         self.identities.clear();
         self.agent_paths.clear();
@@ -561,7 +476,7 @@ impl DiscoveryIndex {
 impl DiscoveryIndex {
     /// Production provider-lane rescan. Identity inventory is built from names only;
     /// admission and mtime are checked before structural bootstrap opens a descriptor.
-    pub(crate) fn scan_admitted(
+    pub fn scan_admitted(
         &mut self,
         parser: &mut impl BootstrapParser,
         interner: &mut PathInterner,
@@ -670,15 +585,6 @@ impl DiscoveryIndex {
         self.rebuild_identities();
         Ok(outcome)
     }
-}
-
-fn bootstrap_file(
-    root: &DiscoveryRoot,
-    relative: &Path,
-    parser: &mut impl BootstrapParser,
-) -> io::Result<Option<BootstrapIdentity>> {
-    let mut file = open_contained_regular_file(&root.path, relative)?;
-    parse_bootstrap_prefix(root, relative, parser, &mut file)
 }
 
 fn bootstrap_file_admitted(
@@ -2143,6 +2049,27 @@ mod tests {
         }
     }
 
+    fn scan_admitted_fixture(
+        index: &mut DiscoveryIndex,
+        parser: &mut impl BootstrapParser,
+        interner: &mut PathInterner,
+    ) -> io::Result<DiscoveryScanOutcome> {
+        let mut admission = lane::Admission::new(0);
+        for root in index.roots.clone() {
+            for artifact in discover_artifacts(&root.path, false)?.artifacts {
+                admission
+                    .admit_pane_artifact(root.provider, &root.path.join(artifact.relative_path));
+            }
+        }
+        index.scan_admitted(
+            parser,
+            interner,
+            &admission,
+            &mut lane::AdmissionIndex::new(),
+            &ProviderDiagnostics::default(),
+        )
+    }
+
     #[test]
     fn bootstrap_skips_non_structural_first_line_and_obeys_caps() {
         let directory = tempfile::tempdir().unwrap();
@@ -2159,7 +2086,7 @@ mod tests {
         let mut parser = LineParser { calls: 0 };
         let mut interner = PathInterner::default();
 
-        index.scan(&mut parser, &mut interner).unwrap();
+        scan_admitted_fixture(&mut index, &mut parser, &mut interner).unwrap();
 
         assert_eq!(parser.calls, 2);
         assert_eq!(
@@ -2191,9 +2118,7 @@ mod tests {
         let mut capped_parser = LineParser { calls: 0 };
         let mut capped_interner = PathInterner::default();
 
-        capped_index
-            .scan(&mut capped_parser, &mut capped_interner)
-            .unwrap();
+        scan_admitted_fixture(&mut capped_index, &mut capped_parser, &mut capped_interner).unwrap();
 
         assert!(capped_index.resolve(Provider::Codex, "too-late").is_none());
         assert!(
@@ -2222,13 +2147,45 @@ mod tests {
         let mut parser = LineParser { calls: 0 };
         let mut interner = PathInterner::default();
 
-        index.scan(&mut parser, &mut interner).unwrap();
+        scan_admitted_fixture(&mut index, &mut parser, &mut interner).unwrap();
         let original_id = index.files()[0].path_id;
-        index.scan(&mut parser, &mut interner).unwrap();
+        scan_admitted_fixture(&mut index, &mut parser, &mut interner).unwrap();
 
         assert_eq!(index.files().len(), 1);
         assert_eq!(index.files()[0].path_id, original_id);
         assert_eq!(parser.calls, 1);
+    }
+
+    #[test]
+    fn scan_admitted_never_bootstraps_an_unadmitted_fixture() {
+        let directory = tempfile::tempdir().unwrap();
+        let admitted = directory.path().join("admitted.jsonl");
+        let stranger = directory.path().join("stranger.jsonl");
+        fs::write(&admitted, b"struct:admitted\n").unwrap();
+        fs::write(&stranger, b"struct:stranger\n").unwrap();
+        let mut index = DiscoveryIndex::new(vec![DiscoveryRoot {
+            provider: Provider::Claude,
+            path: directory.path().to_path_buf(),
+        }])
+        .unwrap();
+        let mut admission = lane::Admission::new(0);
+        admission.admit_pane_artifact(Provider::Claude, &admitted);
+        let mut parser = LineParser { calls: 0 };
+
+        index
+            .scan_admitted(
+                &mut parser,
+                &mut PathInterner::default(),
+                &admission,
+                &mut lane::AdmissionIndex::new(),
+                &ProviderDiagnostics::default(),
+            )
+            .unwrap();
+
+        assert_eq!(parser.calls, 1);
+        assert_eq!(index.files().len(), 1);
+        assert_eq!(index.files()[0].relative_path, Path::new("admitted.jsonl"));
+        assert!(index.resolve(Provider::Claude, "stranger").is_none());
     }
 
     #[test]
@@ -2249,8 +2206,8 @@ mod tests {
         .unwrap();
         let mut parser = LineParser { calls: 0 };
         let mut interner = PathInterner::default();
-        first_index.scan(&mut parser, &mut interner).unwrap();
-        second_index.scan(&mut parser, &mut interner).unwrap();
+        scan_admitted_fixture(&mut first_index, &mut parser, &mut interner).unwrap();
+        scan_admitted_fixture(&mut second_index, &mut parser, &mut interner).unwrap();
         let first_path_id = first_index.files()[0].path_id;
         let second_path_id = second_index.files()[0].path_id;
 
@@ -2291,10 +2248,10 @@ mod tests {
         .unwrap();
         let mut parser = LineParser { calls: 0 };
         let mut interner = PathInterner::default();
-        index.scan(&mut parser, &mut interner).unwrap();
+        scan_admitted_fixture(&mut index, &mut parser, &mut interner).unwrap();
 
         fs::remove_file(&path).unwrap();
-        index.scan(&mut parser, &mut interner).unwrap();
+        scan_admitted_fixture(&mut index, &mut parser, &mut interner).unwrap();
 
         assert!(!index.baseline().contained(directory.path(), relative));
     }

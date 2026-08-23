@@ -5,6 +5,7 @@ use std::path::Path;
 
 use herdr_top::model::{ExecState, Provider};
 use herdr_top::provider::codex::{CodexAdapter, CodexBootstrapParser};
+use herdr_top::provider::lane::{Admission, AdmissionIndex};
 use herdr_top::provider::{
     BootstrapParser, DiscoveryIndex, DiscoveryRoot, MergeOutcome, PathInterner, PendingEvents,
     ProviderDiagnostics, ProviderEvent, SourcePosition, TailRecord,
@@ -27,13 +28,16 @@ struct FixtureIndex {
 impl FixtureIndex {
     fn new(file_names: &[&str]) -> Self {
         let directory = tempfile::tempdir().unwrap();
+        let mut admission = Admission::new(0);
         for file_name in file_names {
             let mut bytes = Vec::new();
             for (_, record) in flat_jsonl_fixture(file_name) {
                 bytes.extend(record);
                 bytes.push(b'\n');
             }
-            fs::write(directory.path().join(file_name), bytes).unwrap();
+            let path = directory.path().join(file_name);
+            fs::write(&path, bytes).unwrap();
+            admission.admit_pane_artifact(Provider::Codex, &path);
         }
         let mut index = DiscoveryIndex::new(vec![DiscoveryRoot {
             provider: Provider::Codex,
@@ -41,7 +45,13 @@ impl FixtureIndex {
         }])
         .unwrap();
         index
-            .scan(&mut CodexBootstrapParser, &mut PathInterner::default())
+            .scan_admitted(
+                &mut CodexBootstrapParser,
+                &mut PathInterner::default(),
+                &admission,
+                &mut AdmissionIndex::new(),
+                &ProviderDiagnostics::default(),
+            )
             .unwrap();
         Self {
             _directory: directory,

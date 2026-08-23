@@ -82,9 +82,13 @@ test against `src/hook_adapter.rs`). Codex sessions synthesize
 `RunKey::Native { provider: Codex, sid: <rollout-id> }` claims through the
 existing native-binding path (herdr pane detection already produces these
 sids for pane roots — verified identical format). Synthesized event ids
-are DETERMINISTIC — `log:<artifact-basename>:<record-ordinal>` — so the
-existing durable event ledger deduplicates re-reads across restarts; ids
-never use the reserved `prov:` prefix (`src/reducer.rs:496` rejects it).
+are DETERMINISTIC — session-scoped events use
+`log:<artifact-basename>:` + `<record-ordinal>:<kind-slug>`, while agent-scoped
+events append `:<agent-id>` — so the existing durable event ledger
+deduplicates re-reads across restarts. The semantic discriminator remains
+stable if fact types are added or reordered; repeated instances of the same
+target and kind within one record are the same event by definition. Ids never
+use the reserved `prov:` prefix (`src/reducer.rs:496` rejects it).
 
 Persistence boundary: no schema change. Token/effort aggregates live in a
 transient telemetry map inside the model (`src/model/entities.rs`,

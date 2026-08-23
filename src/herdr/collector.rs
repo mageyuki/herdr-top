@@ -11498,9 +11498,12 @@ mod provider_integration_tests {
         ));
         assert_eq!(
             synthesized[0].metadata.event_id,
-            "log:agent-child.meta.json:0"
+            "log:agent-child.meta.json:0:dispatch:child"
         );
-        assert_eq!(synthesized[1].metadata.event_id, "log:agent-child.jsonl:0");
+        assert_eq!(
+            synthesized[1].metadata.event_id,
+            "log:agent-child.meta.json:0:task-started:child"
+        );
     }
 
     #[test]
@@ -11598,7 +11601,7 @@ mod provider_integration_tests {
         assert!(events.iter().any(|event| matches!(
             event,
             ProviderEvent::Synthesized(controller)
-                if controller.metadata.event_id == format!("log:{}:2", path.file_name().unwrap().to_string_lossy())
+                if controller.metadata.event_id == format!("log:{}:2:cancelled", path.file_name().unwrap().to_string_lossy())
         )));
     }
 
@@ -11634,7 +11637,7 @@ mod provider_integration_tests {
             .into_iter()
             .find(|event| matches!(event, ProviderEvent::Synthesized(_)))
             .expect("append should synthesize task_started");
-        for replay in [event.clone(), event] {
+        for replay in [event.clone(), event.clone()] {
             apply_provider_event(
                 replay,
                 "session",
@@ -11651,7 +11654,37 @@ mod provider_integration_tests {
         lifecycle.shutdown().await.unwrap();
         let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
         assert_eq!(restored.event_ledger.len(), 1);
-        assert_eq!(restored.event_ledger[0].event_id, "log:session.jsonl:7");
+        assert_eq!(
+            restored.event_ledger[0].event_id,
+            "log:session.jsonl:7:task-started"
+        );
+        let next_ingest_seq = restored.next_ingest_seq;
+
+        drop(persistence);
+        let reopened_store = open_writer(&root).unwrap();
+        let (reopened_lifecycle, reopened_writer) = spawn_writer(reopened_store).unwrap();
+        let mut reopened_persistence = test_runtime(reopened_writer);
+        let (mut reopened_reducer, reopened_shared) = Reducer::new(restored);
+        for replay in [event.clone(), event] {
+            apply_provider_event(
+                replay,
+                "session",
+                &mut reopened_reducer,
+                &reopened_shared,
+                &mut reopened_persistence,
+                &SourceCoverageRegistry::new(SourceAvailability::Available),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(reopened_shared.borrow().task_runs().count(), 1);
+        reopened_lifecycle.shutdown().await.unwrap();
+        drop(reopened_persistence);
+        let replayed = open_reader(&root).unwrap().load_restored_state().unwrap();
+        assert_eq!(
+            replayed.next_ingest_seq, next_ingest_seq,
+            "hydrated durable ledger must suppress every post-restart replay apply"
+        );
     }
 
     fn codex_records(owner: &str, agent: &str, event: &str) -> String {
@@ -12859,14 +12892,29 @@ mod provider_integration_tests {
         let mut inner_state = AdapterRootState::new(Provider::Codex, inner).unwrap();
         let mut worker = AdapterProviderWorker::default();
         let mut parser = AdapterBootstrapParser::default();
+        worker
+            .log_admission
+            .admit_pane_artifact(Provider::Codex, &absolute);
 
         outer_state
             .discovery
-            .scan(&mut parser, &mut worker.interner)
+            .scan_admitted(
+                &mut parser,
+                &mut worker.interner,
+                &worker.log_admission,
+                &mut worker.admission_index,
+                &worker.diagnostics,
+            )
             .unwrap();
         inner_state
             .discovery
-            .scan(&mut parser, &mut worker.interner)
+            .scan_admitted(
+                &mut parser,
+                &mut worker.interner,
+                &worker.log_admission,
+                &mut worker.admission_index,
+                &worker.diagnostics,
+            )
             .unwrap();
         let outer_id = outer_state.discovery.files()[0].path_id;
         let inner_id = inner_state.discovery.files()[0].path_id;

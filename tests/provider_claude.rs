@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 
 use herdr_top::model::Provider;
 use herdr_top::provider::claude::{ClaudeAdapter, ClaudeBootstrapParser};
+use herdr_top::provider::lane::{Admission, AdmissionIndex};
 use herdr_top::provider::{
-    DiscoveryIndex, DiscoveryRoot, PathInterner, ProviderEvent, SourcePosition, TailRecord,
+    DiscoveryIndex, DiscoveryRoot, PathInterner, ProviderDiagnostics, ProviderEvent,
+    SourcePosition, TailRecord,
 };
 
 use common::flat_jsonl_fixture;
@@ -27,11 +29,14 @@ struct FixtureIndex {
 impl FixtureIndex {
     fn new(entries: &[(&str, &str)]) -> Self {
         let directory = tempfile::tempdir().unwrap();
+        let mut admitted_paths = Vec::new();
         for (relative_path, fixture_name) in entries {
             let records = flat_jsonl_fixture(fixture_name);
-            write_records(directory.path().join(relative_path), &records);
+            let path = directory.path().join(relative_path);
+            write_records(path.clone(), &records);
+            admitted_paths.push(path);
         }
-        let index = scan(directory.path());
+        let index = scan(directory.path(), admitted_paths);
         Self {
             _directory: directory,
             index,
@@ -79,8 +84,9 @@ impl SyntheticIndex {
     fn new(relative_path: &str, records: &[&[u8]]) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let records = records_with_offsets(records);
-        write_records(directory.path().join(relative_path), &records);
-        let index = scan(directory.path());
+        let path = directory.path().join(relative_path);
+        write_records(path.clone(), &records);
+        let index = scan(directory.path(), [path]);
         Self {
             _directory: directory,
             index,
@@ -114,14 +120,24 @@ impl SyntheticIndex {
     }
 }
 
-fn scan(root: &Path) -> DiscoveryIndex {
+fn scan(root: &Path, admitted_paths: impl IntoIterator<Item = PathBuf>) -> DiscoveryIndex {
     let mut index = DiscoveryIndex::new(vec![DiscoveryRoot {
         provider: Provider::Claude,
         path: root.to_path_buf(),
     }])
     .unwrap();
+    let mut admission = Admission::new(0);
+    for path in admitted_paths {
+        admission.admit_pane_artifact(Provider::Claude, &path);
+    }
     index
-        .scan(&mut ClaudeBootstrapParser, &mut PathInterner::default())
+        .scan_admitted(
+            &mut ClaudeBootstrapParser,
+            &mut PathInterner::default(),
+            &admission,
+            &mut AdmissionIndex::new(),
+            &ProviderDiagnostics::default(),
+        )
         .unwrap();
     index
 }
@@ -290,7 +306,7 @@ fn meta_json_sibling_is_filtered_at_discovery() {
     )
     .unwrap();
 
-    let index = scan(directory.path());
+    let index = scan(directory.path(), [child_path]);
     let files = index.files();
 
     assert_eq!(files.len(), 1);

@@ -130,6 +130,9 @@ impl Synthesis {
     }
 
     /// Returns the selected current-turn activity for a session scope.
+    ///
+    /// Claude has no turn boundary, so its newest `ToolUse` persists as required by spec row 7.
+    /// Task 9 consumes this selected line.
     #[must_use]
     pub fn live_line(&self, scope: &SessionScope) -> Option<String> {
         self.live_lines
@@ -288,9 +291,8 @@ impl Synthesis {
                     Some(description.clone()),
                     Some(provider_metadata.clone()),
                 )));
-                let started_artifact = subagent_transcript_path(artifact);
                 events.push(ProviderEvent::Synthesized(controller_event(
-                    &started_artifact,
+                    artifact,
                     ordinal,
                     &child_scope,
                     ControllerEventKind::TaskStarted,
@@ -400,19 +402,6 @@ impl Synthesis {
     }
 }
 
-/// Selects a turn-scoped activity line: Claude tool use, otherwise latest commentary,
-/// otherwise latest command.
-#[must_use]
-pub fn select_live_line<'a>(facts: impl IntoIterator<Item = &'a LogFact>) -> Option<String> {
-    let mut selection = ActivitySelection::default();
-    for fact in facts {
-        if let LogFact::Activity { source, line, .. } = fact {
-            selection.observe(source, line);
-        }
-    }
-    selection.selected()
-}
-
 /// Returns the identity form consumed by run-scoped liveness and telemetry routes.
 #[must_use]
 pub fn run_key_for_scope(scope: &SessionScope) -> RunKey {
@@ -493,7 +482,7 @@ fn controller_event(
         schema_version: 1,
         task_run_id: controller_key_for_scope(scope),
         metadata: EventMetadata {
-            event_id: deterministic_event_id(artifact, ordinal),
+            event_id: deterministic_event_id(artifact, ordinal, &event, scope),
             timestamp_ms: at_ms,
             receipt_time_ms: at_ms,
             source: SOURCE_LOG_LANE.to_owned(),
@@ -521,22 +510,39 @@ fn controller_event(
     }
 }
 
-fn deterministic_event_id(artifact: &Path, ordinal: u64) -> String {
+fn controller_event_kind_slug(event: &ControllerEventKind) -> &'static str {
+    match event {
+        ControllerEventKind::Dispatch { .. } => "dispatch",
+        ControllerEventKind::TaskStarted => "task-started",
+        ControllerEventKind::DependsOn { .. } => "depends-on",
+        ControllerEventKind::Blocked => "blocked",
+        ControllerEventKind::Progress => "progress",
+        ControllerEventKind::Complete => "complete",
+        ControllerEventKind::Failed => "failed",
+        ControllerEventKind::Cancelled => "cancelled",
+        ControllerEventKind::Dismiss => "dismiss",
+    }
+}
+
+fn deterministic_event_id(
+    artifact: &Path,
+    ordinal: u64,
+    event: &ControllerEventKind,
+    scope: &SessionScope,
+) -> String {
     let basename = artifact
         .file_name()
         .unwrap_or_else(|| OsStr::new("artifact"))
         .to_string_lossy();
-    format!("log:{basename}:{ordinal}")
-}
-
-fn subagent_transcript_path(artifact: &Path) -> PathBuf {
-    let Some(file_name) = artifact.file_name().and_then(OsStr::to_str) else {
-        return artifact.to_path_buf();
-    };
-    let Some(stem) = file_name.strip_suffix(".meta.json") else {
-        return artifact.with_file_name(format!("{file_name}.started"));
-    };
-    artifact.with_file_name(format!("{stem}.jsonl"))
+    let kind = controller_event_kind_slug(event);
+    match scope {
+        SessionScope::ClaudeSubagent { agent_id, .. } => {
+            format!("log:{basename}:{ordinal}:{kind}:{agent_id}")
+        }
+        SessionScope::ClaudeRoot(_) | SessionScope::Codex { .. } => {
+            format!("log:{basename}:{ordinal}:{kind}")
+        }
+    }
 }
 
 /// One provider artifact kind retained by the evidence index.
@@ -908,7 +914,7 @@ impl Admission {
     }
 
     /// Admits the pane-root identity encoded in an exact provider artifact path.
-    pub(crate) fn admit_pane_artifact(&mut self, provider: Provider, path: &Path) {
+    pub fn admit_pane_artifact(&mut self, provider: Provider, path: &Path) {
         self.pane_paths.insert(path.to_path_buf());
         let session_id = match provider {
             Provider::Claude => path
@@ -1348,8 +1354,8 @@ mod tests {
 
     use crate::hook_adapter::{HookPayload, HookProvider, map_hook_payload};
     use crate::model::{
-        ControllerEvent, ControllerEventKind, DomainModel, EventMetadata, MinimalProviderMetadata,
-        Provider, RunKey, SourceCoverage,
+        AgentNodeObservation, ControllerEvent, ControllerEventKind, DomainModel, EventMetadata,
+        MinimalProviderMetadata, NormalizedEvent, Provider, RunKey, SourceCoverage,
     };
     use crate::provider::claude::{ClaudePathTopology, path_topology};
     use crate::provider::claude_facts::extract_claude_line;
@@ -1463,6 +1469,31 @@ mod tests {
         .0
     }
 
+    fn apply_once_per_event_id(events: &[ProviderEvent]) -> DomainModel {
+        let mut state = RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        };
+        let mut ledger = HashSet::new();
+        for event in synthesized_events(events) {
+            if ledger.insert(event.metadata.event_id.clone()) {
+                let reducer = Reducer::new(state).0;
+                let delta = reducer
+                    .validate_controller_event(event)
+                    .expect("test event should validate");
+                state = RestoredState {
+                    model: delta.post_model,
+                    next_ordinal: delta.post_next_ordinal,
+                    next_ingest_seq: Some(1),
+                    event_ledger: Vec::new(),
+                };
+            }
+        }
+        state.model
+    }
+
     #[test]
     fn synthesized_claude_keys_byte_match_hook_adapter() {
         let hook = map_hook_payload(
@@ -1513,9 +1544,160 @@ mod tests {
             .copied()
             .collect::<HashSet<_>>();
 
-        assert_eq!(first_ids, ["log:rollout.jsonl:9"]);
+        assert_eq!(first_ids, ["log:rollout.jsonl:9:cancelled"]);
         assert_eq!(first_ids, replay_ids);
         assert_eq!(ledger.len(), 1, "replay must have one durable ledger key");
+    }
+
+    #[test]
+    fn controller_event_kind_slugs_cover_the_stable_wire_vocabulary() {
+        let cases = [
+            (
+                ControllerEventKind::Dispatch {
+                    parent_task_run_id: "parent".to_owned(),
+                },
+                "dispatch",
+            ),
+            (ControllerEventKind::TaskStarted, "task-started"),
+            (
+                ControllerEventKind::DependsOn {
+                    depends_on_id: "dependency".to_owned(),
+                },
+                "depends-on",
+            ),
+            (ControllerEventKind::Blocked, "blocked"),
+            (ControllerEventKind::Progress, "progress"),
+            (ControllerEventKind::Complete, "complete"),
+            (ControllerEventKind::Failed, "failed"),
+            (ControllerEventKind::Cancelled, "cancelled"),
+            (ControllerEventKind::Dismiss, "dismiss"),
+        ];
+
+        assert_eq!(
+            cases
+                .iter()
+                .map(|(kind, _)| controller_event_kind_slug(kind))
+                .collect::<Vec<_>>(),
+            cases.iter().map(|(_, slug)| *slug).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn one_record_with_two_task_notifications_applies_both_terminal_events() {
+        let record = r#"{"type":"queue-operation","content":"<task-notification><task-id>1111111111111111</task-id><status>completed</status></task-notification><task-notification><task-id>2222222222222222</task-id><status>failed</status></task-notification>"}"#;
+        let facts = extract_claude_line(&SessionScope::ClaudeRoot(PARENT.to_owned()), record)
+            .into_iter()
+            .map(|fact| (7, fact));
+        let events = synthesize(&mut Synthesis::default(), "queue.jsonl", facts);
+        let synthesized = synthesized_events(&events);
+        let event_ids = synthesized
+            .iter()
+            .map(|event| event.metadata.event_id.as_str())
+            .collect::<HashSet<_>>();
+        let task_run_ids = synthesized
+            .iter()
+            .map(|event| event.task_run_id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(synthesized.len(), 2);
+        assert_eq!(task_run_ids.len(), 2);
+        assert_eq!(
+            event_ids,
+            HashSet::from([
+                "log:queue.jsonl:7:complete:1111111111111111",
+                "log:queue.jsonl:7:failed:2222222222222222",
+            ])
+        );
+        assert_eq!(apply_once_per_event_id(&events).task_runs().count(), 2);
+    }
+
+    #[test]
+    fn append_start_and_subagent_end_at_one_ordinal_both_apply() {
+        let events = synthesize(
+            &mut Synthesis::default(),
+            "session.jsonl",
+            [
+                (
+                    11,
+                    LogFact::Append {
+                        scope: SessionScope::ClaudeRoot(PARENT.to_owned()),
+                        at_ms: 100,
+                    },
+                ),
+                (
+                    11,
+                    LogFact::SubagentEnded {
+                        parent: PARENT.to_owned(),
+                        agent_id: "child".to_owned(),
+                        failed: false,
+                    },
+                ),
+            ],
+        );
+        let synthesized = synthesized_events(&events);
+        let event_ids = synthesized
+            .iter()
+            .map(|event| event.metadata.event_id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(synthesized.len(), 2);
+        assert_eq!(
+            event_ids,
+            HashSet::from([
+                "log:session.jsonl:11:task-started",
+                "log:session.jsonl:11:complete:child",
+            ])
+        );
+        assert_eq!(apply_once_per_event_id(&events).task_runs().count(), 2);
+    }
+
+    #[test]
+    fn semantic_event_ids_do_not_depend_on_fact_order() {
+        let facts = [
+            LogFact::SubagentEnded {
+                parent: PARENT.to_owned(),
+                agent_id: "first".to_owned(),
+                failed: false,
+            },
+            LogFact::SubagentEnded {
+                parent: PARENT.to_owned(),
+                agent_id: "second".to_owned(),
+                failed: true,
+            },
+        ];
+        let ids = |facts: Vec<LogFact>| {
+            synthesized_events(&synthesize(
+                &mut Synthesis::default(),
+                "queue.jsonl",
+                facts.into_iter().map(|fact| (3, fact)),
+            ))
+            .into_iter()
+            .map(|event| (event.task_run_id.clone(), event.metadata.event_id.clone()))
+            .collect::<HashMap<_, _>>()
+        };
+
+        assert_eq!(ids(facts.to_vec()), ids(facts.into_iter().rev().collect()));
+    }
+
+    #[test]
+    fn repeated_target_and_kind_in_one_record_is_one_semantic_event() {
+        let duplicate = LogFact::SubagentEnded {
+            parent: PARENT.to_owned(),
+            agent_id: "child".to_owned(),
+            failed: false,
+        };
+        let events = synthesize(
+            &mut Synthesis::default(),
+            "queue.jsonl",
+            [(4, duplicate.clone()), (4, duplicate)],
+        );
+
+        assert!(matches!(
+            synthesized_events(&events).as_slice(),
+            [event]
+                if event.metadata.event_id == "log:queue.jsonl:4:complete:child"
+                    && matches!(event.event, ControllerEventKind::Complete)
+        ));
     }
 
     #[test]
@@ -1669,6 +1851,116 @@ mod tests {
             .validate_controller_event(synthesized_events(&lane)[0])
             .expect("same lane identity remains a no-conflict no-op");
         assert_eq!(delta.post_model.task_runs().count(), 1);
+    }
+
+    #[test]
+    fn hook_and_lane_subagent_pair_yields_one_run_and_one_agent_node() {
+        const AGENT: &str = "child-7";
+        let hook = map_hook_payload(
+            HookProvider::ClaudeCode,
+            &hook_payload("SubagentStart", PARENT, Some(AGENT)),
+            100,
+            9,
+        );
+        let lane = synthesize(
+            &mut Synthesis::default(),
+            "agent-child-7.meta.json",
+            [(
+                0,
+                LogFact::SubagentAppeared {
+                    parent: PARENT.to_owned(),
+                    agent_id: AGENT.to_owned(),
+                    agent_type: "reviewer".to_owned(),
+                    description: "Review identity convergence".to_owned(),
+                },
+            )],
+        );
+        let mut reducer = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        })
+        .0;
+        let hook_started = hook
+            .iter()
+            .find(|event| event.event_type == "task_started")
+            .map(controller_event_from_hook)
+            .expect("hook must emit a subagent start");
+        let lane_started = synthesized_events(&lane)
+            .into_iter()
+            .find(|event| matches!(event.event, ControllerEventKind::TaskStarted))
+            .expect("lane must synthesize a subagent start");
+        reducer = advance_reducer(reducer, &hook_started);
+        reducer = advance_reducer(reducer, lane_started);
+
+        let agent_key = match run_key_for_scope(&SessionScope::ClaudeSubagent {
+            parent: PARENT.to_owned(),
+            agent_id: AGENT.to_owned(),
+        }) {
+            RunKey::Controller(key) => key,
+            _ => panic!("Claude subagent key must be Controller identity"),
+        };
+        let agent_run_id = reducer
+            .resolve_controller_run(&agent_key)
+            .expect("hook and lane must converge on one subagent run");
+        let post_model = reducer
+            .validate_controller_event(lane_started)
+            .expect("replayed lane start remains a no-conflict no-op")
+            .post_model;
+        assert_eq!(
+            post_model.task_runs().count(),
+            1,
+            "the session and agent pair must identify exactly one run"
+        );
+        assert_eq!(
+            post_model
+                .task_runs()
+                .filter(|run| run.key == RunKey::Controller(agent_key.clone()))
+                .count(),
+            1
+        );
+
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model: post_model,
+            next_ordinal: 2,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let mut metadata = lane_started.metadata.clone();
+        metadata.event_id = "prov:claude:node:child-7".to_owned();
+        metadata.source = "provider".to_owned();
+        metadata.source_event_type = "agent_node".to_owned();
+        metadata.task_run_id = Some(agent_run_id);
+        reducer
+            .apply(NormalizedEvent::AgentNodeUpsert {
+                metadata,
+                node: AgentNodeObservation {
+                    agent_node_id: "agent:claude:child-7".to_owned(),
+                    provider: Provider::Claude,
+                    native_session_id: Some(AGENT.to_owned()),
+                    task_run_id: agent_run_id,
+                    parent_agent_node_id: None,
+                    state: None,
+                    model_id: None,
+                    session_file: Some("agent-child-7.jsonl".to_owned()),
+                },
+            })
+            .expect("subagent node should apply through the reducer");
+
+        let model = shared.borrow();
+        assert_eq!(model.agent_nodes().count(), 1);
+        assert_eq!(
+            model.agent_nodes().next().unwrap().task_run_id,
+            agent_run_id
+        );
+        assert_eq!(model.controller_diagnostics().binding_conflicts(), 0);
+        assert_eq!(
+            model
+                .controller_diagnostics()
+                .provider_identity_disagreements(),
+            0
+        );
     }
 
     #[test]
@@ -1829,38 +2121,34 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_subagent_ended_failed_dominates_both_arrival_orders() {
+    fn duplicate_subagent_ended_merges_failure_within_one_synthesis_batch() {
+        // Task 6 owns persisted-state supersession by grace-deferring lane Completes.
         for failed_first in [false, true] {
             let statuses = if failed_first {
                 [true, false]
             } else {
                 [false, true]
             };
-            let mut synthesis = Synthesis::default();
-            let mut events = Vec::new();
-            for (ordinal, failed) in statuses.into_iter().enumerate() {
-                events.extend(synthesize(
-                    &mut synthesis,
-                    "queue.jsonl",
-                    [(
+            let events = synthesize(
+                &mut Synthesis::default(),
+                "queue.jsonl",
+                statuses.into_iter().enumerate().map(|(ordinal, failed)| {
+                    (
                         ordinal as u64,
                         LogFact::SubagentEnded {
                             parent: PARENT.to_owned(),
                             agent_id: "child".to_owned(),
                             failed,
                         },
-                    )],
-                ));
-            }
+                    )
+                }),
+            );
             let terminal = synthesized_events(&events);
 
             assert!(matches!(
-                terminal.last(),
-                Some(event) if matches!(event.event, ControllerEventKind::Failed)
+                terminal.as_slice(),
+                [event] if matches!(event.event, ControllerEventKind::Failed)
             ));
-            if failed_first {
-                assert_eq!(terminal.len(), 1, "later success cannot weaken failure");
-            }
         }
     }
 
@@ -1908,51 +2196,118 @@ mod tests {
 
     #[test]
     fn live_line_policy_is_turn_scoped_and_commentary_first() {
-        let scope = SessionScope::Codex {
+        let codex_scope = SessionScope::Codex {
             rollout_id: ROLLOUT.to_owned(),
         };
-        let command = |at_ms, line: &str| LogFact::Activity {
-            scope: scope.clone(),
-            at_ms,
-            source: ActivitySource::Command,
-            line: line.to_owned(),
-        };
-        let commentary = |at_ms, line: &str| LogFact::Activity {
-            scope: scope.clone(),
-            at_ms,
-            source: ActivitySource::Commentary,
-            line: line.to_owned(),
-        };
+        let mut synthesis = Synthesis::default();
 
+        synthesize(
+            &mut synthesis,
+            "rollout.jsonl",
+            [
+                (
+                    1,
+                    LogFact::Activity {
+                        scope: codex_scope.clone(),
+                        at_ms: 1,
+                        source: ActivitySource::Command,
+                        line: "first command".to_owned(),
+                    },
+                ),
+                (
+                    2,
+                    LogFact::Activity {
+                        scope: codex_scope.clone(),
+                        at_ms: 2,
+                        source: ActivitySource::Commentary,
+                        line: "first commentary".to_owned(),
+                    },
+                ),
+                (
+                    3,
+                    LogFact::Activity {
+                        scope: codex_scope.clone(),
+                        at_ms: 3,
+                        source: ActivitySource::Command,
+                        line: "later command".to_owned(),
+                    },
+                ),
+                (
+                    4,
+                    LogFact::Activity {
+                        scope: codex_scope.clone(),
+                        at_ms: 4,
+                        source: ActivitySource::Commentary,
+                        line: "latest commentary".to_owned(),
+                    },
+                ),
+            ],
+        );
         assert_eq!(
-            select_live_line([
-                &command(1, "first command"),
-                &commentary(2, "first commentary"),
-                &command(3, "later command"),
-                &commentary(4, "latest commentary"),
-            ]),
+            synthesis.live_line(&codex_scope),
             Some("latest commentary".to_owned())
         );
+
+        synthesize(
+            &mut synthesis,
+            "rollout.jsonl",
+            [(
+                5,
+                LogFact::CodexTurnStarted {
+                    rollout_id: ROLLOUT.to_owned(),
+                    at_ms: 5,
+                },
+            )],
+        );
+        assert_eq!(synthesis.live_line(&codex_scope), None);
+
+        synthesize(
+            &mut synthesis,
+            "rollout.jsonl",
+            [(
+                6,
+                LogFact::Activity {
+                    scope: codex_scope.clone(),
+                    at_ms: 6,
+                    source: ActivitySource::Command,
+                    line: "new turn command".to_owned(),
+                },
+            )],
+        );
         assert_eq!(
-            select_live_line([&command(1, "first"), &command(2, "latest")]),
-            Some("latest".to_owned())
+            synthesis.live_line(&codex_scope),
+            Some("new turn command".to_owned())
         );
 
-        let tool_scope = SessionScope::ClaudeRoot(PARENT.to_owned());
-        let first = LogFact::Activity {
-            scope: tool_scope.clone(),
-            at_ms: 1,
-            source: ActivitySource::ToolUse,
-            line: "first tool".to_owned(),
-        };
-        let latest = LogFact::Activity {
-            scope: tool_scope,
-            at_ms: 2,
-            source: ActivitySource::ToolUse,
-            line: "latest tool".to_owned(),
-        };
+        let claude_scope = SessionScope::ClaudeRoot(PARENT.to_owned());
+        synthesize(
+            &mut synthesis,
+            "session.jsonl",
+            [(
+                7,
+                LogFact::Activity {
+                    scope: claude_scope.clone(),
+                    at_ms: 7,
+                    source: ActivitySource::ToolUse,
+                    line: "first tool".to_owned(),
+                },
+            )],
+        );
+        synthesize(
+            &mut synthesis,
+            "session.jsonl",
+            [(
+                8,
+                LogFact::Activity {
+                    scope: claude_scope.clone(),
+                    at_ms: 8,
+                    source: ActivitySource::ToolUse,
+                    line: "latest tool".to_owned(),
+                },
+            )],
+        );
         assert_eq!(
-            select_live_line([&first, &latest]),
+            synthesis.live_line(&claude_scope),
             Some("latest tool".to_owned())
         );
     }
