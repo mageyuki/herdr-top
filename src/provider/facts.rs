@@ -336,6 +336,7 @@ mod tests {
     fn repo_relative_reduces_relative_input_to_basename() {
         // Claude tools emit absolute paths, so relative input is conservatively reduced.
         assert_eq!(repo_relative("src/provider/facts.rs", "/repo"), "facts.rs");
+        assert_eq!(repo_relative("/repo/a/b.rs", ""), "b.rs");
     }
 
     #[test]
