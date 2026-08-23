@@ -8,9 +8,12 @@ No real content was copied.
 
 All identities are fictional. Home paths use `/home/user`, repository paths
 use `/home/user/git/example/herdr-top`, and the only remote URL uses the
-reserved `.invalid` domain. The large message, reasoning, prompt, and command
-output bodies are intentional: they make privacy-boundary tests non-vacuous by
-ensuring excluded fields would be material if accidentally deserialized.
+reserved `.invalid` domain. The `herdr-top` basename intentionally mirrors this
+repository's public name because display falls back to the cwd basename; its
+owner, host, home, and surrounding path remain synthetic. The large message,
+reasoning, prompt, and command output bodies are intentional: they make
+privacy-boundary tests non-vacuous by ensuring excluded fields would be
+material if accidentally deserialized.
 
 ## Claude fixtures
 
@@ -35,17 +38,19 @@ rollout id `6f9bdfa0-1502-4a37-97aa-c45591141130`; that id is the identity in
 
 ### `claude-subagent-meta.json`
 
-Mirrors `agent-<agentId>.meta.json` with the complete four-field shape:
-`agentType`, `description`, `toolUseId`, and `spawnDepth`.
+Mirrors `agent-<agentId>.meta.json`. `agentType`, `description`, `toolUseId`,
+and `spawnDepth` are the allowlisted subset; real metadata files can carry
+additional fields. Synthetic `model` and `name` fields exercise the requirement
+that non-allowlisted metadata is skipped.
 
 ### `claude-subagent.jsonl`
 
 Mirrors the real-world file
-`agent-0392548834e4a5dc.jsonl`. It contains sidechain `user` and `assistant`
+`agent-a7189abbf3c5741ac.jsonl`. It contains sidechain `user` and `assistant`
 records, an `agentId`, the parent session id, model, effort, usage, and a large
 synthetic assistant report.
 
-The child id `0392548834e4a5dc` is identical in this conceptual filename, the
+The child id `a7189abbf3c5741ac` is identical in this conceptual filename, the
 parent Agent `tool_result` in `claude-session.jsonl`, and the task metadata
 represented by `claude-subagent-meta.json`. Its spawning tool-use id is
 `toolu_02SyntheticAgentSpawn` in both the parent transcript and metadata.
@@ -56,7 +61,8 @@ Mirrors main-session `queue-operation` records. One `enqueue` contains a
 multi-kilobyte ordinary user prompt. Two more contain the real
 `<task-notification>` tag layout: `task-id`, `tool-use-id`, `output-file`,
 `status`, and `summary`. The statuses include both `completed` and `failed`.
-Only `task-id` and `status` are privacy-carve-in outputs.
+One `dequeue` and one `remove` record omit the optional `content` field. Only
+the task identifier and `status` are privacy-carve-in outputs.
 
 Every record in each Claude JSONL fixture uses session id
 `13f03635-c1f6-46e2-8e52-83d217b6f01c`.
@@ -76,11 +82,17 @@ Mirrors one Codex exec rollout. It exercises the Codex read list:
 - `item_completed` timing plus `UserMessage`, `Reasoning`, `AgentMessage`, and
   `CommandExecution` item types.
 
-The commentary AgentMessage is a single 41-character line. The Reasoning item
-has a large synthetic `raw_content` body. The CommandExecution item carries
-synthetic `stdout`, `stderr`, and `aggregated_output`; its `process_id` is the
-JSON string `"42420"`. This file also carries the internal-subagent source
-shape whose `source.subagent` is exactly `{"other":"guardian"}`.
+The commentary AgentMessage is a single 41-character line. The
+`item_completed` Reasoning item has the real tiny shape with empty
+`summary_text` and `raw_content` arrays. Separate `response_item` records carry
+the realistic multi-kilobyte reasoning `encrypted_content`, multi-kilobyte
+custom-tool output, and a message body; a `world_state` record carries another
+excluded body family. These four record families intentionally remain outside
+the ADR read allowlist so a reader that materializes unknown records fails
+privacy review. The CommandExecution item carries synthetic `stdout`, `stderr`,
+and `aggregated_output`; its `process_id` is the JSON string `"42420"`. This file
+also carries the internal-subagent source shape whose `source.subagent` is
+exactly `{"other":"guardian"}`.
 
 Its rollout id is `6f9bdfa0-1502-4a37-97aa-c45591141130`, matching the quoted
 id in the Claude parent spawn command.
@@ -93,6 +105,11 @@ Mirrors one append-resumed rollout. Rollout id
 model `gpt-5.6-terra` at effort `low`; the appended turn context uses model
 `gpt-5.6-sol` at effort `xhigh`. Each turn has its own `last_token_usage`, so a
 consumer can test per-turn token deltas and closure at `task_complete`.
+
+All three fixture `token_count` records carry a synthetic `rate_limits` subtree
+with plan, limit, credit, spend-control, primary, and secondary fields. The
+subtree is deliberately non-allowlisted so fixtures pin that rate-limit account
+state is never materialized.
 
 ### `codex-internal-subagents.jsonl`
 
@@ -113,10 +130,11 @@ rollout identity.
 The typed read fields above are the only fields intended for ordinary parsing.
 The fixtures also contain fields that must never be materialized: Claude user,
 assistant, thinking, prompt, command, and tool-result bodies; Codex user and
-reasoning bodies; Codex command scripts; and CommandExecution `stdout`,
-`stderr`, `aggregated_output`, and formatted output. Files under
-`tool-results/` are outside this fixture set because those directories must
-never be opened.
+reasoning bodies; `response_item` reasoning, custom-tool-output, and message
+bodies; `world_state`; the token-count `rate_limits` subtree; Codex command
+scripts; and CommandExecution `stdout`, `stderr`, `aggregated_output`, and
+formatted output. Files under `tool-results/` are outside this fixture set
+because those directories must never be opened.
 
 Three narrowly bounded pattern-only cases are present: discovered-id and
 `CLAUDE_CONFIG_DIR=` extraction from raw Claude lines, `task-id` and `status`

@@ -50,6 +50,19 @@ fn temp_provider_log_fixtures() -> tempfile::TempDir {
     directory
 }
 
+fn mutate_jsonl(path: &std::path::Path, mut mutator: impl FnMut(&mut serde_json::Value)) {
+    let contents = std::fs::read_to_string(path).expect("read JSONL fixture");
+    let mut output = String::new();
+    for line in contents.lines() {
+        let mut record: serde_json::Value =
+            serde_json::from_str(line).expect("JSONL record parses");
+        mutator(&mut record);
+        output.push_str(&record.to_string());
+        output.push('\n');
+    }
+    std::fs::write(path, output).expect("rewrite JSONL fixture");
+}
+
 #[test]
 fn log_baselines_cover_fixture_record_types() {
     let out = run(&["--log-baselines", PROVIDER_LOG_FIXTURES]);
@@ -104,6 +117,128 @@ fn log_baseline_detects_novel_record_type() {
         String::from_utf8_lossy(&out.stderr).contains("verdict: REVIEW REQUIRED"),
         "stdout: {} stderr: {}",
         String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn log_baseline_rejects_non_string_claude_version() {
+    let fixtures = temp_provider_log_fixtures();
+    mutate_jsonl(&fixtures.path().join("claude-subagent.jsonl"), |record| {
+        if record["type"] == "user" {
+            record["version"] = serde_json::json!(2_102_390);
+        }
+    });
+
+    let out = run(&[
+        "--log-baselines",
+        fixtures.path().to_str().expect("UTF-8 fixture path"),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("error: Claude transcript version must be a string"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn log_baseline_rejects_non_string_codex_cli_version() {
+    let fixtures = temp_provider_log_fixtures();
+    mutate_jsonl(
+        &fixtures.path().join("codex-exec-resume-appended.jsonl"),
+        |record| {
+            if record["type"] == "session_meta" {
+                record["payload"]["cli_version"] = serde_json::json!(149_000);
+            }
+        },
+    );
+
+    let out = run(&[
+        "--log-baselines",
+        fixtures.path().to_str().expect("UTF-8 fixture path"),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("error: Codex cli_version must be a string"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn log_baseline_requires_version_in_every_claude_file() {
+    let fixtures = temp_provider_log_fixtures();
+    mutate_jsonl(&fixtures.path().join("claude-subagent.jsonl"), |record| {
+        record
+            .as_object_mut()
+            .expect("Claude record is an object")
+            .remove("version");
+    });
+
+    let out = run(&[
+        "--log-baselines",
+        fixtures.path().to_str().expect("UTF-8 fixture path"),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("error: no Claude transcript version found in claude-subagent.jsonl"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn log_baseline_renders_version_mismatch_columns_with_tabs() {
+    let fixtures = temp_provider_log_fixtures();
+    mutate_jsonl(&fixtures.path().join("claude-subagent.jsonl"), |record| {
+        if record.get("version").is_some() {
+            record["version"] = serde_json::json!("2.2.0");
+        }
+    });
+
+    let out = run(&[
+        "--log-baselines",
+        fixtures.path().to_str().expect("UTF-8 fixture path"),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout: {stdout} stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("claude\tversion:2.2.0\texpected-prefix:2.1."),
+        "stdout: {stdout} stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !stdout.contains(r"claude\tversion:"),
+        "stdout: {stdout} stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }

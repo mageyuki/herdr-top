@@ -155,8 +155,10 @@ Principles (ADR ships with implementation):
    allowlisted fields, matching the shipped adapter pattern at
    `src/provider/claude.rs:12-30`) — NOT untyped `serde_json::Value`,
    which would materialize entire records including bodies (codex
-   `CommandExecution` carries full `stdout`/`stderr`/`aggregated_output`;
-   `Reasoning` is the largest item class — both verified).
+   `CommandExecution` carries full `stdout`/`stderr`/`aggregated_output` and is
+   the largest `item_completed` class by byte volume; `Reasoning` is the most
+   numerous, while multi-kilobyte reasoning bodies live in `response_item`
+   reasoning `encrypted_content` — all verified).
 3. Three narrow carve-ins, each pattern-extraction-only (input text is
    never retained, displayed, or logged):
    - ID EXTRACTION: raw transcript lines are regex-scanned for

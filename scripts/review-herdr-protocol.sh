@@ -182,8 +182,33 @@ review_log_baselines() {
   claude_prefix=$(jq -er '.version_prefix | select(type == "string" and length > 0)' "$claude_log_baseline" 2>/dev/null) || { echo "error: invalid Claude version prefix" >&2; return 2; }
   codex_prefix=$(jq -er '.version_prefix | select(type == "string" and length > 0)' "$codex_log_baseline" 2>/dev/null) || { echo "error: invalid Codex version prefix" >&2; return 2; }
 
-  local claude_versions codex_versions
-  claude_versions=$(jq -er 'select(.version? != null) | .version | select(type == "string")' "${claude_files[@]}" 2>/dev/null | sort -u) || { echo "error: invalid Claude transcript version" >&2; return 2; }
+  local claude_versions="" codex_versions
+  local claude_file file_versions
+  for claude_file in "${claude_files[@]}"; do
+    jq -se 'all(.[] | select(has("version")); (.version | type) == "string")' \
+      "$claude_file" >/dev/null 2>&1 \
+      || { echo "error: Claude transcript version must be a string" >&2; return 2; }
+    file_versions=$(jq -r 'select(has("version")) | .version' "$claude_file" 2>/dev/null | sort -u) \
+      || { echo "error: invalid Claude transcript version" >&2; return 2; }
+    # queue-operation-only fixtures mirror records that do not carry a
+    # transcript version. Every fixture containing transcript records must
+    # carry its own version evidence rather than relying on another file.
+    if jq -se 'any(.[]; .type == "user" or .type == "assistant")' \
+        "$claude_file" >/dev/null 2>&1 \
+        && [[ -z $file_versions ]]; then
+      echo "error: no Claude transcript version found in ${claude_file##*/}" >&2
+      return 2
+    fi
+    [[ -z $file_versions ]] || claude_versions+="$file_versions"$'\n'
+  done
+  claude_versions=$(sort -u <<<"${claude_versions%$'\n'}")
+
+  jq -se '
+    all(.[]
+      | select(.type == "session_meta" and (.payload | has("cli_version")));
+      (.payload.cli_version | type) == "string")
+  ' "${codex_files[@]}" >/dev/null 2>&1 \
+    || { echo "error: Codex cli_version must be a string" >&2; return 2; }
   codex_versions=$(jq -er 'select(.type == "session_meta") | .payload.cli_version | select(type == "string")' "${codex_files[@]}" 2>/dev/null | sort -u) || { echo "error: invalid Codex cli_version" >&2; return 2; }
   [[ -n $claude_versions ]] || { echo "error: no Claude transcript version found" >&2; return 2; }
   [[ -n $codex_versions ]] || { echo "error: no Codex cli_version found" >&2; return 2; }
@@ -205,11 +230,11 @@ review_log_baselines() {
   local version_mismatches="" version
   while IFS= read -r version; do
     [[ ${version:0:${#claude_prefix}} == "$claude_prefix" ]] \
-      || version_mismatches+="claude\tversion:$version\texpected-prefix:$claude_prefix"$'\n'
+      || version_mismatches+=$'claude\t'"version:$version"$'\t'"expected-prefix:$claude_prefix"$'\n'
   done <<<"$claude_versions"
   while IFS= read -r version; do
     [[ ${version:0:${#codex_prefix}} == "$codex_prefix" ]] \
-      || version_mismatches+="codex\tversion:$version\texpected-prefix:$codex_prefix"$'\n'
+      || version_mismatches+=$'codex\t'"version:$version"$'\t'"expected-prefix:$codex_prefix"$'\n'
   done <<<"$codex_versions"
   version_mismatches=${version_mismatches%$'\n'}
 

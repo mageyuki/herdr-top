@@ -30,7 +30,7 @@
     {
       "scope": "record",
       "type": "queue-operation",
-      "occurrences": 3
+      "occurrences": 5
     },
     {
       "scope": "record",

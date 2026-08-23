@@ -17,8 +17,10 @@ reasoning, commands, tool output, and other text that herdr-top neither needs
 nor should materialize.
 
 The risk is concrete. A Codex `CommandExecution` item carries complete
-`stdout`, `stderr`, and `aggregated_output`, and `Reasoning` is the largest
-observed item class. Deserializing a whole record into an untyped
+`stdout`, `stderr`, and `aggregated_output`. `CommandExecution` is the largest
+`item_completed` class by byte volume, while `Reasoning` is the most numerous;
+multi-kilobyte reasoning bodies live in `response_item` reasoning records as
+`encrypted_content`. Deserializing a whole record into an untyped
 `serde_json::Value` would materialize those bodies even if later code discarded
 them. Claude queue-operation content is also free text: the same field carries
 ordinary user prompts and machine-readable task-notification blocks.

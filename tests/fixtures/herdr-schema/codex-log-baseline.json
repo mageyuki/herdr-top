@@ -69,6 +69,11 @@
     },
     {
       "scope": "record",
+      "type": "response_item",
+      "occurrences": 3
+    },
+    {
+      "scope": "record",
       "type": "session_meta",
       "occurrences": 4
     },
@@ -76,6 +81,11 @@
       "scope": "record",
       "type": "turn_context",
       "occurrences": 4
+    },
+    {
+      "scope": "record",
+      "type": "world_state",
+      "occurrences": 1
     }
   ]
 }
