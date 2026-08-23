@@ -10,6 +10,10 @@ The hook integration does not produce dependency edges. Neither provider's hook
 surface can derive semantic dependencies between runs. Add those relationships
 explicitly as described in [Add dependency edges manually](#add-dependency-edges-manually).
 
+This integration enables task-level monitoring of agent tasks, sub-agents, and
+dispatched background work. Without it, herdr-top monitors only the session
+topology and the agents visible in panes.
+
 ## Install the standalone CLI
 
 The managed Herdr plugin is sufficient for live monitoring. Hook and other

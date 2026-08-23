@@ -30,7 +30,7 @@ For scripted or automated use, download the installer first so a failed
 download is detectable:
 
 ```sh
-f=$(mktemp) && curl --fail --location --silent --show-error https://raw.githubusercontent.com/mageyuki/herdr-top/main/install.sh -o "$f" && bash "$f"
+f=$(mktemp) && curl --fail --location --silent --show-error https://raw.githubusercontent.com/mageyuki/herdr-top/main/install.sh -o "$f" && bash "$f"; rm -f "$f"
 ```
 
 Then, from a pane inside the Herdr session you want to inspect:
@@ -120,7 +120,10 @@ build command is `scripts/fetch-release.sh`; its `top` pane is a tab titled
 
 - [TUI guide](docs/tui.md)
 - [CLI reference](docs/cli.md)
-- [Controller event hook setup](docs/guides/controller-emit-setup.md)
+- [Controller emit setup](docs/guides/controller-emit-setup.md) -- required for
+  task-level monitoring: the live tree of agent tasks, including headless
+  sub-agents, needs this integration; without it herdr-top shows the session
+  topology and pane-visible agents only.
 - [Release process](docs/guides/release-process.md)
 - [MVP design](docs/design/herdr-top-mvp.md)
 - [Design records (ADRs)](docs/adr/)
