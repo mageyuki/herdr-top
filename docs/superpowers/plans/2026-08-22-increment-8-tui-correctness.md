@@ -229,7 +229,7 @@ where `activity` = `format!("{event_kind}: {tool}")` when a tool name exists, el
 
 **Interfaces:**
 - Consumes: Task 1 timestamps; Task 4's tick (live refresh); Task 5's `worker_kind_label` + `newest_agent_node`.
-- Produces: `summary_rows(model: &DomainModel, now_ms: i64) -> Vec<SummaryRow>`; `SummaryRow { worker_kind: String, model: String, run_count: usize, live_count: usize, total_duration_ms: i64, mean_duration_ms: Option<i64> }` — grouped by (worker-kind, model), sorted by `total_duration_ms` descending then keys; **total/mean cover terminal runs only** (spec §8.3); live runs count in `run_count`/`live_count` only. Token and tok/s columns render `-` (Increment 9 fills them; this satisfies the spec's reserved-slot requirement — the header additionally keeps a fixed-width reserved segment rendering nothing until Increment 9).
+- Produces: `summary_rows(model: &DomainModel, now_ms: i64) -> Vec<SummaryRow>`; `SummaryRow { worker_kind: String, model: String, run_count: usize, live_count: usize, total_duration_ms: i64, mean_duration_ms: Option<i64> }` — grouped by (worker-kind, model), sorted by `total_duration_ms` descending then keys; **total/mean cover terminal runs only** (spec §8.3); live runs count in `run_count`/`live_count` only. Token and tok/s columns render `-` (Increment 9 fills them).
 
 - [ ] **Step 1: Failing aggregation test.** Two kinds × two models, mixed live/terminal, fixed timestamps: grouping, counts, terminal-only totals/means, sort order, timestamp-less runs contribute counts but no duration.
 
@@ -289,3 +289,12 @@ Serial 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9. Task 2 (resolution har
 ## Phase R (increment close-out)
 
 After Task 9: full CI-exact gate on the final HEAD under a SIGHUP-default shell; a live smoke run against the running herdr instance (current session's runs attach within one watchdog interval after a forced silence; rows show subjects; names shown; `s` and `c` work; SessionEnd of a scratch session dismisses its run and a resume restores it; restart preserves dismissals); then the standard publication flow (final whole-branch review before any push; push/PR on user instruction).
+
+## Controller amendments
+
+Where these entries conflict with the per-task text above, the shipped code is authoritative.
+
+- **Task 4:** Lifecycle timestamp and dismissal bookkeeping landed on `TaskRun` in `src/model/entities.rs`, with clock control supplied at the production and workload-harness call sites. The proposed `App::advance_clock` interface did not land.
+- **Task 5:** The dependency-view integration landed in `src/tui/dag.rs`. A gated, wall-aligned refresh driven by cached deadlines in `src/tui/app.rs` and `src/tui/projection.rs` replaced the deleted `advance_clock` design.
+- **Task 6:** `src/herdr/collector.rs` and `src/reducer.rs` retain captured names across observationally nameless reconciliation, while `tab_renamed` carries event authority: an explicit empty or absent label persists a clear rather than being treated as a nameless observation.
+- **Task 8:** The shared operator read model was extracted to `src/activity.rs`; collector command servicing is present across subscription setup, convergence, live, reconciling, and backoff lifecycles. The top-level `s` and `c` actions require empty modifiers, while Summary's overlay-local `s` close remains deliberately modifier-blind.

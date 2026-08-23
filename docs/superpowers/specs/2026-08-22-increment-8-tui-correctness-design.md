@@ -46,9 +46,11 @@ from the display.
 1. The model self-heals from a silent event-stream freeze without restart.
 2. Protocol-20 flat `pane_agent_detected` frames are ingested.
 3. Snapshot-driven rebinding cannot violate the native-session unique index.
-4. Hook-originated runs reach a terminal state on `SessionEnd`, and
-   crash-orphaned runs leave the default view after a bounded time.
-5. Task run rows read as work items, not UUIDs.
+4. Hook-originated runs leave the default view through a non-terminal
+   `SessionEnd` dismissal, and crash-orphaned runs leave it after a bounded
+   time.
+5. Task run rows prefer captured work subjects, retaining an identity-shaped
+   fallback only when no subject exists.
 6. The physical tree, tab/pane names, DAG view, and footer are legible.
 7. Session and per-run timing is visible; a summary overlay aggregates it.
 8. A clear key dismisses finished and expired runs persistently.
@@ -69,21 +71,31 @@ from the display.
 
 ### 1. Collector liveness watchdog
 
-The collector records the receive time of the last herdr-sourced event.
-When no herdr event has arrived for `HERDR_LIVENESS_TIMEOUT` (default 30
-seconds; injectable for tests and configuration), the collector:
+The collector measures a monotonic silence deadline from the last
+herdr-sourced subscription event. `LivenessPolicy.timeout_ms` defaults to
+30,000 ms and is injectable. Expiry does not drop the subscription. Instead,
+the collector keeps that event connection open and probes `session.snapshot`
+against the same socket endpoint through `wire::request`'s fresh request
+connection, using the liveness timeout for the probe as well.
 
-1. records a diagnostics observation naming the silent interval,
-2. drops and re-establishes the subscription socket,
-3. requests a full snapshot,
-4. reconciles through the existing observation-gap machinery (the same path
-   startup uses), retiring executions the snapshot no longer supports.
+The shipped outcomes are `WatchdogProbeOutcome::HealthyIdle`,
+`Inconclusive`, and `Reconnect(reason)`, where the reconnect reasons are
+`WatchdogReconnectReason::ProbeFailed` (`snapshot_probe_failed`) and
+`TopologyDiverged` (`topology_diverged`). A failed, timed-out, malformed, or
+undecodable snapshot probe reconnects. A snapshot that diverges from the
+current canonical model proves the subscription was starved and reconnects
+through observation-gap reconciliation. A matching snapshot is healthy idle:
+the collector keeps the subscription, records no gap, and rearms the deadline.
+An ambiguous current projection is inconclusive: the collector increments
+`inconclusive_topology_probes`, does not reconnect, and rearms the deadline.
+Reconnect delay is exponential from 1,000 ms through a 60,000 ms hard cap and
+resets when the first herdr event arrives after reconnect.
 
-Reconnect failures back off (bounded exponential, capped at 60 seconds) and
-each attempt is recorded. The watchdog must be driven by an injected clock
-so tests are deterministic. Periodic herdr traffic (for example pong replies)
-counts as liveness only if it is delivered through the same event stream
-being watched; the timer measures the stream, not the socket.
+A ping/pong liveness scheme was rejected because the request/response path can
+stay alive while the event subscription is starved: the socket answers even
+though the subscription delivers nothing. Snapshot comparison detects that
+specific failure by exposing the divergence between authoritative topology
+and the model.
 
 ### 2. `pane_agent_detected` tolerance
 
@@ -94,11 +106,10 @@ and the protocol-20 flat frame (top-level `pane_id` / `workspace_id` /
 `agent`, no `pane` object, hence no `agent_session`) is accepted without
 error: it counts as stream liveness and is recorded via the collector's
 counter mechanism, but derives no topology mutation of its own — the
-paired full `pane_updated` frame and the watchdog's snapshot path carry
+paired full `pane_updated` frame and later snapshot reconciliation carry
 the actual binding. Both shapes are covered by tests using frames captured
 from real traffic. Whether herdr always pairs the flat frame with a full
-`pane_updated` is not assumed: if it does not, the watchdog's periodic
-re-snapshot still converges the model.
+`pane_updated` is not assumed; the flat frame itself never mutates topology.
 
 ### 3. Native-session binding lookup
 
@@ -115,16 +126,18 @@ a column binding, snapshot re-observation of the same sid).
    identified by the hook's session identity. It deliberately does NOT
    produce a terminal task state: the reducer rejects `task_started` on
    terminal runs as stale (its replay protection), so a terminal mapping
-   would make resumed sessions permanently invisible. Because any new
-   activity clears a dismissal, a resumed session (`SessionStart` on the
-   same id) reappears naturally. The decision and the rejected
-   alternatives (terminal mapping with a reopen rule; expiry-only) are
-   recorded in a new ADR (`docs/adr/`), and the mapping table in
+   would make resumed sessions permanently invisible. Because a later
+   non-terminal Task Run mutation through `TaskRun::touch` clears a dismissal,
+   a resumed session (`SessionStart` on the same id) reappears naturally. The
+   decision and the rejected alternatives (terminal mapping with a reopen
+   rule; expiry-only) are recorded in
+   `docs/adr/2026-08-22-session-end-auto-dismiss.md`, and the mapping table in
    `docs/guides/controller-emit-setup.md` is updated.
 2. Default-visibility expiry: a hook-only run (zero executions) that is
-   non-terminal counts as expired when `now - last_activity >= 24h`; expired
+   non-terminal counts as expired when `now - updated_at_ms >= 24h`; expired
    runs leave the default view but remain in the store and remain reachable
-   via filtering. Any new activity resets the timer and restores visibility.
+   via filtering. A later non-terminal Task Run mutation through
+   `TaskRun::touch` resets the timer and restores visibility.
 3. The existing rules for runs with executions are unchanged.
 
 ### 5. Task run row readability
@@ -135,11 +148,11 @@ A task run row renders as:
 
 1. `worker-kind` derives from the run key and provider (for example
    `claude`, `codex`, controller-source names from the hook adapter).
-2. `subject` is the sanitized controller label (`task_subject` from the
-   `TaskCreated` hook, existing 256-byte cap) — a static one-line anchor
-   set once at dispatch. The label is copied onto the `TaskRun` (new
-   field) when an event carries one; absent a label the row falls back to
-   the current key-derived name. Free-text activity excerpts remain
+2. `subject` is the first non-empty sanitized controller label
+   (`task_subject` from the `TaskCreated` hook, existing 256-byte cap), copied
+   onto the `TaskRun` by task-state bookkeeping and never overwritten. Absent
+   a label the row falls back to the current key-derived name. Free-text
+   activity excerpts remain
    prohibited in this increment (unchanged privacy rule). The agreed end
    state is Claude-Code-style live activity text: Increment 9's allowlist
    revision (the same one that adds token metrics) is expected to design a
@@ -149,14 +162,19 @@ A task run row renders as:
 3. `activity` is a live, structured suffix rebuilt from the run's newest
    agent-node observation: `last_event_kind` and, when present,
    `last_tool_name` (for example `tool_use: Bash`). It updates on each
-   event; terminal runs drop it.
-4. `model` comes from the run's newest agent node with a `model_id`.
+   applicable provider activity event; terminal runs drop it.
+4. Select the run's newest agent node by the greatest
+   `(last_activity_at_ms, agent_node_id)` tuple, using `agent_node_id` as the
+   deterministic tiebreak, then read that node's `model_id`. An older node is
+   not substituted merely because it has a model.
 5. `status` is the existing task state, untruncated.
 6. `duration` is `finished_at - created_at` for terminal runs and
    `now - created_at` for live ones (see section 8 for the data source),
    updating as time passes for live runs.
-7. Full identifiers (UUIDs, run keys) move to the Detail overlay (`i`),
-   which gains the run's identity block.
+7. The Detail overlay (`i`) is the complete identity surface and gains the
+   run's full key, UUID, native binding, and timestamps. A row with a captured
+   subject does not append its key or UUID; when the subject is absent, the
+   key-derived fallback can itself be an identifier.
 
 ### 6. Physical tree glyphs
 
@@ -184,8 +202,7 @@ rules as controller labels.
 2. The header shows session-wide wall-clock elapsed time (now minus the
    session's first observation) at all times. Summed worker time (total of
    run durations) appears only in the Summary overlay, so the two figures
-   are never conflated. The header layout reserves space for a future tok/s
-   figure but renders nothing for it in this increment.
+   are never conflated.
 3. A new Summary overlay opens on `s` (and closes on `s` / `Esc`), built on
    the existing overlay mechanism. It aggregates, per worker-kind × model:
    run count, total and mean duration for terminal runs, and count of live
@@ -199,7 +216,8 @@ rules as controller labels.
 2. When the DAG view has zero dependency edges it renders a one-line
    placeholder ("no dependency edges recorded") instead of empty columns.
 3. The footer defines explicit truncation tiers by available width, dropping
-   whole hints from the right rather than cutting mid-hint; the full hint
+   whole hints from the right rather than cutting mid-hint; below the
+   27-column compact floor only that floor is width-truncated. The full hint
    list remains available in the Help overlay (`?`).
 
 ### 10. Clear key
@@ -207,8 +225,8 @@ rules as controller labels.
 `c` dismisses from the default view: every terminal run, and every expired
 hook-only run (section 4.2). Dismissal is recorded in SQLite (new
 `dismissed_at_ms` on task runs) and survives restart. Dismissed runs stay
-filterable, and any new activity on a dismissed run clears the dismissal.
-`c` never deletes rows.
+filterable, and a later non-terminal Task Run mutation through
+`TaskRun::touch` clears the dismissal. `c` never deletes rows.
 
 ## Error handling and edge cases
 
