@@ -68,6 +68,14 @@ static WORKLOAD_RECEIPT_TIME_BASE_MS: std::sync::LazyLock<i64> = std::sync::Lazy
     .unwrap()
 });
 
+/// Whole-second real-epoch base for deterministic workload frame-driver clocks.
+#[cfg(feature = "workload-harness")]
+static WORKLOAD_FRAME_DRIVER_EPOCH_BASE_MS: std::sync::LazyLock<i64> =
+    std::sync::LazyLock::new(|| {
+        let receipt_time_base_ms = *WORKLOAD_RECEIPT_TIME_BASE_MS;
+        receipt_time_base_ms - receipt_time_base_ms.rem_euclid(1_000)
+    });
+
 #[cfg(feature = "workload-harness")]
 struct AtomicEpochClock {
     milliseconds: Arc<AtomicI64>,
@@ -93,7 +101,8 @@ fn frame_driver_for_times(
         .flat_map(|millis| [Duration::from_millis(*millis); 2])
         .collect::<Vec<_>>();
     let mut clock_values = clock_values.into_iter();
-    let epoch_milliseconds = Arc::new(AtomicI64::new(0));
+    let epoch_base_ms = *WORKLOAD_FRAME_DRIVER_EPOCH_BASE_MS;
+    let epoch_milliseconds = Arc::new(AtomicI64::new(epoch_base_ms));
     let (model_sender, model_receiver) =
         tokio::sync::watch::channel(std::sync::Arc::new(DomainModel::default()));
     let (performance_sender, performance) =
@@ -114,7 +123,8 @@ fn frame_driver_for_times(
             .next()
             .expect("fixed workload clock must cover every limiter read");
         epoch_milliseconds.store(
-            i64::try_from(now.as_millis()).unwrap_or(i64::MAX),
+            i64::try_from(now.as_millis())
+                .map_or(i64::MAX, |millis| epoch_base_ms.saturating_add(millis)),
             Ordering::SeqCst,
         );
         now
@@ -126,9 +136,9 @@ fn frame_driver_for_times(
 #[test]
 fn workload_frame_driver_matches_production_limiter_decisions() {
     let (mut driver, _model_sender, _quality_sender) =
-        frame_driver_for_times(&[0, 50, 99, 100, 200]);
+        frame_driver_for_times(&[0, 50, 99, 100, 200, 995]);
 
-    let observations = [false, false, true, false, true]
+    let observations = [false, false, true, false, true, false]
         .into_iter()
         .map(|dirty| driver.step(dirty).unwrap())
         .collect::<Vec<_>>();
@@ -138,7 +148,7 @@ fn workload_frame_driver_matches_production_limiter_decisions() {
             .iter()
             .map(|observation| observation.draw_ordinal)
             .collect::<Vec<_>>(),
-        vec![Some(0), None, None, Some(1), Some(2)]
+        vec![Some(0), None, None, Some(1), Some(2), None]
     );
     assert_eq!(
         observations
@@ -151,6 +161,7 @@ fn workload_frame_driver_matches_production_limiter_decisions() {
             Duration::from_millis(1),
             Duration::from_millis(10),
             Duration::from_millis(10),
+            Duration::from_millis(5),
         ]
     );
 }
