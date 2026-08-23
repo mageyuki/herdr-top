@@ -110,7 +110,10 @@ Backfill anchor (v2, resolves a plan/spec conflict): the anchor is
 `max(earliest own-DB event for this session, now − HERDR_TOP_BACKFILL_WINDOW_MS)`
 — the window is a hard scan bound; the DB can only narrow it, never widen
 it. Files strictly older than the anchor are skipped unless admitted by
-lineage evidence.
+lineage evidence. Pane-root artifacts (the transcript or rollout of an
+admitted pane session) are likewise exempt from the anchor — a live but
+idle pane's own artifact must not become invisible when its mtime falls
+behind the window.
 
 Watching: the existing worker's notify + rescan machinery; per-file
 `SourcePosition` offsets; polling degradation. Idle cost stays
