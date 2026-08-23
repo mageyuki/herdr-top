@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, DirEntry};
+use std::fs::{self, DirEntry, FileType};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
@@ -21,28 +21,44 @@ pub const DEFAULT_BACKFILL_WINDOW_MS: i64 = 86_400_000;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DiscoveredArtifactKind {
     /// Claude root transcript.
-    ClaudeSession { session_id: String },
+    ClaudeSession {
+        /// Provider-native Claude session ID.
+        session_id: String,
+    },
     /// Claude subagent transcript or metadata sidecar.
-    ClaudeSubagent { parent: String, agent_id: String },
+    ClaudeSubagent {
+        /// Owning Claude root session ID.
+        parent: String,
+        /// Provider-native Claude subagent ID.
+        agent_id: String,
+    },
     /// Codex rollout transcript.
-    CodexRollout { rollout_id: String },
+    CodexRollout {
+        /// Provider-native Codex rollout ID.
+        rollout_id: String,
+    },
 }
 
 /// One artifact observed by bounded provider discovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveredArtifact {
+    /// Provider that owns the artifact.
     pub provider: Provider,
+    /// Absolute path observed during discovery.
     pub path: PathBuf,
+    /// Provider-specific artifact identity and kind.
     pub kind: DiscoveredArtifactKind,
 }
 
 /// Identity-keyed artifact inventory used only for evidence matching.
 #[derive(Clone, Debug, Default)]
-pub struct DiscoveredIndex {
+pub struct AdmissionIndex {
     by_identity: HashMap<String, Vec<DiscoveredArtifact>>,
+    had_errors: bool,
 }
 
-impl DiscoveredIndex {
+impl AdmissionIndex {
+    /// Creates an empty evidence-matching index.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -102,10 +118,17 @@ impl DiscoveredIndex {
     }
 
     /// Indexes rollout filenames only in UTC date shards on or after `anchor_ms`.
+    ///
+    /// Within the anchor day, parseable filename timestamps before the anchor are skipped.
+    /// Individual nested-entry errors are recorded and do not discard healthy siblings.
     pub fn discover_codex_date_shards(root: &Path, anchor_ms: i64) -> io::Result<Self> {
         let result = Self::discover_codex_date_shards_inner(root, anchor_ms);
         #[cfg(test)]
         CODEX_SHARD_SCAN_HOOK.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        #[cfg(test)]
+        CODEX_DISCOVERY_FILE_TYPE_HOOK.with(|slot| {
             slot.borrow_mut().take();
         });
         result
@@ -116,25 +139,52 @@ impl DiscoveredIndex {
 
         let anchor_day = anchor_ms.div_euclid(MILLIS_PER_DAY);
         let mut index = Self::new();
-        for year in sorted_directory_entries(root)? {
+        for year in sorted_directory_entries(root, true, &mut index.had_errors)? {
             let Some(year_value) = fixed_decimal(&year.file_name(), 4) else {
                 continue;
             };
-            if !year.file_type()?.is_dir() {
+            let year_path = year.path();
+            let year_kind = match codex_discovery_file_type(&year, &year_path) {
+                Ok(kind) => kind,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    index.had_errors = true;
+                    continue;
+                }
+            };
+            if !year_kind.is_dir() {
                 continue;
             }
-            for month in sorted_directory_entries(&year.path())? {
+            for month in sorted_directory_entries(&year_path, false, &mut index.had_errors)? {
                 let Some(month_value) = fixed_decimal(&month.file_name(), 2) else {
                     continue;
                 };
-                if !month.file_type()?.is_dir() {
+                let month_path = month.path();
+                let month_kind = match codex_discovery_file_type(&month, &month_path) {
+                    Ok(kind) => kind,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(_) => {
+                        index.had_errors = true;
+                        continue;
+                    }
+                };
+                if !month_kind.is_dir() {
                     continue;
                 }
-                for day in sorted_directory_entries(&month.path())? {
+                for day in sorted_directory_entries(&month_path, false, &mut index.had_errors)? {
                     let Some(day_value) = fixed_decimal(&day.file_name(), 2) else {
                         continue;
                     };
-                    if !day.file_type()?.is_dir() {
+                    let day_path = day.path();
+                    let day_kind = match codex_discovery_file_type(&day, &day_path) {
+                        Ok(kind) => kind,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                        Err(_) => {
+                            index.had_errors = true;
+                            continue;
+                        }
+                    };
+                    if !day_kind.is_dir() {
                         continue;
                     }
                     let Some(shard_day) = civil_day(year_value, month_value, day_value) else {
@@ -143,9 +193,21 @@ impl DiscoveredIndex {
                     if shard_day < anchor_day {
                         continue;
                     }
-                    record_codex_shard_scan(&day.path());
-                    for artifact in sorted_directory_entries(&day.path())? {
-                        if !artifact.file_type()?.is_file() {
+                    record_codex_shard_scan(&day_path);
+                    for artifact in
+                        sorted_directory_entries(&day_path, false, &mut index.had_errors)?
+                    {
+                        let artifact_path = artifact.path();
+                        let artifact_kind =
+                            match codex_discovery_file_type(&artifact, &artifact_path) {
+                                Ok(kind) => kind,
+                                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                                Err(_) => {
+                                    index.had_errors = true;
+                                    continue;
+                                }
+                            };
+                        if !artifact_kind.is_file() {
                             continue;
                         }
                         let file_name = artifact.file_name();
@@ -153,6 +215,12 @@ impl DiscoveredIndex {
                             continue;
                         };
                         if !file_name.starts_with("rollout-") || !file_name.ends_with(".jsonl") {
+                            continue;
+                        }
+                        if shard_day == anchor_day
+                            && rollout_filename_timestamp_ms(file_name)
+                                .is_some_and(|timestamp_ms| timestamp_ms < anchor_ms)
+                        {
                             continue;
                         }
                         let rollout_id = super::facts::scan_raw_ids(file_name)
@@ -163,7 +231,7 @@ impl DiscoveredIndex {
                             })
                             .next_back();
                         if let Some(rollout_id) = rollout_id {
-                            index.insert_codex_rollout(&rollout_id, artifact.path());
+                            index.insert_codex_rollout(&rollout_id, artifact_path);
                         }
                     }
                 }
@@ -172,9 +240,16 @@ impl DiscoveredIndex {
         Ok(index)
     }
 
+    /// Reports whether an exact discovered artifact is keyed by `uuid`.
     #[must_use]
     pub fn contains_uuid(&self, uuid: &str) -> bool {
         self.by_identity.contains_key(uuid)
+    }
+
+    /// Reports whether any nested directory entry could not be inspected.
+    #[must_use]
+    pub const fn had_errors(&self) -> bool {
+        self.had_errors
     }
 
     /// Returns every discovered artifact exactly keyed by `uuid`.
@@ -187,8 +262,30 @@ impl DiscoveredIndex {
 /// A discovery root whose membership stays scoped to its evidence parent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DerivedRoot {
+    /// Already-admitted scope whose evidence produced this root.
     pub scope: SessionScope,
+    /// Provider and scoped configuration path to discover.
     pub root: DiscoveryRoot,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum ScopeKey {
+    ClaudeRoot(String),
+    ClaudeSubagent { parent: String, agent_id: String },
+    Codex(String),
+}
+
+impl From<&SessionScope> for ScopeKey {
+    fn from(scope: &SessionScope) -> Self {
+        match scope {
+            SessionScope::ClaudeRoot(session_id) => Self::ClaudeRoot(session_id.clone()),
+            SessionScope::ClaudeSubagent { parent, agent_id } => Self::ClaudeSubagent {
+                parent: parent.clone(),
+                agent_id: agent_id.clone(),
+            },
+            SessionScope::Codex { rollout_id } => Self::Codex(rollout_id.clone()),
+        }
+    }
 }
 
 /// Evidence-gated provider artifact admission state.
@@ -196,20 +293,21 @@ pub struct DerivedRoot {
 pub struct Admission {
     anchor_ms: i64,
     claude_sessions: HashSet<String>,
-    claude_subagents: HashSet<(String, String)>,
     codex_rollouts: HashSet<String>,
+    admitted_scopes: HashSet<ScopeKey>,
     admitted_paths: HashSet<PathBuf>,
     derived_roots: Vec<DerivedRoot>,
 }
 
 impl Admission {
+    /// Creates an empty admission graph with a hard file-mtime anchor.
     #[must_use]
     pub fn new(anchor_ms: i64) -> Self {
         Self {
             anchor_ms,
             claude_sessions: HashSet::new(),
-            claude_subagents: HashSet::new(),
             codex_rollouts: HashSet::new(),
+            admitted_scopes: HashSet::new(),
             admitted_paths: HashSet::new(),
             derived_roots: Vec::new(),
         }
@@ -223,25 +321,35 @@ impl Admission {
         match provider {
             Provider::Claude => {
                 self.claude_sessions.insert(session_id.to_owned());
+                self.admitted_scopes
+                    .insert(ScopeKey::ClaudeRoot(session_id.to_owned()));
             }
             Provider::Codex => {
                 self.codex_rollouts.insert(session_id.to_owned());
+                self.admitted_scopes
+                    .insert(ScopeKey::Codex(session_id.to_owned()));
             }
         }
     }
 
+    /// Applies one allowlisted evidence ID emitted by an already-admitted parent scope.
+    ///
+    /// UUID evidence admits only exact paths present in `discovered`. Configuration-directory
+    /// evidence derives a provider root without enumerating or opening it.
     pub fn on_evidence(
         &mut self,
         parent: &SessionScope,
         id: &EvidenceId,
-        discovered: &DiscoveredIndex,
+        discovered: &AdmissionIndex,
     ) -> Option<SessionScope> {
+        if !self.admitted_scopes.contains(&ScopeKey::from(parent)) {
+            return None;
+        }
         match id {
             EvidenceId::ConfigDir(config_dir) => {
                 if !config_dir.is_absolute() {
                     return None;
                 }
-                self.admit_scope(parent);
                 let derived = DerivedRoot {
                     scope: parent.clone(),
                     root: DiscoveryRoot {
@@ -263,12 +371,15 @@ impl Admission {
                 for artifact in artifacts {
                     self.admitted_paths.insert(artifact.path.clone());
                 }
-                self.admit_scope(&scope);
+                self.admitted_scopes.insert(ScopeKey::from(&scope));
                 Some(scope)
             }
         }
     }
 
+    /// Reports whether a path is admitted by pane identity or exact lineage evidence.
+    ///
+    /// Any path containing a `tool-results` component is categorically rejected.
     #[must_use]
     pub fn is_admitted_path(&self, path: &Path) -> bool {
         if has_component(path, OsStr::new("tool-results")) {
@@ -284,18 +395,21 @@ impl Admission {
         {
             return true;
         }
-        if self
-            .claude_sessions
+        self.claude_sessions
             .iter()
             .any(|session_id| claude_session_path_matches(path, session_id))
-        {
-            return true;
-        }
-        self.claude_subagents
-            .iter()
-            .any(|(parent, agent_id)| claude_subagent_path_matches(path, parent, Some(agent_id)))
     }
 
+    /// Applies the hard backfill anchor to an otherwise admitted regular file.
+    #[must_use]
+    pub fn is_admitted_file(&self, path: &Path, modified_ms: i64) -> bool {
+        self.is_admitted_path(path)
+            && (modified_ms >= self.anchor_ms
+                || self.admitted_paths.contains(path)
+                || self.is_pane_root_path(path))
+    }
+
+    /// Returns provider roots derived from allowlisted configuration-directory evidence.
     #[must_use]
     pub fn derived_roots(&self) -> &[DerivedRoot] {
         &self.derived_roots
@@ -307,29 +421,25 @@ impl Admission {
         self.anchor_ms
     }
 
-    fn admit_scope(&mut self, scope: &SessionScope) {
-        match scope {
-            SessionScope::ClaudeRoot(session_id) => {
-                self.claude_sessions.insert(session_id.clone());
-            }
-            SessionScope::ClaudeSubagent { parent, agent_id } => {
-                self.claude_sessions.insert(parent.clone());
-                self.claude_subagents
-                    .insert((parent.clone(), agent_id.clone()));
-            }
-            SessionScope::Codex { rollout_id } => {
-                self.codex_rollouts.insert(rollout_id.clone());
-            }
-        }
+    fn is_pane_root_path(&self, path: &Path) -> bool {
+        self.codex_rollouts
+            .iter()
+            .any(|rollout_id| codex_path_matches(path, rollout_id))
+            || self
+                .claude_sessions
+                .iter()
+                .any(|session_id| claude_root_path_matches(path, session_id))
     }
 }
 
+/// Computes the hard backfill anchor, allowing the database only to narrow the window.
 #[must_use]
 pub fn backfill_anchor_ms(earliest_db_event: Option<i64>, now_ms: i64, window_ms: i64) -> i64 {
     let window_anchor = now_ms.saturating_sub(window_ms);
     earliest_db_event.map_or(window_anchor, |earliest| earliest.max(window_anchor))
 }
 
+/// Parses a positive UTF-8 decimal millisecond window or returns the one-day default.
 #[must_use]
 pub fn parse_backfill_window_ms(value: Option<&OsStr>) -> i64 {
     value
@@ -339,6 +449,10 @@ pub fn parse_backfill_window_ms(value: Option<&OsStr>) -> i64 {
         .unwrap_or(DEFAULT_BACKFILL_WINDOW_MS)
 }
 
+/// Recomputes the zero-based record ordinal by counting newlines before `byte_offset`.
+///
+/// The read is routed through the admission-gated open seam and is used when reopening an
+/// artifact at a nonzero byte offset without a persisted ordinal.
 pub fn record_ordinal_at_offset(
     root: &Path,
     relative: &Path,
@@ -380,8 +494,13 @@ pub fn record_ordinal_at_offset(
 type CodexShardScanHook = Box<dyn FnMut(&Path)>;
 
 #[cfg(test)]
+type CodexDiscoveryFileTypeHook = Box<dyn FnMut(&Path) -> io::Result<()>>;
+
+#[cfg(test)]
 thread_local! {
     static CODEX_SHARD_SCAN_HOOK: RefCell<Option<CodexShardScanHook>> =
+        const { RefCell::new(None) };
+    static CODEX_DISCOVERY_FILE_TYPE_HOOK: RefCell<Option<CodexDiscoveryFileTypeHook>> =
         const { RefCell::new(None) };
 }
 
@@ -391,6 +510,16 @@ fn set_codex_shard_scan_hook(hook: impl FnMut(&Path) + 'static) {
         assert!(
             slot.borrow_mut().replace(Box::new(hook)).is_none(),
             "codex shard scan hook was already installed"
+        );
+    });
+}
+
+#[cfg(test)]
+fn set_codex_discovery_file_type_hook(hook: impl FnMut(&Path) -> io::Result<()> + 'static) {
+    CODEX_DISCOVERY_FILE_TYPE_HOOK.with(|slot| {
+        assert!(
+            slot.borrow_mut().replace(Box::new(hook)).is_none(),
+            "codex discovery file-type hook was already installed"
         );
     });
 }
@@ -425,15 +554,44 @@ impl DiscoveredArtifact {
     }
 }
 
-fn sorted_directory_entries(path: &Path) -> io::Result<Vec<DirEntry>> {
+fn sorted_directory_entries(
+    path: &Path,
+    is_root: bool,
+    had_errors: &mut bool,
+) -> io::Result<Vec<DirEntry>> {
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
+        Err(error) if is_root => return Err(error),
+        Err(_) => {
+            *had_errors = true;
+            return Ok(Vec::new());
+        }
     };
-    let mut entries = entries.collect::<io::Result<Vec<_>>>()?;
+    let mut found = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => found.push(entry),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => *had_errors = true,
+        }
+    }
+    let mut entries = found;
     entries.sort_by_key(DirEntry::file_name);
     Ok(entries)
+}
+
+fn codex_discovery_file_type(entry: &DirEntry, path: &Path) -> io::Result<FileType> {
+    #[cfg(test)]
+    CODEX_DISCOVERY_FILE_TYPE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(path)?;
+        }
+        Ok::<(), io::Error>(())
+    })?;
+    #[cfg(not(test))]
+    let _ = path;
+    entry.file_type()
 }
 
 fn fixed_decimal(value: &OsString, width: usize) -> Option<u32> {
@@ -456,6 +614,34 @@ fn civil_day(year: u32, month: u32, day: u32) -> Option<i64> {
     let day_of_year = (153 * shifted_month + 2) / 5 + i64::from(day) - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     Some(era * 146_097 + day_of_era - 719_468)
+}
+
+fn rollout_filename_timestamp_ms(file_name: &str) -> Option<i64> {
+    const MILLIS_PER_DAY: i64 = 86_400_000;
+
+    let value = file_name.strip_prefix("rollout-")?;
+    let timestamp = value.get(..19)?;
+    if value.as_bytes().get(19) != Some(&b'-')
+        || timestamp.as_bytes().get(4) != Some(&b'-')
+        || timestamp.as_bytes().get(7) != Some(&b'-')
+        || timestamp.as_bytes().get(10) != Some(&b'T')
+        || timestamp.as_bytes().get(13) != Some(&b'-')
+        || timestamp.as_bytes().get(16) != Some(&b'-')
+    {
+        return None;
+    }
+    let year = timestamp.get(0..4)?.parse::<u32>().ok()?;
+    let month = timestamp.get(5..7)?.parse::<u32>().ok()?;
+    let day = timestamp.get(8..10)?.parse::<u32>().ok()?;
+    let hour = timestamp.get(11..13)?.parse::<u32>().ok()?;
+    let minute = timestamp.get(14..16)?.parse::<u32>().ok()?;
+    let second = timestamp.get(17..19)?.parse::<u32>().ok()?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    civil_day(year, month, day)?
+        .checked_mul(MILLIS_PER_DAY)?
+        .checked_add(i64::from(hour * 3_600 + minute * 60 + second) * 1_000)
 }
 
 const fn days_in_month(year: u32, month: u32) -> u32 {
@@ -499,9 +685,13 @@ fn codex_path_matches(path: &Path, rollout_id: &str) -> bool {
 }
 
 fn claude_session_path_matches(path: &Path, session_id: &str) -> bool {
+    claude_root_path_matches(path, session_id)
+        || claude_subagent_path_matches(path, session_id, None)
+}
+
+fn claude_root_path_matches(path: &Path, session_id: &str) -> bool {
     path.extension() == Some(OsStr::new("jsonl"))
         && path.file_stem().and_then(OsStr::to_str) == Some(session_id)
-        || claude_subagent_path_matches(path, session_id, None)
 }
 
 fn claude_subagent_path_matches(
@@ -539,13 +729,14 @@ fn subagent_artifact_id(file_name: &OsStr) -> Option<&str> {
 mod tests {
     use std::ffi::OsStr;
     use std::fs::{self, OpenOptions};
-    use std::io::Write;
+    use std::io::{self, Write};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
     use crate::model::Provider;
     use crate::provider::claude::{ClaudePathTopology, path_topology};
     use crate::provider::facts::{EvidenceId, SessionScope};
+    use crate::provider::tail::{MAX_TAIL_RECORD_BYTES, RECORD_TOO_LONG_ERROR};
     use crate::provider::{
         FirstSeenBaseline, FsReadBoundary, ProviderDiagnostics, TailFile,
         open_admitted_regular_file,
@@ -558,15 +749,21 @@ mod tests {
     const STRANGER: &str = "33333333-3333-4333-8333-333333333333";
 
     #[test]
-    fn unadmitted_files_are_never_opened() {
+    fn open_admitted_regular_file_gates_strangers_and_tool_results() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("projects");
         let admitted = PathBuf::from(format!("workspace/{PARENT}.jsonl"));
         let stranger = PathBuf::from(format!("workspace/{STRANGER}.jsonl"));
-        let tool_result = PathBuf::from(format!(
-            "workspace/{PARENT}/tool-results/private-output.jsonl"
-        ));
-        for relative in [&admitted, &stranger, &tool_result] {
+        let tool_results = [
+            PathBuf::from(format!("workspace/tool-results/{PARENT}.jsonl")),
+            PathBuf::from(format!(
+                "workspace/tool-results/{PARENT}/subagents/agent-child.jsonl"
+            )),
+        ];
+        for relative in [&admitted, &stranger]
+            .into_iter()
+            .chain(tool_results.iter())
+        {
             let path = root.join(relative);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, b"{}\n").unwrap();
@@ -591,13 +788,15 @@ mod tests {
         );
         assert_eq!(stranger_diagnostics.admission_open_attempts(), 0);
 
-        let tool_diagnostics = ProviderDiagnostics::default();
-        assert!(
-            open_admitted_regular_file(&root, &tool_result, &admission, &tool_diagnostics)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(tool_diagnostics.admission_open_attempts(), 0);
+        for tool_result in tool_results {
+            let tool_diagnostics = ProviderDiagnostics::default();
+            assert!(
+                open_admitted_regular_file(&root, &tool_result, &admission, &tool_diagnostics)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(tool_diagnostics.admission_open_attempts(), 0);
+        }
     }
 
     #[test]
@@ -633,10 +832,11 @@ mod tests {
         let rollout_path = PathBuf::from(format!(
             "/home/user/.codex/sessions/2026/08/24/rollout-2026-08-24T00-00-00-{ROLLOUT}.jsonl"
         ));
-        let mut discovered = DiscoveredIndex::new();
+        let mut discovered = AdmissionIndex::new();
         discovered.insert_codex_rollout(ROLLOUT, rollout_path.clone());
         let parent = SessionScope::ClaudeRoot(PARENT.to_owned());
         let mut admission = Admission::new(0);
+        admission.admit_pane_session(Provider::Claude, PARENT);
 
         assert_eq!(
             admission.on_evidence(&parent, &EvidenceId::Uuid(STRANGER.to_owned()), &discovered),
@@ -653,16 +853,58 @@ mod tests {
     }
 
     #[test]
+    fn evidence_admission_is_path_exact_across_shards() {
+        let file_name = format!("rollout-2026-08-24T00-00-00-{ROLLOUT}.jsonl");
+        let admitted_path = PathBuf::from("/home/user/.codex/sessions/2026/08/24").join(&file_name);
+        let anchored_out_copy =
+            PathBuf::from("/home/user/.codex/sessions/2026/08/20").join(&file_name);
+        let mut discovered = AdmissionIndex::new();
+        discovered.insert_codex_rollout(ROLLOUT, admitted_path.clone());
+        let parent = SessionScope::ClaudeRoot(PARENT.to_owned());
+        let mut admission = Admission::new(0);
+        admission.admit_pane_session(Provider::Claude, PARENT);
+
+        assert!(
+            admission
+                .on_evidence(&parent, &EvidenceId::Uuid(ROLLOUT.to_owned()), &discovered,)
+                .is_some()
+        );
+        assert!(admission.is_admitted_path(&admitted_path));
+        assert!(!admission.is_admitted_path(&anchored_out_copy));
+    }
+
+    #[test]
+    fn evidence_requires_an_already_admitted_parent() {
+        let rollout_path = PathBuf::from(format!(
+            "/home/user/.codex/sessions/2026/08/24/rollout-2026-08-24T00-00-00-{ROLLOUT}.jsonl"
+        ));
+        let mut discovered = AdmissionIndex::new();
+        discovered.insert_codex_rollout(ROLLOUT, rollout_path.clone());
+        let mut admission = Admission::new(0);
+
+        assert_eq!(
+            admission.on_evidence(
+                &SessionScope::ClaudeRoot(PARENT.to_owned()),
+                &EvidenceId::Uuid(ROLLOUT.to_owned()),
+                &discovered,
+            ),
+            None
+        );
+        assert!(!admission.is_admitted_path(&rollout_path));
+    }
+
+    #[test]
     fn config_dir_evidence_creates_scoped_root() {
         let parent = SessionScope::ClaudeRoot(PARENT.to_owned());
         let config_dir = PathBuf::from("/opt/claude-secondary");
         let mut admission = Admission::new(0);
+        admission.admit_pane_session(Provider::Claude, PARENT);
 
         assert_eq!(
             admission.on_evidence(
                 &parent,
                 &EvidenceId::ConfigDir(config_dir.clone()),
-                &DiscoveredIndex::new(),
+                &AdmissionIndex::new(),
             ),
             Some(parent.clone())
         );
@@ -686,6 +928,35 @@ mod tests {
     }
 
     #[test]
+    fn per_file_anchor_bounds_descendants_but_not_exact_or_pane_roots() {
+        let mut admission = Admission::new(1_000);
+        admission.admit_pane_session(Provider::Claude, PARENT);
+        let pane_root = PathBuf::from(format!("/logs/workspace/{PARENT}.jsonl"));
+        let subagent = PathBuf::from(format!(
+            "/logs/workspace/{PARENT}/subagents/agent-child.jsonl"
+        ));
+        let evidence_path = PathBuf::from(format!(
+            "/logs/sessions/2026/08/24/rollout-2026-08-24T12-00-00-{ROLLOUT}.jsonl"
+        ));
+        let mut index = AdmissionIndex::new();
+        index.insert_codex_rollout(ROLLOUT, evidence_path.clone());
+        assert!(
+            admission
+                .on_evidence(
+                    &SessionScope::ClaudeRoot(PARENT.to_owned()),
+                    &EvidenceId::Uuid(ROLLOUT.to_owned()),
+                    &index,
+                )
+                .is_some()
+        );
+
+        assert!(admission.is_admitted_file(&pane_root, 100));
+        assert!(!admission.is_admitted_file(&subagent, 999));
+        assert!(admission.is_admitted_file(&evidence_path, 100));
+        assert!(admission.is_admitted_file(&subagent, 1_000));
+    }
+
+    #[test]
     fn date_shard_scan_bounded_by_anchor() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("sessions");
@@ -703,7 +974,7 @@ mod tests {
         let observed = Arc::clone(&scanned);
         set_codex_shard_scan_hook(move |path| observed.lock().unwrap().push(path.to_path_buf()));
 
-        let index = DiscoveredIndex::discover_codex_date_shards(
+        let index = AdmissionIndex::discover_codex_date_shards(
             &root,
             1_787_486_400_000, // 2026-08-23T12:00:00Z
         )
@@ -716,6 +987,77 @@ mod tests {
             *scanned.lock().unwrap(),
             [root.join("2026/08/23"), root.join("2026/08/24")]
         );
+    }
+
+    #[test]
+    fn anchor_day_rollouts_are_bounded_by_filename_timestamp() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sessions");
+        let anchor_day = root.join("2026/08/23");
+        let later_day = root.join("2026/08/24");
+        fs::create_dir_all(&anchor_day).unwrap();
+        fs::create_dir_all(&later_day).unwrap();
+        let before = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        let equal = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+        let after = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+        let malformed = "99999999-9999-4999-8999-999999999999";
+        let later = "77777777-7777-4777-8777-777777777777";
+        for (name, id) in [
+            ("rollout-2026-08-23T11-59-59", before),
+            ("rollout-2026-08-23T12-00-00", equal),
+            ("rollout-2026-08-23T12-00-01", after),
+            ("rollout-not-a-time", malformed),
+        ] {
+            fs::write(anchor_day.join(format!("{name}-{id}.jsonl")), b"{}\n").unwrap();
+        }
+        fs::write(
+            later_day.join(format!("rollout-2026-08-24T00-00-00-{later}.jsonl")),
+            b"{}\n",
+        )
+        .unwrap();
+
+        let index = AdmissionIndex::discover_codex_date_shards(
+            &root,
+            1_787_486_400_000, // 2026-08-23T12:00:00Z
+        )
+        .unwrap();
+
+        assert!(!index.contains_uuid(before));
+        assert!(index.contains_uuid(equal));
+        assert!(index.contains_uuid(after));
+        assert!(index.contains_uuid(malformed));
+        assert!(index.contains_uuid(later));
+    }
+
+    #[test]
+    fn codex_shard_entry_error_retains_sibling_rollouts() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sessions");
+        let shard = root.join("2026/08/24");
+        fs::create_dir_all(&shard).unwrap();
+        let unreadable_id = "11111111-aaaa-4111-8111-111111111111";
+        let sibling_id = "22222222-bbbb-4222-8222-222222222222";
+        let unreadable = shard.join(format!("rollout-2026-08-24T00-00-00-{unreadable_id}.jsonl"));
+        let sibling = shard.join(format!("rollout-2026-08-24T00-00-01-{sibling_id}.jsonl"));
+        fs::write(&unreadable, b"{}\n").unwrap();
+        fs::write(&sibling, b"{}\n").unwrap();
+        let injected_path = unreadable.clone();
+        set_codex_discovery_file_type_hook(move |path| {
+            if path == injected_path {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected unreadable rollout",
+                ))
+            } else {
+                Ok(())
+            }
+        });
+
+        let index = AdmissionIndex::discover_codex_date_shards(&root, 0).unwrap();
+
+        assert!(index.had_errors());
+        assert!(!index.contains_uuid(unreadable_id));
+        assert!(index.contains_uuid(sibling_id));
     }
 
     #[test]
@@ -750,30 +1092,57 @@ mod tests {
     fn record_ordinal_is_stable_after_reopen_at_nonzero_offset() {
         let directory = tempfile::tempdir().unwrap();
         let relative = PathBuf::from(format!("rollout-example-{ROLLOUT}.jsonl"));
-        fs::write(directory.path().join(&relative), b"zero\none\ntwo\n").unwrap();
+        let mut fixture = b"first\r\n".to_vec();
+        fixture.extend(vec![b'x'; MAX_TAIL_RECORD_BYTES + 1]);
+        fixture.push(b'\n');
+        fixture.extend_from_slice(b"trailing-partial");
+        fs::write(directory.path().join(&relative), &fixture).unwrap();
         let mut admission = Admission::new(0);
         admission.admit_pane_session(Provider::Codex, ROLLOUT);
-        let second_record_offset = 5;
-
-        let before_restart = record_ordinal_at_offset(
+        let mut boundary = FsReadBoundary;
+        let mut tail = TailFile::open(
             directory.path(),
             &relative,
-            second_record_offset,
+            &FirstSeenBaseline::default(),
+            0,
+            &mut boundary,
+        )
+        .unwrap();
+        let mut records = Vec::new();
+        while tail.offset() < fixture.len() as u64 {
+            records.extend(tail.poll(&mut boundary).unwrap());
+        }
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].bytes, b"first");
+        assert_eq!(records[0].error_code, None);
+        assert!(records[1].bytes.is_empty());
+        assert_eq!(records[1].error_code, Some(RECORD_TOO_LONG_ERROR));
+        assert!(tail.poll(&mut boundary).unwrap().is_empty());
+
+        for (record_index, record) in records.iter().enumerate() {
+            assert_eq!(
+                record_ordinal_at_offset(
+                    directory.path(),
+                    &relative,
+                    record.offset,
+                    &admission,
+                    &ProviderDiagnostics::default(),
+                )
+                .unwrap(),
+                record_index as u64
+            );
+        }
+
+        let reopened_ordinal = record_ordinal_at_offset(
+            directory.path(),
+            &relative,
+            records[1].offset,
             &admission,
             &ProviderDiagnostics::default(),
         )
         .unwrap();
-        let after_restart = record_ordinal_at_offset(
-            directory.path(),
-            &relative,
-            second_record_offset,
-            &admission,
-            &ProviderDiagnostics::default(),
-        )
-        .unwrap();
-
-        assert_eq!(before_restart, 1);
-        assert_eq!(after_restart, 1);
+        assert_eq!(reopened_ordinal, 1);
     }
 
     #[test]
@@ -813,6 +1182,18 @@ mod tests {
                 parent_session: PARENT.to_owned(),
                 agent_id: "child".to_owned(),
             })
+        );
+        assert_eq!(
+            path_topology(Path::new(&format!(
+                "workspace/{PARENT}/subagents/agent-.jsonl"
+            ))),
+            None
+        );
+        assert_eq!(
+            path_topology(Path::new(&format!(
+                "workspace/{PARENT}/subagents/agent-.meta.json"
+            ))),
+            None
         );
     }
 }

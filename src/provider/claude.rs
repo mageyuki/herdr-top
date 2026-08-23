@@ -284,15 +284,21 @@ pub fn path_topology(relative_path: &Path) -> Option<ClaudePathTopology> {
         {
             let file_name = file_name.to_str()?;
             if let Some(stem) = file_name.strip_suffix(".jsonl") {
+                let agent_id = stem
+                    .strip_prefix("agent-")
+                    .filter(|agent_id| !agent_id.is_empty())?;
                 return Some(ClaudePathTopology::Subagent {
                     parent_session: parent_session.to_string_lossy().into_owned(),
-                    agent_id: stem.strip_prefix("agent-")?.to_owned(),
+                    agent_id: agent_id.to_owned(),
                 });
             }
             file_name.strip_suffix(".meta.json").and_then(|stem| {
+                let agent_id = stem
+                    .strip_prefix("agent-")
+                    .filter(|agent_id| !agent_id.is_empty())?;
                 Some(ClaudePathTopology::SubagentMeta {
                     parent_session: parent_session.to_string_lossy().into_owned(),
-                    agent_id: stem.strip_prefix("agent-")?.to_owned(),
+                    agent_id: agent_id.to_owned(),
                 })
             })
         }

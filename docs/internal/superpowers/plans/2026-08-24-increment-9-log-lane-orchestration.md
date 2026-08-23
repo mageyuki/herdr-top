@@ -232,8 +232,9 @@ pub struct Admission { /* admitted scopes, derived roots, anchor */ }
 impl Admission {
     pub fn new(anchor_ms: i64) -> Self;
     pub fn admit_pane_session(&mut self, provider: Provider, session_id: &str);
-    pub fn on_evidence(&mut self, parent: &SessionScope, id: &EvidenceId, discovered: &DiscoveredIndex) -> Option<SessionScope>;
+    pub fn on_evidence(&mut self, parent: &SessionScope, id: &EvidenceId, discovered: &AdmissionIndex) -> Option<SessionScope>;
     pub fn is_admitted_path(&self, path: &Path) -> bool;      // consulted BEFORE open
+    pub fn is_admitted_file(&self, path: &Path, modified_ms: i64) -> bool;
 }
 pub fn backfill_anchor_ms(earliest_db_event: Option<i64>, now_ms: i64, window_ms: i64) -> i64; // max(earliest, now - window)
 ```
@@ -243,7 +244,7 @@ open attempts (feature-gated counter alongside the existing provider
 diagnostics counters).
 
 - [ ] **Step 1: Failing tests:**
-  `unadmitted_files_are_never_opened` (stranger session + tool-results
+  `open_admitted_regular_file_gates_strangers_and_tool_results` (stranger session + tool-results
   dir in the tempdir; open-counter for them stays 0 — not merely zero
   facts);
   `subagents_dir_admitted_via_parent`;
@@ -263,8 +264,10 @@ diagnostics counters).
   (`ProviderEvent::Synthesized(ControllerEvent)`,
   `ProviderEvent::RunLiveness { key, at_ms }`,
   `ProviderEvent::Telemetry { key, output_tokens, model, effort }`),
-  `src/herdr/collector.rs` (route Synthesized through the existing
-  controller-event application; Telemetry/Liveness to Task 6/7 entries)
+  `src/herdr/collector.rs` (route existing-worker `bootstrap_file` and
+  `TailFile` opens through `is_admitted_file` / `open_admitted_regular_file`;
+  route Synthesized through the existing controller-event application;
+  Telemetry/Liveness to Task 6/7 entries)
 - Test: lane + collector unit tests
 
 **Interfaces:**
@@ -290,8 +293,10 @@ diagnostics counters).
   `hook_and_lane_same_fixture_yield_single_run` (apply hook-adapter
   events AND lane events for the same identity; exactly one run, no
   merge conflict).
-- [ ] **Step 2–4:** fail → implement → gates (collector routing must not
-  change the reducer-owning select set).
+- [ ] **Step 2–4:** Wire every collector-reached `bootstrap_file` and
+  `TailFile` open through the provider admission seam before opening the
+  descriptor, making the Task 4 guarantee enforced; fail → implement →
+  gates (collector routing must not change the reducer-owning select set).
 - [ ] **Step 5:** Commit `feat(lane): synthesize controller events with hook-identical identity`.
 
 ### Task 6: Lifecycle state — grace, reopen, inactivity, liveness
