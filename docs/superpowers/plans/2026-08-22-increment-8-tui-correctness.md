@@ -295,6 +295,8 @@ After Task 9: full CI-exact gate on the final HEAD under a SIGHUP-default shell;
 Where these entries conflict with the per-task text above, the shipped code is authoritative.
 
 - **Task 4:** Lifecycle timestamp and dismissal bookkeeping landed on `TaskRun` in `src/model/entities.rs`, with clock control supplied at the production and workload-harness call sites. The proposed `App::advance_clock` interface did not land.
+- **Task 4:** The default-visibility helper in `src/activity.rs` has the signature `is_default_visible_task_run(run, operator, runs_with_executions, now_ms)`, which supersedes the plan-declared `DomainModel` parameter.
 - **Task 5:** The dependency-view integration landed in `src/tui/dag.rs`. A gated, wall-aligned refresh driven by cached deadlines in `src/tui/app.rs` and `src/tui/projection.rs` replaced the deleted `advance_clock` design.
 - **Task 6:** `src/herdr/collector.rs` and `src/reducer.rs` retain captured names across observationally nameless reconciliation, while `tab_renamed` carries event authority: an explicit empty or absent label persists a clear rather than being treated as a nameless observation.
+- **Task 6:** The watchdog probe's topology comparison follows the same name-retention rule as reconciliation; a probe-versus-model label mismatch therefore cannot make the watchdog oscillate permanently between divergence and reconnect.
 - **Task 8:** The shared operator read model was extracted to `src/activity.rs`; collector command servicing is present across subscription setup, convergence, live, reconciling, and backoff lifecycles. The top-level `s` and `c` actions require empty modifiers, while Summary's overlay-local `s` close remains deliberately modifier-blind.

@@ -248,11 +248,12 @@ filterable, and a later non-terminal Task Run mutation through
 1. Watchdog: injected-clock tests for freeze detection, reconnect, snapshot
    request, reconciliation, and backoff; a regression test that a silent
    stream with an open socket recovers.
-2. Flat/nested `pane_agent_detected` fixtures, both asserted to produce the
-   same normalized observation.
+2. Nested `pane_agent_detected` fixtures assert the normal pane-upsert path;
+   flat fixtures assert diagnostic counting with no topology or persistence
+   mutation.
 3. Binding-column lookup regression test (previously fatal path).
-4. Reducer tests: `SessionEnd` terminality, 24h expiry with activity reset,
-   dismissal persistence and un-dismissal on activity.
+4. Reducer tests: `SessionEnd` producing a non-terminal dismissal, 24h expiry,
+   dismissal persistence, and clearing via a non-terminal `TaskRun::touch`.
 5. View tests: row format with and without label/model/duration, glyph and
    ASCII tree rendering, DAG placeholder, header view name, footer tiers,
    Summary overlay aggregation (fixed clock).
@@ -261,10 +262,11 @@ filterable, and a later non-terminal Task Run mutation through
 
 ## Documentation impact
 
-1. `docs/design/herdr-top-mvp.md`: §6 (tree rendering, row format, names,
-   footer), §7 (watchdog and reconnect), §10 (restored fields, dismissal),
-   plus the keybinding list (`s`, `c`).
-2. New ADR: `SessionEnd` terminal mapping (reversal of the no-op decision).
+1. `docs/design/herdr-top-mvp.md`: §6 (tree rendering, row format, names),
+   §7 (watchdog and reconnect), §10 (restored fields, dismissal), and §11
+   (footer and the `s`/`c` keybindings).
+2. `docs/adr/2026-08-22-session-end-auto-dismiss.md`: non-terminal
+   `SessionEnd` auto-dismiss.
 3. `docs/guides/controller-emit-setup.md`: event mapping table.
 
 ## Sequencing and integration
@@ -278,5 +280,5 @@ filterable, and a later non-terminal Task Run mutation through
    `src/model/ids.rs` (if row identity needs it), `src/store/*`
    (columns + restore), `src/tui/*`, `src/activity.rs`, fixtures and tests,
    the documents above.
-3. Token metrics (Increment 9) will build on the Summary overlay and the
-   reserved header slot without reshaping this increment's UI.
+3. Token metrics (Increment 9) will build on the Summary overlay's placeholder
+   columns without reshaping this increment's UI.

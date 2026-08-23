@@ -227,7 +227,7 @@ Herdr is authoritative for:
 
 The collector connects through `HERDR_SOCKET_PATH` and converges in a fixed order: subscribe to events first, buffer pushed events, fetch `session.snapshot` as the authoritative base, apply it, then replay the buffered events in receipt order, dispatching each by kind — creation events upsert their entity and closure events remove it. Anomaly classification happens at the buffer's drain boundary: an update for an entity absent from the snapshot, from the buffered creations, and from any later buffered closure marks the collector `RECONCILING` and triggers a resnapshot with a fresh buffer generation, bounded to three attempts before the collector stays `RECONCILING` and reports non-convergence rather than silently entering `LIVE`. Events arriving during replay append to the current generation's buffer, and the collector enters `LIVE` only after the buffer drains cleanly. Version fields are compared only where a pushed event actually carries one; most Herdr events carry none, so replay relies on idempotent upserts keyed by entity identity, not on version arithmetic. Herdr's event stream carries no global sequence number or replay cursor, so continuity can never be proven by the server. The collector therefore records an observation gap for any interval without an active subscription — initial startup, reconnects, and socket replacement included — and reconnect always repeats the subscribe-buffer-snapshot sequence. Gap reconciliation is uniform: every observation gap — startup, reconnect, socket replacement — retires every pre-gap execution and applies the attachment and closure rule of section 10.1 step 8 before buffered replay, while a resnapshot under an active subscription is not an observation gap and reconciles in place. Herdr's `seq` field on token-metadata reports orders that metadata only; it is not an event-stream cursor.
 
-Collector liveness uses snapshot-probe semantics. A monotonic silence deadline, measured only from the last Herdr subscription event, defaults to 30,000 ms through injectable `LivenessPolicy.timeout_ms`. Expiry does not first drop the subscription: the collector leaves that event connection open and issues `session.snapshot` against the same socket endpoint over `wire::request`'s fresh request connection, with the same timeout. `WatchdogProbeOutcome::HealthyIdle` means the canonical snapshot matches the current model; it causes no reconnect or gap and rearms the deadline. `WatchdogProbeOutcome::Inconclusive` means the live projection is ambiguous; it increments `inconclusive_topology_probes`, causes no reconnect, and rearms the deadline. A request, timeout, decode, or topology-conversion failure produces `Reconnect(WatchdogReconnectReason::ProbeFailed)`, logged as `snapshot_probe_failed`; a canonical topology mismatch produces `Reconnect(WatchdogReconnectReason::TopologyDiverged)`, logged as `topology_diverged`, because a responsive request socket alongside divergent state proves the event subscription was starved. Either reconnect path drops the subscription, re-enters gap reconciliation, and waits on exponential delays of 1,000, 2,000, 4,000, 8,000, 16,000, 32,000, then 60,000 ms, capped at 60,000 ms. The first Herdr event received after reconnect resets the failure count, so the next watchdog reconnect begins again at 1,000 ms. A ping/pong-only test is insufficient: request/response traffic can remain healthy while the subscription delivers nothing, whereas the snapshot comparison detects the resulting divergence.
+Collector liveness uses snapshot-probe semantics. A monotonic silence deadline, measured only from the last Herdr subscription event, defaults to 30,000 ms through injectable `LivenessPolicy.timeout_ms`. Expiry does not first drop the subscription: the collector leaves that event connection open and issues `session.snapshot` against the same socket endpoint over `wire::request`'s fresh request connection, with the same timeout. `WatchdogProbeOutcome::HealthyIdle` means the canonical snapshot matches the current model; it causes no reconnect or gap and rearms the deadline. `WatchdogProbeOutcome::Inconclusive` means the live projection is ambiguous; it increments `inconclusive_topology_probes`, causes no reconnect, and rearms the deadline. A request, timeout, decode, or topology-conversion failure produces `Reconnect(WatchdogReconnectReason::ProbeFailed)`, logged as `snapshot_probe_failed`; a canonical topology mismatch produces `Reconnect(WatchdogReconnectReason::TopologyDiverged)`, logged as `topology_diverged`, because a responsive request socket alongside divergent state proves the event subscription was starved. Either reconnect path drops the subscription, waits on exponential delays of 1,000, 2,000, 4,000, 8,000, 16,000, 32,000, then 60,000 ms, capped at 60,000 ms, resubscribes, and then re-enters gap reconciliation. The first Herdr event received after reconnect resets the failure count, so the next watchdog reconnect begins again at 1,000 ms. A ping/pong-only test is insufficient: request/response traffic can remain healthy while the subscription delivers nothing, whereas the snapshot comparison detects the resulting divergence.
 
 The primary subscription includes `tab.renamed`. Live and reconciling dispatch both tolerate the protocol-20 flat `pane_agent_detected` shape: a frame with a top-level `pane_id` but no nested pane is counted in `flat_pane_agent_detected` and produces no topology or persistence mutation; a nested pane keeps the normal upsert behavior. Tab labels and pane display names captured from live events or snapshots survive an otherwise nameless reconciliation for the same entity. Observational nameless upserts therefore do not erase a known name, but `tab_renamed` is authoritative user intent: its sanitized non-empty `label` writes through, while an empty or absent label writes through as `NULL` and clears the stored label.
 
@@ -481,19 +481,19 @@ Prompts, responses, terminal scrollback, and raw provider payloads are not retai
 The alternate-screen interface is fixed rather than append-only.
 
 ```text
-┌ Herdr Top ─ host / session / workspaces / LIVE / lag / sources ┐
-│ filters and summary counters                                   │
-├ Execution tree or dependency view ─────────────────────────────┤
-│ stable, selectable, internally scrollable viewport             │
-├ Activity for selected item ────────────────────────────────────┤
-│ recent normalized events                                       │
-├ q stop tab view / filter f follow s summary ? help c clear ────┤
+┌ Herdr Top ─ host / session / up / workspaces / LIVE / lag / sources ┐
+│ filters and summary counters                                        │
+├ Execution tree or dependency view ──────────────────────────────────┤
+│ stable, selectable, internally scrollable viewport                  │
+├ Activity for selected item ─────────────────────────────────────────┤
+│ recent normalized events                                            │
+├ q stop tab view / filter f follow s summary ? help c clear ─────────┤
 ```
 
 Required behavior:
 
 - fixed header and footer;
-- header shows host, named session, workspace count, quality, event lag — the age of the oldest received but not yet applied event, zero when the queue is empty — and source coverage, truncating below the standard width in the fixed order of criterion 15;
+- header shows host, named session, session elapsed time (`up:`), workspace count, quality, event lag — the age of the oldest received but not yet applied event, zero when the queue is empty — and source coverage, truncating below the standard width in the fixed order of criterion 15;
 - `LIVE`, `RECONCILING`, `DISCONNECTED`, and `DEGRADED` indicators;
 - internal scrolling and lower selected-item activity;
 - stable ordering and selection during updates: Task Runs, Agent Nodes, and topology rows receive unique, persisted, immutable display ordinals on first entry into the model and siblings sort by them, never by an identity-key component; execution placement order remains in-session; a state refresh never reorders rows, and after a merge the merged-in rows vanish while the survivor keeps its own ordinal and relative position;
@@ -664,7 +664,7 @@ Provider adapters must not force unstable Claude Code or Codex JSON into an over
 - fixed layout and header scope/freshness/coverage;
 - all four observation-quality states;
 - scroll, collapse, follow, filtered ancestors, dependency-list order stability, and selection recovery;
-- all non-terminal plus one-hour terminal default visibility;
+- default visibility for all non-terminal runs except the 24-hour hook-only expiry and dismissal, plus one-hour terminal visibility unless dismissed;
 - first-launch CLI notice and `?` help;
 - narrow-terminal and wide-Unicode rendering.
 
@@ -732,11 +732,11 @@ Herdr Top's differentiating combination is:
 8. Provider failure leaves `DEGRADED / Herdr-only` visibility.
 9. Non-authoritative disappearance during live observation is `stale` for 30 seconds before `ended`; across an observation gap executions retire immediately.
 10. Execution end never implies semantic completion.
-11. All non-terminal runs remain visible regardless of age.
-12. Runs in a terminal state, including `ended_unknown`, remain default-visible for one hour and filterable for 30 days.
+11. All non-terminal runs remain visible regardless of age except that Controller-keyed runs with no execution leave the default view 24 hours after their last update and dismissed runs are hidden.
+12. Runs in a terminal state, including `ended_unknown`, remain default-visible for one hour unless dismissed with `c`, which hides them immediately; they remain filterable for 30 days.
 13. Activity events are ring-bounded to 100,000 per named session and seven days; the `event_id` ledger is retained independently for seven days; no semantic state depends on event retention.
 14. The fixed TUI supports scroll, stable selection, activity, follow, help, and narrow panes.
-15. At or above the standard width of 100 columns the header shows host, session, workspace count, quality, lag, and coverage; below it, down to the minimum supported width of 48 columns, fields truncate in the fixed order coverage, lag, workspace count, host — quality and session are never dropped.
+15. At or above the standard width of 100 columns the header shows host, session, session elapsed time (`up:`), workspace count, quality, lag, and coverage; below it, down to the minimum supported width of 48 columns, fields truncate in the fixed order coverage, lag, workspace count, host — session, `up:`, and quality are never dropped.
 16. `q` stops only Herdr Top; agents continue.
 17. Detach/reattach keeps the collector running.
 18. Cold restart stops the collector; next manual launch restores from SQLite and reconciles.
