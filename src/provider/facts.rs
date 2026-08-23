@@ -1,7 +1,7 @@
 //! Provider-neutral facts extracted from append-only agent logs.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Identity and ownership of the session evidenced by a log record.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -165,7 +165,14 @@ pub fn repo_relative(path: &str, cwd: &str) -> String {
     let path = Path::new(path);
     match path.strip_prefix(Path::new(cwd)) {
         Ok(relative) if relative.as_os_str().is_empty() => ".".to_owned(),
-        Ok(relative) if !relative.is_absolute() => relative.to_string_lossy().into_owned(),
+        Ok(relative)
+            if !relative.is_absolute()
+                && !relative
+                    .components()
+                    .any(|component| component == Component::ParentDir) =>
+        {
+            relative.to_string_lossy().into_owned()
+        }
         Ok(_) | Err(_) => path.file_name().map_or_else(
             || ".".to_owned(),
             |name| name.to_string_lossy().into_owned(),
@@ -175,6 +182,15 @@ pub fn repo_relative(path: &str, cwd: &str) -> String {
 
 fn config_dir_value_bounds(line: &str, value_start: usize) -> Option<(usize, usize)> {
     let bytes = line.as_bytes();
+    if bytes[value_start..].starts_with(b"\\\"") {
+        let quoted_start = value_start + 2;
+        let quoted_end = bytes[quoted_start..]
+            .windows(2)
+            .position(|window| window == b"\\\"")?
+            + quoted_start;
+        return (quoted_end > quoted_start).then_some((quoted_start, quoted_end));
+    }
+
     if let Some(quote @ (b'\'' | b'"')) = bytes.get(value_start).copied() {
         let quoted_start = value_start + 1;
         let quoted_end = bytes[quoted_start..]
@@ -289,6 +305,37 @@ mod tests {
                 EvidenceId::ConfigDir(PathBuf::from("/home/user/.claude-single")),
             ]
         );
+    }
+
+    #[test]
+    fn raw_id_scan_reads_json_escaped_double_quoted_config_dir() {
+        let line = serde_json::json!({
+            "type": "user",
+            "command": "CLAUDE_CONFIG_DIR=\"/home/user/.claude-double\" claude -p hi"
+        })
+        .to_string();
+
+        assert_eq!(
+            scan_raw_ids(&line),
+            vec![EvidenceId::ConfigDir(PathBuf::from(
+                "/home/user/.claude-double"
+            ))]
+        );
+    }
+
+    #[test]
+    fn repo_relative_reduces_parent_traversals_to_basename() {
+        assert_eq!(
+            repo_relative("/repo/public/../../private/secret", "/repo"),
+            "secret"
+        );
+        assert_eq!(repo_relative("/repo/../etc/passwd", "/repo"), "passwd");
+    }
+
+    #[test]
+    fn repo_relative_reduces_relative_input_to_basename() {
+        // Claude tools emit absolute paths, so relative input is conservatively reduced.
+        assert_eq!(repo_relative("src/provider/facts.rs", "/repo"), "facts.rs");
     }
 
     #[test]
