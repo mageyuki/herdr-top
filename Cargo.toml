@@ -3,6 +3,11 @@ name = "herdr-top"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97.1"
+description = "Terminal monitor for herdr-managed Claude and Codex agent sessions"
+repository = "https://github.com/mageyuki/herdr-top"
+license = "MIT"
+keywords = ["terminal", "monitoring", "tui", "claude", "codex"]
+categories = ["command-line-utilities", "development-tools"]
 
 [features]
 workload-harness = []

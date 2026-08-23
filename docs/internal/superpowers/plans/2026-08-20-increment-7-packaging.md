@@ -20,7 +20,7 @@ holds everywhere.
 Actions (`macos-15`, `macos-15-intel`, `ubuntu-24.04`, `ubuntu-24.04-arm`
 runners), GitHub Releases via `gh` CLI.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-increment-7-packaging-design.md`
+**Spec:** `docs/internal/superpowers/specs/2026-08-20-increment-7-packaging-design.md`
 
 ## Global Constraints
 

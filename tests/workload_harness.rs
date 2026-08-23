@@ -26,6 +26,27 @@ use ratatui::Terminal;
 #[cfg(feature = "workload-harness")]
 use ratatui::backend::TestBackend;
 
+fn developer_home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .expect("HOME must be set for the reference workload")
+}
+
+fn developer_home_string() -> String {
+    developer_home()
+        .into_os_string()
+        .into_string()
+        .expect("HOME must be valid UTF-8 for the reference workload")
+}
+
+fn developer_home_path(relative: &str) -> String {
+    developer_home()
+        .join(relative)
+        .into_os_string()
+        .into_string()
+        .expect("HOME must be valid UTF-8 for the reference workload")
+}
+
 #[cfg(feature = "workload-harness")]
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 #[cfg(feature = "workload-harness")]
@@ -3276,8 +3297,7 @@ fn raw_artifact_digest_and_scenario_matrix_fail_closed() {
 fn measured_child_and_observer_environment_ownership_is_exact() {
     let baseline = valid_synthetic_result();
     let trial = &baseline.document().trials[0];
-    let expected_measured = [
-        ("CARGO_HOME", "/home/mageyuki/.cargo"),
+    let mut expected_measured = [
         (
             "HERDR_PERF_OBSERVER_CONTROL_SOCKET",
             "/tmp/herdr-i5.synthetic/sustained-trial-0001.sock",
@@ -3297,22 +3317,22 @@ fn measured_child_and_observer_environment_ownership_is_exact() {
         ),
         ("HERDR_PERF_STAGE", "baseline"),
         ("HERDR_PERF_SUBJECT", BASELINE_SUBJECT_SHA),
-        ("HOME", "/home/mageyuki"),
         ("LC_ALL", "C"),
         ("PATH", "/usr/bin:/bin"),
-        ("RUSTUP_HOME", "/home/mageyuki/.rustup"),
         ("TZ", "UTC"),
     ]
     .into_iter()
     .map(|(key, value)| (key.to_owned(), value.to_owned()))
     .collect::<BTreeMap<_, _>>();
+    expected_measured.insert("CARGO_HOME".to_owned(), developer_home_path(".cargo"));
+    expected_measured.insert("HOME".to_owned(), developer_home_string());
+    expected_measured.insert("RUSTUP_HOME".to_owned(), developer_home_path(".rustup"));
     assert_eq!(
         trial.raw.child_controls.measured_environment,
         expected_measured
     );
 
-    let expected_observer = [
-        ("CARGO_HOME", "/home/mageyuki/.cargo"),
+    let mut expected_observer = [
         ("HERDR_PERF_OBSERVED_ROOT_PID", "10001"),
         ("HERDR_PERF_OBSERVED_ROOT_START_TICKS", "55"),
         (
@@ -3329,15 +3349,16 @@ fn measured_child_and_observer_environment_ownership_is_exact() {
         ),
         ("HERDR_PERF_SCENARIO", "sustained"),
         ("HERDR_PERF_TRIAL_ORIGIN_NS", "1000000000000"),
-        ("HOME", "/home/mageyuki"),
         ("LC_ALL", "C"),
         ("PATH", "/usr/bin:/bin"),
-        ("RUSTUP_HOME", "/home/mageyuki/.rustup"),
         ("TZ", "UTC"),
     ]
     .into_iter()
     .map(|(key, value)| (key.to_owned(), value.to_owned()))
     .collect::<BTreeMap<_, _>>();
+    expected_observer.insert("CARGO_HOME".to_owned(), developer_home_path(".cargo"));
+    expected_observer.insert("HOME".to_owned(), developer_home_string());
+    expected_observer.insert("RUSTUP_HOME".to_owned(), developer_home_path(".rustup"));
     assert_eq!(
         trial.control_evidence.observer_environment,
         expected_observer
@@ -3645,15 +3666,15 @@ fn cargo_configuration_policy_covers_ancestors_and_rejects_all_entry_kinds() {
             .controls
             .cargo_configuration
             .ordered_absent_candidates,
-        [
-            "/src/herdr-top/.cargo/config",
-            "/src/herdr-top/.cargo/config.toml",
-            "/src/.cargo/config",
-            "/src/.cargo/config.toml",
-            "/.cargo/config",
-            "/.cargo/config.toml",
-            "/home/mageyuki/.cargo/config",
-            "/home/mageyuki/.cargo/config.toml",
+        vec![
+            "/src/herdr-top/.cargo/config".to_owned(),
+            "/src/herdr-top/.cargo/config.toml".to_owned(),
+            "/src/.cargo/config".to_owned(),
+            "/src/.cargo/config.toml".to_owned(),
+            "/.cargo/config".to_owned(),
+            "/.cargo/config.toml".to_owned(),
+            developer_home_path(".cargo/config"),
+            developer_home_path(".cargo/config.toml"),
         ]
     );
 
@@ -3672,8 +3693,8 @@ fn cargo_configuration_policy_covers_ancestors_and_rejects_all_entry_kinds() {
             })
             .collect::<Vec<_>>();
         candidates.extend([
-            PathBuf::from("/home/mageyuki/.cargo/config"),
-            PathBuf::from("/home/mageyuki/.cargo/config.toml"),
+            developer_home().join(".cargo/config"),
+            developer_home().join(".cargo/config.toml"),
         ]);
         let mut result = valid_synthetic_result();
         result.document_mut().controls.rustc_version =
@@ -5077,14 +5098,11 @@ fn closed_entrypoint_environment(
     additional: impl IntoIterator<Item = (String, String)>,
 ) -> BTreeMap<String, String> {
     let mut environment = BTreeMap::from([
-        ("CARGO_HOME".to_owned(), "/home/mageyuki/.cargo".to_owned()),
-        ("HOME".to_owned(), "/home/mageyuki".to_owned()),
+        ("CARGO_HOME".to_owned(), developer_home_path(".cargo")),
+        ("HOME".to_owned(), developer_home_string()),
         ("LC_ALL".to_owned(), "C".to_owned()),
         ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
-        (
-            "RUSTUP_HOME".to_owned(),
-            "/home/mageyuki/.rustup".to_owned(),
-        ),
+        ("RUSTUP_HOME".to_owned(), developer_home_path(".rustup")),
         ("TZ".to_owned(), "UTC".to_owned()),
     ]);
     environment.extend(additional);
@@ -5865,10 +5883,9 @@ fn toolchain_provenance_has_one_controls_owner_and_one_launcher_inventory_entry(
         .iter()
         .map(|identity| identity.requested_path.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(
-        requested,
-        vec![
-            "/home/mageyuki/.cargo/bin/rustup",
+    let mut expected_requested = vec![developer_home_path(".cargo/bin/rustup")];
+    expected_requested.extend(
+        [
             "/usr/bin/awk",
             "/usr/bin/bash",
             "/usr/bin/env",
@@ -5895,7 +5912,10 @@ fn toolchain_provenance_has_one_controls_owner_and_one_launcher_inventory_entry(
             "/usr/bin/uname",
             "/usr/bin/unlink",
         ]
+        .into_iter()
+        .map(str::to_owned),
     );
+    assert_eq!(requested, expected_requested);
 }
 
 #[test]
@@ -7955,12 +7975,9 @@ esac"#;
 
     fn caller_environment(attempt_id: Option<&str>) -> BTreeMap<String, String> {
         let mut environment = BTreeMap::from([
-            ("HOME".to_owned(), "/home/mageyuki".to_owned()),
-            (
-                "RUSTUP_HOME".to_owned(),
-                "/home/mageyuki/.rustup".to_owned(),
-            ),
-            ("CARGO_HOME".to_owned(), "/home/mageyuki/.cargo".to_owned()),
+            ("HOME".to_owned(), developer_home_string()),
+            ("RUSTUP_HOME".to_owned(), developer_home_path(".rustup")),
+            ("CARGO_HOME".to_owned(), developer_home_path(".cargo")),
             ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
             ("LC_ALL".to_owned(), "C".to_owned()),
             ("TZ".to_owned(), "UTC".to_owned()),
@@ -8009,12 +8026,9 @@ esac"#;
         push_identity(&mut controller_args, "runner-script", runner);
         push_identity(&mut controller_args, "program", &bash);
         for (key, value) in BTreeMap::from([
-            ("HOME".to_owned(), "/home/mageyuki".to_owned()),
-            (
-                "RUSTUP_HOME".to_owned(),
-                "/home/mageyuki/.rustup".to_owned(),
-            ),
-            ("CARGO_HOME".to_owned(), "/home/mageyuki/.cargo".to_owned()),
+            ("HOME".to_owned(), developer_home_string()),
+            ("RUSTUP_HOME".to_owned(), developer_home_path(".rustup")),
+            ("CARGO_HOME".to_owned(), developer_home_path(".cargo")),
             ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
             ("LC_ALL".to_owned(), "C".to_owned()),
             ("TZ".to_owned(), "UTC".to_owned()),
@@ -8042,6 +8056,8 @@ esac"#;
             .env_clear()
             .args(["-p", "-c", EMPTY_BOOTSTRAP_BODY, "herdr-i5-bootstrap"])
             .arg(&controller.canonical)
+            .arg("--developer-home")
+            .arg(developer_home())
             .args(controller_args);
         command
     }
@@ -9457,7 +9473,7 @@ fn source_fixture_inventory_is_portable_and_role_closed() {
         });
         mutations.push(extra);
         let mut workstation = make_tools();
-        workstation[0].requested = PathBuf::from("/home/mageyuki/.herdr-i5-task7-absent/env");
+        workstation[0].requested = developer_home().join(".herdr-i5-task7-absent/env");
         mutations.push(workstation);
 
         for (index, tools) in mutations.iter().enumerate() {
@@ -10074,12 +10090,8 @@ fn pidstat_child_status_modes_are_calibrated_and_cross_checked() {
 fn run_closed_git(cwd: &std::path::Path, arguments: &[&str]) -> Result<Vec<u8>, String> {
     let output = std::process::Command::new("/usr/bin/git")
         .env_clear()
-        .envs([
-            ("HOME", "/home/mageyuki"),
-            ("PATH", "/usr/bin:/bin"),
-            ("LC_ALL", "C"),
-            ("TZ", "UTC"),
-        ])
+        .env("HOME", developer_home())
+        .envs([("PATH", "/usr/bin:/bin"), ("LC_ALL", "C"), ("TZ", "UTC")])
         .current_dir(cwd)
         .args(arguments)
         .output()
@@ -10186,8 +10198,8 @@ fn verify_subject_diff_is_harness_only_impl(
     let allowed = [
         ".github/workflows/ci.yml",
         "Cargo.toml",
-        "docs/superpowers/plans/2026-08-12-increment-5-reliability-performance.md",
-        "docs/superpowers/specs/2026-08-12-increment-5-reliability-performance-design.md",
+        "docs/internal/superpowers/plans/2026-08-12-increment-5-reliability-performance.md",
+        "docs/internal/superpowers/specs/2026-08-12-increment-5-reliability-performance-design.md",
         "scripts/run-reference-profile.sh",
         "tests/common/mod.rs",
         "tests/common/workload.rs",
@@ -10232,12 +10244,12 @@ fn verify_subject_diff_is_harness_only_impl(
     }
     for (path, expected) in [
         (
-            "docs/superpowers/specs/2026-08-12-increment-5-reliability-performance-design.md",
+            "docs/internal/superpowers/specs/2026-08-12-increment-5-reliability-performance-design.md",
             "17dfeb91a2ce0efeff7a6c79bcac345e7ca051f268ed0c39c57ad297e38035f4",
         ),
         (
-            "docs/superpowers/plans/2026-08-12-increment-5-reliability-performance.md",
-            "dd70fd70bca4e6fd1762e9b37f877deb3c830e7c38a0da054eb1a78434e28799",
+            "docs/internal/superpowers/plans/2026-08-12-increment-5-reliability-performance.md",
+            "2dfd93ecce75c817e2e11cc6de54933857f5095eaf43f60ae36b429b21eb2dab",
         ),
     ] {
         let bytes = std::fs::read(cwd.join(path)).map_err(|error| error.to_string())?;
@@ -10962,17 +10974,18 @@ fn verify_subject_diff_is_harness_only() {
     let actual = std::env::vars()
         .map(|(key, _)| key)
         .collect::<BTreeSet<_>>();
+    let expected_values = BTreeMap::from([
+        ("HOME", developer_home_string()),
+        ("RUSTUP_HOME", developer_home_path(".rustup")),
+        ("CARGO_HOME", developer_home_path(".cargo")),
+        ("PATH", "/usr/bin:/bin".to_owned()),
+        ("LC_ALL", "C".to_owned()),
+        ("TZ", "UTC".to_owned()),
+    ]);
     if actual != expected
-        || [
-            ("HOME", "/home/mageyuki"),
-            ("RUSTUP_HOME", "/home/mageyuki/.rustup"),
-            ("CARGO_HOME", "/home/mageyuki/.cargo"),
-            ("PATH", "/usr/bin:/bin"),
-            ("LC_ALL", "C"),
-            ("TZ", "UTC"),
-        ]
-        .iter()
-        .any(|(key, value)| std::env::var(key).as_deref() != Ok(*value))
+        || expected_values
+            .iter()
+            .any(|(key, value)| std::env::var(key).as_deref() != Ok(value.as_str()))
     {
         std::process::exit(20);
     }

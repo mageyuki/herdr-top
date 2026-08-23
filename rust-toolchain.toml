@@ -1,0 +1,4 @@
+# Pin the MSRV toolchain for local development; CI selects its toolchains explicitly.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

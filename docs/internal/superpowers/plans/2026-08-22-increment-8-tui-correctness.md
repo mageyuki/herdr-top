@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust (edition 2024, rust-version 1.97.1), ratatui 0.30, tokio, rusqlite, serde.
 
-**Spec:** `docs/superpowers/specs/2026-08-22-increment-8-tui-correctness-design.md` (user-approved 2026-08-22; SessionEnd auto-dismiss decision 2026-08-22). Diagnosis evidence: `~/.research/mageyuki--herdr-top/herdr-top-ui-fixes/diagnosis-attach-bugs.md`.
+**Spec:** `docs/internal/superpowers/specs/2026-08-22-increment-8-tui-correctness-design.md` (user-approved 2026-08-22; SessionEnd auto-dismiss decision 2026-08-22). Diagnosis evidence: `~/.research/mageyuki--herdr-top/herdr-top-ui-fixes/diagnosis-attach-bugs.md`.
 
 **Revision:** v2. The pre-implementation plan review (archived at `.superpowers/sdd/increment8-plan-review.md`, verdict REVISE: 9 blockers / 10 should-fix / 8 consider) is fully incorporated; every finding was fixed at source in this version, and the SessionEnd lifecycle was re-decided by the user as auto-dismiss (B6).
 

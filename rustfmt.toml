@@ -1,0 +1,2 @@
+# This project deliberately uses the default rustfmt configuration for the pinned toolchain.
+# This file makes the formatting contract explicit so any future deviation is a reviewed change.

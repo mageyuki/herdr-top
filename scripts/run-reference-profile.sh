@@ -6,6 +6,10 @@ case $- in
   *) builtin printf '%s\n' 'error: protected Bash mode is required' >&2; exit 20 ;;
 esac
 
+normalized_developer_home=${HOME-}
+normalized_developer_home=${normalized_developer_home%/}
+readonly normalized_developer_home
+
 bootstrap_source_fixture() {
   [[ ${source_fixture_bootstrap_parsed-} != 1 ]] || return 0
   [[ ${HERDR_INCREMENT5_BOOTSTRAP_TOOLS_V1+x} != x ]] || return 20
@@ -545,11 +549,11 @@ launch_fixture_pair() {
   [[ -x $measured_callback && -f $measured_callback ]] || return 20
   [[ -x $observer_callback && -f $observer_callback ]] || return 20
   "$source_setsid_executable" "$source_env_executable" -i \
-    HOME=/home/mageyuki PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
+    HOME="$HOME" PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
     "$measured_callback" &
   fixture_measured_pid=$!
   "$source_setsid_executable" "$source_env_executable" -i \
-    HOME=/home/mageyuki PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
+    HOME="$HOME" PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
     "$observer_callback" &
   fixture_observer_pid=$!
   readonly fixture_measured_pid fixture_observer_pid || return 20
@@ -570,7 +574,7 @@ launch_fixture_handshake_phase() {
   validate_fixture_output_path "$groups_output" || return 20
   [[ -x $measured_callback && -f $measured_callback ]] || return 20
   "$source_setsid_executable" "$source_env_executable" -i \
-    HOME=/home/mageyuki PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
+    HOME="$HOME" PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
     "$measured_callback" &
   fixture_measured_pid=$!
   fixture_observer_pid=
@@ -718,8 +722,8 @@ run_orchestration_fixture() {
         local child_environment_output=$2
         validate_fixture_output_path "$child_environment_output" || return 20
         "$source_env_executable" -i \
-          HOME=/home/mageyuki RUSTUP_HOME=/home/mageyuki/.rustup \
-          CARGO_HOME=/home/mageyuki/.cargo PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
+          HOME="$HOME" RUSTUP_HOME="$HOME/.rustup" \
+          CARGO_HOME="$HOME/.cargo" PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
           >"$child_environment_output" || return 20
       fi
       publish_runner_test_outcome "$attempt_outcome" 0 true || return 20
@@ -781,7 +785,7 @@ run_orchestration_fixture() {
       local mutation_callback=$2
       local mutation_operand=$3
       [[ $mutation_callback == /* && -f $mutation_callback && -x $mutation_callback ]] || return 20
-      "$source_env_executable" -i HOME=/home/mageyuki PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
+      "$source_env_executable" -i HOME="$HOME" PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
         "$mutation_callback" "$mutation_operand" || return 20
       revalidate_source_fixture_bootstrap || return 20
       publish_runner_test_outcome "$revalidation_outcome" 0 true || return 20
@@ -1013,6 +1017,7 @@ run_orchestration_fixture() {
       [[ $baseline_validator == /* && -f $baseline_validator && -x $baseline_validator ]] || return 20
       set +e
       "$source_env_executable" -i \
+        HERDR_PERF_DEVELOPER_HOME="$normalized_developer_home" \
         HERDR_PERF_VALIDATE_BASELINE_RESULTS_ROOT="$baseline_root" \
         "$baseline_validator" validate_reference_baseline_set --exact --ignored --test-threads=1
       baseline_status=$?
@@ -1097,7 +1102,7 @@ bootstrap_authoritative_manifest() {
     time uname unlink
   )
   local -ar expected_requested=(
-    /home/mageyuki/.cargo/bin/rustup
+    "$normalized_developer_home/.cargo/bin/rustup"
     /usr/bin/awk /usr/bin/bash /usr/bin/env /usr/bin/findmnt /usr/bin/git
     /usr/bin/id /usr/bin/jq /usr/bin/lsblk /usr/bin/lscpu /usr/bin/mkdir
     /usr/bin/mktemp /usr/bin/mv /usr/bin/pidstat /usr/bin/prlimit
@@ -1306,7 +1311,7 @@ validate_cargo_configuration_absence() {
     current=${current%/*}
     [[ -n $current ]] || current=/
   done
-  for candidate in /home/mageyuki/.cargo/config /home/mageyuki/.cargo/config.toml; do
+  for candidate in "$HOME/.cargo/config" "$HOME/.cargo/config.toml"; do
     local present=false existing
     for existing in "${candidates[@]}"; do
       [[ $existing != "$candidate" ]] || present=true
@@ -1364,11 +1369,11 @@ probe_pidstat_mode() {
     *) return 20 ;;
   esac
   set +e
-  "$env_executable" -i HOME=/home/mageyuki PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
+  "$env_executable" -i HOME="$HOME" PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
     "$pidstat_executable" -u -r -T ALL -o JSON 1 -e \
     "$bash_executable" -p -c 'exit 0' >"$zero_output" 2>&1
   zero_status=$?
-  "$env_executable" -i HOME=/home/mageyuki PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
+  "$env_executable" -i HOME="$HOME" PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
     "$pidstat_executable" -u -r -T ALL -o JSON 1 -e \
     "$bash_executable" -p -c 'exit 23' >"$failing_output" 2>&1
   failing_status=$?
@@ -1451,8 +1456,8 @@ verify_measured_entrypoint_exists() {
   local list_output=$1
   local status entrypoint
   set +e
-  "$auth_env_executable" -i HOME=/home/mageyuki RUSTUP_HOME=/home/mageyuki/.rustup \
-    CARGO_HOME=/home/mageyuki/.cargo PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
+  "$auth_env_executable" -i HOME="$HOME" RUSTUP_HOME="$HOME/.rustup" \
+    CARGO_HOME="$HOME/.cargo" PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
     "$test_binary" --list --ignored >"$list_output" 2>&1
   status=$?
   set -e
@@ -1538,8 +1543,8 @@ authoritative_preflight() {
   "$auth_mkdir_executable" -- "$runner_output_root" || return 20
   [[ "$("$auth_readlink_executable" -e -- "$runner_output_root")" == "$runner_output_root" ]] || return 20
   cargo_artifact_json="$runner_output_root/cargo-artifacts.json"
-  "$auth_env_executable" -i HOME=/home/mageyuki RUSTUP_HOME=/home/mageyuki/.rustup \
-    CARGO_HOME=/home/mageyuki/.cargo PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
+  "$auth_env_executable" -i HOME="$HOME" RUSTUP_HOME="$HOME/.rustup" \
+    CARGO_HOME="$HOME/.cargo" PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
     "$auth_rustup_executable" run 1.97.1 cargo test --release --locked \
       --features workload-harness --test workload_harness --no-run \
       --message-format=json >"$cargo_artifact_json" || return 20
@@ -1547,8 +1552,8 @@ authoritative_preflight() {
   controller_artifact_list="$runner_output_root/measured-entrypoints.txt"
   verify_measured_entrypoint_exists "$controller_artifact_list" || return 20
   if [[ $runner_stage == baseline ]]; then
-    "$auth_env_executable" -i HOME=/home/mageyuki RUSTUP_HOME=/home/mageyuki/.rustup \
-      CARGO_HOME=/home/mageyuki/.cargo PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
+    "$auth_env_executable" -i HOME="$HOME" RUSTUP_HOME="$HOME/.rustup" \
+      CARGO_HOME="$HOME/.cargo" PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
       HERDR_PERF_VERIFY_INVOCATION_CWD="$invocation_cwd" \
       HERDR_PERF_VERIFY_SUBJECT="$runner_subject" \
       "$test_binary" verify_subject_diff_is_harness_only --exact --ignored \
@@ -1836,8 +1841,8 @@ run_trial_process_tree() {
   set +e
   ( "$auth_sleep_executable" "$outer_deadline_seconds" ) &
   active_orchestration_supervisor_pid=$!
-  "$auth_env_executable" -i HOME=/home/mageyuki RUSTUP_HOME=/home/mageyuki/.rustup \
-    CARGO_HOME=/home/mageyuki/.cargo PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
+  "$auth_env_executable" -i HOME="$HOME" RUSTUP_HOME="$HOME/.rustup" \
+    CARGO_HOME="$HOME/.cargo" PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
     "$auth_taskset_executable" -c 4-7,12-15 \
     "$auth_pidstat_executable" -u -r -T ALL -o JSON 1 -e \
     "$auth_bash_executable" -p -c "$shared_orchestration_functions"$'\n''
@@ -1935,8 +1940,8 @@ run_trial_process_tree() {
       ) &
       watchdog_pid=$!
       measured_environment=(
-        HOME=/home/mageyuki RUSTUP_HOME=/home/mageyuki/.rustup
-        CARGO_HOME=/home/mageyuki/.cargo PATH=/usr/bin:/bin LC_ALL=C TZ=UTC
+        HOME="$HOME" RUSTUP_HOME="$HOME/.rustup"
+        CARGO_HOME="$HOME/.cargo" PATH=/usr/bin:/bin LC_ALL=C TZ=UTC
         HERDR_PERF_SCENARIO="$scenario" HERDR_PERF_SUBJECT="$subject"
         HERDR_PERF_OUTPUT="$harness_output" HERDR_PERF_STAGE="$stage"
         HERDR_PERF_OBSERVER_HANDSHAKE="$observer_handshake"
@@ -1967,8 +1972,8 @@ run_trial_process_tree() {
         "$measured_wrapper_pid" - "$frozen_socket_identity" || exit 20
       IFS=" " read -r observed_root_pid observed_start_ticks trial_origin_ns <"$observer_handshake"
       observer_environment=(
-        HOME=/home/mageyuki RUSTUP_HOME=/home/mageyuki/.rustup
-        CARGO_HOME=/home/mageyuki/.cargo PATH=/usr/bin:/bin LC_ALL=C TZ=UTC
+        HOME="$HOME" RUSTUP_HOME="$HOME/.rustup"
+        CARGO_HOME="$HOME/.cargo" PATH=/usr/bin:/bin LC_ALL=C TZ=UTC
         HERDR_PERF_SCENARIO="$scenario"
         HERDR_PERF_OBSERVED_ROOT_PID="$observed_root_pid"
         HERDR_PERF_OBSERVED_ROOT_START_TICKS="$observed_start_ticks"
@@ -2030,8 +2035,8 @@ record_trial_control() {
   local trial_status_output="$trial_raw_root/trial-status"
   runtime_socket_path_has_shape "$control_socket" || return 20
   local -a control_environment=(
-    HOME=/home/mageyuki RUSTUP_HOME=/home/mageyuki/.rustup
-    CARGO_HOME=/home/mageyuki/.cargo PATH=/usr/bin:/bin LC_ALL=C TZ=UTC
+    HOME="$HOME" RUSTUP_HOME="$HOME/.rustup"
+    CARGO_HOME="$HOME/.cargo" PATH=/usr/bin:/bin LC_ALL=C TZ=UTC
     HERDR_INCREMENT5_CONTROLLER_REQUESTED="$HERDR_INCREMENT5_CONTROLLER_REQUESTED"
     HERDR_INCREMENT5_CONTROLLER_CANONICAL="$HERDR_INCREMENT5_CONTROLLER_CANONICAL"
     HERDR_INCREMENT5_CONTROLLER_SHA256="$HERDR_INCREMENT5_CONTROLLER_SHA256"
@@ -2172,8 +2177,8 @@ compose_and_validate_scenario() {
   local baseline_arg=$runner_baseline_root
   local composer_status composer_status_token validator_status
   local -a composer_environment=(
-    HOME=/home/mageyuki RUSTUP_HOME=/home/mageyuki/.rustup
-    CARGO_HOME=/home/mageyuki/.cargo PATH=/usr/bin:/bin LC_ALL=C TZ=UTC
+    HOME="$HOME" RUSTUP_HOME="$HOME/.rustup"
+    CARGO_HOME="$HOME/.cargo" PATH=/usr/bin:/bin LC_ALL=C TZ=UTC
     HERDR_PERF_COMPOSE_RAW_ROOT="$scenario_root"
     HERDR_PERF_COMPOSE_OUTPUT="$scenario_root/candidate-v1.json"
     HERDR_PERF_COMPOSE_STAGE="$runner_stage"
@@ -2195,8 +2200,8 @@ compose_and_validate_scenario() {
     *) composer_status_token="unexpected:$composer_status" ;;
   esac
   local -a validator_environment=(
-    HOME=/home/mageyuki RUSTUP_HOME=/home/mageyuki/.rustup
-    CARGO_HOME=/home/mageyuki/.cargo PATH=/usr/bin:/bin LC_ALL=C TZ=UTC
+    HOME="$HOME" RUSTUP_HOME="$HOME/.rustup"
+    CARGO_HOME="$HOME/.cargo" PATH=/usr/bin:/bin LC_ALL=C TZ=UTC
     HERDR_PERF_VALIDATE_RAW_ROOT="$scenario_root"
     HERDR_PERF_VALIDATE_CANDIDATE="$scenario_root/candidate-v1.json"
     HERDR_PERF_VALIDATE_OUTPUT="$scenario_root/result-v1.json"
@@ -2266,6 +2271,7 @@ validate_baseline_layout_up_front() {
     [[ -d $runner_baseline_root/$mapped/trial-0001 ]] || return 20
   done
   "$auth_env_executable" -i \
+    HERDR_PERF_DEVELOPER_HOME="$normalized_developer_home" \
     HERDR_PERF_VALIDATE_BASELINE_RESULTS_ROOT="$runner_baseline_root" \
     "$test_binary" validate_reference_baseline_set --exact --ignored --test-threads=1 \
     || return 20
