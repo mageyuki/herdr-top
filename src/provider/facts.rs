@@ -1,6 +1,7 @@
 //! Provider-neutral facts extracted from append-only agent logs.
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 /// Identity and ownership of the session evidenced by a log record.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,6 +51,8 @@ pub enum LogFact {
         description: String,
     },
     /// Evidence that a Claude subagent ended.
+    ///
+    /// Duplicate facts are allowed; synthesis merges them with `failed: true` dominant.
     SubagentEnded {
         /// Owning root Claude session ID.
         parent: String,
@@ -83,6 +86,9 @@ pub enum LogFact {
         effort: Option<String>,
     },
     /// Identifier found by the bounded raw-line evidence scan.
+    ///
+    /// The raw scanner intentionally over-emits UUIDs. Synthesis in Task 5, where the
+    /// discovery set lives, filters unmatched UUIDs as required by the ADR.
     EvidenceId {
         /// Session whose raw line contained the identifier.
         parent: SessionScope,
@@ -92,7 +98,7 @@ pub enum LogFact {
 }
 
 /// Narrow identifier evidence that may be scanned from a raw log line.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum EvidenceId {
     /// Lowercase hexadecimal UUID-shaped token.
     Uuid(String),
@@ -108,6 +114,7 @@ pub fn scan_raw_ids(line: &str) -> Vec<EvidenceId> {
 
     let bytes = line.as_bytes();
     let mut found = Vec::new();
+    let mut seen = HashSet::new();
     let mut index = 0;
     while index < bytes.len() {
         if index + UUID_LEN <= bytes.len() && uuid_at(bytes, index) {
@@ -119,7 +126,7 @@ pub fn scan_raw_ids(line: &str) -> Vec<EvidenceId> {
                 .is_some_and(u8::is_ascii_hexdigit);
             if !before_is_hex && !after_is_hex {
                 let id = EvidenceId::Uuid(line[index..index + UUID_LEN].to_owned());
-                push_unique(&mut found, id);
+                push_unique(&mut found, &mut seen, id);
             }
         }
 
@@ -129,13 +136,9 @@ pub fn scan_raw_ids(line: &str) -> Vec<EvidenceId> {
             })
         {
             let value_start = index + CONFIG_PREFIX.len();
-            let value_end = line[value_start..]
-                .char_indices()
-                .find(|(_, ch)| ch.is_whitespace() || matches!(ch, '\'' | '"'))
-                .map_or(line.len(), |(offset, _)| value_start + offset);
-            if value_end > value_start {
+            if let Some((value_start, value_end)) = config_dir_value_bounds(line, value_start) {
                 let id = EvidenceId::ConfigDir(PathBuf::from(&line[value_start..value_end]));
-                push_unique(&mut found, id);
+                push_unique(&mut found, &mut seen, id);
             }
         }
 
@@ -159,16 +162,33 @@ pub fn sanitize_command_script(script: &str) -> String {
 pub fn repo_relative(path: &str, cwd: &str) -> String {
     let path = path.strip_prefix("file://").unwrap_or(path);
     let cwd = cwd.strip_prefix("file://").unwrap_or(cwd);
-    if cwd.is_empty() {
-        return path.to_owned();
+    let path = Path::new(path);
+    match path.strip_prefix(Path::new(cwd)) {
+        Ok(relative) if relative.as_os_str().is_empty() => ".".to_owned(),
+        Ok(relative) if !relative.is_absolute() => relative.to_string_lossy().into_owned(),
+        Ok(_) | Err(_) => path.file_name().map_or_else(
+            || ".".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        ),
+    }
+}
+
+fn config_dir_value_bounds(line: &str, value_start: usize) -> Option<(usize, usize)> {
+    let bytes = line.as_bytes();
+    if let Some(quote @ (b'\'' | b'"')) = bytes.get(value_start).copied() {
+        let quoted_start = value_start + 1;
+        let quoted_end = bytes[quoted_start..]
+            .iter()
+            .position(|byte| *byte == quote)?
+            + quoted_start;
+        return (quoted_end > quoted_start).then_some((quoted_start, quoted_end));
     }
 
-    std::path::Path::new(path)
-        .strip_prefix(std::path::Path::new(cwd))
-        .map_or_else(
-            |_| path.to_owned(),
-            |relative| relative.to_string_lossy().into_owned(),
-        )
+    let value_end = line[value_start..]
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace() || matches!(ch, '\'' | '"'))
+        .map_or(line.len(), |(offset, _)| value_start + offset);
+    (value_end > value_start).then_some((value_start, value_end))
 }
 
 fn uuid_at(bytes: &[u8], start: usize) -> bool {
@@ -185,8 +205,8 @@ fn uuid_at(bytes: &[u8], start: usize) -> bool {
         })
 }
 
-fn push_unique(found: &mut Vec<EvidenceId>, id: EvidenceId) {
-    if !found.contains(&id) {
+fn push_unique(found: &mut Vec<EvidenceId>, seen: &mut HashSet<EvidenceId>, id: EvidenceId) {
+    if seen.insert(id.clone()) {
         found.push(id);
     }
 }
@@ -223,7 +243,7 @@ fn is_word(ch: char) -> bool {
     ch == '_' || ch.is_alphanumeric()
 }
 
-fn truncate_60(value: &str) -> String {
+pub(crate) fn truncate_60(value: &str) -> String {
     value.chars().take(60).collect()
 }
 
@@ -250,6 +270,23 @@ mod tests {
                 EvidenceId::Uuid("6f9bdfa0-1502-4a37-97aa-c45591141130".to_owned()),
                 EvidenceId::ConfigDir(PathBuf::from("/home/user/.claude-secondary")),
                 EvidenceId::Uuid("745480a2-5bdc-483f-ab53-0b4fabc01781".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_id_scan_reads_matched_quoted_config_dirs_only() {
+        let line = concat!(
+            "CLAUDE_CONFIG_DIR=\"/home/user/.claude-double\" ",
+            "CLAUDE_CONFIG_DIR='/home/user/.claude-single' ",
+            "CLAUDE_CONFIG_DIR=\"/home/user/.claude-unmatched"
+        );
+
+        assert_eq!(
+            scan_raw_ids(line),
+            vec![
+                EvidenceId::ConfigDir(PathBuf::from("/home/user/.claude-double")),
+                EvidenceId::ConfigDir(PathBuf::from("/home/user/.claude-single")),
             ]
         );
     }

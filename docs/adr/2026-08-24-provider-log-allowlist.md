@@ -46,6 +46,7 @@ The ordinary typed reader may read:
 - assistant `message.id`, `message.model`, top-level `effort`, and numeric
   `message.usage` fields;
 - `tool_use.name`, plus `input.description` for Bash and Agent tool uses;
+- `input.file_path` for path-bearing tool uses, used only to render a repository-relative display path;
 - `toolUseResult.agentId` for an Agent tool result; and
 - all four subagent metadata fields: `agentType`, `description`, `toolUseId`,
   and `spawnDepth`.

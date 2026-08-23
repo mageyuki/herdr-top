@@ -2,7 +2,9 @@
 
 use serde::Deserialize;
 
-use super::facts::{LogFact, SessionScope, repo_relative, sanitize_command_script, scan_raw_ids};
+use crate::model::sanitize_controller_text;
+
+use super::facts::{LogFact, SessionScope, repo_relative, scan_raw_ids, truncate_60};
 
 #[derive(Deserialize)]
 struct RecordType {
@@ -10,7 +12,7 @@ struct RecordType {
     record_type: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AiTitleRecord {
     session_id: Option<String>,
@@ -50,33 +52,31 @@ struct ContentBlock {
 #[derive(Debug, Deserialize)]
 struct ToolInput {
     description: Option<String>,
-    command: Option<String>,
     file_path: Option<String>,
-    #[serde(rename = "subagent_type")]
-    _subagent_type: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UserRecord {
     timestamp: Option<String>,
     tool_use_result: Option<ToolUseResult>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ToolUseResult {
     agent_id: Option<String>,
-    status: Option<String>,
 }
 
+// Deliberate carve-in-2 exception: content is scanned transiently only for
+// `<task-notification>` tags; nothing beyond the extracted task ID and status is retained.
 #[derive(Deserialize)]
 struct QueueOperationRecord {
     timestamp: Option<String>,
     content: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MetaRecord {
     agent_type: Option<String>,
@@ -185,11 +185,11 @@ fn extract_user(scope: &SessionScope, line: &str, facts: &mut Vec<LogFact>) {
     let Some(result) = record.tool_use_result else {
         return;
     };
-    if let (Some(agent_id), Some(status)) = (result.agent_id, result.status) {
+    if let Some(agent_id) = result.agent_id {
         facts.push(LogFact::SubagentEnded {
             parent: parent_id(scope).to_owned(),
             agent_id,
-            failed: status != "completed",
+            failed: false,
         });
     }
 }
@@ -208,10 +208,10 @@ fn extract_queue_operation(scope: &SessionScope, line: &str, facts: &mut Vec<Log
         return;
     };
     facts.extend(
-        task_notifications(&content).map(|(agent_id, status)| LogFact::SubagentEnded {
+        task_notifications(&content).map(|(agent_id, failed)| LogFact::SubagentEnded {
             parent: parent_id(scope).to_owned(),
             agent_id,
-            failed: status != "completed",
+            failed,
         }),
     );
 }
@@ -225,8 +225,6 @@ fn activity_line(block: ContentBlock, cwd: &str) -> Option<String> {
     let line = if name == "Bash" {
         if let Some(description) = input.and_then(|input| input.description.as_deref()) {
             description.to_owned()
-        } else if let Some(command) = input.and_then(|input| input.command.as_deref()) {
-            sanitize_command_script(command)
         } else {
             name
         }
@@ -239,10 +237,10 @@ fn activity_line(block: ContentBlock, cwd: &str) -> Option<String> {
     } else {
         name
     };
-    Some(truncate_60(&line))
+    Some(truncate_60(&sanitize_controller_text(&line)))
 }
 
-fn task_notifications(content: &str) -> impl Iterator<Item = (String, String)> + '_ {
+fn task_notifications(content: &str) -> impl Iterator<Item = (String, bool)> + '_ {
     const OPEN: &str = "<task-notification>";
     const CLOSE: &str = "</task-notification>";
 
@@ -270,7 +268,12 @@ fn task_notifications(content: &str) -> impl Iterator<Item = (String, String)> +
             let Some(status) = tag_value(block, "status") else {
                 continue;
             };
-            return Some((agent_id.to_owned(), status.to_owned()));
+            let failed = match status {
+                "completed" => false,
+                "failed" => true,
+                _ => continue,
+            };
+            return Some((agent_id.to_owned(), failed));
         }
     })
 }
@@ -292,11 +295,7 @@ fn parent_id(scope: &SessionScope) -> &str {
     }
 }
 
-fn truncate_60(value: &str) -> String {
-    value.chars().take(60).collect()
-}
-
-fn parse_timestamp_ms(timestamp: &str) -> Option<i64> {
+pub(crate) fn parse_timestamp_ms(timestamp: &str) -> Option<i64> {
     let (date_time, offset_seconds) = if let Some(value) = timestamp.strip_suffix('Z') {
         (value, 0_i64)
     } else {
@@ -357,14 +356,14 @@ fn parse_timestamp_ms(timestamp: &str) -> Option<i64> {
     seconds.checked_mul(1_000)?.checked_add(i64::from(millis))
 }
 
-fn parse_decimal(value: &str) -> Option<u32> {
+pub(crate) fn parse_decimal(value: &str) -> Option<u32> {
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
     value.parse().ok()
 }
 
-fn fraction_millis(fraction: &str) -> Option<u32> {
+pub(crate) fn fraction_millis(fraction: &str) -> Option<u32> {
     if fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
@@ -375,7 +374,7 @@ fn fraction_millis(fraction: &str) -> Option<u32> {
     Some(millis)
 }
 
-const fn days_in_month(year: u32, month: u32) -> u32 {
+pub(crate) const fn days_in_month(year: u32, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
@@ -387,7 +386,7 @@ const fn days_in_month(year: u32, month: u32) -> u32 {
     }
 }
 
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+pub(crate) fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let year = year - i64::from(month <= 2);
     let era = if year >= 0 { year } else { year - 399 } / 400;
     let year_of_era = year - era * 400;
@@ -493,6 +492,46 @@ mod tests {
     }
 
     #[test]
+    fn bash_without_description_uses_bare_tool_name() {
+        let line = r#"{"type":"assistant","timestamp":"2026-08-24T01:00:03.000Z","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"echo private-command-body"}}]}}"#;
+        assert!(line.contains("private-command-body"));
+        let envelope: AssistantRecord =
+            serde_json::from_str(line).expect("allowlisted envelope parses");
+        assert!(!format!("{envelope:?}").contains("private-command-body"));
+
+        let activities = extract_claude_line(&root_scope(), line)
+            .into_iter()
+            .filter_map(|fact| match fact {
+                LogFact::Activity { line, .. } => Some(line),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(activities, vec!["Bash"]);
+    }
+
+    #[test]
+    fn activity_lines_escape_controls_before_truncation() {
+        let description = format!("Inspect\n\u{1b}[31m{}", "\n".repeat(40));
+        let encoded = serde_json::to_string(&description).expect("description serializes");
+        let line = format!(
+            r#"{{"type":"assistant","timestamp":"2026-08-24T01:00:03.000Z","message":{{"content":[{{"type":"tool_use","name":"Agent","input":{{"description":{encoded}}}}}]}}}}"#
+        );
+        let activity = extract_claude_line(&root_scope(), &line)
+            .into_iter()
+            .find_map(|fact| match fact {
+                LogFact::Activity { line, .. } => Some(line),
+                _ => None,
+            })
+            .expect("tool use emits activity");
+
+        assert!(!activity.chars().any(char::is_control));
+        assert!(activity.contains(r"\n"));
+        assert!(activity.contains(r"\u{1b}[31m"));
+        assert!(activity.chars().count() <= 60);
+    }
+
+    #[test]
     fn edit_paths_render_repo_relative() {
         let line = r#"{"type":"assistant","timestamp":"2026-08-24T01:00:03.000Z","cwd":"/home/user/git/example/herdr-top","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/home/user/git/example/herdr-top/src/provider/facts.rs"}}]}}"#;
         let facts = extract_claude_line(&root_scope(), line);
@@ -514,7 +553,29 @@ mod tests {
                 "/home/user/elsewhere/data.txt",
                 "/home/user/git/example/herdr-top"
             ),
-            "/home/user/elsewhere/data.txt"
+            "data.txt"
+        );
+    }
+
+    #[test]
+    fn repo_relative_handles_equal_and_outside_paths_without_absolute_display() {
+        assert_eq!(
+            repo_relative(
+                "file:///home/user/git/example/herdr-top",
+                "file:///home/user/git/example/herdr-top"
+            ),
+            "."
+        );
+        assert_eq!(
+            repo_relative(
+                "file:///home/user/elsewhere/data.txt",
+                "/home/user/git/example/herdr-top"
+            ),
+            "data.txt"
+        );
+        assert_eq!(
+            repo_relative("file:///", "/home/user/git/example/herdr-top"),
+            "."
         );
     }
 
@@ -594,6 +655,17 @@ mod tests {
     }
 
     #[test]
+    fn task_notification_running_is_not_ended_evidence() {
+        let line = r#"{"type":"queue-operation","content":"<task-notification><task-id>abcdef12</task-id><status>running</status></task-notification>"}"#;
+
+        assert!(
+            extract_claude_line(&root_scope(), line)
+                .into_iter()
+                .all(|fact| !matches!(fact, LogFact::SubagentEnded { .. }))
+        );
+    }
+
+    #[test]
     fn typed_envelopes_cannot_hold_bodies() {
         let line = fixture("claude-session.jsonl")
             .lines()
@@ -614,6 +686,112 @@ mod tests {
         );
         assert!(!debug.contains("immutable snapshot"));
         assert!(!debug.contains("I will treat the cache report"));
+    }
+
+    #[test]
+    fn user_record_debug_excludes_message_and_tool_result_bodies() {
+        let line = fixture("claude-session.jsonl")
+            .lines()
+            .nth(6)
+            .expect("fixture has user tool-result record")
+            .to_owned();
+        let prompt =
+            "Inspect only the fictional cache diagnostic behavior and report boundary-case gaps.";
+        let result_text = "Synthetic reviewer result: equality at the warning threshold";
+        let body_markers = [prompt, result_text];
+        for marker in body_markers {
+            assert!(line.contains(marker));
+        }
+
+        let envelope: UserRecord =
+            serde_json::from_str(&line).expect("allowlisted envelope parses");
+        let debug = format!("{envelope:?}");
+
+        assert!(
+            debug.len() < 512,
+            "debug representation was {} bytes",
+            debug.len()
+        );
+        for marker in body_markers {
+            assert!(!debug.contains(marker));
+        }
+    }
+
+    #[test]
+    fn tool_use_result_debug_excludes_non_allowlisted_body_fields() {
+        let line = fixture("claude-session.jsonl")
+            .lines()
+            .nth(6)
+            .expect("fixture has user tool-result record")
+            .to_owned();
+        let prompt =
+            "Inspect only the fictional cache diagnostic behavior and report boundary-case gaps.";
+        let body_markers = [
+            prompt,
+            "Check deterministic cache report boundaries",
+            "claude-sonnet-5",
+            "/tmp/claude-4242/",
+            "completed",
+        ];
+        for marker in body_markers {
+            assert!(line.contains(marker));
+        }
+
+        let envelope: UserRecord =
+            serde_json::from_str(&line).expect("allowlisted envelope parses");
+        let result = envelope
+            .tool_use_result
+            .expect("fixture has a tool-use result");
+        let debug = format!("{result:?}");
+
+        assert!(
+            debug.len() < 512,
+            "debug representation was {} bytes",
+            debug.len()
+        );
+        for marker in body_markers {
+            assert!(!debug.contains(marker));
+        }
+    }
+
+    #[test]
+    fn meta_record_debug_excludes_non_allowlisted_fields() {
+        let source = fixture("claude-subagent-meta.json");
+        assert!(source.contains("claude-opus-5"));
+        assert!(source.contains("cache-report-worker"));
+
+        let envelope: MetaRecord =
+            serde_json::from_str(&source).expect("allowlisted envelope parses");
+        let debug = format!("{envelope:?}");
+
+        assert!(
+            debug.len() < 512,
+            "debug representation was {} bytes",
+            debug.len()
+        );
+        assert!(!debug.contains("claude-opus-5"));
+        assert!(!debug.contains("cache-report-worker"));
+    }
+
+    #[test]
+    fn ai_title_record_debug_excludes_unknown_body() {
+        let body = "ai-title-private-body ".repeat(64);
+        let source = format!(
+            r#"{{"type":"ai-title","sessionId":"session-title","aiTitle":"Safe title","largeBody":{}}}"#,
+            serde_json::to_string(&body).expect("body serializes")
+        );
+        assert!(source.contains("ai-title-private-body"));
+
+        let envelope: AiTitleRecord =
+            serde_json::from_str(&source).expect("allowlisted envelope parses");
+        let debug = format!("{envelope:?}");
+
+        assert!(
+            debug.len() < 512,
+            "debug representation was {} bytes",
+            debug.len()
+        );
+        assert!(!debug.contains("ai-title-private-body"));
     }
 
     #[test]
@@ -650,6 +828,19 @@ mod tests {
                 agent_id: "a7189abbf3c5741ac".to_owned(),
                 failed: false,
             }]
+        );
+    }
+
+    #[test]
+    fn tool_use_result_agent_id_without_status_marks_subagent_ended() {
+        let line = r#"{"type":"user","timestamp":"2026-08-24T01:00:12.000Z","toolUseResult":{"agentId":"a7189abbf3c5741ac"}}"#;
+
+        assert!(
+            extract_claude_line(&root_scope(), line).contains(&LogFact::SubagentEnded {
+                parent: PARENT.to_owned(),
+                agent_id: "a7189abbf3c5741ac".to_owned(),
+                failed: false,
+            })
         );
     }
 
@@ -701,8 +892,24 @@ mod tests {
         assert!(facts.contains(&LogFact::SubagentEnded {
             parent: PARENT.to_owned(),
             agent_id: "fedcba98".to_owned(),
-            failed: true,
+            failed: false,
         }));
+    }
+
+    #[test]
+    fn assistant_envelope_skips_unauthorized_subagent_type() {
+        let line = fixture("claude-session.jsonl")
+            .lines()
+            .nth(5)
+            .expect("fixture has Agent tool-use record")
+            .to_owned();
+        assert!(line.contains(r#""subagent_type":"reviewer""#));
+
+        let envelope: AssistantRecord =
+            serde_json::from_str(&line).expect("allowlisted envelope parses");
+        let debug = format!("{envelope:?}");
+
+        assert!(!debug.contains("reviewer"));
     }
 
     #[test]
