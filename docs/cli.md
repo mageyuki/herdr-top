@@ -129,7 +129,14 @@ The global `--session <SESSION>` and `--socket <PATH>` options are also accepted
 Doctor checks session and state paths, Herdr reachability, Controller
 rendezvous, ownership, database schema, provider discovery, compatibility,
 native-session coverage, and logs. It exits with status 1 when any check has
-`Error`; warnings alone do not produce a failing exit status.
+`error`; warnings alone do not produce a failing exit status.
+
+Individual checks use the lowercase statuses `ok`, `warning`, `error`, and
+`not_applicable`. The last status is commonly emitted when a check does not
+apply, such as the breadcrumb path check for a non-plugin install.
+`overall_status` appears in the human-readable header line and as a JSON field.
+It is the worst-of severity across the checks and has only `ok`, `warning`, or
+`error`; there is no `not_applicable` overall status.
 
 ### Herdr protocol compatibility
 
@@ -138,11 +145,11 @@ Compatibility uses Herdr version 0.8.0 and protocol 19 as floors, with protocols
 
 | Observation | Doctor status | Check identifier |
 | --- | --- | --- |
-| Herdr version is at least 0.8.0 and protocol is 19 or 20 | `Ok` | `herdr_compatible` |
-| Protocol is newer than 20 | `Warning` | `herdr_protocol_newer_unreviewed` |
-| Herdr version is below 0.8.0 | `Error` | `herdr_below_floor` |
-| Protocol is below 19, or falls into an unreviewed gap below the newest reviewed protocol | `Error` | `herdr_protocol_mismatch` |
-| Herdr version cannot be parsed or obtained | `Error` | `herdr_version_unparseable` |
+| Herdr version is at least 0.8.0 and protocol is 19 or 20 | `ok` | `herdr_compatible` |
+| Protocol is newer than 20 | `warning` | `herdr_protocol_newer_unreviewed` |
+| Herdr version is below 0.8.0 | `error` | `herdr_below_floor` |
+| Protocol is below 19, or falls into an unreviewed gap below the newest reviewed protocol | `error` | `herdr_protocol_mismatch` |
+| Herdr version cannot be parsed or obtained | `error` | `herdr_version_unparseable` |
 
 The version floor is checked before the protocol tier. A newer-than-reviewed
 protocol is tolerated with a warning; a below-floor or unreviewed older

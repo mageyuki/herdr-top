@@ -12,13 +12,17 @@ The normal screen has four regions:
 
 - **Header.** Shows the host, named session, elapsed session time, workspace
   count, observation quality, event lag, and source coverage when width permits.
-  Quality is one of `LIVE`, `RECONCILING`, `DISCONNECTED`, or `DEGRADED`.
+  A `perf:` field appears between `lag:` and `sources:` only when the
+  performance snapshot contains at least one reason. Quality is one of `LIVE`,
+  `RECONCILING`, `DISCONNECTED`, or `DEGRADED`.
 - **Execution tree or dependency DAG.** The execution tree places Task Runs
   beneath their current workspace, tab, and pane. The DAG view is a stable list
   with Task Run, prerequisite, and dependent columns. `Tab` switches views.
 - **Activity for selected item.** Shows persistence and Controller status, the
   selected row, selection recovery status, and the newest normalized activity
   item in the selected scope.
+  Its first line uses `p:` for persistence, `ctl:` for Controller input, and
+  `D4:` for the dangling announcement count.
 - **Footer.** Shows controls that fit the current terminal width. Its wording
   distinguishes stopping herdr-top with `q` from detaching the Herdr client.
 
