@@ -10,6 +10,13 @@ see where work is running, what each worker is doing, and which observations
 are live, degraded, or disconnected. Quitting the monitor does not stop the
 agents it observes.
 
+Its sweet spot is agent orchestration. A single chat in a single pane is easy
+to follow -- but once a session fans out into sub-agents and dispatched
+background tasks, what is actually running becomes invisible. herdr-top keeps
+every agent, sub-agent, and dispatched task in the session in one live view:
+what is running, what is blocked, and what has finished. It is like top for your
+agent swarm.
+
 ## 30-second quickstart
 
 Install the latest release into `~/.local/bin`:
@@ -23,7 +30,7 @@ For scripted or automated use, download the installer first so a failed
 download is detectable:
 
 ```sh
-curl --fail --location --silent --show-error https://raw.githubusercontent.com/mageyuki/herdr-top/main/install.sh -o /tmp/herdr-top-install.sh && bash /tmp/herdr-top-install.sh
+f=$(mktemp) && curl --fail --location --silent --show-error https://raw.githubusercontent.com/mageyuki/herdr-top/main/install.sh -o "$f" && bash "$f"
 ```
 
 Then, from a pane inside the Herdr session you want to inspect:
