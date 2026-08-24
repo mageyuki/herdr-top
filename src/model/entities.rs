@@ -81,15 +81,17 @@ impl TaskRun {
     }
 }
 
+// These telemetry-only types intentionally omit serde derives. That compile-enforces the
+// never-persisted invariant if DomainModel ever gains a serialization derive.
 /// One model/effort attribution observed for a Codex turn.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TurnAttr {
     pub model: Option<String>,
     pub effort: Option<String>,
 }
 
 /// Transient output-token telemetry for one task run.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunTelemetry {
     pub output_tokens: u64,
     pub started_wall_ms: i64,
@@ -796,20 +798,47 @@ impl DomainModel {
         self.telemetry.iter()
     }
 
-    pub(crate) fn telemetry_entry(
-        &mut self,
-        run_id: RunId,
-        started_wall_ms: i64,
-    ) -> &mut RunTelemetry {
-        self.telemetry
+    pub(crate) fn telemetry_entry(&mut self, run_id: RunId, at_ms: i64) -> &mut RunTelemetry {
+        let telemetry = self
+            .telemetry
             .entry(run_id)
             .or_insert_with(|| RunTelemetry {
                 output_tokens: 0,
-                started_wall_ms,
+                started_wall_ms: at_ms,
                 model: None,
                 effort: None,
                 per_turn: Vec::new(),
-            })
+            });
+        telemetry.started_wall_ms = telemetry.started_wall_ms.min(at_ms);
+        telemetry
+    }
+
+    pub(crate) fn fold_telemetry(&mut self, survivor: RunId, absorbed: RunId) {
+        let Some(mut absorbed_telemetry) = self.telemetry.remove(&absorbed) else {
+            return;
+        };
+        let Some(canonical) = self.telemetry.get_mut(&survivor) else {
+            self.telemetry.insert(survivor, absorbed_telemetry);
+            return;
+        };
+
+        canonical.output_tokens = canonical
+            .output_tokens
+            .saturating_add(absorbed_telemetry.output_tokens);
+        canonical.started_wall_ms = canonical
+            .started_wall_ms
+            .min(absorbed_telemetry.started_wall_ms);
+        if canonical.model.is_none() {
+            canonical.model = absorbed_telemetry.model.take();
+        }
+        if canonical.effort.is_none() {
+            canonical.effort = absorbed_telemetry.effort.take();
+        }
+        for attribution in absorbed_telemetry.per_turn {
+            if canonical.per_turn.last() != Some(&attribution) {
+                canonical.per_turn.push(attribution);
+            }
+        }
     }
 
     pub fn insert_execution(&mut self, execution: Execution) -> Option<Execution> {

@@ -539,7 +539,7 @@ impl Synthesis {
             }
             LogFact::Usage {
                 scope,
-                at_ms: _,
+                at_ms,
                 sample_id,
                 output_tokens,
                 model,
@@ -550,6 +550,7 @@ impl Synthesis {
                     let context = self.turn_context.get(&scope_key);
                     events.push(ProviderEvent::Telemetry {
                         key: run_key_for_scope(&scope),
+                        at_ms,
                         output_tokens,
                         model: model.or_else(|| context.map(|(model, _)| model.clone())),
                         effort: effort.or_else(|| context.and_then(|(_, effort)| effort.clone())),

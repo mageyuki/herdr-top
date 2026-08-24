@@ -4818,11 +4818,12 @@ async fn apply_provider_event_with_admission(
         }
         ProviderEvent::Telemetry {
             key,
+            at_ms,
             output_tokens,
             model,
             effort,
         } => {
-            let persist = reducer.apply_telemetry(&key, output_tokens, model, effort);
+            let persist = reducer.apply_telemetry(&key, at_ms, output_tokens, model, effort);
             debug_assert!(persist.is_empty(), "telemetry must remain transient");
             if let Some(admission) = admission.take() {
                 admission.complete();

@@ -83,6 +83,7 @@ pub enum ProviderEvent {
     /// Allowlisted usage sample consumed by telemetry in Increment 9 Task 7.
     Telemetry {
         key: RunKey,
+        at_ms: i64,
         output_tokens: u64,
         model: Option<String>,
         effort: Option<String>,

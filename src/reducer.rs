@@ -532,6 +532,7 @@ impl Reducer {
     pub fn apply_telemetry(
         &mut self,
         key: &RunKey,
+        at_ms: i64,
         output_tokens: u64,
         model: Option<String>,
         effort: Option<String>,
@@ -540,9 +541,6 @@ impl Reducer {
             return Vec::new();
         };
         let run_id = task_run.run_id;
-        let Some(started_wall_ms) = task_run.created_at_ms else {
-            return Vec::new();
-        };
         let retain_turn = matches!(
             key,
             RunKey::Native {
@@ -550,9 +548,12 @@ impl Reducer {
                 ..
             }
         );
-        self.model
-            .telemetry_entry(run_id, started_wall_ms)
-            .accumulate(output_tokens, model, effort, retain_turn);
+        self.model.telemetry_entry(run_id, at_ms).accumulate(
+            output_tokens,
+            model,
+            effort,
+            retain_turn,
+        );
         self.publish();
         Vec::new()
     }
@@ -3224,8 +3225,7 @@ mod tests {
     fn telemetry_accumulates_deduped_output_tokens() {
         let run_id = RunId::new();
         let key = RunKey::Controller("telemetry-run".to_owned());
-        let mut task_run = run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
-        task_run.created_at_ms = Some(1_234);
+        let task_run = run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
         let mut model = DomainModel::default();
         model.insert_task_run(task_run);
         let (mut reducer, shared) = Reducer::new(restored(model, 2));
@@ -3234,6 +3234,7 @@ mod tests {
             reducer
                 .apply_telemetry(
                     &key,
+                    1_100,
                     17,
                     Some("claude-opus-4-1".to_owned()),
                     Some("high".to_owned()),
@@ -3244,6 +3245,7 @@ mod tests {
             reducer
                 .apply_telemetry(
                     &key,
+                    1_200,
                     25,
                     Some("claude-opus-4-1".to_owned()),
                     Some("high".to_owned()),
@@ -3254,7 +3256,34 @@ mod tests {
         let snapshot = shared.borrow();
         let telemetry = snapshot.telemetry(&run_id).unwrap();
         assert_eq!(telemetry.output_tokens, 42);
-        assert_eq!(telemetry.started_wall_ms, 1_234);
+        assert_eq!(telemetry.started_wall_ms, 1_100);
+    }
+
+    #[test]
+    fn telemetry_uses_earliest_log_time_after_late_monitor_start() {
+        let run_id = RunId::new();
+        let key = RunKey::Controller("late-backfill".to_owned());
+        let mut task_run = run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
+        task_run.created_at_ms = Some(50_000);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        assert!(
+            reducer
+                .apply_telemetry(&key, 1_000, 17, None, None)
+                .is_empty()
+        );
+        assert!(
+            reducer
+                .apply_telemetry(&key, 2_000, 25, None, None)
+                .is_empty()
+        );
+
+        assert_eq!(
+            shared.borrow().telemetry(&run_id).unwrap().started_wall_ms,
+            1_000
+        );
     }
 
     #[tokio::test]
@@ -3269,7 +3298,24 @@ mod tests {
             .await;
         let key = telemetry_fixture_key();
         let run_id = shared.borrow().task_run_by_key(&key).unwrap().run_id;
-        let first = serde_json::to_vec(shared.borrow().telemetry(&run_id).unwrap()).unwrap();
+        let first = shared.borrow().telemetry(&run_id).unwrap().clone();
+        assert_eq!(first.output_tokens, 42);
+        assert_eq!(first.started_wall_ms, 1_100);
+        assert_eq!(first.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(first.effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            first.per_turn.as_slice(),
+            &[
+                TurnAttr {
+                    model: Some("gpt-5.6-terra".to_owned()),
+                    effort: Some("high".to_owned()),
+                },
+                TurnAttr {
+                    model: Some("gpt-5.6-sol".to_owned()),
+                    effort: Some("xhigh".to_owned()),
+                },
+            ]
+        );
         lifecycle.shutdown().await.unwrap();
 
         let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
@@ -3283,9 +3329,11 @@ mod tests {
 
         apply_telemetry_fixture_events(&mut reducer, &mut writer, synthesize_telemetry_fixture())
             .await;
-        let second = serde_json::to_vec(shared.borrow().telemetry(&run_id).unwrap()).unwrap();
-
-        assert_eq!(second, first);
+        {
+            let snapshot = shared.borrow();
+            let second = snapshot.telemetry(&run_id).unwrap();
+            assert_eq!(second, &first);
+        }
         lifecycle.shutdown().await.unwrap();
     }
 
@@ -3293,14 +3341,14 @@ mod tests {
     fn telemetry_is_not_persisted() {
         let run_id = RunId::new();
         let key = RunKey::Controller("transient-telemetry".to_owned());
-        let mut task_run = run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
-        task_run.created_at_ms = Some(4_321);
+        let task_run = run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
         let mut model = DomainModel::default();
         model.insert_task_run(task_run);
         let (mut reducer, shared) = Reducer::new(restored(model, 2));
 
         let persist = reducer.apply_telemetry(
             &key,
+            4_000,
             9_876_543_210,
             Some("distinctive-transient-model".to_owned()),
             Some("distinctive-transient-effort".to_owned()),
@@ -3311,10 +3359,11 @@ mod tests {
             snapshot.telemetry(&run_id).unwrap().output_tokens,
             9_876_543_210
         );
+        assert_eq!(snapshot.telemetry(&run_id).unwrap().started_wall_ms, 4_000);
 
-        // DomainModel is not a serde persistence blob. TaskRun is the serializable run
-        // projection that reaches persistence, so the invariant is asserted on that real
-        // surface as well as on the reducer's empty PersistOp batch above.
+        // RunTelemetry has no serde implementation, which compile-enforces the transient
+        // invariant. TaskRun is the serializable projection that reaches persistence, so the
+        // real persistence surface is still checked alongside the empty PersistOp batch.
         let serialized = serde_json::to_string(snapshot.task_run(&run_id).unwrap()).unwrap();
         assert!(!serialized.contains("\"telemetry\":"));
         assert!(!serialized.contains("\"output_tokens\":"));
@@ -3330,21 +3379,21 @@ mod tests {
             provider: Provider::Codex,
             sid: "per-turn-rollout".to_owned(),
         };
-        let mut task_run = run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
-        task_run.created_at_ms = Some(2_000);
+        let task_run = run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
         let mut model = DomainModel::default();
         model.insert_task_run(task_run);
         let (mut reducer, shared) = Reducer::new(restored(model, 2));
 
-        for (tokens, model, effort) in [
-            (10, "gpt-5.6-terra", "high"),
-            (20, "gpt-5.6-terra", "high"),
-            (30, "gpt-5.6-sol", "xhigh"),
+        for (at_ms, tokens, model, effort) in [
+            (2_000, 10, "gpt-5.6-terra", "high"),
+            (2_100, 20, "gpt-5.6-terra", "high"),
+            (2_200, 30, "gpt-5.6-sol", "xhigh"),
         ] {
             assert!(
                 reducer
                     .apply_telemetry(
                         &key,
+                        at_ms,
                         tokens,
                         Some(model.to_owned()),
                         Some(effort.to_owned()),
@@ -3356,6 +3405,7 @@ mod tests {
         let snapshot = shared.borrow();
         let telemetry = snapshot.telemetry(&run_id).unwrap();
         assert_eq!(telemetry.output_tokens, 60);
+        assert_eq!(telemetry.started_wall_ms, 2_000);
         assert_eq!(telemetry.model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(telemetry.effort.as_deref(), Some("xhigh"));
         assert_eq!(
@@ -3427,6 +3477,8 @@ mod tests {
             ),
             (
                 4,
+                // The repeated (scope, sample_id) is deliberately poisoned: lane deduplication
+                // excludes 999, so the fixture total proves 42 = 17 + 25.
                 LogFact::Usage {
                     scope: scope.clone(),
                     at_ms: 1_101,
@@ -3486,13 +3538,14 @@ mod tests {
                 }
                 ProviderEvent::Telemetry {
                     key,
+                    at_ms,
                     output_tokens,
                     model,
                     effort,
                 } => {
                     assert!(
                         reducer
-                            .apply_telemetry(&key, output_tokens, model, effort)
+                            .apply_telemetry(&key, at_ms, output_tokens, model, effort)
                             .is_empty()
                     );
                 }
