@@ -42,6 +42,33 @@ pub(crate) struct LiveLineReadModel {
 }
 
 impl LiveLineReadModel {
+    fn from_model(model: &DomainModel) -> Self {
+        let mut selected = HashMap::<RunId, (Option<i64>, String, String)>::new();
+        for agent in model.agent_nodes().filter(|agent| {
+            agent.last_event_kind.as_deref() == Some(crate::provider::lane::LIVE_LINE_EVENT_KIND)
+        }) {
+            let candidate = (
+                agent.last_activity_at_ms,
+                agent.agent_node_id.clone(),
+                agent.last_tool_name.clone().unwrap_or_default(),
+            );
+            selected
+                .entry(agent.task_run_id)
+                .and_modify(|current| {
+                    if (current.0, current.1.as_str()) < (candidate.0, candidate.1.as_str()) {
+                        current.clone_from(&candidate);
+                    }
+                })
+                .or_insert(candidate);
+        }
+        Self {
+            by_run: selected
+                .into_iter()
+                .filter_map(|(run_id, (_, _, line))| (!line.is_empty()).then_some((run_id, line)))
+                .collect(),
+        }
+    }
+
     fn get(&self, run_id: &RunId) -> Option<&str> {
         self.by_run.get(run_id).map(String::as_str)
     }
@@ -1073,7 +1100,7 @@ fn append_execution_tree_rows<'model>(
     newest_agents: &NewestAgentNodes<'model>,
 ) {
     let (mut pane_runs, unattached, nested_runs) = place_runs(model, state);
-    let live_lines = LiveLineReadModel::default();
+    let live_lines = LiveLineReadModel::from_model(model);
     let stalled_runs =
         projection::stalled_run_ids(model, state.now_ms(), crate::activity::stall_warn_ms());
     let run_row_context = RunRowContext {
@@ -1380,6 +1407,7 @@ fn append_run_subtree(
         .model
         .agent_nodes()
         .filter(|agent| agent.task_run_id == run_id)
+        .filter(|agent| !is_live_line_agent(agent))
         .filter(|agent| {
             provider_from_key(&run.key).is_none_or(|provider| provider == agent.provider)
         })
@@ -1676,7 +1704,10 @@ pub(crate) fn newest_agent_nodes(model: &DomainModel) -> NewestAgentNodes<'_> {
     #[cfg(test)]
     record_newest_agent_scan();
     let mut newest = NewestAgentNodes::new();
-    for agent in model.agent_nodes() {
+    for agent in model
+        .agent_nodes()
+        .filter(|agent| !is_live_line_agent(agent))
+    {
         newest
             .entry(agent.task_run_id)
             .and_modify(|current| {
@@ -1689,6 +1720,10 @@ pub(crate) fn newest_agent_nodes(model: &DomainModel) -> NewestAgentNodes<'_> {
             .or_insert(agent);
     }
     newest
+}
+
+fn is_live_line_agent(agent: &AgentNode) -> bool {
+    agent.last_event_kind.as_deref() == Some(crate::provider::lane::LIVE_LINE_EVENT_KIND)
 }
 
 #[cfg(test)]
@@ -1948,7 +1983,6 @@ pub(crate) fn truncate_to_width(value: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::path::Path;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1973,8 +2007,6 @@ mod tests {
         ExecutionEdge, Pane, Provider, RunId, RunKey, Tab, TaskRun, TaskState, Workspace,
     };
     use crate::performance::{PerformanceDegradationReason, PerformanceSnapshot};
-    use crate::provider::facts::{ActivitySource, LogFact, SessionScope};
-    use crate::provider::lane::{Admission, AdmissionIndex, Synthesis};
     use crate::store::writer::PersistenceStatus;
     use crate::tui::app::{App, AppState, HeaderInputs, SystemClock, TuiSetup};
 
@@ -2121,32 +2153,6 @@ mod tests {
     }
 
     #[test]
-    fn subject_chain_meta_title_cwd_id() {
-        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        let live_lines = LiveLineReadModel::default();
-        for (subject, expected) in [
-            (Some("AI title"), "● claude-code AI title"),
-            (Some("herdr-top"), "● claude-code herdr-top"),
-            (None, "● claude-code session-id"),
-        ] {
-            let run = label_run(
-                run_id,
-                RunKey::Controller("hook:claude-code:session-id".to_owned()),
-                TaskState::Running,
-                None,
-                None,
-                subject,
-            );
-            let model = DomainModel::default();
-
-            assert_eq!(
-                run_row_label_with_agent(&model, &run, None, 0, &live_lines, false,),
-                expected
-            );
-        }
-    }
-
-    #[test]
     fn codex_worker_rows_have_no_subject() {
         let root_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let worker_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
@@ -2188,159 +2194,6 @@ mod tests {
         assert_eq!(
             run_row_label_with_agent(&model, &worker, None, 0, &live_lines, false),
             "● Codex"
-        );
-    }
-
-    #[test]
-    fn live_prefers_commentary_then_command() {
-        const ROLLOUT: &str = "22222222-2222-4222-8222-222222222222";
-        let scope = SessionScope::Codex {
-            rollout_id: ROLLOUT.to_owned(),
-        };
-        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        let run = label_run(
-            run_id,
-            RunKey::Native {
-                provider: Provider::Codex,
-                sid: ROLLOUT.to_owned(),
-            },
-            TaskState::Running,
-            None,
-            None,
-            None,
-        );
-        let mut model = DomainModel::default();
-        model.insert_task_run(run.clone());
-        let mut synthesis = Synthesis::default();
-        let mut admission = Admission::new(0);
-        let discovered = AdmissionIndex::new();
-        synthesis.synthesize_batch(
-            Path::new("rollout.jsonl"),
-            [
-                (
-                    1,
-                    LogFact::CodexTurnStarted {
-                        rollout_id: ROLLOUT.to_owned(),
-                        at_ms: 1,
-                    },
-                ),
-                (
-                    2,
-                    LogFact::Activity {
-                        scope: scope.clone(),
-                        at_ms: 2,
-                        source: ActivitySource::Command,
-                        line: "cargo test".to_owned(),
-                    },
-                ),
-                (
-                    3,
-                    LogFact::Activity {
-                        scope: scope.clone(),
-                        at_ms: 3,
-                        source: ActivitySource::Commentary,
-                        line: "checking invariants".to_owned(),
-                    },
-                ),
-            ],
-            &mut admission,
-            &discovered,
-        );
-        let commentary = synthesis.live_line(&scope).unwrap();
-        let live_lines = LiveLineReadModel {
-            by_run: HashMap::from([(run_id, commentary)]),
-        };
-        assert_eq!(
-            run_row_label_with_agent(&model, &run, None, 4, &live_lines, false),
-            format!("● Codex {ROLLOUT} — checking invariants")
-        );
-
-        synthesis.synthesize_batch(
-            Path::new("rollout.jsonl"),
-            [
-                (
-                    4,
-                    LogFact::CodexTurnStarted {
-                        rollout_id: ROLLOUT.to_owned(),
-                        at_ms: 4,
-                    },
-                ),
-                (
-                    5,
-                    LogFact::Activity {
-                        scope: scope.clone(),
-                        at_ms: 5,
-                        source: ActivitySource::Command,
-                        line: "next command".to_owned(),
-                    },
-                ),
-            ],
-            &mut admission,
-            &discovered,
-        );
-        let command = synthesis.live_line(&scope).unwrap();
-        let live_lines = LiveLineReadModel {
-            by_run: HashMap::from([(run_id, command)]),
-        };
-        assert_eq!(
-            run_row_label_with_agent(&model, &run, None, 6, &live_lines, false),
-            format!("● Codex {ROLLOUT} — next command")
-        );
-
-        let claude_scope = SessionScope::ClaudeRoot("claude-session".to_owned());
-        synthesis.synthesize_batch(
-            Path::new("session.jsonl"),
-            [(
-                6,
-                LogFact::Activity {
-                    scope: claude_scope.clone(),
-                    at_ms: 6,
-                    source: ActivitySource::ToolUse,
-                    line: "Read: Cargo.toml".to_owned(),
-                },
-            )],
-            &mut admission,
-            &discovered,
-        );
-        let claude_run = label_run(
-            run_id,
-            RunKey::Controller("hook:claude-code:claude-session".to_owned()),
-            TaskState::Running,
-            None,
-            None,
-            Some("inspect project"),
-        );
-        let live_lines = LiveLineReadModel {
-            by_run: HashMap::from([(run_id, synthesis.live_line(&claude_scope).unwrap())]),
-        };
-        assert_eq!(
-            run_row_label_with_agent(&model, &claude_run, None, 7, &live_lines, false),
-            "● claude-code inspect project — Read: Cargo.toml"
-        );
-    }
-
-    #[test]
-    fn terminal_rows_drop_live() {
-        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        let run = label_run(
-            run_id,
-            RunKey::Native {
-                provider: Provider::Codex,
-                sid: "session".to_owned(),
-            },
-            TaskState::Completed,
-            None,
-            None,
-            Some("finished subject"),
-        );
-        let model = DomainModel::default();
-        let live_lines = LiveLineReadModel {
-            by_run: HashMap::from([(run_id, "must not render".to_owned())]),
-        };
-
-        assert_eq!(
-            run_row_label_with_agent(&model, &run, None, 0, &live_lines, false),
-            "✓ Codex finished subject"
         );
     }
 

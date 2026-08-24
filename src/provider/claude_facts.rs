@@ -151,6 +151,15 @@ fn extract_assistant(scope: &SessionScope, line: &str, facts: &mut Vec<LogFact>)
         return;
     };
 
+    if let SessionScope::ClaudeRoot(session_id) = scope
+        && let Some(cwd) = record.cwd.as_ref().filter(|cwd| !cwd.is_empty())
+    {
+        facts.push(LogFact::ClaudeCwd {
+            session_id: session_id.clone(),
+            cwd: cwd.clone(),
+        });
+    }
+
     let Some(message) = record.message else {
         return;
     };

@@ -39,6 +39,13 @@ pub enum LogFact {
         /// Generated session title.
         title: String,
     },
+    /// Claude root working directory used only for the subject basename fallback.
+    ClaudeCwd {
+        /// Claude root session ID that owns the working directory.
+        session_id: String,
+        /// Raw allowlisted working directory string.
+        cwd: String,
+    },
     /// Identity metadata reported by a Codex rollout.
     CodexMeta {
         /// Rollout ID of the artifact being read.

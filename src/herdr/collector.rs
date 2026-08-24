@@ -5990,38 +5990,85 @@ fn normalize_provider_event(
             ..
         } => {
             let model = shared.borrow();
-            let node = model
-                .agent_nodes()
-                .filter(|node| {
-                    node.provider == provider
-                        && node.native_session_id.as_deref() == Some(agent_thread_id.as_str())
+            let lane_activity =
+                activity.event_kind.as_deref() == Some(crate::provider::lane::LIVE_LINE_EVENT_KIND);
+            let resolved = if lane_activity {
+                let lane_key = match provider {
+                    Provider::Claude => RunKey::Controller(agent_thread_id.clone()),
+                    Provider::Codex => RunKey::Native {
+                        provider,
+                        sid: agent_thread_id.clone(),
+                    },
+                };
+                model.task_run_by_key(&lane_key).map(|run| {
+                    let node_id =
+                        deterministic_agent_node_id(provider, &format!("lane:{agent_thread_id}"));
+                    let create_node = model.agent_node(&node_id).is_none();
+                    (run.run_id, node_id, create_node)
                 })
-                .min_by_key(|node| node.agent_node_id.as_str())
-                .cloned();
-            let Some(node) = node else {
+            } else {
+                model
+                    .agent_nodes()
+                    .filter(|node| {
+                        node.provider == provider
+                            && node.native_session_id.as_deref() == Some(agent_thread_id.as_str())
+                    })
+                    .min_by_key(|node| node.agent_node_id.as_str())
+                    .cloned()
+                    .map(|node| (node.task_run_id, node.agent_node_id, false))
+            };
+            let Some((run_id, node_id, create_node)) = resolved else {
                 return NormalizedProviderObservation {
                     events: Vec::new(),
                     identity_disagreement: false,
                 };
             };
             drop(model);
+            let mut events = Vec::new();
+            if create_node {
+                let node_metadata = provider_metadata_for(
+                    session,
+                    provider,
+                    format!("{event_id}:node"),
+                    "agent_node",
+                    observed_at_ms,
+                    run_id,
+                    &node_id,
+                    activity.clone(),
+                    coverage,
+                );
+                events.push(NormalizedEvent::AgentNodeUpsert {
+                    metadata: node_metadata,
+                    node: AgentNodeObservation {
+                        agent_node_id: node_id.clone(),
+                        provider,
+                        native_session_id: None,
+                        task_run_id: run_id,
+                        parent_agent_node_id: None,
+                        state: None,
+                        model_id: None,
+                        session_file: None,
+                    },
+                });
+            }
             let metadata = provider_metadata_for(
                 session,
                 provider,
                 event_id,
                 "activity",
                 observed_at_ms,
-                node.task_run_id,
-                &node.agent_node_id,
+                run_id,
+                &node_id,
                 activity.clone(),
                 coverage,
             );
+            events.push(NormalizedEvent::AgentActivity {
+                metadata,
+                agent_node_id: node_id,
+                activity,
+            });
             NormalizedProviderObservation {
-                events: vec![NormalizedEvent::AgentActivity {
-                    metadata,
-                    agent_node_id: node.agent_node_id,
-                    activity,
-                }],
+                events,
                 identity_disagreement: false,
             }
         }
@@ -11469,6 +11516,7 @@ mod provider_integration_tests {
     use std::collections::HashSet;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -11478,12 +11526,18 @@ mod provider_integration_tests {
     use crate::lockfile::StateRoot;
     use crate::model::{
         AgentNode, ControllerEventKind, DisplayOrdinal, DomainModel, ExecState, ExecutionEdge,
-        MinimalProviderMetadata, RunKey, TaskRun, TaskState,
+        MinimalProviderMetadata, RunId, RunKey, SharedModel, TaskRun, TaskState,
     };
+    use crate::provider::claude_facts::extract_claude_line;
+    use crate::provider::facts::{ActivitySource, LogFact, SessionScope};
+    use crate::provider::lane::{Admission, AdmissionIndex, Synthesis};
     use crate::provider::{ProviderCycle, ProviderEvent, ProviderWorker, SourcePosition};
+    use crate::store::WriterLifecycle;
     use crate::store::{
         NativeSessionBinding, PersistOp, PersistTaskRun, open_reader, open_writer, spawn_writer,
     };
+    use crate::tui::app::AppState;
+    use crate::tui::view::build_rows;
 
     struct TestOccurrenceSink;
 
@@ -11495,6 +11549,419 @@ mod provider_integration_tests {
 
     fn test_runtime(writer: WriterClient) -> RuntimePersistence {
         RuntimePersistence::new_for_test(writer, Arc::new(TestOccurrenceSink)).0
+    }
+
+    struct LaneModelHarness {
+        _directory: tempfile::TempDir,
+        lifecycle: WriterLifecycle,
+        persistence: RuntimePersistence,
+        reducer: Reducer,
+        shared: SharedModel,
+    }
+
+    impl LaneModelHarness {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let root = StateRoot(directory.path().to_path_buf());
+            let store = open_writer(&root).unwrap();
+            let (lifecycle, writer) = spawn_writer(store).unwrap();
+            let persistence = test_runtime(writer);
+            let (reducer, shared) = Reducer::new(RestoredState {
+                model: DomainModel::default(),
+                next_ordinal: 1,
+                next_ingest_seq: Some(1),
+                event_ledger: Vec::new(),
+            });
+            Self {
+                _directory: directory,
+                lifecycle,
+                persistence,
+                reducer,
+                shared,
+            }
+        }
+
+        async fn apply(&mut self, events: impl IntoIterator<Item = ProviderEvent>) {
+            let coverage = SourceCoverageRegistry::new(SourceAvailability::Available);
+            for event in events {
+                apply_provider_event(
+                    event,
+                    "session",
+                    &mut self.reducer,
+                    &self.shared,
+                    &mut self.persistence,
+                    &coverage,
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        fn run_id(&self, key: &RunKey) -> RunId {
+            self.shared
+                .borrow()
+                .task_run_by_key(key)
+                .unwrap_or_else(|| panic!("missing run for {key:?}"))
+                .run_id
+        }
+
+        fn row_label(&self, run_id: RunId) -> String {
+            let model = self.shared.borrow();
+            build_rows(&model, &AppState::default())
+                .into_iter()
+                .find(|row| row.key.run_id() == Some(run_id))
+                .unwrap_or_else(|| panic!("missing row for {run_id}"))
+                .label
+        }
+
+        fn row_labels(&self) -> Vec<String> {
+            let model = self.shared.borrow();
+            build_rows(&model, &AppState::default())
+                .into_iter()
+                .map(|row| row.label)
+                .collect()
+        }
+
+        async fn shutdown(self) {
+            drop(self.persistence);
+            self.lifecycle.shutdown().await.unwrap();
+        }
+    }
+
+    fn synthesize_claude_record(
+        synthesis: &mut Synthesis,
+        admission: &mut Admission,
+        artifact: &Path,
+        scope: &SessionScope,
+        ordinal: u64,
+        line: &str,
+    ) -> Vec<ProviderEvent> {
+        synthesis.synthesize_batch(
+            artifact,
+            extract_claude_line(scope, line)
+                .into_iter()
+                .map(|fact| (ordinal, fact)),
+            admission,
+            &AdmissionIndex::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn live_prefers_commentary_then_command() {
+        const ROLLOUT: &str = "22222222-2222-4222-8222-222222222222";
+        let scope = SessionScope::Codex {
+            rollout_id: ROLLOUT.to_owned(),
+        };
+        let run_key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: ROLLOUT.to_owned(),
+        };
+        let mut synthesis = Synthesis::default();
+        let mut admission = Admission::new(0);
+        let discovered = AdmissionIndex::new();
+        let mut harness = LaneModelHarness::new();
+
+        let events = synthesis.synthesize_batch(
+            Path::new("rollout.jsonl"),
+            [
+                (
+                    1,
+                    LogFact::CodexTurnStarted {
+                        rollout_id: ROLLOUT.to_owned(),
+                        at_ms: 1,
+                    },
+                ),
+                (
+                    2,
+                    LogFact::Activity {
+                        scope: scope.clone(),
+                        at_ms: 2,
+                        source: ActivitySource::Command,
+                        line: "cargo test".to_owned(),
+                    },
+                ),
+                (
+                    3,
+                    LogFact::Activity {
+                        scope: scope.clone(),
+                        at_ms: 3,
+                        source: ActivitySource::Commentary,
+                        line: "checking invariants".to_owned(),
+                    },
+                ),
+            ],
+            &mut admission,
+            &discovered,
+        );
+        harness.apply(events).await;
+        let run_id = harness.run_id(&run_key);
+        let commentary_row = harness.row_label(run_id);
+        assert!(
+            commentary_row.contains(" — checking invariants"),
+            "lane commentary did not reach the row: {commentary_row}"
+        );
+        assert!(
+            harness
+                .row_labels()
+                .iter()
+                .all(|label| !label.contains("native agent: agent:codex:lane:")),
+            "the live-line transport node must not create a synthetic agent row"
+        );
+
+        let events = synthesis.synthesize_batch(
+            Path::new("rollout.jsonl"),
+            [(
+                4,
+                LogFact::Activity {
+                    scope: scope.clone(),
+                    at_ms: 4,
+                    source: ActivitySource::Command,
+                    line: "later command".to_owned(),
+                },
+            )],
+            &mut admission,
+            &discovered,
+        );
+        harness.apply(events).await;
+        let same_turn_row = harness.row_label(run_id);
+        assert!(same_turn_row.contains(" — checking invariants"));
+        assert!(!same_turn_row.contains("later command"));
+
+        let events = synthesis.synthesize_batch(
+            Path::new("rollout.jsonl"),
+            [
+                (
+                    5,
+                    LogFact::CodexTurnStarted {
+                        rollout_id: ROLLOUT.to_owned(),
+                        at_ms: 5,
+                    },
+                ),
+                (
+                    6,
+                    LogFact::Activity {
+                        scope,
+                        at_ms: 6,
+                        source: ActivitySource::Command,
+                        line: "next turn command".to_owned(),
+                    },
+                ),
+            ],
+            &mut admission,
+            &discovered,
+        );
+        harness.apply(events).await;
+        let next_turn_row = harness.row_label(run_id);
+        assert!(
+            next_turn_row.contains(" — next turn command"),
+            "next-turn command did not reach the row: {next_turn_row}"
+        );
+        assert!(!next_turn_row.contains("checking invariants"));
+
+        const CLAUDE_SESSION: &str = "77777777-7777-4777-8777-777777777777";
+        let claude_scope = SessionScope::ClaudeRoot(CLAUDE_SESSION.to_owned());
+        let claude_events = synthesis.synthesize_batch(
+            Path::new("claude-session.jsonl"),
+            [
+                (
+                    7,
+                    LogFact::Append {
+                        scope: claude_scope.clone(),
+                        at_ms: 7,
+                    },
+                ),
+                (
+                    8,
+                    LogFact::AiTitle {
+                        session_id: CLAUDE_SESSION.to_owned(),
+                        title: "inspect project".to_owned(),
+                    },
+                ),
+                (
+                    9,
+                    LogFact::Activity {
+                        scope: claude_scope,
+                        at_ms: 9,
+                        source: ActivitySource::ToolUse,
+                        line: "Read: Cargo.toml".to_owned(),
+                    },
+                ),
+            ],
+            &mut admission,
+            &discovered,
+        );
+        harness.apply(claude_events).await;
+        let claude_run_id = harness.run_id(&RunKey::Controller(format!(
+            "hook:claude-code:{CLAUDE_SESSION}"
+        )));
+        let claude_row = harness.row_label(claude_run_id);
+        assert!(
+            claude_row.contains("claude-code inspect project — Read: Cargo.toml"),
+            "Claude ToolUse selected line changed: {claude_row}"
+        );
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_rows_drop_live() {
+        const ROLLOUT: &str = "33333333-3333-4333-8333-333333333333";
+        let scope = SessionScope::Codex {
+            rollout_id: ROLLOUT.to_owned(),
+        };
+        let run_key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: ROLLOUT.to_owned(),
+        };
+        let mut synthesis = Synthesis::default();
+        let mut admission = Admission::new(0);
+        let discovered = AdmissionIndex::new();
+        let mut harness = LaneModelHarness::new();
+
+        let active = synthesis.synthesize_batch(
+            Path::new("terminal-rollout.jsonl"),
+            [
+                (
+                    1,
+                    LogFact::CodexTurnStarted {
+                        rollout_id: ROLLOUT.to_owned(),
+                        at_ms: 1,
+                    },
+                ),
+                (
+                    2,
+                    LogFact::Activity {
+                        scope,
+                        at_ms: 2,
+                        source: ActivitySource::Command,
+                        line: "must disappear".to_owned(),
+                    },
+                ),
+            ],
+            &mut admission,
+            &discovered,
+        );
+        harness.apply(active).await;
+        let run_id = harness.run_id(&run_key);
+        let active_row = harness.row_label(run_id);
+        assert!(
+            active_row.contains(" — must disappear"),
+            "test precondition missing real live line: {active_row}"
+        );
+
+        let terminal = synthesis.synthesize_batch(
+            Path::new("terminal-rollout.jsonl"),
+            [(
+                3,
+                LogFact::CodexTurnAborted {
+                    rollout_id: ROLLOUT.to_owned(),
+                    at_ms: 3,
+                },
+            )],
+            &mut admission,
+            &discovered,
+        );
+        harness.apply(terminal).await;
+        let terminal_row = harness.row_label(run_id);
+        assert!(
+            terminal_row.starts_with('✗'),
+            "unexpected terminal row: {terminal_row}"
+        );
+        assert!(!terminal_row.contains("must disappear"));
+        assert!(!terminal_row.contains(" — "));
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn subject_chain_meta_title_cwd_id() {
+        const TITLE_SESSION: &str = "44444444-4444-4444-8444-444444444444";
+        const CWD_SESSION: &str = "55555555-5555-4555-8555-555555555555";
+        const ID_SESSION: &str = "66666666-6666-4666-8666-666666666666";
+        let title_scope = SessionScope::ClaudeRoot(TITLE_SESSION.to_owned());
+        let cwd_scope = SessionScope::ClaudeRoot(CWD_SESSION.to_owned());
+        let id_scope = SessionScope::ClaudeRoot(ID_SESSION.to_owned());
+        let mut synthesis = Synthesis::default();
+        let mut admission = Admission::new(0);
+        let mut harness = LaneModelHarness::new();
+
+        for (ordinal, line) in [
+            (
+                1,
+                "{\"type\":\"assistant\",\"timestamp\":\"2026-08-24T00:00:01Z\",\"cwd\":\"/work/herdr-top\",\"message\":{\"content\":[]}}"
+                    .to_owned(),
+            ),
+            (
+                2,
+                format!(
+                    "{{\"type\":\"ai-title\",\"sessionId\":\"{TITLE_SESSION}\",\"aiTitle\":\"Initial title\"}}"
+                ),
+            ),
+            (
+                3,
+                format!(
+                    "{{\"type\":\"ai-title\",\"sessionId\":\"{TITLE_SESSION}\",\"aiTitle\":\"Latest title\"}}"
+                ),
+            ),
+        ] {
+            let events = synthesize_claude_record(
+                &mut synthesis,
+                &mut admission,
+                Path::new("title-session.jsonl"),
+                &title_scope,
+                ordinal,
+                &line,
+            );
+            harness.apply(events).await;
+        }
+        let cwd_events = synthesize_claude_record(
+            &mut synthesis,
+            &mut admission,
+            Path::new("cwd-session.jsonl"),
+            &cwd_scope,
+            1,
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-08-24T00:00:02Z\",\"cwd\":\"/work/cwd-project\",\"message\":{\"content\":[]}}",
+        );
+        harness.apply(cwd_events).await;
+        let id_events = synthesize_claude_record(
+            &mut synthesis,
+            &mut admission,
+            Path::new("id-session.jsonl"),
+            &id_scope,
+            1,
+            "{\"type\":\"user\",\"timestamp\":\"2026-08-24T00:00:03Z\"}",
+        );
+        harness.apply(id_events).await;
+
+        let title_id = harness.run_id(&RunKey::Controller(format!(
+            "hook:claude-code:{TITLE_SESSION}"
+        )));
+        let cwd_id = harness.run_id(&RunKey::Controller(format!(
+            "hook:claude-code:{CWD_SESSION}"
+        )));
+        let fallback_id = harness.run_id(&RunKey::Controller(format!(
+            "hook:claude-code:{ID_SESSION}"
+        )));
+        assert!(
+            harness
+                .row_label(title_id)
+                .contains("claude-code Latest title"),
+            "latest ai-title did not win"
+        );
+        assert!(
+            harness
+                .row_label(cwd_id)
+                .contains("claude-code cwd-project"),
+            "cwd basename did not supply the subject"
+        );
+        assert!(
+            harness
+                .row_label(fallback_id)
+                .contains(&format!("claude-code {ID_SESSION}")),
+            "session id did not supply the final fallback"
+        );
+
+        harness.shutdown().await;
     }
 
     fn test_diagnostics() -> watch::Receiver<RuntimeDiagnosticsSnapshot> {

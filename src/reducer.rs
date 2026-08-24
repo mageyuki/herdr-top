@@ -1217,7 +1217,12 @@ impl Reducer {
                 target,
                 allow_lane_reopen,
             );
-            if task_run.subject.is_none()
+            let lane_claude_root_subject = metadata.source
+                == crate::provider::lane::SOURCE_LOG_LANE
+                && metadata.source_event_type == "progress"
+                && metadata.provider == Some(Provider::Claude)
+                && metadata.native_session_id.is_some();
+            if (task_run.subject.is_none() || lane_claude_root_subject)
                 && let Some(label) = metadata.label.as_ref().filter(|label| !label.is_empty())
             {
                 task_run.subject = Some(label.clone());

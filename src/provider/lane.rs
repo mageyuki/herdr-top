@@ -14,7 +14,7 @@ use crate::model::{
 };
 
 use super::facts::{ActivitySource, CodexInternal, EvidenceId, LogFact, SessionScope};
-use super::{DiscoveryRoot, ProviderDiagnostics, ProviderEvent};
+use super::{DiscoveryRoot, ProviderDiagnostics, ProviderEvent, SourcePosition};
 
 #[cfg(test)]
 use std::cell::RefCell;
@@ -27,6 +27,8 @@ pub const DEFAULT_COMPLETE_GRACE_MS: i64 = 30_000;
 pub const DEFAULT_HEADLESS_INACTIVITY_MS: i64 = 600_000;
 /// Event-source marker reserved for facts synthesized from provider log artifacts.
 pub const SOURCE_LOG_LANE: &str = "provider-log";
+/// Provider metadata marker for a lane-selected row live line.
+pub const LIVE_LINE_EVENT_KIND: &str = "lane_live_line";
 
 /// Effective provider-log lane timing configuration resolved at process startup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,6 +71,12 @@ struct ActivitySelection {
     command: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FactPosition {
+    ordinal: u64,
+    sequence: usize,
+}
+
 impl ActivitySelection {
     fn observe(&mut self, source: &ActivitySource, line: &str) {
         match source {
@@ -94,6 +102,8 @@ pub struct Synthesis {
     session_meta: HashMap<PathBuf, CodexSessionMetadata>,
     turn_context: HashMap<ScopeKey, (String, Option<String>)>,
     ai_titles: HashMap<String, String>,
+    claude_cwds: HashMap<String, String>,
+    published_subjects: HashMap<String, String>,
     started: HashSet<ScopeKey>,
     usage_samples: HashSet<(ScopeKey, String)>,
     subagent_ends: HashMap<(String, String), bool>,
@@ -134,6 +144,8 @@ impl Synthesis {
             session_meta: HashMap::new(),
             turn_context: HashMap::new(),
             ai_titles: HashMap::new(),
+            claude_cwds: HashMap::new(),
+            published_subjects: HashMap::new(),
             started: HashSet::new(),
             usage_samples: HashSet::new(),
             subagent_ends: HashMap::new(),
@@ -246,7 +258,11 @@ impl Synthesis {
     ) -> Vec<ProviderEvent> {
         let mut ordinary = Vec::new();
         let mut ended: HashMap<(String, String), (u64, bool)> = HashMap::new();
-        for (sequence, (ordinal, fact)) in facts.into_iter().enumerate() {
+        let mut ordinal_sequences = HashMap::<u64, usize>::new();
+        for (order, (ordinal, fact)) in facts.into_iter().enumerate() {
+            let sequence = ordinal_sequences.entry(ordinal).or_default();
+            let record_sequence = *sequence;
+            *sequence = sequence.saturating_add(1);
             if let LogFact::SubagentEnded {
                 parent,
                 agent_id,
@@ -257,7 +273,7 @@ impl Synthesis {
                 terminal.0 = terminal.0.min(ordinal);
                 terminal.1 |= failed;
             } else {
-                ordinary.push((ordinal, sequence, fact));
+                ordinary.push((ordinal, order, record_sequence, fact));
             }
         }
         ordinary.extend(
@@ -267,6 +283,7 @@ impl Synthesis {
                     (
                         ordinal,
                         usize::MAX,
+                        0,
                         LogFact::SubagentEnded {
                             parent,
                             agent_id,
@@ -275,14 +292,21 @@ impl Synthesis {
                     )
                 }),
         );
-        ordinary.sort_by_key(|(ordinal, sequence, fact)| {
+        ordinary.sort_by_key(|(ordinal, order, _, fact)| {
             let append_first = !matches!(fact, LogFact::Append { .. });
-            (*ordinal, append_first, *sequence)
+            (*ordinal, append_first, *order)
         });
 
         let mut events = Vec::new();
-        for (ordinal, _, fact) in ordinary {
-            self.synthesize_fact(artifact, ordinal, fact, admission, discovered, &mut events);
+        for (ordinal, _, sequence, fact) in ordinary {
+            self.synthesize_fact(
+                artifact,
+                FactPosition { ordinal, sequence },
+                fact,
+                admission,
+                discovered,
+                &mut events,
+            );
         }
         events
     }
@@ -301,12 +325,13 @@ impl Synthesis {
     fn synthesize_fact(
         &mut self,
         artifact: &Path,
-        ordinal: u64,
+        position: FactPosition,
         fact: LogFact,
         admission: &mut Admission,
         discovered: &AdmissionIndex,
         events: &mut Vec<ProviderEvent>,
     ) {
+        let FactPosition { ordinal, sequence } = position;
         if let Some(at_ms) = fact_lifecycle_time(&fact) {
             self.latest_lifecycle_ms = self.latest_lifecycle_ms.max(at_ms);
         }
@@ -334,7 +359,19 @@ impl Synthesis {
                 }
             }
             LogFact::AiTitle { session_id, title } => {
-                self.ai_titles.insert(session_id, title);
+                self.ai_titles.insert(session_id.clone(), title);
+                self.publish_claude_subject(artifact, ordinal, &session_id, events);
+            }
+            LogFact::ClaudeCwd { session_id, cwd } => {
+                if let Some(basename) = Path::new(&cwd)
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .filter(|basename| !basename.is_empty())
+                {
+                    self.claude_cwds
+                        .insert(session_id.clone(), basename.to_owned());
+                    self.publish_claude_subject(artifact, ordinal, &session_id, events);
+                }
             }
             LogFact::CodexMeta {
                 rollout_id,
@@ -394,7 +431,16 @@ impl Synthesis {
                 let scope = SessionScope::Codex { rollout_id };
                 let scope_key = ScopeKey::from(&scope);
                 let _ = self.prepare_resume(&scope_key, at_ms, events);
-                self.live_lines.remove(&scope_key);
+                if self
+                    .live_lines
+                    .remove(&scope_key)
+                    .and_then(|selection| selection.selected())
+                    .is_some()
+                {
+                    events.push(live_line_event(
+                        artifact, ordinal, sequence, &scope, at_ms, None,
+                    ));
+                }
                 if self.started.insert(scope_key) {
                     events.push(ProviderEvent::Synthesized(controller_event(
                         artifact,
@@ -529,14 +575,19 @@ impl Synthesis {
             }
             LogFact::Activity {
                 scope,
-                at_ms: _,
+                at_ms,
                 source,
                 line,
             } => {
-                self.live_lines
-                    .entry(ScopeKey::from(&scope))
-                    .or_default()
-                    .observe(&source, &line);
+                let selection = self.live_lines.entry(ScopeKey::from(&scope)).or_default();
+                let previous = selection.selected();
+                selection.observe(&source, &line);
+                let selected = selection.selected();
+                if selected != previous {
+                    events.push(live_line_event(
+                        artifact, ordinal, sequence, &scope, at_ms, selected,
+                    ));
+                }
             }
             LogFact::Usage {
                 scope,
@@ -587,6 +638,47 @@ impl Synthesis {
                 )));
             }
         }
+    }
+
+    fn publish_claude_subject(
+        &mut self,
+        artifact: &Path,
+        ordinal: u64,
+        session_id: &str,
+        events: &mut Vec<ProviderEvent>,
+    ) {
+        let subject = self
+            .ai_titles
+            .get(session_id)
+            .filter(|title| !title.is_empty())
+            .or_else(|| self.claude_cwds.get(session_id))
+            .cloned();
+        let Some(subject) = subject else {
+            return;
+        };
+        if self.published_subjects.get(session_id) == Some(&subject) {
+            return;
+        }
+        self.published_subjects
+            .insert(session_id.to_owned(), subject.clone());
+        let scope = SessionScope::ClaudeRoot(session_id.to_owned());
+        let scope_key = ScopeKey::from(&scope);
+        let at_ms = self
+            .last_append_ms
+            .get(&scope_key)
+            .copied()
+            .unwrap_or(self.latest_lifecycle_ms);
+        let mut event = controller_event(
+            artifact,
+            ordinal,
+            &scope,
+            ControllerEventKind::Progress,
+            at_ms,
+            Some(subject),
+            None,
+        );
+        event.metadata.event_id = deterministic_subject_event_id(artifact, ordinal, &scope);
+        events.push(ProviderEvent::Synthesized(event));
     }
 }
 
@@ -663,12 +755,48 @@ fn fact_lifecycle_time(fact: &LogFact) -> Option<i64> {
         | LogFact::Activity { at_ms, .. }
         | LogFact::Usage { at_ms, .. } => Some(*at_ms),
         LogFact::AiTitle { .. }
+        | LogFact::ClaudeCwd { .. }
         | LogFact::CodexMeta { .. }
         | LogFact::CodexTurn { .. }
         | LogFact::CodexPid { .. }
         | LogFact::SubagentAppeared { .. }
         | LogFact::SubagentEnded { .. }
         | LogFact::EvidenceId { .. } => None,
+    }
+}
+
+fn live_line_event(
+    artifact: &Path,
+    ordinal: u64,
+    sequence: usize,
+    scope: &SessionScope,
+    at_ms: i64,
+    line: Option<String>,
+) -> ProviderEvent {
+    let (provider, agent_thread_id) = match run_key_for_scope(scope) {
+        RunKey::Controller(key) => (Provider::Claude, key),
+        RunKey::Native { provider, sid } => (provider, sid),
+        RunKey::NativePath { .. } | RunKey::Provisional { .. } => {
+            unreachable!("lane scopes have only Controller or Native keys")
+        }
+    };
+    ProviderEvent::Activity {
+        provider,
+        agent_thread_id: agent_thread_id.clone(),
+        activity: MinimalProviderMetadata {
+            agent_id: Some(agent_thread_id),
+            event_kind: Some(LIVE_LINE_EVENT_KIND.to_owned()),
+            tool_name: Some(line.unwrap_or_default()),
+            ..MinimalProviderMetadata::default()
+        },
+        depth: None,
+        event_id: deterministic_live_line_event_id(artifact, ordinal, sequence, scope),
+        observed_at_ms: at_ms,
+        position: SourcePosition {
+            path_id: 0,
+            generation: 0,
+            offset: ordinal,
+        },
     }
 }
 
@@ -760,6 +888,41 @@ fn deterministic_event_id(
         SessionScope::Codex { rollout_id } => rollout_id,
     };
     format!("log:{basename}:{ordinal}:{kind}:{target_id}")
+}
+
+fn deterministic_subject_event_id(artifact: &Path, ordinal: u64, scope: &SessionScope) -> String {
+    deterministic_lane_event_id(artifact, ordinal, "subject", None, scope)
+}
+
+fn deterministic_live_line_event_id(
+    artifact: &Path,
+    ordinal: u64,
+    sequence: usize,
+    scope: &SessionScope,
+) -> String {
+    deterministic_lane_event_id(artifact, ordinal, "activity", Some(sequence), scope)
+}
+
+fn deterministic_lane_event_id(
+    artifact: &Path,
+    ordinal: u64,
+    kind: &str,
+    sequence: Option<usize>,
+    scope: &SessionScope,
+) -> String {
+    let basename = artifact
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("artifact"))
+        .to_string_lossy();
+    let target_id = match scope {
+        SessionScope::ClaudeRoot(session_id) => session_id,
+        SessionScope::ClaudeSubagent { agent_id, .. } => agent_id,
+        SessionScope::Codex { rollout_id } => rollout_id,
+    };
+    sequence.map_or_else(
+        || format!("log:{basename}:{ordinal}:{kind}:{target_id}"),
+        |sequence| format!("log:{basename}:{ordinal}:{kind}:{target_id}:{sequence}"),
+    )
 }
 
 /// One provider artifact kind retained by the evidence index.
@@ -3030,6 +3193,51 @@ mod tests {
             synthesis.live_line(&claude_scope),
             Some("latest tool".to_owned())
         );
+    }
+
+    #[test]
+    fn live_line_event_ids_do_not_depend_on_batching() {
+        let scope = SessionScope::Codex {
+            rollout_id: ROLLOUT.to_owned(),
+        };
+        let facts = [
+            (
+                1,
+                LogFact::Activity {
+                    scope: scope.clone(),
+                    at_ms: 1,
+                    source: ActivitySource::Command,
+                    line: "command".to_owned(),
+                },
+            ),
+            (
+                2,
+                LogFact::Activity {
+                    scope,
+                    at_ms: 2,
+                    source: ActivitySource::Commentary,
+                    line: "commentary".to_owned(),
+                },
+            ),
+        ];
+        let batched = synthesize(&mut Synthesis::default(), "rollout.jsonl", facts.clone())
+            .into_iter()
+            .filter_map(|event| match event {
+                ProviderEvent::Activity { event_id, .. } => Some(event_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut synthesis = Synthesis::default();
+        let separate = facts
+            .into_iter()
+            .flat_map(|fact| synthesize(&mut synthesis, "rollout.jsonl", [fact]))
+            .filter_map(|event| match event {
+                ProviderEvent::Activity { event_id, .. } => Some(event_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(batched, separate);
     }
 
     #[test]
