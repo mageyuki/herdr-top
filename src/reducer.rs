@@ -1012,20 +1012,29 @@ impl Reducer {
             }
 
             if let Some(provider) = provider {
-                let existing_node = native_sid
-                    .as_deref()
-                    .filter(|sid| !sid.is_empty())
-                    .and_then(|sid| {
-                        self.model
-                            .agent_nodes()
-                            .filter(|node| {
-                                node.task_run_id == run_id
-                                    && node.provider == provider
-                                    && node.native_session_id.as_deref() == Some(sid)
-                            })
-                            .min_by_key(|node| node.agent_node_id.as_str())
-                            .cloned()
-                    });
+                let existing_node = match native_sid.as_deref().filter(|sid| !sid.is_empty()) {
+                    Some(sid) => self
+                        .model
+                        .agent_nodes()
+                        .filter(|node| {
+                            node.task_run_id == run_id
+                                && node.provider == provider
+                                && node.native_session_id.as_deref() == Some(sid)
+                        })
+                        .min_by_key(|node| node.agent_node_id.as_str())
+                        .cloned(),
+                    None => self
+                        .model
+                        .agent_nodes()
+                        .filter(|node| node.task_run_id == run_id && node.provider == provider)
+                        .min_by_key(|node| {
+                            (
+                                node.native_session_id.is_none(),
+                                node.agent_node_id.as_str(),
+                            )
+                        })
+                        .cloned(),
+                };
                 let agent_node = match existing_node {
                     Some(node) => node,
                     None => AgentNode {
@@ -5086,15 +5095,21 @@ mod tests {
                 gap_kind: GapKind::Reconnect,
             })
             .unwrap();
-        let (first_run_id, first_execution_id) = {
+        let (first_run_id, first_execution_id, first_agent_node_id, first_display_ordinal) = {
             let model = shared.borrow();
             let execution = model
                 .executions()
                 .find(|execution| !execution.state.is_terminal())
                 .unwrap();
+            let agent_node = model.agent_nodes().next().unwrap();
             assert_eq!(model.task_runs().count(), 1);
             assert_eq!(model.executions().count(), 1);
-            (execution.task_run_id, execution.execution_id.clone())
+            (
+                execution.task_run_id,
+                execution.execution_id.clone(),
+                agent_node.agent_node_id.clone(),
+                agent_node.display_ordinal,
+            )
         };
 
         reducer
@@ -5114,6 +5129,10 @@ mod tests {
         assert_eq!(live_executions.len(), 1);
         assert_eq!(live_executions[0].task_run_id, first_run_id);
         assert_eq!(live_executions[0].execution_id, first_execution_id);
+        assert_eq!(model.agent_nodes().count(), 1);
+        let agent_node = model.agent_nodes().next().unwrap();
+        assert_eq!(agent_node.agent_node_id, first_agent_node_id);
+        assert_eq!(agent_node.display_ordinal, first_display_ordinal);
     }
 
     #[test]
