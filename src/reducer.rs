@@ -533,10 +533,12 @@ impl Reducer {
         let Some(mut task_run) = self.model.task_run_by_key(key).cloned() else {
             return Vec::new();
         };
-        let runs_with_executions = activity::runs_with_executions(&self.model);
+        let has_live_execution = self.model.executions().any(|execution| {
+            execution.task_run_id == task_run.run_id && !execution.state.is_terminal()
+        });
         if task_run.dismissed_at_ms.is_some()
             || task_run.state.is_terminal()
-            || runs_with_executions.contains(&task_run.run_id)
+            || has_live_execution
             || self.non_lane_task_state_runs.contains(&task_run.run_id)
         {
             return Vec::new();
@@ -3080,6 +3082,26 @@ mod tests {
 
         assert!(reducer.apply_lane_close(&key, 700).is_empty());
         assert_eq!(shared.borrow().task_run(&run_id), Some(&task_run));
+    }
+
+    #[test]
+    fn lane_close_allows_runs_with_only_terminal_executions() {
+        let run_id = RunId::new();
+        let key = RunKey::Controller("pane-ended".to_owned());
+        let mut task_run = run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
+        task_run.updated_at_ms = Some(100);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        model.insert_execution(execution(run_id, "ended-pane", ExecState::Ended));
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        let persist = reducer.apply_lane_close(&key, 700);
+
+        assert!(!persist.is_empty());
+        assert_eq!(
+            shared.borrow().task_run(&run_id).unwrap().state,
+            TaskState::EndedUnknown
+        );
     }
 
     #[test]

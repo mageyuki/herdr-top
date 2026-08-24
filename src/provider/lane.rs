@@ -2687,6 +2687,48 @@ mod tests {
     }
 
     #[test]
+    fn append_after_inactivity_close_reopens_and_clears_close_state() {
+        let scope = SessionScope::ClaudeRoot(PARENT.to_owned());
+        let mut synthesis = Synthesis::with_lifecycle_timing(30, 50);
+        let _ = synthesize(
+            &mut synthesis,
+            "session.jsonl",
+            [(
+                1,
+                LogFact::Append {
+                    scope: scope.clone(),
+                    at_ms: 100,
+                },
+            )],
+        );
+        assert!(matches!(
+            synthesis.advance_lifecycle(150).as_slice(),
+            [ProviderEvent::LaneClose { .. }]
+        ));
+        let reopened = synthesize(
+            &mut synthesis,
+            "session.jsonl",
+            [(
+                2,
+                LogFact::Append {
+                    scope: scope.clone(),
+                    at_ms: 160,
+                },
+            )],
+        );
+        assert!(
+            synthesized_events(&reopened)
+                .iter()
+                .any(|event| matches!(event.event, ControllerEventKind::TaskStarted))
+        );
+        assert!(
+            !synthesis
+                .inactivity_closed
+                .contains(&ScopeKey::from(&scope))
+        );
+    }
+
+    #[test]
     fn bare_subagent_append_emits_liveness_only() {
         let scope = SessionScope::ClaudeSubagent {
             parent: PARENT.to_owned(),

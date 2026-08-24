@@ -134,6 +134,19 @@ pub enum ProviderEvent {
 }
 
 impl ProviderEvent {
+    pub(crate) const fn requires_admission(&self) -> bool {
+        match self {
+            Self::Synthesized(_)
+            | Self::RunLiveness { .. }
+            | Self::LaneClose { .. }
+            | Self::Telemetry { .. }
+            | Self::SessionResolved { .. }
+            | Self::AgentUpsert { .. }
+            | Self::Activity { .. } => true,
+            Self::SourceState { .. } | Self::Malformed { .. } => false,
+        }
+    }
+
     fn entity_key(&self) -> Option<EntityKey> {
         match self {
             Self::SessionResolved {
@@ -225,17 +238,7 @@ impl ProviderEventSender {
                         return Err(tokio::sync::mpsc::error::TrySendError::Closed(event));
                     }
                 };
-                let admission = matches!(
-                    &event,
-                    ProviderEvent::Synthesized(_)
-                        | ProviderEvent::RunLiveness { .. }
-                        | ProviderEvent::LaneClose { .. }
-                        | ProviderEvent::Telemetry { .. }
-                        | ProviderEvent::SessionResolved { .. }
-                        | ProviderEvent::AgentUpsert { .. }
-                        | ProviderEvent::Activity { .. }
-                )
-                .then(|| ingress.admit());
+                let admission = event.requires_admission().then(|| ingress.admit());
                 permit.send(ProviderIngressEvent { event, admission });
                 Ok(())
             }
@@ -246,17 +249,7 @@ impl ProviderEventSender {
         match self {
             Self::Raw(sender) => sender.blocking_send(event).is_ok(),
             Self::Tracked { sender, ingress } => {
-                let admission = matches!(
-                    &event,
-                    ProviderEvent::Synthesized(_)
-                        | ProviderEvent::RunLiveness { .. }
-                        | ProviderEvent::LaneClose { .. }
-                        | ProviderEvent::Telemetry { .. }
-                        | ProviderEvent::SessionResolved { .. }
-                        | ProviderEvent::AgentUpsert { .. }
-                        | ProviderEvent::Activity { .. }
-                )
-                .then(|| ingress.admit());
+                let admission = event.requires_admission().then(|| ingress.admit());
                 sender
                     .blocking_send(ProviderIngressEvent { event, admission })
                     .is_ok()
