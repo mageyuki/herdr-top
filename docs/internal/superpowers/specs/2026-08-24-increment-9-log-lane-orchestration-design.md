@@ -83,12 +83,12 @@ test against `src/hook_adapter.rs`). Codex sessions synthesize
 existing native-binding path (herdr pane detection already produces these
 sids for pane roots — verified identical format). Synthesized event ids
 are DETERMINISTIC —
-`log:<artifact-basename>:<record-ordinal>:<kind-slug>[:<agent-id>]` — so the
-existing durable event ledger
-deduplicates re-reads across restarts. The semantic discriminator remains
-stable if fact types are added or reordered; repeated instances of the same
-target and kind within one record are the same event by definition. Ids never
-use the reserved `prov:` prefix (`src/reducer.rs:496` rejects it).
+`log:<artifact-basename>:<record-ordinal>:<kind-slug>:<target-id>` — so the
+existing durable event ledger deduplicates re-reads across restarts. The id
+keys on (artifact basename, record ordinal, kind, target identity) and remains
+stable if fact types are added or reordered, treating repeated instances of
+the same target and kind within one record as the same event. Ids never use the
+reserved `prov:` prefix (`src/reducer.rs:496` rejects it).
 
 Persistence boundary: no schema change. Token/effort aggregates live in a
 transient telemetry map inside the model (`src/model/entities.rs`,

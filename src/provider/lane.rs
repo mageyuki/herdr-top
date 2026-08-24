@@ -535,14 +535,12 @@ fn deterministic_event_id(
         .unwrap_or_else(|| OsStr::new("artifact"))
         .to_string_lossy();
     let kind = controller_event_kind_slug(event);
-    match scope {
-        SessionScope::ClaudeSubagent { agent_id, .. } => {
-            format!("log:{basename}:{ordinal}:{kind}:{agent_id}")
-        }
-        SessionScope::ClaudeRoot(_) | SessionScope::Codex { .. } => {
-            format!("log:{basename}:{ordinal}:{kind}")
-        }
-    }
+    let target_id = match scope {
+        SessionScope::ClaudeRoot(session_id) => session_id,
+        SessionScope::ClaudeSubagent { agent_id, .. } => agent_id,
+        SessionScope::Codex { rollout_id } => rollout_id,
+    };
+    format!("log:{basename}:{ordinal}:{kind}:{target_id}")
 }
 
 /// One provider artifact kind retained by the evidence index.
@@ -913,28 +911,16 @@ impl Admission {
         self.pane_paths.clear();
     }
 
-    /// Admits the pane-root identity encoded in an exact provider artifact path.
+    /// Admits an exact provider transcript path and its pane-root identity.
+    ///
+    /// Claude accepts only `<uuid>.jsonl`; Codex accepts only `rollout-*.jsonl` containing
+    /// a rollout UUID. Any path that does not match the given provider is silently ignored.
     pub fn admit_pane_artifact(&mut self, provider: Provider, path: &Path) {
-        self.pane_paths.insert(path.to_path_buf());
-        let session_id = match provider {
-            Provider::Claude => path
-                .file_stem()
-                .and_then(OsStr::to_str)
-                .filter(|id| super::valid_native_id(id))
-                .map(str::to_owned),
-            Provider::Codex => path.file_name().and_then(OsStr::to_str).and_then(|name| {
-                super::facts::scan_raw_ids(name)
-                    .into_iter()
-                    .filter_map(|id| match id {
-                        EvidenceId::Uuid(uuid) => Some(uuid),
-                        EvidenceId::ConfigDir(_) => None,
-                    })
-                    .next_back()
-            }),
+        let Some(session_id) = pane_artifact_session_id(provider, path) else {
+            return;
         };
-        if let Some(session_id) = session_id {
-            self.admit_pane_session(provider, &session_id);
-        }
+        self.pane_paths.insert(path.to_path_buf());
+        self.admit_pane_session(provider, &session_id);
     }
 
     /// Applies one allowlisted evidence ID emitted by an already-admitted parent scope.
@@ -1047,6 +1033,29 @@ impl Admission {
                 .claude_sessions
                 .iter()
                 .any(|session_id| claude_root_path_matches(path, session_id))
+    }
+}
+
+fn pane_artifact_session_id(provider: Provider, path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    match provider {
+        Provider::Claude => {
+            let session_id = file_name.strip_suffix(".jsonl")?;
+            match super::facts::scan_raw_ids(session_id).as_slice() {
+                [EvidenceId::Uuid(uuid)] if uuid == session_id => Some(uuid.clone()),
+                _ => None,
+            }
+        }
+        Provider::Codex => {
+            let body = file_name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+            super::facts::scan_raw_ids(body)
+                .into_iter()
+                .filter_map(|id| match id {
+                    EvidenceId::Uuid(uuid) => Some(uuid),
+                    EvidenceId::ConfigDir(_) => None,
+                })
+                .next_back()
+        }
     }
 }
 
@@ -1544,7 +1553,10 @@ mod tests {
             .copied()
             .collect::<HashSet<_>>();
 
-        assert_eq!(first_ids, ["log:rollout.jsonl:9:cancelled"]);
+        assert_eq!(
+            first_ids,
+            ["log:rollout.jsonl:9:cancelled:22222222-2222-4222-8222-222222222222"]
+        );
         assert_eq!(first_ids, replay_ids);
         assert_eq!(ledger.len(), 1, "replay must have one durable ledger key");
     }
@@ -1644,7 +1656,7 @@ mod tests {
         assert_eq!(
             event_ids,
             HashSet::from([
-                "log:session.jsonl:11:task-started",
+                "log:session.jsonl:11:task-started:11111111-1111-4111-8111-111111111111",
                 "log:session.jsonl:11:complete:child",
             ])
         );
@@ -2153,6 +2165,143 @@ mod tests {
     }
 
     #[test]
+    fn failed_subagent_end_suppresses_ok_downgrade_in_later_batch() {
+        let mut synthesis = Synthesis::default();
+        let failed = synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                4,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "child".to_owned(),
+                    failed: true,
+                },
+            )],
+        );
+        let downgrade = synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                5,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "child".to_owned(),
+                    failed: false,
+                },
+            )],
+        );
+
+        assert!(matches!(
+            synthesized_events(&failed).as_slice(),
+            [event] if matches!(event.event, ControllerEventKind::Failed)
+        ));
+        assert_eq!(synthesized_events(&downgrade).len(), 0);
+    }
+
+    #[test]
+    fn one_record_with_two_codex_evidence_children_applies_both_dispatches() {
+        let mut admission = Admission::new(0);
+        admission.admit_pane_session(Provider::Claude, PARENT);
+        let mut discovered = AdmissionIndex::new();
+        discovered.insert_codex_rollout(
+            ROLLOUT,
+            PathBuf::from(format!("/sessions/rollout-{ROLLOUT}.jsonl")),
+        );
+        discovered.insert_codex_rollout(
+            STRANGER,
+            PathBuf::from(format!("/sessions/rollout-{STRANGER}.jsonl")),
+        );
+        let events = Synthesis::default().synthesize_batch(
+            Path::new("parent.jsonl"),
+            [ROLLOUT, STRANGER].into_iter().map(|id| {
+                (
+                    7,
+                    LogFact::EvidenceId {
+                        parent: SessionScope::ClaudeRoot(PARENT.to_owned()),
+                        id: EvidenceId::Uuid(id.to_owned()),
+                    },
+                )
+            }),
+            &mut admission,
+            &discovered,
+        );
+        let synthesized = synthesized_events(&events);
+
+        assert_eq!(synthesized.len(), 2);
+        assert_eq!(
+            synthesized
+                .iter()
+                .map(|event| event.metadata.event_id.as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
+        let model = apply_once_per_event_id(&events);
+        for rollout_id in [ROLLOUT, STRANGER] {
+            assert!(
+                model
+                    .task_run_by_key(&RunKey::Native {
+                        provider: Provider::Codex,
+                        sid: rollout_id.to_owned(),
+                    })
+                    .is_some(),
+                "missing reduced Codex child {rollout_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_record_with_two_claude_root_evidence_children_applies_both_dispatches() {
+        let mut admission = Admission::new(0);
+        admission.admit_pane_session(Provider::Claude, PARENT);
+        let mut discovered = AdmissionIndex::new();
+        discovered.insert_claude_session(
+            ROLLOUT,
+            PathBuf::from(format!("/projects/workspace/{ROLLOUT}.jsonl")),
+        );
+        discovered.insert_claude_session(
+            STRANGER,
+            PathBuf::from(format!("/projects/workspace/{STRANGER}.jsonl")),
+        );
+        let events = Synthesis::default().synthesize_batch(
+            Path::new("parent.jsonl"),
+            [ROLLOUT, STRANGER].into_iter().map(|id| {
+                (
+                    7,
+                    LogFact::EvidenceId {
+                        parent: SessionScope::ClaudeRoot(PARENT.to_owned()),
+                        id: EvidenceId::Uuid(id.to_owned()),
+                    },
+                )
+            }),
+            &mut admission,
+            &discovered,
+        );
+        let synthesized = synthesized_events(&events);
+
+        assert_eq!(synthesized.len(), 2);
+        assert_eq!(
+            synthesized
+                .iter()
+                .map(|event| event.metadata.event_id.as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
+        let model = apply_once_per_event_id(&events);
+        for session_id in [ROLLOUT, STRANGER] {
+            let scope = SessionScope::ClaudeRoot(session_id.to_owned());
+            assert!(
+                model
+                    .task_run_by_key(&RunKey::Controller(controller_key_for_scope(&scope)))
+                    .is_some(),
+                "missing reduced Claude root child {session_id}"
+            );
+        }
+    }
+
+    #[test]
     fn unmatched_evidence_uuid_is_discarded_before_dispatch() {
         let mut admission = Admission::new(0);
         admission.admit_pane_session(Provider::Claude, PARENT);
@@ -2385,6 +2534,53 @@ mod tests {
                 .collect::<Vec<_>>(),
             [PathBuf::from("workspace/allowed.jsonl")]
         );
+    }
+
+    #[test]
+    fn pane_artifact_admission_rejects_arbitrary_path() {
+        let invalid = Path::new("/etc/shadow");
+        let mut admission = Admission::new(0);
+
+        admission.admit_pane_artifact(Provider::Codex, invalid);
+
+        assert!(!admission.is_admitted_path(invalid));
+    }
+
+    #[test]
+    fn pane_artifact_admission_accepts_codex_rollout() {
+        let valid = PathBuf::from(format!(
+            "/home/user/.codex/sessions/2026/08/24/rollout-2026-08-24T00-00-00-{ROLLOUT}.jsonl"
+        ));
+        let mut admission = Admission::new(0);
+
+        admission.admit_pane_artifact(Provider::Codex, &valid);
+
+        assert!(admission.is_admitted_path(&valid));
+    }
+
+    #[test]
+    fn pane_artifact_admission_accepts_claude_uuid_transcript() {
+        let valid = PathBuf::from(format!(
+            "/home/user/.claude/projects/workspace/{PARENT}.jsonl"
+        ));
+        let mut admission = Admission::new(0);
+
+        admission.admit_pane_artifact(Provider::Claude, &valid);
+
+        assert!(admission.is_admitted_path(&valid));
+    }
+
+    #[test]
+    fn pane_artifact_admission_rejects_provider_mismatch() {
+        let codex = PathBuf::from(format!("/sessions/rollout-example-{ROLLOUT}.jsonl"));
+        let claude = PathBuf::from(format!("/projects/workspace/{PARENT}.jsonl"));
+        let mut admission = Admission::new(0);
+
+        admission.admit_pane_artifact(Provider::Claude, &codex);
+        admission.admit_pane_artifact(Provider::Codex, &claude);
+
+        assert!(!admission.is_admitted_path(&codex));
+        assert!(!admission.is_admitted_path(&claude));
     }
 
     #[test]

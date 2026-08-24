@@ -2009,6 +2009,10 @@ mod tests {
     use crate::model::DomainModel;
     use crate::performance::{TestPerformanceClock, performance_tracker};
 
+    const CLAUDE_FIXTURE_A: &str = "11111111-1111-4111-8111-111111111111";
+    const CLAUDE_FIXTURE_B: &str = "22222222-2222-4222-8222-222222222222";
+    const CODEX_FIXTURE: &str = "rollout-fixture-33333333-3333-4333-8333-333333333333.jsonl";
+
     // I2a test list, written before implementation:
     // - bootstrap skips non-structural lines and obeys byte/record caps
     // - discovery filters non-jsonl artifacts and maps thread IDs to paths/parents
@@ -2073,8 +2077,9 @@ mod tests {
     #[test]
     fn bootstrap_skips_non_structural_first_line_and_obeys_caps() {
         let directory = tempfile::tempdir().unwrap();
+        let session_file = format!("{CLAUDE_FIXTURE_A}.jsonl");
         fs::write(
-            directory.path().join("session.jsonl"),
+            directory.path().join(&session_file),
             b"last-prompt\nstruct:thread-1\nignored\n",
         )
         .unwrap();
@@ -2092,7 +2097,7 @@ mod tests {
         assert_eq!(
             index.resolve(Provider::Claude, "thread-1").unwrap(),
             &DiscoveredIdentity {
-                path: directory.path().join("session.jsonl"),
+                path: directory.path().join(session_file),
                 parent_thread_id: Some("parent-1".to_owned())
             }
         );
@@ -2100,9 +2105,11 @@ mod tests {
         let capped = tempfile::tempdir().unwrap();
         let mut records = vec![b"noise\n".to_vec(); BOOTSTRAP_MAX_RECORDS];
         records.push(b"struct:too-late\n".to_vec());
-        fs::write(capped.path().join("record-cap.jsonl"), records.concat()).unwrap();
+        fs::write(capped.path().join(CODEX_FIXTURE), records.concat()).unwrap();
         fs::write(
-            capped.path().join("byte-cap.jsonl"),
+            capped
+                .path()
+                .join("rollout-byte-cap-44444444-4444-4444-8444-444444444444.jsonl"),
             [
                 vec![b'x'; BOOTSTRAP_MAX_BYTES],
                 b"\nstruct:past-byte-cap\n".to_vec(),
@@ -2132,7 +2139,11 @@ mod tests {
     fn discovery_filters_artifacts_and_preserves_path_ids() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("subagents")).unwrap();
-        fs::write(directory.path().join("main.jsonl"), b"struct:main\n").unwrap();
+        fs::write(
+            directory.path().join(format!("{CLAUDE_FIXTURE_A}.jsonl")),
+            b"struct:main\n",
+        )
+        .unwrap();
         fs::write(directory.path().join("ignored.txt"), b"struct:no\n").unwrap();
         fs::write(
             directory.path().join("subagents/agent.meta.json"),
@@ -2159,8 +2170,8 @@ mod tests {
     #[test]
     fn scan_admitted_never_bootstraps_an_unadmitted_fixture() {
         let directory = tempfile::tempdir().unwrap();
-        let admitted = directory.path().join("admitted.jsonl");
-        let stranger = directory.path().join("stranger.jsonl");
+        let admitted = directory.path().join(format!("{CLAUDE_FIXTURE_A}.jsonl"));
+        let stranger = directory.path().join(format!("{CLAUDE_FIXTURE_B}.jsonl"));
         fs::write(&admitted, b"struct:admitted\n").unwrap();
         fs::write(&stranger, b"struct:stranger\n").unwrap();
         let mut index = DiscoveryIndex::new(vec![DiscoveryRoot {
@@ -2184,7 +2195,10 @@ mod tests {
 
         assert_eq!(parser.calls, 1);
         assert_eq!(index.files().len(), 1);
-        assert_eq!(index.files()[0].relative_path, Path::new("admitted.jsonl"));
+        assert_eq!(
+            index.files()[0].relative_path,
+            Path::new(&format!("{CLAUDE_FIXTURE_A}.jsonl"))
+        );
         assert!(index.resolve(Provider::Claude, "stranger").is_none());
     }
 
@@ -2192,8 +2206,8 @@ mod tests {
     fn same_provider_files_in_different_roots_use_distinct_path_ids_for_freshness() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        fs::write(first.path().join("session.jsonl"), b"struct:first\n").unwrap();
-        fs::write(second.path().join("session.jsonl"), b"struct:second\n").unwrap();
+        fs::write(first.path().join(CODEX_FIXTURE), b"struct:first\n").unwrap();
+        fs::write(second.path().join(CODEX_FIXTURE), b"struct:second\n").unwrap();
         let mut first_index = DiscoveryIndex::new(vec![DiscoveryRoot {
             provider: Provider::Codex,
             path: first.path().to_path_buf(),

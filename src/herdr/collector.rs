@@ -11387,6 +11387,27 @@ mod provider_integration_tests {
         events
     }
 
+    fn codex_artifact_name(label: &str) -> String {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in label.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let rollout_id = format!(
+            "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
+            (hash >> 32) as u32,
+            (hash >> 16) as u16,
+            hash & 0x0fff,
+            (hash >> 12) & 0x0fff,
+            hash & 0xffff_ffff_ffff
+        );
+        format!("rollout-{label}-{rollout_id}.jsonl")
+    }
+
+    fn codex_artifact(root: &Path, label: &str) -> PathBuf {
+        root.join(codex_artifact_name(label))
+    }
+
     #[test]
     fn worker_admission_gates_bootstrap_and_tail_before_open() {
         let directory = tempfile::tempdir().unwrap();
@@ -11601,7 +11622,10 @@ mod provider_integration_tests {
         assert!(events.iter().any(|event| matches!(
             event,
             ProviderEvent::Synthesized(controller)
-                if controller.metadata.event_id == format!("log:{}:2:cancelled", path.file_name().unwrap().to_string_lossy())
+                if controller.metadata.event_id == format!(
+                    "log:{}:2:cancelled:{rollout}",
+                    path.file_name().unwrap().to_string_lossy()
+                )
         )));
     }
 
@@ -11656,7 +11680,7 @@ mod provider_integration_tests {
         assert_eq!(restored.event_ledger.len(), 1);
         assert_eq!(
             restored.event_ledger[0].event_id,
-            "log:session.jsonl:7:task-started"
+            "log:session.jsonl:7:task-started:11111111-1111-4111-8111-111111111111"
         );
         let next_ingest_seq = restored.next_ingest_seq;
 
@@ -11783,7 +11807,7 @@ mod provider_integration_tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("home/.codex/sessions");
         std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("session.jsonl");
+        let path = codex_artifact(&root, "session");
         std::fs::write(&path, b"").unwrap();
         let diagnostics = crate::provider::ProviderDiagnostics::default();
         let mut worker = AdapterProviderWorker::new(
@@ -11849,8 +11873,8 @@ mod provider_integration_tests {
         let good_root = directory.path().join("good/.codex/sessions");
         let failed_root = directory.path().join("failed/.codex/sessions");
         std::fs::create_dir_all(&good_root).unwrap();
-        let good = good_root.join("good.jsonl");
-        let failed = failed_root.join("failed.jsonl");
+        let good = codex_artifact(&good_root, "good");
+        let failed = codex_artifact(&failed_root, "failed");
         std::fs::write(&good, b"").unwrap();
         let targets = TargetSet::new([
             ProviderTarget {
@@ -11874,7 +11898,7 @@ mod provider_integration_tests {
                 detail: "root_not_found".to_owned(),
             })
         );
-        assert!(tail_read_calls(&worker, &good_root, "good.jsonl").is_some());
+        assert!(tail_read_calls(&worker, &good_root, &codex_artifact_name("good")).is_some());
     }
 
     #[test]
@@ -11894,8 +11918,8 @@ mod provider_integration_tests {
         process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
         let _ = drain_pending(&mut pending);
 
-        let unreadable = root.join("1-unreadable.jsonl");
-        let good = root.join("2-good.jsonl");
+        let unreadable = codex_artifact(&root, "1-unreadable");
+        let good = codex_artifact(&root, "2-good");
         std::fs::write(
             &unreadable,
             codex_records("unreadable-owner", "unreadable-agent", "unreadable-event"),
@@ -11930,7 +11954,8 @@ mod provider_integration_tests {
             "per-file permission failure was mislabeled as a root failure"
         );
         assert!(
-            tail_read_calls(&worker, &root, "2-good.jsonl").is_some_and(|calls| calls > 0),
+            tail_read_calls(&worker, &root, &codex_artifact_name("2-good"))
+                .is_some_and(|calls| calls > 0),
             "unreadable file starved its readable sibling"
         );
         assert!(events.iter().any(|event| matches!(
@@ -11958,7 +11983,7 @@ mod provider_integration_tests {
         let _ = drain_pending(&mut pending);
 
         let unreadable = root.join("1-unreadable");
-        let good = root.join("2-good.jsonl");
+        let good = codex_artifact(&root, "2-good");
         std::fs::create_dir(&unreadable).unwrap();
         std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
         std::fs::write(
@@ -11983,7 +12008,8 @@ mod provider_integration_tests {
             "nested traversal failure was mislabeled as a root failure"
         );
         assert!(
-            tail_read_calls(&worker, &root, "2-good.jsonl").is_some_and(|calls| calls > 0),
+            tail_read_calls(&worker, &root, &codex_artifact_name("2-good"))
+                .is_some_and(|calls| calls > 0),
             "unreadable subdirectory starved its readable sibling"
         );
         assert!(events.iter().any(|event| matches!(
@@ -11998,8 +12024,8 @@ mod provider_integration_tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("home/.codex/sessions");
         let nested = root.join("nested");
-        let relative = Path::new("nested/session.jsonl");
-        let path = root.join(relative);
+        let relative = PathBuf::from("nested").join(codex_artifact_name("session"));
+        let path = root.join(&relative);
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(
             &path,
@@ -12041,7 +12067,7 @@ mod provider_integration_tests {
             .path_id;
         let tail_before = worker.tails.get(&path_id).unwrap();
         let state_before = (tail_before.generation(), tail_before.offset());
-        assert!(state.discovery.baseline().contained(&root, relative));
+        assert!(state.discovery.baseline().contained(&root, &relative));
         assert!(worker.bootstrap_emitted.contains(&path_id));
 
         std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -12066,7 +12092,7 @@ mod provider_integration_tests {
             .unwrap()
             .discovery
             .baseline()
-            .contained(&root, relative);
+            .contained(&root, &relative);
         std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         assert_eq!(
@@ -12113,7 +12139,7 @@ mod provider_integration_tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("home/.codex/sessions");
         std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("vanishing.jsonl");
+        let path = codex_artifact(&root, "vanishing-race");
         std::fs::write(&path, codex_records("owner", "agent", "event")).unwrap();
         let hook_path = path.clone();
         crate::provider::set_discovery_file_type_hook(move |entry_path| {
@@ -12156,7 +12182,7 @@ mod provider_integration_tests {
     fn target_before_root_exists_recovers_when_the_root_appears() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("fresh/.codex/sessions");
-        let path = root.join("future.jsonl");
+        let path = codex_artifact(&root, "future");
         let targets = TargetSet::new([ProviderTarget {
             provider: Provider::Codex,
             path,
@@ -12187,7 +12213,7 @@ mod provider_integration_tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("home/.codex/sessions");
         std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("vanishing.jsonl");
+        let path = codex_artifact(&root, "vanishing");
         std::fs::write(&path, b"").unwrap();
         let targets = TargetSet::new([ProviderTarget {
             provider: Provider::Codex,
@@ -12254,7 +12280,7 @@ mod provider_integration_tests {
             },
             ProviderTarget {
                 provider: Provider::Codex,
-                path: codex_root.join("missing.jsonl"),
+                path: codex_artifact(&codex_root, "missing"),
             },
         ]);
         let mut worker = AdapterProviderWorker::default();
@@ -12292,7 +12318,7 @@ mod provider_integration_tests {
         process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
         let _ = drain_pending(&mut pending);
 
-        let valid = root.join("valid.jsonl");
+        let valid = codex_artifact(&root, "valid");
         std::fs::write(
             &valid,
             codex_records("valid-owner", "valid-agent", "valid-event"),
@@ -12326,7 +12352,10 @@ mod provider_integration_tests {
             ProviderEvent::Activity { event_id, .. }
                 if event_id == "prov:codex:act:valid-event"
         )));
-        assert!(tail_read_calls(&worker, &root, "valid.jsonl").is_some_and(|calls| calls > 0));
+        assert!(
+            tail_read_calls(&worker, &root, &codex_artifact_name("valid"))
+                .is_some_and(|calls| calls > 0)
+        );
     }
 
     #[test]
@@ -12334,7 +12363,7 @@ mod provider_integration_tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("codex/.codex/sessions");
         std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("target.jsonl");
+        let path = codex_artifact(&root, "target");
         std::fs::write(&path, b"").unwrap();
         let diagnostics = crate::provider::ProviderDiagnostics::default();
         let mut worker = AdapterProviderWorker::new(
@@ -12372,8 +12401,8 @@ mod provider_integration_tests {
     fn logical_sweep_recovers_even_when_every_physical_cycle_saturates() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("home/.codex/sessions");
-        let first = root.join("first.jsonl");
-        let second = root.join("second.jsonl");
+        let first = codex_artifact(&root, "first");
+        let second = codex_artifact(&root, "second");
         let targets = TargetSet::new([
             ProviderTarget {
                 provider: Provider::Codex,
@@ -12410,9 +12439,9 @@ mod provider_integration_tests {
                 !worker.deferred.is_empty(),
                 "physical cycle did not saturate as arranged"
             );
-            let all_visited = ["first.jsonl", "second.jsonl"]
+            let all_visited = [codex_artifact_name("first"), codex_artifact_name("second")]
                 .into_iter()
-                .all(|name| tail_read_calls(&worker, &root, name).is_some_and(|calls| calls > 0));
+                .all(|name| tail_read_calls(&worker, &root, &name).is_some_and(|calls| calls > 0));
             let events = drain_pending(&mut pending);
             if provider_source_state(&events, Provider::Codex)
                 == Some(ProviderSourceState::Available)
@@ -12436,8 +12465,8 @@ mod provider_integration_tests {
         let added_root = directory.path().join("a/.codex/sessions");
         std::fs::create_dir_all(&late_root).unwrap();
         std::fs::create_dir_all(&added_root).unwrap();
-        let late = late_root.join("late.jsonl");
-        let added = added_root.join("added.jsonl");
+        let late = codex_artifact(&late_root, "late");
+        let added = codex_artifact(&added_root, "added");
         std::fs::write(&late, codex_records("late-owner", "late-agent", "late")).unwrap();
         let initial_targets = TargetSet::new([ProviderTarget {
             provider: Provider::Codex,
@@ -12477,10 +12506,11 @@ mod provider_integration_tests {
         let mut observed_passed_addition = false;
         for _ in 0..4 {
             process_adapter_worker(&mut worker, &expanded_targets, &mut pending);
-            let late_visited =
-                tail_read_calls(&worker, &late_root, "late.jsonl").is_some_and(|calls| calls > 0);
+            let late_visited = tail_read_calls(&worker, &late_root, &codex_artifact_name("late"))
+                .is_some_and(|calls| calls > 0);
             let added_visited =
-                tail_read_calls(&worker, &added_root, "added.jsonl").is_some_and(|calls| calls > 0);
+                tail_read_calls(&worker, &added_root, &codex_artifact_name("added"))
+                    .is_some_and(|calls| calls > 0);
             let events = drain_pending(&mut pending);
             if late_visited && !added_visited {
                 assert_eq!(
@@ -12501,7 +12531,8 @@ mod provider_integration_tests {
         for _ in 0..6 {
             process_adapter_worker(&mut worker, &expanded_targets, &mut pending);
             let added_visited =
-                tail_read_calls(&worker, &added_root, "added.jsonl").is_some_and(|calls| calls > 0);
+                tail_read_calls(&worker, &added_root, &codex_artifact_name("added"))
+                    .is_some_and(|calls| calls > 0);
             let events = drain_pending(&mut pending);
             if provider_source_state(&events, Provider::Codex)
                 == Some(ProviderSourceState::Available)
@@ -12522,7 +12553,7 @@ mod provider_integration_tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("home/.codex/sessions");
         std::fs::create_dir_all(&root).unwrap();
-        let initial = root.join("initial.jsonl");
+        let initial = codex_artifact(&root, "initial");
         std::fs::write(
             &initial,
             codex_records("initial-owner", "initial-agent", "initial"),
@@ -12553,7 +12584,10 @@ mod provider_integration_tests {
             provider_source_state(&provisional, Provider::Codex),
             Some(ProviderSourceState::Available)
         );
-        assert_eq!(tail_read_calls(&worker, &root, "initial.jsonl"), Some(0));
+        assert_eq!(
+            tail_read_calls(&worker, &root, &codex_artifact_name("initial")),
+            Some(0)
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
         process_adapter_worker(&mut worker, &initial_targets, &mut pending);
@@ -12570,7 +12604,7 @@ mod provider_integration_tests {
         std::fs::create_dir_all(&root).unwrap();
         let recovery_paths = (0..3)
             .map(|index| {
-                let path = root.join(format!("recovery-{index}.jsonl"));
+                let path = codex_artifact(&root, &format!("recovery-{index}"));
                 std::fs::write(
                     &path,
                     codex_records(
@@ -12630,7 +12664,7 @@ mod provider_integration_tests {
         .unwrap();
         wait_for_provider_readiness(&mut events).await;
 
-        let path = root.join("created-after-ready.jsonl");
+        let path = codex_artifact(&root, "created-after-ready");
         std::fs::write(
             &path,
             concat!(
@@ -12662,7 +12696,7 @@ mod provider_integration_tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("home/.codex/sessions");
         std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("existing-before-ready.jsonl");
+        let path = codex_artifact(&root, "existing-before-ready");
         std::fs::write(
             &path,
             concat!(
@@ -12715,7 +12749,7 @@ mod provider_integration_tests {
         let fallback_root = directory.path().join("foreign/.codex/sessions");
         std::fs::create_dir_all(&standard_root).unwrap();
         std::fs::create_dir_all(&fallback_root).unwrap();
-        let path = fallback_root.join("fallback.jsonl");
+        let path = codex_artifact(&fallback_root, "fallback");
         std::fs::write(
             &path,
             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"fallback-owner\",\"session_id\":\"fallback-owner\"}}\n",
@@ -12792,7 +12826,7 @@ mod provider_integration_tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("standard/.codex/sessions");
         let unreadable = root.join("unreadable");
-        let existing = root.join("existing.jsonl");
+        let existing = codex_artifact(&root, "existing");
         std::fs::create_dir_all(&unreadable).unwrap();
         std::fs::write(&existing, codex_records("owner", "agent", "event")).unwrap();
         std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -12823,7 +12857,7 @@ mod provider_integration_tests {
             state
                 .discovery
                 .baseline()
-                .contained(&root, Path::new("existing.jsonl")),
+                .contained(&root, Path::new(&codex_artifact_name("existing"))),
             "successful retry did not capture the complete baseline"
         );
         assert_eq!(diagnostics.baseline_approximations(), 1);
@@ -12834,7 +12868,7 @@ mod provider_integration_tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("fallback-root");
         std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("session.jsonl");
+        let path = codex_artifact(&root, "session");
         std::fs::write(
             &path,
             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"recreate-owner\",\"session_id\":\"recreate-owner\"}}\n",
@@ -12886,7 +12920,7 @@ mod provider_integration_tests {
         let outer = directory.path().join("outer");
         let inner = outer.join("inner");
         std::fs::create_dir_all(&inner).unwrap();
-        let absolute = inner.join("shared.jsonl");
+        let absolute = codex_artifact(&inner, "shared");
         std::fs::write(&absolute, b"{}\n").unwrap();
         let mut outer_state = AdapterRootState::new(Provider::Codex, outer).unwrap();
         let mut inner_state = AdapterRootState::new(Provider::Codex, inner).unwrap();
@@ -12934,8 +12968,8 @@ mod provider_integration_tests {
         let outer = directory.path().join("fallback");
         let inner = outer.join("inner");
         std::fs::create_dir_all(&inner).unwrap();
-        let outer_target = outer.join("owner.jsonl");
-        let shared = inner.join("shared.jsonl");
+        let outer_target = codex_artifact(&outer, "owner");
+        let shared = codex_artifact(&inner, "shared");
         std::fs::write(
             &outer_target,
             codex_records("shared-owner", "outer-agent", "outer-initial"),
@@ -13020,8 +13054,8 @@ mod provider_integration_tests {
         let outer = directory.path().join("fallback");
         let inner = outer.join("inner");
         std::fs::create_dir_all(&outer).unwrap();
-        let outer_target = outer.join("owner.jsonl");
-        let shared = inner.join("shared.jsonl");
+        let outer_target = codex_artifact(&outer, "owner");
+        let shared = codex_artifact(&inner, "shared");
         std::fs::write(
             &outer_target,
             codex_records("shared-owner", "outer-agent", "outer-initial"),
@@ -13082,8 +13116,8 @@ mod provider_integration_tests {
         process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
         let _ = drain_pending(&mut pending);
 
-        let first = root.join("1-first.jsonl");
-        let second = root.join("2-second.jsonl");
+        let first = codex_artifact(&root, "1-first");
+        let second = codex_artifact(&root, "2-second");
         std::fs::write(
             &first,
             codex_records("first-owner", "first-agent-0", "first-0"),
@@ -13114,13 +13148,16 @@ mod provider_integration_tests {
                 &format!("first-{cycle}"),
             );
             process_adapter_worker(&mut worker, &targets, &mut pending);
-            if tail_read_calls(&worker, &root, "2-second.jsonl").is_some_and(|calls| calls > 0) {
+            if tail_read_calls(&worker, &root, &codex_artifact_name("2-second"))
+                .is_some_and(|calls| calls > 0)
+            {
                 break;
             }
         }
 
         assert!(
-            tail_read_calls(&worker, &root, "2-second.jsonl").is_some_and(|calls| calls > 0),
+            tail_read_calls(&worker, &root, &codex_artifact_name("2-second"))
+                .is_some_and(|calls| calls > 0),
             "second file was not polled within the bounded cycle budget"
         );
     }
@@ -13142,9 +13179,9 @@ mod provider_integration_tests {
         process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
         let _ = drain_pending(&mut pending);
 
-        let first = root.join("1-first.jsonl");
-        let vanished = root.join("2-vanished.jsonl");
-        let third = root.join("3-third.jsonl");
+        let first = codex_artifact(&root, "1-first");
+        let vanished = codex_artifact(&root, "2-vanished");
+        let third = codex_artifact(&root, "3-third");
         std::fs::write(
             &first,
             codex_records("first-owner", "first-agent-0", "first-0"),
@@ -13182,7 +13219,7 @@ mod provider_integration_tests {
         process_adapter_worker(&mut worker, &targets, &mut pending);
 
         assert!(
-            tail_read_calls(&worker, &root, "3-third.jsonl").is_some(),
+            tail_read_calls(&worker, &root, &codex_artifact_name("3-third")).is_some(),
             "cursor disappearance restarted at the starving first file"
         );
     }
@@ -13203,7 +13240,7 @@ mod provider_integration_tests {
         let mut pending = PendingEvents::with_capacity(1, diagnostics);
         process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
         let _ = drain_pending(&mut pending);
-        let path = root.join("bootstrap.jsonl");
+        let path = codex_artifact(&root, "bootstrap");
         std::fs::write(
             &path,
             codex_records("bootstrap-owner", "bootstrap-owner", "bootstrap-activity"),
@@ -13228,13 +13265,19 @@ mod provider_integration_tests {
         }]);
 
         process_adapter_worker(&mut worker, &targets, &mut pending);
-        assert_eq!(tail_read_calls(&worker, &root, "bootstrap.jsonl"), Some(0));
+        assert_eq!(
+            tail_read_calls(&worker, &root, &codex_artifact_name("bootstrap")),
+            Some(0)
+        );
         assert!(worker.resume_cursor.is_some());
 
         let _ = drain_pending(&mut pending);
         process_adapter_worker(&mut worker, &targets, &mut pending);
 
-        assert_eq!(tail_read_calls(&worker, &root, "bootstrap.jsonl"), Some(1));
+        assert_eq!(
+            tail_read_calls(&worker, &root, &codex_artifact_name("bootstrap")),
+            Some(1)
+        );
     }
 
     #[test]
@@ -13254,7 +13297,7 @@ mod provider_integration_tests {
         process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
         let _ = drain_pending(&mut pending);
 
-        let path = root.join("recreated.jsonl");
+        let path = codex_artifact(&root, "recreated");
         std::fs::write(
             &path,
             codex_records("old-owner", "old-owner", "old-activity"),
@@ -13326,7 +13369,7 @@ mod provider_integration_tests {
         let mut pending = PendingEvents::new(diagnostics);
         process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
         let _ = drain_pending(&mut pending);
-        let path = root.join("rotated.jsonl");
+        let path = codex_artifact(&root, "rotated");
         std::fs::write(
             &path,
             codex_records("original-owner", "original-owner", "original-activity"),
@@ -13381,7 +13424,7 @@ mod provider_integration_tests {
         let mut pending = PendingEvents::with_capacity(1, diagnostics);
         process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
         let _ = drain_pending(&mut pending);
-        let path = root.join("bounded.jsonl");
+        let path = codex_artifact(&root, "bounded");
         let mut contents = codex_records("bounded-owner", "bounded-agent-0", "bounded-0");
         for index in 1..8 {
             contents.push_str(&format!(
@@ -13395,7 +13438,7 @@ mod provider_integration_tests {
         }]);
 
         process_adapter_worker(&mut worker, &targets, &mut pending);
-        let read_calls = tail_read_calls(&worker, &root, "bounded.jsonl").unwrap();
+        let read_calls = tail_read_calls(&worker, &root, &codex_artifact_name("bounded")).unwrap();
         let deferred_len = worker.deferred.len();
         let cursor = worker.resume_cursor.clone();
         assert!(deferred_len > 0);
@@ -13405,7 +13448,7 @@ mod provider_integration_tests {
         }
 
         assert_eq!(
-            tail_read_calls(&worker, &root, "bounded.jsonl"),
+            tail_read_calls(&worker, &root, &codex_artifact_name("bounded")),
             Some(read_calls)
         );
         assert_eq!(worker.deferred.len(), deferred_len);
@@ -13429,7 +13472,7 @@ mod provider_integration_tests {
         let mut pending = PendingEvents::new(diagnostics);
         process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
         let _ = drain_pending(&mut pending);
-        let path = root.join("dormant.jsonl");
+        let path = codex_artifact(&root, "dormant");
         std::fs::write(&path, b"").unwrap();
         let targets = TargetSet::new([ProviderTarget {
             provider: Provider::Codex,
@@ -13479,7 +13522,7 @@ mod provider_integration_tests {
         let mut pending = PendingEvents::new(diagnostics);
         process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
         let _ = drain_pending(&mut pending);
-        let path = root.join("rotating.jsonl");
+        let path = codex_artifact(&root, "rotating");
         std::fs::write(&path, b"").unwrap();
         let targets = TargetSet::new([ProviderTarget {
             provider: Provider::Codex,
@@ -13546,8 +13589,8 @@ mod provider_integration_tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("standard/.codex/sessions");
         std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("1-rotating.jsonl");
-        let sibling = root.join("2-sibling.jsonl");
+        let path = codex_artifact(&root, "1-rotating");
+        let sibling = codex_artifact(&root, "2-sibling");
         std::fs::write(&path, b"").unwrap();
         std::fs::write(&sibling, b"").unwrap();
         let diagnostics = crate::provider::ProviderDiagnostics::default();
@@ -13643,8 +13686,8 @@ mod provider_integration_tests {
         let mut pending = PendingEvents::new(diagnostics);
         process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
         let _ = drain_pending(&mut pending);
-        let active = root.join("1-active.jsonl");
-        let later = root.join("2-later.jsonl");
+        let active = codex_artifact(&root, "1-active");
+        let later = codex_artifact(&root, "2-later");
         std::fs::write(&active, b"").unwrap();
         std::fs::write(&later, b"").unwrap();
         let targets = TargetSet::new([
@@ -13686,7 +13729,7 @@ mod provider_integration_tests {
             .discovery
             .files()
             .into_iter()
-            .find(|file| file.relative_path == Path::new("1-active.jsonl"))
+            .find(|file| file.relative_path == Path::new(&codex_artifact_name("1-active")))
             .unwrap()
             .path_id;
 
@@ -13700,7 +13743,10 @@ mod provider_integration_tests {
             ProviderEvent::Activity { event_id, .. }
                 if event_id == "prov:codex:act:later-event"
         )));
-        assert!(tail_read_calls(&worker, &root, "2-later.jsonl").is_some_and(|calls| calls > 0));
+        assert!(
+            tail_read_calls(&worker, &root, &codex_artifact_name("2-later"))
+                .is_some_and(|calls| calls > 0)
+        );
     }
 
     #[test]
@@ -13719,7 +13765,7 @@ mod provider_integration_tests {
         let mut pending = PendingEvents::new(diagnostics);
         process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
         let _ = drain_pending(&mut pending);
-        let path = root.join("stopping.jsonl");
+        let path = codex_artifact(&root, "stopping");
         std::fs::write(&path, b"").unwrap();
         let targets = TargetSet::new([ProviderTarget {
             provider: Provider::Codex,
@@ -13734,7 +13780,8 @@ mod provider_integration_tests {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let hook_stop = Arc::clone(&stop_flag);
         worker.set_after_tail_chunk(move |_, _| hook_stop.store(true, Ordering::Release));
-        let reads_before = tail_read_calls(&worker, &root, "stopping.jsonl").unwrap();
+        let reads_before =
+            tail_read_calls(&worker, &root, &codex_artifact_name("stopping")).unwrap();
 
         try_process_adapter_worker_with_stop(&mut worker, &targets, &mut pending, &stop_flag)
             .unwrap();
@@ -13772,7 +13819,7 @@ mod provider_integration_tests {
         let mut pending = PendingEvents::new(diagnostics);
         process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
         let _ = drain_pending(&mut pending);
-        let path = root.join("oversized.jsonl");
+        let path = codex_artifact(&root, "oversized");
         let mut contents = vec![b'x'; MAX_TAIL_RECORD_BYTES + MAX_TAIL_CHUNK_BYTES + 1];
         contents.extend_from_slice(
             b"\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"sub_agent_activity\",\"event_id\":\"after-oversized\",\"occurred_at_ms\":3,\"agent_thread_id\":\"after-oversized-agent\",\"agent_path\":\"/root\",\"kind\":\"interacted\"}}\n",
@@ -14461,7 +14508,7 @@ mod provider_integration_tests {
         let root = StateRoot(directory.path().to_path_buf());
         let sessions = directory.path().join("home/.codex/sessions/2026/08/09");
         std::fs::create_dir_all(&sessions).unwrap();
-        let session_file = sessions.join("rollout-owner.jsonl");
+        let session_file = codex_artifact(&sessions, "owner");
         std::fs::write(
             &session_file,
             br#"{"type":"session_meta","payload":{"id":"owner","session_id":"owner","model":"gpt-test"}}

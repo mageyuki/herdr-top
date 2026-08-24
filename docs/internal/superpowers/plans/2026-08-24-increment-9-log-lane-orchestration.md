@@ -41,11 +41,11 @@ no new dependencies.
   `src/hook_adapter.rs`); codex sessions claim
   `RunKey::Native { Codex, <rollout-id> }`. Synthesized event ids use the
   semantic form
-  `log:<artifact-basename>:<record-ordinal>:<kind-slug>[:<agent-id>]`. This
-  avoids positional-id drift when fact types are added or
-  reordered; the same target and kind repeated within one record is one
-  semantic event. Ids are never `prov:`-prefixed (`src/reducer.rs:496`
-  rejects that prefix).
+  `log:<artifact-basename>:<record-ordinal>:<kind-slug>:<target-id>`. The id
+  keys on (artifact basename, record ordinal, kind, target identity). This
+  avoids positional-id drift when fact types are added or reordered; the same
+  target and kind repeated within one record is one semantic event. Ids are
+  never `prov:`-prefixed (`src/reducer.rs:496` rejects that prefix).
 - Evidence only; no inference. Codex lineage uses the id-extraction
   carve-in matched against discovered artifacts; no match → Unattached.
 - TOK/TOK-S = OUTPUT tokens (Claude usage deduped by `message.id`; codex
@@ -279,9 +279,10 @@ diagnostics counters).
   `hook:claude-code:<uuid>` / `hook:claude-code:<uuid>:agent:<agentId>`;
   codex native claim `RunKey::Native { Codex, rollout_id }`.
 - Event ids:
-  `log:<artifact-basename>:<record-ordinal>:<kind-slug>[:<agent-id>]`; the
-  semantic discriminator is order-independent and the durable event ledger
-  dedupes replays across restarts.
+  `log:<artifact-basename>:<record-ordinal>:<kind-slug>:<target-id>`; the id
+  keys on (artifact basename, record ordinal, kind, target identity) and is
+  order-independent, letting the durable event ledger dedupe replays across
+  restarts.
 - Mapping: SubagentAppeared → Dispatch + TaskStarted (label =
   description, agent type in metadata); SubagentEnded → Complete/Failed;
   codex admission-with-evidence → Dispatch; CodexTurnComplete →

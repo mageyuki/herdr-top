@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use herdr_top::model::Provider;
 use herdr_top::provider::claude::{ClaudeAdapter, ClaudeBootstrapParser};
+use herdr_top::provider::facts::{EvidenceId, SessionScope};
 use herdr_top::provider::lane::{Admission, AdmissionIndex};
 use herdr_top::provider::{
     DiscoveryIndex, DiscoveryRoot, PathInterner, ProviderDiagnostics, ProviderEvent,
@@ -126,16 +127,41 @@ fn scan(root: &Path, admitted_paths: impl IntoIterator<Item = PathBuf>) -> Disco
         path: root.to_path_buf(),
     }])
     .unwrap();
+    let admitted_paths = admitted_paths.into_iter().collect::<Vec<_>>();
+    let pane_session = if admitted_paths
+        .iter()
+        .any(|path| path.file_name() == Some(std::ffi::OsStr::new(&format!("{ROOT_ID}.jsonl"))))
+    {
+        ROOT_ID
+    } else {
+        "fixture-pane-root"
+    };
     let mut admission = Admission::new(0);
+    admission.admit_pane_session(Provider::Claude, pane_session);
+    let mut evidence = AdmissionIndex::new();
+    let parent = SessionScope::ClaudeRoot(pane_session.to_owned());
     for path in admitted_paths {
-        admission.admit_pane_artifact(Provider::Claude, &path);
+        let Some(agent_id) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("agent-"))
+            .and_then(|name| name.strip_suffix(".jsonl"))
+        else {
+            continue;
+        };
+        evidence.insert_claude_subagent(ROOT_ID, agent_id, path.clone());
+        assert!(
+            admission
+                .on_evidence(&parent, &EvidenceId::Uuid(agent_id.to_owned()), &evidence,)
+                .is_some()
+        );
     }
     index
         .scan_admitted(
             &mut ClaudeBootstrapParser,
             &mut PathInterner::default(),
             &admission,
-            &mut AdmissionIndex::new(),
+            &mut evidence,
             &ProviderDiagnostics::default(),
         )
         .unwrap();
@@ -342,11 +368,11 @@ fn named_spawn_filename_uses_in_record_agent_id() {
 
 #[test]
 fn unknown_record_types_and_fields_preserve_known_records_on_both_sides() {
-    let before = br#"{"type":"user","uuid":"11111111-1111-4111-8111-111111111111","timestamp":"2026-08-09T01:02:03.456Z","sessionId":"inline-session","isSidechain":false}"#;
+    let before = br#"{"type":"user","uuid":"11111111-1111-4111-8111-111111111111","timestamp":"2026-08-09T01:02:03.456Z","sessionId":"87099666-7f29-425c-859c-6b95a6dd650a","isSidechain":false}"#;
     let unknown = br#"{"type":"future-record","uuid":"not:an:id","message":{"content":"ignored"}}"#;
-    let after = br#"{"type":"assistant","uuid":"22222222-2222-4222-8222-222222222222","timestamp":"2026-08-09T01:02:04.456Z","sessionId":"inline-session","isSidechain":false,"futureField":{"nested":"ignored"}}"#;
+    let after = br#"{"type":"assistant","uuid":"22222222-2222-4222-8222-222222222222","timestamp":"2026-08-09T01:02:04.456Z","sessionId":"87099666-7f29-425c-859c-6b95a6dd650a","isSidechain":false,"futureField":{"nested":"ignored"}}"#;
     let records: [&[u8]; 3] = [before, unknown, after];
-    let fixtures = SyntheticIndex::new("project-safe/inline-session.jsonl", &records);
+    let fixtures = SyntheticIndex::new(MAIN_PATH, &records);
     let events = fixtures.all_events(&records, 0);
 
     assert!(events.iter().any(
@@ -364,9 +390,10 @@ fn unknown_record_types_and_fields_preserve_known_records_on_both_sides() {
 
 #[test]
 fn malformed_line_reports_escaped_context_and_next_record_still_lands() {
-    let bootstrap = br#"{"type":"user","uuid":"33333333-3333-4333-8333-333333333333","timestamp":"2026-08-09T01:02:03Z","sessionId":"main-session","isSidechain":false}"#;
-    let fixtures = SyntheticIndex::new("project\nslug/main-session.jsonl", &[bootstrap]);
-    let good = br#"{"type":"assistant","uuid":"44444444-4444-4444-8444-444444444444","timestamp":"2026-08-09T01:02:04Z","sessionId":"main-session","isSidechain":false}"#;
+    let bootstrap = br#"{"type":"user","uuid":"33333333-3333-4333-8333-333333333333","timestamp":"2026-08-09T01:02:03Z","sessionId":"87099666-7f29-425c-859c-6b95a6dd650a","isSidechain":false}"#;
+    let relative_path = format!("project\nslug/{ROOT_ID}.jsonl");
+    let fixtures = SyntheticIndex::new(&relative_path, &[bootstrap]);
+    let good = br#"{"type":"assistant","uuid":"44444444-4444-4444-8444-444444444444","timestamp":"2026-08-09T01:02:04Z","sessionId":"87099666-7f29-425c-859c-6b95a6dd650a","isSidechain":false}"#;
 
     let events = parse_inline(
         &fixtures.index,
@@ -383,7 +410,7 @@ fn malformed_line_reports_escaped_context_and_next_record_still_lands() {
             generation: 9,
             byte_offset: 41,
             error_code: "claude_json",
-        } if path_display == "project\\nslug/main-session.jsonl"
+        } if path_display == "project\\nslug/87099666-7f29-425c-859c-6b95a6dd650a.jsonl"
     ));
     assert!(events.iter().any(|event| {
         event_id(event) == Some("prov:claude:rec:44444444-4444-4444-8444-444444444444")
@@ -392,10 +419,10 @@ fn malformed_line_reports_escaped_context_and_next_record_still_lands() {
 
 #[test]
 fn grammar_failing_record_id_is_malformed_and_parsing_continues() {
-    let bootstrap = br#"{"type":"user","uuid":"55555555-5555-4555-8555-555555555555","timestamp":"2026-08-09T01:02:03Z","sessionId":"main-session","isSidechain":false}"#;
-    let fixtures = SyntheticIndex::new("project-safe/main-session.jsonl", &[bootstrap]);
-    let bad = br#"{"type":"user","uuid":"bad:uuid","timestamp":"2026-08-09T01:02:04Z","sessionId":"main-session","isSidechain":false}"#;
-    let good = br#"{"type":"assistant","uuid":"66666666-6666-4666-8666-666666666666","timestamp":"2026-08-09T01:02:05Z","sessionId":"main-session","isSidechain":false}"#;
+    let bootstrap = br#"{"type":"user","uuid":"55555555-5555-4555-8555-555555555555","timestamp":"2026-08-09T01:02:03Z","sessionId":"87099666-7f29-425c-859c-6b95a6dd650a","isSidechain":false}"#;
+    let fixtures = SyntheticIndex::new(MAIN_PATH, &[bootstrap]);
+    let bad = br#"{"type":"user","uuid":"bad:uuid","timestamp":"2026-08-09T01:02:04Z","sessionId":"87099666-7f29-425c-859c-6b95a6dd650a","isSidechain":false}"#;
+    let good = br#"{"type":"assistant","uuid":"66666666-6666-4666-8666-666666666666","timestamp":"2026-08-09T01:02:05Z","sessionId":"87099666-7f29-425c-859c-6b95a6dd650a","isSidechain":false}"#;
 
     let events = parse_inline(
         &fixtures.index,
@@ -424,7 +451,7 @@ fn non_allowlisted_prompt_sentinel_never_enters_events_or_diagnostics() {
         r#"{{"type":"user","uuid":"77777777-7777-4777-8777-777777777777","timestamp":"2026-08-09T01:02:03Z","sessionId":"sentinel-session","isSidechain":false,"message":{{"role":"user","content":"{SENTINEL}"}},"toolUseResult":{{"arguments":"{SENTINEL}"}},"future":"{SENTINEL}"}}"#
     );
     let records: [&[u8]; 1] = [record.as_bytes()];
-    let fixtures = SyntheticIndex::new("project-safe/sentinel-session.jsonl", &records);
+    let fixtures = SyntheticIndex::new(MAIN_PATH, &records);
     let events = fixtures.all_events(&records, 0);
 
     assert!(!events.is_empty());
