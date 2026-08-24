@@ -33,7 +33,15 @@ const MIN_WIDTH: u16 = 48;
 const MIN_HEIGHT: u16 = 14;
 type RunPlacement = (RunId, bool);
 type PaneRuns = HashMap<String, Vec<RunPlacement>>;
+type NestedRuns = HashMap<RunId, Vec<RunId>>;
 pub(crate) type NewestAgentNodes<'a> = HashMap<RunId, &'a AgentNode>;
+
+struct RunRowContext<'model, 'data> {
+    model: &'model DomainModel,
+    nested_runs: &'data NestedRuns,
+    newest_agents: &'data NewestAgentNodes<'model>,
+    now_ms: i64,
+}
 
 #[cfg(test)]
 thread_local! {
@@ -1034,13 +1042,19 @@ fn build_full_rows(model: &DomainModel, state: &AppState) -> Vec<TreeRow> {
     }
 }
 
-fn append_execution_tree_rows(
+fn append_execution_tree_rows<'model>(
     rows: &mut Vec<TreeRow>,
-    model: &DomainModel,
+    model: &'model DomainModel,
     state: &AppState,
-    newest_agents: &NewestAgentNodes<'_>,
+    newest_agents: &NewestAgentNodes<'model>,
 ) {
-    let (mut pane_runs, unattached) = place_runs(model, state);
+    let (mut pane_runs, unattached, nested_runs) = place_runs(model, state);
+    let run_row_context = RunRowContext {
+        model,
+        nested_runs: &nested_runs,
+        newest_agents,
+        now_ms: state.now_ms(),
+    };
 
     let mut workspaces = model.workspaces().collect::<Vec<_>>();
     workspaces.sort_by_key(|workspace| {
@@ -1105,15 +1119,7 @@ fn append_execution_tree_rows(
                     dependents: Vec::new(),
                 });
                 if let Some(runs) = pane_runs.remove(&pane.pane_id) {
-                    append_run_rows(
-                        rows,
-                        model,
-                        runs,
-                        Some(&pane.pane_id),
-                        4,
-                        state.now_ms(),
-                        newest_agents,
-                    );
+                    append_run_rows(rows, runs, Some(&pane.pane_id), 4, &run_row_context);
                 }
             }
         }
@@ -1131,20 +1137,40 @@ fn append_execution_tree_rows(
             .into_iter()
             .map(|run_id| (run_id, false))
             .collect();
-        append_run_rows(rows, model, runs, None, 2, state.now_ms(), newest_agents);
+        append_run_rows(rows, runs, None, 2, &run_row_context);
     }
 }
 
-fn place_runs(model: &DomainModel, state: &AppState) -> (PaneRuns, Vec<RunId>) {
+fn place_runs(model: &DomainModel, state: &AppState) -> (PaneRuns, Vec<RunId>, NestedRuns) {
     let mut pane_runs = PaneRuns::new();
     let mut unattached = Vec::new();
+    let mut unplaced = Vec::new();
+    let mut candidate_parents = HashMap::new();
     let mut runs = model.task_runs().collect::<Vec<_>>();
     runs.sort_by_key(|run| (run.display_ordinal.get(), run.run_id));
+    let execution_run_ids = crate::activity::runs_with_executions(model);
+    let operator = state.operator_snapshot();
+    let default_visible_runs = runs
+        .iter()
+        .filter(|run| {
+            crate::activity::is_default_visible_task_run(
+                run,
+                &operator,
+                &execution_run_ids,
+                state.now_ms(),
+            )
+        })
+        .map(|run| run.run_id)
+        .collect::<HashSet<_>>();
 
     for run in runs {
-        let mut executions = model
+        let all_executions = model
             .executions()
             .filter(|execution| execution.task_run_id == run.run_id)
+            .collect::<Vec<_>>();
+        let has_execution_history = !all_executions.is_empty();
+        let mut executions = all_executions
+            .into_iter()
             .filter(|execution| pane_is_renderable(model, &execution.pane_id))
             .collect::<Vec<_>>();
         executions.sort_by_key(|execution| {
@@ -1177,7 +1203,23 @@ fn place_runs(model: &DomainModel, state: &AppState) -> (PaneRuns, Vec<RunId>) {
                 .or_default()
                 .push((run.run_id, false));
         } else {
-            unattached.push(run.run_id);
+            unplaced.push(run.run_id);
+            if !has_execution_history
+                && let Some(parent) = dispatch_parent_run(model, run.run_id)
+                && default_visible_runs.contains(&parent.run_id)
+            {
+                candidate_parents.insert(run.run_id, parent.run_id);
+            }
+        }
+    }
+    let mut nested_runs = NestedRuns::new();
+    for run_id in unplaced {
+        if let Some(parent_run_id) = candidate_parents.get(&run_id).copied()
+            && !parent_chain_has_cycle(run_id, &candidate_parents)
+        {
+            nested_runs.entry(parent_run_id).or_default().push(run_id);
+        } else {
+            unattached.push(run_id);
         }
     }
     for runs in pane_runs.values_mut() {
@@ -1189,7 +1231,35 @@ fn place_runs(model: &DomainModel, state: &AppState) -> (PaneRuns, Vec<RunId>) {
         });
         runs.dedup_by_key(|(run_id, _)| *run_id);
     }
-    (pane_runs, unattached)
+    for runs in nested_runs.values_mut() {
+        runs.sort_by_key(|run_id| {
+            model
+                .task_run(run_id)
+                .map(|run| (run.display_ordinal.get(), run.run_id))
+                .unwrap_or((i64::MAX, *run_id))
+        });
+        runs.dedup();
+    }
+    unattached.sort_by_key(|run_id| {
+        model
+            .task_run(run_id)
+            .map(|run| (run.display_ordinal.get(), run.run_id))
+            .unwrap_or((i64::MAX, *run_id))
+    });
+    unattached.dedup();
+    (pane_runs, unattached, nested_runs)
+}
+
+fn parent_chain_has_cycle(run_id: RunId, candidate_parents: &HashMap<RunId, RunId>) -> bool {
+    let mut seen = HashSet::new();
+    let mut current = run_id;
+    while seen.insert(current) {
+        let Some(parent_run_id) = candidate_parents.get(&current).copied() else {
+            return false;
+        };
+        current = parent_run_id;
+    }
+    true
 }
 
 fn pane_is_renderable(model: &DomainModel, pane_id: &str) -> bool {
@@ -1212,42 +1282,80 @@ fn topology_row_label(kind: &str, id: &str, name: Option<&str>) -> String {
 
 fn append_run_rows(
     rows: &mut Vec<TreeRow>,
-    model: &DomainModel,
     runs: Vec<RunPlacement>,
     pane_id: Option<&str>,
     depth: usize,
-    now_ms: i64,
-    newest_agents: &NewestAgentNodes<'_>,
+    context: &RunRowContext<'_, '_>,
 ) {
-    for (run_id, shared) in runs {
-        let Some(run) = model.task_run(&run_id) else {
-            continue;
-        };
-        rows.push(TreeRow {
-            key: NodeKey::Run {
-                run_id,
-                pane_id: pane_id.map(str::to_owned),
-            },
+    for placement in runs {
+        append_run_subtree(
+            rows,
+            placement,
+            pane_id,
             depth,
-            label: task_run_label(
-                model,
-                run,
-                shared,
-                now_ms,
-                newest_agents.get(&run_id).copied(),
-            ),
-            prerequisites: Vec::new(),
-            dependents: Vec::new(),
-        });
-        let agents = model
-            .agent_nodes()
-            .filter(|agent| agent.task_run_id == run_id)
-            .filter(|agent| {
-                provider_from_key(&run.key).is_none_or(|provider| provider == agent.provider)
-            })
-            .collect::<Vec<_>>();
-        append_agent_rows(rows, agents, pane_id, depth.saturating_add(1));
+            pane_id.is_some(),
+            context,
+            &mut HashSet::new(),
+        );
     }
+}
+
+fn append_run_subtree(
+    rows: &mut Vec<TreeRow>,
+    (run_id, shared): RunPlacement,
+    pane_id: Option<&str>,
+    depth: usize,
+    show_dispatch_parent: bool,
+    context: &RunRowContext<'_, '_>,
+    ancestors: &mut HashSet<RunId>,
+) {
+    if !ancestors.insert(run_id) {
+        return;
+    }
+    let Some(run) = context.model.task_run(&run_id) else {
+        ancestors.remove(&run_id);
+        return;
+    };
+    rows.push(TreeRow {
+        key: NodeKey::Run {
+            run_id,
+            pane_id: pane_id.map(str::to_owned),
+        },
+        depth,
+        label: task_run_label_for_placement(
+            context.model,
+            run,
+            shared,
+            context.now_ms,
+            context.newest_agents.get(&run_id).copied(),
+            show_dispatch_parent,
+        ),
+        prerequisites: Vec::new(),
+        dependents: Vec::new(),
+    });
+    let agents = context
+        .model
+        .agent_nodes()
+        .filter(|agent| agent.task_run_id == run_id)
+        .filter(|agent| {
+            provider_from_key(&run.key).is_none_or(|provider| provider == agent.provider)
+        })
+        .collect::<Vec<_>>();
+    append_agent_rows(rows, agents, pane_id, depth.saturating_add(1));
+    if let Some(children) = context.nested_runs.get(&run_id) {
+        for child_run_id in children {
+            append_run_subtree(
+                rows,
+                (*child_run_id, false),
+                pane_id,
+                depth.saturating_add(1),
+                false,
+                context,
+                ancestors,
+            );
+        }
+    }
+    ancestors.remove(&run_id);
 }
 
 fn append_agent_rows(
@@ -1352,17 +1460,22 @@ pub(crate) fn task_run_label(
     now_ms: i64,
     newest_agent: Option<&AgentNode>,
 ) -> String {
+    task_run_label_for_placement(model, run, shared, now_ms, newest_agent, true)
+}
+
+fn task_run_label_for_placement(
+    model: &DomainModel,
+    run: &TaskRun,
+    shared: bool,
+    now_ms: i64,
+    newest_agent: Option<&AgentNode>,
+    show_dispatch_parent: bool,
+) -> String {
     let mut label = run_row_label_with_agent(run, newest_agent, now_ms);
     if shared {
         label.push_str(" [shared]");
     }
-    let mut parents = model
-        .execution_edges()
-        .filter(|edge| edge.child_run_id == run.run_id)
-        .filter_map(|edge| model.task_run(&edge.parent_run_id))
-        .collect::<Vec<_>>();
-    parents.sort_by_key(|parent| (parent.display_ordinal.get(), parent.run_id));
-    if let Some(parent) = parents.first() {
+    if show_dispatch_parent && let Some(parent) = dispatch_parent_run(model, run.run_id) {
         label.push_str(&format!(" [dispatched by: {}]", short_run_name(parent)));
     }
     let linked = model
@@ -1375,6 +1488,16 @@ pub(crate) fn task_run_label(
         label.push_str(" [unlinked]");
     }
     label
+}
+
+fn dispatch_parent_run(model: &DomainModel, child_run_id: RunId) -> Option<&TaskRun> {
+    let mut parents = model
+        .execution_edges()
+        .filter(|edge| edge.child_run_id == child_run_id)
+        .filter_map(|edge| model.task_run(&edge.parent_run_id))
+        .collect::<Vec<_>>();
+    parents.sort_by_key(|parent| (parent.display_ordinal.get(), parent.run_id));
+    parents.into_iter().next()
 }
 
 fn worker_kind_label(run: &TaskRun) -> String {
@@ -3017,6 +3140,354 @@ mod tests {
         });
 
         assert_eq!(hosting_pane, Some("pane-new"));
+    }
+
+    fn placement_model(pane_ids: &[&str]) -> DomainModel {
+        let mut model = DomainModel::default();
+        model.insert_workspace(Workspace {
+            workspace_id: "workspace".to_owned(),
+        });
+        model.insert_tab(Tab {
+            tab_id: "tab".to_owned(),
+            workspace_id: "workspace".to_owned(),
+            label: None,
+        });
+        for (index, pane_id) in pane_ids.iter().enumerate() {
+            model.insert_pane(Pane {
+                pane_id: (*pane_id).to_owned(),
+                workspace_id: "workspace".to_owned(),
+                tab_id: "tab".to_owned(),
+                terminal_id: format!("terminal-{pane_id}"),
+                display_name: None,
+            });
+            model.set_pane_ordinal((*pane_id).to_owned(), DisplayOrdinal::new(index as i64 + 1));
+        }
+        model
+    }
+
+    fn insert_placement_run(model: &mut DomainModel, run_id: RunId, label: &str, ordinal: i64) {
+        model.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::Controller(label.to_owned()),
+            display_ordinal: DisplayOrdinal::new(ordinal),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+    }
+
+    fn insert_placement_execution(
+        model: &mut DomainModel,
+        run_id: RunId,
+        execution_id: &str,
+        pane_id: &str,
+        state: ExecState,
+    ) {
+        model.insert_execution(Execution {
+            execution_id: execution_id.to_owned(),
+            pane_id: pane_id.to_owned(),
+            terminal_id: format!("terminal-{pane_id}"),
+            task_run_id: run_id,
+            state,
+        });
+    }
+
+    fn only_run_row(rows: &[TreeRow], run_id: RunId) -> &TreeRow {
+        let matches = rows
+            .iter()
+            .filter(|row| row.key.run_id() == Some(run_id))
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "expected exactly one row for {run_id}");
+        matches[0]
+    }
+
+    #[test]
+    fn headless_child_nests_under_dispatch_parent() {
+        let parent = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let child = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let mut model = placement_model(&["pane-parent"]);
+        insert_placement_run(&mut model, parent, "parent", 1);
+        insert_placement_run(&mut model, child, "child", 2);
+        insert_placement_execution(
+            &mut model,
+            parent,
+            "parent-execution",
+            "pane-parent",
+            ExecState::Working,
+        );
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: parent,
+            child_run_id: child,
+        });
+
+        let newest_agents = newest_agent_nodes(&model);
+        let rows = build_tree_rows(&model, &AppState::default(), &newest_agents);
+        let parent_row = only_run_row(&rows, parent);
+        let child_row = only_run_row(&rows, child);
+        let parent_index = rows.iter().position(|row| row == parent_row).unwrap();
+        let child_index = rows.iter().position(|row| row == child_row).unwrap();
+
+        assert_eq!(parent_row.depth, 4);
+        assert_eq!(child_row.depth, 5);
+        assert_eq!(
+            child_row.key,
+            NodeKey::Run {
+                run_id: child,
+                pane_id: Some("pane-parent".to_owned()),
+            }
+        );
+        assert!(parent_index < child_index);
+        assert!(!child_row.label.contains("[dispatched by:"));
+        assert!(rows.iter().all(|row| row.key != NodeKey::UnattachedGroup));
+    }
+
+    #[test]
+    fn ended_exec_pane_fallback_still_wins_over_parent() {
+        let parent = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let ended_child = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let headless_grandchild = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        let mut model = placement_model(&["pane-parent", "pane-ended"]);
+        insert_placement_run(&mut model, parent, "parent", 1);
+        insert_placement_run(&mut model, ended_child, "ended-child", 2);
+        insert_placement_run(&mut model, headless_grandchild, "headless-grandchild", 3);
+        insert_placement_execution(
+            &mut model,
+            parent,
+            "parent-execution",
+            "pane-parent",
+            ExecState::Working,
+        );
+        insert_placement_execution(
+            &mut model,
+            ended_child,
+            "ended-child-execution",
+            "pane-ended",
+            ExecState::Ended,
+        );
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: parent,
+            child_run_id: ended_child,
+        });
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: ended_child,
+            child_run_id: headless_grandchild,
+        });
+
+        let newest_agents = newest_agent_nodes(&model);
+        let rows = build_tree_rows(&model, &AppState::default(), &newest_agents);
+        let ended_row = only_run_row(&rows, ended_child);
+        let grandchild_row = only_run_row(&rows, headless_grandchild);
+
+        assert_eq!(ended_row.depth, 4);
+        assert_eq!(
+            ended_row.key,
+            NodeKey::Run {
+                run_id: ended_child,
+                pane_id: Some("pane-ended".to_owned()),
+            }
+        );
+        assert!(ended_row.label.contains("[dispatched by: parent]"));
+        assert_eq!(grandchild_row.depth, 5);
+        assert_eq!(
+            grandchild_row.key,
+            NodeKey::Run {
+                run_id: headless_grandchild,
+                pane_id: Some("pane-ended".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn three_level_chain_renders() {
+        let root = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let child = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let grandchild = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        let mut model = placement_model(&["pane-root"]);
+        for (run_id, label, ordinal) in [
+            (root, "root", 1),
+            (child, "child", 2),
+            (grandchild, "grandchild", 3),
+        ] {
+            insert_placement_run(&mut model, run_id, label, ordinal);
+        }
+        insert_placement_execution(
+            &mut model,
+            root,
+            "root-execution",
+            "pane-root",
+            ExecState::Working,
+        );
+        for (parent_run_id, child_run_id) in [(root, child), (child, grandchild)] {
+            model.insert_execution_edge(ExecutionEdge {
+                parent_run_id,
+                child_run_id,
+            });
+        }
+
+        let newest_agents = newest_agent_nodes(&model);
+        let rows = build_tree_rows(&model, &AppState::default(), &newest_agents);
+        let run_rows = rows
+            .iter()
+            .filter(|row| row.key.run_id().is_some())
+            .collect::<Vec<_>>();
+
+        assert_eq!(run_rows.len(), 3);
+        assert_eq!(
+            run_rows
+                .iter()
+                .map(|row| (row.key.run_id().unwrap(), row.depth))
+                .collect::<Vec<_>>(),
+            [(root, 4), (child, 5), (grandchild, 6)]
+        );
+        assert!(run_rows.iter().all(|row| {
+            matches!(
+                &row.key,
+                NodeKey::Run {
+                    pane_id: Some(pane_id),
+                    ..
+                } if pane_id == "pane-root"
+            )
+        }));
+    }
+
+    #[test]
+    fn hidden_parent_children_fall_to_unattached() {
+        let root = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let hidden_middle = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let visible_grandchild = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        let mut model = placement_model(&["pane-root"]);
+        insert_placement_run(&mut model, root, "root", 1);
+        model.insert_task_run(TaskRun {
+            run_id: hidden_middle,
+            key: RunKey::Controller("hidden-middle".to_owned()),
+            display_ordinal: DisplayOrdinal::new(2),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: Some(10),
+        });
+        insert_placement_run(&mut model, visible_grandchild, "visible-grandchild", 3);
+        insert_placement_execution(
+            &mut model,
+            root,
+            "root-execution",
+            "pane-root",
+            ExecState::Working,
+        );
+        for (parent_run_id, child_run_id) in
+            [(root, hidden_middle), (hidden_middle, visible_grandchild)]
+        {
+            model.insert_execution_edge(ExecutionEdge {
+                parent_run_id,
+                child_run_id,
+            });
+        }
+
+        let rows = build_uncollapsed_rows(&model, &AppState::default());
+        assert!(
+            rows.iter()
+                .all(|row| row.key.run_id() != Some(hidden_middle))
+        );
+        let grandchild_row = only_run_row(&rows, visible_grandchild);
+        assert_eq!(grandchild_row.depth, 2);
+        assert_eq!(
+            grandchild_row.key,
+            NodeKey::Run {
+                run_id: visible_grandchild,
+                pane_id: None,
+            }
+        );
+        assert!(!grandchild_row.label.contains("[dispatched by:"));
+        let unattached_index = rows
+            .iter()
+            .position(|row| row.key == NodeKey::UnattachedGroup)
+            .unwrap();
+        let grandchild_index = rows.iter().position(|row| row == grandchild_row).unwrap();
+        assert!(unattached_index < grandchild_index);
+    }
+
+    #[test]
+    fn cycle_bails_to_unattached() {
+        let first = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let second = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let mut model = placement_model(&[]);
+        insert_placement_run(&mut model, first, "first", 1);
+        insert_placement_run(&mut model, second, "second", 2);
+        for (parent_run_id, child_run_id) in [(first, second), (second, first)] {
+            model.insert_execution_edge(ExecutionEdge {
+                parent_run_id,
+                child_run_id,
+            });
+        }
+
+        let rows = build_uncollapsed_rows(&model, &AppState::default());
+        let run_rows = rows
+            .iter()
+            .filter(|row| row.key.run_id().is_some())
+            .collect::<Vec<_>>();
+
+        assert_eq!(run_rows.len(), 2);
+        assert_eq!(
+            run_rows
+                .iter()
+                .map(|row| (row.key.run_id().unwrap(), row.depth))
+                .collect::<Vec<_>>(),
+            [(first, 2), (second, 2)]
+        );
+        assert!(run_rows.iter().all(|row| {
+            matches!(row.key, NodeKey::Run { pane_id: None, .. })
+                && !row.label.contains("[dispatched by:")
+        }));
+    }
+
+    #[test]
+    fn sibling_order_is_dispatch_order() {
+        let parent = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let ordinal_late = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let tied_low = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        let tied_high = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAY");
+        let mut model = placement_model(&["pane-parent"]);
+        insert_placement_run(&mut model, parent, "parent", 1);
+        insert_placement_run(&mut model, ordinal_late, "ordinal-late", 3);
+        insert_placement_run(&mut model, tied_high, "tied-high", 2);
+        insert_placement_run(&mut model, tied_low, "tied-low", 2);
+        insert_placement_execution(
+            &mut model,
+            parent,
+            "parent-execution",
+            "pane-parent",
+            ExecState::Working,
+        );
+        for child_run_id in [ordinal_late, tied_high, tied_low] {
+            model.insert_execution_edge(ExecutionEdge {
+                parent_run_id: parent,
+                child_run_id,
+            });
+        }
+
+        let newest_agents = newest_agent_nodes(&model);
+        let rows = build_tree_rows(&model, &AppState::default(), &newest_agents);
+        let run_rows = rows
+            .iter()
+            .filter_map(|row| row.key.run_id().map(|run_id| (run_id, row.depth)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            run_rows,
+            [
+                (parent, 4),
+                (tied_low, 5),
+                (tied_high, 5),
+                (ordinal_late, 5),
+            ]
+        );
     }
 
     #[test]
