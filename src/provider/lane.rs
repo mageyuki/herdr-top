@@ -20,8 +20,33 @@ use std::cell::RefCell;
 
 /// Default bounded provider-log backfill window: one day.
 pub const DEFAULT_BACKFILL_WINDOW_MS: i64 = 86_400_000;
+/// Default delay before a provider-log Complete becomes durable.
+pub const DEFAULT_COMPLETE_GRACE_MS: i64 = 30_000;
+/// Default append-silence interval before a provider-log run closes without a terminal fact.
+pub const DEFAULT_HEADLESS_INACTIVITY_MS: i64 = 600_000;
 /// Event-source marker reserved for facts synthesized from provider log artifacts.
 pub const SOURCE_LOG_LANE: &str = "provider-log";
+
+/// Effective provider-log lane timing configuration resolved at process startup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LogLaneConfig {
+    /// Hard historical scan bound.
+    pub backfill_window_ms: i64,
+    /// Delay that allows a later failure or resume to supersede a Complete.
+    pub complete_grace_ms: i64,
+    /// Append-silence interval before an active lane run becomes `ended_unknown`.
+    pub headless_inactivity_ms: i64,
+}
+
+impl Default for LogLaneConfig {
+    fn default() -> Self {
+        Self {
+            backfill_window_ms: DEFAULT_BACKFILL_WINDOW_MS,
+            complete_grace_ms: DEFAULT_COMPLETE_GRACE_MS,
+            headless_inactivity_ms: DEFAULT_HEADLESS_INACTIVITY_MS,
+        }
+    }
+}
 
 /// First allowlisted Codex session metadata retained for one artifact identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,8 +86,10 @@ impl ActivitySelection {
 }
 
 /// Stateful fact consumer that emits deterministic provider-lane events.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Synthesis {
+    complete_grace_ms: i64,
+    headless_inactivity_ms: i64,
     session_meta: HashMap<PathBuf, CodexSessionMetadata>,
     turn_context: HashMap<ScopeKey, (String, Option<String>)>,
     ai_titles: HashMap<String, String>,
@@ -71,10 +98,111 @@ pub struct Synthesis {
     subagent_ends: HashMap<(String, String), bool>,
     lineage: HashSet<(ScopeKey, ScopeKey)>,
     last_append_ms: HashMap<ScopeKey, i64>,
+    pending_completes: HashMap<ScopeKey, ControllerEvent>,
+    completed: HashSet<ScopeKey>,
+    inactivity_closed: HashSet<ScopeKey>,
     live_lines: HashMap<ScopeKey, ActivitySelection>,
 }
 
+impl Default for Synthesis {
+    fn default() -> Self {
+        Self::with_lifecycle_timing(DEFAULT_COMPLETE_GRACE_MS, DEFAULT_HEADLESS_INACTIVITY_MS)
+    }
+}
+
 impl Synthesis {
+    /// Creates synthesis state with explicit, deterministic lifecycle intervals.
+    #[must_use]
+    pub fn with_lifecycle_timing(complete_grace_ms: i64, headless_inactivity_ms: i64) -> Self {
+        Self {
+            complete_grace_ms,
+            headless_inactivity_ms,
+            session_meta: HashMap::new(),
+            turn_context: HashMap::new(),
+            ai_titles: HashMap::new(),
+            started: HashSet::new(),
+            usage_samples: HashSet::new(),
+            subagent_ends: HashMap::new(),
+            lineage: HashSet::new(),
+            last_append_ms: HashMap::new(),
+            pending_completes: HashMap::new(),
+            completed: HashSet::new(),
+            inactivity_closed: HashSet::new(),
+            live_lines: HashMap::new(),
+        }
+    }
+
+    /// Advances grace and inactivity against an injected Unix-epoch millisecond clock.
+    pub fn advance_lifecycle(&mut self, now_ms: i64) -> Vec<ProviderEvent> {
+        let mut events = Vec::new();
+        self.flush_due_completes(now_ms, &mut events);
+
+        let mut inactive = self
+            .last_append_ms
+            .iter()
+            .filter(|(scope, at_ms)| {
+                self.started.contains(*scope)
+                    && !self.inactivity_closed.contains(*scope)
+                    && now_ms.saturating_sub(**at_ms) >= self.headless_inactivity_ms
+            })
+            .map(|(scope, _)| scope.clone())
+            .collect::<Vec<_>>();
+        inactive.sort();
+        for scope in inactive {
+            self.inactivity_closed.insert(scope.clone());
+            self.started.remove(&scope);
+            events.push(ProviderEvent::LaneClose {
+                key: run_key_for_scope_key(&scope),
+                at_ms: now_ms,
+            });
+        }
+        events
+    }
+
+    fn flush_due_completes(&mut self, now_ms: i64, events: &mut Vec<ProviderEvent>) {
+        let mut due = self
+            .pending_completes
+            .iter()
+            .filter(|(_, event)| {
+                now_ms
+                    >= event
+                        .metadata
+                        .timestamp_ms
+                        .saturating_add(self.complete_grace_ms)
+            })
+            .map(|(scope, event)| (scope.clone(), event.metadata.event_id.clone()))
+            .collect::<Vec<_>>();
+        due.sort_by(|left, right| left.1.cmp(&right.1));
+        for (scope, _) in due {
+            if let Some(event) = self.pending_completes.remove(&scope) {
+                self.started.remove(&scope);
+                self.completed.insert(scope);
+                events.push(ProviderEvent::Synthesized(event));
+            }
+        }
+    }
+
+    fn prepare_resume(
+        &mut self,
+        scope: &ScopeKey,
+        at_ms: i64,
+        events: &mut Vec<ProviderEvent>,
+    ) -> bool {
+        self.flush_due_completes(at_ms, events);
+        self.pending_completes.remove(scope);
+        let was_completed = self.completed.remove(scope);
+        let was_inactive = self.inactivity_closed.remove(scope);
+        if let ScopeKey::ClaudeSubagent { parent, agent_id } = scope {
+            self.subagent_ends
+                .remove(&(parent.clone(), agent_id.clone()));
+        }
+        was_completed || was_inactive
+    }
+
+    fn hold_complete(&mut self, scope: ScopeKey, event: ControllerEvent) {
+        self.pending_completes.entry(scope).or_insert(event);
+    }
+
     /// Consumes a file-order batch of facts from one artifact.
     ///
     /// Duplicate subagent terminal facts are collapsed before mapping so `failed: true`
@@ -152,12 +280,18 @@ impl Synthesis {
         match fact {
             LogFact::Append { scope, at_ms } => {
                 let key = ScopeKey::from(&scope);
+                let reopen = self.prepare_resume(&key, at_ms, events);
                 self.last_append_ms.insert(key.clone(), at_ms);
                 events.push(ProviderEvent::RunLiveness {
                     key: run_key_for_scope(&scope),
                     at_ms,
                 });
-                if matches!(scope, SessionScope::ClaudeRoot(_)) && self.started.insert(key) {
+                if (matches!(
+                    scope,
+                    SessionScope::ClaudeRoot(_) | SessionScope::ClaudeSubagent { .. }
+                ) || reopen)
+                    && self.started.insert(key)
+                {
                     events.push(ProviderEvent::Synthesized(controller_event(
                         artifact,
                         ordinal,
@@ -199,7 +333,9 @@ impl Synthesis {
                     .get(&ScopeKey::from(&scope))
                     .copied()
                     .unwrap_or_default();
-                self.started.insert(ScopeKey::from(&scope));
+                let scope_key = ScopeKey::from(&scope);
+                let _ = self.prepare_resume(&scope_key, at_ms, events);
+                self.started.insert(scope_key);
                 events.push(ProviderEvent::Synthesized(controller_event(
                     artifact,
                     ordinal,
@@ -227,21 +363,25 @@ impl Synthesis {
             LogFact::CodexTurnStarted { rollout_id, at_ms } => {
                 let scope = SessionScope::Codex { rollout_id };
                 let scope_key = ScopeKey::from(&scope);
+                let _ = self.prepare_resume(&scope_key, at_ms, events);
                 self.live_lines.remove(&scope_key);
-                self.started.insert(scope_key);
-                events.push(ProviderEvent::Synthesized(controller_event(
-                    artifact,
-                    ordinal,
-                    &scope,
-                    ControllerEventKind::TaskStarted,
-                    at_ms,
-                    None,
-                    None,
-                )));
+                if self.started.insert(scope_key) {
+                    events.push(ProviderEvent::Synthesized(controller_event(
+                        artifact,
+                        ordinal,
+                        &scope,
+                        ControllerEventKind::TaskStarted,
+                        at_ms,
+                        None,
+                        None,
+                    )));
+                }
             }
             LogFact::CodexTurnComplete { rollout_id, at_ms } => {
                 let scope = SessionScope::Codex { rollout_id };
-                events.push(ProviderEvent::Synthesized(controller_event(
+                self.flush_due_completes(at_ms, events);
+                let scope_key = ScopeKey::from(&scope);
+                let event = controller_event(
                     artifact,
                     ordinal,
                     &scope,
@@ -249,10 +389,16 @@ impl Synthesis {
                     at_ms,
                     None,
                     None,
-                )));
+                );
+                self.hold_complete(scope_key, event);
             }
             LogFact::CodexTurnAborted { rollout_id, at_ms } => {
                 let scope = SessionScope::Codex { rollout_id };
+                let scope_key = ScopeKey::from(&scope);
+                self.flush_due_completes(at_ms, events);
+                self.pending_completes.remove(&scope_key);
+                self.completed.remove(&scope_key);
+                self.started.remove(&scope_key);
                 events.push(ProviderEvent::Synthesized(controller_event(
                     artifact,
                     ordinal,
@@ -276,6 +422,8 @@ impl Synthesis {
                     .get(&ScopeKey::from(&parent_scope))
                     .copied()
                     .unwrap_or_default();
+                let child_key = ScopeKey::from(&child_scope);
+                let _ = self.prepare_resume(&child_key, at_ms, events);
                 let provider_metadata = MinimalProviderMetadata {
                     event_kind: Some(agent_type),
                     ..MinimalProviderMetadata::default()
@@ -300,7 +448,7 @@ impl Synthesis {
                     Some(description),
                     Some(provider_metadata),
                 )));
-                self.started.insert(ScopeKey::from(&child_scope));
+                self.started.insert(child_key);
             }
             LogFact::SubagentEnded {
                 parent,
@@ -308,10 +456,8 @@ impl Synthesis {
                 failed,
             } => {
                 let terminal_key = (parent.clone(), agent_id.clone());
-                if self
-                    .subagent_ends
-                    .get(&terminal_key)
-                    .is_some_and(|previous| *previous && !failed)
+                if let Some(previous) = self.subagent_ends.get(&terminal_key)
+                    && (*previous || !failed)
                 {
                     return;
                 }
@@ -326,7 +472,9 @@ impl Synthesis {
                     .get(&ScopeKey::from(&parent_scope))
                     .copied()
                     .unwrap_or_default();
-                events.push(ProviderEvent::Synthesized(controller_event(
+                let scope_key = ScopeKey::from(&scope);
+                self.flush_due_completes(at_ms, events);
+                let event = controller_event(
                     artifact,
                     ordinal,
                     &scope,
@@ -338,7 +486,15 @@ impl Synthesis {
                     at_ms,
                     None,
                     None,
-                )));
+                );
+                if failed {
+                    self.pending_completes.remove(&scope_key);
+                    self.completed.remove(&scope_key);
+                    self.started.remove(&scope_key);
+                    events.push(ProviderEvent::Synthesized(event));
+                } else {
+                    self.hold_complete(scope_key, event);
+                }
             }
             LogFact::Activity {
                 scope,
@@ -410,6 +566,19 @@ pub fn run_key_for_scope(scope: &SessionScope) -> RunKey {
             RunKey::Controller(controller_key_for_scope(scope))
         }
         SessionScope::Codex { rollout_id } => RunKey::Native {
+            provider: Provider::Codex,
+            sid: rollout_id.clone(),
+        },
+    }
+}
+
+fn run_key_for_scope_key(scope: &ScopeKey) -> RunKey {
+    match scope {
+        ScopeKey::ClaudeRoot(session_id) => RunKey::Controller(claude_hook_key(session_id, None)),
+        ScopeKey::ClaudeSubagent { parent, agent_id } => {
+            RunKey::Controller(claude_hook_key(parent, Some(agent_id)))
+        }
+        ScopeKey::Codex(rollout_id) => RunKey::Native {
             provider: Provider::Codex,
             sid: rollout_id.clone(),
         },
@@ -838,7 +1007,7 @@ pub struct DerivedRoot {
     pub root: DiscoveryRoot,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum ScopeKey {
     ClaudeRoot(String),
     ClaudeSubagent { parent: String, agent_id: String },
@@ -1069,14 +1238,30 @@ pub fn backfill_anchor_ms(earliest_db_event: Option<i64>, now_ms: i64, window_ms
     earliest_db_event.map_or(window_anchor, |earliest| earliest.max(window_anchor))
 }
 
-/// Parses a positive UTF-8 decimal millisecond window or returns the one-day default.
-#[must_use]
-pub fn parse_backfill_window_ms(value: Option<&OsStr>) -> i64 {
+fn parse_positive_duration_ms(value: Option<&OsStr>, default_ms: i64) -> i64 {
     value
         .and_then(OsStr::to_str)
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_BACKFILL_WINDOW_MS)
+        .unwrap_or(default_ms)
+}
+
+/// Parses a positive UTF-8 decimal millisecond window or returns the one-day default.
+#[must_use]
+pub fn parse_backfill_window_ms(value: Option<&OsStr>) -> i64 {
+    parse_positive_duration_ms(value, DEFAULT_BACKFILL_WINDOW_MS)
+}
+
+/// Parses a positive UTF-8 decimal completion grace or returns the 30-second default.
+#[must_use]
+pub fn parse_complete_grace_ms(value: Option<&OsStr>) -> i64 {
+    parse_positive_duration_ms(value, DEFAULT_COMPLETE_GRACE_MS)
+}
+
+/// Parses a positive UTF-8 decimal inactivity interval or returns the ten-minute default.
+#[must_use]
+pub fn parse_headless_inactivity_ms(value: Option<&OsStr>) -> i64 {
+    parse_positive_duration_ms(value, DEFAULT_HEADLESS_INACTIVITY_MS)
 }
 
 /// Recomputes the zero-based record ordinal by counting newlines before `byte_offset`.
@@ -1603,7 +1788,9 @@ mod tests {
         let facts = extract_claude_line(&SessionScope::ClaudeRoot(PARENT.to_owned()), record)
             .into_iter()
             .map(|fact| (7, fact));
-        let events = synthesize(&mut Synthesis::default(), "queue.jsonl", facts);
+        let mut synthesis = Synthesis::default();
+        let mut events = synthesize(&mut synthesis, "queue.jsonl", facts);
+        events.extend(synthesis.advance_lifecycle(DEFAULT_COMPLETE_GRACE_MS));
         let synthesized = synthesized_events(&events);
         let event_ids = synthesized
             .iter()
@@ -1628,8 +1815,9 @@ mod tests {
 
     #[test]
     fn append_start_and_subagent_end_at_one_ordinal_both_apply() {
-        let events = synthesize(
-            &mut Synthesis::default(),
+        let mut synthesis = Synthesis::default();
+        let mut events = synthesize(
+            &mut synthesis,
             "session.jsonl",
             [
                 (
@@ -1649,6 +1837,7 @@ mod tests {
                 ),
             ],
         );
+        events.extend(synthesis.advance_lifecycle(100 + DEFAULT_COMPLETE_GRACE_MS));
         let synthesized = synthesized_events(&events);
         let event_ids = synthesized
             .iter()
@@ -1681,14 +1870,17 @@ mod tests {
             },
         ];
         let ids = |facts: Vec<LogFact>| {
-            synthesized_events(&synthesize(
-                &mut Synthesis::default(),
+            let mut synthesis = Synthesis::default();
+            let mut events = synthesize(
+                &mut synthesis,
                 "queue.jsonl",
                 facts.into_iter().map(|fact| (3, fact)),
-            ))
-            .into_iter()
-            .map(|event| (event.task_run_id.clone(), event.metadata.event_id.clone()))
-            .collect::<HashMap<_, _>>()
+            );
+            events.extend(synthesis.advance_lifecycle(DEFAULT_COMPLETE_GRACE_MS));
+            synthesized_events(&events)
+                .into_iter()
+                .map(|event| (event.task_run_id.clone(), event.metadata.event_id.clone()))
+                .collect::<HashMap<_, _>>()
         };
 
         assert_eq!(ids(facts.to_vec()), ids(facts.into_iter().rev().collect()));
@@ -1701,11 +1893,13 @@ mod tests {
             agent_id: "child".to_owned(),
             failed: false,
         };
-        let events = synthesize(
-            &mut Synthesis::default(),
+        let mut synthesis = Synthesis::default();
+        let mut events = synthesize(
+            &mut synthesis,
             "queue.jsonl",
             [(4, duplicate.clone()), (4, duplicate)],
         );
+        events.extend(synthesis.advance_lifecycle(DEFAULT_COMPLETE_GRACE_MS));
 
         assert!(matches!(
             synthesized_events(&events).as_slice(),
@@ -2200,6 +2394,220 @@ mod tests {
             [event] if matches!(event.event, ControllerEventKind::Failed)
         ));
         assert_eq!(synthesized_events(&downgrade).len(), 0);
+    }
+
+    #[test]
+    fn complete_lands_after_grace_only() {
+        let mut synthesis = Synthesis::with_lifecycle_timing(30, 600);
+        let held = synthesize(
+            &mut synthesis,
+            "rollout.jsonl",
+            [(
+                4,
+                LogFact::CodexTurnComplete {
+                    rollout_id: ROLLOUT.to_owned(),
+                    at_ms: 100,
+                },
+            )],
+        );
+
+        assert!(synthesized_events(&held).is_empty());
+        assert!(synthesis.advance_lifecycle(129).is_empty());
+        assert!(matches!(
+            synthesized_events(&synthesis.advance_lifecycle(130)).as_slice(),
+            [event] if matches!(event.event, ControllerEventKind::Complete)
+        ));
+        let reopened = synthesize(
+            &mut synthesis,
+            "rollout.jsonl",
+            [(
+                5,
+                LogFact::Append {
+                    scope: SessionScope::Codex {
+                        rollout_id: ROLLOUT.to_owned(),
+                    },
+                    at_ms: 140,
+                },
+            )],
+        );
+        assert!(
+            synthesized_events(&reopened)
+                .iter()
+                .any(|event| matches!(event.event, ControllerEventKind::TaskStarted))
+        );
+    }
+
+    #[test]
+    fn resume_within_grace_never_flaps() {
+        let mut synthesis = Synthesis::with_lifecycle_timing(30, 600);
+        let mut events = synthesize(
+            &mut synthesis,
+            "rollout.jsonl",
+            [(
+                1,
+                LogFact::CodexMeta {
+                    rollout_id: ROLLOUT.to_owned(),
+                    cwd: "/workspace".to_owned(),
+                    originator: "codex".to_owned(),
+                    internal: None,
+                    cli_version: "0.149.0".to_owned(),
+                },
+            )],
+        );
+        events.extend(synthesize(
+            &mut synthesis,
+            "rollout.jsonl",
+            [(
+                4,
+                LogFact::CodexTurnComplete {
+                    rollout_id: ROLLOUT.to_owned(),
+                    at_ms: 100,
+                },
+            )],
+        ));
+        events.extend(synthesize(
+            &mut synthesis,
+            "rollout.jsonl",
+            [(
+                5,
+                LogFact::CodexTurnStarted {
+                    rollout_id: ROLLOUT.to_owned(),
+                    at_ms: 120,
+                },
+            )],
+        ));
+        events.extend(synthesis.advance_lifecycle(200));
+
+        assert!(
+            synthesized_events(&events)
+                .iter()
+                .all(|event| !matches!(event.event, ControllerEventKind::Complete))
+        );
+        assert_eq!(
+            apply_once_per_event_id(&events)
+                .task_run_by_key(&RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: ROLLOUT.to_owned(),
+                })
+                .unwrap()
+                .state,
+            crate::model::TaskState::Running
+        );
+    }
+
+    #[test]
+    fn failed_subagent_end_in_later_batch_supersedes_grace_held_complete() {
+        let child_scope = SessionScope::ClaudeSubagent {
+            parent: PARENT.to_owned(),
+            agent_id: "child".to_owned(),
+        };
+        let mut synthesis = Synthesis::with_lifecycle_timing(30, 600);
+        let mut events = synthesize(
+            &mut synthesis,
+            "agent-child.meta.json",
+            [(
+                0,
+                LogFact::SubagentAppeared {
+                    parent: PARENT.to_owned(),
+                    agent_id: "child".to_owned(),
+                    agent_type: "reviewer".to_owned(),
+                    description: "Review lifecycle".to_owned(),
+                },
+            )],
+        );
+        events.extend(synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [
+                (
+                    3,
+                    LogFact::Append {
+                        scope: SessionScope::ClaudeRoot(PARENT.to_owned()),
+                        at_ms: 100,
+                    },
+                ),
+                (
+                    3,
+                    LogFact::SubagentEnded {
+                        parent: PARENT.to_owned(),
+                        agent_id: "child".to_owned(),
+                        failed: false,
+                    },
+                ),
+            ],
+        ));
+        assert!(
+            synthesized_events(&events)
+                .iter()
+                .all(|event| !matches!(event.event, ControllerEventKind::Complete))
+        );
+        let failed = synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [
+                (
+                    4,
+                    LogFact::Append {
+                        scope: SessionScope::ClaudeRoot(PARENT.to_owned()),
+                        at_ms: 120,
+                    },
+                ),
+                (
+                    4,
+                    LogFact::SubagentEnded {
+                        parent: PARENT.to_owned(),
+                        agent_id: "child".to_owned(),
+                        failed: true,
+                    },
+                ),
+            ],
+        );
+        assert!(matches!(
+            synthesized_events(&failed)
+                .into_iter()
+                .find(|event| event.task_run_id == controller_key_for_scope(&child_scope))
+                .map(|event| &event.event),
+            Some(ControllerEventKind::Failed)
+        ));
+        events.extend(failed);
+
+        assert_eq!(
+            apply_once_per_event_id(&events)
+                .task_run_by_key(&run_key_for_scope(&child_scope))
+                .unwrap()
+                .state,
+            crate::model::TaskState::Failed
+        );
+    }
+
+    #[test]
+    fn inactivity_timer_closes_once_at_the_boundary() {
+        let scope = SessionScope::ClaudeRoot(PARENT.to_owned());
+        let mut synthesis = Synthesis::with_lifecycle_timing(30, 50);
+        let events = synthesize(
+            &mut synthesis,
+            "session.jsonl",
+            [(
+                1,
+                LogFact::Append {
+                    scope: scope.clone(),
+                    at_ms: 100,
+                },
+            )],
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::Synthesized(event)
+                if matches!(event.event, ControllerEventKind::TaskStarted)
+        )));
+
+        assert!(synthesis.advance_lifecycle(149).is_empty());
+        assert!(matches!(
+            synthesis.advance_lifecycle(150).as_slice(),
+            [ProviderEvent::LaneClose { key, at_ms }]
+                if key == &run_key_for_scope(&scope) && *at_ms == 150
+        ));
+        assert!(synthesis.advance_lifecycle(200).is_empty());
     }
 
     #[test]
@@ -2919,10 +3327,25 @@ mod tests {
     fn backfill_window_parser_uses_positive_utf8_i64_or_default() {
         assert_eq!(parse_backfill_window_ms(None), DEFAULT_BACKFILL_WINDOW_MS);
         assert_eq!(parse_backfill_window_ms(Some(OsStr::new("42"))), 42);
+        assert_eq!(parse_complete_grace_ms(None), DEFAULT_COMPLETE_GRACE_MS);
+        assert_eq!(parse_complete_grace_ms(Some(OsStr::new("42"))), 42);
+        assert_eq!(
+            parse_headless_inactivity_ms(None),
+            DEFAULT_HEADLESS_INACTIVITY_MS
+        );
+        assert_eq!(parse_headless_inactivity_ms(Some(OsStr::new("42"))), 42);
         for value in ["", "0", "-1", "1.5", " 42", "9223372036854775808"] {
             assert_eq!(
                 parse_backfill_window_ms(Some(OsStr::new(value))),
                 DEFAULT_BACKFILL_WINDOW_MS
+            );
+            assert_eq!(
+                parse_complete_grace_ms(Some(OsStr::new(value))),
+                DEFAULT_COMPLETE_GRACE_MS
+            );
+            assert_eq!(
+                parse_headless_inactivity_ms(Some(OsStr::new(value))),
+                DEFAULT_HEADLESS_INACTIVITY_MS
             );
         }
     }

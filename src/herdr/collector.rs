@@ -40,6 +40,7 @@ use crate::performance::{
     Admission, Admitted, PerformanceClock, PerformanceIngress, PerformanceSampler,
     PerformanceSnapshot, SystemPerformanceClock, admitted_channel, performance_tracker,
 };
+use crate::provider::lane::LogLaneConfig;
 #[cfg(test)]
 use crate::provider::spawn_provider_thread_with_diagnostics;
 use crate::provider::{
@@ -1312,6 +1313,8 @@ pub async fn spawn_with_controller_and_performance_clock(
         Arc::new(UnavailableOccurrenceSink),
         empty_operator_seed(),
         None,
+        HashMap::new(),
+        LogLaneConfig::default(),
         performance_clock,
         Some(performance_observer),
     )
@@ -1376,9 +1379,11 @@ pub async fn spawn_with_controller_coverage_occurrence_sink_and_operator_seed(
     controller_coverage: SourceAvailability,
     occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
     restored_operator: RestoredOperatorState,
+    terminal_event_sources: HashMap<RunId, String>,
+    log_lane_config: LogLaneConfig,
     operator_commands: mpsc::Receiver<OperatorCommand>,
 ) -> Result<CollectorHandle, CollectorError> {
-    spawn_configured(
+    spawn_configured_with_lane_lifecycle(
         sock,
         session,
         restored,
@@ -1387,6 +1392,8 @@ pub async fn spawn_with_controller_coverage_occurrence_sink_and_operator_seed(
         controller_coverage,
         occurrence_sink,
         restored_operator,
+        terminal_event_sources,
+        log_lane_config,
         Some(operator_commands),
     )
     .await
@@ -1421,6 +1428,41 @@ async fn spawn_configured(
         occurrence_sink,
         restored_operator,
         operator_commands,
+        HashMap::new(),
+        LogLaneConfig::default(),
+        Arc::new(SystemPerformanceClock::new()),
+        #[cfg(feature = "workload-harness")]
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_configured_with_lane_lifecycle(
+    sock: PathBuf,
+    session: String,
+    restored: RestoredState,
+    writer: WriterClient,
+    controller_listener: Option<StdUnixListener>,
+    controller_coverage: SourceAvailability,
+    occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
+    restored_operator: RestoredOperatorState,
+    terminal_event_sources: HashMap<RunId, String>,
+    log_lane_config: LogLaneConfig,
+    operator_commands: Option<mpsc::Receiver<OperatorCommand>>,
+) -> Result<CollectorHandle, CollectorError> {
+    spawn_configured_inner(
+        sock,
+        session,
+        restored,
+        writer,
+        controller_listener,
+        controller_coverage,
+        occurrence_sink,
+        restored_operator,
+        operator_commands,
+        terminal_event_sources,
+        log_lane_config,
         Arc::new(SystemPerformanceClock::new()),
         #[cfg(feature = "workload-harness")]
         None,
@@ -1439,13 +1481,16 @@ async fn spawn_configured_inner(
     occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
     restored_operator: RestoredOperatorState,
     operator_commands: Option<mpsc::Receiver<OperatorCommand>>,
+    terminal_event_sources: HashMap<RunId, String>,
+    log_lane_config: LogLaneConfig,
     performance_clock: Arc<dyn PerformanceClock>,
     #[cfg(feature = "workload-harness")] performance_observer: Option<WorkloadPerformanceObserver>,
 ) -> Result<CollectorHandle, CollectorError> {
     let owner = OwnerTracker::from_environment();
     writer.replace_owner(owner.record()).await?;
 
-    let (reducer, model, operator) = Reducer::new_with_operator(restored, restored_operator);
+    let (mut reducer, model, operator) = Reducer::new_with_operator(restored, restored_operator);
+    reducer.restore_terminal_event_sources(terminal_event_sources);
     let (performance_sender, performance) = watch::channel(initial_performance_publication());
     let (quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
     let (source_quality_sender, source_quality) = watch::channel(ObservationQuality::Reconciling);
@@ -1483,7 +1528,11 @@ async fn spawn_configured_inner(
     );
     let standard_provider_roots = crate::provider::standard_discovery_roots_from_env();
     let provider_thread = match spawn_provider_thread_with_diagnostics_and_performance(
-        AdapterProviderWorker::new(standard_provider_roots, provider_diagnostics.clone()),
+        AdapterProviderWorker::new_with_log_lane_config(
+            standard_provider_roots,
+            provider_diagnostics.clone(),
+            log_lane_config,
+        ),
         provider_sender,
         Some(Box::new(RecommendedNotifyFactory)),
         provider_diagnostics,
@@ -3390,12 +3439,18 @@ impl AdapterProviderWorker {
         standard_roots: Vec<DiscoveryRoot>,
         diagnostics: crate::provider::ProviderDiagnostics,
     ) -> Self {
+        Self::new_with_log_lane_config(standard_roots, diagnostics, LogLaneConfig::default())
+    }
+
+    fn new_with_log_lane_config(
+        standard_roots: Vec<DiscoveryRoot>,
+        diagnostics: crate::provider::ProviderDiagnostics,
+        config: LogLaneConfig,
+    ) -> Self {
         let anchor_ms = crate::provider::lane::backfill_anchor_ms(
             None,
             unix_now_ms(),
-            crate::provider::lane::parse_backfill_window_ms(
-                env::var_os("HERDR_TOP_LOG_BACKFILL_MS").as_deref(),
-            ),
+            config.backfill_window_ms,
         );
         Self {
             roots: HashMap::new(),
@@ -3406,7 +3461,10 @@ impl AdapterProviderWorker {
             record_ordinals: HashMap::new(),
             log_admission: crate::provider::lane::Admission::new(anchor_ms),
             admission_index: crate::provider::lane::AdmissionIndex::new(),
-            synthesis: crate::provider::lane::Synthesis::default(),
+            synthesis: crate::provider::lane::Synthesis::with_lifecycle_timing(
+                config.complete_grace_ms,
+                config.headless_inactivity_ms,
+            ),
             generations: HashMap::new(),
             deferred: VecDeque::new(),
             standard_roots,
@@ -3434,6 +3492,11 @@ impl AdapterProviderWorker {
     #[cfg(test)]
     fn set_after_tail_chunk(&mut self, hook: impl FnMut(&Path, u64) + Send + 'static) {
         self.after_tail_chunk = Some(Box::new(hook));
+    }
+
+    fn emit_due_lifecycle_events(&mut self, pending: &mut PendingEvents) {
+        let events = self.synthesis.advance_lifecycle(unix_now_ms());
+        let _ = merge_adapter_events(events, pending, &mut self.deferred);
     }
 
     fn initialize_standard_baselines(&mut self) -> HashMap<(Provider, PathBuf), io::ErrorKind> {
@@ -3826,6 +3889,7 @@ impl ProviderWorker for AdapterProviderWorker {
         });
         if work.is_empty() {
             self.finish_completed_sweeps(&universes, cycle.pending);
+            self.emit_due_lifecycle_events(cycle.pending);
             return Ok(());
         }
         let start = resume_start(&work, self.resume_cursor.as_ref());
@@ -4124,6 +4188,7 @@ impl ProviderWorker for AdapterProviderWorker {
         }
         self.resume_cursor = None;
         self.finish_completed_sweeps(&universes, cycle.pending);
+        self.emit_due_lifecycle_events(cycle.pending);
         Ok(())
     }
 }
@@ -4659,9 +4724,30 @@ async fn apply_provider_event_with_admission(
             reducer.complete_operator_submission(outcome);
             Ok(())
         }
-        // Task 6 and Task 7 own these consumers. Keeping explicit no-op routes here
-        // makes their admission and delivery semantics real without implementing them early.
-        ProviderEvent::RunLiveness { .. } | ProviderEvent::Telemetry { .. } => {
+        ProviderEvent::RunLiveness { key, at_ms } => {
+            let persist = reducer.touch_run_liveness(&key, at_ms);
+            if let Some(admission) = admission.take() {
+                admission.complete();
+            }
+            if !persist.is_empty() {
+                let _ = persist_submission(persistence, reducer, persist).await?;
+            }
+            persistence.refresh_snapshot(&shared.borrow(), coverage);
+            Ok(())
+        }
+        ProviderEvent::LaneClose { key, at_ms } => {
+            let persist = reducer.apply_lane_close(&key, at_ms);
+            if let Some(admission) = admission.take() {
+                admission.complete();
+            }
+            if !persist.is_empty() {
+                let _ = persist_submission(persistence, reducer, persist).await?;
+            }
+            persistence.refresh_snapshot(&shared.borrow(), coverage);
+            Ok(())
+        }
+        // Task 7 owns this consumer. Keeping an explicit no-op route preserves admission.
+        ProviderEvent::Telemetry { .. } => {
             if let Some(admission) = admission.take() {
                 admission.complete();
             }
@@ -5864,6 +5950,7 @@ fn normalize_provider_event(
         }
         ProviderEvent::Synthesized(_)
         | ProviderEvent::RunLiveness { .. }
+        | ProviderEvent::LaneClose { .. }
         | ProviderEvent::Telemetry { .. }
         | ProviderEvent::SourceState { .. }
         | ProviderEvent::Malformed { .. } => NormalizedProviderObservation {

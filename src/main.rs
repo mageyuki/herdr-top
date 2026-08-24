@@ -23,7 +23,9 @@ use herdr_top::herdr::wire;
 use herdr_top::hook_adapter::{self, HookPayload};
 use herdr_top::lockfile::{self, LockError, OwnerRecord, StateRoot};
 use herdr_top::model::OperatorCommand;
-use herdr_top::provider::lane::parse_backfill_window_ms;
+use herdr_top::provider::lane::{
+    LogLaneConfig, parse_backfill_window_ms, parse_complete_grace_ms, parse_headless_inactivity_ms,
+};
 use herdr_top::rendezvous::{self, RvError};
 use herdr_top::session_key::{self, ResolvedSession, SessionKeyError};
 use herdr_top::store::{self, StoreError, WriterError};
@@ -388,10 +390,21 @@ async fn run_monitor(cli: &Cli, plugin_state_dir: Option<&OsStr>) -> Result<(), 
     let occurrence_sink = initialize_tracing(&root)?;
     let backfill_window_ms =
         parse_backfill_window_ms(env::var_os("HERDR_TOP_BACKFILL_WINDOW_MS").as_deref());
+    let complete_grace_ms =
+        parse_complete_grace_ms(env::var_os("HERDR_TOP_COMPLETE_GRACE_MS").as_deref());
+    let headless_inactivity_ms =
+        parse_headless_inactivity_ms(env::var_os("HERDR_TOP_HEADLESS_INACTIVITY_MS").as_deref());
     tracing::info!(
         backfill_window_ms,
+        complete_grace_ms,
+        headless_inactivity_ms,
         "resolved provider log lane startup configuration"
     );
+    let log_lane_config = LogLaneConfig {
+        backfill_window_ms,
+        complete_grace_ms,
+        headless_inactivity_ms,
+    };
     let (owner_lock, breadcrumb_status) =
         acquire_monitor_lock_with_plugin_dir(&root, plugin_state_dir)?;
     if let BreadcrumbLaunchStatus::Failed(error) = breadcrumb_status {
@@ -432,6 +445,7 @@ async fn run_monitor(cli: &Cli, plugin_state_dir: Option<&OsStr>) -> Result<(), 
     let store = store::open_writer(&root)?;
     let restored = store.load_restored_state()?;
     let restored_operator = store.load_restored_operator_state()?;
+    let terminal_event_sources = store.terminal_event_sources()?;
     let (lifecycle, writer) = store::spawn_writer(store)?;
     let session_name = resolved.session_key().name().to_owned();
     let (operator_commands, operator_command_receiver) =
@@ -446,6 +460,8 @@ async fn run_monitor(cli: &Cli, plugin_state_dir: Option<&OsStr>) -> Result<(), 
             controller_coverage,
             occurrence_sink,
             restored_operator,
+            terminal_event_sources,
+            log_lane_config,
             operator_command_receiver,
         )
         .await

@@ -212,6 +212,7 @@ fn event_id(event: &ProviderEvent) -> Option<&str> {
         | ProviderEvent::Activity { event_id, .. } => Some(event_id),
         ProviderEvent::Synthesized(_)
         | ProviderEvent::RunLiveness { .. }
+        | ProviderEvent::LaneClose { .. }
         | ProviderEvent::Telemetry { .. }
         | ProviderEvent::SourceState { .. }
         | ProviderEvent::Malformed { .. } => None,

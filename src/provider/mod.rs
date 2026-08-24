@@ -78,6 +78,8 @@ pub enum ProviderEvent {
     Synthesized(ControllerEvent),
     /// Append-time signal consumed by the lifecycle lane in Increment 9 Task 6.
     RunLiveness { key: RunKey, at_ms: i64 },
+    /// Append-silence transition consumed through the lane-specific reducer close path.
+    LaneClose { key: RunKey, at_ms: i64 },
     /// Allowlisted usage sample consumed by telemetry in Increment 9 Task 7.
     Telemetry {
         key: RunKey,
@@ -154,6 +156,7 @@ impl ProviderEvent {
             }),
             Self::Synthesized(_)
             | Self::RunLiveness { .. }
+            | Self::LaneClose { .. }
             | Self::Telemetry { .. }
             | Self::SourceState { .. }
             | Self::Malformed { .. } => None,
@@ -182,6 +185,7 @@ impl ProviderEvent {
             } => Some((event_id, *observed_at_ms, *position)),
             Self::Synthesized(_)
             | Self::RunLiveness { .. }
+            | Self::LaneClose { .. }
             | Self::Telemetry { .. }
             | Self::SourceState { .. }
             | Self::Malformed { .. } => None,
@@ -225,6 +229,7 @@ impl ProviderEventSender {
                     &event,
                     ProviderEvent::Synthesized(_)
                         | ProviderEvent::RunLiveness { .. }
+                        | ProviderEvent::LaneClose { .. }
                         | ProviderEvent::Telemetry { .. }
                         | ProviderEvent::SessionResolved { .. }
                         | ProviderEvent::AgentUpsert { .. }
@@ -886,6 +891,7 @@ impl PendingEvents {
             }
             event @ (ProviderEvent::Synthesized(_)
             | ProviderEvent::RunLiveness { .. }
+            | ProviderEvent::LaneClose { .. }
             | ProviderEvent::Telemetry { .. }) => {
                 if self.lane.len() >= self.capacity {
                     MergeOutcome::AtCapacity(Box::new(event))
@@ -910,6 +916,7 @@ impl PendingEvents {
             ProviderEvent::Activity { .. } => entity.activity.as_ref(),
             ProviderEvent::Synthesized(_)
             | ProviderEvent::RunLiveness { .. }
+            | ProviderEvent::LaneClose { .. }
             | ProviderEvent::Telemetry { .. }
             | ProviderEvent::SourceState { .. }
             | ProviderEvent::Malformed { .. } => unreachable!(),
@@ -952,6 +959,7 @@ impl PendingEvents {
             }
             ProviderEvent::Synthesized(_)
             | ProviderEvent::RunLiveness { .. }
+            | ProviderEvent::LaneClose { .. }
             | ProviderEvent::Telemetry { .. }
             | ProviderEvent::SourceState { .. }
             | ProviderEvent::Malformed { .. } => None,
@@ -966,6 +974,7 @@ impl PendingEvents {
             ProviderEvent::Activity { .. } => &mut entity.activity,
             ProviderEvent::Synthesized(_)
             | ProviderEvent::RunLiveness { .. }
+            | ProviderEvent::LaneClose { .. }
             | ProviderEvent::Telemetry { .. }
             | ProviderEvent::SourceState { .. }
             | ProviderEvent::Malformed { .. } => unreachable!(),
@@ -2371,6 +2380,7 @@ mod tests {
         match event {
             ProviderEvent::Synthesized(_) => "synthesized".to_owned(),
             ProviderEvent::RunLiveness { .. } => "liveness".to_owned(),
+            ProviderEvent::LaneClose { .. } => "lane-close".to_owned(),
             ProviderEvent::Telemetry { .. } => "telemetry".to_owned(),
             ProviderEvent::Activity { activity, .. } => activity.event_kind.unwrap(),
             ProviderEvent::SessionResolved {
