@@ -41,7 +41,7 @@ impl FixtureIndex {
             let relative_path = fixture_artifact_name(file_name);
             let path = directory.path().join(&relative_path);
             fs::write(&path, bytes).unwrap();
-            admission.admit_pane_artifact(Provider::Codex, &path);
+            assert!(admission.admit_pane_artifact(Provider::Codex, &path));
             relative_paths.insert((*file_name).to_owned(), relative_path);
         }
         let mut index = DiscoveryIndex::new(vec![DiscoveryRoot {

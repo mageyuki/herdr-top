@@ -2061,7 +2061,7 @@ mod tests {
         let mut admission = lane::Admission::new(0);
         for root in index.roots.clone() {
             for artifact in discover_artifacts(&root.path, false)?.artifacts {
-                admission
+                let _ = admission
                     .admit_pane_artifact(root.provider, &root.path.join(artifact.relative_path));
             }
         }
@@ -2180,7 +2180,7 @@ mod tests {
         }])
         .unwrap();
         let mut admission = lane::Admission::new(0);
-        admission.admit_pane_artifact(Provider::Claude, &admitted);
+        assert!(admission.admit_pane_artifact(Provider::Claude, &admitted));
         let mut parser = LineParser { calls: 0 };
 
         index

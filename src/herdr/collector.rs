@@ -3632,8 +3632,13 @@ impl ProviderWorker for AdapterProviderWorker {
                 self.diagnostics.record_invalid_target();
                 continue;
             };
-            self.log_admission
-                .admit_pane_artifact(target.provider, &target.path);
+            if !self
+                .log_admission
+                .admit_pane_artifact(target.provider, &target.path)
+            {
+                self.diagnostics.record_invalid_target();
+                continue;
+            }
             targets_by_root
                 .entry((target.provider, root))
                 .or_default()
@@ -12271,7 +12276,7 @@ mod provider_integration_tests {
         let claude_root = directory.path().join("claude/.claude/projects");
         let codex_root = directory.path().join("codex/.codex/sessions");
         std::fs::create_dir_all(&claude_root).unwrap();
-        let claude = claude_root.join("good.jsonl");
+        let claude = claude_root.join("d414d449-40ef-448f-9c0b-fb239dc81bd8.jsonl");
         std::fs::write(&claude, b"").unwrap();
         let targets = TargetSet::new([
             ProviderTarget {
@@ -12356,6 +12361,33 @@ mod provider_integration_tests {
             tail_read_calls(&worker, &root, &codex_artifact_name("valid"))
                 .is_some_and(|calls| calls > 0)
         );
+    }
+
+    #[test]
+    fn mis_shaped_pane_target_is_rejected_and_diagnosed() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("codex/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("session.jsonl");
+        std::fs::write(&target, b"{}\n").unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root,
+            }],
+            diagnostics.clone(),
+        );
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path: target.clone(),
+        }]);
+        let mut pending = PendingEvents::new(diagnostics.clone());
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+
+        assert_eq!(diagnostics.invalid_targets(), 1);
+        assert!(!worker.log_admission.is_admitted_path(&target));
     }
 
     #[test]
@@ -12926,9 +12958,11 @@ mod provider_integration_tests {
         let mut inner_state = AdapterRootState::new(Provider::Codex, inner).unwrap();
         let mut worker = AdapterProviderWorker::default();
         let mut parser = AdapterBootstrapParser::default();
-        worker
-            .log_admission
-            .admit_pane_artifact(Provider::Codex, &absolute);
+        assert!(
+            worker
+                .log_admission
+                .admit_pane_artifact(Provider::Codex, &absolute)
+        );
 
         outer_state
             .discovery

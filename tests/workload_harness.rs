@@ -2611,7 +2611,8 @@ async fn run_fallback_arm(poll: Duration, notification: bool, sequence: u64) -> 
     let temporary = tempfile::tempdir().unwrap();
     let sessions = temporary.path().join("home/.codex/sessions");
     std::fs::create_dir_all(&sessions).unwrap();
-    let session_file = sessions.join("fallback-owner.jsonl");
+    let session_file =
+        sessions.join("rollout-2026-08-24T00-00-00-70c152e6-9912-4c7b-b34c-c6b6553d8115.jsonl");
     std::fs::write(
         &session_file,
         b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"fallback-owner\",\"session_id\":\"fallback-owner\",\"model\":\"gpt-test\"}}\n",

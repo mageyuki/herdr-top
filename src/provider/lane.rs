@@ -914,13 +914,16 @@ impl Admission {
     /// Admits an exact provider transcript path and its pane-root identity.
     ///
     /// Claude accepts only `<uuid>.jsonl`; Codex accepts only `rollout-*.jsonl` containing
-    /// a rollout UUID. Any path that does not match the given provider is silently ignored.
-    pub fn admit_pane_artifact(&mut self, provider: Provider, path: &Path) {
+    /// a rollout UUID. Returns `true` when the path is admitted and `false` when the path does
+    /// not match the given provider.
+    #[must_use]
+    pub fn admit_pane_artifact(&mut self, provider: Provider, path: &Path) -> bool {
         let Some(session_id) = pane_artifact_session_id(provider, path) else {
-            return;
+            return false;
         };
         self.pane_paths.insert(path.to_path_buf());
         self.admit_pane_session(provider, &session_id);
+        true
     }
 
     /// Applies one allowlisted evidence ID emitted by an already-admitted parent scope.
@@ -2541,7 +2544,7 @@ mod tests {
         let invalid = Path::new("/etc/shadow");
         let mut admission = Admission::new(0);
 
-        admission.admit_pane_artifact(Provider::Codex, invalid);
+        assert!(!admission.admit_pane_artifact(Provider::Codex, invalid));
 
         assert!(!admission.is_admitted_path(invalid));
     }
@@ -2553,7 +2556,7 @@ mod tests {
         ));
         let mut admission = Admission::new(0);
 
-        admission.admit_pane_artifact(Provider::Codex, &valid);
+        assert!(admission.admit_pane_artifact(Provider::Codex, &valid));
 
         assert!(admission.is_admitted_path(&valid));
     }
@@ -2565,7 +2568,7 @@ mod tests {
         ));
         let mut admission = Admission::new(0);
 
-        admission.admit_pane_artifact(Provider::Claude, &valid);
+        assert!(admission.admit_pane_artifact(Provider::Claude, &valid));
 
         assert!(admission.is_admitted_path(&valid));
     }
@@ -2576,8 +2579,8 @@ mod tests {
         let claude = PathBuf::from(format!("/projects/workspace/{PARENT}.jsonl"));
         let mut admission = Admission::new(0);
 
-        admission.admit_pane_artifact(Provider::Claude, &codex);
-        admission.admit_pane_artifact(Provider::Codex, &claude);
+        assert!(!admission.admit_pane_artifact(Provider::Claude, &codex));
+        assert!(!admission.admit_pane_artifact(Provider::Codex, &claude));
 
         assert!(!admission.is_admitted_path(&codex));
         assert!(!admission.is_admitted_path(&claude));

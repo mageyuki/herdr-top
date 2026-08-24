@@ -260,7 +260,8 @@ async fn allowlist_scan_is_non_vacuous_across_every_artifact() {
     let provider_directory = tempfile::tempdir().expect("provider base should exist");
     let observed_root = provider_directory.path().join(".codex/sessions");
     fs::create_dir_all(&observed_root).expect("observed root should exist before observation");
-    let observed_file = observed_root.join("allowlist-root.jsonl");
+    let observed_file = observed_root
+        .join("rollout-2026-08-24T00-00-00-c0d15934-5f67-465f-8157-708524997bb0.jsonl");
     assert!(!observed_file.exists());
 
     let snapshot = snapshot_with_provider_path(&observed_file);
