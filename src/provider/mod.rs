@@ -799,6 +799,7 @@ struct PendingEntity {
     identity: Option<PendingSlot>,
     upsert: Option<PendingSlot>,
     activity: Option<PendingSlot>,
+    lane_activity: Option<PendingSlot>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -829,6 +830,7 @@ enum PendingToken {
     Identity(EntityKey),
     Upsert(EntityKey),
     Activity(EntityKey),
+    LaneActivity(EntityKey),
     Malformed(MalformedKey),
 }
 
@@ -921,6 +923,11 @@ impl PendingEvents {
     }
 
     fn merge_entity(&mut self, event: ProviderEvent) -> MergeOutcome {
+        let lane_activity = matches!(
+            &event,
+            ProviderEvent::Activity { activity, .. }
+                if activity.event_kind.as_deref() == Some(lane::LIVE_LINE_EVENT_KIND)
+        );
         let key = event.entity_key().expect("entity event has a key");
         if !self.entities.contains_key(&key) && self.entities.len() >= self.capacity {
             return MergeOutcome::AtCapacity(Box::new(event));
@@ -929,6 +936,7 @@ impl PendingEvents {
         let existing_slot = match &event {
             ProviderEvent::SessionResolved { .. } => entity.identity.as_ref(),
             ProviderEvent::AgentUpsert { .. } => entity.upsert.as_ref(),
+            ProviderEvent::Activity { .. } if lane_activity => entity.lane_activity.as_ref(),
             ProviderEvent::Activity { .. } => entity.activity.as_ref(),
             ProviderEvent::Synthesized(_)
             | ProviderEvent::RunLiveness { .. }
@@ -987,6 +995,7 @@ impl PendingEvents {
         let slot = match event {
             ProviderEvent::SessionResolved { .. } => &mut entity.identity,
             ProviderEvent::AgentUpsert { .. } => &mut entity.upsert,
+            ProviderEvent::Activity { .. } if lane_activity => &mut entity.lane_activity,
             ProviderEvent::Activity { .. } => &mut entity.activity,
             ProviderEvent::Synthesized(_)
             | ProviderEvent::RunLiveness { .. }
@@ -1064,6 +1073,9 @@ impl PendingEvents {
             if let Some(slot) = entity.activity.as_ref() {
                 return Some((PendingToken::Activity(key.clone()), slot.event.clone()));
             }
+            if let Some(slot) = entity.lane_activity.as_ref() {
+                return Some((PendingToken::LaneActivity(key.clone()), slot.event.clone()));
+            }
         }
 
         let mut malformed = self.malformed.keys().collect::<Vec<_>>();
@@ -1107,6 +1119,12 @@ impl PendingEvents {
                 }
                 self.remove_empty_entity(&key);
             }
+            PendingToken::LaneActivity(key) => {
+                if let Some(entity) = self.entities.get_mut(&key) {
+                    entity.lane_activity = None;
+                }
+                self.remove_empty_entity(&key);
+            }
             PendingToken::Malformed(key) => {
                 if let Some(pending) = self.malformed.get_mut(&key) {
                     pending.samples.pop_front();
@@ -1120,7 +1138,10 @@ impl PendingEvents {
 
     fn remove_empty_entity(&mut self, key: &EntityKey) {
         if self.entities.get(key).is_some_and(|entity| {
-            entity.identity.is_none() && entity.upsert.is_none() && entity.activity.is_none()
+            entity.identity.is_none()
+                && entity.upsert.is_none()
+                && entity.activity.is_none()
+                && entity.lane_activity.is_none()
         }) {
             self.entities.remove(key);
         }

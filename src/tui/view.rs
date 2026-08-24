@@ -1084,12 +1084,12 @@ pub(crate) fn build_uncollapsed_rows(model: &DomainModel, state: &AppState) -> V
 }
 
 fn build_full_rows(model: &DomainModel, state: &AppState) -> Vec<TreeRow> {
-    let newest_agents = newest_agent_nodes(model);
     match state.view_mode() {
-        ViewMode::ExecutionTree => build_tree_rows(model, state, &newest_agents),
-        ViewMode::DependencyDag => {
-            dag::build_rows(model, state.dag_order(), state.now_ms(), &newest_agents)
+        ViewMode::ExecutionTree => {
+            let newest_agents = newest_agent_nodes(model);
+            build_tree_rows(model, state, &newest_agents)
         }
+        ViewMode::DependencyDag => dag::build_rows(model, state.dag_order(), state.now_ms()),
     }
 }
 
@@ -1530,9 +1530,10 @@ pub(crate) fn task_run_label(
     run: &TaskRun,
     shared: bool,
     now_ms: i64,
-    newest_agent: Option<&AgentNode>,
+    stalled: bool,
 ) -> String {
-    let label = legacy_run_row_label(run, newest_agent, now_ms);
+    let mut label = run_row_head(model, run, stalled);
+    append_run_duration(&mut label, run, now_ms);
     append_task_run_annotations(model, run, label, shared, true)
 }
 
@@ -1578,36 +1579,6 @@ fn append_task_run_annotations(
     if !linked {
         label.push_str(" [unlinked]");
     }
-    label
-}
-
-fn legacy_run_row_label(run: &TaskRun, newest_agent: Option<&AgentNode>, now_ms: i64) -> String {
-    let mut label = worker_kind_label(run);
-    let subject = run
-        .subject
-        .as_deref()
-        .map_or_else(|| run_subject_fallback(run), safe_text);
-    if !subject.is_empty() {
-        label.push(' ');
-        label.push_str(&subject);
-    }
-    if !run.state.is_terminal()
-        && let Some(event_kind) = newest_agent.and_then(|agent| agent.last_event_kind.as_deref())
-    {
-        label.push_str(" — ");
-        label.push_str(&safe_text(event_kind));
-        if let Some(tool_name) = newest_agent.and_then(|agent| agent.last_tool_name.as_deref()) {
-            label.push_str(": ");
-            label.push_str(&safe_text(tool_name));
-        }
-    }
-    if let Some(model_id) = newest_agent.and_then(|agent| agent.model_id.as_deref()) {
-        label.push_str(" [model:");
-        label.push_str(&safe_text(model_id));
-        label.push(']');
-    }
-    label.push_str(&format!(" [{}]", task_state_label(run.state)));
-    append_run_duration(&mut label, run, now_ms);
     label
 }
 
@@ -1754,21 +1725,7 @@ fn run_row_label_with_agent(
     live_lines: &LiveLineReadModel,
     stalled: bool,
 ) -> String {
-    let mut label = status_glyph(run.state, stalled).to_owned();
-    label.push(' ');
-    label.push_str(&worker_kind_label(run));
-    let subject = if is_codex_worker(model, run) {
-        String::new()
-    } else {
-        run.subject
-            .as_deref()
-            .map_or_else(|| run_subject_fallback(run), safe_text)
-    };
-    if !subject.is_empty() {
-        label.push(' ');
-        label.push_str(&subject);
-    }
-
+    let mut label = run_row_head(model, run, stalled);
     let live_line = live_lines.get(&run.run_id).map(str::to_owned).or_else(|| {
         newest_agent
             .filter(|agent| run_uses_claude_tool_line(run, agent))
@@ -1794,6 +1751,24 @@ fn run_row_label_with_agent(
         label.push_str(&live_line);
     }
     append_run_duration(&mut label, run, now_ms);
+    label
+}
+
+fn run_row_head(model: &DomainModel, run: &TaskRun, stalled: bool) -> String {
+    let mut label = status_glyph(run.state, stalled).to_owned();
+    label.push(' ');
+    label.push_str(&worker_kind_label(run));
+    let subject = if is_codex_worker(model, run) {
+        String::new()
+    } else {
+        run.subject
+            .as_deref()
+            .map_or_else(|| run_subject_fallback(run), safe_text)
+    };
+    if !subject.is_empty() {
+        label.push(' ');
+        label.push_str(&subject);
+    }
     label
 }
 
@@ -1925,18 +1900,6 @@ fn provider_label(provider: Provider) -> &'static str {
     }
 }
 
-fn task_state_label(state: TaskState) -> &'static str {
-    match state {
-        TaskState::Queued => "queued",
-        TaskState::Running => "running",
-        TaskState::Blocked => "blocked",
-        TaskState::Completed => "completed",
-        TaskState::Failed => "failed",
-        TaskState::Cancelled => "cancelled",
-        TaskState::EndedUnknown => "ended_unknown",
-    }
-}
-
 fn exec_state_label(state: &ExecState) -> &'static str {
     match state {
         ExecState::Unknown => "unknown",
@@ -2008,7 +1971,7 @@ mod tests {
     };
     use crate::performance::{PerformanceDegradationReason, PerformanceSnapshot};
     use crate::store::writer::PersistenceStatus;
-    use crate::tui::app::{App, AppState, HeaderInputs, SystemClock, TuiSetup};
+    use crate::tui::app::{App, AppState, Clock, HeaderInputs, SystemClock, TuiSetup};
 
     fn run_id(value: &str) -> RunId {
         RunId::parse(value).unwrap()
@@ -2150,6 +2113,43 @@ mod tests {
                 format!("{glyph} claude-code subject")
             );
         }
+    }
+
+    #[test]
+    fn build_rows_marks_quiet_run_stalled() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let now_ms = SystemClock.now_ms();
+        let mut run = label_run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "quiet-session".to_owned(),
+            },
+            TaskState::Running,
+            None,
+            None,
+            Some("quiet work"),
+        );
+        run.updated_at_ms = Some(
+            now_ms
+                .saturating_sub(crate::activity::DEFAULT_STALL_WARN_MS)
+                .saturating_sub(1),
+        );
+        let mut model = DomainModel::default();
+        model.insert_task_run(run);
+        let (_sender, receiver) = watch::channel(Arc::new(model));
+        let app = App::new(receiver, HeaderInputs::default());
+
+        let row = build_rows(app.model(), app.state())
+            .into_iter()
+            .find(|row| row.key.run_id() == Some(run_id))
+            .expect("build_rows renders the quiet run");
+
+        assert!(
+            row.label.starts_with("⚠ "),
+            "quiet run did not render the stall glyph: {}",
+            row.label
+        );
     }
 
     #[test]
@@ -2619,12 +2619,12 @@ mod tests {
         });
 
         assert_eq!(
-            task_run_label(&model, &child, true, 10, None),
-            "claude-code Shared child [running] [shared] [dispatched by: Parent]"
+            task_run_label(&model, &child, true, 10, false),
+            "● claude-code Shared child [shared] [dispatched by: Parent]"
         );
         assert_eq!(
-            task_run_label(&model, &orphan, false, 10, None),
-            "codex Orphan [queued] [unlinked]"
+            task_run_label(&model, &orphan, false, 10, false),
+            "◌ codex Orphan [unlinked]"
         );
     }
 
@@ -4030,8 +4030,8 @@ mod tests {
         assert!(!dependent_columns[2].contains("前提"));
 
         let initial_activity = rows.iter().find(|row| row.contains("Selected:")).unwrap();
-        assert!(initial_activity.contains("Selected: 依存先🙂with-a-long-tail"));
-        assert!(!initial_activity.contains("Selected: 前提🙂"));
+        assert!(initial_activity.contains("Selected: ● 依存先🙂with-a-long-tail"));
+        assert!(!initial_activity.contains("Selected: ● 前提🙂"));
 
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(
@@ -4046,8 +4046,8 @@ mod tests {
             .iter()
             .find(|row| row.contains("Selected:"))
             .unwrap();
-        assert!(moved_activity.contains("Selected: 前提🙂"));
-        assert!(!moved_activity.contains("Selected: 依存先"));
+        assert!(moved_activity.contains("Selected: ● 前提🙂"));
+        assert!(!moved_activity.contains("Selected: ● 依存先"));
 
         let minimum_rows = render(&app, 48, 18);
         let screen = minimum_rows.join("\n");
@@ -4057,7 +4057,7 @@ mod tests {
         assert!(screen.contains("Prereqs"));
         assert!(screen.contains("Dependents"));
         assert!(screen.contains("前提"));
-        assert!(screen.contains("Selected: 前提"));
+        assert!(screen.contains("Selected: ● 前提"));
         for row in &minimum_rows {
             assert!(
                 Line::raw(row.as_str()).width() <= 48,

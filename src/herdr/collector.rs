@@ -11528,7 +11528,7 @@ mod provider_integration_tests {
         AgentNode, ControllerEventKind, DisplayOrdinal, DomainModel, ExecState, ExecutionEdge,
         MinimalProviderMetadata, RunId, RunKey, SharedModel, TaskRun, TaskState,
     };
-    use crate::provider::claude_facts::extract_claude_line;
+    use crate::provider::claude_facts::{extract_claude_line, extract_meta_json};
     use crate::provider::facts::{ActivitySource, LogFact, SessionScope};
     use crate::provider::lane::{Admission, AdmissionIndex, Synthesis};
     use crate::provider::{ProviderCycle, ProviderEvent, ProviderWorker, SourcePosition};
@@ -11804,6 +11804,93 @@ mod provider_integration_tests {
     }
 
     #[tokio::test]
+    async fn lane_and_adapter_activity_for_same_codex_rollout_both_reach_model() {
+        const ROLLOUT: &str = "019f7504-83e2-75f0-870d-cc423f88a73b";
+        let fixture = include_str!("../../tests/fixtures/provider/codex-depth2-child.jsonl");
+        let root_meta = fixture
+            .lines()
+            .nth(1)
+            .expect("fixture has copied root metadata");
+        let adapter_activity = fixture
+            .lines()
+            .nth(15)
+            .expect("fixture has root activity in the child rollout");
+        let task_started = r#"{"timestamp":"2026-08-24T02:00:00.020Z","type":"event_msg","payload":{"type":"task_started"}}"#;
+        let commentary = r#"{"timestamp":"2026-08-24T02:00:01.010Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","content":[{"type":"Text","text":"adapter and lane both survive"}],"phase":"commentary"}}}"#;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("fallback/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new_with_log_lane_config(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+            LogLaneConfig {
+                headless_inactivity_ms: i64::MAX / 2,
+                ..LogLaneConfig::default()
+            },
+        );
+        let mut pending = PendingEvents::new(diagnostics);
+        let path = root.join(format!("rollout-2026-08-24T02-00-00-{ROLLOUT}.jsonl"));
+        std::fs::write(&path, format!("{root_meta}\n")).unwrap();
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path: path.clone(),
+        }]);
+        let mut harness = LaneModelHarness::new();
+        let mut seed_synthesis = Synthesis::default();
+        let mut seed_admission = Admission::new(0);
+        let seed = seed_synthesis.synthesize_batch(
+            Path::new("seed-rollout.jsonl"),
+            [(
+                1,
+                LogFact::CodexTurnStarted {
+                    rollout_id: ROLLOUT.to_owned(),
+                    at_ms: 1,
+                },
+            )],
+            &mut seed_admission,
+            &AdmissionIndex::new(),
+        );
+        harness.apply(seed).await;
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        harness.apply(drain_pending(&mut pending)).await;
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(file, "{task_started}").unwrap();
+        writeln!(file, "{adapter_activity}").unwrap();
+        writeln!(file, "{commentary}").unwrap();
+        file.flush().unwrap();
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        harness.apply(drain_pending(&mut pending)).await;
+
+        let run_id = harness.run_id(&RunKey::Native {
+            provider: Provider::Codex,
+            sid: ROLLOUT.to_owned(),
+        });
+        {
+            let model = harness.shared.borrow();
+            let adapter_node = model
+                .agent_nodes()
+                .find(|node| {
+                    node.task_run_id == run_id && node.native_session_id.as_deref() == Some(ROLLOUT)
+                })
+                .expect("adapter root node reaches the model");
+            assert_eq!(adapter_node.last_event_kind.as_deref(), Some("interacted"));
+            assert_eq!(adapter_node.last_activity_at_ms, Some(1_784_391_169_725));
+        }
+        let row = harness.row_label(run_id);
+        assert!(
+            row.contains(" — adapter and lane both survive"),
+            "lane commentary did not survive the mixed batch: {row}"
+        );
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn terminal_rows_drop_live() {
         const ROLLOUT: &str = "33333333-3333-4333-8333-333333333333";
         let scope = SessionScope::Codex {
@@ -11878,9 +11965,12 @@ mod provider_integration_tests {
         const TITLE_SESSION: &str = "44444444-4444-4444-8444-444444444444";
         const CWD_SESSION: &str = "55555555-5555-4555-8555-555555555555";
         const ID_SESSION: &str = "66666666-6666-4666-8666-666666666666";
+        const META_PARENT: &str = "88888888-8888-4888-8888-888888888888";
+        const META_AGENT: &str = "agent-meta-subject";
         let title_scope = SessionScope::ClaudeRoot(TITLE_SESSION.to_owned());
         let cwd_scope = SessionScope::ClaudeRoot(CWD_SESSION.to_owned());
         let id_scope = SessionScope::ClaudeRoot(ID_SESSION.to_owned());
+        let meta_parent_scope = SessionScope::ClaudeRoot(META_PARENT.to_owned());
         let mut synthesis = Synthesis::default();
         let mut admission = Admission::new(0);
         let mut harness = LaneModelHarness::new();
@@ -11932,6 +12022,28 @@ mod provider_integration_tests {
             "{\"type\":\"user\",\"timestamp\":\"2026-08-24T00:00:03Z\"}",
         );
         harness.apply(id_events).await;
+        let meta_parent_events = synthesize_claude_record(
+            &mut synthesis,
+            &mut admission,
+            Path::new("meta-parent.jsonl"),
+            &meta_parent_scope,
+            1,
+            "{\"type\":\"user\",\"timestamp\":\"2026-08-24T00:00:04Z\"}",
+        );
+        harness.apply(meta_parent_events).await;
+        let meta_fact = extract_meta_json(
+            META_PARENT,
+            META_AGENT,
+            br#"{"agentType":"reviewer","description":"Review the meta-derived subject","toolUseId":"tool-meta","spawnDepth":1}"#,
+        )
+        .expect("meta fixture yields an allowlisted appearance fact");
+        let meta_events = synthesis.synthesize_batch(
+            Path::new("agent-meta-subject.meta.json"),
+            [(2, meta_fact)],
+            &mut admission,
+            &AdmissionIndex::new(),
+        );
+        harness.apply(meta_events).await;
 
         let title_id = harness.run_id(&RunKey::Controller(format!(
             "hook:claude-code:{TITLE_SESSION}"
@@ -11942,11 +12054,14 @@ mod provider_integration_tests {
         let fallback_id = harness.run_id(&RunKey::Controller(format!(
             "hook:claude-code:{ID_SESSION}"
         )));
+        let meta_id = harness.run_id(&RunKey::Controller(format!(
+            "hook:claude-code:{META_PARENT}:agent:{META_AGENT}"
+        )));
         assert!(
             harness
                 .row_label(title_id)
                 .contains("claude-code Latest title"),
-            "latest ai-title did not win"
+            "latest ai-title did not win over cwd"
         );
         assert!(
             harness
@@ -11959,6 +12074,12 @@ mod provider_integration_tests {
                 .row_label(fallback_id)
                 .contains(&format!("claude-code {ID_SESSION}")),
             "session id did not supply the final fallback"
+        );
+        assert!(
+            harness
+                .row_label(meta_id)
+                .contains("claude-code Review the meta-derived subject"),
+            "meta.json description did not supply the dispatched subject"
         );
 
         harness.shutdown().await;

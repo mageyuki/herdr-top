@@ -793,7 +793,7 @@ fn live_line_event(
         event_id: deterministic_live_line_event_id(artifact, ordinal, sequence, scope),
         observed_at_ms: at_ms,
         position: SourcePosition {
-            path_id: 0,
+            path_id: u32::MAX,
             generation: 0,
             offset: ordinal,
         },
@@ -3238,6 +3238,60 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(batched, separate);
+    }
+
+    #[test]
+    fn live_line_events_use_reserved_source_positions() {
+        let scope = SessionScope::Codex {
+            rollout_id: ROLLOUT.to_owned(),
+        };
+        let events = synthesize(
+            &mut Synthesis::default(),
+            "rollout.jsonl",
+            [
+                (
+                    7,
+                    LogFact::Activity {
+                        scope: scope.clone(),
+                        at_ms: 1,
+                        source: ActivitySource::Command,
+                        line: "command".to_owned(),
+                    },
+                ),
+                (
+                    9,
+                    LogFact::Activity {
+                        scope,
+                        at_ms: 2,
+                        source: ActivitySource::Commentary,
+                        line: "commentary".to_owned(),
+                    },
+                ),
+            ],
+        );
+        let positions = events
+            .into_iter()
+            .filter_map(|event| match event {
+                ProviderEvent::Activity { position, .. } => Some(position),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            positions,
+            [
+                SourcePosition {
+                    path_id: u32::MAX,
+                    generation: 0,
+                    offset: 7,
+                },
+                SourcePosition {
+                    path_id: u32::MAX,
+                    generation: 0,
+                    offset: 9,
+                },
+            ]
+        );
     }
 
     #[test]

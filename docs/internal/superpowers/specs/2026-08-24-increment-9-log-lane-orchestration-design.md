@@ -210,6 +210,8 @@ same-agent resume continues the same branch.
 As v1 (glyphs, subject chain, live line, columns, shedding, indent
 compression) with v2 corrections:
 
+The dependency DAG renders the status glyph plus label without the live line.
+
 - EFF is real on BOTH providers (Claude assistant records carry top-level
   `effort` — verified), so the column shows actual values, `—` only when
   genuinely absent.

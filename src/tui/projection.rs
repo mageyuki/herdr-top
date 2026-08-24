@@ -217,7 +217,9 @@ pub(crate) fn project_rows(
             continue;
         };
         if is_default_visible_task_run(run, operator, &execution_run_ids, now_ms) {
-            if let RunKey::Provisional { start_ms, .. } = &run.key {
+            if !run.state.is_terminal()
+                && let RunKey::Provisional { start_ms, .. } = &run.key
+            {
                 let last_observed_ms = run.updated_at_ms.or(run.created_at_ms).unwrap_or(*start_ms);
                 let expiry = last_observed_ms.saturating_add(ghost_visibility_ms());
                 next_expiry_ms = Some(next_expiry_ms.map_or(expiry, |current| current.min(expiry)));
@@ -1201,6 +1203,47 @@ mod tests {
     }
 
     #[test]
+    fn terminal_provisional_schedules_terminal_instead_of_ghost_expiry() {
+        let updated_at_ms = 100;
+        let mut terminal = run("terminal-provisional", 1, TaskState::Completed);
+        terminal.key = RunKey::Provisional {
+            terminal_id: "terminal".to_owned(),
+            start_ms: updated_at_ms,
+            seq: 1,
+        };
+        terminal.updated_at_ms = Some(updated_at_ms);
+        let mut model = DomainModel::default();
+        model.insert_task_run(terminal.clone());
+        let rows = vec![row(
+            NodeKey::Run {
+                run_id: terminal.run_id,
+                pane_id: None,
+            },
+            0,
+            "terminal provisional",
+        )];
+
+        let projection = project_rows(
+            &model,
+            &rows,
+            &operator(
+                Vec::new(),
+                HashMap::from([(terminal.run_id, updated_at_ms)]),
+            ),
+            "",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            updated_at_ms + crate::activity::DEFAULT_GHOST_VISIBILITY_MS,
+        );
+
+        assert_eq!(projection.rows.len(), 1);
+        assert_eq!(
+            projection.next_expiry_ms,
+            Some(updated_at_ms + crate::activity::DEFAULT_TERMINAL_VISIBILITY_MS)
+        );
+    }
+
+    #[test]
     fn hook_only_and_live_duration_deadlines_choose_the_minimum_in_both_directions() {
         let mut hook_only = run("hook-only", 1, TaskState::Running);
         hook_only.created_at_ms = Some(0);
@@ -1470,14 +1513,7 @@ mod tests {
             model.insert_agent_node(agent);
         }
 
-        let newest_agents = crate::tui::view::newest_agent_nodes(&model);
-        let label = crate::tui::view::task_run_label(
-            &model,
-            &selected,
-            false,
-            9_000,
-            newest_agents.get(&selected.run_id).copied(),
-        );
+        let label = crate::tui::view::task_run_label(&model, &selected, false, 9_000, false);
         assert!(!label.contains(full_key));
         let selected_row = row(
             NodeKey::Run {
@@ -1837,11 +1873,10 @@ mod tests {
             dependent_run_id: child.run_id,
         });
 
-        let tree_label = crate::tui::view::task_run_label(&model, &child, false, 0, None);
+        let tree_label = crate::tui::view::task_run_label(&model, &child, false, 0, false);
         let mut dag_order = crate::tui::dag::DagOrder::default();
         dag_order.recompute(&model);
-        let newest_agents = crate::tui::view::newest_agent_nodes(&model);
-        let dag_text = crate::tui::dag::build_rows(&model, &dag_order, 0, &newest_agents)
+        let dag_text = crate::tui::dag::build_rows(&model, &dag_order, 0)
             .into_iter()
             .flat_map(|row| {
                 std::iter::once(row.label)
@@ -1862,7 +1897,7 @@ mod tests {
                 pane_id: Some("pane".to_owned()),
             },
             0,
-            &crate::tui::view::task_run_label(&model, &child, false, 0, None),
+            &crate::tui::view::task_run_label(&model, &child, false, 0, false),
         );
         let tied = operator(
             vec![

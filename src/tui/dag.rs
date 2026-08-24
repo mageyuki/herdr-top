@@ -6,7 +6,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use crate::model::{DomainModel, RunId};
 
 use super::app::NodeKey;
-use super::view::{NewestAgentNodes, TreeRow, short_run_name, task_run_label};
+use super::view::{TreeRow, short_run_name, task_run_label};
 
 /// Session-local dependency order derived from the last displayed DAG.
 #[derive(Debug, Default)]
@@ -142,12 +142,9 @@ impl DagOrder {
     }
 }
 
-pub(crate) fn build_rows(
-    model: &DomainModel,
-    order: &DagOrder,
-    now_ms: i64,
-    newest_agents: &NewestAgentNodes<'_>,
-) -> Vec<TreeRow> {
+pub(crate) fn build_rows(model: &DomainModel, order: &DagOrder, now_ms: i64) -> Vec<TreeRow> {
+    let stalled_runs =
+        super::projection::stalled_run_ids(model, now_ms, crate::activity::stall_warn_ms());
     let mut prerequisites = HashMap::<RunId, Vec<RunId>>::new();
     let mut dependents = HashMap::<RunId, Vec<RunId>>::new();
     for edge in model.dependency_edges() {
@@ -192,7 +189,7 @@ pub(crate) fn build_rows(
                 run,
                 false,
                 now_ms,
-                newest_agents.get(&run.run_id).copied(),
+                stalled_runs.contains(&run.run_id),
             ),
             prerequisites: neighbor_names(prerequisites.get(&run.run_id)),
             dependents: neighbor_names(dependents.get(&run.run_id)),
@@ -513,8 +510,7 @@ mod tests {
         let mut order = DagOrder::default();
         order.recompute(&model);
 
-        let newest_agents = crate::tui::view::newest_agent_nodes(&model);
-        let rows = super::build_rows(&model, &order, 0, &newest_agents);
+        let rows = super::build_rows(&model, &order, 0);
 
         assert_eq!(rows.len(), model.task_runs().count());
         assert!(
@@ -530,7 +526,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(dependent.label, "D D [queued] [dispatched by: Dispatcher]");
+        assert_eq!(dependent.label, "◌ D D [dispatched by: Dispatcher]");
         assert_eq!(dependent.prerequisites, ["Q", "P"]);
         assert_eq!(dependent.dependents, ["Z1", "Z2"]);
         let second_hop = rows
@@ -564,7 +560,57 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(unlinked.label, "U U [queued] [unlinked]");
+        assert_eq!(unlinked.label, "◌ U U [unlinked]");
+    }
+
+    #[test]
+    fn rows_use_stall_glyph_suppress_codex_worker_subject_and_omit_live_line() {
+        let (mut model, ids) = model(&[("Parent", 1)], &[]);
+        let worker_id = RunId::new();
+        model.insert_task_run(TaskRun {
+            run_id: worker_id,
+            key: RunKey::Native {
+                provider: Provider::Codex,
+                sid: "worker-session".to_owned(),
+            },
+            display_ordinal: DisplayOrdinal::new(2),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: Some(0),
+            finished_at_ms: None,
+            subject: Some("must not render".to_owned()),
+            dismissed_at_ms: None,
+        });
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: ids["Parent"],
+            child_run_id: worker_id,
+        });
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "worker-agent".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some("worker-session".to_owned()),
+            task_run_id: worker_id,
+            display_ordinal: DisplayOrdinal::new(3),
+            parent_agent_node_id: None,
+            state: None,
+            model_id: Some("must-not-render-model".to_owned()),
+            last_event_kind: Some("tool_use".to_owned()),
+            last_tool_name: Some("must not render live".to_owned()),
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: Some(0),
+            session_file: None,
+        });
+        let mut order = DagOrder::default();
+        order.recompute(&model);
+        let rows = super::build_rows(&model, &order, crate::activity::DEFAULT_STALL_WARN_MS + 1);
+        let worker = rows
+            .iter()
+            .find(|row| row.key.run_id() == Some(worker_id))
+            .expect("DAG has the worker row");
+
+        assert_eq!(worker.label, "⚠ Codex [dispatched by: Parent]");
     }
 
     #[test]

@@ -138,7 +138,9 @@ pub fn is_default_visible_task_run_with_ghost_window(
     if run.dismissed_at_ms.is_some() {
         return false;
     }
-    if let RunKey::Provisional { start_ms, .. } = &run.key {
+    if !run.state.is_terminal()
+        && let RunKey::Provisional { start_ms, .. } = &run.key
+    {
         let last_observed_ms = run.updated_at_ms.or(run.created_at_ms).unwrap_or(*start_ms);
         if now_ms >= last_observed_ms.saturating_add(ghost_visibility_ms) {
             return false;
@@ -466,8 +468,21 @@ mod tests {
             TaskState::Running,
             Some(updated_at_ms),
         );
-        let execution_run_ids = HashSet::from([ghost.run_id, ordinary.run_id]);
-        let operator = empty_operator();
+        let terminal_ghost = task_run(
+            RunKey::Provisional {
+                terminal_id: "completed".to_owned(),
+                start_ms: updated_at_ms,
+                seq: 2,
+            },
+            TaskState::Completed,
+            Some(updated_at_ms),
+        );
+        let execution_run_ids =
+            HashSet::from([ghost.run_id, ordinary.run_id, terminal_ghost.run_id]);
+        let operator = OperatorSnapshot {
+            activity: Arc::from(Vec::new()),
+            terminal_times: Arc::new(HashMap::from([(terminal_ghost.run_id, updated_at_ms)])),
+        };
 
         assert!(is_default_visible_task_run_with_ghost_window(
             &ghost,
@@ -488,6 +503,27 @@ mod tests {
             &operator,
             &execution_run_ids,
             updated_at_ms + DEFAULT_GHOST_VISIBILITY_MS,
+            DEFAULT_GHOST_VISIBILITY_MS,
+        ));
+        assert!(is_default_visible_task_run_with_ghost_window(
+            &terminal_ghost,
+            &operator,
+            &execution_run_ids,
+            updated_at_ms + DEFAULT_GHOST_VISIBILITY_MS,
+            DEFAULT_GHOST_VISIBILITY_MS,
+        ));
+        assert!(is_default_visible_task_run_with_ghost_window(
+            &terminal_ghost,
+            &operator,
+            &execution_run_ids,
+            updated_at_ms + DEFAULT_TERMINAL_VISIBILITY_MS - 1,
+            DEFAULT_GHOST_VISIBILITY_MS,
+        ));
+        assert!(!is_default_visible_task_run_with_ghost_window(
+            &terminal_ghost,
+            &operator,
+            &execution_run_ids,
+            updated_at_ms + DEFAULT_TERMINAL_VISIBILITY_MS,
             DEFAULT_GHOST_VISIBILITY_MS,
         ));
     }
