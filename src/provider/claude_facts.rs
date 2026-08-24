@@ -12,6 +12,7 @@ use super::facts::{
 struct RecordType {
     #[serde(rename = "type")]
     record_type: Option<String>,
+    timestamp: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,7 +61,6 @@ struct ToolInput {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UserRecord {
-    timestamp: Option<String>,
     tool_use_result: Option<ToolUseResult>,
 }
 
@@ -74,7 +74,6 @@ struct ToolUseResult {
 // `<task-notification>` tags; nothing beyond the extracted task ID and status is retained.
 #[derive(Deserialize)]
 struct QueueOperationRecord {
-    timestamp: Option<String>,
     content: Option<String>,
 }
 
@@ -103,6 +102,16 @@ pub fn extract_claude_line(scope: &SessionScope, line: &str) -> Vec<LogFact> {
     let Ok(record_type) = serde_json::from_str::<RecordType>(line) else {
         return facts;
     };
+    if let Some(at_ms) = record_type
+        .timestamp
+        .as_deref()
+        .and_then(parse_timestamp_ms)
+    {
+        facts.push(LogFact::Append {
+            scope: scope.clone(),
+            at_ms,
+        });
+    }
     match record_type.record_type.as_deref() {
         Some("ai-title") => extract_ai_title(line, &mut facts),
         Some("assistant") => extract_assistant(scope, line, &mut facts),
@@ -141,10 +150,6 @@ fn extract_assistant(scope: &SessionScope, line: &str, facts: &mut Vec<LogFact>)
     let Some(at_ms) = record.timestamp.as_deref().and_then(parse_timestamp_ms) else {
         return;
     };
-    facts.push(LogFact::Append {
-        scope: scope.clone(),
-        at_ms,
-    });
 
     let Some(message) = record.message else {
         return;
@@ -179,12 +184,6 @@ fn extract_user(scope: &SessionScope, line: &str, facts: &mut Vec<LogFact>) {
     let Ok(record) = serde_json::from_str::<UserRecord>(line) else {
         return;
     };
-    if let Some(at_ms) = record.timestamp.as_deref().and_then(parse_timestamp_ms) {
-        facts.push(LogFact::Append {
-            scope: scope.clone(),
-            at_ms,
-        });
-    }
     let Some(result) = record.tool_use_result else {
         return;
     };
@@ -201,12 +200,6 @@ fn extract_queue_operation(scope: &SessionScope, line: &str, facts: &mut Vec<Log
     let Ok(record) = serde_json::from_str::<QueueOperationRecord>(line) else {
         return;
     };
-    if let Some(at_ms) = record.timestamp.as_deref().and_then(parse_timestamp_ms) {
-        facts.push(LogFact::Append {
-            scope: scope.clone(),
-            at_ms,
-        });
-    }
     let Some(content) = record.content else {
         return;
     };
@@ -814,6 +807,34 @@ mod tests {
                 parent: root_scope(),
                 id: EvidenceId::Uuid("6f9bdfa0-1502-4a37-97aa-c45591141130".to_owned()),
             }]
+        );
+    }
+
+    #[test]
+    fn system_record_with_timestamp_refreshes_liveness_once() {
+        let line = r#"{"type":"system","timestamp":"2026-08-24T01:00:03.000Z","body":"never materialized"}"#;
+
+        assert_eq!(
+            extract_claude_line(&root_scope(), line),
+            vec![LogFact::Append {
+                scope: root_scope(),
+                at_ms: 1_787_533_203_000,
+            }]
+        );
+    }
+
+    #[test]
+    fn ai_title_without_timestamp_does_not_refresh_liveness() {
+        let facts = extract_claude_line(
+            &root_scope(),
+            r#"{"type":"ai-title","sessionId":"session-title","aiTitle":"Safe title"}"#,
+        );
+
+        // Accepted boundary: ai-title records do not carry an envelope timestamp.
+        assert!(
+            facts
+                .iter()
+                .all(|fact| !matches!(fact, LogFact::Append { .. }))
         );
     }
 

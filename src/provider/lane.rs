@@ -98,7 +98,10 @@ pub struct Synthesis {
     subagent_ends: HashMap<(String, String), bool>,
     lineage: HashSet<(ScopeKey, ScopeKey)>,
     last_append_ms: HashMap<ScopeKey, i64>,
+    /// Grace-held outcomes flush on graceful shutdown. After a crash, `EndedUnknown` is the
+    /// designed honest recovery for an outcome nobody witnessed.
     pending_completes: HashMap<ScopeKey, ControllerEvent>,
+    latest_lifecycle_ms: i64,
     completed: HashSet<ScopeKey>,
     inactivity_closed: HashSet<ScopeKey>,
     live_lines: HashMap<ScopeKey, ActivitySelection>,
@@ -114,6 +117,16 @@ impl Synthesis {
     /// Creates synthesis state with explicit, deterministic lifecycle intervals.
     #[must_use]
     pub fn with_lifecycle_timing(complete_grace_ms: i64, headless_inactivity_ms: i64) -> Self {
+        Self::with_lifecycle_timing_at(complete_grace_ms, headless_inactivity_ms, 1)
+    }
+
+    /// Creates synthesis state with explicit intervals and an injected lifecycle clock anchor.
+    #[must_use]
+    pub fn with_lifecycle_timing_at(
+        complete_grace_ms: i64,
+        headless_inactivity_ms: i64,
+        now_ms: i64,
+    ) -> Self {
         Self {
             complete_grace_ms,
             headless_inactivity_ms,
@@ -126,6 +139,7 @@ impl Synthesis {
             lineage: HashSet::new(),
             last_append_ms: HashMap::new(),
             pending_completes: HashMap::new(),
+            latest_lifecycle_ms: now_ms.max(1),
             completed: HashSet::new(),
             inactivity_closed: HashSet::new(),
             live_lines: HashMap::new(),
@@ -134,6 +148,7 @@ impl Synthesis {
 
     /// Advances grace and inactivity against an injected Unix-epoch millisecond clock.
     pub fn advance_lifecycle(&mut self, now_ms: i64) -> Vec<ProviderEvent> {
+        self.latest_lifecycle_ms = self.latest_lifecycle_ms.max(now_ms);
         let mut events = Vec::new();
         self.flush_due_completes(now_ms, &mut events);
 
@@ -180,6 +195,20 @@ impl Synthesis {
                 events.push(ProviderEvent::Synthesized(event));
             }
         }
+    }
+
+    /// Forfeits completion grace and emits every held outcome for graceful shutdown.
+    pub fn flush_pending_completes(&mut self) -> Vec<ProviderEvent> {
+        let mut pending = self.pending_completes.drain().collect::<Vec<_>>();
+        pending.sort_by(|left, right| left.1.metadata.event_id.cmp(&right.1.metadata.event_id));
+        pending
+            .into_iter()
+            .map(|(scope, event)| {
+                self.started.remove(&scope);
+                self.completed.insert(scope);
+                ProviderEvent::Synthesized(event)
+            })
+            .collect()
     }
 
     fn prepare_resume(
@@ -277,6 +306,9 @@ impl Synthesis {
         discovered: &AdmissionIndex,
         events: &mut Vec<ProviderEvent>,
     ) {
+        if let Some(at_ms) = fact_lifecycle_time(&fact) {
+            self.latest_lifecycle_ms = self.latest_lifecycle_ms.max(at_ms);
+        }
         match fact {
             LogFact::Append { scope, at_ms } => {
                 let key = ScopeKey::from(&scope);
@@ -286,10 +318,7 @@ impl Synthesis {
                     key: run_key_for_scope(&scope),
                     at_ms,
                 });
-                if (matches!(
-                    scope,
-                    SessionScope::ClaudeRoot(_) | SessionScope::ClaudeSubagent { .. }
-                ) || reopen)
+                if (matches!(scope, SessionScope::ClaudeRoot(_)) || reopen)
                     && self.started.insert(key)
                 {
                     events.push(ProviderEvent::Synthesized(controller_event(
@@ -471,7 +500,8 @@ impl Synthesis {
                     .last_append_ms
                     .get(&ScopeKey::from(&parent_scope))
                     .copied()
-                    .unwrap_or_default();
+                    .filter(|at_ms| *at_ms != 0)
+                    .unwrap_or(self.latest_lifecycle_ms);
                 let scope_key = ScopeKey::from(&scope);
                 self.flush_due_completes(at_ms, events);
                 let event = controller_event(
@@ -620,6 +650,24 @@ fn claude_hook_key(session_id: &str, agent_id: Option<&str>) -> String {
         })
         .expect("supported Claude hook identity must map")
         .task_run_id
+}
+
+fn fact_lifecycle_time(fact: &LogFact) -> Option<i64> {
+    match fact {
+        LogFact::Append { at_ms, .. }
+        | LogFact::CodexTurnStarted { at_ms, .. }
+        | LogFact::CodexTurnComplete { at_ms, .. }
+        | LogFact::CodexTurnAborted { at_ms, .. }
+        | LogFact::Activity { at_ms, .. }
+        | LogFact::Usage { at_ms, .. } => Some(*at_ms),
+        LogFact::AiTitle { .. }
+        | LogFact::CodexMeta { .. }
+        | LogFact::CodexTurn { .. }
+        | LogFact::CodexPid { .. }
+        | LogFact::SubagentAppeared { .. }
+        | LogFact::SubagentEnded { .. }
+        | LogFact::EvidenceId { .. } => None,
+    }
 }
 
 fn controller_event(
@@ -1790,7 +1838,7 @@ mod tests {
             .map(|fact| (7, fact));
         let mut synthesis = Synthesis::default();
         let mut events = synthesize(&mut synthesis, "queue.jsonl", facts);
-        events.extend(synthesis.advance_lifecycle(DEFAULT_COMPLETE_GRACE_MS));
+        events.extend(synthesis.advance_lifecycle(1 + DEFAULT_COMPLETE_GRACE_MS));
         let synthesized = synthesized_events(&events);
         let event_ids = synthesized
             .iter()
@@ -1876,7 +1924,7 @@ mod tests {
                 "queue.jsonl",
                 facts.into_iter().map(|fact| (3, fact)),
             );
-            events.extend(synthesis.advance_lifecycle(DEFAULT_COMPLETE_GRACE_MS));
+            events.extend(synthesis.advance_lifecycle(1 + DEFAULT_COMPLETE_GRACE_MS));
             synthesized_events(&events)
                 .into_iter()
                 .map(|event| (event.task_run_id.clone(), event.metadata.event_id.clone()))
@@ -1899,7 +1947,7 @@ mod tests {
             "queue.jsonl",
             [(4, duplicate.clone()), (4, duplicate)],
         );
-        events.extend(synthesis.advance_lifecycle(DEFAULT_COMPLETE_GRACE_MS));
+        events.extend(synthesis.advance_lifecycle(1 + DEFAULT_COMPLETE_GRACE_MS));
 
         assert!(matches!(
             synthesized_events(&events).as_slice(),
@@ -2438,6 +2486,34 @@ mod tests {
     }
 
     #[test]
+    fn subagent_end_without_append_holds_for_full_grace() {
+        let mut synthesis = Synthesis::with_lifecycle_timing(30, 600);
+        assert!(synthesis.advance_lifecycle(100).is_empty());
+
+        let held = synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                4,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "child".to_owned(),
+                    failed: false,
+                },
+            )],
+        );
+
+        assert!(synthesized_events(&held).is_empty());
+        assert!(synthesis.advance_lifecycle(129).is_empty());
+        assert!(matches!(
+            synthesized_events(&synthesis.advance_lifecycle(130)).as_slice(),
+            [event]
+                if matches!(event.event, ControllerEventKind::Complete)
+                    && event.metadata.timestamp_ms == 100
+        ));
+    }
+
+    #[test]
     fn resume_within_grace_never_flaps() {
         let mut synthesis = Synthesis::with_lifecycle_timing(30, 600);
         let mut events = synthesize(
@@ -2608,6 +2684,34 @@ mod tests {
                 if key == &run_key_for_scope(&scope) && *at_ms == 150
         ));
         assert!(synthesis.advance_lifecycle(200).is_empty());
+    }
+
+    #[test]
+    fn bare_subagent_append_emits_liveness_only() {
+        let scope = SessionScope::ClaudeSubagent {
+            parent: PARENT.to_owned(),
+            agent_id: "unannounced".to_owned(),
+        };
+
+        let events = synthesize(
+            &mut Synthesis::default(),
+            "agent-unannounced.jsonl",
+            [(
+                1,
+                LogFact::Append {
+                    scope: scope.clone(),
+                    at_ms: 100,
+                },
+            )],
+        );
+
+        assert_eq!(
+            events,
+            vec![ProviderEvent::RunLiveness {
+                key: run_key_for_scope(&scope),
+                at_ms: 100,
+            }]
+        );
     }
 
     #[test]

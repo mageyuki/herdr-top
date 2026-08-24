@@ -241,6 +241,28 @@ impl ProviderEventSender {
             }
         }
     }
+
+    fn blocking_send(&self, event: ProviderEvent) -> bool {
+        match self {
+            Self::Raw(sender) => sender.blocking_send(event).is_ok(),
+            Self::Tracked { sender, ingress } => {
+                let admission = matches!(
+                    &event,
+                    ProviderEvent::Synthesized(_)
+                        | ProviderEvent::RunLiveness { .. }
+                        | ProviderEvent::LaneClose { .. }
+                        | ProviderEvent::Telemetry { .. }
+                        | ProviderEvent::SessionResolved { .. }
+                        | ProviderEvent::AgentUpsert { .. }
+                        | ProviderEvent::Activity { .. }
+                )
+                .then(|| ingress.admit());
+                sender
+                    .blocking_send(ProviderIngressEvent { event, admission })
+                    .is_ok()
+            }
+        }
+    }
 }
 
 /// Returns whether a provider-native identifier fits the colon-free grammar.
@@ -1502,6 +1524,11 @@ pub(crate) fn test_provider_cycle_with_stop<'a>(
 /// Adapter-owned discovery, tailing, and parsing work executed on the provider thread.
 pub trait ProviderWorker: Send + 'static {
     fn process(&mut self, cycle: &mut ProviderCycle<'_>) -> io::Result<()>;
+
+    /// Emits final provider events that must traverse normal egress on graceful shutdown.
+    fn graceful_stop(&mut self) -> Vec<ProviderEvent> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug)]
@@ -1811,16 +1838,28 @@ fn provider_thread_main(
 
     loop {
         let control = receiver.recv_timeout(rescan_interval);
-        if stop_flag.load(Ordering::Acquire) {
-            break;
-        }
         let (hint, timed_out) = match control {
-            Ok(Control::Stop) => break,
+            Ok(Control::Stop) => {
+                for event in worker.graceful_stop() {
+                    if !egress.blocking_send(event) {
+                        break;
+                    }
+                }
+                break;
+            }
             Ok(Control::Hint(path)) => (Some(path), false),
             Ok(Control::TargetsUpdated) => (None, false),
             Err(mpsc::RecvTimeoutError::Timeout) => (None, true),
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        if stop_flag.load(Ordering::Acquire) {
+            for event in worker.graceful_stop() {
+                if !egress.blocking_send(event) {
+                    break;
+                }
+            }
+            break;
+        }
         run_provider_cycle(
             &mut worker,
             &egress,

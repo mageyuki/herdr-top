@@ -436,6 +436,23 @@ impl Store {
         Ok(sources)
     }
 
+    /// Returns runs with at least one persisted task-state event not owned by the log lane.
+    pub fn non_lane_task_state_runs(&self) -> Result<HashSet<RunId>, StoreError> {
+        let mut runs = HashSet::new();
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT task_run_id FROM events \
+             WHERE task_run_id IS NOT NULL \
+               AND task_state IS NOT NULL \
+               AND source <> ?1",
+        )?;
+        let mut rows = statement.query([crate::provider::lane::SOURCE_LOG_LANE])?;
+        while let Some(row) = rows.next()? {
+            let run_id: String = row.get(0)?;
+            runs.insert(parse_run_id(&run_id)?);
+        }
+        Ok(runs)
+    }
+
     /// Restores persisted topology, task runs, executions, nodes, and edges.
     pub fn load_restored_state(&self) -> Result<RestoredState, StoreError> {
         let mut model = crate::model::DomainModel::default();

@@ -138,7 +138,7 @@ Outside-pane execution and session isolation: unchanged from v1.
 | 7 | Current activity | Claude: newest `tool_use` name + summary param (repo-relative paths; codex `CommandExecution.cwd` is a `file://` URI — strip the scheme before relativizing). Codex: AgentMessage `phase=="commentary"` text at `item.content[0].text`, else CommandExecution sanitized head — `command` is an ARGV ARRAY (verified); sanitize the script element, not the array head |
 | 8 | Tokens (v2, exact definitions) | TOK = OUTPUT tokens; tok/s = output tokens / wall-clock (cumulative mean). Claude: deduplicate usage samples by `message.id` (verified: identical records recur up to 7×), then sum `output_tokens`; the full breakdown (input, cache read/creation — which dwarf output ~350×) goes to the Detail overlay only. Codex: `token_count.total_token_usage` is cumulative WITHIN a turn and RESETS across turns (verified) — accumulate per-turn deltas using `last_token_usage`, closing each turn at `task_complete` |
 | 9 | Completion: codex tail `task_complete`; Claude child = parent notification with `status=completed`; `status=failed` (verified 7 occurrences) maps to `Failed`; codex `turn_aborted` maps to `Cancelled` | `complete`/`failed`/`cancelled` via the grace rule |
-| 10 | Death backstop: append silence past `HERDR_TOP_HEADLESS_INACTIVITY_MS` | the lane synthesizes its OWN `ended_unknown` transition (v2: the existing observation close path is unreachable for lane-created runs because synthesized controller events set `has_controller_task_state_event`, and `src/reducer.rs:1626-1638` early-returns on it). The lane's close honors the same guards: never on terminal, never on dismissed |
+| 10 | Death backstop: append silence past `HERDR_TOP_HEADLESS_INACTIVITY_MS` | the lane synthesizes its OWN `ended_unknown` transition (v2: the existing observation close path is unreachable for lane-created runs because synthesized controller events set `has_controller_task_state_event`, and `src/reducer.rs:1626-1638` early-returns on it). The lane's close honors the same guards: never on terminal, never on dismissed, never when pane-occupied (has an execution), and never with non-lane-sourced task-state evidence |
 | 11 | Liveness: any append | refresh the run's `updated_at` — ROOTS INCLUDED; dismissal is checked BEFORE touching (touch clears `dismissed_at_ms` on the non-terminal branch) |
 
 Completion grace and reopen (unchanged mechanism, v2 provenance):
@@ -150,6 +150,7 @@ determined from the persisted `events.source` of the terminal event
 schema change. Hook-sourced terminals are never reopenable; the shipped
 stale-event guard (`src/reducer.rs:2054-2061`) stays intact for every
 non-lane source.
+The pre-existing `ended_unknown -> running` resume transition is distinct from this provenance-gated `complete -> running` reopen.
 
 Stall (⚠) and ghost-run window: unchanged from v1.
 

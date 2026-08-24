@@ -446,6 +446,7 @@ async fn run_monitor(cli: &Cli, plugin_state_dir: Option<&OsStr>) -> Result<(), 
     let restored = store.load_restored_state()?;
     let restored_operator = store.load_restored_operator_state()?;
     let terminal_event_sources = store.terminal_event_sources()?;
+    let non_lane_task_state_runs = store.non_lane_task_state_runs()?;
     let (lifecycle, writer) = store::spawn_writer(store)?;
     let session_name = resolved.session_key().name().to_owned();
     let (operator_commands, operator_command_receiver) =
@@ -461,6 +462,7 @@ async fn run_monitor(cli: &Cli, plugin_state_dir: Option<&OsStr>) -> Result<(), 
             occurrence_sink,
             restored_operator,
             terminal_event_sources,
+            non_lane_task_state_runs,
             log_lane_config,
             operator_command_receiver,
         )

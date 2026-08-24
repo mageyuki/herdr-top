@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -1012,6 +1012,7 @@ pub struct CollectorHandle {
     performance_monitor: JoinHandle<()>,
     controller_acceptor: Option<JoinHandle<Result<(), ControllerServerError>>>,
     provider_thread: Option<ProviderThreadHandle>,
+    provider_events_drained: Option<oneshot::Receiver<()>>,
 }
 
 impl CollectorHandle {
@@ -1028,6 +1029,26 @@ impl CollectorHandle {
 
     async fn stop_with_timeout(self, timeout: Duration) -> Result<(), CollectorError> {
         self.cancellation.cancel();
+        let provider_result = match self.provider_thread {
+            Some(provider) => provider.stop().await,
+            None => Ok(()),
+        };
+        let provider_drain_result = if provider_result.is_ok() {
+            match self.provider_events_drained {
+                Some(mut drained) => match tokio::time::timeout(timeout, &mut drained).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(_)) => Err(CollectorError::Task(
+                        "provider event drain acknowledgement dropped".to_owned(),
+                    )),
+                    Err(_) => Err(CollectorError::StopTimeout {
+                        seconds: timeout.as_secs(),
+                    }),
+                },
+                None => Ok(()),
+            }
+        } else {
+            Ok(())
+        };
         let mut task = self.task;
         let collector_result = match tokio::time::timeout(timeout, &mut task).await {
             Ok(result) => result
@@ -1061,14 +1082,11 @@ impl CollectorHandle {
         } else {
             Ok(())
         };
-        let provider_result = match self.provider_thread {
-            Some(provider) => provider.stop().await,
-            None => Ok(()),
-        };
         if let Err(error) = &provider_result
             && (collector_result.is_err()
                 || performance_result.is_err()
-                || controller_result.is_err())
+                || controller_result.is_err()
+                || provider_drain_result.is_err())
         {
             let provider_error_code = match error {
                 ProviderThreadError::ThreadPanicked => "provider_thread_panicked",
@@ -1085,6 +1103,7 @@ impl CollectorHandle {
         performance_result?;
         controller_result?;
         provider_result?;
+        provider_drain_result?;
         Ok(())
     }
 }
@@ -1173,11 +1192,13 @@ pub async fn spawn_workload_collector(
     provider_publisher.update_targets(restored_targets.clone());
     let coverage =
         CoverageTracker::new(controller_coverage, coverage_sender, source_quality_sender);
-    let provider_integration = ProviderIntegration::new(
+    let (provider_events_drained_sender, provider_events_drained) = oneshot::channel();
+    let provider_integration = ProviderIntegration::new_with_drain_acknowledgement(
         provider_events,
         provider_publisher,
         restored_targets,
         coverage,
+        provider_events_drained_sender,
     );
     let task_cancellation = cancellation.clone();
     let task_model = model.clone();
@@ -1225,6 +1246,7 @@ pub async fn spawn_workload_collector(
         performance_monitor,
         controller_acceptor: None,
         provider_thread: Some(provider_thread),
+        provider_events_drained: Some(provider_events_drained),
     };
     Ok(WorkloadCollectorHandle {
         collector,
@@ -1314,6 +1336,7 @@ pub async fn spawn_with_controller_and_performance_clock(
         empty_operator_seed(),
         None,
         HashMap::new(),
+        HashSet::new(),
         LogLaneConfig::default(),
         performance_clock,
         Some(performance_observer),
@@ -1380,6 +1403,7 @@ pub async fn spawn_with_controller_coverage_occurrence_sink_and_operator_seed(
     occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
     restored_operator: RestoredOperatorState,
     terminal_event_sources: HashMap<RunId, String>,
+    non_lane_task_state_runs: HashSet<RunId>,
     log_lane_config: LogLaneConfig,
     operator_commands: mpsc::Receiver<OperatorCommand>,
 ) -> Result<CollectorHandle, CollectorError> {
@@ -1393,6 +1417,7 @@ pub async fn spawn_with_controller_coverage_occurrence_sink_and_operator_seed(
         occurrence_sink,
         restored_operator,
         terminal_event_sources,
+        non_lane_task_state_runs,
         log_lane_config,
         Some(operator_commands),
     )
@@ -1429,6 +1454,7 @@ async fn spawn_configured(
         restored_operator,
         operator_commands,
         HashMap::new(),
+        HashSet::new(),
         LogLaneConfig::default(),
         Arc::new(SystemPerformanceClock::new()),
         #[cfg(feature = "workload-harness")]
@@ -1448,6 +1474,7 @@ async fn spawn_configured_with_lane_lifecycle(
     occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
     restored_operator: RestoredOperatorState,
     terminal_event_sources: HashMap<RunId, String>,
+    non_lane_task_state_runs: HashSet<RunId>,
     log_lane_config: LogLaneConfig,
     operator_commands: Option<mpsc::Receiver<OperatorCommand>>,
 ) -> Result<CollectorHandle, CollectorError> {
@@ -1462,6 +1489,7 @@ async fn spawn_configured_with_lane_lifecycle(
         restored_operator,
         operator_commands,
         terminal_event_sources,
+        non_lane_task_state_runs,
         log_lane_config,
         Arc::new(SystemPerformanceClock::new()),
         #[cfg(feature = "workload-harness")]
@@ -1482,6 +1510,7 @@ async fn spawn_configured_inner(
     restored_operator: RestoredOperatorState,
     operator_commands: Option<mpsc::Receiver<OperatorCommand>>,
     terminal_event_sources: HashMap<RunId, String>,
+    non_lane_task_state_runs: HashSet<RunId>,
     log_lane_config: LogLaneConfig,
     performance_clock: Arc<dyn PerformanceClock>,
     #[cfg(feature = "workload-harness")] performance_observer: Option<WorkloadPerformanceObserver>,
@@ -1491,6 +1520,7 @@ async fn spawn_configured_inner(
 
     let (mut reducer, model, operator) = Reducer::new_with_operator(restored, restored_operator);
     reducer.restore_terminal_event_sources(terminal_event_sources);
+    reducer.restore_non_lane_task_state_runs(non_lane_task_state_runs);
     let (performance_sender, performance) = watch::channel(initial_performance_publication());
     let (quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
     let (source_quality_sender, source_quality) = watch::channel(ObservationQuality::Reconciling);
@@ -1557,11 +1587,13 @@ async fn spawn_configured_inner(
     provider_publisher.update_targets(restored_targets.clone());
     let coverage =
         CoverageTracker::new(controller_coverage, coverage_sender, source_quality_sender);
-    let provider_integration = ProviderIntegration::new(
+    let (provider_events_drained_sender, provider_events_drained) = oneshot::channel();
+    let provider_integration = ProviderIntegration::new_with_drain_acknowledgement(
         provider_events,
         provider_publisher,
         restored_targets,
         coverage,
+        provider_events_drained_sender,
     );
     let task_cancellation = cancellation.clone();
     let task_model = model.clone();
@@ -1610,6 +1642,7 @@ async fn spawn_configured_inner(
         performance_monitor,
         controller_acceptor,
         provider_thread: Some(provider_thread),
+        provider_events_drained: Some(provider_events_drained),
     })
 }
 
@@ -1653,13 +1686,13 @@ async fn run_collector(
 
     loop {
         if cancellation.is_cancelled() {
-            return Ok(());
+            break;
         }
 
         let socket_identity = socket_identity(&sock);
         let subscriptions = subscriptions();
         let stream = match tokio::select! {
-            () = cancellation.cancelled() => return Ok(()),
+            () = cancellation.cancelled() => break,
             _ = retention_cleanup.tick() => {
                 let _ = persistence.cleanup(unix_now_ms()).await?;
                 continue;
@@ -1732,7 +1765,7 @@ async fn run_collector(
                 )
                 .await?
                 {
-                    return Ok(());
+                    break;
                 }
                 continue;
             }
@@ -1820,14 +1853,14 @@ async fn run_collector(
                     &shared,
                 );
                 if matches!(outcome.outcome, SubscriptionOutcome::Cancelled) {
-                    return Ok(());
+                    break;
                 }
                 let _ = error;
             }
             EventReaderExitReason::Clean => {}
         }
         match outcome.outcome {
-            SubscriptionOutcome::Cancelled => return Ok(()),
+            SubscriptionOutcome::Cancelled => break,
             SubscriptionOutcome::WatchdogReconnect(reason) => {
                 provider.set_herdr_quality(
                     ObservationQuality::Disconnected,
@@ -1853,7 +1886,7 @@ async fn run_collector(
                 )
                 .await?
                 {
-                    return Ok(());
+                    break;
                 }
             }
             SubscriptionOutcome::Ended => {
@@ -1865,6 +1898,15 @@ async fn run_collector(
             }
         }
     }
+
+    drain_provider_events(
+        &mut provider,
+        &session,
+        &mut reducer,
+        &shared,
+        &mut persistence,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3447,11 +3489,9 @@ impl AdapterProviderWorker {
         diagnostics: crate::provider::ProviderDiagnostics,
         config: LogLaneConfig,
     ) -> Self {
-        let anchor_ms = crate::provider::lane::backfill_anchor_ms(
-            None,
-            unix_now_ms(),
-            config.backfill_window_ms,
-        );
+        let now_ms = unix_now_ms();
+        let anchor_ms =
+            crate::provider::lane::backfill_anchor_ms(None, now_ms, config.backfill_window_ms);
         Self {
             roots: HashMap::new(),
             interner: PathInterner::default(),
@@ -3461,9 +3501,10 @@ impl AdapterProviderWorker {
             record_ordinals: HashMap::new(),
             log_admission: crate::provider::lane::Admission::new(anchor_ms),
             admission_index: crate::provider::lane::AdmissionIndex::new(),
-            synthesis: crate::provider::lane::Synthesis::with_lifecycle_timing(
+            synthesis: crate::provider::lane::Synthesis::with_lifecycle_timing_at(
                 config.complete_grace_ms,
                 config.headless_inactivity_ms,
+                now_ms,
             ),
             generations: HashMap::new(),
             deferred: VecDeque::new(),
@@ -4191,6 +4232,10 @@ impl ProviderWorker for AdapterProviderWorker {
         self.emit_due_lifecycle_events(cycle.pending);
         Ok(())
     }
+
+    fn graceful_stop(&mut self) -> Vec<ProviderEvent> {
+        self.synthesis.flush_pending_completes()
+    }
 }
 
 fn parse_adapter_record(
@@ -4293,6 +4338,7 @@ const fn integration_provider_rank(provider: Provider) -> u8 {
 
 struct ProviderIntegration {
     events: Option<mpsc::Receiver<ProviderIngressEvent>>,
+    events_drained: Option<oneshot::Sender<()>>,
     target_publisher: ProviderTargetPublisher,
     published_targets: TargetSet,
     coverage: CoverageTracker,
@@ -4374,6 +4420,7 @@ impl CoverageTracker {
 }
 
 impl ProviderIntegration {
+    #[cfg(test)]
     fn new(
         events: mpsc::Receiver<ProviderIngressEvent>,
         target_publisher: ProviderTargetPublisher,
@@ -4382,9 +4429,32 @@ impl ProviderIntegration {
     ) -> Self {
         Self {
             events: Some(events),
+            events_drained: None,
             target_publisher,
             published_targets,
             coverage,
+        }
+    }
+
+    fn new_with_drain_acknowledgement(
+        events: mpsc::Receiver<ProviderIngressEvent>,
+        target_publisher: ProviderTargetPublisher,
+        published_targets: TargetSet,
+        coverage: CoverageTracker,
+        events_drained: oneshot::Sender<()>,
+    ) -> Self {
+        Self {
+            events: Some(events),
+            events_drained: Some(events_drained),
+            target_publisher,
+            published_targets,
+            coverage,
+        }
+    }
+
+    fn acknowledge_events_drained(&mut self) {
+        if let Some(events_drained) = self.events_drained.take() {
+            let _ = events_drained.send(());
         }
     }
 
@@ -6427,6 +6497,20 @@ async fn receive_provider(
     }
 }
 
+async fn drain_provider_events(
+    provider: &mut ProviderIntegration,
+    session: &str,
+    reducer: &mut Reducer,
+    shared: &SharedModel,
+    persistence: &mut RuntimePersistence,
+) -> Result<(), CollectorError> {
+    while provider.events.is_some() {
+        let event = receive_provider(&mut provider.events).await;
+        service_provider_event(event, provider, session, reducer, shared, persistence).await?;
+    }
+    Ok(())
+}
+
 async fn service_provider_event(
     event: Option<ProviderIngressEvent>,
     provider: &mut ProviderIntegration,
@@ -6492,6 +6576,7 @@ async fn service_provider_event(
         }
         None => {
             provider.events = None;
+            provider.acknowledge_events_drained();
             provider.coverage.mark_egress_closed();
             Ok(())
         }
@@ -11385,8 +11470,8 @@ mod provider_integration_tests {
     use super::*;
     use crate::lockfile::StateRoot;
     use crate::model::{
-        AgentNode, DisplayOrdinal, DomainModel, ExecState, ExecutionEdge, MinimalProviderMetadata,
-        RunKey, TaskRun, TaskState,
+        AgentNode, ControllerEventKind, DisplayOrdinal, DomainModel, ExecState, ExecutionEdge,
+        MinimalProviderMetadata, RunKey, TaskRun, TaskState,
     };
     use crate::provider::{ProviderCycle, ProviderEvent, ProviderWorker, SourcePosition};
     use crate::store::{
@@ -11433,6 +11518,133 @@ mod provider_integration_tests {
         })
         .await
         .expect("provider readiness is bounded");
+    }
+
+    #[tokio::test]
+    async fn graceful_provider_stop_emits_complete_held_in_grace() {
+        let now_ms = unix_now_ms();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new_with_log_lane_config(
+            Vec::new(),
+            diagnostics,
+            LogLaneConfig {
+                complete_grace_ms: i64::MAX / 2,
+                ..LogLaneConfig::default()
+            },
+        );
+        assert!(worker.synthesis.advance_lifecycle(now_ms).is_empty());
+        let held = worker.synthesis.synthesize_batch(
+            Path::new("rollout.jsonl"),
+            [(
+                4,
+                crate::provider::facts::LogFact::CodexTurnComplete {
+                    rollout_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+                    at_ms: now_ms,
+                },
+            )],
+            &mut worker.log_admission,
+            &worker.admission_index,
+        );
+        assert!(held.iter().all(|event| !matches!(
+            event,
+            ProviderEvent::Synthesized(controller)
+                if matches!(controller.event, ControllerEventKind::Complete)
+        )));
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (persistence, diagnostics) =
+            RuntimePersistence::new_for_test(writer, Arc::new(TestOccurrenceSink));
+        let (reducer, shared, operator) = Reducer::new_with_operator(
+            RestoredState {
+                model: DomainModel::default(),
+                next_ordinal: 1,
+                next_ingest_seq: Some(1),
+                event_ledger: Vec::new(),
+            },
+            empty_operator_seed(),
+        );
+        let (performance_ingress, _performance_sampler) =
+            performance_tracker(Arc::new(SystemPerformanceClock::new()));
+        let (provider_sender, provider_events) = mpsc::channel(8);
+        let provider_thread = spawn_provider_thread_with_diagnostics_and_performance(
+            worker,
+            provider_sender,
+            None,
+            crate::provider::ProviderDiagnostics::default(),
+            performance_ingress,
+        )
+        .unwrap();
+        let (_performance_sender, performance) = watch::channel(initial_performance_publication());
+        let (_quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
+        let (coverage_sender, source_coverage) =
+            watch::channel(SourceCoverageRegistry::new(SourceAvailability::Available));
+        let (source_quality_sender, _source_quality) =
+            watch::channel(ObservationQuality::Reconciling);
+        let coverage = CoverageTracker::new(
+            SourceAvailability::Available,
+            coverage_sender,
+            source_quality_sender,
+        );
+        let (events_drained_sender, events_drained) = oneshot::channel();
+        let mut provider = ProviderIntegration::new_with_drain_acknowledgement(
+            provider_events,
+            provider_thread.target_publisher(),
+            TargetSet::default(),
+            coverage,
+            events_drained_sender,
+        );
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let task_shared = shared.clone();
+        let task = tokio::spawn(async move {
+            let mut reducer = reducer;
+            let mut persistence = persistence;
+            task_cancellation.cancelled().await;
+            drain_provider_events(
+                &mut provider,
+                "session",
+                &mut reducer,
+                &task_shared,
+                &mut persistence,
+            )
+            .await
+        });
+        let monitor_cancellation = cancellation.clone();
+        let handle = CollectorHandle {
+            performance,
+            quality,
+            source_coverage,
+            diagnostics,
+            operator,
+            model: shared,
+            primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
+            cancellation,
+            task,
+            performance_monitor: tokio::spawn(async move {
+                monitor_cancellation.cancelled().await;
+            }),
+            controller_acceptor: None,
+            provider_thread: Some(provider_thread),
+            provider_events_drained: Some(events_drained),
+        };
+
+        handle.stop().await.unwrap();
+        lifecycle.shutdown().await.unwrap();
+
+        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+        assert_eq!(
+            restored
+                .model
+                .task_run_by_key(&RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: "22222222-2222-4222-8222-222222222222".to_owned(),
+                })
+                .unwrap()
+                .state,
+            TaskState::Completed
+        );
     }
 
     fn process_adapter_worker(
@@ -14189,6 +14401,7 @@ mod provider_integration_tests {
                     performance_monitor: tokio::spawn(async {}),
                     controller_acceptor: None,
                     provider_thread: Some(provider_thread),
+                    provider_events_drained: None,
                 };
 
                 handle.stop_with_timeout(Duration::from_secs(1)).await
@@ -14244,6 +14457,7 @@ mod provider_integration_tests {
             performance_monitor: tokio::spawn(async {}),
             controller_acceptor: None,
             provider_thread: Some(provider_thread),
+            provider_events_drained: None,
         };
 
         assert!(matches!(
