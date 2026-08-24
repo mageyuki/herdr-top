@@ -900,9 +900,15 @@ impl DomainModel {
         canonical.output_tokens = canonical
             .output_tokens
             .saturating_add(absorbed_telemetry.output_tokens);
+        let canonical_context_window = canonical.token_breakdown.context_window;
+        let absorbed_context_window = absorbed_telemetry.token_breakdown.context_window;
         canonical
             .token_breakdown
             .accumulate(absorbed_telemetry.token_breakdown);
+        // Per-turn accumulation treats this as a last-sample gauge, but a fold has no ordering:
+        // keep the canonical run's value unless it has no context-window evidence.
+        canonical.token_breakdown.context_window =
+            canonical_context_window.or(absorbed_context_window);
         canonical.started_wall_ms = canonical
             .started_wall_ms
             .min(absorbed_telemetry.started_wall_ms);
@@ -1451,6 +1457,40 @@ mod tests {
         assert_eq!(quantize_progress(0.99995), Ok(10_000));
         assert_eq!(quantize_progress(-0.000_001), Err(ProgressOutOfRange));
         assert_eq!(quantize_progress(1.000_001), Err(ProgressOutOfRange));
+    }
+
+    #[test]
+    fn fold_telemetry_keeps_the_survivor_context_window() {
+        let mut model = DomainModel::default();
+        let survivor = RunId::new();
+        let absorbed = RunId::new();
+        let survivor_telemetry = model.telemetry_entry(survivor, 100);
+        survivor_telemetry.output_tokens = 7;
+        survivor_telemetry.token_breakdown.context_window = Some(200_000);
+        let absorbed_telemetry = model.telemetry_entry(absorbed, 200);
+        absorbed_telemetry.output_tokens = 11;
+        absorbed_telemetry.token_breakdown.context_window = Some(114_000);
+
+        model.fold_telemetry(survivor, absorbed);
+
+        let telemetry = model.telemetry(&survivor).unwrap();
+        assert_eq!(telemetry.output_tokens, 18);
+        assert_eq!(telemetry.token_breakdown.context_window, Some(200_000));
+
+        let survivor_without_context = RunId::new();
+        let absorbed_with_context = RunId::new();
+        model
+            .telemetry_entry(survivor_without_context, 300)
+            .output_tokens = 13;
+        let absorbed_telemetry = model.telemetry_entry(absorbed_with_context, 400);
+        absorbed_telemetry.output_tokens = 17;
+        absorbed_telemetry.token_breakdown.context_window = Some(114_000);
+
+        model.fold_telemetry(survivor_without_context, absorbed_with_context);
+
+        let telemetry = model.telemetry(&survivor_without_context).unwrap();
+        assert_eq!(telemetry.output_tokens, 30);
+        assert_eq!(telemetry.token_breakdown.context_window, Some(114_000));
     }
 
     #[test]

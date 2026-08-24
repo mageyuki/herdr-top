@@ -529,7 +529,8 @@ impl Reducer {
     ///
     /// Telemetry deliberately emits no persistence operations. The provider lane owns usage
     /// sample deduplication, so this path adds every delta it receives exactly once.
-    pub fn apply_telemetry(
+    #[cfg(test)]
+    pub(crate) fn apply_telemetry(
         &mut self,
         key: &RunKey,
         at_ms: i64,

@@ -2096,8 +2096,16 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        let observed = observed.expect("provider watcher did not publish an observation");
+        assert!(
+            observed.is_some(),
+            "provider watcher did not publish an observation"
+        );
         handle.stop().await.unwrap();
+        // Read the baseline only after stop has joined the watcher, so no in-flight observation
+        // can race this value before the unchanged-after-sleep assertion.
+        let observed = diagnostics
+            .last_watcher_observation_ms()
+            .expect("stopped provider watcher lost its observation");
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(
             diagnostics.last_watcher_observation_ms(),

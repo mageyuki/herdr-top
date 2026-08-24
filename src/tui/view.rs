@@ -3086,6 +3086,7 @@ mod tests {
             ("claude-3-5-sonnet-20241022", "3-5-sonnet"),
             ("claude-sonnet-4-2025-01-01", "sonnet-4"),
             ("gpt-4o-20240513", "gpt-4o"),
+            ("gpt4o20240513", "gpt4o"),
             ("gpt-5.6-sol", "gpt-5.6-sol"),
             ("gpt-5.6-terra", "gpt-5.6-te…"),
             ("long-model-name", "long-model…"),

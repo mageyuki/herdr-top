@@ -1578,6 +1578,14 @@ async fn spawn_configured_with_lane_lifecycle(
     .await
 }
 
+fn earliest_restored_event_ms(restored: &RestoredState) -> Option<i64> {
+    restored
+        .event_ledger
+        .iter()
+        .map(|entry| entry.seen_at_ms)
+        .min()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn spawn_configured_inner(
     sock: PathBuf,
@@ -1598,6 +1606,7 @@ async fn spawn_configured_inner(
     let owner = OwnerTracker::from_environment();
     writer.replace_owner(owner.record()).await?;
 
+    let earliest_db_event = earliest_restored_event_ms(&restored);
     let (mut reducer, model, operator) = Reducer::new_with_operator(restored, restored_operator);
     reducer.restore_terminal_event_sources(terminal_event_sources);
     reducer.restore_non_lane_task_state_runs(non_lane_task_state_runs);
@@ -1642,6 +1651,7 @@ async fn spawn_configured_inner(
             standard_provider_roots,
             provider_diagnostics.clone(),
             log_lane_config,
+            earliest_db_event,
         ),
         provider_sender,
         Some(Box::new(RecommendedNotifyFactory)),
@@ -1775,6 +1785,7 @@ async fn run_collector(
             () = cancellation.cancelled() => break,
             _ = retention_cleanup.tick() => {
                 let _ = persistence.cleanup(unix_now_ms()).await?;
+                persistence.refresh_pane_coverage(&shared.borrow());
                 continue;
             }
             request = receive_controller(&mut controller_requests) => {
@@ -3565,17 +3576,21 @@ impl AdapterProviderWorker {
         standard_roots: Vec<DiscoveryRoot>,
         diagnostics: crate::provider::ProviderDiagnostics,
     ) -> Self {
-        Self::new_with_log_lane_config(standard_roots, diagnostics, LogLaneConfig::default())
+        Self::new_with_log_lane_config(standard_roots, diagnostics, LogLaneConfig::default(), None)
     }
 
     fn new_with_log_lane_config(
         standard_roots: Vec<DiscoveryRoot>,
         diagnostics: crate::provider::ProviderDiagnostics,
         config: LogLaneConfig,
+        earliest_db_event: Option<i64>,
     ) -> Self {
         let now_ms = unix_now_ms();
-        let anchor_ms =
-            crate::provider::lane::backfill_anchor_ms(None, now_ms, config.backfill_window_ms);
+        let anchor_ms = crate::provider::lane::backfill_anchor_ms(
+            earliest_db_event,
+            now_ms,
+            config.backfill_window_ms,
+        );
         Self {
             roots: HashMap::new(),
             interner: PathInterner::default(),
@@ -6968,7 +6983,216 @@ mod tests {
         DurabilityDisposition, PersistenceFailure, PersistenceFailureCode, PersistenceOperation,
         PersistencePhase,
     };
-    use crate::store::{PersistExecution, PersistTaskRun, open_writer, spawn_writer};
+    use crate::store::{LedgerEntry, PersistExecution, PersistTaskRun, open_writer, spawn_writer};
+
+    #[test]
+    fn backfill_anchor_uses_earliest_restored_event() {
+        const BACKFILL_WINDOW_MS: i64 = 10_000_000_000;
+        let before_inside = unix_now_ms();
+        let inside_window = before_inside.saturating_sub(BACKFILL_WINDOW_MS / 2);
+        let inside_worker = AdapterProviderWorker::new_with_log_lane_config(
+            Vec::new(),
+            crate::provider::ProviderDiagnostics::default(),
+            LogLaneConfig {
+                backfill_window_ms: BACKFILL_WINDOW_MS,
+                ..LogLaneConfig::default()
+            },
+            Some(inside_window),
+        );
+        assert_eq!(inside_worker.log_admission.anchor_ms(), inside_window);
+
+        let before_old = unix_now_ms();
+        let older_than_window = before_old.saturating_sub(BACKFILL_WINDOW_MS.saturating_mul(2));
+        let old_worker = AdapterProviderWorker::new_with_log_lane_config(
+            Vec::new(),
+            crate::provider::ProviderDiagnostics::default(),
+            LogLaneConfig {
+                backfill_window_ms: BACKFILL_WINDOW_MS,
+                ..LogLaneConfig::default()
+            },
+            Some(older_than_window),
+        );
+        let after_old = unix_now_ms();
+        let anchor = old_worker.log_admission.anchor_ms();
+        assert!(
+            (before_old.saturating_sub(BACKFILL_WINDOW_MS)
+                ..=after_old.saturating_sub(BACKFILL_WINDOW_MS))
+                .contains(&anchor),
+            "an older database event must not widen the window: {anchor}"
+        );
+    }
+
+    #[test]
+    fn earliest_restored_event_is_the_minimum_ledger_stamp() {
+        let mut restored = RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: vec![
+                LedgerEntry {
+                    event_id: "later".to_owned(),
+                    seen_at_ms: 900,
+                },
+                LedgerEntry {
+                    event_id: "earliest".to_owned(),
+                    seen_at_ms: 100,
+                },
+                LedgerEntry {
+                    event_id: "middle".to_owned(),
+                    seen_at_ms: 500,
+                },
+            ],
+        };
+        assert_eq!(earliest_restored_event_ms(&restored), Some(100));
+
+        restored.event_ledger.clear();
+        assert_eq!(earliest_restored_event_ms(&restored), None);
+    }
+
+    #[tokio::test]
+    async fn reconnect_retention_refreshes_pane_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let run_id = RunId::new();
+        let native_session_id = "coverage-owner";
+        let mut model = DomainModel::default();
+        model.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::Native {
+                provider: Provider::Codex,
+                sid: native_session_id.to_owned(),
+            },
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Running,
+            has_controller_task_state_event: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        model.insert_execution(crate::model::Execution {
+            execution_id: "coverage-execution".to_owned(),
+            pane_id: "coverage-pane".to_owned(),
+            terminal_id: "coverage-terminal".to_owned(),
+            task_run_id: run_id,
+            state: ExecState::Working,
+        });
+        let (reducer, mut shared) = Reducer::new(RestoredState {
+            model,
+            next_ordinal: 2,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let initial_coverage = SourceCoverageRegistry::new(SourceAvailability::NotApplicable);
+        let (persistence, mut diagnostics) = RuntimePersistence::new(
+            writer,
+            &shared.borrow(),
+            &initial_coverage,
+            Arc::new(RecordingOccurrenceSink::default()),
+        );
+        assert_eq!(
+            diagnostics.borrow().provider_counters.pane_sessions_total,
+            1
+        );
+        assert_eq!(
+            diagnostics
+                .borrow()
+                .provider_counters
+                .pane_sessions_with_artifacts,
+            0
+        );
+
+        let (provider_sender, provider, provider_thread) = inactive_provider_integration();
+        let (performance, _sampler) =
+            performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(run_collector(
+            directory.path().join("absent-herdr.sock"),
+            "coverage-session".to_owned(),
+            persistence,
+            reducer,
+            shared.clone(),
+            performance.clone(),
+            cancellation.clone(),
+            OwnerTracker::from_environment(),
+            None,
+            None,
+            provider,
+            LivenessPolicy::default(),
+            PrimaryStreamDiagnosticsHandle::default(),
+        ));
+        provider_sender
+            .send(ProviderIngressEvent {
+                event: ProviderEvent::SessionResolved {
+                    provider: Provider::Codex,
+                    agent_thread_id: native_session_id.to_owned(),
+                    owner_session_id: Some(native_session_id.to_owned()),
+                    parent_thread_id: None,
+                    path: PathBuf::from("/tmp/coverage-session.jsonl"),
+                    model_id: None,
+                    depth: Some(0),
+                    event_id: "coverage-session-resolved".to_owned(),
+                    observed_at_ms: 100,
+                    position: crate::provider::SourcePosition {
+                        path_id: 1,
+                        generation: 0,
+                        offset: 1,
+                    },
+                },
+                admission: Some(performance.admit()),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if shared.borrow().agent_nodes().any(|node| {
+                    node.task_run_id == run_id && node.session_file.as_deref().is_some()
+                }) {
+                    break;
+                }
+                shared.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("provider event did not add artifact coverage during reconnect");
+        assert_eq!(
+            diagnostics
+                .borrow()
+                .provider_counters
+                .pane_sessions_with_artifacts,
+            0,
+            "the gauge should remain stale until the retention tick"
+        );
+
+        let refreshed = tokio::time::timeout(Duration::from_secs(7), async {
+            loop {
+                if diagnostics
+                    .borrow()
+                    .provider_counters
+                    .pane_sessions_with_artifacts
+                    == 1
+                {
+                    break;
+                }
+                diagnostics.changed().await.unwrap();
+            }
+        })
+        .await
+        .is_ok();
+
+        cancellation.cancel();
+        drop(provider_sender);
+        task.await.unwrap().unwrap();
+        provider_thread.stop().await.unwrap();
+        lifecycle.shutdown().await.unwrap();
+        assert!(
+            refreshed,
+            "pane coverage did not refresh during the disconnected retry loop"
+        );
+    }
 
     #[derive(Default)]
     struct RecordingOccurrenceSink {
@@ -12033,6 +12257,7 @@ mod provider_integration_tests {
                 headless_inactivity_ms: i64::MAX / 2,
                 ..LogLaneConfig::default()
             },
+            None,
         );
         let mut pending = PendingEvents::new(diagnostics);
         let path = root.join(format!("rollout-2026-08-24T02-00-00-{ROLLOUT}.jsonl"));
@@ -12329,6 +12554,7 @@ mod provider_integration_tests {
                 complete_grace_ms: i64::MAX / 2,
                 ..LogLaneConfig::default()
             },
+            None,
         );
         assert!(worker.synthesis.advance_lifecycle(now_ms).is_empty());
         let held = worker.synthesis.synthesize_batch(
