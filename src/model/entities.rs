@@ -81,6 +81,49 @@ impl TaskRun {
     }
 }
 
+/// One model/effort attribution observed for a Codex turn.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TurnAttr {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+/// Transient output-token telemetry for one task run.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RunTelemetry {
+    pub output_tokens: u64,
+    pub started_wall_ms: i64,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub per_turn: Vec<TurnAttr>,
+}
+
+impl RunTelemetry {
+    pub(crate) fn accumulate(
+        &mut self,
+        output_tokens: u64,
+        model: Option<String>,
+        effort: Option<String>,
+        retain_turn: bool,
+    ) {
+        self.output_tokens = self.output_tokens.saturating_add(output_tokens);
+        if model.is_none() && effort.is_none() {
+            return;
+        }
+
+        let attribution = TurnAttr { model, effort };
+        self.model.clone_from(&attribution.model);
+        self.effort.clone_from(&attribution.effort);
+        // Telemetry carries attribution but no turn ID. Consecutive identical samples are
+        // therefore one observed turn context; changes retain their complete file order.
+        if retain_turn && self.per_turn.last() != Some(&attribution) {
+            self.per_turn.push(attribution);
+        }
+    }
+}
+
+pub type RunTelemetryMap = HashMap<RunId, RunTelemetry>;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentNode {
     pub agent_node_id: String,
@@ -565,6 +608,8 @@ pub struct DomainModel {
     topology_ordinals: HashMap<(TopologyKind, String), DisplayOrdinal>,
     task_runs: HashMap<RunId, TaskRun>,
     run_ids_by_key: HashMap<RunKey, RunId>,
+    /// Recomputed from provider logs at startup; no serialized or database projection owns it.
+    telemetry: RunTelemetryMap,
     executions: HashMap<String, Execution>,
     agent_nodes: HashMap<String, AgentNode>,
     execution_edges: HashSet<ExecutionEdge>,
@@ -738,6 +783,33 @@ impl DomainModel {
 
     pub fn task_runs(&self) -> impl Iterator<Item = &TaskRun> {
         self.task_runs.values()
+    }
+
+    /// Returns transient output-token telemetry for one run.
+    #[must_use]
+    pub fn telemetry(&self, run_id: &RunId) -> Option<&RunTelemetry> {
+        self.telemetry.get(run_id)
+    }
+
+    /// Iterates over all transient run telemetry.
+    pub fn telemetry_entries(&self) -> impl Iterator<Item = (&RunId, &RunTelemetry)> {
+        self.telemetry.iter()
+    }
+
+    pub(crate) fn telemetry_entry(
+        &mut self,
+        run_id: RunId,
+        started_wall_ms: i64,
+    ) -> &mut RunTelemetry {
+        self.telemetry
+            .entry(run_id)
+            .or_insert_with(|| RunTelemetry {
+                output_tokens: 0,
+                started_wall_ms,
+                model: None,
+                effort: None,
+                per_turn: Vec::new(),
+            })
     }
 
     pub fn insert_execution(&mut self, execution: Execution) -> Option<Execution> {

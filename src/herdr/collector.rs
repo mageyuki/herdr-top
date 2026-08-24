@@ -4816,8 +4816,14 @@ async fn apply_provider_event_with_admission(
             persistence.refresh_snapshot(&shared.borrow(), coverage);
             Ok(())
         }
-        // Task 7 owns this consumer. Keeping an explicit no-op route preserves admission.
-        ProviderEvent::Telemetry { .. } => {
+        ProviderEvent::Telemetry {
+            key,
+            output_tokens,
+            model,
+            effort,
+        } => {
+            let persist = reducer.apply_telemetry(&key, output_tokens, model, effort);
+            debug_assert!(persist.is_empty(), "telemetry must remain transient");
             if let Some(admission) = admission.take() {
                 admission.complete();
             }

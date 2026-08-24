@@ -525,6 +525,38 @@ impl Reducer {
         persist
     }
 
+    /// Accumulates one lane-deduplicated output-token delta in transient model state.
+    ///
+    /// Telemetry deliberately emits no persistence operations. The provider lane owns usage
+    /// sample deduplication, so this path adds every delta it receives exactly once.
+    pub fn apply_telemetry(
+        &mut self,
+        key: &RunKey,
+        output_tokens: u64,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> Vec<PersistOp> {
+        let Some(task_run) = self.model.task_run_by_key(key) else {
+            return Vec::new();
+        };
+        let run_id = task_run.run_id;
+        let Some(started_wall_ms) = task_run.created_at_ms else {
+            return Vec::new();
+        };
+        let retain_turn = matches!(
+            key,
+            RunKey::Native {
+                provider: Provider::Codex,
+                ..
+            }
+        );
+        self.model
+            .telemetry_entry(run_id, started_wall_ms)
+            .accumulate(output_tokens, model, effort, retain_turn);
+        self.publish();
+        Vec::new()
+    }
+
     /// Closes one active provider-log run after append inactivity.
     ///
     /// This lane-specific path deliberately ignores `has_controller_task_state_event`, which is
@@ -2544,6 +2576,7 @@ fn unix_now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::Path;
     use std::sync::Arc;
 
     use crate::diagnostics::RuntimeWriteOutcome;
@@ -2554,9 +2587,11 @@ mod tests {
         EventMetadata, ExecState, Execution, ExecutionEdge, GapKind, MinimalProviderMetadata,
         NormalizedEvent, OperatorCommand, Pane, PaneSnapshot, Provider, ReconcileBatch, RunId,
         RunKey, SharedModel, SnapshotAgent, Tab, TaskRun, TaskState, TopologyEntity,
-        TopologyEntityId, TopologySnapshot, Workspace,
+        TopologyEntityId, TopologySnapshot, TurnAttr, Workspace,
     };
-    use crate::provider::lane::SOURCE_LOG_LANE;
+    use crate::provider::ProviderEvent;
+    use crate::provider::facts::{LogFact, SessionScope};
+    use crate::provider::lane::{Admission, AdmissionIndex, SOURCE_LOG_LANE, Synthesis};
     use crate::store::{
         NativeSessionBinding, PersistOp, PersistTaskRun, RestoredState, WriterClient,
         database_path, open_reader, open_writer, spawn_writer,
@@ -3183,6 +3218,287 @@ mod tests {
 
         assert!(reducer.touch_run_liveness(&key, 200).is_empty());
         assert_eq!(shared.borrow().task_run(&run_id), Some(&expected));
+    }
+
+    #[test]
+    fn telemetry_accumulates_deduped_output_tokens() {
+        let run_id = RunId::new();
+        let key = RunKey::Controller("telemetry-run".to_owned());
+        let mut task_run = run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
+        task_run.created_at_ms = Some(1_234);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        assert!(
+            reducer
+                .apply_telemetry(
+                    &key,
+                    17,
+                    Some("claude-opus-4-1".to_owned()),
+                    Some("high".to_owned()),
+                )
+                .is_empty()
+        );
+        assert!(
+            reducer
+                .apply_telemetry(
+                    &key,
+                    25,
+                    Some("claude-opus-4-1".to_owned()),
+                    Some("high".to_owned()),
+                )
+                .is_empty()
+        );
+
+        let snapshot = shared.borrow();
+        let telemetry = snapshot.telemetry(&run_id).unwrap();
+        assert_eq!(telemetry.output_tokens, 42);
+        assert_eq!(telemetry.started_wall_ms, 1_234);
+    }
+
+    #[tokio::test]
+    async fn telemetry_survives_backfill_replay_identically() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        apply_telemetry_fixture_events(&mut reducer, &mut writer, synthesize_telemetry_fixture())
+            .await;
+        let key = telemetry_fixture_key();
+        let run_id = shared.borrow().task_run_by_key(&key).unwrap().run_id;
+        let first = serde_json::to_vec(shared.borrow().telemetry(&run_id).unwrap()).unwrap();
+        lifecycle.shutdown().await.unwrap();
+
+        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+        assert!(
+            restored.model.telemetry(&run_id).is_none(),
+            "the persisted restart seed must not contain transient telemetry"
+        );
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored);
+
+        apply_telemetry_fixture_events(&mut reducer, &mut writer, synthesize_telemetry_fixture())
+            .await;
+        let second = serde_json::to_vec(shared.borrow().telemetry(&run_id).unwrap()).unwrap();
+
+        assert_eq!(second, first);
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn telemetry_is_not_persisted() {
+        let run_id = RunId::new();
+        let key = RunKey::Controller("transient-telemetry".to_owned());
+        let mut task_run = run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
+        task_run.created_at_ms = Some(4_321);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        let persist = reducer.apply_telemetry(
+            &key,
+            9_876_543_210,
+            Some("distinctive-transient-model".to_owned()),
+            Some("distinctive-transient-effort".to_owned()),
+        );
+        assert!(persist.is_empty());
+        let snapshot = shared.borrow();
+        assert_eq!(
+            snapshot.telemetry(&run_id).unwrap().output_tokens,
+            9_876_543_210
+        );
+
+        // DomainModel is not a serde persistence blob. TaskRun is the serializable run
+        // projection that reaches persistence, so the invariant is asserted on that real
+        // surface as well as on the reducer's empty PersistOp batch above.
+        let serialized = serde_json::to_string(snapshot.task_run(&run_id).unwrap()).unwrap();
+        assert!(!serialized.contains("\"telemetry\":"));
+        assert!(!serialized.contains("\"output_tokens\":"));
+        assert!(!serialized.contains("9876543210"));
+        assert!(!serialized.contains("distinctive-transient-model"));
+        assert!(!serialized.contains("distinctive-transient-effort"));
+    }
+
+    #[test]
+    fn per_turn_model_effort_latest_wins_for_display() {
+        let run_id = RunId::new();
+        let key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "per-turn-rollout".to_owned(),
+        };
+        let mut task_run = run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
+        task_run.created_at_ms = Some(2_000);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        for (tokens, model, effort) in [
+            (10, "gpt-5.6-terra", "high"),
+            (20, "gpt-5.6-terra", "high"),
+            (30, "gpt-5.6-sol", "xhigh"),
+        ] {
+            assert!(
+                reducer
+                    .apply_telemetry(
+                        &key,
+                        tokens,
+                        Some(model.to_owned()),
+                        Some(effort.to_owned()),
+                    )
+                    .is_empty()
+            );
+        }
+
+        let snapshot = shared.borrow();
+        let telemetry = snapshot.telemetry(&run_id).unwrap();
+        assert_eq!(telemetry.output_tokens, 60);
+        assert_eq!(telemetry.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(telemetry.effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            telemetry.per_turn,
+            vec![
+                TurnAttr {
+                    model: Some("gpt-5.6-terra".to_owned()),
+                    effort: Some("high".to_owned()),
+                },
+                TurnAttr {
+                    model: Some("gpt-5.6-sol".to_owned()),
+                    effort: Some("xhigh".to_owned()),
+                },
+            ],
+            "consecutive identical attributions are one observed turn context"
+        );
+    }
+
+    fn telemetry_fixture_key() -> RunKey {
+        RunKey::Native {
+            provider: Provider::Codex,
+            sid: "telemetry-replay-rollout".to_owned(),
+        }
+    }
+
+    fn synthesize_telemetry_fixture() -> Vec<ProviderEvent> {
+        let rollout_id = "telemetry-replay-rollout";
+        let scope = SessionScope::Codex {
+            rollout_id: rollout_id.to_owned(),
+        };
+        let facts = [
+            (
+                0,
+                LogFact::Append {
+                    scope: scope.clone(),
+                    at_ms: 1_000,
+                },
+            ),
+            (
+                1,
+                LogFact::CodexMeta {
+                    rollout_id: rollout_id.to_owned(),
+                    cwd: "/workspace".to_owned(),
+                    originator: "codex_cli_rs".to_owned(),
+                    internal: None,
+                    cli_version: "0.1.0".to_owned(),
+                },
+            ),
+            (
+                2,
+                LogFact::CodexTurn {
+                    rollout_id: rollout_id.to_owned(),
+                    turn_id: "turn-1".to_owned(),
+                    model: "gpt-5.6-terra".to_owned(),
+                    effort: Some("high".to_owned()),
+                    sandbox: Some("workspace-write".to_owned()),
+                },
+            ),
+            (
+                3,
+                LogFact::Usage {
+                    scope: scope.clone(),
+                    at_ms: 1_100,
+                    sample_id: "turn-1:sample".to_owned(),
+                    output_tokens: 17,
+                    model: None,
+                    effort: None,
+                },
+            ),
+            (
+                4,
+                LogFact::Usage {
+                    scope: scope.clone(),
+                    at_ms: 1_101,
+                    sample_id: "turn-1:sample".to_owned(),
+                    output_tokens: 999,
+                    model: None,
+                    effort: None,
+                },
+            ),
+            (
+                5,
+                LogFact::CodexTurn {
+                    rollout_id: rollout_id.to_owned(),
+                    turn_id: "turn-2".to_owned(),
+                    model: "gpt-5.6-sol".to_owned(),
+                    effort: Some("xhigh".to_owned()),
+                    sandbox: Some("workspace-write".to_owned()),
+                },
+            ),
+            (
+                6,
+                LogFact::Usage {
+                    scope,
+                    at_ms: 1_200,
+                    sample_id: "turn-2:sample".to_owned(),
+                    output_tokens: 25,
+                    model: None,
+                    effort: None,
+                },
+            ),
+        ];
+        Synthesis::default().synthesize_batch(
+            Path::new("rollout-telemetry-replay.jsonl"),
+            facts,
+            &mut Admission::new(0),
+            &AdmissionIndex::new(),
+        )
+    }
+
+    async fn apply_telemetry_fixture_events(
+        reducer: &mut Reducer,
+        writer: &mut WriterClient,
+        events: Vec<ProviderEvent>,
+    ) {
+        for event in events {
+            match event {
+                ProviderEvent::Synthesized(event) => {
+                    if !writer.is_duplicate(&event.metadata.event_id) {
+                        commit_controller(reducer, writer, event).await;
+                    }
+                }
+                ProviderEvent::RunLiveness { key, at_ms } => {
+                    let persist = reducer.touch_run_liveness(&key, at_ms);
+                    if !persist.is_empty() {
+                        writer.apply(persist).await.unwrap();
+                    }
+                }
+                ProviderEvent::Telemetry {
+                    key,
+                    output_tokens,
+                    model,
+                    effort,
+                } => {
+                    assert!(
+                        reducer
+                            .apply_telemetry(&key, output_tokens, model, effort)
+                            .is_empty()
+                    );
+                }
+                other => panic!("unexpected telemetry fixture event: {other:?}"),
+            }
+        }
     }
 
     #[test]
