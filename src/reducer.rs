@@ -959,8 +959,19 @@ impl Reducer {
                 (reference.kind == AgentSessionReferenceKind::Id && !reference.value.is_empty())
                     .then(|| reference.value.clone())
             });
-            let existing_run = match (provider, native_sid.as_deref()) {
-                (Some(provider), Some(sid)) => self.run_for_native_session(provider, sid),
+            let native_path = pane.agent_session.as_ref().and_then(|reference| {
+                (reference.kind == AgentSessionReferenceKind::Path && !reference.value.is_empty())
+                    .then_some(reference.value.as_str())
+            });
+            let existing_run = match (provider, native_sid.as_deref(), native_path) {
+                (Some(provider), Some(sid), _) => self.run_for_native_session(provider, sid),
+                (Some(provider), None, Some(path)) => self
+                    .model
+                    .task_run_by_key(&RunKey::NativePath {
+                        provider,
+                        path: path.to_owned(),
+                    })
+                    .map(|task_run| task_run.run_id),
                 _ => None,
             };
             let run_id = match existing_run {
@@ -968,11 +979,7 @@ impl Reducer {
                 None => self.insert_snapshot_run(
                     provider,
                     native_sid.as_deref(),
-                    pane.agent_session.as_ref().and_then(|reference| {
-                        (reference.kind == AgentSessionReferenceKind::Path
-                            && !reference.value.is_empty())
-                        .then_some(reference.value.as_str())
-                    }),
+                    native_path,
                     &pane.terminal_id,
                     now_ms,
                     &mut persist,
@@ -5054,6 +5061,94 @@ mod tests {
                 }),
             }],
         }
+    }
+
+    fn path_snapshot(path: &str) -> TopologySnapshot {
+        let mut snapshot = native_snapshot(path);
+        snapshot.panes[0].agent_session.as_mut().unwrap().kind = AgentSessionReferenceKind::Path;
+        snapshot
+    }
+
+    fn provisional_snapshot() -> TopologySnapshot {
+        let mut snapshot = native_snapshot("");
+        snapshot.panes[0].agent.as_mut().unwrap().agent_name = "unknown".to_owned();
+        snapshot.panes[0].agent_session = None;
+        snapshot
+    }
+
+    #[test]
+    fn path_keyed_occupant_reuses_run_and_execution() {
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: path_snapshot("/tmp/session.jsonl"),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let (first_run_id, first_execution_id) = {
+            let model = shared.borrow();
+            let execution = model
+                .executions()
+                .find(|execution| !execution.state.is_terminal())
+                .unwrap();
+            assert_eq!(model.task_runs().count(), 1);
+            assert_eq!(model.executions().count(), 1);
+            (execution.task_run_id, execution.execution_id.clone())
+        };
+
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: path_snapshot("/tmp/session.jsonl"),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let model = shared.borrow();
+        let live_executions = model
+            .executions()
+            .filter(|execution| !execution.state.is_terminal())
+            .collect::<Vec<_>>();
+
+        assert_eq!(model.task_runs().count(), 1);
+        assert_eq!(model.executions().count(), 1);
+        assert_eq!(live_executions.len(), 1);
+        assert_eq!(live_executions[0].task_run_id, first_run_id);
+        assert_eq!(live_executions[0].execution_id, first_execution_id);
+    }
+
+    #[test]
+    fn provisional_occupant_keeps_minting_per_observation() {
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: provisional_snapshot(),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let first_execution_id = shared
+            .borrow()
+            .executions()
+            .find(|execution| !execution.state.is_terminal())
+            .unwrap()
+            .execution_id
+            .clone();
+
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: provisional_snapshot(),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let model = shared.borrow();
+        let live_execution = model
+            .executions()
+            .find(|execution| !execution.state.is_terminal())
+            .unwrap();
+
+        assert_eq!(model.task_runs().count(), 2);
+        assert_eq!(model.executions().count(), 2);
+        assert_ne!(live_execution.execution_id, first_execution_id);
     }
 
     #[test]

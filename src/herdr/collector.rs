@@ -1786,6 +1786,7 @@ async fn run_collector(
             _ = retention_cleanup.tick() => {
                 let _ = persistence.cleanup(unix_now_ms()).await?;
                 persistence.refresh_pane_coverage(&shared.borrow());
+                persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
                 continue;
             }
             request = receive_controller(&mut controller_requests) => {
@@ -7080,12 +7081,14 @@ mod tests {
             task_run_id: run_id,
             state: ExecState::Working,
         });
-        let (reducer, mut shared) = Reducer::new(RestoredState {
+        let shared_model = model.clone();
+        let (reducer, _reducer_shared) = Reducer::new(RestoredState {
             model,
             next_ordinal: 2,
             next_ingest_seq: Some(1),
             event_ledger: Vec::new(),
         });
+        let (shared_sender, shared) = watch::channel(Arc::new(shared_model));
         let initial_coverage = SourceCoverageRegistry::new(SourceAvailability::NotApplicable);
         let (persistence, mut diagnostics) = RuntimePersistence::new(
             writer,
@@ -7105,12 +7108,40 @@ mod tests {
             0
         );
 
+        let socket = directory.path().join("stalled-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, first_request) = accept_wire_request(&listener).await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            write_wire_frame(
+                &mut first,
+                &json!({
+                    "id": first_request["id"],
+                    "result": {"type": "not_subscription_started"},
+                }),
+            )
+            .await;
+
+            let (second, _second_request) = accept_wire_request(&listener).await;
+            tokio::time::sleep(Duration::from_millis(3_500)).await;
+            drop(second);
+            let (mut post_retention, post_retention_request) = accept_wire_request(&listener).await;
+            write_wire_frame(
+                &mut post_retention,
+                &json!({
+                    "id": post_retention_request["id"],
+                    "result": {"type": "subscription_started"},
+                }),
+            )
+            .await;
+            std::future::pending::<()>().await;
+        });
         let (provider_sender, provider, provider_thread) = inactive_provider_integration();
         let (performance, _sampler) =
             performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
         let cancellation = CancellationToken::new();
         let task = tokio::spawn(run_collector(
-            directory.path().join("absent-herdr.sock"),
+            socket,
             "coverage-session".to_owned(),
             persistence,
             reducer,
@@ -7124,40 +7155,38 @@ mod tests {
             LivenessPolicy::default(),
             PrimaryStreamDiagnosticsHandle::default(),
         ));
-        provider_sender
-            .send(ProviderIngressEvent {
-                event: ProviderEvent::SessionResolved {
-                    provider: Provider::Codex,
-                    agent_thread_id: native_session_id.to_owned(),
-                    owner_session_id: Some(native_session_id.to_owned()),
-                    parent_thread_id: None,
-                    path: PathBuf::from("/tmp/coverage-session.jsonl"),
-                    model_id: None,
-                    depth: Some(0),
-                    event_id: "coverage-session-resolved".to_owned(),
-                    observed_at_ms: 100,
-                    position: crate::provider::SourcePosition {
-                        path_id: 1,
-                        generation: 0,
-                        offset: 1,
-                    },
-                },
-                admission: Some(performance.admit()),
-            })
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if shared.borrow().agent_nodes().any(|node| {
-                    node.task_run_id == run_id && node.session_file.as_deref().is_some()
+                if diagnostics.borrow().source_coverage.iter().any(|coverage| {
+                    coverage.source == DiagnosticSource::Herdr
+                        && coverage.availability == InputAvailability::Unavailable
                 }) {
                     break;
                 }
-                shared.changed().await.unwrap();
+                diagnostics.changed().await.unwrap();
             }
         })
         .await
-        .expect("provider event did not add artifact coverage during reconnect");
+        .expect("collector did not publish the first disconnected subscription");
+
+        let mut model_with_artifact = shared.borrow().as_ref().clone();
+        model_with_artifact.insert_agent_node(AgentNode {
+            agent_node_id: "coverage-node".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some(native_session_id.to_owned()),
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(2),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Working),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: Some("/tmp/coverage-session.jsonl".to_owned()),
+        });
+        shared_sender.send_replace(Arc::new(model_with_artifact));
         assert_eq!(
             diagnostics
                 .borrow()
@@ -7167,30 +7196,31 @@ mod tests {
             "the gauge should remain stale until the retention tick"
         );
 
-        let refreshed = tokio::time::timeout(Duration::from_secs(7), async {
+        let refreshed = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                if diagnostics
-                    .borrow()
-                    .provider_counters
-                    .pane_sessions_with_artifacts
-                    == 1
-                {
-                    break;
+                let snapshot = diagnostics.borrow().clone();
+                if snapshot.provider_counters.pane_sessions_with_artifacts == 1 {
+                    return snapshot.source_coverage.iter().any(|coverage| {
+                        coverage.source == DiagnosticSource::Herdr
+                            && coverage.availability == InputAvailability::Unavailable
+                    });
                 }
                 diagnostics.changed().await.unwrap();
             }
         })
         .await
-        .is_ok();
+        .unwrap_or(false);
 
         cancellation.cancel();
         drop(provider_sender);
         task.await.unwrap().unwrap();
+        server.abort();
+        let _ = server.await;
         provider_thread.stop().await.unwrap();
         lifecycle.shutdown().await.unwrap();
         assert!(
             refreshed,
-            "pane coverage did not refresh during the disconnected retry loop"
+            "pane coverage and disconnected source coverage did not publish together during retention"
         );
     }
 
