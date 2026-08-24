@@ -212,6 +212,8 @@ compression) with v2 corrections:
 
 The dependency DAG renders the status glyph plus label without the live line.
 
+The fixed documentation columns have widths MODEL 11, EFF 5, TOK 5, TOK-S 5, and TIME 6; bands are selected from the Execution tree inner width as 120 or wider for all five, 104–119 for EFF/TOK/TOK-S/TIME, 90–103 for TOK/TOK-S/TIME, 76–89 for TOK/TIME, 62–75 for TIME, and below 62 for none, yielding the ratified narrow-screen drop order MODEL, EFF, TOK-S, TOK, TIME.
+
 - EFF is real on BOTH providers (Claude assistant records carry top-level
   `effort` — verified), so the column shows actual values, `—` only when
   genuinely absent.

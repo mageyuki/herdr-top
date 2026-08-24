@@ -1,10 +1,11 @@
 # TUI guide
 
 herdr-top is a fixed-screen terminal monitor for one resolved Herdr session. It
-combines Herdr's physical workspace, tab, and pane topology with semantic Task
-Runs and native Claude Code or Codex agent nodes. Run `herdr-top` in a managed
-Herdr pane, or pass an explicit session and socket as described in the
-[CLI reference](cli.md).
+combines Herdr's physical workspace, tab, and pane topology with Task Runs and
+native Claude Code or Codex agent nodes synthesized directly from provider
+session logs. No hook registration or `emit` wiring is required. Run
+`herdr-top` in a managed Herdr pane, or pass an explicit session and socket as
+described in the [CLI reference](cli.md).
 
 ## Screen layout
 
@@ -39,10 +40,18 @@ Four overlays can replace the center of the screen:
   monitoring continues. `Enter` or `Esc` dismisses the notice and records its
   marker on a best-effort basis.
 - **Selected detail (`i`).** Shows the selected entity's identifiers and state,
-  plus up to 100 recent activity items in its scope.
+  plus up to 100 recent activity items in its scope. Task Run detail includes
+  `tokens.output`, `tokens.input`, `tokens.cached_input`,
+  `tokens.cache_write_input`, `tokens.reasoning_output`, `tokens.total`, and
+  `tokens.context_window`, followed by
+  `scope: semantic run and agent descendants`. Unreported fields use a
+  not-reported-style placeholder rather than zero. Resumed Codex rollouts also
+  show per-turn model, effort, and sandbox history.
 - **Summary (`s`).** Groups all Task Runs by worker kind and model. It reports
-  run and live counts, valid terminal-run total and mean durations, and `-` for
-  token fields that are not yet populated.
+  run and live counts, valid terminal-run total and mean durations, accumulated
+  output-token totals, and a weighted output-token rate: total rated output
+  tokens divided by total rated elapsed seconds. A token field uses its
+  placeholder only when the required telemetry is unavailable.
 - **Help (`?`).** Shows the key map and current runtime diagnostics, including
   persistence, Controller input, source coverage, and the standalone probe.
 
@@ -135,31 +144,89 @@ the following ASCII forms; every other value leaves Unicode connectors enabled.
 A Task Run follows this grammar:
 
 ```text
-<worker-kind> <subject> — <event-kind>: <tool> [model:<model>] [<status>] · <duration> <annotations>
+<glyph> <worker-kind>[ <subject>][ — <live line>][ · <duration>][ annotations]
 ```
 
-- **Worker kind** comes from the run key: a native provider name, the selector
-  from a hook-backed Controller key, another Controller key, or `provisional`.
+- **Glyph** carries the lifecycle state, with the stall override described
+  below.
+- **Worker kind** comes from the projected run kind, falling back to the native
+  provider name, the selector from a hook-backed Controller key, another
+  Controller key, or `provisional`.
 - **Subject** is the captured task subject. If none exists, the renderer uses a
-  key-derived identity rather than leaving the segment empty.
-- **Activity** appears only for a non-terminal run whose newest Agent Node has
-  a last event kind. The `: <tool>` suffix appears only when that node also has
-  a tool name.
-- **`[model:...]`** appears when that same newest Agent Node has a model ID.
-- **Status** always appears and can be `queued`, `running`, `blocked`,
-  `completed`, `failed`, `cancelled`, or `ended_unknown`.
+  key-derived identity rather than leaving the segment empty. A native or
+  native-path Codex run that is the child of an execution edge renders the kind
+  alone and suppresses the subject.
+- **Live line** appears only on a non-terminal run. It comes from the log-lane
+  live-line read model, or, for a Claude-flavoured run, from the newest Agent
+  Node's last event kind with a `: <tool>` suffix when a tool name is present.
 - **Duration** appears when the start and live or finished endpoint form a
   non-negative interval. Live durations use the current time; terminal runs use
   their recorded finish time.
 
+The glyph vocabulary is:
+
+| Glyph | Meaning |
+| --- | --- |
+| `⚠` | A non-terminal run whose activity silence has crossed the stall threshold. The override never replaces a terminal glyph. |
+| `●` | `running` or `blocked`. |
+| `✓` | `completed`. |
+| `✗` | `failed` or `cancelled`. |
+| `◌` | `queued` or `ended_unknown`. |
+
 Relationship annotations are appended in this order when applicable:
 
 - `[shared]` means the same Task Run has live executions in more than one pane,
-  so the run appears under each hosting pane.
-- `[dispatched by: ...]` names the explicit Controller dispatch parent. It does
-  not re-parent the physical tree row.
+  so the run appears under each hosting pane. Its descendants expand only on
+  the first occurrence.
+- `[dispatched by: ...]` appears only on a pane-placed run and names its dispatch
+  parent. A run with no execution history instead nests physically beneath its
+  default-visible dispatch parent and carries no textual parent hint. A hidden
+  or expired parent never hides a child: the child falls back to `Unattached`
+  for that frame. A malformed parent cycle also falls back to `Unattached`.
 - `[unlinked]` means no execution or dependency edge links the Task Run. Herdr
   Top does not infer a relationship from neighboring panes or shared paths.
+
+Placement follows live execution panes first, then the pane of the latest ended
+execution, then a default-visible dispatch parent for a run with no execution
+history, and finally `Unattached`. A shared run repeats beneath every live
+hosting pane, while nested descendants appear only beneath its first occurrence.
+
+### Metric columns and narrow panes
+
+Task Run metrics are right-aligned in fixed-width columns at the end of each
+tree row. These names describe the columns; the TUI does not render a header
+row.
+
+| Documentation name | Width | Value |
+| --- | ---: | --- |
+| `MODEL` | 11 | Current model, or an em-dash placeholder when unavailable. |
+| `EFF` | 5 | Current effort, or an em-dash placeholder when unavailable. |
+| `TOK` | 5 | Accumulated output tokens only, or an em-dash placeholder. |
+| `TOK-S` | 5 | Output tokens divided by elapsed seconds, or an em-dash placeholder. |
+| `TIME` | 6 | Run duration. |
+
+For `TOK-S`, elapsed time starts at the run's log-time anchor. It ends at the
+current time for a live run and at `finished_at_ms` for a terminal run, so the
+rate freezes at completion. Tokens, an anchor, and a positive elapsed interval
+are all required.
+
+Column bands are selected from the `Execution tree` pane's inner width, after
+subtracting its two border columns, rather than from raw terminal width:
+
+| Tree inner width | Visible columns |
+| ---: | --- |
+| 120 or wider | `MODEL EFF TOK TOK-S TIME` |
+| 104-119 | `EFF TOK TOK-S TIME` |
+| 90-103 | `TOK TOK-S TIME` |
+| 76-89 | `TOK TIME` |
+| 62-75 | `TIME` |
+| Below 62 | None |
+
+The resulting drop order is `MODEL`, `EFF`, `TOK-S`, `TOK`, then `TIME` as the
+pane narrows. Label text is truncated and deep indentation is compressed before
+the active band's columns disappear at the next threshold. Columns are joined
+with one space; the all-five band reserves 36 columns for metrics plus one
+separator from the padded label.
 
 Native agent rows use this form:
 
@@ -170,7 +237,8 @@ Native agent rows use this form:
 Agent nodes nest recursively only where provider metadata establishes a parent.
 The dependency view remains separate: it lists each Task Run with its explicit
 prerequisites and dependents, or displays `no dependency edges recorded` when
-there are none.
+there are none. DAG rows share the status-glyph and label grammar, but omit the
+live line.
 
 ## Visibility and dismissal
 
@@ -191,6 +259,30 @@ persisted. If that native session resumes, its `SessionStart` becomes
 `task_started`; ordinary non-terminal bookkeeping clears the dismissal and the
 run returns to the default view. A `SessionEnd` for an unknown run creates
 nothing.
+
+## Restart and backfill
+
+At startup, herdr-top re-reads every admitted provider artifact selected by the
+backfill window from byte zero; it does not restore a per-file byte offset. The
+selection anchor is the later of the earliest database event and
+`now - HERDR_TOP_BACKFILL_WINDOW_MS`. The window selects files, not records, so
+every selected artifact is read in full and its run totals are complete.
+Pane-root artifacts and artifacts admitted through lineage evidence are exempt
+from the anchor.
+
+Replay is idempotent through the durable event ledger. Token telemetry,
+subjects, run kind, and per-turn context are transient and are recomputed from
+the artifacts rather than restored from SQLite; token totals therefore return
+after startup backfill instead of being persisted.
+
+One fail-safe limitation remains. If a session completed and then resumed, and
+both halves arrive in one backfill pass, the row remains `completed` until
+genuinely new activity appears. The reopen gate requires the resume's
+source-clock timestamp to be strictly newer than `finished_at_ms`, but replay
+records the historical completion using the current receipt clock. The
+historical resume is therefore older and is denied. Denial avoids a false
+reopen on every restart; a durable correction requires a source-clock
+completion timestamp and a schema change.
 
 ## Liveness watchdog
 
