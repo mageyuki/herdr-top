@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-use crate::model::sanitize_controller_text;
+use crate::model::{TokenBreakdown, sanitize_controller_text};
 
 use super::facts::{
     ActivitySource, LogFact, SessionScope, repo_relative, scan_raw_ids, truncate_60,
@@ -41,6 +41,9 @@ struct AssistantMessage {
 
 #[derive(Debug, Deserialize)]
 struct AssistantUsage {
+    input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
     output_tokens: Option<u64>,
 }
 
@@ -163,15 +166,20 @@ fn extract_assistant(scope: &SessionScope, line: &str, facts: &mut Vec<LogFact>)
     let Some(message) = record.message else {
         return;
     };
-    if let (Some(sample_id), Some(output_tokens)) = (
-        message.id,
-        message.usage.and_then(|usage| usage.output_tokens),
-    ) {
+    if let (Some(sample_id), Some(usage)) = (message.id, message.usage)
+        && let Some(output_tokens) = usage.output_tokens
+    {
         facts.push(LogFact::Usage {
             scope: scope.clone(),
             at_ms,
             sample_id,
             output_tokens,
+            token_breakdown: TokenBreakdown {
+                input_tokens: usage.input_tokens,
+                cached_input_tokens: usage.cache_read_input_tokens,
+                cache_write_input_tokens: usage.cache_creation_input_tokens,
+                ..TokenBreakdown::default()
+            },
             model: message.model,
             effort: record.effort,
         });

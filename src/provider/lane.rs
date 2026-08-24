@@ -594,6 +594,7 @@ impl Synthesis {
                 at_ms,
                 sample_id,
                 output_tokens,
+                token_breakdown,
                 model,
                 effort,
             } => {
@@ -604,6 +605,7 @@ impl Synthesis {
                         key: run_key_for_scope(&scope),
                         at_ms,
                         output_tokens,
+                        token_breakdown,
                         model: model.or_else(|| context.map(|(model, _, _)| model.clone())),
                         effort: effort
                             .or_else(|| context.and_then(|(_, effort, _)| effort.clone())),
@@ -2484,6 +2486,7 @@ mod tests {
                 at_ms: 200,
                 sample_id: "msg_02SyntheticStreamChunk".to_owned(),
                 output_tokens: 11,
+                token_breakdown: crate::model::TokenBreakdown::default(),
                 model: None,
                 effort: None,
             },
@@ -2539,6 +2542,7 @@ mod tests {
                         at_ms: 20,
                         sample_id: "turn-1:2".to_owned(),
                         output_tokens: 42,
+                        token_breakdown: crate::model::TokenBreakdown::default(),
                         model: None,
                         effort: None,
                     },

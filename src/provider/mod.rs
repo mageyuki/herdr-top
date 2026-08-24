@@ -21,7 +21,7 @@ use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
 use crate::model::{
     ControllerEvent, ExecState, MinimalProviderMetadata, Provider, ProviderDiagnosticsHandle,
-    RunKey,
+    RunKey, TokenBreakdown,
 };
 
 pub mod claude;
@@ -85,6 +85,7 @@ pub enum ProviderEvent {
         key: RunKey,
         at_ms: i64,
         output_tokens: u64,
+        token_breakdown: TokenBreakdown,
         model: Option<String>,
         effort: Option<String>,
         sandbox: Option<String>,

@@ -2709,6 +2709,76 @@ mod tests {
     }
 
     #[test]
+    fn unattached_run_after_workspace_renders_honest_session_scope() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FB3");
+        let mut model = DomainModel::default();
+        model.insert_workspace(Workspace {
+            workspace_id: "preceding-workspace".to_owned(),
+        });
+        model.insert_task_run(label_run(
+            run_id,
+            RunKey::Controller("unattached".to_owned()),
+            TaskState::Running,
+            None,
+            None,
+            None,
+        ));
+        let selected = NodeKey::Run {
+            run_id,
+            pane_id: None,
+        };
+        let rows = vec![
+            TreeRow {
+                key: NodeKey::Workspace("preceding-workspace".to_owned()),
+                depth: 1,
+                label: "preceding-workspace".to_owned(),
+                prerequisites: Vec::new(),
+                dependents: Vec::new(),
+            },
+            TreeRow {
+                key: NodeKey::UnattachedGroup,
+                depth: 1,
+                label: "Unattached Task Runs".to_owned(),
+                prerequisites: Vec::new(),
+                dependents: Vec::new(),
+            },
+            TreeRow {
+                key: selected.clone(),
+                depth: 2,
+                label: "unattached".to_owned(),
+                prerequisites: Vec::new(),
+                dependents: Vec::new(),
+            },
+        ];
+
+        let summary = projection::summary_projection(
+            &model,
+            &rows,
+            Some(&selected),
+            projection::SummaryScope::SelectionWorkspace,
+            10,
+        );
+        let lines = summary_lines(
+            &model,
+            &rows,
+            Some(&selected),
+            projection::SummaryScope::SelectionWorkspace,
+            10,
+        );
+
+        assert_eq!(summary.workspace_id, None);
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("scope: session (selection has no workspace; w toggles scope mode)")
+        );
+        assert!(
+            lines
+                .first()
+                .is_some_and(|line| !line.starts_with("scope: workspace "))
+        );
+    }
+
+    #[test]
     fn task_run_rows_use_readable_fixed_time_grammar() {
         let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let cases = [

@@ -91,10 +91,52 @@ pub struct TurnAttr {
     pub sandbox: Option<String>,
 }
 
-/// Transient output-token telemetry for one task run.
+/// Provider-reported numeric token families beyond the output-token total.
+///
+/// Claude `cache_read_input_tokens` and Codex `cached_input_tokens` map to
+/// `cached_input_tokens`; Claude `cache_creation_input_tokens` and Codex
+/// `cache_write_input_tokens` map to `cache_write_input_tokens`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TokenBreakdown {
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub cache_write_input_tokens: Option<u64>,
+    pub reasoning_output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub context_window: Option<u64>,
+}
+
+impl TokenBreakdown {
+    pub(crate) fn accumulate(&mut self, sample: Self) {
+        accumulate_reported(&mut self.input_tokens, sample.input_tokens);
+        accumulate_reported(&mut self.cached_input_tokens, sample.cached_input_tokens);
+        accumulate_reported(
+            &mut self.cache_write_input_tokens,
+            sample.cache_write_input_tokens,
+        );
+        accumulate_reported(
+            &mut self.reasoning_output_tokens,
+            sample.reasoning_output_tokens,
+        );
+        accumulate_reported(&mut self.total_tokens, sample.total_tokens);
+        if sample.context_window.is_some() {
+            // A context window is a gauge: the last reported value replaces the prior value.
+            self.context_window = sample.context_window;
+        }
+    }
+}
+
+fn accumulate_reported(slot: &mut Option<u64>, sample: Option<u64>) {
+    if let Some(value) = sample {
+        *slot = Some(slot.unwrap_or(0).saturating_add(value));
+    }
+}
+
+/// Transient provider telemetry for one task run.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunTelemetry {
     pub output_tokens: u64,
+    pub token_breakdown: TokenBreakdown,
     pub started_wall_ms: i64,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -827,6 +869,7 @@ impl DomainModel {
             .entry(run_id)
             .or_insert_with(|| RunTelemetry {
                 output_tokens: 0,
+                token_breakdown: TokenBreakdown::default(),
                 started_wall_ms: at_ms,
                 model: None,
                 effort: None,
@@ -849,6 +892,9 @@ impl DomainModel {
         canonical.output_tokens = canonical
             .output_tokens
             .saturating_add(absorbed_telemetry.output_tokens);
+        canonical
+            .token_breakdown
+            .accumulate(absorbed_telemetry.token_breakdown);
         canonical.started_wall_ms = canonical
             .started_wall_ms
             .min(absorbed_telemetry.started_wall_ms);

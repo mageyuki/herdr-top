@@ -538,6 +538,28 @@ impl Reducer {
         effort: Option<String>,
         sandbox: Option<String>,
     ) -> Vec<PersistOp> {
+        self.apply_telemetry_with_breakdown(
+            key,
+            at_ms,
+            output_tokens,
+            crate::model::TokenBreakdown::default(),
+            crate::model::TurnAttr {
+                model,
+                effort,
+                sandbox,
+            },
+        )
+    }
+
+    /// Accumulates one lane-deduplicated token sample in transient model state.
+    pub fn apply_telemetry_with_breakdown(
+        &mut self,
+        key: &RunKey,
+        at_ms: i64,
+        output_tokens: u64,
+        token_breakdown: crate::model::TokenBreakdown,
+        attribution: crate::model::TurnAttr,
+    ) -> Vec<PersistOp> {
         let Some(task_run) = self.model.task_run_by_key(key) else {
             return Vec::new();
         };
@@ -549,11 +571,13 @@ impl Reducer {
                 ..
             }
         );
-        self.model.telemetry_entry(run_id, at_ms).accumulate(
+        let telemetry = self.model.telemetry_entry(run_id, at_ms);
+        telemetry.token_breakdown.accumulate(token_breakdown);
+        telemetry.accumulate(
             output_tokens,
-            model,
-            effort,
-            sandbox,
+            attribution.model,
+            attribution.effort,
+            attribution.sandbox,
             retain_turn,
         );
         self.publish();
@@ -3486,6 +3510,7 @@ mod tests {
                     at_ms: 1_100,
                     sample_id: "turn-1:sample".to_owned(),
                     output_tokens: 17,
+                    token_breakdown: crate::model::TokenBreakdown::default(),
                     model: None,
                     effort: None,
                 },
@@ -3499,6 +3524,7 @@ mod tests {
                     at_ms: 1_101,
                     sample_id: "turn-1:sample".to_owned(),
                     output_tokens: 999,
+                    token_breakdown: crate::model::TokenBreakdown::default(),
                     model: None,
                     effort: None,
                 },
@@ -3520,6 +3546,7 @@ mod tests {
                     at_ms: 1_200,
                     sample_id: "turn-2:sample".to_owned(),
                     output_tokens: 25,
+                    token_breakdown: crate::model::TokenBreakdown::default(),
                     model: None,
                     effort: None,
                 },
@@ -3555,13 +3582,24 @@ mod tests {
                     key,
                     at_ms,
                     output_tokens,
+                    token_breakdown,
                     model,
                     effort,
                     sandbox,
                 } => {
                     assert!(
                         reducer
-                            .apply_telemetry(&key, at_ms, output_tokens, model, effort, sandbox,)
+                            .apply_telemetry_with_breakdown(
+                                &key,
+                                at_ms,
+                                output_tokens,
+                                token_breakdown,
+                                crate::model::TurnAttr {
+                                    model,
+                                    effort,
+                                    sandbox,
+                                },
+                            )
                             .is_empty()
                     );
                 }

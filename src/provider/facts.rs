@@ -3,6 +3,8 @@
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
+use crate::model::TokenBreakdown;
+
 /// Identity and ownership of the session evidenced by a log record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionScope {
@@ -146,6 +148,8 @@ pub enum LogFact {
         sample_id: String,
         /// Output tokens only.
         output_tokens: u64,
+        /// Other allowlisted numeric token families reported with this sample.
+        token_breakdown: TokenBreakdown,
         /// Allowlisted provider model name, when present.
         model: Option<String>,
         /// Allowlisted provider effort setting, when present.

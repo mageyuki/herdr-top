@@ -523,8 +523,6 @@ impl RuntimePersistence {
         let acceptor_diagnostics = model.controller_diagnostics().acceptor_handle();
         let enrichment_diagnostics = EnrichmentDiagnosticsHandle::default();
         let provider_diagnostics = model.provider_diagnostics().handle();
-        let (pane_sessions_total, pane_sessions_with_artifacts) =
-            pane_session_artifact_coverage(model);
         let snapshot = RuntimeDiagnosticsSnapshot {
             persistence: writer.persistence_status(),
             controller_input,
@@ -532,30 +530,26 @@ impl RuntimePersistence {
             persistence_counters: PersistenceCounters::default(),
             controller_counters,
             enrichment_counters: EnrichmentCounterSnapshot::default(),
-            provider_counters: provider_counter_snapshot(
-                &provider_diagnostics,
-                pane_sessions_total,
-                pane_sessions_with_artifacts,
-            ),
+            provider_counters: provider_counter_snapshot(&provider_diagnostics, 0, 0),
             source_coverage: diagnostic_source_coverage(coverage, controller_input),
             dangling_announcement_components: controller_counters.dangling_announcement_components,
             first_failure_log: OccurrenceLogStatus::NotAttempted,
         };
         let (publisher, diagnostics) = watch::channel(snapshot.clone());
-        (
-            Self {
-                writer,
-                writer_health,
-                snapshot,
-                publisher,
-                occurrence_sink,
-                occurrence_attempted: false,
-                acceptor_diagnostics,
-                enrichment_diagnostics,
-                provider_diagnostics,
-            },
-            diagnostics,
-        )
+        let mut persistence = Self {
+            writer,
+            writer_health,
+            snapshot,
+            publisher,
+            occurrence_sink,
+            occurrence_attempted: false,
+            acceptor_diagnostics,
+            enrichment_diagnostics,
+            provider_diagnostics,
+        };
+        persistence.refresh_pane_coverage(model);
+        persistence.publish();
+        (persistence, diagnostics)
     }
 
     #[cfg(test)]
@@ -863,16 +857,19 @@ impl RuntimePersistence {
 
     fn refresh_snapshot(&mut self, model: &DomainModel, coverage: &SourceCoverageRegistry) {
         let controller_counters = controller_counter_snapshot(model);
-        let (pane_sessions_total, pane_sessions_with_artifacts) =
-            pane_session_artifact_coverage(model);
-        self.snapshot.provider_counters.pane_sessions_total = pane_sessions_total;
-        self.snapshot.provider_counters.pane_sessions_with_artifacts = pane_sessions_with_artifacts;
         self.snapshot.controller_counters = controller_counters;
         self.snapshot.dangling_announcement_components =
             controller_counters.dangling_announcement_components;
         self.snapshot.source_coverage =
             diagnostic_source_coverage(coverage, self.snapshot.controller_input);
         self.publish();
+    }
+
+    fn refresh_pane_coverage(&mut self, model: &DomainModel) {
+        let (pane_sessions_total, pane_sessions_with_artifacts) =
+            pane_session_artifact_coverage(model);
+        self.snapshot.provider_counters.pane_sessions_total = pane_sessions_total;
+        self.snapshot.provider_counters.pane_sessions_with_artifacts = pane_sessions_with_artifacts;
     }
 
     fn mark_acceptor_stopped(&mut self) {
@@ -2712,6 +2709,7 @@ async fn monitor_live(
                     provider.publish_targets(shared);
                 }
                 let _ = persistence.cleanup(unix_now_ms()).await?;
+                persistence.refresh_pane_coverage(&shared.borrow());
                 persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
                 continue;
             }
@@ -2880,6 +2878,7 @@ async fn monitor_reconciling(
                     provider.publish_targets(shared);
                 }
                 let _ = persistence.cleanup(unix_now_ms()).await?;
+                persistence.refresh_pane_coverage(&shared.borrow());
                 persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
                 continue;
             }
@@ -4903,12 +4902,22 @@ async fn apply_provider_event_with_admission(
             key,
             at_ms,
             output_tokens,
+            token_breakdown,
             model,
             effort,
             sandbox,
         } => {
-            let persist =
-                reducer.apply_telemetry(&key, at_ms, output_tokens, model, effort, sandbox);
+            let persist = reducer.apply_telemetry_with_breakdown(
+                &key,
+                at_ms,
+                output_tokens,
+                token_breakdown,
+                crate::model::TurnAttr {
+                    model,
+                    effort,
+                    sandbox,
+                },
+            );
             debug_assert!(persist.is_empty(), "telemetry must remain transient");
             if let Some(admission) = admission.take() {
                 admission.complete();
@@ -6873,6 +6882,70 @@ mod tests {
         assert_eq!(backoff.consecutive_failures, 0);
         assert_eq!(backoff.on_watchdog_silence(), 1_000);
         assert_eq!(backoff.consecutive_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_snapshot_preserves_pane_coverage_between_sweeps() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut runtime, diagnostics) =
+            RuntimePersistence::new_for_test(writer, Arc::new(RecordingOccurrenceSink::default()));
+        let mut model = DomainModel::default();
+        let run_id = RunId::new();
+        model.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::NativePath {
+                provider: Provider::Codex,
+                path: "/tmp/fixture-rollout.jsonl".to_owned(),
+            },
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Running,
+            has_controller_task_state_event: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        model.insert_execution(Execution {
+            execution_id: "fixture-execution".to_owned(),
+            pane_id: "fixture-pane".to_owned(),
+            terminal_id: "fixture-terminal".to_owned(),
+            task_run_id: run_id,
+            state: ExecState::Working,
+        });
+        let coverage = SourceCoverageRegistry::new(SourceAvailability::Available);
+
+        runtime.refresh_snapshot(&model, &coverage);
+
+        assert_eq!(
+            diagnostics.borrow().provider_counters.pane_sessions_total,
+            0
+        );
+        assert_eq!(
+            diagnostics
+                .borrow()
+                .provider_counters
+                .pane_sessions_with_artifacts,
+            0
+        );
+
+        runtime.refresh_pane_coverage(&model);
+        runtime.refresh_snapshot(&model, &coverage);
+        assert_eq!(
+            diagnostics.borrow().provider_counters.pane_sessions_total,
+            1
+        );
+        assert_eq!(
+            diagnostics
+                .borrow()
+                .provider_counters
+                .pane_sessions_with_artifacts,
+            1
+        );
+        lifecycle.shutdown().await.unwrap();
     }
 
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};

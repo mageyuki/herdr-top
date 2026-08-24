@@ -2098,6 +2098,12 @@ mod tests {
         }
         let observed = observed.expect("provider watcher did not publish an observation");
         handle.stop().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            diagnostics.last_watcher_observation_ms(),
+            Some(observed),
+            "a stopped watcher must not advance its observation timestamp"
+        );
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("still-changing.jsonl");

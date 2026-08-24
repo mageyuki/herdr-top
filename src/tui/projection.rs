@@ -12,7 +12,9 @@ use crate::activity::{
 };
 use crate::diagnostics::{ControllerInputStatus, RuntimeDiagnosticsSnapshot};
 use crate::herdr::collector::ObservationQuality;
-use crate::model::{DomainModel, ExecState, Provider, RunId, RunKey, TaskRun, TaskState, TurnAttr};
+use crate::model::{
+    DomainModel, ExecState, Provider, RunId, RunKey, TaskRun, TaskState, TokenBreakdown, TurnAttr,
+};
 use crate::store::writer::PersistenceStatus;
 
 use super::app::{NodeKey, ViewMode};
@@ -46,7 +48,7 @@ pub(crate) fn run_metric_inputs(model: &DomainModel, run: &TaskRun) -> RunMetric
     }
 }
 
-pub(crate) fn run_token_rate(metrics: &RunMetricInputs, now_ms: i64) -> Option<f64> {
+fn run_rate_terms(metrics: &RunMetricInputs, now_ms: i64) -> Option<(u64, i64)> {
     let output_tokens = metrics.output_tokens?;
     let started_wall_ms = metrics.started_wall_ms?;
     let end_ms = if metrics.terminal {
@@ -58,6 +60,11 @@ pub(crate) fn run_token_rate(metrics: &RunMetricInputs, now_ms: i64) -> Option<f
     if elapsed_ms <= 0 {
         return None;
     }
+    Some((output_tokens, elapsed_ms))
+}
+
+pub(crate) fn run_token_rate(metrics: &RunMetricInputs, now_ms: i64) -> Option<f64> {
+    let (output_tokens, elapsed_ms) = run_rate_terms(metrics, now_ms)?;
     Some(output_tokens as f64 / (elapsed_ms as f64 / 1_000.0))
 }
 
@@ -75,6 +82,7 @@ pub(crate) struct SummaryRow {
     pub(crate) total_duration_ms: i64,
     pub(crate) mean_duration_ms: Option<i64>,
     pub(crate) total_output_tokens: Option<u64>,
+    /// Total rated output tokens divided by total rated elapsed seconds.
     pub(crate) mean_tokens_per_second: Option<f64>,
 }
 
@@ -94,8 +102,8 @@ struct SummaryAccumulator {
     timed_count: i64,
     total_output_tokens: u64,
     token_count: usize,
-    total_tokens_per_second: f64,
-    rated_count: usize,
+    total_rated_output_tokens: u64,
+    total_rated_elapsed_ms: i64,
 }
 
 pub(crate) fn summary_projection(
@@ -106,7 +114,7 @@ pub(crate) fn summary_projection(
     now_ms: i64,
 ) -> SummaryProjection {
     let workspace_id = (scope == SummaryScope::SelectionWorkspace)
-        .then(|| selected.and_then(|selected| selected_workspace_id(model, rows, selected)))
+        .then(|| selected.and_then(|selected| selected_workspace_id(model, selected)))
         .flatten();
     let workspace_runs = workspace_id
         .as_deref()
@@ -182,9 +190,11 @@ fn aggregate_summary_rows(
             group.total_output_tokens = group.total_output_tokens.saturating_add(output_tokens);
             group.token_count = group.token_count.saturating_add(1);
         }
-        if let Some(rate) = run_token_rate(&metrics, now_ms) {
-            group.total_tokens_per_second += rate;
-            group.rated_count = group.rated_count.saturating_add(1);
+        if let Some((output_tokens, elapsed_ms)) = run_rate_terms(&metrics, now_ms) {
+            group.total_rated_output_tokens = group
+                .total_rated_output_tokens
+                .saturating_add(output_tokens);
+            group.total_rated_elapsed_ms = group.total_rated_elapsed_ms.saturating_add(elapsed_ms);
         }
     }
 
@@ -198,8 +208,10 @@ fn aggregate_summary_rows(
             mean_duration_ms: (group.timed_count > 0)
                 .then(|| group.total_duration_ms / group.timed_count),
             total_output_tokens: (group.token_count > 0).then_some(group.total_output_tokens),
-            mean_tokens_per_second: (group.rated_count > 0)
-                .then(|| group.total_tokens_per_second / group.rated_count as f64),
+            mean_tokens_per_second: (group.total_rated_elapsed_ms > 0).then(|| {
+                group.total_rated_output_tokens as f64
+                    / (group.total_rated_elapsed_ms as f64 / 1_000.0)
+            }),
         })
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| {
@@ -211,30 +223,42 @@ fn aggregate_summary_rows(
     rows
 }
 
-fn selected_workspace_id(
-    model: &DomainModel,
-    rows: &[TreeRow],
-    selected: &NodeKey,
-) -> Option<String> {
+fn selected_workspace_id(model: &DomainModel, selected: &NodeKey) -> Option<String> {
     match selected {
         NodeKey::Workspace(workspace_id) => Some(workspace_id.clone()),
         NodeKey::Tab(tab_id) => model.tab(tab_id).map(|tab| tab.workspace_id.clone()),
         NodeKey::Pane(pane_id) => model.pane(pane_id).map(|pane| pane.workspace_id.clone()),
-        NodeKey::Run { pane_id, .. } | NodeKey::Agent { pane_id, .. } => pane_id
+        NodeKey::Run { run_id, pane_id } => pane_id
             .as_deref()
             .and_then(|pane_id| model.pane(pane_id))
             .map(|pane| pane.workspace_id.clone())
-            .or_else(|| preceding_workspace(rows, selected)),
+            .or_else(|| run_workspace_id(model, *run_id)),
+        NodeKey::Agent {
+            agent_node_id,
+            pane_id,
+        } => pane_id
+            .as_deref()
+            .and_then(|pane_id| model.pane(pane_id))
+            .map(|pane| pane.workspace_id.clone())
+            .or_else(|| {
+                model
+                    .agent_node(agent_node_id)
+                    .and_then(|agent| run_workspace_id(model, agent.task_run_id))
+            }),
         NodeKey::Session | NodeKey::UnattachedGroup => None,
     }
 }
 
-fn preceding_workspace(rows: &[TreeRow], selected: &NodeKey) -> Option<String> {
-    let index = rows.iter().position(|row| &row.key == selected)?;
-    rows[..=index].iter().rev().find_map(|row| match &row.key {
-        NodeKey::Workspace(workspace_id) => Some(workspace_id.clone()),
-        _ => None,
-    })
+fn run_workspace_id(model: &DomainModel, run_id: RunId) -> Option<String> {
+    // A run spanning multiple panes selects the lexicographically lowest workspace ID so the
+    // result is deterministic and independent of HashMap iteration order.
+    model
+        .executions()
+        .filter(|execution| execution.task_run_id == run_id)
+        .filter_map(|execution| model.pane(&execution.pane_id))
+        .map(|pane| pane.workspace_id.as_str())
+        .min()
+        .map(str::to_owned)
 }
 
 fn workspace_run_ids(model: &DomainModel, rows: &[TreeRow], workspace_id: &str) -> HashSet<RunId> {
@@ -375,6 +399,7 @@ pub(crate) enum DetailEntity {
         evidence_paths: Vec<String>,
         per_turn: Vec<TurnAttr>,
         output_tokens: Option<u64>,
+        token_breakdown: Option<Box<TokenBreakdown>>,
     },
     Agent {
         agent_node_id: String,
@@ -775,6 +800,8 @@ fn detail_entity(model: &DomainModel, selected: &NodeKey, home: Option<&OsStr>) 
                         .map(|telemetry| telemetry.per_turn.clone())
                         .unwrap_or_default(),
                     output_tokens: telemetry.map(|telemetry| telemetry.output_tokens),
+                    token_breakdown: telemetry
+                        .map(|telemetry| Box::new(telemetry.token_breakdown.clone())),
                 }
             })
         }
@@ -964,6 +991,7 @@ fn entity_lines(entity: &DetailEntity) -> Vec<String> {
             evidence_paths,
             per_turn,
             output_tokens,
+            token_breakdown,
         } => {
             let mut lines = vec![
                 "entity: task_run".to_owned(),
@@ -1025,7 +1053,31 @@ fn entity_lines(entity: &DetailEntity) -> Vec<String> {
                 output_tokens
                     .map_or_else(|| "not retained".to_owned(), |tokens| tokens.to_string())
             ));
-            lines.push("tokens.other: not retained".to_owned());
+            let token_breakdown = token_breakdown.as_ref();
+            lines.push(format!(
+                "tokens.input: {}",
+                reported_tokens(token_breakdown.and_then(|tokens| tokens.input_tokens))
+            ));
+            lines.push(format!(
+                "tokens.cached_input: {}",
+                reported_tokens(token_breakdown.and_then(|tokens| tokens.cached_input_tokens))
+            ));
+            lines.push(format!(
+                "tokens.cache_write_input: {}",
+                reported_tokens(token_breakdown.and_then(|tokens| tokens.cache_write_input_tokens))
+            ));
+            lines.push(format!(
+                "tokens.reasoning_output: {}",
+                reported_tokens(token_breakdown.and_then(|tokens| tokens.reasoning_output_tokens))
+            ));
+            lines.push(format!(
+                "tokens.total: {}",
+                reported_tokens(token_breakdown.and_then(|tokens| tokens.total_tokens))
+            ));
+            lines.push(format!(
+                "tokens.context_window: {}",
+                reported_tokens(token_breakdown.and_then(|tokens| tokens.context_window))
+            ));
             lines.push("scope: semantic run and agent descendants".to_owned());
             lines
         }
@@ -1066,6 +1118,10 @@ fn entity_lines(entity: &DetailEntity) -> Vec<String> {
         ],
         DetailEntity::Missing => vec!["entity: unavailable".to_owned()],
     }
+}
+
+fn reported_tokens(value: Option<u64>) -> String {
+    value.map_or_else(|| "not reported".to_owned(), |value| value.to_string())
 }
 
 pub(crate) fn activity_line(item: &ActivityItem) -> String {
@@ -1288,12 +1344,23 @@ mod tests {
                     key,
                     at_ms,
                     output_tokens,
+                    token_breakdown,
                     model,
                     effort,
                     sandbox,
                 } => assert!(
                     reducer
-                        .apply_telemetry(&key, at_ms, output_tokens, model, effort, sandbox,)
+                        .apply_telemetry_with_breakdown(
+                            &key,
+                            at_ms,
+                            output_tokens,
+                            token_breakdown,
+                            TurnAttr {
+                                model,
+                                effort,
+                                sandbox,
+                            },
+                        )
                         .is_empty()
                 ),
                 ProviderEvent::Activity { .. }
@@ -1307,6 +1374,68 @@ mod tests {
                 }
             }
         }
+    }
+
+    async fn provider_fixture_model() -> DomainModel {
+        let fixture_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-logs");
+        let claude_artifact = fixture_root.join("claude-session.jsonl");
+        let codex_artifact = fixture_root.join("codex-exec-resume-appended.jsonl");
+        let claude_scope =
+            SessionScope::ClaudeRoot("13f03635-c1f6-46e2-8e52-83d217b6f01c".to_owned());
+        let codex_rollout = "745480a2-5bdc-483f-ab53-0b4fabc01781";
+        let claude_facts = fs::read_to_string(&claude_artifact)
+            .unwrap()
+            .lines()
+            .enumerate()
+            .flat_map(|(ordinal, line)| {
+                extract_claude_line(&claude_scope, line)
+                    .into_iter()
+                    .map(move |fact| (ordinal as u64, fact))
+            })
+            .collect::<Vec<_>>();
+        let codex_facts = fs::read_to_string(&codex_artifact)
+            .unwrap()
+            .lines()
+            .enumerate()
+            .flat_map(|(ordinal, line)| {
+                extract_codex_line(codex_rollout, ordinal as u64, line)
+                    .into_iter()
+                    .map(move |fact| (ordinal as u64, fact))
+            })
+            .collect::<Vec<_>>();
+
+        let mut admission = Admission::new(0);
+        let discovered = AdmissionIndex::new();
+        let claude_events = Synthesis::default().synthesize_batch(
+            &claude_artifact,
+            claude_facts,
+            &mut admission,
+            &discovered,
+        );
+        let mut codex_synthesis = Synthesis::default();
+        let mut codex_events = codex_synthesis.synthesize_batch(
+            &codex_artifact,
+            codex_facts,
+            &mut admission,
+            &discovered,
+        );
+        codex_events.extend(codex_synthesis.advance_lifecycle(1_787_544_930_300));
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = open_writer(&StateRoot(directory.path().to_path_buf())).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        apply_fixture_events(&mut reducer, &mut writer, claude_events).await;
+        apply_fixture_events(&mut reducer, &mut writer, codex_events).await;
+        let model = shared.borrow().as_ref().clone();
+        lifecycle.shutdown().await.unwrap();
+        model
     }
 
     #[tokio::test]
@@ -1417,6 +1546,92 @@ mod tests {
     }
 
     #[test]
+    fn summary_mean_token_rate_weights_tokens_by_elapsed_time() {
+        let mut fast = run(
+            "hook:claude-code:session:task:fast",
+            1,
+            TaskState::Completed,
+        );
+        fast.finished_at_ms = Some(1_000);
+        let mut slow = run(
+            "hook:claude-code:session:task:slow",
+            2,
+            TaskState::Completed,
+        );
+        slow.finished_at_ms = Some(1_000_000);
+        let mut model = DomainModel::default();
+        model.insert_task_run(fast.clone());
+        model.insert_task_run(slow.clone());
+        model
+            .telemetry_entry(fast.run_id, 0)
+            .accumulate(100, None, None, None, false);
+        model
+            .telemetry_entry(slow.run_id, 0)
+            .accumulate(1_000, None, None, None, false);
+
+        let summary = summary_projection(
+            &model,
+            &[],
+            Some(&NodeKey::Session),
+            SummaryScope::Session,
+            1_000_000,
+        );
+        let rate = summary
+            .worker_kinds
+            .iter()
+            .find(|row| row.label == "claude-code")
+            .and_then(|row| row.mean_tokens_per_second)
+            .expect("the two rated runs produce one aggregate rate");
+        let expected = 1.098_901_098_901_099;
+        assert!(
+            (rate - expected).abs() < 1e-12,
+            "expected weighted 1100/1001 ~= {expected}, got {rate}"
+        );
+        assert!(
+            (rate - 50.5).abs() > 1e-12,
+            "aggregate rate must not be the arithmetic mean 50.5"
+        );
+    }
+
+    #[test]
+    fn dag_run_selection_resolves_workspace_through_model_execution() {
+        let task_run = run("dag", 1, TaskState::Running);
+        let mut model = DomainModel::default();
+        model.insert_workspace(Workspace {
+            workspace_id: "dag-workspace".to_owned(),
+        });
+        model.insert_pane(Pane {
+            pane_id: "dag-pane".to_owned(),
+            workspace_id: "dag-workspace".to_owned(),
+            tab_id: "dag-tab".to_owned(),
+            terminal_id: "dag-terminal".to_owned(),
+            display_name: None,
+        });
+        model.insert_task_run(task_run.clone());
+        model.insert_execution(Execution {
+            execution_id: "dag-execution".to_owned(),
+            pane_id: "dag-pane".to_owned(),
+            terminal_id: "dag-terminal".to_owned(),
+            task_run_id: task_run.run_id,
+            state: ExecState::Working,
+        });
+        let selected = NodeKey::Run {
+            run_id: task_run.run_id,
+            pane_id: None,
+        };
+
+        let summary = summary_projection(
+            &model,
+            &[],
+            Some(&selected),
+            SummaryScope::SelectionWorkspace,
+            10,
+        );
+
+        assert_eq!(summary.workspace_id.as_deref(), Some("dag-workspace"));
+    }
+
+    #[test]
     fn summary_scope_follows_selection_w_toggles() {
         let first = run("first", 1, TaskState::Running);
         let second = run("second", 2, TaskState::Running);
@@ -1502,8 +1717,8 @@ mod tests {
         assert_eq!(workspace, toggled_back);
     }
 
-    #[test]
-    fn detail_shows_effort_sandbox_evidence_and_breakdown() {
+    #[tokio::test]
+    async fn detail_shows_effort_sandbox_evidence_and_breakdown() {
         let task_run = run("detail", 1, TaskState::Running);
         let mut model = DomainModel::default();
         model.insert_task_run(task_run.clone());
@@ -1589,7 +1804,60 @@ mod tests {
             .unwrap();
         assert!(first_turn < second_turn);
         assert!(lines.contains(&"tokens.output: 50".to_owned()));
-        assert!(lines.contains(&"tokens.other: not retained".to_owned()));
+        assert!(!lines.contains(&"tokens.other: not retained".to_owned()));
+
+        let fixture_model = provider_fixture_model().await;
+        let fixture_detail_lines = |provider| {
+            let run = fixture_model
+                .task_runs()
+                .find(|run| {
+                    summary_worker_kind_label(&fixture_model, run) == provider_name(provider)
+                })
+                .expect("fixture provider run exists");
+            detail_lines(&detail_projection(
+                &fixture_model,
+                &[],
+                &operator(Vec::new(), HashMap::new()),
+                &NodeKey::Run {
+                    run_id: run.run_id,
+                    pane_id: None,
+                },
+                ViewMode::DependencyDag,
+                None,
+            ))
+        };
+
+        let claude_lines = fixture_detail_lines(Provider::Claude);
+        for expected in [
+            "tokens.input: 2770",
+            "tokens.cached_input: 1280",
+            "tokens.cache_write_input: 240",
+            "tokens.output: 901",
+            "tokens.reasoning_output: not reported",
+            "tokens.total: not reported",
+            "tokens.context_window: not reported",
+        ] {
+            assert!(
+                claude_lines.contains(&expected.to_owned()),
+                "missing Claude fixture breakdown line {expected:?}: {claude_lines:?}"
+            );
+        }
+
+        let codex_lines = fixture_detail_lines(Provider::Codex);
+        for expected in [
+            "tokens.input: 1270",
+            "tokens.cached_input: 160",
+            "tokens.cache_write_input: 16",
+            "tokens.output: 450",
+            "tokens.reasoning_output: 145",
+            "tokens.total: 1720",
+            "tokens.context_window: 200000",
+        ] {
+            assert!(
+                codex_lines.contains(&expected.to_owned()),
+                "missing Codex fixture breakdown line {expected:?}: {codex_lines:?}"
+            );
+        }
     }
 
     fn run(label: &str, ordinal: i64, state: TaskState) -> TaskRun {

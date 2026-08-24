@@ -10,7 +10,7 @@ use std::fmt;
 use serde::de::{IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
-use crate::model::sanitize_controller_text;
+use crate::model::{TokenBreakdown, sanitize_controller_text};
 
 use super::claude_facts::{parse_decimal, parse_timestamp_ms};
 use super::facts::{
@@ -197,11 +197,17 @@ struct TokenCountPayload {
 #[derive(Debug, Deserialize)]
 struct TokenCountInfo {
     last_token_usage: Option<LastTokenUsage>,
+    model_context_window: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct LastTokenUsage {
+    input_tokens: Option<u64>,
+    cached_input_tokens: Option<u64>,
+    cache_write_input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    reasoning_output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
 }
 
 impl SessionSource {
@@ -426,11 +432,10 @@ fn extract_token_count(
     let Ok(envelope) = serde_json::from_str::<TokenCountEnvelope>(line) else {
         return;
     };
-    let Some(usage) = envelope
-        .payload
-        .and_then(|payload| payload.info)
-        .and_then(|info| info.last_token_usage)
-    else {
+    let Some(info) = envelope.payload.and_then(|payload| payload.info) else {
+        return;
+    };
+    let Some(usage) = info.last_token_usage else {
         return;
     };
     let output_tokens = usage.output_tokens.unwrap_or_default();
@@ -442,6 +447,14 @@ fn extract_token_count(
         at_ms,
         sample_id: record_ordinal.to_string(),
         output_tokens,
+        token_breakdown: TokenBreakdown {
+            input_tokens: usage.input_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            cache_write_input_tokens: usage.cache_write_input_tokens,
+            reasoning_output_tokens: usage.reasoning_output_tokens,
+            total_tokens: usage.total_tokens,
+            context_window: info.model_context_window,
+        },
         model: None,
         effort: None,
     });
@@ -814,6 +827,10 @@ mod tests {
                 at_ms: 1_787_540_400_100,
                 sample_id: "41".to_owned(),
                 output_tokens: 120,
+                token_breakdown: TokenBreakdown {
+                    reasoning_output_tokens: Some(30),
+                    ..TokenBreakdown::default()
+                },
                 model: None,
                 effort: None,
             })
