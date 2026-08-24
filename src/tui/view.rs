@@ -274,7 +274,7 @@ fn strip_model_date_suffix(model: &str) -> &str {
 }
 
 fn format_effort_value(effort: Option<&str>) -> String {
-    let Some(effort) = effort else {
+    let Some(effort) = effort.filter(|effort| !effort.is_empty()) else {
         return "—".to_owned();
     };
     let effort = safe_text(effort);
@@ -3069,6 +3069,7 @@ mod tests {
             ("claude-fable-5", "fable-5"),
             ("claude-3-5-sonnet-20241022", "3-5-sonnet"),
             ("claude-sonnet-4-2025-01-01", "sonnet-4"),
+            ("gpt-4o-20240513", "gpt-4o"),
             ("gpt-5.6-sol", "gpt-5.6-sol"),
             ("gpt-5.6-terra", "gpt-5.6-te…"),
             ("long-model-name", "long-model…"),
@@ -3082,6 +3083,15 @@ mod tests {
             Span::raw(format_model_value(Some("gpt-5.6-terra"))).width(),
             11
         );
+    }
+
+    #[test]
+    fn effort_values_abbreviate_and_treat_empty_as_absent() {
+        assert_eq!(format_effort_value(Some("minimal")), "min");
+        assert_eq!(format_effort_value(Some("medium")), "med");
+        assert_eq!(format_effort_value(Some("xhigh")), "xhigh");
+        assert_eq!(format_effort_value(None), "—");
+        assert_eq!(format_effort_value(Some("")), "—");
     }
 
     #[test]
@@ -3238,6 +3248,20 @@ mod tests {
                 RunKey::Native {
                     provider: Provider::Codex,
                     sid: "rollout".to_owned(),
+                },
+                "Codex",
+            ),
+            (
+                RunKey::Native {
+                    provider: Provider::Claude,
+                    sid: "session".to_owned(),
+                },
+                "Claude",
+            ),
+            (
+                RunKey::NativePath {
+                    provider: Provider::Codex,
+                    path: "/private/rollout.jsonl".to_owned(),
                 },
                 "Codex",
             ),
@@ -3553,6 +3577,75 @@ mod tests {
     }
 
     #[test]
+    fn compressed_tree_connector_prefixes_render_exact_shapes() {
+        assert_eq!(
+            tree_connector_prefixes_with_style(
+                &connector_fixture_rows(),
+                false,
+                TreeIndentStyle::Compressed,
+            ),
+            ["", "├─", "│ ├─", "│ │ └─", "│ └─", "└─", "  └─"]
+        );
+        assert_eq!(
+            tree_connector_prefixes_with_style(
+                &connector_fixture_rows(),
+                true,
+                TreeIndentStyle::Compressed,
+            ),
+            ["", "|-", "| |-", "| | `-", "| `-", "`-", "  `-"]
+        );
+    }
+
+    #[test]
+    fn clamped_tree_connector_prefixes_elide_leading_levels() {
+        let style = TreeIndentStyle::Clamped { max_levels: 2 };
+        assert_eq!(
+            tree_connector_prefixes_with_style(&connector_fixture_rows(), false, style),
+            ["", "├─", "│ ├─", "…│ └─", "│ └─", "└─", "  └─"]
+        );
+        assert_eq!(
+            tree_connector_prefixes_with_style(&connector_fixture_rows(), true, style),
+            ["", "|-", "| |-", "…| `-", "| `-", "`-", "  `-"]
+        );
+    }
+
+    #[test]
+    fn tree_indent_style_switches_at_exact_budget_boundaries() {
+        let max_depth = 4;
+        let rows = vec![TreeRow {
+            key: NodeKey::Session,
+            depth: max_depth,
+            label: "deep".to_owned(),
+            prerequisites: Vec::new(),
+            dependents: Vec::new(),
+        }];
+        let columns = &[MetricColumn::Time];
+        let fixed_width = metric_block_width(columns)
+            .saturating_add(1)
+            .saturating_add(TREE_SELECTION_MARKER_WIDTH)
+            .saturating_add(MIN_TREE_LABEL_WIDTH);
+        let normal_budget = max_depth * 4;
+        let compressed_budget = max_depth * 2;
+
+        assert_eq!(
+            tree_indent_style(&rows, fixed_width + normal_budget, columns),
+            TreeIndentStyle::Normal
+        );
+        assert_eq!(
+            tree_indent_style(&rows, fixed_width + normal_budget - 1, columns),
+            TreeIndentStyle::Compressed
+        );
+        assert_eq!(
+            tree_indent_style(&rows, fixed_width + compressed_budget, columns),
+            TreeIndentStyle::Compressed
+        );
+        assert_eq!(
+            tree_indent_style(&rows, fixed_width + compressed_budget - 1, columns),
+            TreeIndentStyle::Clamped { max_levels: 3 }
+        );
+    }
+
+    #[test]
     fn deep_indent_compresses_when_narrow() {
         let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let run = label_run(
@@ -3608,9 +3701,10 @@ mod tests {
         let glyph_byte = row.find('●').unwrap();
         let glyph_column = Span::raw(&row[..glyph_byte]).width();
 
-        assert!(
-            glyph_column < 1 + 2 + 12 * 4,
-            "indent did not compress: column {glyph_column}: {row}"
+        assert_eq!(
+            glyph_column,
+            1 + TREE_SELECTION_MARKER_WIDTH + 12 * 2,
+            "compressed indent changed: {row}"
         );
         assert!(
             row.contains("   83    10s"),
@@ -3755,6 +3849,61 @@ mod tests {
         let footer = render(&app, 104, 18).pop().unwrap();
         assert!(footer.contains("/ filter: needlex"), "{footer}");
         assert!(!footer.contains("filter:needle |"), "{footer}");
+    }
+
+    #[test]
+    fn header_fields_drop_in_declared_order_and_up_last() {
+        let model = populated_model();
+        let inputs = HeaderInputs::default();
+        let mut performance = inputs.performance.borrow().clone();
+        performance
+            .snapshot
+            .reasons
+            .insert(PerformanceDegradationReason::LivePanes);
+        let header_field_names = |available_width| {
+            let header = header_line(
+                160,
+                available_width,
+                &model,
+                ObservationQuality::Live,
+                &performance,
+                &inputs,
+                3_661_000,
+            )
+            .spans
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+            header
+                .split(" | ")
+                .map(|field| {
+                    if field == "LIVE" {
+                        "quality"
+                    } else {
+                        field.split_once(':').map_or(field, |(prefix, _)| prefix)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+
+        for (width, expected) in [
+            (
+                76,
+                "host | session | up | workspaces | quality | lag | perf | sources",
+            ),
+            (
+                75,
+                "host | session | up | workspaces | quality | lag | perf",
+            ),
+            (63, "host | session | up | workspaces | quality | perf"),
+            (55, "host | session | up | quality | perf"),
+            (40, "session | up | quality | perf"),
+            (31, "session | up | quality"),
+            (22, "session | quality"),
+        ] {
+            assert_eq!(header_field_names(width), expected, "width {width}");
+        }
     }
 
     #[test]

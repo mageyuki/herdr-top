@@ -48,6 +48,7 @@ const TOOL_ARGUMENT_SENTINEL: &str = "TOOL_ARGUMENT_FORBIDDEN_SENTINEL_I2E_6E43"
 const MALFORMED_RAW_SENTINEL: &str = "MALFORMED_RAW_FORBIDDEN_SENTINEL_I2E_7F54";
 const DOCTOR_PRIVATE_SENTINEL: &str = "DOCTOR_PRIVATE_SENTINEL_I4_T7_8A21";
 const ACTIVITY_IDENTITY_SENTINEL: &str = "ACTIVITY_IDENTITY_FORBIDDEN_I4_A1_HARNESS";
+const FILTER_INDICATOR_QUERY: &str = "FILTER_INDICATOR_I9_T10";
 const TUI_ROW_ONLY_MARKER: &str = "TUI_ROW_ONLY_MARKER_I4_C3";
 
 #[test]
@@ -672,13 +673,17 @@ fn render_new_tui_surfaces(collector: &collector::CollectorHandle) -> Vec<(&'sta
     surfaces.push(("tui-detail", render_app(&app).into_bytes()));
     app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
     app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-    for character in ACTIVITY_IDENTITY_SENTINEL.chars() {
+    for character in FILTER_INDICATOR_QUERY.chars() {
         app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
     }
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     let identity_filter = render_app(&app);
     assert!(identity_filter.contains("Selected: none"));
     assert!(!identity_filter.contains(TUI_ROW_ONLY_MARKER));
+    assert!(
+        identity_filter.contains("filter:FILTER_INDICATOR_I9_T10"),
+        "committed filter indicator must preserve the short operator query verbatim"
+    );
     assert!(!identity_filter.contains(ACTIVITY_IDENTITY_SENTINEL));
     surfaces.push(("tui-identity-filter", identity_filter.into_bytes()));
     for (surface, bytes) in &surfaces {
