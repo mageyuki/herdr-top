@@ -2110,7 +2110,6 @@ fn run_row_head(model: &DomainModel, run: &TaskRun, stalled: bool) -> String {
     let mut label = status_glyph(run.state, stalled).to_owned();
     label.push(' ');
     let run_kind = projection::run_kind_label(model, run);
-    let worker_kind = projection::worker_kind_label(run);
     label.push_str(&run_kind);
     let subject = if is_codex_worker(model, run) {
         String::new()
@@ -2120,10 +2119,6 @@ fn run_row_head(model: &DomainModel, run: &TaskRun, stalled: bool) -> String {
             .map_or_else(|| run_subject_fallback(run), safe_text)
     };
     if !subject.is_empty() {
-        if run_kind != worker_kind {
-            label.push(' ');
-            label.push_str(&worker_kind);
-        }
         label.push(' ');
         label.push_str(&subject);
     }

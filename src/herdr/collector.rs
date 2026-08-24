@@ -12505,8 +12505,9 @@ mod provider_integration_tests {
         assert!(
             harness
                 .row_label(meta_id)
-                .contains("claude-code Review the meta-derived subject"),
-            "meta.json description did not supply the dispatched subject"
+                .contains("● reviewer Review the meta-derived subject"),
+            "meta.json kind and subject were not first after the status glyph; actual row: {:?}",
+            harness.row_label(meta_id)
         );
 
         harness.shutdown().await;
