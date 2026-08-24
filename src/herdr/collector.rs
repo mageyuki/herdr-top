@@ -4123,17 +4123,12 @@ impl ProviderWorker for AdapterProviderWorker {
                     .get(&absolute)
                     .map_or(0, |generation| generation.saturating_add(1));
                 self.generations.insert(absolute, generation);
-                let baseline = self
-                    .roots
-                    .get(&(provider, item.root.clone()))
-                    .expect("work root was scanned")
-                    .discovery
-                    .baseline()
-                    .clone();
                 let tail = match TailFile::open(
                     &file.root,
                     &file.relative_path,
-                    &baseline,
+                    // Admission already bounds the selected files to the backfill anchor. Read
+                    // each admitted artifact completely so transient lane state is reconstructed.
+                    &crate::provider::FirstSeenBaseline::default(),
                     generation,
                     &mut boundary,
                 ) {
@@ -4852,6 +4847,7 @@ async fn apply_provider_event_with_admission(
             event.metadata.receipt_time_ms = unix_now_ms();
             event.metadata.source_coverage = coverage.provider_metadata();
             if persistence.is_duplicate(&event.metadata.event_id) {
+                reducer.restore_replayed_controller_transients(&event);
                 if let Some(admission) = admission.take() {
                     admission.complete();
                 }
@@ -12865,6 +12861,12 @@ mod provider_integration_tests {
                 ProviderEvent::Synthesized(event) => Some(event),
                 _ => None,
             })
+            .filter(|event| {
+                event
+                    .metadata
+                    .event_id
+                    .starts_with("log:agent-child.meta.json:")
+            })
             .collect::<Vec<_>>();
 
         assert_eq!(synthesized.len(), 2);
@@ -12986,6 +12988,278 @@ mod provider_integration_tests {
                     path.file_name().unwrap().to_string_lossy()
                 )
         )));
+    }
+
+    const RESTART_BACKFILL_ROLLOUT: &str = "99999999-9999-4999-8999-999999999999";
+
+    fn restart_backfill_log() -> String {
+        format!(
+            concat!(
+                "{{\"timestamp\":\"2026-08-24T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{0}\",\"session_id\":\"{0}\",\"cwd\":\"/repo\",\"originator\":\"codex_cli_rs\",\"cli_version\":\"0.149.0\"}}}}\n",
+                "{{\"timestamp\":\"2026-08-24T00:00:01Z\",\"type\":\"turn_context\",\"payload\":{{\"turn_id\":\"turn-1\",\"model\":\"gpt-5.6-sol\",\"effort\":\"xhigh\",\"sandbox_policy\":{{\"type\":\"workspace-write\"}}}}}}\n",
+                "{{\"timestamp\":\"2026-08-24T00:00:02Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\"}}}}\n",
+                "{{\"timestamp\":\"2026-08-24T00:00:03Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":{{\"output_tokens\":42}},\"model_context_window\":114000}}}}}}\n",
+                "{{\"timestamp\":\"2026-08-24T00:00:04Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"turn-1\"}}}}\n"
+            ),
+            RESTART_BACKFILL_ROLLOUT
+        )
+    }
+
+    fn restart_backfill_worker(root: &Path) -> AdapterProviderWorker {
+        AdapterProviderWorker::new_with_log_lane_config(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.to_path_buf(),
+            }],
+            crate::provider::ProviderDiagnostics::default(),
+            LogLaneConfig {
+                complete_grace_ms: 0,
+                headless_inactivity_ms: i64::MAX / 2,
+                ..LogLaneConfig::default()
+            },
+            None,
+        )
+    }
+
+    async fn apply_restart_backfill_events(
+        events: impl IntoIterator<Item = ProviderEvent>,
+        reducer: &mut Reducer,
+        shared: &SharedModel,
+        persistence: &mut RuntimePersistence,
+    ) {
+        let coverage = SourceCoverageRegistry::new(SourceAvailability::Available);
+        for event in events {
+            apply_provider_event(
+                event,
+                "restart-backfill",
+                reducer,
+                shared,
+                persistence,
+                &coverage,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    struct PersistedRestartBackfill {
+        _directory: tempfile::TempDir,
+        provider_root: PathBuf,
+        targets: TargetSet,
+        state_root: StateRoot,
+        run_id: RunId,
+        first_telemetry: crate::model::RunTelemetry,
+        terminal_sources: HashMap<RunId, String>,
+        restored: RestoredState,
+    }
+
+    async fn persist_restart_backfill() -> PersistedRestartBackfill {
+        let directory = tempfile::tempdir().unwrap();
+        let provider_root = directory.path().join("home/.codex/sessions");
+        std::fs::create_dir_all(&provider_root).unwrap();
+        let artifact = provider_root.join(format!(
+            "rollout-2026-08-25T00-00-00-{RESTART_BACKFILL_ROLLOUT}.jsonl"
+        ));
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path: artifact.clone(),
+        }]);
+        let mut worker = restart_backfill_worker(&provider_root);
+        let mut pending = PendingEvents::new(crate::provider::ProviderDiagnostics::default());
+        process_adapter_worker(&mut worker, &TargetSet::default(), &mut pending);
+        let _ = drain_pending(&mut pending);
+        std::fs::write(&artifact, restart_backfill_log()).unwrap();
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+
+        let state_path = directory.path().join("state");
+        std::fs::create_dir_all(&state_path).unwrap();
+        let state_root = StateRoot(state_path);
+        let store = open_writer(&state_root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut persistence = test_runtime(writer);
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        apply_restart_backfill_events(
+            drain_pending(&mut pending),
+            &mut reducer,
+            &shared,
+            &mut persistence,
+        )
+        .await;
+        let run_id = shared
+            .borrow()
+            .task_run_by_key(&RunKey::Native {
+                provider: Provider::Codex,
+                sid: RESTART_BACKFILL_ROLLOUT.to_owned(),
+            })
+            .expect("initial pass creates the rollout run")
+            .run_id;
+        let first_telemetry = shared
+            .borrow()
+            .telemetry(&run_id)
+            .expect("initial pass reads telemetry")
+            .clone();
+        drop(persistence);
+        lifecycle.shutdown().await.unwrap();
+
+        let reader = open_reader(&state_root).unwrap();
+        let terminal_sources = reader.terminal_event_sources().unwrap();
+        let restored = reader.load_restored_state().unwrap();
+        PersistedRestartBackfill {
+            _directory: directory,
+            provider_root,
+            targets,
+            state_root,
+            run_id,
+            first_telemetry,
+            terminal_sources,
+            restored,
+        }
+    }
+
+    fn replay_restart_backfill(fixture: &PersistedRestartBackfill) -> Vec<ProviderEvent> {
+        let mut worker = restart_backfill_worker(&fixture.provider_root);
+        let mut pending = PendingEvents::new(crate::provider::ProviderDiagnostics::default());
+        process_adapter_worker(&mut worker, &fixture.targets, &mut pending);
+        drain_pending(&mut pending)
+    }
+
+    #[tokio::test]
+    async fn restart_backfills_in_window_telemetry() {
+        let fixture = persist_restart_backfill().await;
+        assert_eq!(fixture.first_telemetry.output_tokens, 42);
+        assert!(
+            fixture.restored.model.telemetry(&fixture.run_id).is_none(),
+            "restart seed must prove telemetry is reconstructed rather than persisted"
+        );
+        let replay = replay_restart_backfill(&fixture);
+        let store = open_writer(&fixture.state_root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut persistence = test_runtime(writer);
+        let (mut reducer, shared) = Reducer::new(fixture.restored);
+        apply_restart_backfill_events(replay, &mut reducer, &shared, &mut persistence).await;
+
+        let snapshot = shared.borrow();
+        let telemetry = snapshot
+            .telemetry(&fixture.run_id)
+            .expect("startup replay must reconstruct in-window telemetry without an append");
+        assert_eq!(telemetry.output_tokens, 42);
+        assert_eq!(telemetry.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(telemetry.effort.as_deref(), Some("xhigh"));
+        assert_eq!(telemetry.sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(snapshot.run_kind(&fixture.run_id), Some("codex_cli_rs"));
+        drop(snapshot);
+        drop(persistence);
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_does_not_duplicate_events() {
+        let fixture = persist_restart_backfill().await;
+        let ledger_len = fixture.restored.event_ledger.len();
+        let next_ingest_seq = fixture.restored.next_ingest_seq;
+        let replay = replay_restart_backfill(&fixture);
+        assert!(
+            replay
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::Telemetry { .. })),
+            "test precondition requires the startup pass to replay file content"
+        );
+        let store = open_writer(&fixture.state_root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut persistence = test_runtime(writer);
+        let (mut reducer, shared) = Reducer::new(fixture.restored);
+        apply_restart_backfill_events(replay, &mut reducer, &shared, &mut persistence).await;
+        assert_eq!(
+            shared
+                .borrow()
+                .telemetry(&fixture.run_id)
+                .expect("telemetry proves replay reached the reducer")
+                .output_tokens,
+            42
+        );
+        drop(persistence);
+        lifecycle.shutdown().await.unwrap();
+
+        let replayed = open_reader(&fixture.state_root)
+            .unwrap()
+            .load_restored_state()
+            .unwrap();
+        assert_eq!(replayed.event_ledger.len(), ledger_len);
+        assert_eq!(replayed.next_ingest_seq, next_ingest_seq);
+        assert_eq!(replayed.model.task_runs().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn restart_does_not_flap_restored_terminal_runs() {
+        let fixture = persist_restart_backfill().await;
+        let expected_terminal = fixture
+            .restored
+            .model
+            .task_run(&fixture.run_id)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            expected_terminal.state,
+            TaskState::Completed,
+            "zero completion grace must persist the terminal precondition"
+        );
+        let ledger_len = fixture.restored.event_ledger.len();
+        let next_ingest_seq = fixture.restored.next_ingest_seq;
+        let replay = replay_restart_backfill(&fixture);
+        assert_eq!(
+            replay
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ProviderEvent::Synthesized(controller)
+                        if matches!(controller.event, ControllerEventKind::Complete)
+                ))
+                .count(),
+            1,
+            "startup replay must exercise the normal held-then-flushed Complete path"
+        );
+        let store = open_writer(&fixture.state_root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut persistence = test_runtime(writer);
+        let (mut reducer, shared) = Reducer::new(fixture.restored);
+        reducer.restore_terminal_event_sources(fixture.terminal_sources);
+        let coverage = SourceCoverageRegistry::new(SourceAvailability::Available);
+        for (index, event) in replay.into_iter().enumerate() {
+            apply_provider_event(
+                event,
+                "restart-backfill",
+                &mut reducer,
+                &shared,
+                &mut persistence,
+                &coverage,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                shared.borrow().task_run(&fixture.run_id),
+                Some(&expected_terminal),
+                "replay event {index} changed the restored terminal run"
+            );
+        }
+        drop(persistence);
+        lifecycle.shutdown().await.unwrap();
+
+        let replayed = open_reader(&fixture.state_root)
+            .unwrap()
+            .load_restored_state()
+            .unwrap();
+        assert_eq!(replayed.event_ledger.len(), ledger_len);
+        assert_eq!(replayed.next_ingest_seq, next_ingest_seq);
+        assert_eq!(
+            replayed.model.task_run(&fixture.run_id),
+            Some(&expected_terminal),
+            "replay persisted a reopen or duplicate terminal transition"
+        );
     }
 
     #[tokio::test]
@@ -14078,7 +14352,7 @@ mod provider_integration_tests {
     }
 
     #[tokio::test]
-    async fn file_existing_before_worker_readiness_starts_at_eof() {
+    async fn file_existing_before_worker_readiness_backfills_from_zero() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("home/.codex/sessions");
         std::fs::create_dir_all(&root).unwrap();
@@ -14122,10 +14396,7 @@ mod provider_integration_tests {
         .await;
         thread.stop().await.unwrap();
 
-        assert!(
-            activity.is_err(),
-            "pre-existing activity replayed from byte zero"
-        );
+        assert!(activity.is_ok(), "pre-existing activity was not backfilled");
     }
 
     #[test]

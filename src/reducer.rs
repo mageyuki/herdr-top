@@ -495,6 +495,33 @@ impl Reducer {
             .map(|run| run.run_id)
     }
 
+    /// Rebuilds transient provider metadata from a durable-ledger duplicate during log replay.
+    pub(crate) fn restore_replayed_controller_transients(&mut self, event: &ControllerEvent) {
+        if event.metadata.source != crate::provider::lane::SOURCE_LOG_LANE
+            || !matches!(
+                event.event,
+                ControllerEventKind::Dispatch { .. } | ControllerEventKind::TaskStarted
+            )
+        {
+            return;
+        }
+        let Some(kind) = event
+            .metadata
+            .provider_metadata
+            .as_ref()
+            .and_then(|provider| provider.event_kind.as_ref())
+        else {
+            return;
+        };
+        let Some(run_id) = self.resolve_controller_run(&event.task_run_id) else {
+            return;
+        };
+        if self.model.run_kind(&run_id).is_none() && !kind.is_empty() {
+            self.model.set_run_kind(run_id, kind.clone());
+            self.publish();
+        }
+    }
+
     /// Installs terminal-event provenance reconstructed from the durable event read model.
     pub fn restore_terminal_event_sources(&mut self, mut sources: HashMap<RunId, String>) {
         sources.retain(|run_id, _| self.model.task_run(run_id).is_some());
@@ -514,7 +541,12 @@ impl Reducer {
         let Some(mut task_run) = self.model.task_run_by_key(key).cloned() else {
             return Vec::new();
         };
-        if task_run.dismissed_at_ms.is_some() || task_run.state.is_terminal() {
+        if task_run.dismissed_at_ms.is_some()
+            || task_run.state.is_terminal()
+            || task_run
+                .updated_at_ms
+                .is_some_and(|updated_at_ms| updated_at_ms >= at_ms)
+        {
             return Vec::new();
         }
         Self::touch_task_run(&mut task_run, at_ms);
@@ -3293,6 +3325,24 @@ mod tests {
 
         assert!(reducer.touch_run_liveness(&key, 200).is_empty());
         assert_eq!(shared.borrow().task_run(&run_id), Some(&expected));
+    }
+
+    #[test]
+    fn liveness_touch_does_not_regress_restored_timestamp() {
+        let run_id = RunId::new();
+        let key = RunKey::Controller("restored-live".to_owned());
+        let mut restored_run =
+            run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
+        restored_run.updated_at_ms = Some(200);
+        let mut model = DomainModel::default();
+        model.insert_task_run(restored_run);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        assert!(reducer.touch_run_liveness(&key, 100).is_empty());
+        assert_eq!(
+            shared.borrow().task_run(&run_id).unwrap().updated_at_ms,
+            Some(200)
+        );
     }
 
     #[test]
