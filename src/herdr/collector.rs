@@ -4618,13 +4618,26 @@ fn derive_provider_targets(model: &DomainModel) -> TargetSet {
         | RunKey::Provisional { .. } => None,
     });
     let node_targets = model.agent_nodes().filter_map(|node| {
-        node.session_file
-            .as_deref()
-            .filter(|path| !path.is_empty())
-            .map(|path| ProviderTarget {
-                provider: node.provider,
-                path: PathBuf::from(path),
-            })
+        let path = PathBuf::from(
+            node.session_file
+                .as_deref()
+                .filter(|path| !path.is_empty())?,
+        );
+        let is_claude_subagent = node.provider == Provider::Claude
+            && provider_root_for_target(node.provider, &path)
+                .ok()
+                .and_then(|root| path.strip_prefix(root).ok())
+                .and_then(crate::provider::claude::path_topology)
+                .is_some_and(|topology| {
+                    matches!(
+                        topology,
+                        crate::provider::claude::ClaudePathTopology::Subagent { .. }
+                    )
+                });
+        (!is_claude_subagent).then_some(ProviderTarget {
+            provider: node.provider,
+            path,
+        })
     });
     let session_targets = model.executions().filter_map(|execution| {
         let run = model.task_run(&execution.task_run_id)?;
@@ -11404,6 +11417,74 @@ mod tests {
             PersistOp::UpsertPane { pane, .. }
                 if pane.display_name.as_deref() == Some("UI修正")
         )));
+    }
+
+    #[test]
+    fn restored_claude_subagent_target_is_not_rejected_across_provider_cycles() {
+        const PARENT_SESSION: &str = "11111111-1111-4111-8111-111111111111";
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.claude/projects");
+        let artifact = root.join(format!(
+            "project/{PARENT_SESSION}/subagents/agent-restored.jsonl"
+        ));
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, b"{}\n").unwrap();
+
+        let mut model = DomainModel::default();
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "agent:claude:restored".to_owned(),
+            provider: Provider::Claude,
+            native_session_id: Some("restored".to_owned()),
+            task_run_id: RunId::new(),
+            display_ordinal: DisplayOrdinal::new(1),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Working),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: Some(artifact.to_string_lossy().into_owned()),
+        });
+        let (_reducer, restored) = Reducer::new(RestoredState {
+            model,
+            next_ordinal: 2,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        assert_eq!(
+            restored
+                .borrow()
+                .agent_node("agent:claude:restored")
+                .and_then(|node| node.session_file.as_deref()),
+            artifact.to_str()
+        );
+
+        let targets = derive_provider_targets(&restored.borrow());
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Claude,
+                path: root,
+            }],
+            diagnostics.clone(),
+        );
+        let mut pending = PendingEvents::new(diagnostics.clone());
+
+        for _ in 0..2 {
+            let mut watch_requests = Vec::new();
+            let mut cycle =
+                crate::provider::test_provider_cycle(&targets, &mut pending, &mut watch_requests);
+            worker.process(&mut cycle).unwrap();
+        }
+
+        assert_eq!(
+            diagnostics.invalid_targets(),
+            0,
+            "restored subagent transcripts must not become pane-root targets"
+        );
     }
 
     #[test]

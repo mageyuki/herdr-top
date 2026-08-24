@@ -320,9 +320,10 @@ The new `provider-log|669`, `pane_sessions_with_artifacts:1`, live lines,
 tokens, and lifecycle closures independently demonstrate that the previous
 failure is resolved rather than hidden by the doctor presentation.
 
-## Residual rejected-target counter anomaly
+## Rejected-target counter anomaly observed in this run
 
-The successful restart run exposed a separate diagnostic defect. Restored
+The successful restart run exposed a separate diagnostic defect in the smoked
+build. Restored
 Claude subagent nodes have valid operational paths ending in
 `subagents/agent-*.jsonl`. `derive_provider_targets` in
 `src/herdr/collector.rs` promotes every non-empty Agent Node `session_file` to a
@@ -338,9 +339,12 @@ The exact chain is `derive_provider_targets` at
 `src/herdr/collector.rs:3842`, `Admission::admit_pane_artifact` at
 `src/provider/lane.rs:1306`, and the UUID-only Claude parser at
 `src/provider/lane.rs:1428`. The six-point functionality continued to work, so
-this is not softened into a smoke failure. No follow-up code fix was made: the
-dispatch authorized a bounded fix only if the lane still admitted nothing,
-which was disproved by the live event ledger.
+this is not softened into a smoke failure. The smoke itself made no follow-up
+code fix because its dispatch authorized a bounded fix only if the lane still
+admitted nothing, which was disproved by the live event ledger. The
+implementation now filters canonical Claude subagent transcript paths through
+Claude's path topology before pane-root targets are constructed, so those paths
+no longer increment the rejection counter on each provider cycle.
 
 ## Headless child observation
 
@@ -396,8 +400,10 @@ Not established or intentionally bounded:
 - Complete steady-state backfill performance on this large live artifact. The
   screens remained `DEGRADED` under event-rate and visible-run thresholds while
   useful data continued to arrive.
-- Correct rejected-target accounting after restart. The counter anomaly above
-  is directly observed and remains unfixed.
+- A repeated live validation of corrected rejected-target accounting after
+  restart. The counter anomaly above was directly observed in this run and has
+  since been fixed at target derivation, with regression coverage, but the
+  six-point smoke was not repeated after that correction.
 
 No raw transcript, prompt, response, tool argument, or tool output was used as
 quoted evidence. The record relies on live Herdr inventory, provider-file

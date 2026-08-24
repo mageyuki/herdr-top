@@ -390,7 +390,7 @@ The log-lane checks are:
 | Check | Outcomes |
 | --- | --- |
 | `log_lane.readable` | `warning` / `log_lane_roots_unreadable` when an existing root cannot be read; `ok` / `log_lane_roots_readable` when one exists and is readable; `not_applicable` / `log_lane_roots_absent` when none exists. |
-| `log_lane.coverage` | `warning` / `log_lane_targets_rejected` when no pane session has artifacts but targets were rejected; `not_applicable` / `log_lane_coverage_empty` with no pane sessions; `warning` / `log_lane_coverage_partial` when some pane session lacks an artifact; otherwise `ok` / `log_lane_coverage_complete`. |
+| `log_lane.coverage` | `warning` / `log_lane_targets_rejected` when any targets were rejected, taking precedence over coverage; `not_applicable` / `log_lane_coverage_empty` with no pane sessions; `warning` / `log_lane_coverage_partial` when some pane session lacks an artifact; otherwise `ok` / `log_lane_coverage_complete`. |
 | `log_lane.freshness` | `ok` / `log_lane_fresh` when the latest watcher observation is at most 120000 ms old; `warning` / `log_lane_stale` beyond that; `warning` / `log_lane_unobserved` before any watcher observation. |
 
 Coverage and freshness use `warning` / `log_lane_runtime_unavailable` when

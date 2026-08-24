@@ -508,7 +508,7 @@ fn message(code: &str) -> &'static str {
         "log_lane_coverage_complete" => "pane-session artifact coverage is complete",
         "log_lane_coverage_partial" => "pane-session artifact coverage is partial",
         "log_lane_coverage_empty" => "no pane sessions are present",
-        "log_lane_targets_rejected" => "pane-session artifacts were rejected",
+        "log_lane_targets_rejected" => "provider-log targets were rejected",
         "log_lane_fresh" => "log-lane watcher is fresh",
         "log_lane_stale" => "log-lane watcher is stale",
         "log_lane_unobserved" => "log-lane watcher has no observation",
@@ -806,8 +806,8 @@ fn coverage_check(
         },
     ];
     let mut unknown_provider = 0_u64;
-    let lane_has_no_artifacts = runtime_snapshot
-        .is_some_and(|snapshot| snapshot.provider_counters.pane_sessions_with_artifacts == 0);
+    let mut remaining_artifact_coverage =
+        runtime_snapshot.map(|snapshot| snapshot.provider_counters.pane_sessions_with_artifacts);
     if let Some(snapshot) = snapshot {
         for pane in &snapshot.panes {
             let Some(agent) = pane.agent.as_deref() else {
@@ -826,10 +826,17 @@ fn coverage_check(
             match pane.agent_session.as_ref() {
                 Some(reference) if provider_from_name(&reference.agent) == Some(provider) => {
                     match reference.kind {
-                        AgentSessionKind::Id if lane_has_no_artifacts => {
+                        AgentSessionKind::Id
+                            if remaining_artifact_coverage.as_ref() == Some(&0) =>
+                        {
                             row.uncovered = row.uncovered.saturating_add(1);
                         }
-                        AgentSessionKind::Id => row.covered = row.covered.saturating_add(1),
+                        AgentSessionKind::Id => {
+                            row.covered = row.covered.saturating_add(1);
+                            if let Some(remaining) = &mut remaining_artifact_coverage {
+                                *remaining = remaining.saturating_sub(1);
+                            }
+                        }
                         AgentSessionKind::Path => row.partial = row.partial.saturating_add(1),
                     }
                 }
@@ -1075,16 +1082,15 @@ fn log_lane_coverage_check(
             .saturating_sub(counters.pane_sessions_with_artifacts),
         rejected_targets: counters.invalid_targets,
     };
-    let (status, code) =
-        if observation.pane_sessions_with_artifacts == 0 && observation.rejected_targets > 0 {
-            (CheckStatus::Warning, "log_lane_targets_rejected")
-        } else if observation.pane_sessions_total == 0 {
-            (CheckStatus::NotApplicable, "log_lane_coverage_empty")
-        } else if observation.pane_sessions_without_artifacts > 0 {
-            (CheckStatus::Warning, "log_lane_coverage_partial")
-        } else {
-            (CheckStatus::Ok, "log_lane_coverage_complete")
-        };
+    let (status, code) = if observation.rejected_targets > 0 {
+        (CheckStatus::Warning, "log_lane_targets_rejected")
+    } else if observation.pane_sessions_total == 0 {
+        (CheckStatus::NotApplicable, "log_lane_coverage_empty")
+    } else if observation.pane_sessions_without_artifacts > 0 {
+        (CheckStatus::Warning, "log_lane_coverage_partial")
+    } else {
+        (CheckStatus::Ok, "log_lane_coverage_complete")
+    };
     check(status, code, Some(observation))
 }
 
@@ -2077,6 +2083,23 @@ mod tests {
         assert_eq!(rejected.code, "log_lane_targets_rejected");
     }
 
+    #[test]
+    fn doctor_rejected_targets_take_precedence_over_partial_and_empty_coverage() {
+        for (scenario, total, with_artifacts) in [("partial", 2, 1), ("empty", 0, 0)] {
+            let mut snapshot = runtime(PersistenceStatus::Healthy);
+            snapshot.provider_counters.pane_sessions_total = total;
+            snapshot.provider_counters.pane_sessions_with_artifacts = with_artifacts;
+            snapshot.provider_counters.invalid_targets = 1;
+
+            let result = log_lane_coverage_check(Some(&snapshot));
+
+            assert_eq!(
+                result.code, "log_lane_targets_rejected",
+                "rejected targets did not take precedence over {scenario} coverage"
+            );
+        }
+    }
+
     struct ObservingWorker;
 
     impl ProviderWorker for ObservingWorker {
@@ -2649,5 +2672,48 @@ mod tests {
         );
         assert_eq!(result.code, "coverage_partial");
         assert_eq!(result.observed.unwrap().uncovered, 1);
+    }
+
+    #[test]
+    fn doctor_id_kind_coverage_uses_aggregate_artifact_budget() {
+        let mut runtime = runtime(PersistenceStatus::Healthy);
+        runtime.provider_counters.pane_sessions_total = 2;
+        runtime.provider_counters.pane_sessions_with_artifacts = 1;
+        let result = coverage_check(
+            Some(&snapshot(vec![
+                pane(Some("claude"), Some(("claude", AgentSessionKind::Id))),
+                pane(Some("claude"), Some(("claude", AgentSessionKind::Id))),
+            ])),
+            Some(&runtime),
+        );
+
+        assert_eq!(result.status, CheckStatus::Warning);
+        assert_eq!(result.code, "coverage_partial");
+        assert_eq!(
+            result.observed,
+            Some(CoverageObservation {
+                covered: 1,
+                partial: 0,
+                uncovered: 1,
+                total: 2,
+                unknown_provider: 0,
+                by_provider: vec![
+                    ProviderCoverageCounts {
+                        provider: DoctorProvider::Claude,
+                        covered: 1,
+                        partial: 0,
+                        uncovered: 1,
+                        total: 2,
+                    },
+                    ProviderCoverageCounts {
+                        provider: DoctorProvider::Codex,
+                        covered: 0,
+                        partial: 0,
+                        uncovered: 0,
+                        total: 0,
+                    },
+                ],
+            })
+        );
     }
 }
