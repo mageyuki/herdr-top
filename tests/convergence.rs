@@ -1504,14 +1504,16 @@ async fn gap_retires_pre_gap_executions_all_three_kinds() {
 
     wait_until(|| mock.snapshot_requests() >= 2).await;
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
-    assert_execution_generations(&handle, run_id, 2, 1);
+    // The startup row for the old pane stays ended, while an unchanged occupant reuses the same
+    // live execution across reconnect and socket-replacement gaps.
+    assert_execution_generations(&handle, run_id, 1, 1);
 
     mock.replace_socket()
         .await
         .expect("scripted socket should be replaced at the same path");
     wait_until(|| mock.snapshot_requests() >= 3).await;
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
-    assert_execution_generations(&handle, run_id, 3, 1);
+    assert_execution_generations(&handle, run_id, 1, 1);
 
     shutdown(handle, lifecycle).await;
     let connection = Connection::open(database_path(&root)).expect("database should open");

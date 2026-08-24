@@ -934,6 +934,9 @@ impl Reducer {
         pre_gap_runs.dedup();
 
         for mut execution in pre_gap_executions {
+            if execution.state.is_terminal() {
+                continue;
+            }
             execution.state = ExecState::Ended;
             self.model.insert_execution(execution.clone());
             persist.push(persist_execution(execution, now_ms));
@@ -974,8 +977,19 @@ impl Reducer {
                     &mut persist,
                 )?,
             };
+            let existing_execution_id = self
+                .model
+                .executions()
+                .filter(|execution| {
+                    execution.pane_id.as_str() == pane.pane_id.as_str()
+                        && execution.terminal_id.as_str() == pane.terminal_id.as_str()
+                        && execution.task_run_id == run_id
+                })
+                .min_by_key(|execution| execution.execution_id.as_str())
+                .map(|execution| execution.execution_id.clone());
             let token = RunId::new().to_string();
-            let execution_id = format!("gap-execution-{token}");
+            let execution_id =
+                existing_execution_id.unwrap_or_else(|| format!("gap-execution-{token}"));
             let execution = Execution {
                 execution_id: execution_id.clone(),
                 pane_id: pane.pane_id,
@@ -5030,6 +5044,136 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_reuses_gap_execution_same_occupant() {
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: native_snapshot("sid-1"),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let (first_count, first_execution_id) = {
+            let model = shared.borrow();
+            let execution = model
+                .executions()
+                .find(|execution| !execution.state.is_terminal())
+                .unwrap();
+            (model.executions().count(), execution.execution_id.clone())
+        };
+
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: native_snapshot("sid-1"),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let model = shared.borrow();
+        let execution = model
+            .executions()
+            .find(|execution| !execution.state.is_terminal())
+            .unwrap();
+
+        assert_eq!(model.executions().count(), first_count);
+        assert_eq!(execution.execution_id, first_execution_id);
+    }
+
+    #[test]
+    fn occupant_change_mints_new_execution() {
+        let first_run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            first_run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "sid-1".to_owned(),
+            },
+            1,
+            TaskState::Running,
+        ));
+        model.insert_execution(execution(
+            first_run_id,
+            "gap-execution-existing",
+            ExecState::Working,
+        ));
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: native_snapshot("sid-1"),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let first_execution_id = shared
+            .borrow()
+            .executions()
+            .find(|execution| !execution.state.is_terminal())
+            .unwrap()
+            .execution_id
+            .clone();
+
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: native_snapshot("sid-2"),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let model = shared.borrow();
+        let new_execution = model
+            .executions()
+            .find(|execution| !execution.state.is_terminal())
+            .unwrap();
+        let previous_execution = model.execution(&first_execution_id).unwrap();
+
+        assert_ne!(new_execution.execution_id, first_execution_id);
+        // Store upserts rewrite `task_run_id` on execution-id conflict, so preserving the old
+        // execution id and owner is what protects the previous occupant's history.
+        assert_eq!(previous_execution.task_run_id, first_run_id);
+        assert_eq!(previous_execution.state, ExecState::Ended);
+        assert_ne!(new_execution.task_run_id, first_run_id);
+        assert_eq!(model.executions().count(), 2);
+    }
+
+    #[test]
+    fn terminal_executions_not_repersisted() {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "sid-1".to_owned(),
+            },
+            1,
+            TaskState::Running,
+        ));
+        model.insert_execution(execution(run_id, "pre-gap", ExecState::Working));
+        let (mut reducer, _shared) = Reducer::new(restored(model, 2));
+
+        let first = reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: TopologySnapshot::default(),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let second = reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: TopologySnapshot::default(),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let execution_ops = |batch: &[PersistOp]| {
+            batch
+                .iter()
+                .filter(|operation| matches!(operation, PersistOp::UpsertExecution(_)))
+                .count()
+        };
+
+        assert_eq!(execution_ops(&first), 1);
+        assert_eq!(execution_ops(&second), 0);
+    }
+
+    #[test]
     fn done_maps_to_idle_never_ended() {
         let run_id = RunId::new();
         let mut model = DomainModel::default();
@@ -5185,9 +5329,11 @@ mod tests {
             shared.borrow().task_run(&run_id).unwrap().state,
             TaskState::Running
         );
+        // The same occupant reuses its pre-gap execution while remaining live throughout the
+        // reconciliation batch.
         assert!(shared.borrow().executions().any(|value| {
             value.task_run_id == run_id
-                && value.execution_id != "pre-gap"
+                && value.execution_id == "pre-gap"
                 && !value.state.is_terminal()
         }));
         assert!(!batch.iter().any(|operation| matches!(

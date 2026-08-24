@@ -2402,6 +2402,8 @@ fn canonical_topology(mut topology: TopologySnapshot) -> TopologySnapshot {
                 .map(|session| session.agent.as_str()),
         );
         agent.agent_name = provider.map(provider_name).unwrap_or("unknown").to_owned();
+        // Agent state is a volatile gauge, not topology; comparing it caused reconnect churn.
+        agent.state = ExecState::Unknown;
         pane.agent_session = match (provider, pane.agent_session.take()) {
             (Some(_), Some(mut session)) if !session.value.is_empty() => {
                 session.source.clear();
@@ -8532,6 +8534,31 @@ mod tests {
     }
 
     #[test]
+    fn probe_ignores_volatile_state_but_detects_topology_change() {
+        let current = watchdog_probe_topology(
+            Some("claude"),
+            Some((AgentSessionReferenceKind::Id, "herdr:claude", "sid-1")),
+        );
+        let mut volatile_state = current.clone();
+        volatile_state.panes[0].agent.as_mut().unwrap().state = ExecState::Idle;
+        assert!(
+            probe_topology_matches_model(volatile_state, current.clone()),
+            "volatile execution state must not trigger topology divergence"
+        );
+
+        let mut changed_session = current.clone();
+        changed_session.panes[0]
+            .agent_session
+            .as_mut()
+            .unwrap()
+            .value = "sid-2".to_owned();
+        assert!(
+            !probe_topology_matches_model(changed_session, current),
+            "native session identity remains part of topology"
+        );
+    }
+
+    #[test]
     fn watchdog_probe_name_comparison_matches_retention_and_detects_non_null_changes() {
         let mut current = watchdog_probe_topology(None, None);
         current.tabs[0].label = Some("stored tab".to_owned());
@@ -8591,7 +8618,7 @@ mod tests {
     }
 
     #[test]
-    fn watchdog_probe_detects_agent_presence_state_and_provider_changes() {
+    fn watchdog_probe_detects_agent_presence_and_provider_changes() {
         let topology = watchdog_probe_topology(Some("claude"), None);
         let (projected, probed) = reconciled_probe_topologies(topology);
 
@@ -8609,7 +8636,8 @@ mod tests {
 
         let mut changed = probed.clone();
         changed.panes[0].agent.as_mut().unwrap().state = ExecState::Idle;
-        assert_probe_comparison_diverges(&projected, changed, "execution state change");
+        // Execution state is a volatile gauge and must not define topology identity.
+        assert!(probe_topology_matches_model(changed, projected.clone()));
 
         let mut changed = probed;
         changed.panes[0].agent.as_mut().unwrap().agent_name = "codex".to_owned();
