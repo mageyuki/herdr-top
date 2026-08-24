@@ -6,6 +6,7 @@ use std::fs::{self, DirEntry, FileType};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
+use crate::activity::{DEFAULT_GHOST_VISIBILITY_MS, DEFAULT_STALL_WARN_MS};
 use crate::hook_adapter::{HookPayload, HookProvider, map_hook_payload};
 use crate::model::{
     ControllerEvent, ControllerEventKind, EventMetadata, MinimalProviderMetadata, Provider, RunKey,
@@ -78,10 +79,10 @@ impl ActivitySelection {
     }
 
     fn selected(&self) -> Option<String> {
-        self.tool_use
+        self.commentary
             .clone()
-            .or_else(|| self.commentary.clone())
             .or_else(|| self.command.clone())
+            .or_else(|| self.tool_use.clone())
     }
 }
 
@@ -1311,6 +1312,18 @@ pub fn parse_complete_grace_ms(value: Option<&OsStr>) -> i64 {
 #[must_use]
 pub fn parse_headless_inactivity_ms(value: Option<&OsStr>) -> i64 {
     parse_positive_duration_ms(value, DEFAULT_HEADLESS_INACTIVITY_MS)
+}
+
+/// Parses a positive UTF-8 decimal stall warning interval or returns the five-minute default.
+#[must_use]
+pub fn parse_stall_warn_ms(value: Option<&OsStr>) -> i64 {
+    parse_positive_duration_ms(value, DEFAULT_STALL_WARN_MS)
+}
+
+/// Parses a positive UTF-8 decimal ghost visibility interval or returns the five-minute default.
+#[must_use]
+pub fn parse_ghost_visibility_ms(value: Option<&OsStr>) -> i64 {
+    parse_positive_duration_ms(value, DEFAULT_GHOST_VISIBILITY_MS)
 }
 
 /// Recomputes the zero-based record ordinal by counting newlines before `byte_offset`.
@@ -3493,6 +3506,24 @@ mod tests {
             assert_eq!(
                 parse_headless_inactivity_ms(Some(OsStr::new(value))),
                 DEFAULT_HEADLESS_INACTIVITY_MS
+            );
+        }
+    }
+
+    #[test]
+    fn display_duration_parsers_use_positive_utf8_i64_or_default() {
+        assert_eq!(parse_stall_warn_ms(None), DEFAULT_STALL_WARN_MS);
+        assert_eq!(parse_ghost_visibility_ms(None), DEFAULT_GHOST_VISIBILITY_MS);
+        assert_eq!(parse_stall_warn_ms(Some(OsStr::new("42"))), 42);
+        assert_eq!(parse_ghost_visibility_ms(Some(OsStr::new("42"))), 42);
+        for value in ["", "0", "-1", "1.5", " 42", "9223372036854775808"] {
+            assert_eq!(
+                parse_stall_warn_ms(Some(OsStr::new(value))),
+                DEFAULT_STALL_WARN_MS
+            );
+            assert_eq!(
+                parse_ghost_visibility_ms(Some(OsStr::new(value))),
+                DEFAULT_GHOST_VISIBILITY_MS
             );
         }
     }

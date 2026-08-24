@@ -2,11 +2,33 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::model::{Provider, RunId, RunKey, TaskRun, TaskState};
 
 pub const DEFAULT_TERMINAL_VISIBILITY_MS: i64 = 60 * 60 * 1_000;
 pub const HOOK_ONLY_STALE_VISIBILITY_MS: i64 = 24 * 60 * 60 * 1_000;
+pub const DEFAULT_STALL_WARN_MS: i64 = 300_000;
+pub const DEFAULT_GHOST_VISIBILITY_MS: i64 = 300_000;
+
+static STALL_WARN_MS: AtomicI64 = AtomicI64::new(DEFAULT_STALL_WARN_MS);
+static GHOST_VISIBILITY_MS: AtomicI64 = AtomicI64::new(DEFAULT_GHOST_VISIBILITY_MS);
+
+/// Installs process-wide display timing resolved once by the monitor entrypoint.
+pub fn configure_display_timing(stall_warn_ms: i64, ghost_visibility_ms: i64) {
+    STALL_WARN_MS.store(stall_warn_ms, Ordering::Relaxed);
+    GHOST_VISIBILITY_MS.store(ghost_visibility_ms, Ordering::Relaxed);
+}
+
+#[must_use]
+pub(crate) fn stall_warn_ms() -> i64 {
+    STALL_WARN_MS.load(Ordering::Relaxed)
+}
+
+#[must_use]
+pub(crate) fn ghost_visibility_ms() -> i64 {
+    GHOST_VISIBILITY_MS.load(Ordering::Relaxed)
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ActivityIdentity {
@@ -91,8 +113,36 @@ pub fn is_default_visible_task_run(
     runs_with_executions: &HashSet<RunId>,
     now_ms: i64,
 ) -> bool {
+    is_default_visible_task_run_with_ghost_window(
+        run,
+        operator,
+        runs_with_executions,
+        now_ms,
+        ghost_visibility_ms(),
+    )
+}
+
+/// Returns default visibility with an explicit provisional-run window.
+///
+/// `RunKey::Provisional` is minted for terminal occupancy without provider identity, so its
+/// latest observation bounds the lifetime of a possible herdr misdetection independently of the
+/// ordinary terminal and hook-only windows.
+#[must_use]
+pub fn is_default_visible_task_run_with_ghost_window(
+    run: &crate::model::TaskRun,
+    operator: &OperatorSnapshot,
+    runs_with_executions: &HashSet<RunId>,
+    now_ms: i64,
+    ghost_visibility_ms: i64,
+) -> bool {
     if run.dismissed_at_ms.is_some() {
         return false;
+    }
+    if let RunKey::Provisional { start_ms, .. } = &run.key {
+        let last_observed_ms = run.updated_at_ms.or(run.created_at_ms).unwrap_or(*start_ms);
+        if now_ms >= last_observed_ms.saturating_add(ghost_visibility_ms) {
+            return false;
+        }
     }
     if is_hook_only_stale_task_run(run, runs_with_executions, now_ms) {
         return false;
@@ -393,6 +443,52 @@ mod tests {
             &operator,
             &execution_run_ids,
             3_600_100,
+        ));
+    }
+
+    #[test]
+    fn ghost_provisional_short_window() {
+        let updated_at_ms = 100;
+        let ghost = task_run(
+            RunKey::Provisional {
+                terminal_id: "misdetected".to_owned(),
+                start_ms: updated_at_ms,
+                seq: 1,
+            },
+            TaskState::Running,
+            Some(updated_at_ms),
+        );
+        let ordinary = task_run(
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "real-session".to_owned(),
+            },
+            TaskState::Running,
+            Some(updated_at_ms),
+        );
+        let execution_run_ids = HashSet::from([ghost.run_id, ordinary.run_id]);
+        let operator = empty_operator();
+
+        assert!(is_default_visible_task_run_with_ghost_window(
+            &ghost,
+            &operator,
+            &execution_run_ids,
+            updated_at_ms + DEFAULT_GHOST_VISIBILITY_MS - 1,
+            DEFAULT_GHOST_VISIBILITY_MS,
+        ));
+        assert!(!is_default_visible_task_run_with_ghost_window(
+            &ghost,
+            &operator,
+            &execution_run_ids,
+            updated_at_ms + DEFAULT_GHOST_VISIBILITY_MS,
+            DEFAULT_GHOST_VISIBILITY_MS,
+        ));
+        assert!(is_default_visible_task_run_with_ghost_window(
+            &ordinary,
+            &operator,
+            &execution_run_ids,
+            updated_at_ms + DEFAULT_GHOST_VISIBILITY_MS,
+            DEFAULT_GHOST_VISIBILITY_MS,
         ));
     }
 }

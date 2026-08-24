@@ -1,14 +1,14 @@
 //! Pure, privacy-safe TUI projection tests and implementation.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::Path;
 
 use crate::activity::{
     ActivityDurability, ActivityItem, DEFAULT_TERMINAL_VISIBILITY_MS,
-    HOOK_ONLY_STALE_VISIBILITY_MS, OperatorSnapshot, is_default_visible_task_run,
-    runs_with_executions,
+    HOOK_ONLY_STALE_VISIBILITY_MS, OperatorSnapshot, ghost_visibility_ms,
+    is_default_visible_task_run, runs_with_executions,
 };
 use crate::diagnostics::{ControllerInputStatus, RuntimeDiagnosticsSnapshot};
 use crate::herdr::collector::ObservationQuality;
@@ -25,6 +25,71 @@ pub(crate) const DETAIL_ACTIVITY_LIMIT: usize = 100;
 pub(crate) struct RowProjection {
     pub(crate) rows: Vec<TreeRow>,
     pub(crate) next_expiry_ms: Option<i64>,
+}
+
+pub(crate) fn stalled_run_ids(
+    model: &DomainModel,
+    now_ms: i64,
+    stall_warn_ms: i64,
+) -> HashSet<RunId> {
+    let active = model
+        .task_runs()
+        .filter(|run| !run.state.is_terminal())
+        .filter(|run| {
+            run.updated_at_ms
+                .or(run.created_at_ms)
+                .is_some_and(|last_activity_ms| {
+                    now_ms < last_activity_ms.saturating_add(stall_warn_ms)
+                })
+        })
+        .map(|run| run.run_id)
+        .collect::<HashSet<_>>();
+    let mut children = HashMap::<RunId, Vec<RunId>>::new();
+    for edge in model.execution_edges() {
+        if model.task_run(&edge.parent_run_id).is_some()
+            && model.task_run(&edge.child_run_id).is_some()
+        {
+            children
+                .entry(edge.parent_run_id)
+                .or_default()
+                .push(edge.child_run_id);
+        }
+    }
+
+    model
+        .task_runs()
+        .filter(|run| !run.state.is_terminal())
+        .filter(|run| {
+            run.updated_at_ms
+                .or(run.created_at_ms)
+                .is_some_and(|last_activity_ms| {
+                    now_ms >= last_activity_ms.saturating_add(stall_warn_ms)
+                })
+        })
+        .filter(|run| !has_active_descendant(run.run_id, &children, &active))
+        .map(|run| run.run_id)
+        .collect()
+}
+
+fn has_active_descendant(
+    run_id: RunId,
+    children: &HashMap<RunId, Vec<RunId>>,
+    active: &HashSet<RunId>,
+) -> bool {
+    let mut pending = children.get(&run_id).cloned().unwrap_or_default();
+    let mut visited = HashSet::from([run_id]);
+    while let Some(descendant) = pending.pop() {
+        if !visited.insert(descendant) {
+            continue;
+        }
+        if active.contains(&descendant) {
+            return true;
+        }
+        if let Some(grandchildren) = children.get(&descendant) {
+            pending.extend(grandchildren);
+        }
+    }
+    false
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -152,7 +217,11 @@ pub(crate) fn project_rows(
             continue;
         };
         if is_default_visible_task_run(run, operator, &execution_run_ids, now_ms) {
-            if run.state.is_terminal()
+            if let RunKey::Provisional { start_ms, .. } = &run.key {
+                let last_observed_ms = run.updated_at_ms.or(run.created_at_ms).unwrap_or(*start_ms);
+                let expiry = last_observed_ms.saturating_add(ghost_visibility_ms());
+                next_expiry_ms = Some(next_expiry_ms.map_or(expiry, |current| current.min(expiry)));
+            } else if run.state.is_terminal()
                 && let Some(first_terminal_ms) = operator.terminal_times.get(&run_id).copied()
             {
                 let expiry = first_terminal_ms.saturating_add(DEFAULT_TERMINAL_VISIBILITY_MS);
@@ -854,6 +923,37 @@ mod tests {
             subject: None,
             dismissed_at_ms: None,
         }
+    }
+
+    #[test]
+    fn stall_suppressed_while_descendant_active() {
+        let mut parent = run("parent", 1, TaskState::Running);
+        parent.updated_at_ms = Some(0);
+        let mut child = run("child", 2, TaskState::Running);
+        child.updated_at_ms = Some(900);
+        let mut model = DomainModel::default();
+        model.insert_task_run(parent.clone());
+        model.insert_task_run(child.clone());
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: parent.run_id,
+            child_run_id: child.run_id,
+        });
+
+        let stalled = stalled_run_ids(&model, 1_000, 500);
+        assert!(!stalled.contains(&parent.run_id));
+        assert!(!stalled.contains(&child.run_id));
+
+        child.updated_at_ms = Some(0);
+        model.insert_task_run(child.clone());
+        let stalled = stalled_run_ids(&model, 1_000, 500);
+        assert!(stalled.contains(&parent.run_id));
+        assert!(stalled.contains(&child.run_id));
+
+        child.updated_at_ms = None;
+        child.created_at_ms = Some(0);
+        model.insert_task_run(child.clone());
+        let stalled = stalled_run_ids(&model, 1_000, 500);
+        assert!(stalled.contains(&child.run_id));
     }
 
     fn row(key: NodeKey, depth: usize, label: &str) -> TreeRow {

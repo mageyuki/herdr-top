@@ -36,10 +36,28 @@ type PaneRuns = HashMap<String, Vec<RunPlacement>>;
 type NestedRuns = HashMap<RunId, Vec<RunId>>;
 pub(crate) type NewestAgentNodes<'a> = HashMap<RunId, &'a AgentNode>;
 
+#[derive(Default)]
+pub(crate) struct LiveLineReadModel {
+    by_run: HashMap<RunId, String>,
+}
+
+impl LiveLineReadModel {
+    fn get(&self, run_id: &RunId) -> Option<&str> {
+        self.by_run.get(run_id).map(String::as_str)
+    }
+}
+
+struct RunRowSignals<'a> {
+    live_lines: &'a LiveLineReadModel,
+    stalled: bool,
+}
+
 struct RunRowContext<'model, 'data> {
     model: &'model DomainModel,
     nested_runs: &'data NestedRuns,
     newest_agents: &'data NewestAgentNodes<'model>,
+    live_lines: &'data LiveLineReadModel,
+    stalled_runs: &'data HashSet<RunId>,
     now_ms: i64,
 }
 
@@ -1055,10 +1073,15 @@ fn append_execution_tree_rows<'model>(
     newest_agents: &NewestAgentNodes<'model>,
 ) {
     let (mut pane_runs, unattached, nested_runs) = place_runs(model, state);
+    let live_lines = LiveLineReadModel::default();
+    let stalled_runs =
+        projection::stalled_run_ids(model, state.now_ms(), crate::activity::stall_warn_ms());
     let run_row_context = RunRowContext {
         model,
         nested_runs: &nested_runs,
         newest_agents,
+        live_lines: &live_lines,
+        stalled_runs: &stalled_runs,
         now_ms: state.now_ms(),
     };
     let mut run_render_state = RunRenderState::default();
@@ -1345,6 +1368,10 @@ fn append_run_subtree(
             context.now_ms,
             context.newest_agents.get(&run_id).copied(),
             show_dispatch_parent,
+            RunRowSignals {
+                live_lines: context.live_lines,
+                stalled: context.stalled_runs.contains(&run_id),
+            },
         ),
         prerequisites: Vec::new(),
         dependents: Vec::new(),
@@ -1477,7 +1504,8 @@ pub(crate) fn task_run_label(
     now_ms: i64,
     newest_agent: Option<&AgentNode>,
 ) -> String {
-    task_run_label_for_placement(model, run, shared, now_ms, newest_agent, true)
+    let label = legacy_run_row_label(run, newest_agent, now_ms);
+    append_task_run_annotations(model, run, label, shared, true)
 }
 
 fn task_run_label_for_placement(
@@ -1487,8 +1515,26 @@ fn task_run_label_for_placement(
     now_ms: i64,
     newest_agent: Option<&AgentNode>,
     show_dispatch_parent: bool,
+    signals: RunRowSignals<'_>,
 ) -> String {
-    let mut label = run_row_label_with_agent(run, newest_agent, now_ms);
+    let label = run_row_label_with_agent(
+        model,
+        run,
+        newest_agent,
+        now_ms,
+        signals.live_lines,
+        signals.stalled,
+    );
+    append_task_run_annotations(model, run, label, shared, show_dispatch_parent)
+}
+
+fn append_task_run_annotations(
+    model: &DomainModel,
+    run: &TaskRun,
+    mut label: String,
+    shared: bool,
+    show_dispatch_parent: bool,
+) -> String {
     if shared {
         label.push_str(" [shared]");
     }
@@ -1504,6 +1550,36 @@ fn task_run_label_for_placement(
     if !linked {
         label.push_str(" [unlinked]");
     }
+    label
+}
+
+fn legacy_run_row_label(run: &TaskRun, newest_agent: Option<&AgentNode>, now_ms: i64) -> String {
+    let mut label = worker_kind_label(run);
+    let subject = run
+        .subject
+        .as_deref()
+        .map_or_else(|| run_subject_fallback(run), safe_text);
+    if !subject.is_empty() {
+        label.push(' ');
+        label.push_str(&subject);
+    }
+    if !run.state.is_terminal()
+        && let Some(event_kind) = newest_agent.and_then(|agent| agent.last_event_kind.as_deref())
+    {
+        label.push_str(" — ");
+        label.push_str(&safe_text(event_kind));
+        if let Some(tool_name) = newest_agent.and_then(|agent| agent.last_tool_name.as_deref()) {
+            label.push_str(": ");
+            label.push_str(&safe_text(tool_name));
+        }
+    }
+    if let Some(model_id) = newest_agent.and_then(|agent| agent.model_id.as_deref()) {
+        label.push_str(" [model:");
+        label.push_str(&safe_text(model_id));
+        label.push(']');
+    }
+    label.push_str(&format!(" [{}]", task_state_label(run.state)));
+    append_run_duration(&mut label, run, now_ms);
     label
 }
 
@@ -1623,41 +1699,70 @@ fn newest_agent_node(model: &DomainModel, run_id: RunId) -> Option<&AgentNode> {
 #[cfg(test)]
 fn run_row_label(model: &DomainModel, run: &TaskRun, now_ms: i64) -> String {
     let newest_agent = newest_agent_node(model, run.run_id);
-    run_row_label_with_agent(run, newest_agent, now_ms)
+    let stalled = projection::stalled_run_ids(model, now_ms, crate::activity::stall_warn_ms())
+        .contains(&run.run_id);
+    run_row_label_with_agent(
+        model,
+        run,
+        newest_agent,
+        now_ms,
+        &LiveLineReadModel::default(),
+        stalled,
+    )
 }
 
 fn run_row_label_with_agent(
+    model: &DomainModel,
     run: &TaskRun,
     newest_agent: Option<&AgentNode>,
     now_ms: i64,
+    live_lines: &LiveLineReadModel,
+    stalled: bool,
 ) -> String {
-    let mut label = worker_kind_label(run);
-    let subject = run
-        .subject
-        .as_deref()
-        .map_or_else(|| run_subject_fallback(run), safe_text);
+    let mut label = status_glyph(run.state, stalled).to_owned();
+    label.push(' ');
+    label.push_str(&worker_kind_label(run));
+    let subject = if is_codex_worker(model, run) {
+        String::new()
+    } else {
+        run.subject
+            .as_deref()
+            .map_or_else(|| run_subject_fallback(run), safe_text)
+    };
     if !subject.is_empty() {
         label.push(' ');
         label.push_str(&subject);
     }
 
+    let live_line = live_lines.get(&run.run_id).map(str::to_owned).or_else(|| {
+        newest_agent
+            .filter(|agent| run_uses_claude_tool_line(run, agent))
+            .and_then(|agent| {
+                agent
+                    .last_event_kind
+                    .as_deref()
+                    .map(|event_kind| (agent, event_kind))
+            })
+            .map(|(agent, event_kind)| {
+                let mut line = safe_text(event_kind);
+                if let Some(tool_name) = agent.last_tool_name.as_deref() {
+                    line.push_str(": ");
+                    line.push_str(&safe_text(tool_name));
+                }
+                line
+            })
+    });
     if !run.state.is_terminal()
-        && let Some(event_kind) = newest_agent.and_then(|agent| agent.last_event_kind.as_deref())
+        && let Some(live_line) = live_line
     {
         label.push_str(" — ");
-        label.push_str(&safe_text(event_kind));
-        if let Some(tool_name) = newest_agent.and_then(|agent| agent.last_tool_name.as_deref()) {
-            label.push_str(": ");
-            label.push_str(&safe_text(tool_name));
-        }
+        label.push_str(&live_line);
     }
-    if let Some(model_id) = newest_agent.and_then(|agent| agent.model_id.as_deref()) {
-        label.push_str(" [model:");
-        label.push_str(&safe_text(model_id));
-        label.push(']');
-    }
-    label.push_str(&format!(" [{}]", task_state_label(run.state)));
+    append_run_duration(&mut label, run, now_ms);
+    label
+}
 
+fn append_run_duration(label: &mut String, run: &TaskRun, now_ms: i64) {
     let elapsed_ms = run.created_at_ms.and_then(|created_at_ms| {
         let end_ms = if run.state.is_terminal() {
             run.finished_at_ms?
@@ -1672,12 +1777,51 @@ fn run_row_label_with_agent(
         label.push_str(" · ");
         label.push_str(&format_duration(elapsed_ms));
     }
-    label
+}
+
+fn run_uses_claude_tool_line(run: &TaskRun, agent: &AgentNode) -> bool {
+    match &run.key {
+        RunKey::Controller(name) => name.starts_with("hook:claude-code:"),
+        RunKey::Native { provider, .. } | RunKey::NativePath { provider, .. } => {
+            *provider == Provider::Claude
+        }
+        RunKey::Provisional { .. } => agent.provider == Provider::Claude,
+    }
+}
+
+fn is_codex_worker(model: &DomainModel, run: &TaskRun) -> bool {
+    matches!(
+        &run.key,
+        RunKey::Native {
+            provider: Provider::Codex,
+            ..
+        } | RunKey::NativePath {
+            provider: Provider::Codex,
+            ..
+        }
+    ) && model
+        .execution_edges()
+        .any(|edge| edge.child_run_id == run.run_id)
+}
+
+fn status_glyph(state: TaskState, stalled: bool) -> &'static str {
+    if stalled && !state.is_terminal() {
+        return "⚠";
+    }
+    match state {
+        TaskState::Running | TaskState::Blocked => "●",
+        TaskState::Completed => "✓",
+        TaskState::Failed | TaskState::Cancelled => "✗",
+        TaskState::Queued | TaskState::EndedUnknown => "◌",
+    }
 }
 
 fn run_subject_fallback(run: &TaskRun) -> String {
     match &run.key {
-        RunKey::Controller(_) => run_name(run),
+        RunKey::Controller(name) => name
+            .strip_prefix("hook:claude-code:")
+            .filter(|suffix| !suffix.contains(':'))
+            .map_or_else(|| run_name(run), safe_text),
         RunKey::Native { sid, .. } => safe_text(sid),
         RunKey::NativePath { .. } => run.run_id.to_string(),
         RunKey::Provisional {
@@ -1804,6 +1948,7 @@ pub(crate) fn truncate_to_width(value: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::Path;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1828,6 +1973,8 @@ mod tests {
         ExecutionEdge, Pane, Provider, RunId, RunKey, Tab, TaskRun, TaskState, Workspace,
     };
     use crate::performance::{PerformanceDegradationReason, PerformanceSnapshot};
+    use crate::provider::facts::{ActivitySource, LogFact, SessionScope};
+    use crate::provider::lane::{Admission, AdmissionIndex, Synthesis};
     use crate::store::writer::PersistenceStatus;
     use crate::tui::app::{App, AppState, HeaderInputs, SystemClock, TuiSetup};
 
@@ -1940,6 +2087,261 @@ mod tests {
             last_activity_at_ms,
             session_file: None,
         }
+    }
+
+    #[test]
+    fn glyph_reflects_state_and_stall() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let live_lines = LiveLineReadModel::default();
+        for (state, stalled, glyph) in [
+            (TaskState::Running, false, "●"),
+            (TaskState::Blocked, false, "●"),
+            (TaskState::Queued, false, "◌"),
+            (TaskState::Completed, false, "✓"),
+            (TaskState::Failed, false, "✗"),
+            (TaskState::Cancelled, false, "✗"),
+            (TaskState::EndedUnknown, false, "◌"),
+            (TaskState::Running, true, "⚠"),
+        ] {
+            let run = label_run(
+                run_id,
+                RunKey::Controller("hook:claude-code:session".to_owned()),
+                state,
+                None,
+                None,
+                Some("subject"),
+            );
+            let model = DomainModel::default();
+
+            assert_eq!(
+                run_row_label_with_agent(&model, &run, None, 1_000, &live_lines, stalled,),
+                format!("{glyph} claude-code subject")
+            );
+        }
+    }
+
+    #[test]
+    fn subject_chain_meta_title_cwd_id() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let live_lines = LiveLineReadModel::default();
+        for (subject, expected) in [
+            (Some("AI title"), "● claude-code AI title"),
+            (Some("herdr-top"), "● claude-code herdr-top"),
+            (None, "● claude-code session-id"),
+        ] {
+            let run = label_run(
+                run_id,
+                RunKey::Controller("hook:claude-code:session-id".to_owned()),
+                TaskState::Running,
+                None,
+                None,
+                subject,
+            );
+            let model = DomainModel::default();
+
+            assert_eq!(
+                run_row_label_with_agent(&model, &run, None, 0, &live_lines, false,),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn codex_worker_rows_have_no_subject() {
+        let root_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let worker_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let root = label_run(
+            root_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "root-session".to_owned(),
+            },
+            TaskState::Running,
+            None,
+            None,
+            Some("root subject"),
+        );
+        let worker = label_run(
+            worker_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "worker-session".to_owned(),
+            },
+            TaskState::Running,
+            None,
+            None,
+            Some("must not render"),
+        );
+        let mut model = DomainModel::default();
+        model.insert_task_run(root.clone());
+        model.insert_task_run(worker.clone());
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: root_id,
+            child_run_id: worker_id,
+        });
+        let live_lines = LiveLineReadModel::default();
+
+        assert_eq!(
+            run_row_label_with_agent(&model, &root, None, 0, &live_lines, false),
+            "● Codex root subject"
+        );
+        assert_eq!(
+            run_row_label_with_agent(&model, &worker, None, 0, &live_lines, false),
+            "● Codex"
+        );
+    }
+
+    #[test]
+    fn live_prefers_commentary_then_command() {
+        const ROLLOUT: &str = "22222222-2222-4222-8222-222222222222";
+        let scope = SessionScope::Codex {
+            rollout_id: ROLLOUT.to_owned(),
+        };
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let run = label_run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: ROLLOUT.to_owned(),
+            },
+            TaskState::Running,
+            None,
+            None,
+            None,
+        );
+        let mut model = DomainModel::default();
+        model.insert_task_run(run.clone());
+        let mut synthesis = Synthesis::default();
+        let mut admission = Admission::new(0);
+        let discovered = AdmissionIndex::new();
+        synthesis.synthesize_batch(
+            Path::new("rollout.jsonl"),
+            [
+                (
+                    1,
+                    LogFact::CodexTurnStarted {
+                        rollout_id: ROLLOUT.to_owned(),
+                        at_ms: 1,
+                    },
+                ),
+                (
+                    2,
+                    LogFact::Activity {
+                        scope: scope.clone(),
+                        at_ms: 2,
+                        source: ActivitySource::Command,
+                        line: "cargo test".to_owned(),
+                    },
+                ),
+                (
+                    3,
+                    LogFact::Activity {
+                        scope: scope.clone(),
+                        at_ms: 3,
+                        source: ActivitySource::Commentary,
+                        line: "checking invariants".to_owned(),
+                    },
+                ),
+            ],
+            &mut admission,
+            &discovered,
+        );
+        let commentary = synthesis.live_line(&scope).unwrap();
+        let live_lines = LiveLineReadModel {
+            by_run: HashMap::from([(run_id, commentary)]),
+        };
+        assert_eq!(
+            run_row_label_with_agent(&model, &run, None, 4, &live_lines, false),
+            format!("● Codex {ROLLOUT} — checking invariants")
+        );
+
+        synthesis.synthesize_batch(
+            Path::new("rollout.jsonl"),
+            [
+                (
+                    4,
+                    LogFact::CodexTurnStarted {
+                        rollout_id: ROLLOUT.to_owned(),
+                        at_ms: 4,
+                    },
+                ),
+                (
+                    5,
+                    LogFact::Activity {
+                        scope: scope.clone(),
+                        at_ms: 5,
+                        source: ActivitySource::Command,
+                        line: "next command".to_owned(),
+                    },
+                ),
+            ],
+            &mut admission,
+            &discovered,
+        );
+        let command = synthesis.live_line(&scope).unwrap();
+        let live_lines = LiveLineReadModel {
+            by_run: HashMap::from([(run_id, command)]),
+        };
+        assert_eq!(
+            run_row_label_with_agent(&model, &run, None, 6, &live_lines, false),
+            format!("● Codex {ROLLOUT} — next command")
+        );
+
+        let claude_scope = SessionScope::ClaudeRoot("claude-session".to_owned());
+        synthesis.synthesize_batch(
+            Path::new("session.jsonl"),
+            [(
+                6,
+                LogFact::Activity {
+                    scope: claude_scope.clone(),
+                    at_ms: 6,
+                    source: ActivitySource::ToolUse,
+                    line: "Read: Cargo.toml".to_owned(),
+                },
+            )],
+            &mut admission,
+            &discovered,
+        );
+        let claude_run = label_run(
+            run_id,
+            RunKey::Controller("hook:claude-code:claude-session".to_owned()),
+            TaskState::Running,
+            None,
+            None,
+            Some("inspect project"),
+        );
+        let live_lines = LiveLineReadModel {
+            by_run: HashMap::from([(run_id, synthesis.live_line(&claude_scope).unwrap())]),
+        };
+        assert_eq!(
+            run_row_label_with_agent(&model, &claude_run, None, 7, &live_lines, false),
+            "● claude-code inspect project — Read: Cargo.toml"
+        );
+    }
+
+    #[test]
+    fn terminal_rows_drop_live() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let run = label_run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "session".to_owned(),
+            },
+            TaskState::Completed,
+            None,
+            None,
+            Some("finished subject"),
+        );
+        let model = DomainModel::default();
+        let live_lines = LiveLineReadModel {
+            by_run: HashMap::from([(run_id, "must not render".to_owned())]),
+        };
+
+        assert_eq!(
+            run_row_label_with_agent(&model, &run, None, 0, &live_lines, false),
+            "✓ Codex finished subject"
+        );
     }
 
     #[test]
@@ -2136,7 +2538,7 @@ mod tests {
                     Some("gpt-5.6-sol"),
                 )),
                 1_033_000,
-                "claude-code Implement I7 Task 2 wire tolerance — tool_use: Bash [model:gpt-5.6-sol] [running] · 17m03s",
+                "⚠ claude-code Implement I7 Task 2 wire tolerance — tool_use: Bash · 17m03s",
             ),
             (
                 label_run(
@@ -2149,7 +2551,7 @@ mod tests {
                 ),
                 None,
                 5_000,
-                "claude-code hook:claude-code:S:task:T [queued]",
+                "◌ claude-code hook:claude-code:S:task:T",
             ),
             (
                 label_run(
@@ -2169,7 +2571,7 @@ mod tests {
                     Some("gpt-terminal"),
                 )),
                 9_000_000,
-                "claude-code Finish work [model:gpt-terminal] [completed] · 1h01m",
+                "✓ claude-code Finish work · 1h01m",
             ),
             (
                 label_run(
@@ -2189,7 +2591,7 @@ mod tests {
                     None,
                 )),
                 5_000,
-                "claude-code No timing — message [running]",
+                "● claude-code No timing — message",
             ),
             (
                 label_run(
@@ -2202,7 +2604,7 @@ mod tests {
                 ),
                 None,
                 5_000,
-                "claude-code Clock skew [running]",
+                "● claude-code Clock skew",
             ),
         ];
 
@@ -2266,7 +2668,7 @@ mod tests {
         recency_model.insert_agent_node(newer);
         assert_eq!(
             run_row_label(&recency_model, &run, 1_000),
-            "claude-code Tie break — newer: Read [model:model-newer] [running]"
+            "● claude-code Tie break — newer: Read"
         );
 
         for agents in [
@@ -2281,7 +2683,7 @@ mod tests {
             for _ in 0..8 {
                 assert_eq!(
                     run_row_label(&tie_model, &run, 1_000),
-                    "claude-code Tie break — tie-high: Bash [model:model-high] [running]"
+                    "● claude-code Tie break — tie-high: Bash"
                 );
             }
         }
@@ -2396,14 +2798,14 @@ mod tests {
                     provider: Provider::Codex,
                     sid: "native-session".to_owned(),
                 },
-                "Codex native-session [running]",
+                "● Codex native-session",
             ),
             (
                 RunKey::NativePath {
                     provider: Provider::Codex,
                     path: "/private/session.jsonl".to_owned(),
                 },
-                "Codex 01ARZ3NDEKTSV4RRFFQ69G5FAV [running]",
+                "● Codex 01ARZ3NDEKTSV4RRFFQ69G5FAV",
             ),
             (
                 RunKey::Provisional {
@@ -2411,11 +2813,11 @@ mod tests {
                     start_ms: 1,
                     seq: 2,
                 },
-                "provisional terminal:1:2 [running]",
+                "● provisional terminal:1:2",
             ),
             (
                 RunKey::Controller("hook:claude-code:S:task:T".to_owned()),
-                "claude-code hook:claude-code:S:task:T [running]",
+                "● claude-code hook:claude-code:S:task:T",
             ),
         ] {
             let run = label_run(run_id, key, TaskState::Running, None, None, None);
@@ -2669,8 +3071,8 @@ mod tests {
         assert_eq!(workspace_x, session_x + 4);
         assert_eq!(tab_x, workspace_x + 4);
         assert_eq!(pane_x, tab_x + 4);
-        assert_eq!(run_x, pane_x + 4);
-        assert_eq!(agent_x, run_x + 4);
+        assert_eq!(run_x, pane_x + 6);
+        assert_eq!(agent_x, run_x + 2);
     }
 
     #[test]

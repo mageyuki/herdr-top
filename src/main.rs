@@ -24,7 +24,8 @@ use herdr_top::hook_adapter::{self, HookPayload};
 use herdr_top::lockfile::{self, LockError, OwnerRecord, StateRoot};
 use herdr_top::model::OperatorCommand;
 use herdr_top::provider::lane::{
-    LogLaneConfig, parse_backfill_window_ms, parse_complete_grace_ms, parse_headless_inactivity_ms,
+    LogLaneConfig, parse_backfill_window_ms, parse_complete_grace_ms, parse_ghost_visibility_ms,
+    parse_headless_inactivity_ms, parse_stall_warn_ms,
 };
 use herdr_top::rendezvous::{self, RvError};
 use herdr_top::session_key::{self, ResolvedSession, SessionKeyError};
@@ -394,10 +395,16 @@ async fn run_monitor(cli: &Cli, plugin_state_dir: Option<&OsStr>) -> Result<(), 
         parse_complete_grace_ms(env::var_os("HERDR_TOP_COMPLETE_GRACE_MS").as_deref());
     let headless_inactivity_ms =
         parse_headless_inactivity_ms(env::var_os("HERDR_TOP_HEADLESS_INACTIVITY_MS").as_deref());
+    let stall_warn_ms = parse_stall_warn_ms(env::var_os("HERDR_TOP_STALL_WARN_MS").as_deref());
+    let ghost_visibility_ms =
+        parse_ghost_visibility_ms(env::var_os("HERDR_TOP_GHOST_VISIBILITY_MS").as_deref());
+    herdr_top::activity::configure_display_timing(stall_warn_ms, ghost_visibility_ms);
     tracing::info!(
         backfill_window_ms,
         complete_grace_ms,
         headless_inactivity_ms,
+        stall_warn_ms,
+        ghost_visibility_ms,
         "resolved provider log lane startup configuration"
     );
     let log_lane_config = LogLaneConfig {
