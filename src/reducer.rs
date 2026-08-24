@@ -495,30 +495,37 @@ impl Reducer {
             .map(|run| run.run_id)
     }
 
-    /// Rebuilds transient provider metadata from a durable-ledger duplicate during log replay.
+    /// Rebuilds transient reducer state from a durable-ledger duplicate during log replay.
     pub(crate) fn restore_replayed_controller_transients(&mut self, event: &ControllerEvent) {
-        if event.metadata.source != crate::provider::lane::SOURCE_LOG_LANE
-            || !matches!(
-                event.event,
-                ControllerEventKind::Dispatch { .. } | ControllerEventKind::TaskStarted
-            )
-        {
+        if event.metadata.source != crate::provider::lane::SOURCE_LOG_LANE {
             return;
         }
-        let Some(kind) = event
-            .metadata
-            .provider_metadata
-            .as_ref()
-            .and_then(|provider| provider.event_kind.as_ref())
-        else {
-            return;
-        };
         let Some(run_id) = self.resolve_controller_run(&event.task_run_id) else {
             return;
         };
-        if self.model.run_kind(&run_id).is_none() && !kind.is_empty() {
-            self.model.set_run_kind(run_id, kind.clone());
-            self.publish();
+        match &event.event {
+            ControllerEventKind::Dispatch { .. } | ControllerEventKind::TaskStarted => {
+                let Some(kind) = event
+                    .metadata
+                    .provider_metadata
+                    .as_ref()
+                    .and_then(|provider| provider.event_kind.as_ref())
+                else {
+                    return;
+                };
+                if self.model.run_kind(&run_id).is_none() && !kind.is_empty() {
+                    self.model.set_run_kind(run_id, kind.clone());
+                    self.publish();
+                }
+            }
+            ControllerEventKind::Complete
+            | ControllerEventKind::Failed
+            | ControllerEventKind::Cancelled => {
+                self.terminal_event_sources
+                    .entry(run_id)
+                    .or_insert_with(|| crate::provider::lane::SOURCE_LOG_LANE.to_owned());
+            }
+            _ => {}
         }
     }
 
@@ -805,8 +812,12 @@ impl Reducer {
             _ => {}
         }
 
-        let allow_lane_reopen =
-            scratch.lane_reopen_allowed(&event.event, subject, &metadata.source);
+        let allow_lane_reopen = scratch.lane_reopen_allowed(
+            &event.event,
+            subject,
+            &metadata.source,
+            metadata.timestamp_ms,
+        );
         let mut diagnostic_deltas = validate_controller_transition(
             &scratch.model,
             &event.event,
@@ -909,9 +920,11 @@ impl Reducer {
 
         self.ensure_event_runs(&event, &metadata, &mut persist)?;
         let allow_lane_reopen = match &event {
-            NormalizedEvent::ControllerEvent { event, .. } => metadata
-                .task_run_id
-                .is_some_and(|run_id| self.lane_reopen_allowed(event, run_id, &metadata.source)),
+            NormalizedEvent::ControllerEvent { event, .. } => {
+                metadata.task_run_id.is_some_and(|run_id| {
+                    self.lane_reopen_allowed(event, run_id, &metadata.source, metadata.timestamp_ms)
+                })
+            }
             _ => false,
         };
         self.apply_controller_metadata(&metadata, allow_lane_reopen, &mut persist);
@@ -1344,13 +1357,19 @@ impl Reducer {
         event: &ControllerEventKind,
         run_id: RunId,
         source: &str,
+        source_timestamp_ms: i64,
     ) -> bool {
+        // Source time is otherwise display-only. Replay receipt time is "now", so this narrow
+        // comparison is the only way to distinguish a genuine resume from replayed history.
+        let start_follows_completion = self.model.task_run(&run_id).is_some_and(|run| {
+            run.state == TaskState::Completed
+                && run
+                    .finished_at_ms
+                    .is_some_and(|finished_at_ms| source_timestamp_ms > finished_at_ms)
+        });
         matches!(event, ControllerEventKind::TaskStarted)
             && source == crate::provider::lane::SOURCE_LOG_LANE
-            && self
-                .model
-                .task_run(&run_id)
-                .is_some_and(|run| run.state == TaskState::Completed)
+            && start_follows_completion
             && self
                 .terminal_event_sources
                 .get(&run_id)
@@ -3044,6 +3063,7 @@ mod tests {
             ControllerEventKind::TaskStarted,
         );
         hook_reopen.metadata.source = SOURCE_LOG_LANE.to_owned();
+        hook_reopen.metadata.timestamp_ms = 21;
         assert!(matches!(
             reducer.validate_controller_event(&hook_reopen),
             Err(RejectReason::StaleEvent)
@@ -3055,6 +3075,7 @@ mod tests {
             ControllerEventKind::TaskStarted,
         );
         lane_reopen.metadata.source = SOURCE_LOG_LANE.to_owned();
+        lane_reopen.metadata.timestamp_ms = 21;
         let reopened = reducer.validate_controller_event(&lane_reopen).unwrap();
         let run_id = reducer.resolve_controller_run("lane-terminal").unwrap();
         assert_eq!(
@@ -3062,6 +3083,147 @@ mod tests {
             TaskState::Running
         );
         lifecycle.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn lane_reopen_requires_timestamp_strictly_after_finish() {
+        for (case, finished_at_ms, timestamp_ms, expected_state) in [
+            ("before", Some(100), 99, None),
+            ("equal", Some(100), 100, None),
+            ("after", Some(100), 101, Some(TaskState::Running)),
+            ("missing-finish", None, 101, None),
+        ] {
+            let (mut model, run_id) = controller_model(case, TaskState::Completed);
+            let mut run = model.task_run(&run_id).unwrap().clone();
+            run.finished_at_ms = finished_at_ms;
+            model.insert_task_run(run);
+            let (mut reducer, _shared) = Reducer::new(restored(model, 2));
+            reducer.restore_terminal_event_sources(HashMap::from([(
+                run_id,
+                SOURCE_LOG_LANE.to_owned(),
+            )]));
+            let mut reopen = controller_event(
+                &format!("lane-reopen-{case}"),
+                case,
+                ControllerEventKind::TaskStarted,
+            );
+            reopen.metadata.source = SOURCE_LOG_LANE.to_owned();
+            reopen.metadata.timestamp_ms = timestamp_ms;
+
+            let result = reducer.validate_controller_event(&reopen);
+            match expected_state {
+                Some(expected_state) => assert_eq!(
+                    result
+                        .expect("a strictly newer lane start must reopen")
+                        .post_model
+                        .task_run(&run_id)
+                        .unwrap()
+                        .state,
+                    expected_state,
+                    "case {case}"
+                ),
+                None => assert!(
+                    matches!(result, Err(RejectReason::StaleEvent)),
+                    "case {case} unexpectedly reopened"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn replayed_lane_terminal_restores_only_missing_provenance() {
+        for (case, terminal_event) in [
+            ("complete", ControllerEventKind::Complete),
+            ("failed", ControllerEventKind::Failed),
+            ("cancelled", ControllerEventKind::Cancelled),
+        ] {
+            let (mut model, run_id) = controller_model(case, TaskState::Completed);
+            let mut run = model.task_run(&run_id).unwrap().clone();
+            run.finished_at_ms = Some(100);
+            model.insert_task_run(run);
+            let (mut reducer, _shared) = Reducer::new(restored(model, 2));
+            let mut replayed_terminal =
+                controller_event(&format!("replayed-{case}"), case, terminal_event);
+            replayed_terminal.metadata.source = SOURCE_LOG_LANE.to_owned();
+
+            reducer.restore_replayed_controller_transients(&replayed_terminal);
+
+            assert_eq!(
+                reducer
+                    .terminal_event_sources
+                    .get(&run_id)
+                    .map(String::as_str),
+                Some(SOURCE_LOG_LANE),
+                "replayed {case} did not rebuild missing lane provenance"
+            );
+            let mut historical_start = controller_event(
+                &format!("historical-start-after-{case}"),
+                case,
+                ControllerEventKind::TaskStarted,
+            );
+            historical_start.metadata.source = SOURCE_LOG_LANE.to_owned();
+            historical_start.metadata.timestamp_ms = 99;
+            assert!(
+                matches!(
+                    reducer.validate_controller_event(&historical_start),
+                    Err(RejectReason::StaleEvent)
+                ),
+                "rebuilt {case} provenance allowed a historical start to reopen"
+            );
+            let mut resumed_start = controller_event(
+                &format!("resumed-start-after-{case}"),
+                case,
+                ControllerEventKind::TaskStarted,
+            );
+            resumed_start.metadata.source = SOURCE_LOG_LANE.to_owned();
+            resumed_start.metadata.timestamp_ms = 101;
+            assert_eq!(
+                reducer
+                    .validate_controller_event(&resumed_start)
+                    .expect("a new start must use rebuilt lane provenance")
+                    .post_model
+                    .task_run(&run_id)
+                    .unwrap()
+                    .state,
+                TaskState::Running,
+                "replayed {case} did not permit a genuine resume"
+            );
+        }
+
+        let (mut model, run_id) = controller_model("hook", TaskState::Completed);
+        let mut run = model.task_run(&run_id).unwrap().clone();
+        run.finished_at_ms = Some(100);
+        model.insert_task_run(run);
+        let (mut reducer, _shared) = Reducer::new(restored(model, 2));
+        reducer.restore_terminal_event_sources(HashMap::from([(run_id, "hook".to_owned())]));
+        let mut replayed_terminal = controller_event(
+            "replayed-lane-complete",
+            "hook",
+            ControllerEventKind::Complete,
+        );
+        replayed_terminal.metadata.source = SOURCE_LOG_LANE.to_owned();
+
+        reducer.restore_replayed_controller_transients(&replayed_terminal);
+
+        assert_eq!(
+            reducer
+                .terminal_event_sources
+                .get(&run_id)
+                .map(String::as_str),
+            Some("hook"),
+            "log replay overwrote existing hook provenance"
+        );
+        let mut attempted_reopen = controller_event(
+            "hook-reopen-after-lane-replay",
+            "hook",
+            ControllerEventKind::TaskStarted,
+        );
+        attempted_reopen.metadata.source = SOURCE_LOG_LANE.to_owned();
+        attempted_reopen.metadata.timestamp_ms = 101;
+        assert!(matches!(
+            reducer.validate_controller_event(&attempted_reopen),
+            Err(RejectReason::StaleEvent)
+        ));
     }
 
     #[tokio::test]
@@ -3095,6 +3257,12 @@ mod tests {
             terminal_sources.get(&run_id).map(String::as_str),
             Some(SOURCE_LOG_LANE)
         );
+        let finished_at_ms = restored
+            .model
+            .task_run(&run_id)
+            .unwrap()
+            .finished_at_ms
+            .unwrap();
         let (mut reducer, _shared) = Reducer::new(restored);
         reducer.restore_terminal_event_sources(terminal_sources);
         let mut reopen = controller_event(
@@ -3103,6 +3271,7 @@ mod tests {
             ControllerEventKind::TaskStarted,
         );
         reopen.metadata.source = SOURCE_LOG_LANE.to_owned();
+        reopen.metadata.timestamp_ms = finished_at_ms + 1;
 
         let reopened = reducer.validate_controller_event(&reopen).unwrap();
         assert_eq!(

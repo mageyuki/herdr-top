@@ -4126,8 +4126,8 @@ impl ProviderWorker for AdapterProviderWorker {
                 let tail = match TailFile::open(
                     &file.root,
                     &file.relative_path,
-                    // Admission already bounds the selected files to the backfill anchor. Read
-                    // each admitted artifact completely so transient lane state is reconstructed.
+                    // Admission applies the anchor plus pane-root and explicit-lineage exemptions.
+                    // Read each admitted artifact from zero to reconstruct transient lane state.
                     &crate::provider::FirstSeenBaseline::default(),
                     generation,
                     &mut boundary,
@@ -4148,6 +4148,7 @@ impl ProviderWorker for AdapterProviderWorker {
                 let ordinal = if tail.offset() == 0 {
                     0
                 } else {
+                    // Reserved for a future nonzero-offset reopen (rotation/truncation/later tail); record_ordinal_at_offset tests: src/provider/lane.rs:3884 and :3896.
                     match crate::provider::lane::record_ordinal_at_offset(
                         &file.root,
                         &file.relative_path,
@@ -13259,6 +13260,149 @@ mod provider_integration_tests {
             replayed.model.task_run(&fixture.run_id),
             Some(&expected_terminal),
             "replay persisted a reopen or duplicate terminal transition"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_historical_start_missing_from_ledger_does_not_reopen_completed_run() {
+        let fixture = persist_restart_backfill().await;
+        let replay = replay_restart_backfill(&fixture);
+        let started_event_id = replay
+            .iter()
+            .find_map(|event| match event {
+                ProviderEvent::Synthesized(controller)
+                    if matches!(controller.event, ControllerEventKind::TaskStarted) =>
+                {
+                    Some(controller.metadata.event_id.clone())
+                }
+                _ => None,
+            })
+            .expect("startup replay must contain the historical TaskStarted");
+        let complete_event_id = replay
+            .iter()
+            .find_map(|event| match event {
+                ProviderEvent::Synthesized(controller)
+                    if matches!(controller.event, ControllerEventKind::Complete) =>
+                {
+                    Some(controller.metadata.event_id.clone())
+                }
+                _ => None,
+            })
+            .expect("startup replay must contain the retained Complete");
+        let connection =
+            rusqlite::Connection::open(crate::store::database_path(&fixture.state_root)).unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    "DELETE FROM event_ledger WHERE event_id = ?1",
+                    [&started_event_id],
+                )
+                .unwrap(),
+            1,
+            "fixture must prune only the historical TaskStarted ledger row"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE event_id IN (?1, ?2)",
+                    (&started_event_id, &complete_event_id),
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2,
+            "both historical event rows must survive the ledger-only prune"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM event_ledger WHERE event_id = ?1",
+                    [&complete_event_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "the retained Complete must remain a ledger duplicate"
+        );
+        drop(connection);
+
+        let reader = open_reader(&fixture.state_root).unwrap();
+        let terminal_sources = reader.terminal_event_sources().unwrap();
+        let restored = reader.load_restored_state().unwrap();
+        assert_eq!(
+            restored.model.task_run(&fixture.run_id).unwrap().state,
+            TaskState::Completed,
+            "restart seed must restore the persisted terminal run"
+        );
+        assert!(
+            !restored
+                .event_ledger
+                .iter()
+                .any(|entry| entry.event_id == started_event_id),
+            "restart ledger must expose the pruned historical TaskStarted"
+        );
+        drop(reader);
+        let store = open_writer(&fixture.state_root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut persistence = test_runtime(writer);
+        let (mut reducer, shared) = Reducer::new(restored);
+        reducer.restore_terminal_event_sources(terminal_sources);
+        apply_restart_backfill_events(replay, &mut reducer, &shared, &mut persistence).await;
+        let replayed_state = shared
+            .borrow()
+            .task_run(&fixture.run_id)
+            .expect("replayed run must remain visible")
+            .state;
+        let persistence_status = persistence.snapshot.persistence;
+        drop(persistence);
+        lifecycle.shutdown().await.unwrap();
+
+        let connection =
+            rusqlite::Connection::open(crate::store::database_path(&fixture.state_root)).unwrap();
+        let persisted_start_events = connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_id = ?1",
+                [&started_event_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let persisted_start_ledger = connection
+            .query_row(
+                "SELECT COUNT(*) FROM event_ledger WHERE event_id = ?1",
+                [&started_event_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        drop(connection);
+        let reader = open_reader(&fixture.state_root).unwrap();
+        let persisted_state = reader
+            .load_restored_state()
+            .unwrap()
+            .model
+            .task_run(&fixture.run_id)
+            .expect("replayed run must remain persisted")
+            .state;
+        assert_eq!(
+            persisted_start_events, 1,
+            "historical TaskStarted replay persisted a duplicate Running event"
+        );
+        assert_eq!(
+            persisted_start_ledger, 0,
+            "historical TaskStarted replay repopulated its pruned ledger entry"
+        );
+        assert_eq!(
+            persistence_status,
+            crate::store::PersistenceStatus::Healthy,
+            "historical TaskStarted replay attempted a conflicting durable event write"
+        );
+        assert_eq!(
+            persisted_state,
+            TaskState::Completed,
+            "historical TaskStarted replay persisted a spurious reopen"
+        );
+        assert_eq!(
+            replayed_state,
+            TaskState::Completed,
+            "historical TaskStarted replay reopened the restored terminal run"
         );
     }
 
