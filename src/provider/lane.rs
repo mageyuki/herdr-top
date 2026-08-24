@@ -1793,6 +1793,7 @@ mod tests {
     };
     use crate::reducer::Reducer;
     use crate::store::RestoredState;
+    use crate::tui::view::task_run_label;
 
     use super::*;
 
@@ -1918,6 +1919,157 @@ mod tests {
             }
         }
         state.model
+    }
+
+    #[test]
+    fn run_rows_render_stable_lane_kind() {
+        const AGENT: &str = "child-kind";
+        let claude_scope = SessionScope::ClaudeSubagent {
+            parent: PARENT.to_owned(),
+            agent_id: AGENT.to_owned(),
+        };
+        let codex_scope = SessionScope::Codex {
+            rollout_id: ROLLOUT.to_owned(),
+        };
+        let mut synthesis = Synthesis::default();
+        let mut events = synthesize(
+            &mut synthesis,
+            "agent-child-kind.meta.json",
+            [(
+                0,
+                LogFact::SubagentAppeared {
+                    parent: PARENT.to_owned(),
+                    agent_id: AGENT.to_owned(),
+                    agent_type: "reviewer".to_owned(),
+                    description: "Review the projected rows".to_owned(),
+                },
+            )],
+        );
+        events.extend(synthesize(
+            &mut synthesis,
+            "rollout.jsonl",
+            [(
+                0,
+                LogFact::CodexMeta {
+                    rollout_id: ROLLOUT.to_owned(),
+                    cwd: "/tmp/project".to_owned(),
+                    originator: "codex_cli_rs".to_owned(),
+                    internal: None,
+                    cli_version: "0.1.0".to_owned(),
+                },
+            )],
+        ));
+        let model = apply_once_per_event_id(&events);
+        let claude_run = model
+            .task_run_by_key(&run_key_for_scope(&claude_scope))
+            .expect("the lane must create the Claude subagent run");
+        let codex_run = model
+            .task_run_by_key(&run_key_for_scope(&codex_scope))
+            .expect("the lane must create the Codex session run");
+        let claude_run_id = claude_run.run_id;
+        let claude_label = task_run_label(&model, claude_run, false, 0, false);
+        let codex_label = task_run_label(&model, codex_run, false, 0, false);
+        assert!(
+            claude_label.starts_with("● reviewer "),
+            "Claude row must render agentType: {claude_label}"
+        );
+        assert!(
+            codex_label.starts_with("● codex_cli_rs"),
+            "Codex row must render rollout originator: {codex_label}"
+        );
+
+        let agent_node_id = "volatile-agent-node";
+        let lane_started = synthesized_events(&events)
+            .into_iter()
+            .find(|event| {
+                event.task_run_id == controller_key_for_scope(&claude_scope)
+                    && matches!(event.event, ControllerEventKind::TaskStarted)
+            })
+            .expect("the lane must synthesize the Claude start")
+            .clone();
+        let mut later_started = lane_started.clone();
+        later_started.metadata.event_id = "later-task-started".to_owned();
+        later_started.metadata.timestamp_ms = 1;
+        later_started.metadata.receipt_time_ms = 1;
+        later_started.metadata.provider_metadata = Some(MinimalProviderMetadata {
+            event_kind: Some("must-not-overwrite-reviewer".to_owned()),
+            ..MinimalProviderMetadata::default()
+        });
+        let (reducer, _shared) = Reducer::new(RestoredState {
+            model,
+            next_ordinal: 10,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let later_started = reducer
+            .validate_controller_event(&later_started)
+            .expect("a repeated lane start must remain valid");
+        let mut metadata = lane_started.metadata;
+        metadata.event_id = "later-agent-node".to_owned();
+        metadata.timestamp_ms = 1;
+        metadata.receipt_time_ms = 1;
+        metadata.source_event_type = "agent_node".to_owned();
+        metadata.task_run_id = Some(claude_run_id);
+        metadata.task_state = None;
+        metadata.execution_parent = None;
+        metadata.agent_node_id = Some(agent_node_id.to_owned());
+        metadata.provider_metadata = None;
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model: later_started.post_model,
+            next_ordinal: later_started.post_next_ordinal,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        reducer
+            .apply(NormalizedEvent::AgentNodeUpsert {
+                metadata: metadata.clone(),
+                node: AgentNodeObservation {
+                    agent_node_id: agent_node_id.to_owned(),
+                    provider: Provider::Claude,
+                    native_session_id: None,
+                    task_run_id: claude_run_id,
+                    parent_agent_node_id: None,
+                    state: None,
+                    model_id: None,
+                    session_file: None,
+                },
+            })
+            .expect("agent node must apply");
+        let activity = MinimalProviderMetadata {
+            agent_id: Some("volatile-agent".to_owned()),
+            event_kind: Some("unrelated_activity".to_owned()),
+            ..MinimalProviderMetadata::default()
+        };
+        metadata.event_id = "later-agent-activity".to_owned();
+        metadata.source_event_type = "activity".to_owned();
+        metadata.provider_metadata = Some(activity.clone());
+        reducer
+            .apply(NormalizedEvent::AgentActivity {
+                metadata,
+                agent_node_id: agent_node_id.to_owned(),
+                activity,
+            })
+            .expect("later activity must apply");
+
+        let snapshot = shared.borrow();
+        assert_eq!(
+            snapshot
+                .agent_node(agent_node_id)
+                .and_then(|node| node.last_event_kind.as_deref()),
+            Some("unrelated_activity"),
+            "the volatile activity path must actually update"
+        );
+        let stable_label = task_run_label(
+            &snapshot,
+            snapshot.task_run(&claude_run_id).unwrap(),
+            false,
+            1,
+            false,
+        );
+        assert!(
+            stable_label.starts_with("● reviewer "),
+            "later activity must not overwrite the stable run kind: {stable_label}"
+        );
     }
 
     #[test]

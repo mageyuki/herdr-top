@@ -1343,7 +1343,19 @@ impl Reducer {
         persist: &mut PersistBatch,
     ) -> Result<(), ReducerError> {
         match event {
-            NormalizedEvent::ControllerEvent { .. } => {}
+            NormalizedEvent::ControllerEvent { event, .. } => {
+                if matches!(
+                    event,
+                    ControllerEventKind::Dispatch { .. } | ControllerEventKind::TaskStarted
+                ) && let Some(run_id) = metadata.task_run_id
+                    && let Some(kind) = metadata
+                        .provider_metadata
+                        .as_ref()
+                        .and_then(|provider| provider.event_kind.as_ref())
+                {
+                    self.model.set_run_kind(run_id, kind.clone());
+                }
+            }
             NormalizedEvent::TopologyUpsert { entity, .. } => match entity {
                 TopologyEntity::Workspace(workspace) => {
                     let display_ordinal =

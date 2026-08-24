@@ -81,7 +81,7 @@ impl TaskRun {
     }
 }
 
-// These telemetry-only types intentionally omit serde derives. That compile-enforces the
+// These transient-only types intentionally omit serde derives. That compile-enforces the
 // never-persisted invariant if DomainModel ever gains a serialization derive.
 /// One model/effort/sandbox attribution observed for a Codex turn.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -175,6 +175,12 @@ impl RunTelemetry {
 }
 
 pub type RunTelemetryMap = HashMap<RunId, RunTelemetry>;
+
+/// Stable provider run kinds recomputed from provider logs at startup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunKind(String);
+
+pub type RunKindMap = HashMap<RunId, RunKind>;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentNode {
@@ -677,6 +683,8 @@ pub struct DomainModel {
     run_ids_by_key: HashMap<RunKey, RunId>,
     /// Recomputed from provider logs at startup; no serialized or database projection owns it.
     telemetry: RunTelemetryMap,
+    /// First provider kind per run; recomputed at startup and never persisted.
+    run_kinds: RunKindMap,
     executions: HashMap<String, Execution>,
     agent_nodes: HashMap<String, AgentNode>,
     execution_edges: HashSet<ExecutionEdge>,
@@ -912,6 +920,26 @@ impl DomainModel {
                 canonical.per_turn.push(attribution);
             }
         }
+    }
+
+    /// Returns the stable transient provider kind for one run.
+    #[must_use]
+    pub fn run_kind(&self, run_id: &RunId) -> Option<&str> {
+        self.run_kinds.get(run_id).map(|kind| kind.0.as_str())
+    }
+
+    /// Records the first non-empty provider kind observed for one run.
+    pub(crate) fn set_run_kind(&mut self, run_id: RunId, kind: String) {
+        if !kind.is_empty() {
+            self.run_kinds.entry(run_id).or_insert(RunKind(kind));
+        }
+    }
+
+    pub(crate) fn fold_run_kind(&mut self, survivor: RunId, absorbed: RunId) {
+        let Some(absorbed_kind) = self.run_kinds.remove(&absorbed) else {
+            return;
+        };
+        self.run_kinds.entry(survivor).or_insert(absorbed_kind);
     }
 
     pub fn insert_execution(&mut self, execution: Execution) -> Option<Execution> {

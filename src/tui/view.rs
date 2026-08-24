@@ -2109,7 +2109,9 @@ fn run_row_label_with_agent(
 fn run_row_head(model: &DomainModel, run: &TaskRun, stalled: bool) -> String {
     let mut label = status_glyph(run.state, stalled).to_owned();
     label.push(' ');
-    label.push_str(&projection::worker_kind_label(run));
+    let run_kind = projection::run_kind_label(model, run);
+    let worker_kind = projection::worker_kind_label(run);
+    label.push_str(&run_kind);
     let subject = if is_codex_worker(model, run) {
         String::new()
     } else {
@@ -2118,6 +2120,10 @@ fn run_row_head(model: &DomainModel, run: &TaskRun, stalled: bool) -> String {
             .map_or_else(|| run_subject_fallback(run), safe_text)
     };
     if !subject.is_empty() {
+        if run_kind != worker_kind {
+            label.push(' ');
+            label.push_str(&worker_kind);
+        }
         label.push(' ');
         label.push_str(&subject);
     }
@@ -4565,8 +4571,8 @@ mod tests {
         let first = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let second = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
         let mut model = placement_model(&[]);
-        insert_placement_run(&mut model, first, "first", 1);
-        insert_placement_run(&mut model, second, "second", 2);
+        insert_placement_run(&mut model, first, "first", 2);
+        insert_placement_run(&mut model, second, "second", 1);
         for (parent_run_id, child_run_id) in [(first, second), (second, first)] {
             model.insert_execution_edge(ExecutionEdge {
                 parent_run_id,
@@ -4586,7 +4592,7 @@ mod tests {
                 .iter()
                 .map(|row| (row.key.run_id().unwrap(), row.depth))
                 .collect::<Vec<_>>(),
-            [(first, 2), (second, 2)]
+            [(second, 2), (first, 2)]
         );
         assert!(run_rows.iter().all(|row| {
             matches!(row.key, NodeKey::Run { pane_id: None, .. })

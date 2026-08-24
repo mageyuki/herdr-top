@@ -272,6 +272,17 @@ impl NodeKey {
             | Self::UnattachedGroup => None,
         }
     }
+
+    /// Ignores a run's hosting pane so parent expiry does not churn collapse membership.
+    pub(crate) fn collapse_key(&self) -> Self {
+        match self {
+            Self::Run { run_id, .. } => Self::Run {
+                run_id: *run_id,
+                pane_id: None,
+            },
+            _ => self.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -499,7 +510,7 @@ impl AppState {
 
     #[cfg(test)]
     fn is_collapsed(&self, key: &NodeKey) -> bool {
-        self.collapsed.contains(key)
+        self.collapsed.contains(&key.collapse_key())
     }
 
     #[cfg(test)]
@@ -1046,10 +1057,11 @@ impl App {
         }
         self.state.follow = false;
         self.state.selection_reason = None;
-        let collapsed = if self.state.collapsed.remove(&key) {
+        let collapse_key = key.collapse_key();
+        let collapsed = if self.state.collapsed.remove(&collapse_key) {
             false
         } else {
-            self.state.collapsed.insert(key);
+            self.state.collapsed.insert(collapse_key);
             true
         };
         let new_rows = self.rebuild_rows();
@@ -1065,7 +1077,7 @@ impl App {
         let Some(selected) = self.state.selected.clone() else {
             return;
         };
-        if self.state.collapsed.contains(&selected) {
+        if self.state.collapsed.contains(&selected.collapse_key()) {
             self.toggle_collapse(selected);
             return;
         }
@@ -1096,7 +1108,7 @@ impl App {
             return;
         };
         let depth = rows[index].depth;
-        let expanded_branch = !self.state.collapsed.contains(&selected)
+        let expanded_branch = !self.state.collapsed.contains(&selected.collapse_key())
             && rows
                 .get(index.saturating_add(1))
                 .is_some_and(|next| next.depth > depth);
@@ -1275,6 +1287,18 @@ impl App {
             self.state.selection_reason = (survivor_id != old_run_id)
                 .then_some(SelectionReason::Merged)
                 .or(reason_hint);
+            return;
+        }
+
+        // A candidate already present in the old rows is a separate occurrence that survived;
+        // only a newly introduced key represents this occurrence being re-parented.
+        if let Some(run_id) = selected.run_id()
+            && let Some(row) = preferred_run_row(new_rows, run_id, &selected)
+            && !old_rows.iter().any(|old_row| old_row.key == row.key)
+        {
+            let replacement = row.key.clone();
+            self.set_selection(Some(replacement));
+            self.state.selection_reason = None;
             return;
         }
 
@@ -2425,6 +2449,129 @@ mod tests {
         assert!(!manual_missing.is_following());
         assert_eq!(manual_missing.selected_run_id(), Some(first));
         assert_eq!(manual_missing.state().selection_reason(), None);
+    }
+
+    #[test]
+    fn selection_survives_parent_expiry_rekey() {
+        let selected_run = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let neighbor_run = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let initial = model_with_runs(&[
+            (selected_run, "selected", 1, TaskState::Running),
+            (neighbor_run, "neighbor", 2, TaskState::Running),
+        ]);
+        let mut expired = initial.clone();
+        expired.remove_pane("pane");
+        let old_key = NodeKey::Run {
+            run_id: selected_run,
+            pane_id: Some("pane".to_owned()),
+        };
+        let new_key = NodeKey::Run {
+            run_id: selected_run,
+            pane_id: None,
+        };
+        let neighbor_key = NodeKey::Run {
+            run_id: neighbor_run,
+            pane_id: None,
+        };
+        let (mut app, model_sender) = app_with_model(initial);
+        app.state.follow = false;
+        app.set_selection(Some(old_key.clone()));
+        assert!(
+            view::build_rows(app.model(), app.state())
+                .iter()
+                .any(|row| row.key == old_key),
+            "the selected run must start nested under its pane"
+        );
+
+        model_sender.send(Arc::new(expired)).unwrap();
+        app.refresh();
+
+        let new_rows = view::build_rows(app.model(), app.state());
+        assert!(
+            new_rows.iter().any(|row| row.key == new_key),
+            "the same run must remain visible under the Unattached group"
+        );
+        assert_eq!(app.state().selected(), Some(&new_key));
+        assert_eq!(
+            app.state().selected().and_then(NodeKey::run_id),
+            Some(selected_run)
+        );
+        assert_eq!(app.state().selection_reason(), None);
+        assert_ne!(app.state().selected(), Some(&neighbor_key));
+        assert_ne!(app.state().selected(), new_rows.first().map(|row| &row.key));
+        assert!(
+            !matches!(
+                app.state().selected(),
+                Some(NodeKey::Session)
+                    | Some(NodeKey::Workspace(_))
+                    | Some(NodeKey::Tab(_))
+                    | Some(NodeKey::Pane(_))
+            ),
+            "selection must not fall back to an ancestor"
+        );
+    }
+
+    #[test]
+    fn collapse_survives_parent_expiry_rekey() {
+        let run = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut initial = model_with_runs(&[(run, "run", 1, TaskState::Running)]);
+        initial.insert_agent_node(AgentNode {
+            agent_node_id: "agent-child".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some("agent-native".to_owned()),
+            task_run_id: run,
+            display_ordinal: DisplayOrdinal::new(2),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Working),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
+        });
+        let mut expired = initial.clone();
+        expired.remove_pane("pane");
+        let old_key = NodeKey::Run {
+            run_id: run,
+            pane_id: Some("pane".to_owned()),
+        };
+        let new_key = NodeKey::Run {
+            run_id: run,
+            pane_id: None,
+        };
+        let new_agent_key = NodeKey::Agent {
+            agent_node_id: "agent-child".to_owned(),
+            pane_id: None,
+        };
+        let old_agent_key = NodeKey::Agent {
+            agent_node_id: "agent-child".to_owned(),
+            pane_id: Some("pane".to_owned()),
+        };
+        let (mut app, model_sender) = app_with_model(initial);
+        app.state.follow = false;
+        app.set_selection(Some(old_key.clone()));
+        assert!(
+            view::build_rows(app.model(), app.state())
+                .iter()
+                .any(|row| row.key == old_agent_key),
+            "the run must begin as a collapsible branch"
+        );
+        app.toggle_collapse(old_key.clone());
+        assert!(app.state().is_collapsed(&old_key));
+
+        model_sender.send(Arc::new(expired)).unwrap();
+        app.refresh();
+
+        assert_eq!(app.state().selected(), Some(&new_key));
+        assert!(app.state().is_collapsed(&new_key));
+        assert!(
+            !view::build_rows(app.model(), app.state())
+                .iter()
+                .any(|row| row.key == new_agent_key),
+            "the re-keyed run's child must remain hidden"
+        );
     }
 
     #[test]

@@ -297,6 +297,13 @@ pub(crate) fn worker_kind_label(run: &TaskRun) -> String {
     }
 }
 
+pub(crate) fn run_kind_label(model: &DomainModel, run: &TaskRun) -> String {
+    model
+        .run_kind(&run.run_id)
+        .filter(|kind| !kind.is_empty())
+        .map_or_else(|| worker_kind_label(run), escape_controls)
+}
+
 #[derive(Debug)]
 pub(crate) struct RowProjection {
     pub(crate) rows: Vec<TreeRow>,
@@ -590,7 +597,7 @@ fn apply_collapse(rows: &[TreeRow], collapsed: &HashSet<NodeKey>) -> Vec<TreeRow
         }
         hidden_below = None;
         output.push(row.clone());
-        if collapsed.contains(&row.key) {
+        if collapsed.contains(&row.key.collapse_key()) {
             hidden_below = Some(row.depth);
         }
     }
@@ -1873,6 +1880,20 @@ mod tests {
             subject: None,
             dismissed_at_ms: None,
         }
+    }
+
+    #[test]
+    fn stable_run_kind_label_escapes_controls_and_empty_falls_back() {
+        let escaped = run("fallback", 1, TaskState::Running);
+        let fallback = run("hook:claude-code:session", 2, TaskState::Running);
+        let mut model = DomainModel::default();
+        model.insert_task_run(escaped.clone());
+        model.insert_task_run(fallback.clone());
+        model.set_run_kind(escaped.run_id, "reviewer\n\t".to_owned());
+        model.set_run_kind(fallback.run_id, String::new());
+
+        assert_eq!(run_kind_label(&model, &escaped), "reviewer\\n\\t");
+        assert_eq!(run_kind_label(&model, &fallback), "claude-code");
     }
 
     #[test]

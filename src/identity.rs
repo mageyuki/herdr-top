@@ -795,6 +795,7 @@ fn merge_in_memory(
     // scope, the lane is the sole Telemetry emitter, its (scope, sample_id) deduplication lasts
     // for the process lifetime, and merged runs have disjoint ScopeKeys.
     model.fold_telemetry(survivor, absorbed);
+    model.fold_run_kind(survivor, absorbed);
     model.remove_task_run_record(&absorbed);
     for execution in model.executions_mut() {
         if execution.task_run_id == absorbed {
@@ -1012,6 +1013,32 @@ mod tests {
             "the identical attribution at the fold boundary must stay coalesced"
         );
         assert!(model.telemetry(&absorbed).is_none());
+    }
+
+    #[test]
+    fn merge_run_kind_keeps_canonical_value_or_adopts_absorbed_value() {
+        for (canonical_kind, expected) in [
+            (Some("canonical-kind"), "canonical-kind"),
+            (None, "absorbed-kind"),
+        ] {
+            let mut model = DomainModel::default();
+            let survivor = insert_run(
+                &mut model,
+                RunKey::Controller("controller-survivor".to_owned()),
+                1,
+            );
+            let absorbed = insert_run(&mut model, native(Provider::Codex, "lane-rollout"), 2);
+            if let Some(kind) = canonical_kind {
+                model.set_run_kind(survivor, kind.to_owned());
+            }
+            model.set_run_kind(absorbed, "absorbed-kind".to_owned());
+
+            apply_binding_plan_at(&mut model, BindingPlan::Merge { survivor, absorbed }, 2_000)
+                .unwrap();
+
+            assert_eq!(model.run_kind(&survivor), Some(expected));
+            assert_eq!(model.run_kind(&absorbed), None);
+        }
     }
 
     #[test]
