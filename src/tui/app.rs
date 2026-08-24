@@ -353,6 +353,7 @@ pub(crate) struct AppState {
     filter_query: String,
     filter_draft: Option<String>,
     overlay: Option<Overlay>,
+    summary_session_wide: bool,
     overlay_scroll: AtomicUsize,
     overlay_scroll_max: AtomicUsize,
     safe_warning: Option<&'static str>,
@@ -416,6 +417,14 @@ impl AppState {
 
     pub(super) const fn overlay(&self) -> Option<Overlay> {
         self.overlay
+    }
+
+    pub(super) const fn summary_scope(&self) -> super::projection::SummaryScope {
+        if self.summary_session_wide {
+            super::projection::SummaryScope::Session
+        } else {
+            super::projection::SummaryScope::SelectionWorkspace
+        }
     }
 
     pub(super) fn overlay_scroll(&self) -> usize {
@@ -509,6 +518,7 @@ fn default_diagnostics() -> RuntimeDiagnosticsSnapshot {
         persistence_counters: PersistenceCounters::default(),
         controller_counters: ControllerCounterSnapshot::default(),
         enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
+        provider_counters: crate::diagnostics::ProviderCounterSnapshot::default(),
         source_coverage: Vec::new(),
         dangling_announcement_components: 0,
         first_failure_log: OccurrenceLogStatus::NotAttempted,
@@ -786,6 +796,7 @@ impl App {
             }
             KeyCode::Char('s') if key.modifiers.is_empty() => {
                 self.state.overlay = Some(Overlay::Summary);
+                self.state.summary_session_wide = false;
                 self.state.reset_overlay_scroll();
                 LoopControl::Continue
             }
@@ -964,6 +975,10 @@ impl App {
             Overlay::Summary if matches!(code, KeyCode::Esc | KeyCode::Char('s')) => {
                 // Modifier-blind closing stays local because it is a reversible UI-only toggle.
                 self.state.overlay = None;
+            }
+            Overlay::Summary if code == KeyCode::Char('w') => {
+                self.state.summary_session_wide = !self.state.summary_session_wide;
+                self.state.reset_overlay_scroll();
             }
             Overlay::Help | Overlay::Detail | Overlay::Summary => match code {
                 KeyCode::Up => self.state.scroll_overlay_up(),
@@ -1634,6 +1649,7 @@ mod tests {
         DurabilityDisposition, PersistenceFailure, PersistenceFailureCode, PersistenceOperation,
         PersistencePhase, PersistenceStatus,
     };
+    use crate::tui::projection::SummaryScope;
 
     fn run_id(value: &str) -> RunId {
         RunId::parse(value).unwrap()
@@ -1865,6 +1881,17 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         assert_eq!(app.state().overlay(), Some(Overlay::Summary));
+        assert_eq!(
+            app.state().summary_scope(),
+            SummaryScope::SelectionWorkspace
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert_eq!(app.state().summary_scope(), SummaryScope::Session);
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert_eq!(
+            app.state().summary_scope(),
+            SummaryScope::SelectionWorkspace
+        );
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.state().overlay_scroll(), 1);
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
@@ -1876,6 +1903,8 @@ mod tests {
         assert_eq!(app.state().overlay(), Some(Overlay::Summary));
         assert_eq!(app.state().overlay_scroll(), 0);
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.state().overlay(), None);
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
         assert_eq!(app.state().overlay(), None);
     }
 
@@ -1929,15 +1958,17 @@ mod tests {
         let lines = render_lines(&app, 160, 18);
         let screen = lines.join("\n");
         assert!(screen.contains(" Summary "));
-        assert!(screen.contains("worker kind | model | runs | live | total | mean | tok | tok/s"));
+        assert!(screen.contains("worker kind | runs | live | total | mean | tok | mean tok/s"));
+        assert!(screen.contains("model | runs | live | total | mean | tok | mean tok/s"));
         let data_rows = lines
             .iter()
-            .filter(|line| line.contains("model-alpha") || line.contains("model-beta"))
+            .filter(|line| line.contains("claude-code |") || line.contains("Codex |"))
             .collect::<Vec<_>>();
         assert_eq!(data_rows.len(), 2, "{screen}");
         assert!(data_rows.iter().all(|line| line.contains(" | - | -")));
-        assert!(screen.contains("claude-code | model-alpha | 1 | 0 | 01m00s | 01m00s | - | -"));
-        assert!(screen.contains("Codex | model-beta | 1 | 1 | 00s | - | - | -"));
+        assert!(screen.contains("claude-code | 1 | 0 | 01m00s | 01m00s | - | -"));
+        assert!(screen.contains("Codex | 1 | 1 | 00s | - | - | -"));
+        assert!(screen.contains("unknown | 2 | 1 | 01m00s | 01m00s | - | -"));
     }
 
     #[test]
@@ -2041,6 +2072,7 @@ mod tests {
             persistence_counters: PersistenceCounters::default(),
             controller_counters: ControllerCounterSnapshot::default(),
             enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
+            provider_counters: crate::diagnostics::ProviderCounterSnapshot::default(),
             source_coverage: Vec::new(),
             dangling_announcement_components: 0,
             first_failure_log: OccurrenceLogStatus::NotAttempted,
@@ -2767,6 +2799,7 @@ mod tests {
                 accept_failures: 18,
             },
             enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
+            provider_counters: crate::diagnostics::ProviderCounterSnapshot::default(),
             source_coverage: vec![
                 SourceCoverageSnapshot {
                     source: DiagnosticSource::Herdr,

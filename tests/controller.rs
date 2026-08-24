@@ -490,6 +490,7 @@ fn controlled_diagnostics() -> (
         persistence_counters: PersistenceCounters::default(),
         controller_counters,
         enrichment_counters: herdr_top::diagnostics::EnrichmentCounterSnapshot::default(),
+        provider_counters: herdr_top::diagnostics::ProviderCounterSnapshot::default(),
         source_coverage: [
             DiagnosticSource::Herdr,
             DiagnosticSource::Controller,

@@ -536,6 +536,7 @@ impl Reducer {
         output_tokens: u64,
         model: Option<String>,
         effort: Option<String>,
+        sandbox: Option<String>,
     ) -> Vec<PersistOp> {
         let Some(task_run) = self.model.task_run_by_key(key) else {
             return Vec::new();
@@ -552,6 +553,7 @@ impl Reducer {
             output_tokens,
             model,
             effort,
+            sandbox,
             retain_turn,
         );
         self.publish();
@@ -3243,6 +3245,7 @@ mod tests {
                     17,
                     Some("claude-opus-4-1".to_owned()),
                     Some("high".to_owned()),
+                    None,
                 )
                 .is_empty()
         );
@@ -3254,6 +3257,7 @@ mod tests {
                     25,
                     Some("claude-opus-4-1".to_owned()),
                     Some("high".to_owned()),
+                    None,
                 )
                 .is_empty()
         );
@@ -3276,12 +3280,12 @@ mod tests {
 
         assert!(
             reducer
-                .apply_telemetry(&key, 1_000, 17, None, None)
+                .apply_telemetry(&key, 1_000, 17, None, None, None)
                 .is_empty()
         );
         assert!(
             reducer
-                .apply_telemetry(&key, 2_000, 25, None, None)
+                .apply_telemetry(&key, 2_000, 25, None, None, None)
                 .is_empty()
         );
 
@@ -3314,10 +3318,12 @@ mod tests {
                 TurnAttr {
                     model: Some("gpt-5.6-terra".to_owned()),
                     effort: Some("high".to_owned()),
+                    sandbox: Some("workspace-write".to_owned()),
                 },
                 TurnAttr {
                     model: Some("gpt-5.6-sol".to_owned()),
                     effort: Some("xhigh".to_owned()),
+                    sandbox: Some("workspace-write".to_owned()),
                 },
             ]
         );
@@ -3357,6 +3363,7 @@ mod tests {
             9_876_543_210,
             Some("distinctive-transient-model".to_owned()),
             Some("distinctive-transient-effort".to_owned()),
+            None,
         );
         assert!(persist.is_empty());
         let snapshot = shared.borrow();
@@ -3402,6 +3409,7 @@ mod tests {
                         tokens,
                         Some(model.to_owned()),
                         Some(effort.to_owned()),
+                        Some("workspace-write".to_owned()),
                     )
                     .is_empty()
             );
@@ -3419,10 +3427,12 @@ mod tests {
                 TurnAttr {
                     model: Some("gpt-5.6-terra".to_owned()),
                     effort: Some("high".to_owned()),
+                    sandbox: Some("workspace-write".to_owned()),
                 },
                 TurnAttr {
                     model: Some("gpt-5.6-sol".to_owned()),
                     effort: Some("xhigh".to_owned()),
+                    sandbox: Some("workspace-write".to_owned()),
                 },
             ],
             "consecutive identical attributions are one observed turn context"
@@ -3547,10 +3557,11 @@ mod tests {
                     output_tokens,
                     model,
                     effort,
+                    sandbox,
                 } => {
                     assert!(
                         reducer
-                            .apply_telemetry(&key, at_ms, output_tokens, model, effort)
+                            .apply_telemetry(&key, at_ms, output_tokens, model, effort, sandbox,)
                             .is_empty()
                     );
                 }

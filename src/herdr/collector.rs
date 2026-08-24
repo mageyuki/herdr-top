@@ -24,17 +24,18 @@ use crate::diagnostics::{
     ControllerInputStatus, ControllerInputUnavailableReason, DiagnosticSource,
     EnrichmentCounterSnapshot, InputAvailability, OccurrenceLogStatus, OwnerFreshness,
     PersistenceCounters, PersistenceOccurrenceSink, PrimaryStreamCounterSnapshot,
-    PrimaryStreamDiagnosticsHandle, RuntimeDiagnosticsSnapshot, RuntimeWriteOutcome,
-    SourceCoverageSnapshot, controller_counter_snapshot, encode_persistence_occurrence,
+    PrimaryStreamDiagnosticsHandle, ProviderCounterSnapshot, RuntimeDiagnosticsSnapshot,
+    RuntimeWriteOutcome, SourceCoverageSnapshot, controller_counter_snapshot,
+    encode_persistence_occurrence,
 };
 use crate::lockfile::OwnerRecord;
 use crate::model::{
     AgentNodeObservation, AgentSessionReference, AgentSessionReferenceKind,
     ControllerDiagnosticsHandle, DomainModel, EnrichmentDiagnosticsHandle, EventMetadata,
     ExecState, Execution, GapKind, MinimalProviderMetadata, NormalizedEvent, OperatorCommand, Pane,
-    PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SharedModel, SnapshotAgent,
-    SourceCoverage, Tab, TopologyEntity, TopologyEntityId, TopologySnapshot, Workspace,
-    sanitize_controller_text,
+    PaneSnapshot, Provider, ProviderDiagnosticsHandle, ReconcileBatch, RunId, RunKey, SharedModel,
+    SnapshotAgent, SourceCoverage, Tab, TopologyEntity, TopologyEntityId, TopologySnapshot,
+    Workspace, sanitize_controller_text,
 };
 use crate::performance::{
     Admission, Admitted, PerformanceClock, PerformanceIngress, PerformanceSampler,
@@ -505,6 +506,7 @@ pub(crate) struct RuntimePersistence {
     occurrence_attempted: bool,
     acceptor_diagnostics: ControllerDiagnosticsHandle,
     enrichment_diagnostics: EnrichmentDiagnosticsHandle,
+    provider_diagnostics: ProviderDiagnosticsHandle,
 }
 
 impl RuntimePersistence {
@@ -520,6 +522,9 @@ impl RuntimePersistence {
         let controller_counters = controller_counter_snapshot(model);
         let acceptor_diagnostics = model.controller_diagnostics().acceptor_handle();
         let enrichment_diagnostics = EnrichmentDiagnosticsHandle::default();
+        let provider_diagnostics = model.provider_diagnostics().handle();
+        let (pane_sessions_total, pane_sessions_with_artifacts) =
+            pane_session_artifact_coverage(model);
         let snapshot = RuntimeDiagnosticsSnapshot {
             persistence: writer.persistence_status(),
             controller_input,
@@ -527,6 +532,11 @@ impl RuntimePersistence {
             persistence_counters: PersistenceCounters::default(),
             controller_counters,
             enrichment_counters: EnrichmentCounterSnapshot::default(),
+            provider_counters: provider_counter_snapshot(
+                &provider_diagnostics,
+                pane_sessions_total,
+                pane_sessions_with_artifacts,
+            ),
             source_coverage: diagnostic_source_coverage(coverage, controller_input),
             dangling_announcement_components: controller_counters.dangling_announcement_components,
             first_failure_log: OccurrenceLogStatus::NotAttempted,
@@ -542,6 +552,7 @@ impl RuntimePersistence {
                 occurrence_attempted: false,
                 acceptor_diagnostics,
                 enrichment_diagnostics,
+                provider_diagnostics,
             },
             diagnostics,
         )
@@ -587,6 +598,7 @@ impl RuntimePersistence {
             occurrence_attempted,
             acceptor_diagnostics,
             enrichment_diagnostics,
+            provider_diagnostics,
         } = self;
         let permit = writer.reserve_enqueue();
         let status = {
@@ -601,6 +613,7 @@ impl RuntimePersistence {
             occurrence_attempted,
             acceptor_diagnostics,
             enrichment_diagnostics,
+            provider_diagnostics,
         );
         match status {
             PersistenceStatus::Healthy => permit,
@@ -700,6 +713,7 @@ impl RuntimePersistence {
             occurrence_attempted,
             acceptor_diagnostics,
             enrichment_diagnostics,
+            provider_diagnostics,
             ..
         } = self;
         Self::ingest_writer_status(
@@ -710,9 +724,13 @@ impl RuntimePersistence {
             occurrence_attempted,
             acceptor_diagnostics,
             enrichment_diagnostics,
+            provider_diagnostics,
         );
     }
 
+    // The static transition receives every facade component explicitly so failure publication
+    // cannot accidentally borrow unrelated RuntimePersistence state.
+    #[allow(clippy::too_many_arguments)]
     fn ingest_writer_status(
         status: PersistenceStatus,
         snapshot: &mut RuntimeDiagnosticsSnapshot,
@@ -721,6 +739,7 @@ impl RuntimePersistence {
         occurrence_attempted: &mut bool,
         acceptor_diagnostics: &ControllerDiagnosticsHandle,
         enrichment_diagnostics: &EnrichmentDiagnosticsHandle,
+        provider_diagnostics: &ProviderDiagnosticsHandle,
     ) {
         if snapshot.persistence != PersistenceStatus::Healthy {
             return;
@@ -742,6 +761,7 @@ impl RuntimePersistence {
                 occurrence_attempted,
                 acceptor_diagnostics,
                 enrichment_diagnostics,
+                provider_diagnostics,
             );
         }
     }
@@ -760,6 +780,7 @@ impl RuntimePersistence {
             &mut self.occurrence_attempted,
             &self.acceptor_diagnostics,
             &self.enrichment_diagnostics,
+            &self.provider_diagnostics,
         )
     }
 
@@ -773,6 +794,7 @@ impl RuntimePersistence {
         occurrence_attempted: &mut bool,
         acceptor_diagnostics: &ControllerDiagnosticsHandle,
         enrichment_diagnostics: &EnrichmentDiagnosticsHandle,
+        provider_diagnostics: &ProviderDiagnosticsHandle,
     ) -> RuntimeWriteOutcome {
         let outcome = match failure.durability {
             DurabilityDisposition::Committed => RuntimeWriteOutcome::CommittedButDegraded(failure),
@@ -834,12 +856,17 @@ impl RuntimePersistence {
             publisher,
             acceptor_diagnostics,
             enrichment_diagnostics,
+            provider_diagnostics,
         );
         outcome
     }
 
     fn refresh_snapshot(&mut self, model: &DomainModel, coverage: &SourceCoverageRegistry) {
         let controller_counters = controller_counter_snapshot(model);
+        let (pane_sessions_total, pane_sessions_with_artifacts) =
+            pane_session_artifact_coverage(model);
+        self.snapshot.provider_counters.pane_sessions_total = pane_sessions_total;
+        self.snapshot.provider_counters.pane_sessions_with_artifacts = pane_sessions_with_artifacts;
         self.snapshot.controller_counters = controller_counters;
         self.snapshot.dangling_announcement_components =
             controller_counters.dangling_announcement_components;
@@ -864,6 +891,7 @@ impl RuntimePersistence {
             &self.publisher,
             &self.acceptor_diagnostics,
             &self.enrichment_diagnostics,
+            &self.provider_diagnostics,
         );
     }
 
@@ -872,6 +900,7 @@ impl RuntimePersistence {
         publisher: &watch::Sender<RuntimeDiagnosticsSnapshot>,
         acceptor_diagnostics: &ControllerDiagnosticsHandle,
         enrichment_diagnostics: &EnrichmentDiagnosticsHandle,
+        provider_diagnostics: &ProviderDiagnosticsHandle,
     ) {
         snapshot.controller_counters.socket_saturations = acceptor_diagnostics.socket_saturations();
         snapshot.controller_counters.accept_failures = acceptor_diagnostics.accept_failures();
@@ -879,6 +908,11 @@ impl RuntimePersistence {
             channel_full_drops: enrichment_diagnostics.channel_full_drops(),
             episode_discards: enrichment_diagnostics.episode_discards(),
         };
+        snapshot.provider_counters = provider_counter_snapshot(
+            provider_diagnostics,
+            snapshot.provider_counters.pane_sessions_total,
+            snapshot.provider_counters.pane_sessions_with_artifacts,
+        );
         let publication = snapshot.clone();
         publisher.send_if_modified(|current| {
             if *current == publication {
@@ -889,6 +923,55 @@ impl RuntimePersistence {
             }
         });
     }
+}
+
+fn provider_counter_snapshot(
+    diagnostics: &ProviderDiagnosticsHandle,
+    pane_sessions_total: u64,
+    pane_sessions_with_artifacts: u64,
+) -> ProviderCounterSnapshot {
+    ProviderCounterSnapshot {
+        invalid_targets: diagnostics.invalid_targets(),
+        duplicate_events: diagnostics.duplicate_events(),
+        malformed_records: diagnostics.malformed_records(),
+        duplicate_path_targets: diagnostics.duplicate_path_targets(),
+        baseline_approximations: diagnostics.baseline_approximations(),
+        provider_cycles: diagnostics.provider_cycles(),
+        provider_io_errors: diagnostics.provider_io_errors(),
+        watch_cap_fallbacks: diagnostics.watch_cap_fallbacks(),
+        notify_creation_failures: diagnostics.notify_creation_failures(),
+        dropped_hints: diagnostics.dropped_hints(),
+        coalesced_updates: diagnostics.coalesced_updates(),
+        egress_saturations: diagnostics.egress_saturations(),
+        egress_closed: diagnostics.egress_closed(),
+        pane_sessions_total,
+        pane_sessions_with_artifacts: pane_sessions_with_artifacts.min(pane_sessions_total),
+        last_watcher_observation_ms: diagnostics.last_watcher_observation_ms(),
+    }
+}
+
+fn pane_session_artifact_coverage(model: &DomainModel) -> (u64, u64) {
+    let pane_sessions = model.executions().collect::<Vec<_>>();
+    let total = u64::try_from(pane_sessions.len()).unwrap_or(u64::MAX);
+    let with_artifacts = pane_sessions
+        .iter()
+        .filter(|execution| {
+            let run_id = execution.task_run_id;
+            model.agent_nodes().any(|agent| {
+                agent.task_run_id == run_id
+                    && agent
+                        .session_file
+                        .as_deref()
+                        .is_some_and(|path| !path.is_empty())
+            }) || model.task_run(&run_id).is_some_and(
+                |run| matches!(&run.key, RunKey::NativePath { path, .. } if !path.is_empty()),
+            )
+        })
+        .count();
+    (
+        total,
+        u64::try_from(with_artifacts).unwrap_or(u64::MAX).min(total),
+    )
 }
 
 async fn persist_submission(
@@ -4822,8 +4905,10 @@ async fn apply_provider_event_with_admission(
             output_tokens,
             model,
             effort,
+            sandbox,
         } => {
-            let persist = reducer.apply_telemetry(&key, at_ms, output_tokens, model, effort);
+            let persist =
+                reducer.apply_telemetry(&key, at_ms, output_tokens, model, effort, sandbox);
             debug_assert!(persist.is_empty(), "telemetry must remain transient");
             if let Some(admission) = admission.take() {
                 admission.complete();
@@ -6733,6 +6818,22 @@ mod tests {
     use std::sync::Barrier;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn exactly_six_reducer_owning_selects() {
+        let source = include_str!("collector.rs");
+        let reducer_owning_selects = source
+            .lines()
+            .filter(|line| {
+                let line = line.trim();
+                line.starts_with("command = receive_operator_command(") && line.ends_with(") => {")
+            })
+            .count();
+        assert_eq!(
+            reducer_owning_selects, 6,
+            "receive_operator_command must remain wired into exactly six production select arms"
+        );
+    }
 
     #[test]
     fn watchdog_backoff_uses_exponential_delays_with_a_hard_cap() {
@@ -12095,6 +12196,7 @@ mod provider_integration_tests {
             persistence_counters: PersistenceCounters::default(),
             controller_counters: crate::diagnostics::ControllerCounterSnapshot::default(),
             enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
+            provider_counters: crate::diagnostics::ProviderCounterSnapshot::default(),
             source_coverage: Vec::new(),
             dangling_announcement_components: 0,
             first_failure_log: OccurrenceLogStatus::NotAttempted,

@@ -100,6 +100,27 @@ pub struct EnrichmentCounterSnapshot {
     pub episode_discards: u64,
 }
 
+/// Immutable copy of log-lane counters and watcher-owned health gauges.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub struct ProviderCounterSnapshot {
+    pub invalid_targets: u64,
+    pub duplicate_events: u64,
+    pub malformed_records: u64,
+    pub duplicate_path_targets: u64,
+    pub baseline_approximations: u64,
+    pub provider_cycles: u64,
+    pub provider_io_errors: u64,
+    pub watch_cap_fallbacks: u64,
+    pub notify_creation_failures: u64,
+    pub dropped_hints: u64,
+    pub coalesced_updates: u64,
+    pub egress_saturations: u64,
+    pub egress_closed: u64,
+    pub pane_sessions_total: u64,
+    pub pane_sessions_with_artifacts: u64,
+    pub last_watcher_observation_ms: Option<i64>,
+}
+
 /// Immutable copy of primary-stream tolerance counters.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
 pub struct PrimaryStreamCounterSnapshot {
@@ -161,6 +182,7 @@ pub struct RuntimeDiagnosticsSnapshot {
     pub persistence_counters: PersistenceCounters,
     pub controller_counters: ControllerCounterSnapshot,
     pub enrichment_counters: EnrichmentCounterSnapshot,
+    pub provider_counters: ProviderCounterSnapshot,
     pub source_coverage: Vec<SourceCoverageSnapshot>,
     pub dangling_announcement_components: u64,
     pub first_failure_log: OccurrenceLogStatus,
@@ -318,6 +340,7 @@ mod tests {
                 ..ControllerCounterSnapshot::default()
             },
             enrichment_counters: EnrichmentCounterSnapshot::default(),
+            provider_counters: ProviderCounterSnapshot::default(),
             source_coverage: vec![
                 SourceCoverageSnapshot {
                     source: DiagnosticSource::Herdr,
@@ -374,6 +397,24 @@ mod tests {
                 "enrichment_counters": {
                     "channel_full_drops": 0,
                     "episode_discards": 0
+                },
+                "provider_counters": {
+                    "invalid_targets": 0,
+                    "duplicate_events": 0,
+                    "malformed_records": 0,
+                    "duplicate_path_targets": 0,
+                    "baseline_approximations": 0,
+                    "provider_cycles": 0,
+                    "provider_io_errors": 0,
+                    "watch_cap_fallbacks": 0,
+                    "notify_creation_failures": 0,
+                    "dropped_hints": 0,
+                    "coalesced_updates": 0,
+                    "egress_saturations": 0,
+                    "egress_closed": 0,
+                    "pane_sessions_total": 0,
+                    "pane_sessions_with_artifacts": 0,
+                    "last_watcher_observation_ms": null
                 },
                 "source_coverage": [
                     {"source": "herdr", "availability": "available"},

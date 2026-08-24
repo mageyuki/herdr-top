@@ -87,6 +87,7 @@ pub enum ProviderEvent {
         output_tokens: u64,
         model: Option<String>,
         effort: Option<String>,
+        sandbox: Option<String>,
     },
     SessionResolved {
         provider: Provider,
@@ -1241,6 +1242,9 @@ impl ProviderDiagnostics {
     fn record_io_error(&self) {
         self.0.record_provider_io_error();
     }
+    fn record_watcher_observation(&self, at_ms: i64) {
+        self.0.record_watcher_observation(at_ms);
+    }
 
     #[must_use]
     pub fn dropped_hints(&self) -> u64 {
@@ -1249,6 +1253,10 @@ impl ProviderDiagnostics {
     #[must_use]
     pub fn coalesced_updates(&self) -> u64 {
         self.0.coalesced_updates()
+    }
+    #[must_use]
+    pub fn last_watcher_observation_ms(&self) -> Option<i64> {
+        self.0.last_watcher_observation_ms()
     }
     #[must_use]
     pub fn duplicate_events(&self) -> u64 {
@@ -1918,6 +1926,7 @@ fn run_provider_cycle(
     if worker.process(&mut cycle).is_err() {
         diagnostics.record_io_error();
     }
+    diagnostics.record_watcher_observation(system_time_ms(SystemTime::now()));
     if let Some(registry) = lock_unpoisoned(watcher).as_mut() {
         for directory in watch_requests {
             if registry.add(directory).is_err() {

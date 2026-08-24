@@ -916,12 +916,14 @@ mod tests {
             17,
             Some("gpt-5.6-terra".to_owned()),
             Some("high".to_owned()),
+            None,
             true,
         );
         model.telemetry_entry(absorbed, 1_100).accumulate(
             25,
             Some("gpt-5.6-sol".to_owned()),
             Some("xhigh".to_owned()),
+            None,
             true,
         );
 
@@ -970,11 +972,13 @@ mod tests {
             u64::MAX - 10,
             Some("controller-model".to_owned()),
             None,
+            None,
             true,
         );
         model.telemetry_entry(absorbed, 1_100).accumulate(
             17,
             Some("controller-model".to_owned()),
+            None,
             None,
             true,
         );
@@ -982,6 +986,7 @@ mod tests {
             25,
             Some("gpt-5.6-sol".to_owned()),
             Some("xhigh".to_owned()),
+            None,
             true,
         );
 

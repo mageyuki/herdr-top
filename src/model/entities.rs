@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -83,11 +83,12 @@ impl TaskRun {
 
 // These telemetry-only types intentionally omit serde derives. That compile-enforces the
 // never-persisted invariant if DomainModel ever gains a serialization derive.
-/// One model/effort attribution observed for a Codex turn.
+/// One model/effort/sandbox attribution observed for a Codex turn.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TurnAttr {
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub sandbox: Option<String>,
 }
 
 /// Transient output-token telemetry for one task run.
@@ -97,6 +98,7 @@ pub struct RunTelemetry {
     pub started_wall_ms: i64,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub sandbox: Option<String>,
     pub per_turn: Vec<TurnAttr>,
 }
 
@@ -106,16 +108,22 @@ impl RunTelemetry {
         output_tokens: u64,
         model: Option<String>,
         effort: Option<String>,
+        sandbox: Option<String>,
         retain_turn: bool,
     ) {
         self.output_tokens = self.output_tokens.saturating_add(output_tokens);
-        if model.is_none() && effort.is_none() {
+        if model.is_none() && effort.is_none() && sandbox.is_none() {
             return;
         }
 
-        let attribution = TurnAttr { model, effort };
+        let attribution = TurnAttr {
+            model,
+            effort,
+            sandbox,
+        };
         self.model.clone_from(&attribution.model);
         self.effort.clone_from(&attribution.effort);
+        self.sandbox.clone_from(&attribution.sandbox);
         // Telemetry carries attribution but no turn ID. Consecutive identical samples are
         // therefore one observed turn context; changes retain their complete file order.
         if retain_turn && self.per_turn.last() != Some(&attribution) {
@@ -399,6 +407,7 @@ pub struct ProviderDiagnosticsHandle {
     notify_creation_failures: Arc<AtomicU64>,
     provider_cycles: Arc<AtomicU64>,
     provider_io_errors: Arc<AtomicU64>,
+    last_watcher_observation_ms: Arc<AtomicI64>,
 }
 
 impl ProviderDiagnosticsHandle {
@@ -466,6 +475,14 @@ impl ProviderDiagnosticsHandle {
 
     pub fn record_provider_io_error(&self) {
         Self::increment(&self.provider_io_errors);
+    }
+
+    pub fn record_watcher_observation(&self, at_ms: i64) {
+        let _ = self.last_watcher_observation_ms.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.max(at_ms)),
+        );
     }
 
     #[must_use]
@@ -537,6 +554,12 @@ impl ProviderDiagnosticsHandle {
     #[must_use]
     pub fn provider_io_errors(&self) -> u64 {
         self.provider_io_errors.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn last_watcher_observation_ms(&self) -> Option<i64> {
+        let observed = self.last_watcher_observation_ms.load(Ordering::Relaxed);
+        (observed > 0).then_some(observed)
     }
 }
 
@@ -807,6 +830,7 @@ impl DomainModel {
                 started_wall_ms: at_ms,
                 model: None,
                 effort: None,
+                sandbox: None,
                 per_turn: Vec::new(),
             });
         telemetry.started_wall_ms = telemetry.started_wall_ms.min(at_ms);
@@ -833,6 +857,9 @@ impl DomainModel {
         }
         if canonical.effort.is_none() {
             canonical.effort = absorbed_telemetry.effort.take();
+        }
+        if canonical.sandbox.is_none() {
+            canonical.sandbox = absorbed_telemetry.sandbox.take();
         }
         for attribution in absorbed_telemetry.per_turn {
             if canonical.per_turn.last() != Some(&attribution) {

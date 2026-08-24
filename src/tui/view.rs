@@ -312,24 +312,7 @@ fn format_scaled_token_count(tokens: u64, divisor: u64, suffix: char) -> String 
 }
 
 fn format_token_rate_value(metrics: &projection::RunMetricInputs, now_ms: i64) -> String {
-    let Some(output_tokens) = metrics.output_tokens else {
-        return "—".to_owned();
-    };
-    let Some(started_wall_ms) = metrics.started_wall_ms else {
-        return "—".to_owned();
-    };
-    let Some(end_ms) = metric_end_ms(metrics, now_ms) else {
-        return "—".to_owned();
-    };
-    let Some(elapsed_ms) = end_ms.checked_sub(started_wall_ms) else {
-        return "—".to_owned();
-    };
-    let elapsed_seconds = elapsed_ms as f64 / 1_000.0;
-    if elapsed_seconds <= 0.0 {
-        return "—".to_owned();
-    }
-    let rate = output_tokens as f64 / elapsed_seconds;
-    format_token_rate(rate)
+    projection::run_token_rate(metrics, now_ms).map_or_else(|| "—".to_owned(), format_token_rate)
 }
 
 fn format_token_rate(rate: f64) -> String {
@@ -939,7 +922,16 @@ fn render_interaction_layer(
     let (title, lines) = match overlay {
         Overlay::Notice => (" Setup notice ", notice_lines(setup)),
         Overlay::Help => (" Help ", help_lines(diagnostics, setup)),
-        Overlay::Summary => (" Summary ", summary_lines(model, paint.now_ms)),
+        Overlay::Summary => (
+            " Summary ",
+            summary_lines(
+                model,
+                paint.rows,
+                state.selected(),
+                state.summary_scope(),
+                paint.now_ms,
+            ),
+        ),
         Overlay::Detail => {
             let detail = state.selected().map_or_else(
                 || projection::DetailProjection {
@@ -981,23 +973,62 @@ fn render_interaction_layer(
     frame.render_widget(Paragraph::new(visible).block(block), modal);
 }
 
-fn summary_lines(model: &DomainModel, now_ms: i64) -> Vec<String> {
-    let mut lines =
-        vec!["worker kind | model | runs | live | total | mean | tok | tok/s".to_owned()];
-    lines.extend(summary_rows(model, now_ms).into_iter().map(|row| {
+fn summary_lines(
+    model: &DomainModel,
+    rows: &[TreeRow],
+    selected: Option<&NodeKey>,
+    scope: projection::SummaryScope,
+    now_ms: i64,
+) -> Vec<String> {
+    let summary = projection::summary_projection(model, rows, selected, scope, now_ms);
+    let mut lines = vec![match (&summary.scope, &summary.workspace_id) {
+        (projection::SummaryScope::SelectionWorkspace, Some(workspace_id)) => {
+            format!("scope: workspace {} (w: session)", safe_text(workspace_id))
+        }
+        (projection::SummaryScope::SelectionWorkspace, None) => {
+            "scope: session (selection has no workspace; w toggles scope mode)".to_owned()
+        }
+        (projection::SummaryScope::Session, _) => {
+            "scope: session (w: selection workspace)".to_owned()
+        }
+    }];
+    append_summary_table(&mut lines, "worker kind", summary.worker_kinds);
+    append_summary_table(&mut lines, "model", summary.models);
+    lines
+}
+
+fn append_summary_table(
+    lines: &mut Vec<String>,
+    dimension: &str,
+    rows: Vec<projection::SummaryRow>,
+) {
+    lines.push(String::new());
+    lines.push(format!("per {dimension}"));
+    lines.push(format!(
+        "{dimension} | runs | live | total | mean | tok | mean tok/s"
+    ));
+    if rows.is_empty() {
+        lines.push("- | 0 | 0 | 00s | - | - | -".to_owned());
+        return;
+    }
+    lines.extend(rows.into_iter().map(|row| {
         let mean = row
             .mean_duration_ms
             .map_or_else(|| "-".to_owned(), format_duration);
+        let tokens = row
+            .total_output_tokens
+            .map_or_else(|| "-".to_owned(), format_token_count);
+        let rate = row
+            .mean_tokens_per_second
+            .map_or_else(|| "-".to_owned(), format_token_rate);
         format!(
-            "{} | {} | {} | {} | {} | {mean} | - | -",
-            row.worker_kind,
-            row.model,
+            "{} | {} | {} | {} | {mean} | {tokens} | {rate}",
+            safe_text(&row.label),
             row.run_count,
             row.live_count,
             format_duration(row.total_duration_ms),
         )
     }));
-    lines
 }
 
 fn notice_lines(setup: &TuiSetup) -> Vec<String> {
@@ -1020,7 +1051,8 @@ fn help_lines(diagnostics: &RuntimeDiagnosticsSnapshot, setup: &TuiSetup) -> Vec
         "Tree: Left collapse/parent; Right expand/child; Enter toggles branch".to_owned(),
         "Collapse is ignored while filtering and in DAG; stored state survives view toggles"
             .to_owned(),
-        "i detail; s summary; ? help; Esc/opening key closes; Up/Down scrolls overlays".to_owned(),
+        "i detail; s summary; w toggles Summary workspace/session scope; ? help".to_owned(),
+        "Esc/opening key closes; Up/Down scrolls overlays".to_owned(),
         "Follow pins selection and viewport to newest; manual navigation disables it".to_owned(),
         "Recovery: ancestor, stable neighbor, first; reasons are typed".to_owned(),
         "Controller input is optional capability; standalone setup is optional".to_owned(),
@@ -1991,85 +2023,6 @@ fn dispatch_parent_run(model: &DomainModel, child_run_id: RunId) -> Option<&Task
     parents.into_iter().next()
 }
 
-fn worker_kind_label(run: &TaskRun) -> String {
-    match &run.key {
-        RunKey::Native { provider, .. } | RunKey::NativePath { provider, .. } => {
-            provider_label(*provider).to_owned()
-        }
-        RunKey::Controller(name) => {
-            let label = name
-                .strip_prefix("hook:")
-                .and_then(|suffix| suffix.split_once(':').map(|(selector, _)| selector))
-                .unwrap_or(name);
-            safe_text(label)
-        }
-        RunKey::Provisional { .. } => "provisional".to_owned(),
-    }
-}
-
-pub(crate) struct SummaryRow {
-    pub(crate) worker_kind: String,
-    pub(crate) model: String,
-    pub(crate) run_count: usize,
-    pub(crate) live_count: usize,
-    pub(crate) total_duration_ms: i64,
-    pub(crate) mean_duration_ms: Option<i64>,
-}
-
-/// Aggregates runs for the Summary overlay; `_now_ms` is reserved for Increment 9 rates.
-pub(crate) fn summary_rows(model: &DomainModel, _now_ms: i64) -> Vec<SummaryRow> {
-    let newest_agents = newest_agent_nodes(model);
-    let mut groups = HashMap::<(String, String), (usize, usize, i64, i64)>::new();
-    for run in model.task_runs() {
-        let worker_kind = worker_kind_label(run);
-        let model = newest_agents
-            .get(&run.run_id)
-            .and_then(|agent| agent.model_id.as_deref())
-            .unwrap_or("unknown")
-            .to_owned();
-        let group = groups.entry((worker_kind, model)).or_default();
-        group.0 = group.0.saturating_add(1);
-        if !run.state.is_terminal() {
-            group.1 = group.1.saturating_add(1);
-            continue;
-        }
-        let Some(duration) = run
-            .finished_at_ms
-            .zip(run.created_at_ms)
-            .and_then(|(finished, created)| finished.checked_sub(created))
-            .filter(|duration| *duration >= 0)
-        else {
-            continue;
-        };
-        group.2 = group.2.saturating_add(duration);
-        group.3 = group.3.saturating_add(1);
-    }
-
-    let mut rows = groups
-        .into_iter()
-        .map(
-            |((worker_kind, model), (run_count, live_count, total_duration_ms, timed_count))| {
-                SummaryRow {
-                    worker_kind,
-                    model,
-                    run_count,
-                    live_count,
-                    total_duration_ms,
-                    mean_duration_ms: (timed_count > 0).then(|| total_duration_ms / timed_count),
-                }
-            },
-        )
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| {
-        right
-            .total_duration_ms
-            .cmp(&left.total_duration_ms)
-            .then_with(|| left.worker_kind.cmp(&right.worker_kind))
-            .then_with(|| left.model.cmp(&right.model))
-    });
-    rows
-}
-
 pub(crate) fn newest_agent_nodes(model: &DomainModel) -> NewestAgentNodes<'_> {
     #[cfg(test)]
     record_newest_agent_scan();
@@ -2156,7 +2109,7 @@ fn run_row_label_with_agent(
 fn run_row_head(model: &DomainModel, run: &TaskRun, stalled: bool) -> String {
     let mut label = status_glyph(run.state, stalled).to_owned();
     label.push(' ');
-    label.push_str(&worker_kind_label(run));
+    label.push_str(&projection::worker_kind_label(run));
     let subject = if is_codex_worker(model, run) {
         String::new()
     } else {
@@ -2679,92 +2632,79 @@ mod tests {
             ),
         ];
 
-        for (index, (id, key, state, created, finished, model_id)) in
-            fixtures.into_iter().enumerate()
-        {
+        for (id, key, state, created, finished, model_id) in fixtures {
             let run_id = run_id(id);
             model.insert_task_run(label_run(run_id, key, state, created, finished, None));
             if let Some(model_id) = model_id {
-                model.insert_agent_node(label_agent(
-                    &format!("agent-{index}"),
-                    run_id,
-                    Some(index as i64),
+                model.telemetry_entry(run_id, 0).accumulate(
+                    10,
+                    Some(model_id.to_owned()),
                     None,
                     None,
-                    Some(model_id),
-                ));
+                    false,
+                );
             }
         }
-        let first_run = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        model.insert_agent_node(label_agent(
-            "agent-older",
-            first_run,
-            Some(-1),
-            None,
-            None,
-            Some("model-b"),
-        ));
 
-        reset_newest_agent_scan_count();
-        let actual = summary_rows(&model, 123_456)
-            .into_iter()
+        let summary = projection::summary_projection(
+            &model,
+            &[],
+            None,
+            projection::SummaryScope::Session,
+            123_456,
+        );
+        let worker_kinds = summary
+            .worker_kinds
+            .iter()
             .map(|row| {
                 (
-                    row.worker_kind,
-                    row.model,
+                    row.label.clone(),
                     row.run_count,
                     row.live_count,
                     row.total_duration_ms,
                     row.mean_duration_ms,
+                    row.total_output_tokens,
                 )
             })
             .collect::<Vec<_>>();
-        assert_eq!(newest_agent_scan_count(), 1);
-
         assert_eq!(
-            actual,
+            worker_kinds,
             [
                 (
                     "claude-code".to_owned(),
-                    "model-a".to_owned(),
-                    3,
+                    4,
                     1,
-                    9_000,
-                    Some(9_000)
+                    16_000,
+                    Some(8_000),
+                    Some(40),
                 ),
-                (
-                    "Codex".to_owned(),
-                    "model-a".to_owned(),
-                    2,
-                    1,
-                    7_000,
-                    Some(7_000)
-                ),
-                (
-                    "Codex".to_owned(),
-                    "model-b".to_owned(),
-                    1,
-                    0,
-                    7_000,
-                    Some(7_000)
-                ),
-                (
-                    "claude-code".to_owned(),
-                    "model-b".to_owned(),
-                    1,
-                    0,
-                    7_000,
-                    Some(7_000)
-                ),
-                (
-                    "provisional".to_owned(),
-                    "unknown".to_owned(),
-                    1,
-                    0,
-                    0,
-                    None
-                ),
+                ("Codex".to_owned(), 3, 1, 14_000, Some(7_000), Some(30),),
+                ("provisional".to_owned(), 1, 0, 0, None, None,),
             ]
+        );
+        assert_eq!(
+            summary
+                .models
+                .iter()
+                .map(|row| (
+                    row.label.as_str(),
+                    row.run_count,
+                    row.total_duration_ms,
+                    row.total_output_tokens,
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("model-a", 5, 16_000, Some(50)),
+                ("model-b", 2, 14_000, Some(20)),
+                ("unknown", 1, 0, None),
+            ]
+        );
+        assert!(
+            summary
+                .worker_kinds
+                .iter()
+                .filter(|row| row.total_output_tokens.is_some())
+                .all(|row| row.mean_tokens_per_second.is_some())
         );
     }
 
@@ -3113,6 +3053,7 @@ mod tests {
             83,
             Some("gpt-5.6-sol".to_owned()),
             Some("xhigh".to_owned()),
+            None,
             true,
         );
         let running_metrics = projection::run_metric_inputs(&model, &running);
@@ -3228,7 +3169,7 @@ mod tests {
             ),
         ] {
             let run = label_run(run_id, key, TaskState::Running, None, None, None);
-            assert_eq!(worker_kind_label(&run), expected);
+            assert_eq!(projection::worker_kind_label(&run), expected);
         }
     }
 
@@ -3665,6 +3606,7 @@ mod tests {
             83,
             Some("gpt-5.6-sol".to_owned()),
             Some("xhigh".to_owned()),
+            None,
             true,
         );
         let rows = vec![TreeRow {
@@ -4993,6 +4935,7 @@ mod tests {
                 persistence_counters: PersistenceCounters::default(),
                 controller_counters: ControllerCounterSnapshot::default(),
                 enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
+                provider_counters: crate::diagnostics::ProviderCounterSnapshot::default(),
                 source_coverage: Vec::new(),
                 dangling_announcement_components: 0,
                 first_failure_log: OccurrenceLogStatus::NotAttempted,

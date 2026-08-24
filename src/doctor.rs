@@ -3,6 +3,7 @@
 use std::env;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -20,7 +21,8 @@ use crate::diagnostics::remote::{
 use crate::diagnostics::{
     ControllerCounterSnapshot, ControllerInputStatus, ControllerInputUnavailableReason,
     DiagnosticSource, EnrichmentCounterSnapshot, InputAvailability, OccurrenceLogStatus,
-    OwnerFreshness, PersistenceCounters, RuntimeDiagnosticsSnapshot, SourceCoverageSnapshot,
+    OwnerFreshness, PersistenceCounters, ProviderCounterSnapshot, RuntimeDiagnosticsSnapshot,
+    SourceCoverageSnapshot,
 };
 use crate::herdr::controller;
 use crate::herdr::types::{AgentSessionKind, Pong, Snapshot};
@@ -38,6 +40,7 @@ use crate::store::{
 const SCHEMA_VERSION: u64 = 1;
 const LOG_FILE: &str = "herdr-top.log";
 const VERSION_FIXTURE_ENV: &str = "HERDR_TOP_TEST_DOCTOR_VERSION_FIXTURES";
+const LOG_LANE_FRESHNESS_STALE_MS: i64 = 120_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -75,6 +78,7 @@ pub struct DoctorReportV1 {
     pub lock: LockSection,
     pub database: DatabaseSection,
     pub providers: ProvidersSection,
+    pub log_lane: LogLaneSection,
     pub compatibility: CompatibilitySection,
     pub coverage: CoverageSection,
     pub logs: LogsSection,
@@ -120,6 +124,13 @@ pub struct DatabaseSection {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ProvidersSection {
     pub discovery: Check<Vec<ProviderRootObservation>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LogLaneSection {
+    pub readable: Check<Vec<ProviderRootObservation>>,
+    pub coverage: Check<LogLaneCoverageObservation>,
+    pub freshness: Check<LogLaneFreshnessObservation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -222,6 +233,22 @@ pub struct ProviderRootObservation {
     pub provider: DoctorProvider,
     pub path: String,
     pub exists: bool,
+    pub readable: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LogLaneCoverageObservation {
+    pub pane_sessions_total: u64,
+    pub pane_sessions_with_artifacts: u64,
+    pub pane_sessions_without_artifacts: u64,
+    pub rejected_targets: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LogLaneFreshnessObservation {
+    pub last_watcher_observation_ms: Option<i64>,
+    pub age_ms: Option<i64>,
+    pub stale_after_ms: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -327,6 +354,9 @@ impl DoctorReportV1 {
             view("lock.ownership", &self.lock.ownership),
             view("database.schema", &self.database.schema),
             view("providers.discovery", &self.providers.discovery),
+            view("log_lane.readable", &self.log_lane.readable),
+            view("log_lane.coverage", &self.log_lane.coverage),
+            view("log_lane.freshness", &self.log_lane.freshness),
             view("compatibility.herdr", &self.compatibility.herdr),
             view(
                 "compatibility.integrations",
@@ -472,6 +502,17 @@ fn message(code: &str) -> &'static str {
         "provider_roots_found" => "provider roots found",
         "provider_roots_missing" => "provider roots are missing",
         "provider_roots_partial" => "provider roots are partial",
+        "log_lane_roots_readable" => "log-lane roots are readable",
+        "log_lane_roots_unreadable" => "a log-lane root is unreadable",
+        "log_lane_roots_absent" => "no log-lane roots exist",
+        "log_lane_coverage_complete" => "pane-session artifact coverage is complete",
+        "log_lane_coverage_partial" => "pane-session artifact coverage is partial",
+        "log_lane_coverage_empty" => "no pane sessions are present",
+        "log_lane_targets_rejected" => "pane-session artifacts were rejected",
+        "log_lane_fresh" => "log-lane watcher is fresh",
+        "log_lane_stale" => "log-lane watcher is stale",
+        "log_lane_unobserved" => "log-lane watcher has no observation",
+        "log_lane_runtime_unavailable" => "log-lane runtime diagnostics are unavailable",
         "herdr_compatible" => "Herdr is compatible",
         "herdr_below_floor" => "Herdr is below the minimum version",
         "herdr_protocol_mismatch" => "Herdr protocol differs",
@@ -968,17 +1009,26 @@ fn schema_check(verdict: SchemaProbeVerdict) -> Check<DatabaseSchemaObservation>
     }
 }
 
-fn provider_roots_check(home: Option<&OsStr>) -> Check<Vec<ProviderRootObservation>> {
+fn provider_root_observations(home: Option<&OsStr>) -> Vec<ProviderRootObservation> {
     let mut roots = provider::standard_discovery_roots(home)
         .into_iter()
-        .map(|root| ProviderRootObservation {
-            provider: root.provider.into(),
-            path: local::format_operational_path(&root.path, home),
-            exists: std::fs::symlink_metadata(&root.path)
-                .is_ok_and(|metadata| metadata.file_type().is_dir()),
+        .map(|root| {
+            let exists = std::fs::symlink_metadata(&root.path)
+                .is_ok_and(|metadata| metadata.file_type().is_dir());
+            ProviderRootObservation {
+                provider: root.provider.into(),
+                path: local::format_operational_path(&root.path, home),
+                exists,
+                readable: exists && std::fs::read_dir(&root.path).is_ok(),
+            }
         })
         .collect::<Vec<_>>();
     roots.sort_by_key(|root| root.provider);
+    roots
+}
+
+fn provider_roots_check(home: Option<&OsStr>) -> Check<Vec<ProviderRootObservation>> {
+    let roots = provider_root_observations(home);
     let found = roots.iter().filter(|root| root.exists).count();
     let (status, code) = if found == 2 && roots.len() == 2 {
         (CheckStatus::Ok, "provider_roots_found")
@@ -988,6 +1038,81 @@ fn provider_roots_check(home: Option<&OsStr>) -> Check<Vec<ProviderRootObservati
         (CheckStatus::Warning, "provider_roots_partial")
     };
     check(status, code, Some(roots))
+}
+
+fn log_lane_readable_check(home: Option<&OsStr>) -> Check<Vec<ProviderRootObservation>> {
+    let roots = provider_root_observations(home);
+    let (status, code) = if roots.iter().any(|root| root.exists && !root.readable) {
+        (CheckStatus::Warning, "log_lane_roots_unreadable")
+    } else if roots.iter().any(|root| root.exists) {
+        (CheckStatus::Ok, "log_lane_roots_readable")
+    } else {
+        (CheckStatus::NotApplicable, "log_lane_roots_absent")
+    };
+    check(status, code, Some(roots))
+}
+
+fn log_lane_coverage_check(
+    snapshot: Option<&RuntimeDiagnosticsSnapshot>,
+) -> Check<LogLaneCoverageObservation> {
+    let Some(snapshot) = snapshot else {
+        return check(CheckStatus::Warning, "log_lane_runtime_unavailable", None);
+    };
+    let counters = snapshot.provider_counters;
+    let observation = LogLaneCoverageObservation {
+        pane_sessions_total: counters.pane_sessions_total,
+        pane_sessions_with_artifacts: counters.pane_sessions_with_artifacts,
+        pane_sessions_without_artifacts: counters
+            .pane_sessions_total
+            .saturating_sub(counters.pane_sessions_with_artifacts),
+        rejected_targets: counters.invalid_targets,
+    };
+    let (status, code) =
+        if observation.pane_sessions_with_artifacts == 0 && observation.rejected_targets > 0 {
+            (CheckStatus::Warning, "log_lane_targets_rejected")
+        } else if observation.pane_sessions_total == 0 {
+            (CheckStatus::NotApplicable, "log_lane_coverage_empty")
+        } else if observation.pane_sessions_without_artifacts > 0 {
+            (CheckStatus::Warning, "log_lane_coverage_partial")
+        } else {
+            (CheckStatus::Ok, "log_lane_coverage_complete")
+        };
+    check(status, code, Some(observation))
+}
+
+fn log_lane_freshness_check(
+    snapshot: Option<&RuntimeDiagnosticsSnapshot>,
+    now_ms: i64,
+) -> Check<LogLaneFreshnessObservation> {
+    let Some(snapshot) = snapshot else {
+        return check(CheckStatus::Warning, "log_lane_runtime_unavailable", None);
+    };
+    let observed = snapshot.provider_counters.last_watcher_observation_ms;
+    let age_ms = observed.map(|timestamp| now_ms.saturating_sub(timestamp).max(0));
+    let observation = LogLaneFreshnessObservation {
+        last_watcher_observation_ms: observed,
+        age_ms,
+        stale_after_ms: LOG_LANE_FRESHNESS_STALE_MS,
+    };
+    match age_ms {
+        Some(age) if age <= LOG_LANE_FRESHNESS_STALE_MS => {
+            check(CheckStatus::Ok, "log_lane_fresh", Some(observation))
+        }
+        Some(_) => check(CheckStatus::Warning, "log_lane_stale", Some(observation)),
+        None => check(
+            CheckStatus::Warning,
+            "log_lane_unobserved",
+            Some(observation),
+        ),
+    }
+}
+
+fn unix_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(i64::MAX)
 }
 
 fn name_record_check(
@@ -1330,6 +1455,8 @@ pub async fn collect_report(
     } else {
         None
     };
+    let log_lane_coverage = log_lane_coverage_check(controller_snapshot.as_ref());
+    let log_lane_freshness = log_lane_freshness_check(controller_snapshot.as_ref(), unix_now_ms());
     let controller_runtime = controller_runtime_check(runtime_verdict, controller_snapshot);
     let rendezvous = rendezvous_check(runtime_verdict);
 
@@ -1409,6 +1536,11 @@ pub async fn collect_report(
         providers: ProvidersSection {
             discovery: provider_roots_check(home.as_deref()),
         },
+        log_lane: LogLaneSection {
+            readable: log_lane_readable_check(home.as_deref()),
+            coverage: log_lane_coverage,
+            freshness: log_lane_freshness,
+        },
         compatibility: CompatibilitySection {
             herdr: herdr_compatibility,
             integrations,
@@ -1464,7 +1596,7 @@ fn parse_runtime_status(response: &Value) -> Option<RuntimeDiagnosticsSnapshot> 
 
 fn parse_runtime_snapshot(value: &Value) -> Option<RuntimeDiagnosticsSnapshot> {
     let object = value.as_object()?;
-    if object.len() != 9 {
+    if object.len() != 10 {
         return None;
     }
     let persistence = parse_persistence_status(object.get("persistence")?)?;
@@ -1477,6 +1609,7 @@ fn parse_runtime_snapshot(value: &Value) -> Option<RuntimeDiagnosticsSnapshot> {
     let persistence_counters = parse_persistence_counters(object.get("persistence_counters")?)?;
     let controller_counters = parse_controller_counters(object.get("controller_counters")?)?;
     let enrichment_counters = parse_enrichment_counters(object.get("enrichment_counters")?)?;
+    let provider_counters = parse_provider_counters(object.get("provider_counters")?)?;
     let mut source_coverage = object
         .get("source_coverage")?
         .as_array()?
@@ -1504,9 +1637,38 @@ fn parse_runtime_snapshot(value: &Value) -> Option<RuntimeDiagnosticsSnapshot> {
         persistence_counters,
         controller_counters,
         enrichment_counters,
+        provider_counters,
         source_coverage,
         dangling_announcement_components,
         first_failure_log,
+    })
+}
+
+fn parse_provider_counters(value: &Value) -> Option<ProviderCounterSnapshot> {
+    let object = value.as_object()?;
+    if object.len() != 16 {
+        return None;
+    }
+    Some(ProviderCounterSnapshot {
+        invalid_targets: object.get("invalid_targets")?.as_u64()?,
+        duplicate_events: object.get("duplicate_events")?.as_u64()?,
+        malformed_records: object.get("malformed_records")?.as_u64()?,
+        duplicate_path_targets: object.get("duplicate_path_targets")?.as_u64()?,
+        baseline_approximations: object.get("baseline_approximations")?.as_u64()?,
+        provider_cycles: object.get("provider_cycles")?.as_u64()?,
+        provider_io_errors: object.get("provider_io_errors")?.as_u64()?,
+        watch_cap_fallbacks: object.get("watch_cap_fallbacks")?.as_u64()?,
+        notify_creation_failures: object.get("notify_creation_failures")?.as_u64()?,
+        dropped_hints: object.get("dropped_hints")?.as_u64()?,
+        coalesced_updates: object.get("coalesced_updates")?.as_u64()?,
+        egress_saturations: object.get("egress_saturations")?.as_u64()?,
+        egress_closed: object.get("egress_closed")?.as_u64()?,
+        pane_sessions_total: object.get("pane_sessions_total")?.as_u64()?,
+        pane_sessions_with_artifacts: object.get("pane_sessions_with_artifacts")?.as_u64()?,
+        last_watcher_observation_ms: match object.get("last_watcher_observation_ms")? {
+            Value::Null => None,
+            value => Some(value.as_i64()?),
+        },
     })
 }
 
@@ -1777,14 +1939,21 @@ fn canonical_healthy_report_for_test() -> DoctorReportV1 {
                         provider: DoctorProvider::Claude,
                         path: "~/.claude/projects".to_owned(),
                         exists: true,
+                        readable: true,
                     },
                     ProviderRootObservation {
                         provider: DoctorProvider::Codex,
                         path: "~/.codex/sessions".to_owned(),
                         exists: true,
+                        readable: true,
                     },
                 ]),
             ),
+        },
+        log_lane: LogLaneSection {
+            readable: check(CheckStatus::Ok, "log_lane_roots_readable", None),
+            coverage: check(CheckStatus::Ok, "log_lane_coverage_complete", None),
+            freshness: check(CheckStatus::Ok, "log_lane_fresh", None),
         },
         compatibility: CompatibilitySection {
             herdr: check(CheckStatus::Ok, "herdr_compatible", None),
@@ -1816,6 +1985,11 @@ fn test_persistence_failure() -> PersistenceFailure {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::os::unix::fs::PermissionsExt;
+    use std::thread;
+    use std::time::Duration;
+
     use serde_json::json;
 
     use super::*;
@@ -1836,8 +2010,117 @@ mod tests {
         Snapshot,
     };
     use crate::model::Provider;
+    use crate::provider::{
+        ProviderCycle, ProviderWorker, spawn_provider_thread_with_rescan_interval,
+    };
     use crate::rendezvous::ControllerRuntimeProbe;
     use crate::store::PersistenceStatus;
+
+    #[test]
+    fn doctor_warns_on_unreadable_roots() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude/projects");
+        let codex = home.path().join(".codex/sessions");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = log_lane_readable_check(Some(home.path().as_os_str()));
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(result.status, CheckStatus::Warning);
+        assert_eq!(result.code, "log_lane_roots_unreadable");
+        let roots = result.observed.unwrap();
+        assert!(
+            roots
+                .iter()
+                .any(|root| root.path.ends_with(".claude/projects") && root.readable)
+        );
+        assert!(
+            roots
+                .iter()
+                .any(|root| root.path.ends_with(".codex/sessions") && !root.readable)
+        );
+    }
+
+    #[test]
+    fn doctor_coverage_counts_pane_sessions_with_artifacts() {
+        let mut snapshot = runtime(PersistenceStatus::Healthy);
+        snapshot.provider_counters.pane_sessions_total = 3;
+        snapshot.provider_counters.pane_sessions_with_artifacts = 2;
+        let result = log_lane_coverage_check(Some(&snapshot));
+        assert_eq!(result.status, CheckStatus::Warning);
+        assert_eq!(result.code, "log_lane_coverage_partial");
+        assert_eq!(
+            result.observed,
+            Some(LogLaneCoverageObservation {
+                pane_sessions_total: 3,
+                pane_sessions_with_artifacts: 2,
+                pane_sessions_without_artifacts: 1,
+                rejected_targets: 0,
+            })
+        );
+
+        snapshot.provider_counters.pane_sessions_total = 1;
+        snapshot.provider_counters.pane_sessions_with_artifacts = 0;
+        snapshot.provider_counters.invalid_targets = 2;
+        let rejected = log_lane_coverage_check(Some(&snapshot));
+        assert_eq!(rejected.status, CheckStatus::Warning);
+        assert_eq!(rejected.code, "log_lane_targets_rejected");
+    }
+
+    struct ObservingWorker;
+
+    impl ProviderWorker for ObservingWorker {
+        fn process(&mut self, _cycle: &mut ProviderCycle<'_>) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn doctor_freshness_uses_watcher_observations_not_mtime() {
+        let (egress, _receiver) = tokio::sync::mpsc::channel(1);
+        let handle = spawn_provider_thread_with_rescan_interval(
+            ObservingWorker,
+            egress,
+            None,
+            Duration::from_millis(5),
+        )
+        .unwrap();
+        let diagnostics = handle.diagnostics();
+        let mut observed = None;
+        for _ in 0..100 {
+            observed = diagnostics.last_watcher_observation_ms();
+            if observed.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let observed = observed.expect("provider watcher did not publish an observation");
+        handle.stop().await.unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("still-changing.jsonl");
+        std::fs::write(&path, b"one").unwrap();
+        let first_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        thread::sleep(Duration::from_millis(5));
+        std::fs::write(&path, b"two").unwrap();
+        let second_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(second_mtime > first_mtime, "fixture mtime must advance");
+
+        let mut snapshot = runtime(PersistenceStatus::Healthy);
+        snapshot.provider_counters.last_watcher_observation_ms = Some(observed);
+        assert_eq!(
+            log_lane_freshness_check(Some(&snapshot), observed).status,
+            CheckStatus::Ok
+        );
+        let stale = log_lane_freshness_check(
+            Some(&snapshot),
+            observed.saturating_add(LOG_LANE_FRESHNESS_STALE_MS + 1),
+        );
+        assert_eq!(stale.status, CheckStatus::Warning);
+        assert_eq!(stale.code, "log_lane_stale");
+    }
 
     fn runtime(persistence: PersistenceStatus) -> RuntimeDiagnosticsSnapshot {
         RuntimeDiagnosticsSnapshot {
@@ -1847,6 +2130,7 @@ mod tests {
             persistence_counters: PersistenceCounters::default(),
             controller_counters: ControllerCounterSnapshot::default(),
             enrichment_counters: EnrichmentCounterSnapshot::default(),
+            provider_counters: crate::diagnostics::ProviderCounterSnapshot::default(),
             source_coverage: Vec::new(),
             dangling_announcement_components: 0,
             first_failure_log: OccurrenceLogStatus::NotAttempted,
@@ -2117,11 +2401,32 @@ mod tests {
     }
 
     #[test]
-    fn runtime_parser_preserves_enrichment_counters() {
+    fn runtime_parser_preserves_enrichment_and_provider_counters() {
         let mut diagnostics = serde_json::to_value(runtime(PersistenceStatus::Healthy)).unwrap();
         diagnostics.as_object_mut().unwrap().insert(
             "enrichment_counters".to_owned(),
             json!({"channel_full_drops": 7, "episode_discards": 11}),
+        );
+        diagnostics.as_object_mut().unwrap().insert(
+            "provider_counters".to_owned(),
+            json!({
+                "invalid_targets": 2,
+                "duplicate_events": 3,
+                "malformed_records": 5,
+                "duplicate_path_targets": 7,
+                "baseline_approximations": 11,
+                "provider_cycles": 13,
+                "provider_io_errors": 17,
+                "watch_cap_fallbacks": 19,
+                "notify_creation_failures": 23,
+                "dropped_hints": 29,
+                "coalesced_updates": 31,
+                "egress_saturations": 37,
+                "egress_closed": 41,
+                "pane_sessions_total": 43,
+                "pane_sessions_with_artifacts": 42,
+                "last_watcher_observation_ms": 47,
+            }),
         );
 
         let parsed = parse_runtime_status(&json!({
@@ -2134,6 +2439,15 @@ mod tests {
         assert_eq!(
             rendered["enrichment_counters"],
             json!({"channel_full_drops": 7, "episode_discards": 11})
+        );
+        assert_eq!(rendered["provider_counters"]["invalid_targets"], 2);
+        assert_eq!(
+            rendered["provider_counters"]["pane_sessions_with_artifacts"],
+            42
+        );
+        assert_eq!(
+            rendered["provider_counters"]["last_watcher_observation_ms"],
+            47
         );
     }
 

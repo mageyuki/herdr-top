@@ -100,7 +100,7 @@ pub struct Synthesis {
     complete_grace_ms: i64,
     headless_inactivity_ms: i64,
     session_meta: HashMap<PathBuf, CodexSessionMetadata>,
-    turn_context: HashMap<ScopeKey, (String, Option<String>)>,
+    turn_context: HashMap<ScopeKey, (String, Option<String>, Option<String>)>,
     ai_titles: HashMap<String, String>,
     claude_cwds: HashMap<String, String>,
     published_subjects: HashMap<String, String>,
@@ -421,10 +421,10 @@ impl Synthesis {
                 turn_id: _,
                 model,
                 effort,
-                sandbox: _,
+                sandbox,
             } => {
                 self.turn_context
-                    .insert(ScopeKey::Codex(rollout_id), (model, effort));
+                    .insert(ScopeKey::Codex(rollout_id), (model, effort, sandbox));
             }
             LogFact::CodexPid { .. } => {}
             LogFact::CodexTurnStarted { rollout_id, at_ms } => {
@@ -604,8 +604,10 @@ impl Synthesis {
                         key: run_key_for_scope(&scope),
                         at_ms,
                         output_tokens,
-                        model: model.or_else(|| context.map(|(model, _)| model.clone())),
-                        effort: effort.or_else(|| context.and_then(|(_, effort)| effort.clone())),
+                        model: model.or_else(|| context.map(|(model, _, _)| model.clone())),
+                        effort: effort
+                            .or_else(|| context.and_then(|(_, effort, _)| effort.clone())),
+                        sandbox: context.and_then(|(_, _, sandbox)| sandbox.clone()),
                     });
                 }
             }
@@ -2549,8 +2551,9 @@ mod tests {
             [ProviderEvent::Telemetry {
                 model: Some(model),
                 effort: Some(effort),
+                sandbox: Some(sandbox),
                 ..
-            }] if model == "gpt-5.6-sol" && effort == "xhigh"
+            }] if model == "gpt-5.6-sol" && effort == "xhigh" && sandbox == "workspace-write"
         ));
     }
 

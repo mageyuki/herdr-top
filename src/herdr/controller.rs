@@ -225,6 +225,8 @@ pub enum StatusRequestKind {
 /// Distinct closed response for Controller runtime status.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+// The success response deliberately carries one immutable diagnostic snapshot by value.
+#[allow(clippy::large_enum_variant)]
 pub enum ControllerStatusResponse {
     Ok {
         schema_version: u64,
@@ -1240,6 +1242,7 @@ mod tests {
             persistence_counters: PersistenceCounters::default(),
             controller_counters: ControllerCounterSnapshot::default(),
             enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
+            provider_counters: crate::diagnostics::ProviderCounterSnapshot::default(),
             source_coverage: [
                 DiagnosticSource::Herdr,
                 DiagnosticSource::Controller,
@@ -1831,7 +1834,7 @@ mod tests {
         ));
         assert_eq!(
             serde_json::to_vec(&valid).unwrap(),
-            br#"{"status":"ok","schema_version":1,"diagnostics":{"persistence":{"status":"healthy"},"controller_input":{"status":"available"},"owner":"current","persistence_counters":{"not_committed_batches":0,"durability_unknown_batches":0,"committed_but_degraded_batches":0,"skipped_batches":0,"skipped_owner_updates":0},"controller_counters":{"binding_conflicts":0,"terminal_blocked_progress_noops":0,"terminal_forward_reference_creations":0,"dangling_announcement_components":0,"ingest_sequence_exhaustions":0,"provider_parent_conflicts":0,"provider_identity_disagreements":0,"socket_saturations":0,"accept_failures":0},"enrichment_counters":{"channel_full_drops":0,"episode_discards":0},"source_coverage":[{"source":"herdr","availability":"unavailable"},{"source":"controller","availability":"available"},{"source":"claude","availability":"unavailable"},{"source":"codex","availability":"unavailable"}],"dangling_announcement_components":0,"first_failure_log":"not_attempted"}}"#,
+            br#"{"status":"ok","schema_version":1,"diagnostics":{"persistence":{"status":"healthy"},"controller_input":{"status":"available"},"owner":"current","persistence_counters":{"not_committed_batches":0,"durability_unknown_batches":0,"committed_but_degraded_batches":0,"skipped_batches":0,"skipped_owner_updates":0},"controller_counters":{"binding_conflicts":0,"terminal_blocked_progress_noops":0,"terminal_forward_reference_creations":0,"dangling_announcement_components":0,"ingest_sequence_exhaustions":0,"provider_parent_conflicts":0,"provider_identity_disagreements":0,"socket_saturations":0,"accept_failures":0},"enrichment_counters":{"channel_full_drops":0,"episode_discards":0},"provider_counters":{"invalid_targets":0,"duplicate_events":0,"malformed_records":0,"duplicate_path_targets":0,"baseline_approximations":0,"provider_cycles":0,"provider_io_errors":0,"watch_cap_fallbacks":0,"notify_creation_failures":0,"dropped_hints":0,"coalesced_updates":0,"egress_saturations":0,"egress_closed":0,"pane_sessions_total":0,"pane_sessions_with_artifacts":0,"last_watcher_observation_ms":null},"source_coverage":[{"source":"herdr","availability":"unavailable"},{"source":"controller","availability":"available"},{"source":"claude","availability":"unavailable"},{"source":"codex","availability":"unavailable"}],"dangling_announcement_components":0,"first_failure_log":"not_attempted"}}"#,
         );
         let extra = status_response(
             br#"{"request":"status","schema_version":1,"extra":true}"#,
