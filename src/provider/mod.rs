@@ -1470,6 +1470,7 @@ pub struct ProviderTarget {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TargetSet {
     targets: HashSet<ProviderTarget>,
+    sessions: HashSet<(Provider, String)>,
 }
 
 impl TargetSet {
@@ -1477,12 +1478,31 @@ impl TargetSet {
     pub fn new(targets: impl IntoIterator<Item = ProviderTarget>) -> Self {
         Self {
             targets: targets.into_iter().collect(),
+            sessions: HashSet::new(),
+        }
+    }
+
+    /// Creates a target set from provider paths and pane-session identities.
+    pub fn new_with_sessions(
+        targets: impl IntoIterator<Item = ProviderTarget>,
+        sessions: impl IntoIterator<Item = (Provider, String)>,
+    ) -> Self {
+        Self {
+            targets: targets.into_iter().collect(),
+            sessions: sessions.into_iter().collect(),
         }
     }
 
     /// Returns provider-attributed targets.
     pub fn iter(&self) -> impl Iterator<Item = &ProviderTarget> {
         self.targets.iter()
+    }
+
+    /// Returns provider-attributed pane-session identities.
+    pub fn sessions(&self) -> impl Iterator<Item = (Provider, &str)> {
+        self.sessions
+            .iter()
+            .map(|(provider, session_id)| (*provider, session_id.as_str()))
     }
 }
 

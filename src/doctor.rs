@@ -785,7 +785,10 @@ fn provider_from_name(name: &str) -> Option<Provider> {
     }
 }
 
-fn coverage_check(snapshot: Option<&Snapshot>) -> Check<CoverageObservation> {
+fn coverage_check(
+    snapshot: Option<&Snapshot>,
+    runtime_snapshot: Option<&RuntimeDiagnosticsSnapshot>,
+) -> Check<CoverageObservation> {
     let mut rows = [
         ProviderCoverageCounts {
             provider: DoctorProvider::Claude,
@@ -803,6 +806,8 @@ fn coverage_check(snapshot: Option<&Snapshot>) -> Check<CoverageObservation> {
         },
     ];
     let mut unknown_provider = 0_u64;
+    let lane_has_no_artifacts = runtime_snapshot
+        .is_some_and(|snapshot| snapshot.provider_counters.pane_sessions_with_artifacts == 0);
     if let Some(snapshot) = snapshot {
         for pane in &snapshot.panes {
             let Some(agent) = pane.agent.as_deref() else {
@@ -821,6 +826,9 @@ fn coverage_check(snapshot: Option<&Snapshot>) -> Check<CoverageObservation> {
             match pane.agent_session.as_ref() {
                 Some(reference) if provider_from_name(&reference.agent) == Some(provider) => {
                     match reference.kind {
+                        AgentSessionKind::Id if lane_has_no_artifacts => {
+                            row.uncovered = row.uncovered.saturating_add(1);
+                        }
                         AgentSessionKind::Id => row.covered = row.covered.saturating_add(1),
                         AgentSessionKind::Path => row.partial = row.partial.saturating_add(1),
                     }
@@ -1438,12 +1446,6 @@ pub async fn collect_report(
             .and_then(|result| result.as_ref().ok()),
     );
     let integrations = integration_check(&integration_assessments);
-    let coverage = coverage_check(
-        snapshot_result
-            .as_ref()
-            .and_then(|result| result.as_ref().ok()),
-    );
-
     let controller_snapshot = if runtime_verdict == ControllerRuntimeProbe::Live {
         match controller_paths.as_ref() {
             Some(paths) => controller::query_status(&paths.socket)
@@ -1455,6 +1457,12 @@ pub async fn collect_report(
     } else {
         None
     };
+    let coverage = coverage_check(
+        snapshot_result
+            .as_ref()
+            .and_then(|result| result.as_ref().ok()),
+        controller_snapshot.as_ref(),
+    );
     let log_lane_coverage = log_lane_coverage_check(controller_snapshot.as_ref());
     let log_lane_freshness = log_lane_freshness_check(controller_snapshot.as_ref(), unix_now_ms());
     let controller_runtime = controller_runtime_check(runtime_verdict, controller_snapshot);
@@ -2575,22 +2583,25 @@ mod tests {
 
     #[test]
     fn i4_doctor_coverage_id_path_missing_unknown_zero_matrix() {
-        let observed = coverage_check(Some(&snapshot(vec![
-            pane(Some("Claude"), Some(("claude-code", AgentSessionKind::Id))),
-            pane(
-                Some("claude-code"),
-                Some(("CLAUDE", AgentSessionKind::Path)),
-            ),
-            pane(Some("codex-cli"), Some(("CoDeX", AgentSessionKind::Id))),
-            pane(
-                Some("Codex CLAUDE"),
-                Some(("claude-code", AgentSessionKind::Id)),
-            ),
-            pane(Some("codex"), Some(("unknown", AgentSessionKind::Path))),
-            pane(Some("claude"), None),
-            pane(Some("unknown"), Some(("claude", AgentSessionKind::Id))),
-            pane(None, Some(("codex", AgentSessionKind::Id))),
-        ])));
+        let observed = coverage_check(
+            Some(&snapshot(vec![
+                pane(Some("Claude"), Some(("claude-code", AgentSessionKind::Id))),
+                pane(
+                    Some("claude-code"),
+                    Some(("CLAUDE", AgentSessionKind::Path)),
+                ),
+                pane(Some("codex-cli"), Some(("CoDeX", AgentSessionKind::Id))),
+                pane(
+                    Some("Codex CLAUDE"),
+                    Some(("claude-code", AgentSessionKind::Id)),
+                ),
+                pane(Some("codex"), Some(("unknown", AgentSessionKind::Path))),
+                pane(Some("claude"), None),
+                pane(Some("unknown"), Some(("claude", AgentSessionKind::Id))),
+                pane(None, Some(("codex", AgentSessionKind::Id))),
+            ])),
+            None,
+        );
         assert_eq!(observed.status, CheckStatus::Warning);
         assert_eq!(observed.code, "coverage_partial");
         assert_eq!(
@@ -2608,13 +2619,35 @@ mod tests {
             })
         );
 
-        let zero = coverage_check(Some(&snapshot(Vec::new())));
+        let zero = coverage_check(Some(&snapshot(Vec::new())), None);
         assert_eq!(zero.status, CheckStatus::NotApplicable);
         assert_eq!(zero.code, "coverage_zero_relevant");
         assert_eq!(zero.observed.unwrap().total, 0);
 
-        let unavailable = coverage_check(None);
+        let unavailable = coverage_check(None, None);
         assert_eq!(unavailable.status, CheckStatus::NotApplicable);
         assert_eq!(unavailable.code, "coverage_zero_relevant");
+    }
+
+    #[test]
+    fn doctor_id_kind_pane_without_lane_artifact_is_not_fully_covered() {
+        let mut runtime = runtime(PersistenceStatus::Healthy);
+        runtime.provider_counters.pane_sessions_total = 1;
+        runtime.provider_counters.pane_sessions_with_artifacts = 0;
+        let result = coverage_check(
+            Some(&snapshot(vec![pane(
+                Some("claude"),
+                Some(("claude", AgentSessionKind::Id)),
+            )])),
+            Some(&runtime),
+        );
+
+        assert_eq!(
+            result.status,
+            CheckStatus::Warning,
+            "kind-Id pane with zero lane artifacts was reported fully covered"
+        );
+        assert_eq!(result.code, "coverage_partial");
+        assert_eq!(result.observed.unwrap().uncovered, 1);
     }
 }

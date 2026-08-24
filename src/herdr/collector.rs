@@ -3830,7 +3830,15 @@ impl ProviderWorker for AdapterProviderWorker {
     fn process(&mut self, cycle: &mut ProviderCycle<'_>) -> io::Result<()> {
         let baseline_failures = self.initialize_standard_baselines();
         let mut targets_by_root: HashMap<(Provider, PathBuf), HashSet<PathBuf>> = HashMap::new();
+        let mut providers_with_session_admissions = HashSet::new();
         self.log_admission.begin_pane_cycle();
+        for (provider, session_id) in cycle.targets.sessions() {
+            if session_id.is_empty() {
+                continue;
+            }
+            self.log_admission.admit_pane_session(provider, session_id);
+            providers_with_session_admissions.insert(provider);
+        }
         for target in cycle.targets.iter() {
             let Ok(root) = provider_root_for_target(target.provider, &target.path) else {
                 self.diagnostics.record_invalid_target();
@@ -3848,10 +3856,31 @@ impl ProviderWorker for AdapterProviderWorker {
                 .or_default()
                 .insert(target.path.clone());
         }
+        for root in self
+            .standard_roots
+            .iter()
+            .filter(|root| providers_with_session_admissions.contains(&root.provider))
+        {
+            targets_by_root
+                .entry((root.provider, root.path.clone()))
+                .or_default();
+        }
+        for root in self
+            .log_admission
+            .derived_roots()
+            .iter()
+            .map(|derived| &derived.root)
+            .filter(|root| providers_with_session_admissions.contains(&root.provider))
+        {
+            targets_by_root
+                .entry((root.provider, root.path.clone()))
+                .or_default();
+        }
         for provider in [Provider::Claude, Provider::Codex] {
-            let targeted = targets_by_root
-                .keys()
-                .any(|(current, _)| *current == provider);
+            let targeted = providers_with_session_admissions.contains(&provider)
+                || targets_by_root
+                    .keys()
+                    .any(|(current, _)| *current == provider);
             self.update_targeted_transition(provider, targeted, cycle.pending);
         }
         if !drain_deferred_provider_events(&mut self.deferred, cycle.pending) {
@@ -4597,7 +4626,17 @@ fn derive_provider_targets(model: &DomainModel) -> TargetSet {
                 path: PathBuf::from(path),
             })
     });
-    TargetSet::new(run_targets.chain(node_targets))
+    let session_targets = model.executions().filter_map(|execution| {
+        let run = model.task_run(&execution.task_run_id)?;
+        match &run.key {
+            RunKey::Native { provider, sid } if !sid.is_empty() => Some((*provider, sid.clone())),
+            RunKey::Controller(_)
+            | RunKey::Native { .. }
+            | RunKey::NativePath { .. }
+            | RunKey::Provisional { .. } => None,
+        }
+    });
+    TargetSet::new_with_sessions(run_targets.chain(node_targets), session_targets)
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -11365,6 +11404,106 @@ mod tests {
             PersistOp::UpsertPane { pane, .. }
                 if pane.display_name.as_deref() == Some("UI修正")
         )));
+    }
+
+    #[test]
+    fn id_kind_pane_session_admits_matching_artifacts() {
+        const SESSION_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.claude/projects");
+        let artifact = root.join(format!("project/{SESSION_ID}.jsonl"));
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(
+            &artifact,
+            format!(
+                "{{\"type\":\"assistant\",\"uuid\":\"record-{SESSION_ID}\",\"timestamp\":\"2026-08-24T00:00:00Z\",\"sessionId\":\"{SESSION_ID}\",\"isSidechain\":false}}\n"
+            ),
+        )
+        .unwrap();
+
+        let mut snapshot = snapshot_with_names();
+        snapshot.panes[0].agent = Some("claude".to_owned());
+        snapshot.panes[0].agent_status = Some("working".to_owned());
+        snapshot.panes[0].agent_session = Some(crate::herdr::types::AgentSessionInfo {
+            source: "herdr:claude".to_owned(),
+            agent: "claude".to_owned(),
+            kind: AgentSessionKind::Id,
+            value: SESSION_ID.to_owned(),
+        });
+        let topology = topology_from_snapshot(&snapshot).unwrap();
+        let (mut reducer, shared) = empty_reducer();
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology,
+                gap_kind: GapKind::Startup,
+            })
+            .unwrap();
+        let targets = derive_provider_targets(&shared.borrow());
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Claude,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let mut pending = PendingEvents::new(diagnostics.clone());
+        let mut watch_requests = Vec::new();
+        let mut cycle =
+            crate::provider::test_provider_cycle(&targets, &mut pending, &mut watch_requests);
+
+        worker.process(&mut cycle).unwrap();
+        let (sender, mut receiver) = mpsc::channel(16);
+        pending.flush_to(&sender);
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+
+        assert!(
+            worker.log_admission.is_admitted_path(&artifact),
+            "kind-Id pane session was not admitted"
+        );
+        assert!(
+            worker
+                .roots
+                .get(&(Provider::Claude, root))
+                .is_some_and(|state| state
+                    .discovery
+                    .files()
+                    .iter()
+                    .any(|file| { file.root.join(&file.relative_path) == artifact })),
+            "matching pane artifact was not discovered"
+        );
+        assert!(
+            worker
+                .tails
+                .values()
+                .any(|tail| tail.absolute_path() == artifact),
+            "matching pane artifact was not tailed"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::Synthesized(_))),
+            "matching pane artifact produced no synthesized provider-log event"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ProviderEvent::SourceState {
+                    provider: Provider::Claude,
+                    state: ProviderSourceState::Available,
+                }
+            )),
+            "id-only pane admission did not target the provider availability sweep"
+        );
+        assert_eq!(
+            diagnostics.invalid_targets(),
+            0,
+            "pane session IDs must not inflate rejected artifact-path diagnostics"
+        );
     }
 
     fn flat_pane_agent_detected(
