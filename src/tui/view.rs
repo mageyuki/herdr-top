@@ -123,6 +123,256 @@ pub(crate) struct TreeRow {
     pub(crate) dependents: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetricColumn {
+    Model,
+    Effort,
+    Tok,
+    TokPerSecond,
+    Time,
+}
+
+impl MetricColumn {
+    const fn width(self) -> usize {
+        match self {
+            Self::Model => 11,
+            Self::Effort | Self::Tok | Self::TokPerSecond => 5,
+            Self::Time => 6,
+        }
+    }
+}
+
+const ALL_METRIC_COLUMNS: &[MetricColumn] = &[
+    MetricColumn::Model,
+    MetricColumn::Effort,
+    MetricColumn::Tok,
+    MetricColumn::TokPerSecond,
+    MetricColumn::Time,
+];
+const WITHOUT_MODEL_COLUMNS: &[MetricColumn] = &[
+    MetricColumn::Effort,
+    MetricColumn::Tok,
+    MetricColumn::TokPerSecond,
+    MetricColumn::Time,
+];
+const TOKEN_RATE_TIME_COLUMNS: &[MetricColumn] = &[
+    MetricColumn::Tok,
+    MetricColumn::TokPerSecond,
+    MetricColumn::Time,
+];
+const TOKEN_TIME_COLUMNS: &[MetricColumn] = &[MetricColumn::Tok, MetricColumn::Time];
+const TIME_COLUMN: &[MetricColumn] = &[MetricColumn::Time];
+
+/// Selects the fixed metric band for the total tree-row width.
+///
+/// Narrowing drops MODEL, then EFF, TOK-S, TOK, and finally TIME. Label text is
+/// truncated and deep indentation is compressed before the active band's columns
+/// are allowed to disappear at the next declared threshold.
+fn visible_metric_columns(width: usize) -> &'static [MetricColumn] {
+    match width {
+        120.. => ALL_METRIC_COLUMNS,
+        104..=119 => WITHOUT_MODEL_COLUMNS,
+        90..=103 => TOKEN_RATE_TIME_COLUMNS,
+        76..=89 => TOKEN_TIME_COLUMNS,
+        62..=75 => TIME_COLUMN,
+        _ => &[],
+    }
+}
+
+fn metric_block_width(columns: &[MetricColumn]) -> usize {
+    columns
+        .iter()
+        .copied()
+        .map(MetricColumn::width)
+        .sum::<usize>()
+        .saturating_add(columns.len().saturating_sub(1))
+}
+
+fn right_align_to_width(value: &str, width: usize) -> String {
+    let value = truncate_to_width(value, width);
+    let padding = width.saturating_sub(Span::raw(value.as_str()).width());
+    format!("{}{value}", " ".repeat(padding))
+}
+
+fn render_metric_block(
+    metrics: Option<&projection::RunMetricInputs>,
+    columns: &[MetricColumn],
+    now_ms: i64,
+) -> String {
+    columns
+        .iter()
+        .copied()
+        .map(|column| {
+            let value = metrics.map_or_else(String::new, |metrics| {
+                format_metric_value(column, metrics, now_ms)
+            });
+            right_align_to_width(&value, column.width())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn format_metric_value(
+    column: MetricColumn,
+    metrics: &projection::RunMetricInputs,
+    now_ms: i64,
+) -> String {
+    match column {
+        MetricColumn::Model => format_model_value(metrics.model.as_deref()),
+        MetricColumn::Effort => format_effort_value(metrics.effort.as_deref()),
+        MetricColumn::Tok => metrics
+            .output_tokens
+            .map_or_else(|| "—".to_owned(), format_token_count),
+        MetricColumn::TokPerSecond => format_token_rate_value(metrics, now_ms),
+        MetricColumn::Time => format_time_value(metrics, now_ms),
+    }
+}
+
+fn format_model_value(model: Option<&str>) -> String {
+    let Some(model) = model else {
+        return "—".to_owned();
+    };
+    let model = safe_text(model);
+    let shortened = model.strip_prefix("claude-").unwrap_or(&model);
+    let shortened = strip_model_date_suffix(shortened);
+    if shortened.is_empty() {
+        "—".to_owned()
+    } else {
+        truncate_to_width(shortened, MetricColumn::Model.width())
+    }
+}
+
+fn strip_model_date_suffix(model: &str) -> &str {
+    if let Some(prefix) = model.get(..model.len().saturating_sub(11))
+        && let Some(suffix) = model.get(model.len().saturating_sub(11)..)
+        && suffix.len() == 11
+        && suffix.starts_with('-')
+        && suffix.as_bytes()[1..5].iter().all(u8::is_ascii_digit)
+        && suffix.as_bytes()[5] == b'-'
+        && suffix.as_bytes()[6..8].iter().all(u8::is_ascii_digit)
+        && suffix.as_bytes()[8] == b'-'
+        && suffix.as_bytes()[9..11].iter().all(u8::is_ascii_digit)
+    {
+        return prefix;
+    }
+    if let Some(prefix) = model.get(..model.len().saturating_sub(9))
+        && let Some(suffix) = model.get(model.len().saturating_sub(9)..)
+        && suffix.len() == 9
+        && suffix.starts_with('-')
+        && suffix.as_bytes()[1..].iter().all(u8::is_ascii_digit)
+    {
+        return prefix;
+    }
+    if let Some(prefix) = model.get(..model.len().saturating_sub(8))
+        && let Some(suffix) = model.get(model.len().saturating_sub(8)..)
+        && suffix.len() == 8
+        && suffix.as_bytes().iter().all(u8::is_ascii_digit)
+    {
+        return prefix.trim_end_matches('-');
+    }
+    model
+}
+
+fn format_effort_value(effort: Option<&str>) -> String {
+    let Some(effort) = effort else {
+        return "—".to_owned();
+    };
+    let effort = safe_text(effort);
+    match effort.to_ascii_lowercase().as_str() {
+        "minimal" => "min".to_owned(),
+        "low" => "low".to_owned(),
+        "medium" => "med".to_owned(),
+        "high" => "high".to_owned(),
+        "xhigh" => "xhigh".to_owned(),
+        "max" => "max".to_owned(),
+        _ => truncate_to_width(&effort, MetricColumn::Effort.width()),
+    }
+}
+
+fn format_token_count(tokens: u64) -> String {
+    if tokens < 10_000 {
+        return tokens.to_string();
+    }
+    if tokens < 1_000_000 {
+        return format_scaled_token_count(tokens, 1_000, 'k');
+    }
+    format_scaled_token_count(tokens, 1_000_000, 'M')
+}
+
+fn format_scaled_token_count(tokens: u64, divisor: u64, suffix: char) -> String {
+    let scaled = tokens as f64 / divisor as f64;
+    if scaled < 100.0 {
+        let rounded = (scaled * 10.0).round() / 10.0;
+        if rounded < 100.0 {
+            return format!("{rounded:.1}{suffix}");
+        }
+    }
+    let rounded = scaled.round().clamp(0.0, 9_999.0);
+    format!("{rounded:.0}{suffix}")
+}
+
+fn format_token_rate_value(metrics: &projection::RunMetricInputs, now_ms: i64) -> String {
+    let Some(output_tokens) = metrics.output_tokens else {
+        return "—".to_owned();
+    };
+    let Some(started_wall_ms) = metrics.started_wall_ms else {
+        return "—".to_owned();
+    };
+    let Some(end_ms) = metric_end_ms(metrics, now_ms) else {
+        return "—".to_owned();
+    };
+    let Some(elapsed_ms) = end_ms.checked_sub(started_wall_ms) else {
+        return "—".to_owned();
+    };
+    let elapsed_seconds = elapsed_ms as f64 / 1_000.0;
+    if elapsed_seconds <= 0.0 {
+        return "—".to_owned();
+    }
+    let rate = output_tokens as f64 / elapsed_seconds;
+    format_token_rate(rate)
+}
+
+fn format_token_rate(rate: f64) -> String {
+    if rate < 10.0 {
+        let rounded = (rate * 10.0).round() / 10.0;
+        if rounded < 10.0 {
+            return format!("{rounded:.1}/s");
+        }
+    }
+    if rate < 1_000.0 {
+        let rounded = rate.round();
+        if rounded < 1_000.0 {
+            return format!("{rounded:.0}/s");
+        }
+    }
+    let thousands = (rate / 1_000.0).round().clamp(1.0, 99.0);
+    format!("{thousands:.0}k/s")
+}
+
+fn format_time_value(metrics: &projection::RunMetricInputs, now_ms: i64) -> String {
+    let Some(created_at_ms) = metrics.created_at_ms else {
+        return "—".to_owned();
+    };
+    let Some(end_ms) = metric_end_ms(metrics, now_ms) else {
+        return "—".to_owned();
+    };
+    let Some(elapsed_ms) = end_ms
+        .checked_sub(created_at_ms)
+        .filter(|elapsed_ms| *elapsed_ms >= 0)
+    else {
+        return "—".to_owned();
+    };
+    truncate_to_width(&format_duration(elapsed_ms), MetricColumn::Time.width())
+}
+
+fn metric_end_ms(metrics: &projection::RunMetricInputs, now_ms: i64) -> Option<i64> {
+    if metrics.terminal {
+        metrics.finished_at_ms
+    } else {
+        Some(now_ms)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct PaintSnapshot<'a> {
     state: &'a AppState,
@@ -194,13 +444,25 @@ pub(super) fn render(
     );
     match state.view_mode() {
         ViewMode::ExecutionTree => {
-            render_tree(frame, tree_area, rows, state, setup.ascii_tree());
+            render_tree(
+                frame,
+                tree_area,
+                model,
+                rows,
+                state,
+                setup.ascii_tree(),
+                paint.now_ms,
+            );
         }
         ViewMode::DependencyDag => render_dag(frame, tree_area, rows, state),
     }
     render_activity(frame, activity_area, model, rows, state, diagnostics);
+    let committed_filter = (!state.filter_query().is_empty()).then(|| state.filter_query());
     frame.render_widget(
-        Paragraph::new(footer_line(usize::from(footer_area.width))),
+        Paragraph::new(footer_line(
+            usize::from(footer_area.width),
+            committed_filter,
+        )),
         footer_area,
     );
     render_interaction_layer(frame, area, model, paint, diagnostics, setup);
@@ -265,7 +527,15 @@ fn render_header(
     frame.render_widget(Paragraph::new(line).block(block), area);
 }
 
-fn render_tree(frame: &mut Frame<'_>, area: Rect, rows: &[TreeRow], state: &AppState, ascii: bool) {
+fn render_tree(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    model: &DomainModel,
+    rows: &[TreeRow],
+    state: &AppState,
+    ascii: bool,
+    now_ms: i64,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Execution tree ");
@@ -277,7 +547,10 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, rows: &[TreeRow], state: &AppS
     }
     let start = viewport_start(rows, state, viewport_height);
     let width = usize::from(inner.width);
-    let prefixes = tree_connector_prefixes(rows, ascii);
+    let end = start.saturating_add(viewport_height).min(rows.len());
+    let columns = visible_metric_columns(width);
+    let indent_style = tree_indent_style(&rows[start..end], width, columns);
+    let prefixes = tree_connector_prefixes_with_style(rows, ascii, indent_style);
     let lines = rows
         .iter()
         .zip(prefixes.iter())
@@ -286,7 +559,28 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, rows: &[TreeRow], state: &AppS
         .map(|(row, prefix)| {
             let selected = state.selected() == Some(&row.key);
             let marker = if selected { "> " } else { "  " };
-            let text = truncate_to_width(&format!("{marker}{prefix}{}", row.label), width);
+            let metrics = row
+                .key
+                .run_id()
+                .and_then(|run_id| model.task_run(&run_id))
+                .map(|run| projection::run_metric_inputs(model, run));
+            let metric_width = metric_block_width(columns);
+            let reserved_width = if columns.is_empty() {
+                0
+            } else {
+                metric_width.saturating_add(1)
+            };
+            let label_width = width.saturating_sub(reserved_width);
+            let label = truncate_to_width(&format!("{marker}{prefix}{}", row.label), label_width);
+            let text = if columns.is_empty() {
+                label
+            } else {
+                format!(
+                    "{} {}",
+                    pad_to_width(&label, label_width),
+                    render_metric_block(metrics.as_ref(), columns, now_ms)
+                )
+            };
             let style = if selected {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
@@ -298,7 +592,57 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, rows: &[TreeRow], state: &AppS
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+#[cfg(test)]
 fn tree_connector_prefixes(rows: &[TreeRow], ascii: bool) -> Vec<String> {
+    tree_connector_prefixes_with_style(rows, ascii, TreeIndentStyle::Normal)
+}
+
+const MIN_TREE_LABEL_WIDTH: usize = 20;
+const TREE_SELECTION_MARKER_WIDTH: usize = 2;
+
+/// One frame-wide connector shape keeps vertical guides aligned while deep trees narrow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TreeIndentStyle {
+    Normal,
+    Compressed,
+    Clamped { max_levels: usize },
+}
+
+fn tree_indent_style(
+    painted_rows: &[TreeRow],
+    width: usize,
+    columns: &[MetricColumn],
+) -> TreeIndentStyle {
+    let max_depth = painted_rows
+        .iter()
+        .map(|row| row.depth)
+        .max()
+        .unwrap_or_default();
+    let reserved_metrics = if columns.is_empty() {
+        0
+    } else {
+        metric_block_width(columns).saturating_add(1)
+    };
+    let indent_budget = width
+        .saturating_sub(reserved_metrics)
+        .saturating_sub(TREE_SELECTION_MARKER_WIDTH)
+        .saturating_sub(MIN_TREE_LABEL_WIDTH);
+    if max_depth.saturating_mul(4) <= indent_budget {
+        return TreeIndentStyle::Normal;
+    }
+    if max_depth.saturating_mul(2) <= indent_budget {
+        return TreeIndentStyle::Compressed;
+    }
+    TreeIndentStyle::Clamped {
+        max_levels: indent_budget.saturating_sub(1) / 2,
+    }
+}
+
+fn tree_connector_prefixes_with_style(
+    rows: &[TreeRow],
+    ascii: bool,
+    style: TreeIndentStyle,
+) -> Vec<String> {
     let mut last_child = vec![false; rows.len()];
     let mut next_at_depth = Vec::<Option<usize>>::new();
     for (index, row) in rows.iter().enumerate().rev() {
@@ -310,26 +654,40 @@ fn tree_connector_prefixes(rows: &[TreeRow], ascii: bool) -> Vec<String> {
         next_at_depth[row.depth] = Some(index);
     }
 
-    let (branch, last, vertical) = if ascii {
-        ("|-- ", "`-- ", "|   ")
+    let compressed = !matches!(style, TreeIndentStyle::Normal);
+    let (branch, last, vertical, blank) = if ascii && compressed {
+        ("|-", "`-", "| ", "  ")
+    } else if ascii {
+        ("|-- ", "`-- ", "|   ", "    ")
+    } else if compressed {
+        ("├─", "└─", "│ ", "  ")
     } else {
-        ("├── ", "└── ", "│   ")
+        ("├── ", "└── ", "│   ", "    ")
     };
     let mut ancestors = Vec::<Option<usize>>::new();
     let mut prefixes = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
         ancestors.truncate(row.depth);
         ancestors.resize(row.depth, None);
-        let mut prefix = String::with_capacity(row.depth.saturating_mul(4));
+        let mut components = Vec::with_capacity(row.depth);
         for ancestor in ancestors.iter().take(row.depth).skip(1) {
             if ancestor.is_some_and(|ancestor| !last_child[ancestor]) {
-                prefix.push_str(vertical);
+                components.push(vertical);
             } else {
-                prefix.push_str("    ");
+                components.push(blank);
             }
         }
         if row.depth > 0 {
-            prefix.push_str(if last_child[index] { last } else { branch });
+            components.push(if last_child[index] { last } else { branch });
+        }
+        let mut prefix = String::new();
+        if let TreeIndentStyle::Clamped { max_levels } = style
+            && components.len() > max_levels
+        {
+            prefix.push('…');
+            prefix.push_str(&components[components.len().saturating_sub(max_levels)..].concat());
+        } else {
+            prefix.push_str(&components.concat());
         }
         prefixes.push(prefix);
         ancestors.push(Some(index));
@@ -499,7 +857,7 @@ fn render_activity(
     );
 }
 
-fn footer_line(width: usize) -> String {
+fn footer_line(width: usize, committed_filter: Option<&str>) -> String {
     const FULL: &[&str] = &[
         "q: stop Top only; agents continue",
         "detach: Top runs",
@@ -512,6 +870,24 @@ fn footer_line(width: usize) -> String {
         "c clear",
     ];
     const COMPACT: &[&str] = &["q:stop Top; agents continue", "detach:Top runs"];
+    const COMMITTED_FILTER_MAX_WIDTH: usize = 32;
+    if let Some(query) = committed_filter {
+        let filter = truncate_to_width(
+            &format!("filter:{}", safe_text(query)),
+            width.min(COMMITTED_FILTER_MAX_WIDTH),
+        );
+        if Span::raw(filter.as_str()).width() >= width {
+            return truncate_to_width(&filter, width);
+        }
+        let hints = if width >= 70 { FULL } else { COMPACT };
+        for hint_count in (1..=hints.len()).rev() {
+            let candidate = format!("{filter} | {}", hints[..hint_count].join(" | "));
+            if Span::raw(candidate.as_str()).width() <= width {
+                return candidate;
+            }
+        }
+        return filter;
+    }
     let floor = COMPACT[0];
     if Span::raw(floor).width() > width {
         return truncate_to_width(floor, width);
@@ -842,6 +1218,7 @@ struct HeaderField {
     prefix: &'static str,
     value: String,
     shrinkable: bool,
+    droppable: bool,
 }
 
 impl HeaderField {
@@ -869,35 +1246,41 @@ fn header_line(
             prefix: "host:",
             value: safe_text(&inputs.host),
             shrinkable: true,
+            droppable: true,
         });
     }
     fields.push(HeaderField {
         prefix: "session:",
         value: safe_text(&inputs.session),
         shrinkable: true,
+        droppable: false,
     });
     fields.push(HeaderField {
         prefix: "up:",
         value: format_session_elapsed(session_elapsed_ms),
-        shrinkable: false,
+        shrinkable: true,
+        droppable: true,
     });
     if screen_width >= 72 {
         fields.push(HeaderField {
             prefix: "workspaces:",
             value: model.workspaces().count().to_string(),
             shrinkable: true,
+            droppable: true,
         });
     }
     fields.push(HeaderField {
         prefix: "",
         value: quality_label(quality).to_owned(),
         shrinkable: false,
+        droppable: false,
     });
     if screen_width >= 88 {
         fields.push(HeaderField {
             prefix: "lag:",
             value: format!("{}ms", performance.snapshot.event_lag.as_millis()),
             shrinkable: true,
+            droppable: true,
         });
     }
     if !performance.snapshot.reasons.is_empty() {
@@ -912,6 +1295,7 @@ fn header_line(
                 .collect::<Vec<_>>()
                 .join("+"),
             shrinkable: true,
+            droppable: true,
         });
     }
     if screen_width >= 100 {
@@ -920,6 +1304,7 @@ fn header_line(
             prefix: "sources:",
             value: safe_text(&coverage),
             shrinkable: true,
+            droppable: true,
         });
     }
 
@@ -954,7 +1339,7 @@ fn format_session_elapsed(elapsed_ms: i64) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
-fn shrink_header_fields(fields: &mut [HeaderField], available_width: usize) {
+fn shrink_header_fields(fields: &mut Vec<HeaderField>, available_width: usize) {
     let priorities = [
         "sources:",
         "lag:",
@@ -962,6 +1347,7 @@ fn shrink_header_fields(fields: &mut [HeaderField], available_width: usize) {
         "host:",
         "session:",
         "perf:",
+        "up:",
     ];
     loop {
         let current = fields_width(fields);
@@ -988,7 +1374,20 @@ fn shrink_header_fields(fields: &mut [HeaderField], available_width: usize) {
             break;
         }
         if !changed {
+            break;
+        }
+    }
+
+    let drop_priorities = ["sources:", "lag:", "workspaces:", "host:", "perf:", "up:"];
+    for prefix in drop_priorities {
+        if fields_width(fields) <= available_width {
             return;
+        }
+        if let Some(index) = fields
+            .iter()
+            .position(|field| field.prefix == prefix && field.droppable)
+        {
+            fields.remove(index);
         }
     }
 }
@@ -2643,6 +3042,104 @@ mod tests {
     }
 
     #[test]
+    fn columns_shed_at_declared_thresholds() {
+        use MetricColumn::{Effort, Model, Time, Tok, TokPerSecond};
+
+        for (width, expected) in [
+            (usize::MAX, &[Model, Effort, Tok, TokPerSecond, Time][..]),
+            (120, &[Model, Effort, Tok, TokPerSecond, Time][..]),
+            (119, &[Effort, Tok, TokPerSecond, Time][..]),
+            (104, &[Effort, Tok, TokPerSecond, Time][..]),
+            (103, &[Tok, TokPerSecond, Time][..]),
+            (90, &[Tok, TokPerSecond, Time][..]),
+            (89, &[Tok, Time][..]),
+            (76, &[Tok, Time][..]),
+            (75, &[Time][..]),
+            (62, &[Time][..]),
+            (61, &[][..]),
+            (0, &[][..]),
+        ] {
+            assert_eq!(visible_metric_columns(width), expected, "width {width}");
+        }
+    }
+
+    #[test]
+    fn model_names_shorten_and_ellipsize() {
+        for (model, expected) in [
+            ("claude-fable-5", "fable-5"),
+            ("claude-3-5-sonnet-20241022", "3-5-sonnet"),
+            ("claude-sonnet-4-2025-01-01", "sonnet-4"),
+            ("gpt-5.6-sol", "gpt-5.6-sol"),
+            ("gpt-5.6-terra", "gpt-5.6-te…"),
+            ("long-model-name", "long-model…"),
+        ] {
+            let formatted = format_model_value(Some(model));
+            assert_eq!(formatted, expected, "model {model}");
+            assert!(Span::raw(formatted.as_str()).width() <= 11);
+        }
+        assert_eq!(format_model_value(None), "—");
+        assert_eq!(
+            Span::raw(format_model_value(Some("gpt-5.6-terra"))).width(),
+            11
+        );
+    }
+
+    #[test]
+    fn tok_output_only_and_mean_stable_across_completion() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let running = label_run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "telemetry".to_owned(),
+            },
+            TaskState::Running,
+            Some(0),
+            None,
+            Some("telemetry"),
+        );
+        let mut model = DomainModel::default();
+        model.telemetry_entry(run_id, 0).accumulate(
+            83,
+            Some("gpt-5.6-sol".to_owned()),
+            Some("xhigh".to_owned()),
+            true,
+        );
+        let running_metrics = projection::run_metric_inputs(&model, &running);
+
+        assert_eq!(
+            format_metric_value(MetricColumn::Tok, &running_metrics, 10_000),
+            "83"
+        );
+        assert_eq!(
+            format_metric_value(MetricColumn::TokPerSecond, &running_metrics, 10_000),
+            "8.3/s"
+        );
+
+        let mut completed = running.clone();
+        completed.state = TaskState::Completed;
+        completed.finished_at_ms = Some(10_000);
+        let completed_metrics = projection::run_metric_inputs(&model, &completed);
+        assert_eq!(
+            format_metric_value(MetricColumn::TokPerSecond, &completed_metrics, 90_000),
+            "8.3/s",
+            "the cumulative mean must stop at the terminal timestamp"
+        );
+
+        let mut future_started = running_metrics.clone();
+        future_started.started_wall_ms = Some(10_001);
+        assert_eq!(
+            format_metric_value(MetricColumn::TokPerSecond, &future_started, 10_000),
+            "—"
+        );
+        future_started.started_wall_ms = Some(10_000);
+        assert_eq!(
+            format_metric_value(MetricColumn::TokPerSecond, &future_started, 10_000),
+            "—"
+        );
+    }
+
+    #[test]
     fn key_fallback_subject_does_not_repeat_native_or_provisional_worker_kind() {
         let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         for (key, expected) in [
@@ -2722,6 +3219,43 @@ mod tests {
         ] {
             let run = label_run(run_id, key, TaskState::Running, None, None, None);
             assert_eq!(worker_kind_label(&run), expected);
+        }
+    }
+
+    #[test]
+    fn run_row_head_keeps_kind_for_every_current_run_class() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        for (key, expected_kind) in [
+            (
+                RunKey::Controller("hook:claude-code:root-session".to_owned()),
+                "claude-code",
+            ),
+            (
+                RunKey::Controller("hook:claude-code:root-session:agent:agent-7".to_owned()),
+                "claude-code",
+            ),
+            (
+                RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: "rollout".to_owned(),
+                },
+                "Codex",
+            ),
+            (
+                RunKey::Provisional {
+                    terminal_id: "terminal".to_owned(),
+                    start_ms: 1,
+                    seq: 2,
+                },
+                "provisional",
+            ),
+        ] {
+            let run = label_run(run_id, key, TaskState::Running, None, None, Some("subject"));
+            let head = run_row_head(&DomainModel::default(), &run, false);
+            assert!(
+                head.starts_with(&format!("● {expected_kind}")),
+                "missing current kind {expected_kind}: {head}"
+            );
         }
     }
 
@@ -3019,6 +3553,72 @@ mod tests {
     }
 
     #[test]
+    fn deep_indent_compresses_when_narrow() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let run = label_run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "deep".to_owned(),
+            },
+            TaskState::Running,
+            Some(0),
+            None,
+            Some("deeply nested work"),
+        );
+        let mut model = DomainModel::default();
+        model.insert_task_run(run);
+        model.telemetry_entry(run_id, 0).accumulate(
+            83,
+            Some("gpt-5.6-sol".to_owned()),
+            Some("xhigh".to_owned()),
+            true,
+        );
+        let rows = vec![TreeRow {
+            key: NodeKey::Run {
+                run_id,
+                pane_id: None,
+            },
+            depth: 12,
+            label: "● Codex deeply nested work".to_owned(),
+            prerequisites: Vec::new(),
+            dependents: Vec::new(),
+        }];
+        let width = 78;
+        let backend = TestBackend::new(width, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_tree(
+                    frame,
+                    Rect::new(0, 0, width, 3),
+                    &model,
+                    &rows,
+                    &AppState::default(),
+                    false,
+                    10_000,
+                );
+            })
+            .unwrap();
+        let rendered = buffer_rows(terminal.backend().buffer());
+        let row = rendered
+            .iter()
+            .find(|row| row.contains('●'))
+            .expect("the deeply nested status glyph remains visible");
+        let glyph_byte = row.find('●').unwrap();
+        let glyph_column = Span::raw(&row[..glyph_byte]).width();
+
+        assert!(
+            glyph_column < 1 + 2 + 12 * 4,
+            "indent did not compress: column {glyph_column}: {row}"
+        );
+        assert!(
+            row.contains("   83    10s"),
+            "metric columns missing: {row}"
+        );
+    }
+
+    #[test]
     fn execution_tree_row_depths_remain_unchanged() {
         let rows = build_rows(&populated_model(), &AppState::default());
         assert_eq!(
@@ -3101,15 +3701,15 @@ mod tests {
             "c clear",
         ];
         let compact = ["q:stop Top; agents continue", "detach:Top runs"];
-        assert_eq!(footer_line(140), full.join(" | "));
+        assert_eq!(footer_line(140, None), full.join(" | "));
         let without_clear = full[..full.len() - 1].join(" | ");
         assert_eq!(
-            footer_line(Span::raw(without_clear.as_str()).width()),
+            footer_line(Span::raw(without_clear.as_str()).width(), None),
             without_clear
         );
 
         for width in [100, 72, 69, 45, 27] {
-            let rendered = footer_line(width);
+            let rendered = footer_line(width, None);
             let expected_tier = if width >= 70 { &full[..] } else { &compact[..] };
             let pieces = rendered.split(" | ").collect::<Vec<_>>();
             assert_eq!(pieces, expected_tier[..pieces.len()], "width {width}");
@@ -3121,8 +3721,78 @@ mod tests {
     fn footer_preserves_mandated_floor() {
         const FLOOR: &str = "q:stop Top; agents continue";
         assert_eq!(Span::raw(FLOOR).width(), 27);
-        assert_eq!(footer_line(27), FLOOR);
-        assert_eq!(footer_line(26), truncate_to_width(FLOOR, 26));
+        assert_eq!(footer_line(27, None), FLOOR);
+        assert_eq!(footer_line(26, None), truncate_to_width(FLOOR, 26));
+    }
+
+    #[test]
+    fn committed_filter_indicator_persists_and_draft_overrides() {
+        let mut app = app(
+            DomainModel::default(),
+            ObservationQuality::Live,
+            "filter-footer",
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for character in "needle".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        for width in [48, 62, 76, 104, 160] {
+            let footer = render(&app, width, 18).pop().unwrap();
+            assert!(
+                footer.contains("filter:needle"),
+                "committed filter disappeared at width {width}: {footer}"
+            );
+            assert!(
+                !footer.contains("/ filter: needle"),
+                "width {width}: {footer}"
+            );
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let footer = render(&app, 104, 18).pop().unwrap();
+        assert!(footer.contains("/ filter: needlex"), "{footer}");
+        assert!(!footer.contains("filter:needle |"), "{footer}");
+    }
+
+    #[test]
+    fn up_field_shrinks_and_drops_last() {
+        let model = populated_model();
+        let inputs = HeaderInputs::default();
+        let performance = inputs.performance.borrow().clone();
+        let render_header_text = |available_width| {
+            header_line(
+                160,
+                available_width,
+                &model,
+                ObservationQuality::Live,
+                &performance,
+                &inputs,
+                3_661_000,
+            )
+            .spans
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>()
+        };
+
+        let moderate = render_header_text(70);
+        assert!(moderate.contains("up:"), "{moderate}");
+        assert!(!moderate.contains("up:01:01:01"), "{moderate}");
+
+        let after_another_drop = render_header_text(58);
+        assert!(after_another_drop.contains("up:"), "{after_another_drop}");
+        assert!(
+            !after_another_drop.contains("sources:"),
+            "{after_another_drop}"
+        );
+
+        let extreme = render_header_text(18);
+        assert!(!extreme.contains("up:"), "{extreme}");
+        assert!(extreme.contains("session:"), "{extreme}");
+        assert!(extreme.contains("LIVE"), "{extreme}");
     }
 
     #[test]

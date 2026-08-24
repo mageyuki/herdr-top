@@ -12,7 +12,7 @@ use crate::activity::{
 };
 use crate::diagnostics::{ControllerInputStatus, RuntimeDiagnosticsSnapshot};
 use crate::herdr::collector::ObservationQuality;
-use crate::model::{DomainModel, ExecState, Provider, RunId, RunKey, TaskState};
+use crate::model::{DomainModel, ExecState, Provider, RunId, RunKey, TaskRun, TaskState};
 use crate::store::writer::PersistenceStatus;
 
 use super::app::{NodeKey, ViewMode};
@@ -20,6 +20,31 @@ use super::dag;
 use super::view::TreeRow;
 
 pub(crate) const DETAIL_ACTIVITY_LIMIT: usize = 100;
+
+/// Raw run-scoped inputs gathered during paint so elapsed values follow the paint clock.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RunMetricInputs {
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
+    pub(crate) output_tokens: Option<u64>,
+    pub(crate) started_wall_ms: Option<i64>,
+    pub(crate) created_at_ms: Option<i64>,
+    pub(crate) finished_at_ms: Option<i64>,
+    pub(crate) terminal: bool,
+}
+
+pub(crate) fn run_metric_inputs(model: &DomainModel, run: &TaskRun) -> RunMetricInputs {
+    let telemetry = model.telemetry(&run.run_id);
+    RunMetricInputs {
+        model: telemetry.and_then(|telemetry| telemetry.model.clone()),
+        effort: telemetry.and_then(|telemetry| telemetry.effort.clone()),
+        output_tokens: telemetry.map(|telemetry| telemetry.output_tokens),
+        started_wall_ms: telemetry.map(|telemetry| telemetry.started_wall_ms),
+        created_at_ms: run.created_at_ms,
+        finished_at_ms: run.finished_at_ms,
+        terminal: run.state.is_terminal(),
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct RowProjection {
