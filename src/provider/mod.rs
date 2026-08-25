@@ -3317,64 +3317,90 @@ mod tests {
     #[test]
     fn force_request_inside_cooldown_is_deferred_but_not_lost() {
         run_bounded("deferred force rescan", || {
-            let rescan_interval = Duration::from_millis(300);
+            let rescan_interval = Duration::from_secs(1);
             let cycles = Arc::new(Mutex::new(Vec::new()));
-            let worker = CycleRecordingWorker {
+            let (entered_sender, entered_receiver) = mpsc::sync_channel(0);
+            let (release_sender, release_receiver) = mpsc::channel();
+            let worker = GatedCycleRecordingWorker {
                 cycles: Arc::clone(&cycles),
+                entered: entered_sender,
+                release: release_receiver,
+                remaining_gates: 2,
             };
             let (egress, _events) = tokio_mpsc::channel(1);
             let handle =
                 spawn_provider_thread_with_rescan_interval(worker, egress, None, rescan_interval)
                     .unwrap();
-            wait_for_initial_cycle(&cycles);
             let path = PathBuf::from("deferred.jsonl");
+            let initial_gate_error = entered_receiver.recv_timeout(Duration::from_secs(1)).err();
             let requested_at = Instant::now();
-            handle.force_rescan.store(true, Ordering::Release);
-            handle.hint(path.clone());
+            if initial_gate_error.is_none() {
+                handle.force_rescan.store(true, Ordering::Release);
+                handle.hint(path.clone());
+            }
+            let _ = release_sender.send(());
 
-            let hint_deadline = requested_at + Duration::from_millis(250);
-            let scoped_hint = loop {
-                if let Some(cycle) = lock_unpoisoned(&cycles)
-                    .iter()
-                    .find(|cycle| cycle.at >= requested_at && cycle.hint.as_ref() == Some(&path))
-                    .cloned()
-                {
-                    break cycle;
-                }
-                assert!(
-                    Instant::now() < hint_deadline,
-                    "deferred hint was not processed during the cooldown"
-                );
-                thread::yield_now();
+            let scoped_gate_error = if initial_gate_error.is_none() {
+                entered_receiver.recv_timeout(Duration::from_secs(2)).err()
+            } else {
+                Some(mpsc::RecvTimeoutError::Disconnected)
             };
+            // Observe the deferred request while the scoped cycle cannot advance and clear it.
+            let scoped_cycle = scoped_gate_error
+                .is_none()
+                .then(|| lock_unpoisoned(&cycles).last().cloned())
+                .flatten();
+            let force_request_pending =
+                scoped_gate_error.is_none() && handle.force_rescan.load(Ordering::Acquire);
+
+            let full_wait_started = Instant::now();
+            let _ = release_sender.send(());
+            let full_deadline = full_wait_started + rescan_interval + Duration::from_secs(2);
+            let mut deferred_full_rescan_observed = false;
+            if scoped_gate_error.is_none() {
+                while Instant::now() < full_deadline {
+                    if lock_unpoisoned(&cycles)
+                        .iter()
+                        .any(|cycle| cycle.at >= requested_at && cycle.force_rescan)
+                    {
+                        deferred_full_rescan_observed = true;
+                        break;
+                    }
+                    thread::yield_now();
+                }
+            }
+
+            let stop_result = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(handle.stop());
+
             assert!(
-                !scoped_hint.force_rescan,
+                initial_gate_error.is_none(),
+                "initial provider cycle gate timed out: {initial_gate_error:?}"
+            );
+            assert!(
+                scoped_gate_error.is_none(),
+                "scoped provider cycle gate timed out: {scoped_gate_error:?}"
+            );
+            stop_result.unwrap();
+            let scoped_cycle = scoped_cycle.expect("scoped cycle was not recorded");
+            assert_eq!(
+                scoped_cycle.hint.as_ref(),
+                Some(&path),
+                "the gated scoped cycle did not carry the queued hint"
+            );
+            assert!(
+                !scoped_cycle.force_rescan,
                 "force request bypassed the cooldown"
             );
             assert!(
-                handle.force_rescan.load(Ordering::Acquire),
+                force_request_pending,
                 "deferred force request was cleared inside the cooldown"
             );
-
-            let full_deadline = requested_at + rescan_interval + Duration::from_millis(100);
-            loop {
-                if lock_unpoisoned(&cycles)
-                    .iter()
-                    .any(|cycle| cycle.at >= requested_at && cycle.force_rescan)
-                {
-                    break;
-                }
-                assert!(
-                    Instant::now() < full_deadline,
-                    "deferred full rescan was lost"
-                );
-                thread::yield_now();
-            }
-
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(handle.stop())
-                .unwrap();
+            assert!(
+                deferred_full_rescan_observed,
+                "deferred full rescan was lost"
+            );
         });
     }
 
