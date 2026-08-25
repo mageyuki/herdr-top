@@ -243,6 +243,7 @@ pub enum RejectReason {
 pub struct ControllerDiagnosticDeltas {
     pub terminal_blocked_progress_noops: u64,
     pub terminal_forward_reference_creations: u64,
+    pub unknown_lane_terminal_drops: u64,
     pub post_dangling_announcement_components: u64,
 }
 
@@ -735,7 +736,17 @@ impl Reducer {
         });
         scratch.terminal_event_sources = self.terminal_event_sources.clone();
         scratch.non_lane_task_state_runs = self.non_lane_task_state_runs.clone();
-        if matches!(event.event, ControllerEventKind::Dismiss) && subject_was_unknown {
+        let drops_unknown_lane_terminal = subject_was_unknown
+            && metadata.source == crate::provider::lane::SOURCE_LOG_LANE
+            && matches!(
+                event.event,
+                ControllerEventKind::Complete
+                    | ControllerEventKind::Failed
+                    | ControllerEventKind::Cancelled
+            );
+        if subject_was_unknown
+            && (matches!(event.event, ControllerEventKind::Dismiss) || drops_unknown_lane_terminal)
+        {
             metadata.task_run_id = None;
         }
         let normalized = NormalizedEvent::ControllerEvent {
@@ -743,6 +754,22 @@ impl Reducer {
             event: event.event.clone(),
         };
         let mut persist = Vec::new();
+        if drops_unknown_lane_terminal {
+            let diagnostic_deltas = ControllerDiagnosticDeltas {
+                unknown_lane_terminal_drops: 1,
+                post_dangling_announcement_components:
+                    crate::model::graph::dangling_announcement_components(&scratch.model),
+                ..ControllerDiagnosticDeltas::default()
+            };
+            return Ok(MaterializedDelta {
+                post_model: scratch.model,
+                post_next_ordinal: scratch.next_ordinal,
+                post_terminal_event_sources: scratch.terminal_event_sources,
+                post_non_lane_task_state_runs: scratch.non_lane_task_state_runs,
+                diagnostic_deltas,
+                batch: persist,
+            });
+        }
         if matches!(event.event, ControllerEventKind::Dismiss) {
             if let Some(mut task_run) = scratch.model.task_run(&subject).cloned() {
                 task_run.dismissed_at_ms = Some(metadata.receipt_time_ms);
@@ -910,6 +937,7 @@ impl Reducer {
         diagnostics.record_terminal_forward_reference_creations(
             deltas.terminal_forward_reference_creations,
         );
+        diagnostics.record_unknown_lane_terminal_drops(deltas.unknown_lane_terminal_drops);
         diagnostics
             .set_dangling_announcement_components(deltas.post_dangling_announcement_components);
     }
@@ -3975,6 +4003,231 @@ mod tests {
             })
             .unwrap();
         assert_eq!(recorded.task_run_id, None);
+    }
+
+    #[test]
+    fn lane_terminal_events_for_unknown_runs_are_dropped_without_ledger_or_placeholders() {
+        for (event_slug, event_kind) in [
+            ("complete", ControllerEventKind::Complete),
+            ("failed", ControllerEventKind::Failed),
+            ("cancelled", ControllerEventKind::Cancelled),
+        ] {
+            let controller_key = format!("unknown-lane-{event_slug}");
+            let (reducer, _) = Reducer::new(restored(DomainModel::default(), 41));
+            let mut event =
+                controller_event(&format!("lane-{event_slug}"), &controller_key, event_kind);
+            event.metadata.source = SOURCE_LOG_LANE.to_owned();
+
+            let delta = reducer
+                .validate_controller_event(&event)
+                .expect("a dropped lane terminal must be handled without rejection");
+
+            assert_eq!(
+                delta.post_model.task_runs().count(),
+                0,
+                "an unknown lane {event_slug} must not create a run"
+            );
+            assert!(
+                delta
+                    .post_model
+                    .task_run_by_key(&RunKey::Controller(controller_key.clone()))
+                    .is_none(),
+                "the exact lane {event_slug} Controller key must remain absent"
+            );
+            assert_eq!(
+                delta.post_next_ordinal, 41,
+                "dropping lane {event_slug} must not consume a display ordinal"
+            );
+            assert_eq!(
+                delta.diagnostic_deltas.terminal_forward_reference_creations, 0,
+                "a dropped lane {event_slug} is not a terminal forward-reference creation"
+            );
+            assert_eq!(
+                delta.diagnostic_deltas.unknown_lane_terminal_drops, 1,
+                "a dropped lane {event_slug} must increment its diagnostic exactly once"
+            );
+            assert!(
+                delta.batch.iter().all(|operation| !matches!(
+                    operation,
+                    PersistOp::UpsertTaskRun(_)
+                        | PersistOp::UpsertExecution(_)
+                        | PersistOp::UpsertExecutionEdge { .. }
+                        | PersistOp::UpsertDependencyEdge { .. }
+                )),
+                "dropping lane {event_slug} must not persist runs, executions, or edges"
+            );
+            assert!(
+                delta
+                    .batch
+                    .iter()
+                    .all(|operation| !matches!(operation, PersistOp::RecordEvent { .. })),
+                "the dropped lane {event_slug} must not enter the durable ledger"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_unknown_lane_terminal_replays_after_creator_interleaving() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let controller_key = "unknown-lane-failed-replay";
+        let mut terminal = controller_event(
+            "lane-failed-replay",
+            controller_key,
+            ControllerEventKind::Failed,
+        );
+        terminal.metadata.source = SOURCE_LOG_LANE.to_owned();
+        terminal.metadata.timestamp_ms = unix_now_ms();
+        terminal.metadata.receipt_time_ms = terminal.metadata.timestamp_ms;
+
+        let dropped = reducer
+            .validate_controller_event(&terminal)
+            .expect("the early lane terminal must be dropped without rejection");
+        let dropped_recorded = dropped
+            .batch
+            .iter()
+            .any(|operation| matches!(operation, PersistOp::RecordEvent { .. }));
+        let permit = writer.reserve_enqueue().unwrap();
+        let pending = reducer.commit_staged(dropped, permit).unwrap();
+        writer.finish_pending(pending).await.unwrap();
+        assert_eq!(
+            shared
+                .borrow()
+                .controller_diagnostics()
+                .unknown_lane_terminal_drops(),
+            1,
+            "committing the drop must publish its diagnostic"
+        );
+        assert!(
+            shared
+                .borrow()
+                .task_run_by_key(&RunKey::Controller(controller_key.to_owned()))
+                .is_none(),
+            "the early lane terminal must not create its target run"
+        );
+
+        let mut dispatch = controller_event(
+            "lane-dispatch-after-failed",
+            controller_key,
+            ControllerEventKind::Dispatch {
+                parent_task_run_id: "lane-parent".to_owned(),
+            },
+        );
+        dispatch.metadata.source = SOURCE_LOG_LANE.to_owned();
+        commit_controller(&mut reducer, &mut writer, dispatch).await;
+        let mut started = controller_event(
+            "lane-started-after-failed",
+            controller_key,
+            ControllerEventKind::TaskStarted,
+        );
+        started.metadata.source = SOURCE_LOG_LANE.to_owned();
+        commit_controller(&mut reducer, &mut writer, started).await;
+        assert_eq!(
+            shared
+                .borrow()
+                .task_run_by_key(&RunKey::Controller(controller_key.to_owned()))
+                .expect("the creator events must create the exact child run")
+                .state,
+            TaskState::Running
+        );
+
+        let replay_admitted = !writer.is_duplicate(&terminal.metadata.event_id);
+        if replay_admitted {
+            commit_controller(&mut reducer, &mut writer, terminal.clone()).await;
+        }
+        let final_state = shared
+            .borrow()
+            .task_run_by_key(&RunKey::Controller(controller_key.to_owned()))
+            .expect("the creator events must preserve the child run")
+            .state;
+        lifecycle.shutdown().await.unwrap();
+
+        assert_eq!(
+            (dropped_recorded, replay_admitted, final_state),
+            (false, true, TaskState::Failed),
+            "the dropped terminal must write no ledger row so its identical event-id replay can apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_lane_terminal_drop_counter_is_recorded_once_per_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let mut dropped = controller_event(
+            "counter-dropped-lane-terminal",
+            "counter-unknown-lane-run",
+            ControllerEventKind::Failed,
+        );
+        dropped.metadata.source = SOURCE_LOG_LANE.to_owned();
+        commit_controller(&mut reducer, &mut writer, dropped).await;
+
+        let mut started = controller_event(
+            "counter-existing-lane-started",
+            "counter-existing-lane-run",
+            ControllerEventKind::TaskStarted,
+        );
+        started.metadata.source = SOURCE_LOG_LANE.to_owned();
+        commit_controller(&mut reducer, &mut writer, started).await;
+        let mut applied = controller_event(
+            "counter-existing-lane-terminal",
+            "counter-existing-lane-run",
+            ControllerEventKind::Failed,
+        );
+        applied.metadata.source = SOURCE_LOG_LANE.to_owned();
+        commit_controller(&mut reducer, &mut writer, applied).await;
+
+        let counters = serde_json::to_value(crate::diagnostics::controller_counter_snapshot(
+            &shared.borrow(),
+        ))
+        .unwrap();
+        lifecycle.shutdown().await.unwrap();
+        assert_eq!(
+            counters.get("unknown_lane_terminal_drops"),
+            Some(&serde_json::json!(1)),
+            "one unknown lane terminal must increment the counter exactly once, while an applied lane terminal must not"
+        );
+    }
+
+    #[test]
+    fn non_lane_terminal_for_unknown_run_keeps_forward_reference_creation() {
+        let controller_key = "hook-terminal-forward-reference";
+        let (reducer, _) = Reducer::new(restored(DomainModel::default(), 1));
+        let mut event = controller_event(
+            "hook-complete-unknown",
+            controller_key,
+            ControllerEventKind::Complete,
+        );
+        event.metadata.source = "hook:claude-code".to_owned();
+
+        let delta = reducer
+            .validate_controller_event(&event)
+            .expect("a hook terminal forward reference must retain existing semantics");
+
+        let run = delta
+            .post_model
+            .task_run_by_key(&RunKey::Controller(controller_key.to_owned()))
+            .expect("the non-lane terminal must create its Controller run");
+        assert_eq!(run.state, TaskState::Completed);
+        assert_eq!(delta.post_next_ordinal, 2);
+        assert_eq!(
+            delta.diagnostic_deltas.terminal_forward_reference_creations,
+            1
+        );
+        let recorded = delta
+            .batch
+            .iter()
+            .find_map(|operation| match operation {
+                PersistOp::RecordEvent { event, .. } => Some(super::event_metadata(event)),
+                _ => None,
+            })
+            .expect("the hook terminal must be recorded");
+        assert_eq!(recorded.task_run_id, Some(run.run_id));
     }
 
     #[tokio::test]

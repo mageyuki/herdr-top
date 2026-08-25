@@ -114,11 +114,22 @@ directories (raw tool output), and any file class not named in §5.
 Backfill anchor (v2, resolves a plan/spec conflict): the anchor is
 `max(earliest own-DB event for this session, now − HERDR_TOP_BACKFILL_WINDOW_MS)`
 — the window is a hard scan bound; the DB can only narrow it, never widen
-it. Files strictly older than the anchor are skipped unless admitted by
-lineage evidence. Pane-root artifacts (the transcript or rollout of an
-admitted pane session) are likewise exempt from the anchor — a live but
-idle pane's own artifact must not become invisible when its mtime falls
-behind the window.
+it. Lineage evidence admits an artifact's identity for descendant
+discovery and attachment, but reading that artifact still honors the
+anchor. An evidence-admitted artifact whose mtime is strictly older than
+the anchor is not read. Pane-root artifacts (the transcript or rollout of
+an admitted pane session) are likewise exempt from the anchor — a live
+but idle pane's own artifact must not become invisible when its mtime
+falls behind the window.
+
+Known accepted residual: within-window UUID echoes can still cause a
+false attachment. A fresh tool output that merely names a concurrently
+active unrelated session can admit that session's artifact while its
+mtime remains inside the window. Window-bounding removes the multi-day
+replay and limits the blast radius, but it does not eliminate the class.
+A full fix requires dispatch-shaped context parsing that distinguishes a
+UUID in an actual dispatch or spawn record from one merely embedded in
+tool output; that parsing is deliberately out of scope here.
 
 Watching: the existing worker's notify + rescan machinery; per-file
 `SourcePosition` offsets; polling degradation. Idle cost stays
@@ -141,6 +152,17 @@ Outside-pane execution and session isolation: unchanged from v1.
 | 9 | Completion: codex tail `task_complete`; Claude child = parent notification with `status=completed`; `status=failed` (verified 7 occurrences) maps to `Failed`; codex `turn_aborted` maps to `Cancelled` | `complete`/`failed`/`cancelled` via the grace rule |
 | 10 | Death backstop: append silence past `HERDR_TOP_HEADLESS_INACTIVITY_MS` | the lane synthesizes its OWN `ended_unknown` transition (v2: the existing observation close path is unreachable for lane-created runs because synthesized controller events set `has_controller_task_state_event`, and `src/reducer.rs:1626-1638` early-returns on it). The lane's close honors the same guards: never on terminal, never on dismissed, never when pane-occupied (has an execution), and never with non-lane-sourced task-state evidence |
 | 11 | Liveness: any append | refresh the run's `updated_at` — ROOTS INCLUDED; dismissal is checked BEFORE touching (touch clears `dismissed_at_ms` on the non-terminal branch) |
+
+Lane creation invariant: only synthesized `dispatch` and `task_started`
+events create Task Runs. Lane-synthesized `complete`, `failed`, and
+`cancelled` events apply only to an existing run; an unknown target is
+dropped without a ledger entry and without minting a run or relationship
+placeholder. On cold replay, sorted discovery processes the child's
+`subagents/` artifacts, including its metadata creator, before the sibling
+parent transcript that supplies the terminal, so the terminal converges onto
+the created run. A child that remains outside the evidence window is cheaply
+re-dropped on each cold start. Hook-path terminal events keep their existing
+forward-reference creation behavior.
 
 Completion grace and reopen (unchanged mechanism, v2 provenance):
 `task_complete` → grace (`HERDR_TOP_COMPLETE_GRACE_MS`) → `complete`.

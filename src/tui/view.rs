@@ -1094,10 +1094,11 @@ fn help_lines(diagnostics: &RuntimeDiagnosticsSnapshot, setup: &TuiSetup) -> Vec
     ));
     let controller = diagnostics.controller_counters;
     lines.push(format!(
-        "controller counters: binding_conflicts={} terminal_blocked_progress_noops={} terminal_forward_reference_creations={}",
+        "controller counters: binding_conflicts={} terminal_blocked_progress_noops={} terminal_forward_reference_creations={} unknown_lane_terminal_drops={}",
         controller.binding_conflicts,
         controller.terminal_blocked_progress_noops,
         controller.terminal_forward_reference_creations,
+        controller.unknown_lane_terminal_drops,
     ));
     lines.push(format!(
         "controller counters continued: ingest_sequence_exhaustions={} provider_parent_conflicts={} provider_identity_disagreements={} socket_saturations={} accept_failures={}",

@@ -4179,7 +4179,7 @@ impl ProviderWorker for AdapterProviderWorker {
                 let tail = match TailFile::open(
                     &file.root,
                     &file.relative_path,
-                    // Admission applies the anchor plus pane-root and explicit-lineage exemptions.
+                    // Admission applies the anchor except to pane-root identities.
                     // Read each admitted artifact from zero to reconstruct transient lane state.
                     &crate::provider::FirstSeenBaseline::default(),
                     generation,
@@ -12898,6 +12898,7 @@ mod provider_integration_tests {
 
     #[tokio::test]
     async fn graceful_provider_stop_emits_complete_held_in_grace() {
+        const ROLLOUT_ID: &str = "22222222-2222-4222-8222-222222222222";
         let now_ms = unix_now_ms();
         let diagnostics = crate::provider::ProviderDiagnostics::default();
         let mut worker = AdapterProviderWorker::new_with_log_lane_config(
@@ -12910,12 +12911,35 @@ mod provider_integration_tests {
             None,
         );
         assert!(worker.synthesis.advance_lifecycle(now_ms).is_empty());
+        let creator = worker
+            .synthesis
+            .synthesize_batch(
+                Path::new("rollout.jsonl"),
+                [(
+                    0,
+                    crate::provider::facts::LogFact::CodexMeta {
+                        rollout_id: ROLLOUT_ID.to_owned(),
+                        cwd: "/workspace".to_owned(),
+                        originator: "codex".to_owned(),
+                        internal: None,
+                        cli_version: "0.1.0".to_owned(),
+                    },
+                )],
+                &mut worker.log_admission,
+                &worker.admission_index,
+            )
+            .into_iter()
+            .find_map(|event| match event {
+                ProviderEvent::Synthesized(event) => Some(event),
+                _ => None,
+            })
+            .expect("Codex metadata must synthesize the creator TaskStarted");
         let held = worker.synthesis.synthesize_batch(
             Path::new("rollout.jsonl"),
             [(
                 4,
                 crate::provider::facts::LogFact::CodexTurnComplete {
-                    rollout_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+                    rollout_id: ROLLOUT_ID.to_owned(),
                     at_ms: now_ms,
                 },
             )],
@@ -12933,10 +12957,19 @@ mod provider_integration_tests {
         let (lifecycle, writer) = spawn_writer(store).unwrap();
         let (persistence, diagnostics) =
             RuntimePersistence::new_for_test(writer, Arc::new(TestOccurrenceSink));
+        let (creator_reducer, _) = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let creator_delta = creator_reducer
+            .validate_controller_event(&creator)
+            .expect("the creator TaskStarted must establish the Codex run");
         let (reducer, shared, operator) = Reducer::new_with_operator(
             RestoredState {
-                model: DomainModel::default(),
-                next_ordinal: 1,
+                model: creator_delta.post_model,
+                next_ordinal: creator_delta.post_next_ordinal,
                 next_ingest_seq: Some(1),
                 event_ledger: Vec::new(),
             },
@@ -13016,7 +13049,7 @@ mod provider_integration_tests {
                 .model
                 .task_run_by_key(&RunKey::Native {
                     provider: Provider::Codex,
-                    sid: "22222222-2222-4222-8222-222222222222".to_owned(),
+                    sid: ROLLOUT_ID.to_owned(),
                 })
                 .unwrap()
                 .state,

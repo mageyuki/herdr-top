@@ -1380,12 +1380,12 @@ impl Admission {
             .any(|session_id| claude_session_path_matches(path, session_id))
     }
 
-    /// Applies the hard backfill anchor to an otherwise admitted regular file.
+    /// Applies the hard backfill anchor to every admitted regular file except a
+    /// pane-root or exact pane-path identity.
     #[must_use]
     pub fn is_admitted_file(&self, path: &Path, modified_ms: i64) -> bool {
         self.is_admitted_path(path)
             && (modified_ms >= self.anchor_ms
-                || self.admitted_paths.contains(path)
                 || self.pane_paths.contains(path)
                 || self.is_pane_root_path(path))
     }
@@ -1799,7 +1799,7 @@ mod tests {
     use crate::hook_adapter::{HookPayload, HookProvider, map_hook_payload};
     use crate::model::{
         AgentNodeObservation, ControllerEvent, ControllerEventKind, DomainModel, EventMetadata,
-        MinimalProviderMetadata, NormalizedEvent, Provider, RunKey, SourceCoverage,
+        MinimalProviderMetadata, NormalizedEvent, Provider, RunKey, SourceCoverage, TaskState,
     };
     use crate::provider::claude::{ClaudePathTopology, path_topology};
     use crate::provider::claude_facts::extract_claude_line;
@@ -2182,7 +2182,7 @@ mod tests {
     }
 
     #[test]
-    fn one_record_with_two_task_notifications_applies_both_terminal_events() {
+    fn lane_terminal_task_notifications_for_unannounced_children_do_not_create_runs() {
         let record = r#"{"type":"queue-operation","content":"<task-notification><task-id>1111111111111111</task-id><status>completed</status></task-notification><task-notification><task-id>2222222222222222</task-id><status>failed</status></task-notification>"}"#;
         let facts = extract_claude_line(&SessionScope::ClaudeRoot(PARENT.to_owned()), record)
             .into_iter()
@@ -2209,11 +2209,25 @@ mod tests {
                 "log:queue.jsonl:7:failed:2222222222222222",
             ])
         );
-        assert_eq!(apply_once_per_event_id(&events).task_runs().count(), 2);
+        let model = apply_once_per_event_id(&events);
+        assert_eq!(
+            model.task_runs().count(),
+            0,
+            "unannounced task notifications must not mint Task Runs"
+        );
+        for agent_id in ["1111111111111111", "2222222222222222"] {
+            let expected_key = format!("hook:claude-code:{PARENT}:agent:{agent_id}");
+            assert!(
+                model
+                    .task_run_by_key(&RunKey::Controller(expected_key.clone()))
+                    .is_none(),
+                "notification-only child key {expected_key} must remain absent"
+            );
+        }
     }
 
     #[test]
-    fn append_start_and_subagent_end_at_one_ordinal_both_apply() {
+    fn append_start_applies_while_unannounced_subagent_end_is_dropped() {
         let mut synthesis = Synthesis::default();
         let mut events = synthesize(
             &mut synthesis,
@@ -2251,7 +2265,124 @@ mod tests {
                 "log:session.jsonl:11:complete:child",
             ])
         );
-        assert_eq!(apply_once_per_event_id(&events).task_runs().count(), 2);
+        let model = apply_once_per_event_id(&events);
+        assert_eq!(
+            model.task_runs().count(),
+            1,
+            "the root append may create only the root run"
+        );
+        assert!(
+            model
+                .task_run_by_key(&RunKey::Controller(format!("hook:claude-code:{PARENT}")))
+                .is_some(),
+            "the append-derived root TaskStarted must still create its run"
+        );
+        let child_key = format!("hook:claude-code:{PARENT}:agent:child");
+        assert!(
+            model
+                .task_run_by_key(&RunKey::Controller(child_key.clone()))
+                .is_none(),
+            "the same-record terminal-only child key {child_key} must remain absent"
+        );
+    }
+
+    #[test]
+    fn announced_subagent_notification_completes_run_created_by_lane_dispatch() {
+        const AGENT: &str = "a1b2c3d4e5f60718";
+        let child_key = format!("hook:claude-code:{PARENT}:agent:{AGENT}");
+        let mut synthesis = Synthesis::with_lifecycle_timing(30, 600);
+        let creators = synthesize(
+            &mut synthesis,
+            "agent-announced-child.meta.json",
+            [(
+                0,
+                LogFact::SubagentAppeared {
+                    parent: PARENT.to_owned(),
+                    agent_id: AGENT.to_owned(),
+                    agent_type: "reviewer".to_owned(),
+                    description: "Review the reducer gate".to_owned(),
+                },
+            )],
+        );
+        let creator_events = synthesized_events(&creators);
+        let dispatch = creator_events
+            .iter()
+            .find(|event| matches!(event.event, ControllerEventKind::Dispatch { .. }))
+            .expect("subagent metadata must synthesize Dispatch");
+        let started = creator_events
+            .iter()
+            .find(|event| matches!(event.event, ControllerEventKind::TaskStarted))
+            .expect("subagent metadata must synthesize TaskStarted");
+        let (reducer, _) = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+
+        let dispatched = reducer
+            .validate_controller_event(dispatch)
+            .expect("lane Dispatch must create the announced child");
+        let child = dispatched
+            .post_model
+            .task_run_by_key(&RunKey::Controller(child_key.clone()))
+            .expect("Dispatch must create the exact child Controller key");
+        assert_eq!(child.state, TaskState::Queued);
+        let (reducer, _) = Reducer::new(RestoredState {
+            model: dispatched.post_model,
+            next_ordinal: dispatched.post_next_ordinal,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let running = reducer
+            .validate_controller_event(started)
+            .expect("lane TaskStarted must start the announced child");
+        assert_eq!(
+            running
+                .post_model
+                .task_run_by_key(&RunKey::Controller(child_key.clone()))
+                .expect("TaskStarted must preserve the child run")
+                .state,
+            TaskState::Running
+        );
+
+        let notification = format!(
+            r#"{{"type":"queue-operation","content":"<task-notification><task-id>{AGENT}</task-id><status>completed</status></task-notification>"}}"#
+        );
+        let held = synthesize(
+            &mut synthesis,
+            "parent.jsonl",
+            extract_claude_line(&SessionScope::ClaudeRoot(PARENT.to_owned()), &notification)
+                .into_iter()
+                .map(|fact| (7, fact)),
+        );
+        assert!(
+            synthesized_events(&held).is_empty(),
+            "the completion must remain grace-held before the flush"
+        );
+        let flushed = synthesis.advance_lifecycle(31);
+        let complete = synthesized_events(&flushed)
+            .into_iter()
+            .find(|event| matches!(event.event, ControllerEventKind::Complete))
+            .expect("the due-grace flush must release the completion");
+        let (reducer, _) = Reducer::new(RestoredState {
+            model: running.post_model,
+            next_ordinal: running.post_next_ordinal,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let completed = reducer
+            .validate_controller_event(complete)
+            .expect("the terminal must apply to the run created by Dispatch");
+
+        assert_eq!(
+            completed
+                .post_model
+                .task_run_by_key(&RunKey::Controller(child_key))
+                .expect("the completed child must retain its Controller key")
+                .state,
+            TaskState::Completed
+        );
     }
 
     #[test]
@@ -2840,7 +2971,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_end_without_append_holds_for_full_grace() {
+    fn lane_terminal_grace_flush_for_unannounced_child_does_not_create_run() {
         let mut synthesis = Synthesis::with_lifecycle_timing(30, 600);
         assert!(synthesis.advance_lifecycle(100).is_empty());
 
@@ -2859,12 +2990,66 @@ mod tests {
 
         assert!(synthesized_events(&held).is_empty());
         assert!(synthesis.advance_lifecycle(129).is_empty());
+        let flushed = synthesis.advance_lifecycle(130);
         assert!(matches!(
-            synthesized_events(&synthesis.advance_lifecycle(130)).as_slice(),
+            synthesized_events(&flushed).as_slice(),
             [event]
                 if matches!(event.event, ControllerEventKind::Complete)
                     && event.metadata.timestamp_ms == 100
         ));
+        let model = apply_once_per_event_id(&flushed);
+        let child_key = format!("hook:claude-code:{PARENT}:agent:child");
+        assert_eq!(
+            model.task_runs().count(),
+            0,
+            "a due-grace completion for an unknown child must not recreate a run"
+        );
+        assert!(
+            model
+                .task_run_by_key(&RunKey::Controller(child_key.clone()))
+                .is_none(),
+            "the due-grace child key {child_key} must remain absent"
+        );
+    }
+
+    #[test]
+    fn lane_terminal_shutdown_flush_for_unannounced_child_does_not_create_run() {
+        let mut synthesis = Synthesis::with_lifecycle_timing(30, 600);
+        let held = synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                4,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "shutdown-child".to_owned(),
+                    failed: false,
+                },
+            )],
+        );
+        assert!(
+            synthesized_events(&held).is_empty(),
+            "the completion must be held before shutdown flush"
+        );
+
+        let flushed = synthesis.flush_pending_completes();
+        assert!(matches!(
+            synthesized_events(&flushed).as_slice(),
+            [event] if matches!(event.event, ControllerEventKind::Complete)
+        ));
+        let model = apply_once_per_event_id(&flushed);
+        let child_key = format!("hook:claude-code:{PARENT}:agent:shutdown-child");
+        assert_eq!(
+            model.task_runs().count(),
+            0,
+            "a shutdown-flushed completion for an unknown child must not create a run"
+        );
+        assert!(
+            model
+                .task_run_by_key(&RunKey::Controller(child_key.clone()))
+                .is_none(),
+            "the shutdown-flushed child key {child_key} must remain absent"
+        );
     }
 
     #[test]
@@ -3752,7 +3937,7 @@ mod tests {
     }
 
     #[test]
-    fn per_file_anchor_bounds_descendants_but_not_exact_or_pane_roots() {
+    fn per_file_anchor_only_exempts_pane_roots() {
         let mut admission = Admission::new(1_000);
         admission.admit_pane_session(Provider::Claude, PARENT);
         let pane_root = PathBuf::from(format!("/logs/workspace/{PARENT}.jsonl"));
@@ -3774,9 +3959,23 @@ mod tests {
                 .is_some()
         );
 
-        assert!(admission.is_admitted_file(&pane_root, 100));
+        assert!(
+            admission.is_admitted_path(&evidence_path),
+            "lineage evidence must still admit the artifact identity"
+        );
+        assert!(
+            admission.is_admitted_file(&pane_root, 100),
+            "pane roots must remain readable before the anchor"
+        );
         assert!(!admission.is_admitted_file(&subagent, 999));
-        assert!(admission.is_admitted_file(&evidence_path, 100));
+        assert!(
+            !admission.is_admitted_file(&evidence_path, 100),
+            "old evidence-admitted artifacts must honor the anchor"
+        );
+        assert!(
+            admission.is_admitted_file(&evidence_path, 1_000),
+            "fresh evidence-admitted artifacts must remain readable"
+        );
         assert!(admission.is_admitted_file(&subagent, 1_000));
     }
 
