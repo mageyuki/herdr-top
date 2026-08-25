@@ -756,9 +756,16 @@ fn discover_artifacts(root: &Path, include_meta: bool) -> io::Result<ArtifactDis
                         continue;
                     }
                 };
+                let modified_ms = match metadata.modified() {
+                    Ok(modified) => system_time_ms(modified),
+                    Err(_) => {
+                        had_errors = true;
+                        continue;
+                    }
+                };
                 found.push(DiscoveredArtifactEntry {
                     relative_path: relative,
-                    modified_ms: system_time_ms(metadata.modified().unwrap_or(UNIX_EPOCH)),
+                    modified_ms,
                 });
             }
         }
