@@ -3731,6 +3731,7 @@ impl AdapterProviderWorker {
     fn finish_completed_sweeps(
         &mut self,
         universes: &HashMap<Provider, HashSet<AvailabilitySweepMember>>,
+        applicable_providers: &HashSet<Provider>,
         pending: &mut PendingEvents,
     ) {
         for provider in [Provider::Claude, Provider::Codex] {
@@ -3742,13 +3743,18 @@ impl AdapterProviderWorker {
             if !universe.is_subset(&sweep.visited) {
                 continue;
             }
-            let state = sweep
-                .failure
-                .map_or(ProviderSourceState::Available, |failure| {
-                    ProviderSourceState::Unavailable {
-                        detail: failure.detail().to_owned(),
+            let state = sweep.failure.map_or_else(
+                || {
+                    if applicable_providers.contains(&provider) {
+                        ProviderSourceState::Available
+                    } else {
+                        ProviderSourceState::NotApplicable
                     }
-                });
+                },
+                |failure| ProviderSourceState::Unavailable {
+                    detail: failure.detail().to_owned(),
+                },
+            );
             let _ = pending.merge(ProviderEvent::SourceState { provider, state });
             sweep.visited.clear();
             sweep.failure = None;
@@ -3894,24 +3900,38 @@ impl ProviderWorker for AdapterProviderWorker {
                 .then_with(|| (left.0).1.cmp(&(right.0).1))
         });
         let mut universes: HashMap<Provider, HashSet<AvailabilitySweepMember>> = HashMap::new();
+        let mut applicable_providers = HashSet::new();
         let mut work = Vec::new();
-        for ((provider, root), _targets) in roots {
+        for ((provider, root), targets) in roots {
+            let speculative = targets.is_empty();
             let root_member = AvailabilitySweepMember::Root(root.clone());
             universes
                 .entry(provider)
                 .or_default()
                 .insert(root_member.clone());
-            if let Err(error) = std::fs::read_dir(&root) {
-                let failure = match error.kind() {
-                    io::ErrorKind::NotFound => AvailabilitySweepFailure::RootNotFound,
-                    io::ErrorKind::PermissionDenied => {
-                        AvailabilitySweepFailure::RootPermissionDenied
+            if !speculative {
+                applicable_providers.insert(provider);
+            }
+            match std::fs::read_dir(&root) {
+                Ok(_) => {
+                    applicable_providers.insert(provider);
+                }
+                Err(error) => {
+                    // A missing discovery-only root means the provider is not installed or in use.
+                    // Explicit artifact roots remain applicable and report the missing root.
+                    if error.kind() != io::ErrorKind::NotFound || !speculative {
+                        let failure = match error.kind() {
+                            io::ErrorKind::NotFound => AvailabilitySweepFailure::RootNotFound,
+                            io::ErrorKind::PermissionDenied => {
+                                AvailabilitySweepFailure::RootPermissionDenied
+                            }
+                            _ => AvailabilitySweepFailure::FileIoError,
+                        };
+                        self.record_sweep_failure(provider, failure);
                     }
-                    _ => AvailabilitySweepFailure::FileIoError,
-                };
-                self.record_sweep_failure(provider, failure);
-                self.visit_sweep_member(provider, root_member);
-                continue;
+                    self.visit_sweep_member(provider, root_member);
+                    continue;
+                }
             }
             let fallback_root = !self.is_standard_root(provider, &root);
             let root_key = (provider, root.clone());
@@ -4058,7 +4078,7 @@ impl ProviderWorker for AdapterProviderWorker {
             }
         });
         if work.is_empty() {
-            self.finish_completed_sweeps(&universes, cycle.pending);
+            self.finish_completed_sweeps(&universes, &applicable_providers, cycle.pending);
             self.emit_due_lifecycle_events(cycle.pending);
             return Ok(());
         }
@@ -4133,7 +4153,11 @@ impl ProviderWorker for AdapterProviderWorker {
                         );
                         if !merge_adapter_events(events, cycle.pending, &mut self.deferred) {
                             self.resume_cursor = Some(cursor_for_work(item));
-                            self.finish_completed_sweeps(&universes, cycle.pending);
+                            self.finish_completed_sweeps(
+                                &universes,
+                                &applicable_providers,
+                                cycle.pending,
+                            );
                             return Ok(());
                         }
                     }
@@ -4247,7 +4271,7 @@ impl ProviderWorker for AdapterProviderWorker {
                     )
                 {
                     self.resume_cursor = Some(cursor_for_work(item));
-                    self.finish_completed_sweeps(&universes, cycle.pending);
+                    self.finish_completed_sweeps(&universes, &applicable_providers, cycle.pending);
                     return Ok(());
                 }
             }
@@ -4315,7 +4339,11 @@ impl ProviderWorker for AdapterProviderWorker {
                             &work[0]
                         };
                         self.resume_cursor = Some(cursor_for_work(next));
-                        self.finish_completed_sweeps(&universes, cycle.pending);
+                        self.finish_completed_sweeps(
+                            &universes,
+                            &applicable_providers,
+                            cycle.pending,
+                        );
                         return Ok(());
                     }
                 }
@@ -4353,7 +4381,7 @@ impl ProviderWorker for AdapterProviderWorker {
             }
         }
         self.resume_cursor = None;
-        self.finish_completed_sweeps(&universes, cycle.pending);
+        self.finish_completed_sweeps(&universes, &applicable_providers, cycle.pending);
         self.emit_due_lifecycle_events(cycle.pending);
         Ok(())
     }
@@ -13874,6 +13902,91 @@ mod provider_integration_tests {
                 offset: 0,
             },
         }
+    }
+
+    #[test]
+    fn missing_speculative_standard_root_is_not_applicable_and_preserves_live_quality() {
+        const SESSION_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("fresh/.codex/sessions");
+        assert!(!root.exists(), "test root must remain genuinely absent");
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root,
+            }],
+            diagnostics.clone(),
+        );
+        let targets = TargetSet::new_with_sessions(
+            Vec::<ProviderTarget>::new(),
+            [(Provider::Codex, SESSION_ID.to_owned())],
+        );
+        let mut pending = PendingEvents::new(diagnostics);
+        let (quality_sender, quality) = watch::channel(ObservationQuality::Reconciling);
+        let (coverage_sender, coverage) =
+            watch::channel(SourceCoverageRegistry::new(SourceAvailability::Available));
+        let mut tracker = CoverageTracker::new(
+            SourceAvailability::Available,
+            coverage_sender,
+            quality_sender,
+        );
+        tracker.set_herdr_quality(ObservationQuality::Live);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let events = drain_pending(&mut pending);
+        apply_source_states(&mut tracker, &events);
+
+        assert_eq!(
+            provider_source_state(&events, Provider::Codex),
+            Some(ProviderSourceState::NotApplicable),
+            "an absent speculative root was reported as provider breakage: {events:?}"
+        );
+        assert_eq!(
+            coverage.borrow().state(CoverageSource::Codex),
+            &SourceAvailability::NotApplicable
+        );
+        assert_eq!(*quality.borrow(), ObservationQuality::Live);
+    }
+
+    #[test]
+    fn unreadable_speculative_standard_root_is_unavailable() {
+        const SESSION_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("unreadable/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied,
+            "test environment must enforce unreadable directory permissions"
+        );
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let targets = TargetSet::new_with_sessions(
+            Vec::<ProviderTarget>::new(),
+            [(Provider::Codex, SESSION_ID.to_owned())],
+        );
+        let mut pending = PendingEvents::new(diagnostics);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let events = drain_pending(&mut pending);
+
+        assert_eq!(
+            provider_source_state(&events, Provider::Codex),
+            Some(ProviderSourceState::Unavailable {
+                detail: "root_permission_denied".to_owned(),
+            })
+        );
     }
 
     #[test]
