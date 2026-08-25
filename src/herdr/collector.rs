@@ -2503,7 +2503,7 @@ async fn replay_generation(
                 &mut closures,
                 &mut candidates,
             );
-            apply_received_event(
+            let _ = apply_received_event(
                 reducer,
                 shared,
                 persistence,
@@ -2983,13 +2983,12 @@ async fn monitor_live(
                 continue;
             }
             LiveReceipt::Primary(received) => {
-                watchdog_probe = None;
-                watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
                 let (received, admission) = received.into_parts();
                 let target_delta = enrichment_target_delta(&received, shared);
-                let anomalous =
-                    updated_entity(&received).is_some_and(|entity| !entity_exists(shared, &entity));
-                apply_received_event(
+                let anomalous = !is_focus_frame(&received.event)
+                    && updated_entity(&received)
+                        .is_some_and(|entity| !entity_exists(shared, &entity));
+                let produced_observations = apply_received_event(
                     reducer,
                     shared,
                     persistence,
@@ -3001,6 +3000,10 @@ async fn monitor_live(
                     provider,
                 )
                 .await?;
+                if produced_observations {
+                    watchdog_probe = None;
+                    watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
+                }
                 enrichment.apply_target_delta(target_delta);
                 if anomalous || overflowed.swap(false, Ordering::AcqRel) {
                     return Ok(ReplayOutcome::Dirty);
@@ -3139,11 +3142,9 @@ async fn monitor_reconciling(
             }
             ReconcilingReceipt::Primary(received) => received,
         };
-        watchdog_probe = None;
-        watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
         let (received, admission) = received.into_parts();
         let target_delta = enrichment_target_delta(&received, shared);
-        apply_received_event(
+        let produced_observations = apply_received_event(
             reducer,
             shared,
             persistence,
@@ -3155,6 +3156,10 @@ async fn monitor_reconciling(
             provider,
         )
         .await?;
+        if produced_observations {
+            watchdog_probe = None;
+            watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
+        }
         enrichment.apply_target_delta(target_delta);
     }
 }
@@ -5032,7 +5037,7 @@ async fn apply_received_event(
     admission: Admission,
     pending_closures: &mut PendingTopologyClosures,
     provider: &mut ProviderIntegration,
-) -> Result<(), CollectorError> {
+) -> Result<bool, CollectorError> {
     if received.event == "pane_moved"
         && let Err(error) = owner.refresh_from_move(&received.data, persistence).await
     {
@@ -5046,11 +5051,12 @@ async fn apply_received_event(
             return Err(error);
         }
     };
+    let produced_observations = !normalized.is_empty();
     let outcome = apply_collector_observation(reducer, normalized);
     admission.complete();
     let Some(persist) = outcome? else {
         persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
-        return Ok(());
+        return Ok(produced_observations);
     };
     if !persist.is_empty() {
         let _ = persist_submission(persistence, reducer, persist).await?;
@@ -5058,7 +5064,7 @@ async fn apply_received_event(
     persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
     provider.publish_targets(shared);
     cancel_pending_topology_closures(&received, pending_closures);
-    Ok(())
+    Ok(produced_observations)
 }
 
 fn cancel_pending_pane_closure(pane_id: &str, pending: &mut PendingTopologyClosures) {
@@ -6688,7 +6694,9 @@ fn record_replay_facts(
     for entity in closed_entities(received) {
         closures.entry(entity).or_default().push(index);
     }
-    if let Some(entity) = updated_entity(received) {
+    if !is_focus_frame(&received.event)
+        && let Some(entity) = updated_entity(received)
+    {
         candidates.push((index, entity));
     }
 }
@@ -6781,6 +6789,10 @@ fn updated_entity(received: &ReceivedEvent) -> Option<EntityKey> {
             .map(EntityKey::Pane),
         _ => None,
     }
+}
+
+fn is_focus_frame(event: &str) -> bool {
+    matches!(event, "workspace_focused" | "tab_focused" | "pane_focused")
 }
 
 fn entity_exists(shared: &SharedModel, entity: &EntityKey) -> bool {
@@ -9959,6 +9971,572 @@ mod tests {
             .unwrap()
     }
 
+    async fn write_unknown_focus_frames(reader: &mut tokio::io::BufReader<tokio::net::UnixStream>) {
+        for frame in [
+            json!({
+                "event": "workspace_focused",
+                "data": {"workspace_id": "missing-workspace"},
+            }),
+            json!({
+                "event": "tab_focused",
+                "data": {"tab_id": "missing-tab"},
+            }),
+            json!({
+                "event": "pane_focused",
+                "data": {"pane_id": "missing-pane"},
+            }),
+        ] {
+            write_wire_frame(reader, &frame).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn flood_focus_frames_during_replay_do_not_force_dirty() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("focus-replay-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mut harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "focus-replay.log",
+            LivenessPolicy { timeout_ms: 2_000 },
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let snapshot_requests = Arc::new(AtomicUsize::new(0));
+        let observed_snapshot_requests = Arc::clone(&snapshot_requests);
+        let server = tokio::spawn(async move {
+            let mut primary_stream = None;
+            let mut held_streams = Vec::new();
+            loop {
+                let (mut reader, request) = tokio::select! {
+                    () = server_cancellation.cancelled() => break,
+                    accepted = accept_wire_request(&listener) => accepted,
+                };
+                match request["method"].as_str() {
+                    Some("events.subscribe") => {
+                        write_wire_frame(
+                            &mut reader,
+                            &json!({
+                                "id": request["id"],
+                                "result": {"type": "subscription_started"},
+                            }),
+                        )
+                        .await;
+                        if primary_subscription_is_scoped(&request) {
+                            held_streams.push(reader);
+                        } else {
+                            assert!(
+                                primary_stream.replace(reader).is_none(),
+                                "focus replay unexpectedly replaced the primary stream"
+                            );
+                        }
+                    }
+                    Some("session.snapshot") => {
+                        let snapshots =
+                            observed_snapshot_requests.fetch_add(1, Ordering::AcqRel) + 1;
+                        if snapshots == 1 {
+                            write_unknown_focus_frames(
+                                primary_stream
+                                    .as_mut()
+                                    .expect("snapshot arrived before the primary subscription"),
+                            )
+                            .await;
+                        }
+                        write_wire_frame(
+                            &mut reader,
+                            &watchdog_snapshot_frame(&request, false, "claude"),
+                        )
+                        .await;
+                    }
+                    method => panic!("unexpected focus replay request: {method:?}"),
+                }
+            }
+            drop(primary_stream);
+            drop(held_streams);
+        });
+
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "focus replay convergence",
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            snapshot_requests.load(Ordering::Acquire),
+            1,
+            "unknown focus frames made replay request a replacement snapshot"
+        );
+
+        let contents = harness.stop().await;
+        join_fake_server(server, "focus replay").await;
+        assert!(
+            !contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            "focus replay emitted a watchdog warning: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn flood_focus_frames_during_live_do_not_force_dirty() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("focus-live-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (focus_sender, mut focus_receiver) = mpsc::unbounded_channel();
+        let mut harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "focus-live.log",
+            LivenessPolicy { timeout_ms: 2_000 },
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let snapshot_requests = Arc::new(AtomicUsize::new(0));
+        let observed_snapshot_requests = Arc::clone(&snapshot_requests);
+        let server = tokio::spawn(async move {
+            let mut primary_stream = None;
+            let mut held_streams = Vec::new();
+            loop {
+                tokio::select! {
+                    () = server_cancellation.cancelled() => break,
+                    focus = focus_receiver.recv() => {
+                        let Some(()) = focus else {
+                            continue;
+                        };
+                        write_unknown_focus_frames(
+                            primary_stream
+                                .as_mut()
+                                .expect("live focus requested before the primary subscription"),
+                        )
+                        .await;
+                    }
+                    accepted = accept_wire_request(&listener) => {
+                        let (mut reader, request) = accepted;
+                        match request["method"].as_str() {
+                            Some("events.subscribe") => {
+                                write_wire_frame(
+                                    &mut reader,
+                                    &json!({
+                                        "id": request["id"],
+                                        "result": {"type": "subscription_started"},
+                                    }),
+                                )
+                                .await;
+                                if primary_subscription_is_scoped(&request) {
+                                    held_streams.push(reader);
+                                } else {
+                                    assert!(
+                                        primary_stream.replace(reader).is_none(),
+                                        "live focus unexpectedly replaced the primary stream"
+                                    );
+                                }
+                            }
+                            Some("session.snapshot") => {
+                                observed_snapshot_requests.fetch_add(1, Ordering::AcqRel);
+                                write_wire_frame(
+                                    &mut reader,
+                                    &watchdog_snapshot_frame(&request, false, "claude"),
+                                )
+                                .await;
+                            }
+                            method => panic!("unexpected live focus request: {method:?}"),
+                        }
+                    }
+                }
+            }
+            drop(primary_stream);
+            drop(held_streams);
+        });
+
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "initial live focus generation",
+        )
+        .await;
+        focus_sender
+            .send(())
+            .expect("focus server stopped before the live frames were requested");
+        let unexpectedly_resnapshotted = tokio::time::timeout(Duration::from_millis(250), async {
+            while snapshot_requests.load(Ordering::Acquire) == 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            !unexpectedly_resnapshotted,
+            "unknown live focus frames forced a replacement snapshot"
+        );
+        assert_eq!(*harness.source_quality.borrow(), ObservationQuality::Live);
+
+        drop(focus_sender);
+        let contents = harness.stop().await;
+        join_fake_server(server, "live focus").await;
+        assert!(
+            !contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            "live focus emitted a watchdog warning: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn flood_zero_observation_frames_allow_reconciling_probe_to_complete() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("reconciling-flood-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (restarted_sender, restarted_receiver) = tokio::sync::oneshot::channel();
+        let mut harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "reconciling-flood.log",
+            LivenessPolicy { timeout_ms: 120 },
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let server = tokio::spawn(async move {
+            let mut snapshots = 0;
+            let mut restarted_sender = Some(restarted_sender);
+            let mut primary_stream = None;
+            let mut focus_pulse = None;
+            let mut held_streams = Vec::new();
+            loop {
+                let (mut reader, request) = tokio::select! {
+                    () = server_cancellation.cancelled() => break,
+                    accepted = accept_wire_request(&listener) => accepted,
+                };
+                match request["method"].as_str() {
+                    Some("events.subscribe") => {
+                        write_wire_frame(
+                            &mut reader,
+                            &json!({
+                                "id": request["id"],
+                                "result": {"type": "subscription_started"},
+                            }),
+                        )
+                        .await;
+                        if primary_subscription_is_scoped(&request) {
+                            held_streams.push(reader);
+                        } else {
+                            assert!(
+                                primary_stream.replace(reader).is_none(),
+                                "reconciling flood unexpectedly replaced the primary stream"
+                            );
+                        }
+                    }
+                    Some("session.snapshot") => {
+                        snapshots += 1;
+                        if snapshots == RESNAPSHOT_ATTEMPTS + 2 {
+                            tokio::time::sleep(Duration::from_millis(60)).await;
+                        }
+                        write_wire_frame(
+                            &mut reader,
+                            &watchdog_snapshot_frame(&request, false, "claude"),
+                        )
+                        .await;
+                        if snapshots <= RESNAPSHOT_ATTEMPTS + 1 {
+                            write_wire_frame(
+                                primary_stream
+                                    .as_mut()
+                                    .expect("snapshot arrived before the primary subscription"),
+                                &json!({
+                                    "event": "pane_agent_status_changed",
+                                    "data": {
+                                        "pane_id": format!("missing-pane-{snapshots}"),
+                                        "agent_status": "working",
+                                    },
+                                }),
+                            )
+                            .await;
+                            if snapshots == RESNAPSHOT_ATTEMPTS + 1 {
+                                let pulse_cancellation = server_cancellation.clone();
+                                let mut stream = primary_stream
+                                    .take()
+                                    .expect("reconciling flood lost the primary stream")
+                                    .into_inner();
+                                focus_pulse = Some(tokio::spawn(async move {
+                                    let mut interval =
+                                        tokio::time::interval(Duration::from_millis(20));
+                                    interval.set_missed_tick_behavior(
+                                        tokio::time::MissedTickBehavior::Delay,
+                                    );
+                                    let mut frame = serde_json::to_vec(&json!({
+                                        "event": "pane_focused",
+                                        "data": {"pane_id": "missing-pane"},
+                                    }))
+                                    .expect("focus pulse did not serialize");
+                                    frame.push(b'\n');
+                                    loop {
+                                        tokio::select! {
+                                            () = pulse_cancellation.cancelled() => break,
+                                            _ = interval.tick() => {
+                                                if stream.write_all(&frame).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }));
+                            }
+                        } else if snapshots == RESNAPSHOT_ATTEMPTS + 3
+                            && let Some(sender) = restarted_sender.take()
+                        {
+                            sender.send(()).unwrap();
+                        }
+                    }
+                    method => panic!("unexpected reconciling flood request: {method:?}"),
+                }
+            }
+            drop(primary_stream);
+            if let Some(pulse) = focus_pulse {
+                pulse.await.expect("focus pulse task panicked");
+            }
+            drop(held_streams);
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), restarted_receiver)
+            .await
+            .expect("reconciling flood prevented the watchdog probe from completing")
+            .expect("restart-generation observer was dropped");
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "post-flood restart generation",
+        )
+        .await;
+
+        let contents = harness.stop().await;
+        join_fake_server(server, "reconciling focus flood").await;
+        assert!(
+            !contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            "reconciling focus flood emitted a watchdog warning: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn flood_observation_receipt_cancels_probe_and_resets_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("observation-reset-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (cancelled_sender, cancelled_receiver) = tokio::sync::oneshot::channel();
+        let (reprobe_sender, reprobe_receiver) = tokio::sync::oneshot::channel();
+        let liveness_policy = LivenessPolicy { timeout_ms: 300 };
+        let mut harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "observation-reset.log",
+            liveness_policy,
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let server = tokio::spawn(async move {
+            let mut snapshots = 0;
+            let mut cancelled_sender = Some(cancelled_sender);
+            let mut reprobe_sender = Some(reprobe_sender);
+            let mut observation_sent_at = None;
+            let mut primary_stream = None;
+            let mut held_streams = Vec::new();
+            loop {
+                let (mut reader, request) = tokio::select! {
+                    () = server_cancellation.cancelled() => break,
+                    accepted = accept_wire_request(&listener) => accepted,
+                };
+                match request["method"].as_str() {
+                    Some("events.subscribe") => {
+                        write_wire_frame(
+                            &mut reader,
+                            &json!({
+                                "id": request["id"],
+                                "result": {"type": "subscription_started"},
+                            }),
+                        )
+                        .await;
+                        if primary_subscription_is_scoped(&request) {
+                            held_streams.push(reader);
+                        } else {
+                            assert!(
+                                primary_stream.replace(reader).is_none(),
+                                "observation reset unexpectedly replaced the primary stream"
+                            );
+                        }
+                    }
+                    Some("session.snapshot") => {
+                        snapshots += 1;
+                        if snapshots == 1 {
+                            write_wire_frame(
+                                &mut reader,
+                                &watchdog_snapshot_frame(&request, false, "claude"),
+                            )
+                            .await;
+                        } else if snapshots == 2 {
+                            observation_sent_at = Some(Instant::now());
+                            write_wire_frame(
+                                primary_stream
+                                    .as_mut()
+                                    .expect("probe arrived before the primary subscription"),
+                                &json!({
+                                    "event": "workspace_created",
+                                    "data": {
+                                        "workspace": {"workspace_id": "w2"},
+                                    },
+                                }),
+                            )
+                            .await;
+                            let mut line = String::new();
+                            let cancelled = tokio::time::timeout(
+                                Duration::from_millis(100),
+                                reader.read_line(&mut line),
+                            )
+                            .await
+                            .is_ok_and(|result| result.is_ok_and(|bytes_read| bytes_read == 0));
+                            if let Some(sender) = cancelled_sender.take() {
+                                sender.send(cancelled).unwrap();
+                            }
+                            if !cancelled {
+                                break;
+                            }
+                        } else if snapshots == 3 {
+                            let elapsed = observation_sent_at
+                                .expect("replacement probe arrived before the observation")
+                                .elapsed();
+                            if let Some(sender) = reprobe_sender.take() {
+                                sender.send(elapsed).unwrap();
+                            }
+                            held_streams.push(reader);
+                        } else {
+                            panic!("observation reset requested unexpected snapshot {snapshots}");
+                        }
+                    }
+                    method => panic!("unexpected observation reset request: {method:?}"),
+                }
+            }
+            drop(primary_stream);
+            drop(held_streams);
+        });
+
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "initial observation-reset generation",
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), cancelled_receiver)
+                .await
+                .expect("observation did not resolve the pending-probe cancellation check")
+                .expect("pending-probe cancellation observer was dropped"),
+            "observation-producing receipt did not cancel the in-flight probe"
+        );
+        let reprobe_elapsed = tokio::time::timeout(Duration::from_secs(3), reprobe_receiver)
+            .await
+            .expect("observation-producing receipt did not allow a replacement probe")
+            .expect("replacement-probe observer was dropped");
+        assert!(
+            reprobe_elapsed >= liveness_timeout(&liveness_policy),
+            "replacement probe arrived before the reset deadline: {reprobe_elapsed:?}"
+        );
+
+        let contents = harness.stop().await;
+        join_fake_server(server, "observation reset").await;
+        assert!(
+            !contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            "observation reset emitted a watchdog warning: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn flood_overflow_burst_still_forces_dirty() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("overflow-guard-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (burst_sender, mut burst_receiver) = mpsc::unbounded_channel();
+        let mut harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "overflow-guard.log",
+            LivenessPolicy { timeout_ms: 2_000 },
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let server = tokio::spawn(async move {
+            let mut snapshots = 0;
+            let mut primary_stream = None;
+            let mut held_streams = Vec::new();
+            loop {
+                tokio::select! {
+                    () = server_cancellation.cancelled() => break,
+                    burst = burst_receiver.recv() => {
+                        let Some(()) = burst else {
+                            continue;
+                        };
+                        write_primary_overflow_burst(
+                            primary_stream
+                                .as_mut()
+                                .expect("overflow requested before the primary subscription"),
+                        )
+                        .await;
+                    }
+                    accepted = accept_wire_request(&listener) => {
+                        let (mut reader, request) = accepted;
+                        match request["method"].as_str() {
+                            Some("events.subscribe") => {
+                                write_wire_frame(
+                                    &mut reader,
+                                    &json!({
+                                        "id": request["id"],
+                                        "result": {"type": "subscription_started"},
+                                    }),
+                                )
+                                .await;
+                                if primary_subscription_is_scoped(&request) {
+                                    held_streams.push(reader);
+                                } else {
+                                    assert!(
+                                        primary_stream.replace(reader).is_none(),
+                                        "overflow guard unexpectedly replaced the primary stream"
+                                    );
+                                }
+                            }
+                            Some("session.snapshot") => {
+                                snapshots += 1;
+                                if snapshots == 1 {
+                                    write_wire_frame(
+                                        &mut reader,
+                                        &watchdog_snapshot_frame(&request, false, "claude"),
+                                    )
+                                    .await;
+                                } else {
+                                    held_streams.push(reader);
+                                }
+                            }
+                            method => panic!("unexpected overflow guard request: {method:?}"),
+                        }
+                    }
+                }
+            }
+            drop(primary_stream);
+            drop(held_streams);
+        });
+
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "initial overflow-guard generation",
+        )
+        .await;
+        burst_sender
+            .send(())
+            .expect("overflow server stopped before the burst was requested");
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Reconciling,
+            "overflow burst dirty outcome",
+        )
+        .await;
+
+        drop(burst_sender);
+        let contents = harness.stop().await;
+        join_fake_server(server, "overflow guard").await;
+        assert!(
+            !contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            "overflow guard emitted a watchdog warning: {contents}"
+        );
+    }
+
     #[tokio::test]
     async fn watchdog_matching_probes_keep_idle_subscription_and_model_stable() {
         let directory = tempfile::tempdir().unwrap();
@@ -10133,8 +10711,11 @@ mod tests {
                             write_wire_frame(
                                 primary_stream,
                                 &json!({
-                                    "event": "pane_focused",
-                                    "data": {"pane_id": format!("missing-pane-{snapshots}")},
+                                    "event": "pane_agent_status_changed",
+                                    "data": {
+                                        "pane_id": format!("missing-pane-{snapshots}"),
+                                        "agent_status": "working",
+                                    },
                                 }),
                             )
                             .await;

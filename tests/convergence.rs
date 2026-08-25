@@ -795,8 +795,8 @@ async fn queued_enrichment_during_convergence_is_discarded_before_live() {
     wait_until(|| mock.enrichment_subscriptions() == 1).await;
 
     mock.push_primary(push(
-        "pane_focused",
-        json!({"type":"pane_focused", "pane_id":"ghost:p1", "workspace_id":"ghost"}),
+        "pane_agent_status_changed",
+        json!({"type":"pane_agent_status_changed", "pane_id":"ghost:p1", "workspace_id":"ghost"}),
     ))
     .await
     .unwrap();
@@ -1388,8 +1388,8 @@ async fn later_closure_exempts_anomaly() {
 async fn three_attempts_then_stays_reconciling() {
     let snapshot = p1_snapshot();
     let anomaly = push(
-        "pane_focused",
-        json!({"type": "pane_focused", "pane_id": "ghost:p1", "workspace_id": "ghost"}),
+        "pane_agent_status_changed",
+        json!({"type": "pane_agent_status_changed", "pane_id": "ghost:p1", "workspace_id": "ghost"}),
     );
     let mock = ScriptedHerdr::start(
         ScriptedConfig::default()
@@ -1429,8 +1429,8 @@ async fn overflow_consumes_shared_counter_no_retirement() {
         })
         .collect();
     let anomaly = push(
-        "pane_focused",
-        json!({"type": "pane_focused", "pane_id": "ghost:p1", "workspace_id": "ghost"}),
+        "pane_agent_status_changed",
+        json!({"type": "pane_agent_status_changed", "pane_id": "ghost:p1", "workspace_id": "ghost"}),
     );
     let mock = ScriptedHerdr::start(
         ScriptedConfig::default()
@@ -1661,8 +1661,8 @@ async fn terminal_id_preserved_across_move_replay() {
 async fn live_only_after_clean_drain() {
     let snapshot = p1_snapshot();
     let anomaly = push(
-        "pane_focused",
-        json!({"type": "pane_focused", "pane_id": "ghost:p1", "workspace_id": "ghost"}),
+        "pane_agent_status_changed",
+        json!({"type": "pane_agent_status_changed", "pane_id": "ghost:p1", "workspace_id": "ghost"}),
     );
     let mock = ScriptedHerdr::start(
         ScriptedConfig::default()
@@ -3500,8 +3500,8 @@ fn snapshot_without_panes(snapshot: &Value) -> Value {
 
 fn resnapshot_anomaly() -> Value {
     push(
-        "pane_focused",
-        json!({"type": "pane_focused", "pane_id": "ghost:p1", "workspace_id": "ghost"}),
+        "pane_agent_status_changed",
+        json!({"type": "pane_agent_status_changed", "pane_id": "ghost:p1", "workspace_id": "ghost"}),
     )
 }
 

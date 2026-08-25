@@ -99,7 +99,8 @@ degraded state already renders; the TUI edits above are field-init only).
 
 ## Task 2 — F-C flood tolerance
 
-Expected files: `src/herdr/collector.rs` only.
+Expected files: `src/herdr/collector.rs` and `tests/convergence.rs` (fixture
+anomaly-driver substitution only).
 
 1. Anomaly exclusion (C1): filter `*_focused` event names at the two anomaly
    sites — candidate recording in `record_replay_facts` and the dirty check in
