@@ -581,10 +581,10 @@ fn command_activity(command: &[String], cwd: &str) -> Option<String> {
         }
     }
     let script = script.unwrap_or_else(|| Cow::Owned(command.join(" ")));
-    let sanitized = sanitize_controller_text(&script);
-    let relative = sanitized
+    let relative = script
         .split_whitespace()
-        .map(|token| relativize_command_token(token, cwd))
+        .map(sanitize_controller_text)
+        .map(|token| relativize_command_token(&token, cwd))
         .collect::<Vec<_>>()
         .join(" ");
     let line = sanitize_command_script(&relative);
@@ -928,6 +928,76 @@ mod tests {
 
         assert!(!head.contains(secret), "secret leaked in {head:?}");
         assert_eq!(head, "curl https://example.test");
+    }
+
+    #[test]
+    fn command_activity_raw_tabs_do_not_leak_env_assignment() {
+        let command = [
+            "/bin/bash".to_owned(),
+            "-lc".to_owned(),
+            "env\tAPI_TOKEN=sk-x\tcurl".to_owned(),
+        ];
+
+        let head = command_activity(&command, "/repo").expect("command head");
+
+        assert!(!head.contains("sk-x"), "secret leaked in {head:?}");
+    }
+
+    #[test]
+    fn command_activity_raw_leading_newline_does_not_leak_env_assignment() {
+        let command = [
+            "/bin/bash".to_owned(),
+            "-lc".to_owned(),
+            "\nenv API_TOKEN=sk-x curl".to_owned(),
+        ];
+
+        let head = command_activity(&command, "/repo").expect("command head");
+
+        assert!(!head.contains("sk-x"), "secret leaked in {head:?}");
+    }
+
+    #[test]
+    fn command_activity_quoted_assignment_does_not_leak_secret() {
+        let command = [
+            "/bin/bash".to_owned(),
+            "-lc".to_owned(),
+            "env 'API_TOKEN=sk-x' curl".to_owned(),
+        ];
+
+        let head = command_activity(&command, "/repo").expect("command head");
+
+        assert!(!head.contains("sk-x"), "secret leaked in {head:?}");
+    }
+
+    #[test]
+    fn command_activity_raw_tab_relativizes_absolute_path() {
+        let absolute = "/home/alice/private/key";
+        let command = [
+            "/bin/bash".to_owned(),
+            "-lc".to_owned(),
+            format!("cat\t{absolute}"),
+        ];
+
+        let head = command_activity(&command, "/repo").expect("command head");
+
+        assert_eq!(head, "cat key");
+        assert!(!head.contains(absolute), "absolute path leaked in {head:?}");
+    }
+
+    #[test]
+    fn command_activity_never_retains_raw_control_characters() {
+        let command = [
+            "/bin/bash".to_owned(),
+            "-lc".to_owned(),
+            "printf foo\u{7}bar\tbaz\nqux".to_owned(),
+        ];
+
+        let head = command_activity(&command, "/repo").expect("command head");
+
+        assert!(
+            !head.chars().any(char::is_control),
+            "raw control character leaked in {head:?}"
+        );
     }
 
     #[test]

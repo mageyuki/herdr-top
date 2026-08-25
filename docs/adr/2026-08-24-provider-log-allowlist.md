@@ -107,8 +107,13 @@ carve-in outputs:
   confined to Detail;
 - lifecycle state and evidence-backed lineage;
 - current activity from a Claude tool name and Bash or Agent description, an
-  accepted Codex commentary line, or a sanitized CommandExecution head with
-  any path rendered repository-relative; and
+  accepted Codex commentary line, or a sanitized CommandExecution head in
+  which whitespace-separated absolute path tokens are rendered
+  repository-relative and leading environment assignments are removed. The
+  head is a best-effort scrub of unparsed shell text, not a general
+  secret-redaction mechanism: unrecognized `env` wrappers over-redact
+  (possibly to no activity at all), and quoting, escaping, tab or newline
+  separators, and non-assignment operands are not interpreted; and
 - output-token count and output-token rate in the main view, with the full
   token breakdown in Detail only.
 

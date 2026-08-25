@@ -404,9 +404,19 @@ fn leading_token(value: &str) -> Option<(&str, &str)> {
 }
 
 fn is_assignment_token(token: &str) -> bool {
+    let token = strip_matched_quote_pair(token);
     token
         .split_once('=')
         .is_some_and(|(name, _)| !name.is_empty() && name.chars().all(is_word))
+}
+
+fn strip_matched_quote_pair(token: &str) -> &str {
+    let bytes = token.as_bytes();
+    if bytes.len() >= 2 && matches!(bytes[0], b'\'' | b'"') && bytes[0] == bytes[bytes.len() - 1] {
+        &token[1..token.len() - 1]
+    } else {
+        token
+    }
 }
 
 fn is_word(ch: char) -> bool {
