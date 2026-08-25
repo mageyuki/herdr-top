@@ -259,6 +259,9 @@ pub fn sanitize_command_script(script: &str) -> String {
     {
         remainder = after_prefix.trim_start_matches(char::is_whitespace);
     }
+    if let Some(redacted) = redact_unclassified_env_wrapper_assignments(remainder) {
+        return truncate_60(&redacted);
+    }
     truncate_60(remainder)
 }
 
@@ -333,31 +336,8 @@ fn push_unique(found: &mut Vec<EvidenceId>, seen: &mut HashSet<EvidenceId>, id: 
 }
 
 fn strip_assignment_prefix(script: &str) -> Option<&str> {
-    let mut chars = script.char_indices();
-    let (_, first) = chars.next()?;
-    if !is_word(first) {
-        return None;
-    }
-
-    let equals = chars.find_map(|(index, ch)| {
-        (ch == '=')
-            .then_some(index)
-            .or((!is_word(ch)).then_some(usize::MAX))
-    })?;
-    if equals == usize::MAX {
-        return None;
-    }
-
-    let value_start = equals + 1;
-    let first_value = script[value_start..].chars().next()?;
-    if first_value.is_whitespace() {
-        return None;
-    }
-    let value_end = script[value_start..]
-        .char_indices()
-        .find(|(_, ch)| ch.is_whitespace())
-        .map_or(script.len(), |(offset, _)| value_start + offset);
-    Some(&script[value_end..])
+    let (assignment, remainder) = leading_token(script)?;
+    is_assignment_token(assignment).then_some(remainder)
 }
 
 fn strip_env_wrapper_prefix(script: &str) -> Option<&str> {
@@ -391,6 +371,27 @@ fn strip_env_wrapper_prefix(script: &str) -> Option<&str> {
     }
 }
 
+fn redact_unclassified_env_wrapper_assignments(script: &str) -> Option<String> {
+    let (command, remainder) = leading_token(script)?;
+    if command != "env" || strip_env_wrapper_prefix(script).is_some() {
+        return None;
+    }
+
+    let mut removed_assignment = false;
+    let mut redacted = String::new();
+    for token in remainder.split_whitespace() {
+        if is_assignment_token(token) {
+            removed_assignment = true;
+            continue;
+        }
+        if !redacted.is_empty() {
+            redacted.push(' ');
+        }
+        redacted.push_str(token);
+    }
+    removed_assignment.then_some(redacted)
+}
+
 fn leading_token(value: &str) -> Option<(&str, &str)> {
     if value.is_empty() {
         return None;
@@ -400,6 +401,12 @@ fn leading_token(value: &str) -> Option<(&str, &str)> {
         .find(|(_, ch)| ch.is_whitespace())
         .map_or(value.len(), |(index, _)| index);
     Some((&value[..end], &value[end..]))
+}
+
+fn is_assignment_token(token: &str) -> bool {
+    token
+        .split_once('=')
+        .is_some_and(|(name, _)| !name.is_empty() && name.chars().all(is_word))
 }
 
 fn is_word(ch: char) -> bool {
@@ -518,9 +525,48 @@ mod tests {
     }
 
     #[test]
-    fn command_sanitizer_preserves_unknown_env_options() {
+    fn command_sanitizer_redacts_secret_behind_unknown_env_option() {
+        let sanitized =
+            sanitize_command_script("env -C /tmp API_TOKEN=secret curl https://example.test");
+
+        assert!(sanitized.contains("curl"));
+        assert!(
+            !sanitized.contains("secret"),
+            "sanitized command leaked secret: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains("API_TOKEN=secret"),
+            "sanitized command leaked assignment: {sanitized}"
+        );
+    }
+
+    #[test]
+    fn command_sanitizer_redacts_assignments_behind_unknown_env_options() {
         let script = "env -C /tmp API_TOKEN=secret curl";
 
+        assert_eq!(sanitize_command_script(script), "-C /tmp curl");
+        assert_eq!(
+            sanitize_command_script("env -i -C /tmp OUTER=secret --unset OLD INNER=hidden curl"),
+            "-i -C /tmp --unset OLD curl"
+        );
+        assert_eq!(
+            sanitize_command_script("env -C /tmp EMPTY= curl"),
+            "-C /tmp curl"
+        );
+    }
+
+    #[test]
+    fn command_sanitizer_preserves_assignment_arguments_without_env_wrapper() {
+        let script = "make CC=clang target";
+
         assert_eq!(sanitize_command_script(script), script);
+    }
+
+    #[test]
+    fn command_sanitizer_unknown_env_fallback_over_redacts_later_assignments() {
+        assert_eq!(
+            sanitize_command_script("env -C /tmp make CC=clang"),
+            "-C /tmp make"
+        );
     }
 }
