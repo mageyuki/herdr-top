@@ -156,9 +156,13 @@ Outside-pane execution and session isolation: unchanged from v1.
 Lane creation invariant: only synthesized `dispatch` and `task_started`
 events create Task Runs. Lane-synthesized `complete`, `failed`, and
 `cancelled` events apply only to an existing run; an unknown target is
-ledgered for replay deduplication without minting a run or relationship
-placeholder. Hook-path terminal events keep their existing forward-reference
-creation behavior.
+dropped without a ledger entry and without minting a run or relationship
+placeholder. On cold replay, sorted discovery processes the child's
+`subagents/` artifacts, including its metadata creator, before the sibling
+parent transcript that supplies the terminal, so the terminal converges onto
+the created run. A child that remains outside the evidence window is cheaply
+re-dropped on each cold start. Hook-path terminal events keep their existing
+forward-reference creation behavior.
 
 Completion grace and reopen (unchanged mechanism, v2 provenance):
 `task_complete` → grace (`HERDR_TOP_COMPLETE_GRACE_MS`) → `complete`.

@@ -1799,7 +1799,7 @@ fn parse_persistence_counters(value: &Value) -> Option<PersistenceCounters> {
 
 fn parse_controller_counters(value: &Value) -> Option<ControllerCounterSnapshot> {
     let object = value.as_object()?;
-    if object.len() != 9 {
+    if object.len() != 10 {
         return None;
     }
     Some(ControllerCounterSnapshot {
@@ -1808,6 +1808,7 @@ fn parse_controller_counters(value: &Value) -> Option<ControllerCounterSnapshot>
         terminal_forward_reference_creations: object
             .get("terminal_forward_reference_creations")?
             .as_u64()?,
+        unknown_lane_terminal_drops: object.get("unknown_lane_terminal_drops")?.as_u64()?,
         dangling_announcement_components: object
             .get("dangling_announcement_components")?
             .as_u64()?,

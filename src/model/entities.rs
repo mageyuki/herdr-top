@@ -232,6 +232,7 @@ pub struct ControllerDiagnostics {
     binding_conflicts: u64,
     terminal_blocked_progress_noops: u64,
     terminal_forward_reference_creations: u64,
+    unknown_lane_terminal_drops: u64,
     dangling_announcement_components: u64,
     ingest_sequence_exhaustions: u64,
     provider_parent_conflicts: u64,
@@ -256,6 +257,12 @@ impl ControllerDiagnostics {
     #[must_use]
     pub const fn terminal_forward_reference_creations(&self) -> u64 {
         self.terminal_forward_reference_creations
+    }
+
+    /// Lane terminal observations dropped because their Controller run was not yet known.
+    #[must_use]
+    pub const fn unknown_lane_terminal_drops(&self) -> u64 {
+        self.unknown_lane_terminal_drops
     }
 
     /// Dangling relationship-only components observed by the reducer.
@@ -313,6 +320,10 @@ impl ControllerDiagnostics {
         self.terminal_forward_reference_creations = self
             .terminal_forward_reference_creations
             .saturating_add(count);
+    }
+
+    pub(crate) fn record_unknown_lane_terminal_drops(&mut self, count: u64) {
+        self.unknown_lane_terminal_drops = self.unknown_lane_terminal_drops.saturating_add(count);
     }
 
     pub(crate) fn set_dangling_announcement_components(&mut self, count: u64) {
