@@ -19,12 +19,14 @@ Claude Agent-tool children always carry full lineage because their
 `.meta.json` sidecars name the parent and agent type. Inner Codex lineage is
 available only when the child's session ID occurs in the parent's admitted
 artifacts, such as a spawn command, resume invocation, or quoted report. When
-the ID is absent, the child remains visible under `Unattached`; herdr-top never
-guesses from timing, neighboring panes, or shared paths. Measurements on the
-reference development machine found the ID in only a small minority of bare
-spawn command lines, while quoted reports and resumes carried it reliably. An
-optional convention closes this gap: have the dispatching agent echo the child
-session ID into its own transcript. For a headless Claude child, run
+the ID is present, herdr-top admits the child and attaches it in the tree. When
+the ID is absent, the rollout is not admitted and therefore is not displayed
+anywhere, including under `Unattached`; herdr-top never guesses from timing,
+neighboring panes, or shared paths. Measurements on the reference development
+machine found the ID in only a small minority of bare spawn command lines,
+while quoted reports and resumes carried it reliably. An optional convention
+closes this gap: have the dispatching agent echo the child session ID into its
+own transcript. For a headless Claude child, run
 `claude -p --output-format json ...` and retain the returned `session_id` in the
 parent transcript.
 
@@ -385,6 +387,13 @@ locations. It queries versions from the relevant binary or server instead of
 inferring them from installation paths, and it does not print prompts or
 responses.
 
+`coverage.native_sessions` consumes the lane-wide
+`pane_sessions_with_artifacts` count as a shared budget for identifier-kind
+panes in snapshot order. Only the aggregate `covered` and `uncovered` counts
+are contractual. The `by_provider` placement is not proof of artifact
+ownership, and a pane from one provider can consume a budget unit produced by
+the other provider.
+
 The log-lane checks are:
 
 | Check | Outcomes |
@@ -397,6 +406,13 @@ Coverage and freshness use `warning` / `log_lane_runtime_unavailable` when
 runtime diagnostics are unavailable. Freshness comes from the watcher's own
 observation timestamp, not file modification times. Coverage includes pane
 session totals, counts with and without artifacts, and rejected-target counts.
+The `rejected_targets` counter is cumulative for the process lifetime and is
+never reset. After any rejection, `log_lane.coverage` remains `warning` until
+herdr-top restarts, even if the cause is fixed; because rejection takes
+precedence, that warning also suppresses the `log_lane_coverage_partial` and
+`log_lane_coverage_complete` codes. The check's `observed` payload still carries
+the raw `pane_sessions_total`, `pane_sessions_with_artifacts`,
+`pane_sessions_without_artifacts`, and `rejected_targets` values.
 
 Use these checks for common symptoms:
 
@@ -405,6 +421,6 @@ Use these checks for common symptoms:
 | Nothing appears in the TUI | Inspect `log_lane.readable`, `log_lane.coverage`, and `log_lane.freshness`, then confirm session resolution and Herdr reachability. Hook setup is not required for the primary view. |
 | The tree appears but optional Controller detail does not | Confirm that the same-release standalone binary is on the hook process's `PATH`, recheck the append-only registration, complete Codex hook trust, and inspect Controller-socket availability. Outside a managed pane, a clean no-delivery result is expected. |
 | Runs appear but stay unlinked | Inspect hook standard error for a failed `dispatch`, confirm that the relevant start hook remains registered, and review [Understand delivery behavior](#understand-delivery-behavior). A later terminal event can intentionally create a diagnostic-flagged forward reference. |
-| An inner Codex run appears under `Unattached` | Preserve the child session ID in the parent's transcript, or use explicit Controller dispatch events. Herdr Top does not infer lineage without ID evidence. |
+| An admitted inner Codex run appears under `Unattached` | Preserve the child session ID in the parent's transcript, or use explicit Controller dispatch events. Herdr Top does not infer lineage without ID evidence. |
 | A subagent run has no label | Confirm that `SubagentStart` is registered and that its payload contains `agent_type`; the label comes only from that structural field. |
 | A manual hook test seems to hang | The adapter is waiting for standard-input EOF. Use a piped probe from [Test a hook without an agent](#test-a-hook-without-an-agent). |

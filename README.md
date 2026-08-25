@@ -57,7 +57,7 @@ scope, and the footer keeps the primary controls visible.
 │  ├── Workspace: api                                                                                                    │
 │  │   └── Tab: implementation                                                                                           │
 │  │       ├── Pane: w1:p1 (controller)                                                                                  │
-│  │       │   └── ● Claude controller — tool_use: Agent · 17m03s                        fable-5  high  8.4k 8.2/s 17m03s│
+│  │       │   └── ● Claude controller — tool_use: Agent · 17m03s                        fable-5  high  8400 8.2/s 17m03s│
 │  │       │       └── ● Codex — running command · 03m14s                            gpt-5.6-sol xhigh  2140  11/s 03m14s│
 │  │       ├── Pane: w1:p2 (review)                                                                                      │
 │  │       │   └── ⚠ Claude Review failures — tool_use: Bash · 08m01s                 sonnet-4-5  high   920 1.9/s 08m01s│
@@ -76,7 +76,7 @@ scope, and the footer keeps the primary controls visible.
 │selection: stable                                                                                                       │
 │Newest: at=1723456789012 kind=agent_activity source_type=activity provider=Codex durability=current_only                │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-q: stop Top only; agents continue | detach: Top runs | ↑↓ select | f/End follow | tab view | / filter | s summary
+q: stop Top only; agents continue | detach: Top runs | ↑↓ select | f/End follow | tab view | / filter | s summary | ? help
 ```
 
 The example uses a 120-column tree inner width, so all five fixed metric
@@ -88,12 +88,13 @@ truncating labels and compressing deep indentation.
 Claude Agent-tool children carry full lineage through their `.meta.json`
 sidecars. Inner Codex lineage is shown only when the child's session ID appears
 in the parent's admitted artifacts, such as a spawn command, resume invocation,
-or quoted report. Without that evidence the child remains honestly visible
-under `Unattached`; herdr-top never guesses from timing, neighboring panes, or
-shared paths. As an optional convention, make the dispatching agent echo the
-child session ID into its own transcript. For headless Claude children, use
-`claude -p --output-format json ...` and retain the returned `session_id` in
-the parent transcript.
+or quoted report. With that evidence, herdr-top admits the child and attaches it
+in the tree. Without it, the rollout is not admitted and is not displayed
+anywhere, including under `Unattached`; herdr-top never guesses from timing,
+neighboring panes, or shared paths. As an optional convention, make the
+dispatching agent echo the child session ID into its own transcript. For
+headless Claude children, use `claude -p --output-format json ...` and retain
+the returned `session_id` in the parent transcript.
 
 See the [TUI guide](docs/tui.md) for the complete key map, row grammar, views,
 overlays, and visibility rules.

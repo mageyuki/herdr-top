@@ -42,7 +42,12 @@ the herdr-top version. Each named subcommand also provides `-h` and `--help`.
 The five `HERDR_TOP_*_MS` lane values use identical parsing. A value must be
 valid UTF-8 and parse as a decimal `i64` millisecond count greater than zero.
 An absent, non-UTF-8, malformed, zero, negative, or overflowing value silently
-falls back to that variable's default. `doctor` reports the effective values.
+falls back to that variable's default. Monitor startup attaches the effective
+values to the INFO-level `resolved provider log lane startup configuration`
+trace event; `doctor` does not report them. The shipped file subscriber records
+WARN and ERROR, so the default `herdr-top.log` does not retain that INFO event;
+without an INFO-enabled subscriber, only the resulting timing behavior is
+observable.
 
 ## Commands
 
@@ -169,10 +174,10 @@ Three checks describe the zero-configuration provider-log lane:
 | `log_lane.readable` | A provider root exists but cannot be read | `warning` / `log_lane_roots_unreadable` |
 | `log_lane.readable` | At least one provider root exists and is readable | `ok` / `log_lane_roots_readable` |
 | `log_lane.readable` | No provider root exists | `not_applicable` / `log_lane_roots_absent` |
-| `log_lane.coverage` | No pane session has artifacts and targets were rejected | `warning` / `log_lane_targets_rejected` |
-| `log_lane.coverage` | No pane sessions are present | `not_applicable` / `log_lane_coverage_empty` |
-| `log_lane.coverage` | At least one pane session has no artifact | `warning` / `log_lane_coverage_partial` |
-| `log_lane.coverage` | Every pane session has an artifact | `ok` / `log_lane_coverage_complete` |
+| `log_lane.coverage` | Any provider-log targets were rejected; this takes precedence over every coverage state below | `warning` / `log_lane_targets_rejected` |
+| `log_lane.coverage` | No targets were rejected and no pane sessions are present | `not_applicable` / `log_lane_coverage_empty` |
+| `log_lane.coverage` | No targets were rejected and at least one pane session has no artifact | `warning` / `log_lane_coverage_partial` |
+| `log_lane.coverage` | No targets were rejected and every pane session has an artifact | `ok` / `log_lane_coverage_complete` |
 | `log_lane.freshness` | Latest watcher observation is at most 120000 ms old | `ok` / `log_lane_fresh` |
 | `log_lane.freshness` | Latest watcher observation is older than 120000 ms | `warning` / `log_lane_stale` |
 | `log_lane.freshness` | The watcher has never observed | `warning` / `log_lane_unobserved` |

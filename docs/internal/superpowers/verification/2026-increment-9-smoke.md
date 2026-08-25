@@ -9,8 +9,11 @@ at `fad001a` is retained below as before/after evidence.
 2 fail.** The identifier-kind admission defect from the previous run is
 resolved. Provider-log events, human-readable subjects, live lines,
 `ended_unknown`, real token metrics, dismissal, and restart restoration were
-all directly observed. A restart-only rejected-target counter anomaly remains
-and is documented separately; it did not prevent the six demonstrations.
+all directly observed. The historical run also recorded a restart-only
+rejected-target counter anomaly, documented separately below. Root-independent
+target derivation now eliminates both the standard- and
+custom-configuration-directory cases; the anomaly did not prevent the six
+demonstrations.
 
 ## Environment
 
@@ -195,15 +198,19 @@ terminal state.
 ## 5. Summary overlay with real numbers — PASS
 
 Pressing `s` opened the same two-table overlay as the earlier run, now with real
-output-token totals and rates. These are verbatim text rows from the overlay in
-the 95-second screen; borders and trailing spaces are cropped:
+output-token totals and rates. These text rows come from the overlay in the
+95-second screen; borders and trailing spaces are cropped. The `claude-code`
+row is normalized to the renderer's guaranteed spacing because the captured
+frame omitted the space before `124k` and showed a foreign character at the
+right border, a one-column composition artifact whose origin in terminal paint
+or replay reconstruction was not determined.
 
 ```text
 scope: workspace w1 (w: session)
 per worker kind
 worker kind | runs | live | total | mean | tok | mean tok/s
 Claude | 3 | 3 | 00s | - | 153k | 0.1/s
-claude-code | 20 | 20 | 00s | - |124k | 0.3/s
+claude-code | 20 | 20 | 00s | - | 124k | 0.3/s
 per model
 model | runs | live | total | mean | tok | mean tok/s
 claude-fable-5 | 3 | 3 | 00s | - | 153k | 0.1/s
@@ -342,9 +349,10 @@ The exact chain is `derive_provider_targets` at
 this is not softened into a smoke failure. The smoke itself made no follow-up
 code fix because its dispatch authorized a bounded fix only if the lane still
 admitted nothing, which was disproved by the live event ledger. The
-implementation now filters canonical Claude subagent transcript paths through
-Claude's path topology before pane-root targets are constructed, so those paths
-no longer increment the rejection counter on each provider cycle.
+implementation now recognizes the trailing provider-native Claude subagent
+transcript shape independently of root location before pane-root targets are
+constructed. Standard and custom configuration roots therefore no longer
+increment the rejection counter on each provider cycle.
 
 ## Headless child observation
 

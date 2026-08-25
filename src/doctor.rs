@@ -785,6 +785,11 @@ fn provider_from_name(name: &str) -> Option<Provider> {
     }
 }
 
+/// Builds native-session coverage from lane-global runtime counters rather than
+/// per-provider ownership. Identifier-kind panes consume the shared artifact
+/// budget in snapshot order, so only aggregate `covered` and `uncovered` counts
+/// are contractual: `by_provider` placement does not prove artifact ownership,
+/// and a pane from one provider may consume a budget unit produced by another.
 fn coverage_check(
     snapshot: Option<&Snapshot>,
     runtime_snapshot: Option<&RuntimeDiagnosticsSnapshot>,
