@@ -1761,6 +1761,24 @@ fn claude_subagent_path_matches(
     })
 }
 
+pub(crate) fn claude_subagent_artifact_path_matches(path: &Path) -> bool {
+    if path.extension() != Some(OsStr::new("jsonl")) {
+        return false;
+    }
+    let Some(components) = normal_components(path) else {
+        return false;
+    };
+    let Some(parent) = components
+        .len()
+        .checked_sub(3)
+        .and_then(|index| components.get(index))
+        .and_then(|parent| parent.to_str())
+    else {
+        return false;
+    };
+    super::valid_native_id(parent) && claude_subagent_path_matches(path, parent, None)
+}
+
 fn subagent_artifact_id(file_name: &OsStr) -> Option<&str> {
     let file_name = file_name.to_str()?;
     let stem = file_name
