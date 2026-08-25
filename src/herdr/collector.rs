@@ -53,8 +53,8 @@ use crate::provider::{
 };
 use crate::reducer::{ApplyOutcome, CommitStagedError, Reducer, ReducerError};
 use crate::store::writer::{
-    DurabilityDisposition, PendingEnqueue, PersistenceFailure, PersistenceStatus, WriterClient,
-    WriterError,
+    BoundedDetail, DurabilityDisposition, PendingEnqueue, PersistenceFailure,
+    PersistenceHealthSnapshot, PersistenceStatus, WriterClient, WriterError,
 };
 use crate::store::{CollectorGap, PersistBatch, PersistOp, RestoredState};
 
@@ -73,6 +73,7 @@ const DRAIN_QUIET_PERIOD: Duration = Duration::from_millis(5);
 const STALE_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const PERFORMANCE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
+const PERSISTENCE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LivenessPolicy {
@@ -497,9 +498,34 @@ impl PersistenceOccurrenceSink for UnavailableOccurrenceSink {
     }
 }
 
+struct PersistenceRecovery {
+    retry_interval: Duration,
+    next_probe_at: Option<Instant>,
+    probe_due: bool,
+    acceptor_stop_pending: bool,
+    marker_pending: bool,
+}
+
+impl PersistenceRecovery {
+    fn new(retry_interval: Duration) -> Self {
+        Self {
+            retry_interval,
+            next_probe_at: None,
+            probe_due: false,
+            acceptor_stop_pending: false,
+            marker_pending: false,
+        }
+    }
+
+    fn arm_cooldown(&mut self) {
+        self.next_probe_at = Some(Instant::now() + self.retry_interval);
+    }
+}
+
 pub(crate) struct RuntimePersistence {
     writer: WriterClient,
-    writer_health: watch::Receiver<PersistenceStatus>,
+    session: String,
+    writer_health: watch::Receiver<PersistenceHealthSnapshot>,
     snapshot: RuntimeDiagnosticsSnapshot,
     publisher: watch::Sender<RuntimeDiagnosticsSnapshot>,
     occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
@@ -507,16 +533,37 @@ pub(crate) struct RuntimePersistence {
     acceptor_diagnostics: ControllerDiagnosticsHandle,
     enrichment_diagnostics: EnrichmentDiagnosticsHandle,
     provider_diagnostics: ProviderDiagnosticsHandle,
+    recovery: PersistenceRecovery,
 }
 
 impl RuntimePersistence {
     fn new(
         writer: WriterClient,
+        session: &str,
         model: &DomainModel,
         coverage: &SourceCoverageRegistry,
         occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
     ) -> (Self, watch::Receiver<RuntimeDiagnosticsSnapshot>) {
+        Self::new_with_retry_interval(
+            writer,
+            session,
+            model,
+            coverage,
+            occurrence_sink,
+            PERSISTENCE_RETRY_INTERVAL,
+        )
+    }
+
+    fn new_with_retry_interval(
+        writer: WriterClient,
+        session: &str,
+        model: &DomainModel,
+        coverage: &SourceCoverageRegistry,
+        occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
+        retry_interval: Duration,
+    ) -> (Self, watch::Receiver<RuntimeDiagnosticsSnapshot>) {
         let writer_health = writer.subscribe_persistence();
+        let initial_health = writer_health.borrow().clone();
         let controller_input =
             controller_input_from_coverage(coverage.state(CoverageSource::Controller));
         let controller_counters = controller_counter_snapshot(model);
@@ -524,7 +571,8 @@ impl RuntimePersistence {
         let enrichment_diagnostics = EnrichmentDiagnosticsHandle::default();
         let provider_diagnostics = model.provider_diagnostics().handle();
         let snapshot = RuntimeDiagnosticsSnapshot {
-            persistence: writer.persistence_status(),
+            persistence: initial_health.status,
+            persistence_detail: initial_health.detail,
             controller_input,
             owner: OwnerFreshness::Current,
             persistence_counters: PersistenceCounters::default(),
@@ -538,6 +586,7 @@ impl RuntimePersistence {
         let (publisher, diagnostics) = watch::channel(snapshot.clone());
         let mut persistence = Self {
             writer,
+            session: session.to_owned(),
             writer_health,
             snapshot,
             publisher,
@@ -546,6 +595,7 @@ impl RuntimePersistence {
             acceptor_diagnostics,
             enrichment_diagnostics,
             provider_diagnostics,
+            recovery: PersistenceRecovery::new(retry_interval),
         };
         persistence.refresh_pane_coverage(model);
         persistence.publish();
@@ -559,9 +609,26 @@ impl RuntimePersistence {
     ) -> (Self, watch::Receiver<RuntimeDiagnosticsSnapshot>) {
         Self::new(
             writer,
+            "test",
             &DomainModel::default(),
             &SourceCoverageRegistry::new(SourceAvailability::Available),
             occurrence_sink,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_for_test_with_retry_interval(
+        writer: WriterClient,
+        occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
+        retry_interval: Duration,
+    ) -> (Self, watch::Receiver<RuntimeDiagnosticsSnapshot>) {
+        Self::new_with_retry_interval(
+            writer,
+            "test",
+            &DomainModel::default(),
+            &SourceCoverageRegistry::new(SourceAvailability::Available),
+            occurrence_sink,
+            retry_interval,
         )
     }
 
@@ -580,6 +647,13 @@ impl RuntimePersistence {
     pub(crate) fn reserve_enqueue(&mut self) -> Option<crate::store::EnqueuePermit<'_>> {
         self.observe_writer_health();
         if self.snapshot.persistence != PersistenceStatus::Healthy {
+            self.recovery.probe_due = true;
+            self.snapshot.persistence_counters.skipped_enqueues = self
+                .snapshot
+                .persistence_counters
+                .skipped_enqueues
+                .saturating_add(1);
+            self.publish();
             return None;
         }
 
@@ -593,14 +667,14 @@ impl RuntimePersistence {
             acceptor_diagnostics,
             enrichment_diagnostics,
             provider_diagnostics,
+            recovery,
+            session: _,
         } = self;
         let permit = writer.reserve_enqueue();
-        let status = {
-            let status = writer_health.borrow();
-            *status
-        };
+        let health = writer_health.borrow().clone();
         Self::ingest_writer_status(
-            status,
+            health.status,
+            health.detail,
             snapshot,
             publisher,
             occurrence_sink.as_ref(),
@@ -608,8 +682,25 @@ impl RuntimePersistence {
             acceptor_diagnostics,
             enrichment_diagnostics,
             provider_diagnostics,
+            recovery,
         );
-        match status {
+        if permit.is_none() || !matches!(health.status, PersistenceStatus::Healthy) {
+            snapshot.persistence_counters.skipped_enqueues = snapshot
+                .persistence_counters
+                .skipped_enqueues
+                .saturating_add(1);
+            if !matches!(health.status, PersistenceStatus::Healthy) {
+                recovery.probe_due = true;
+            }
+            Self::publish_facade(
+                snapshot,
+                publisher,
+                acceptor_diagnostics,
+                enrichment_diagnostics,
+                provider_diagnostics,
+            );
+        }
+        match health.status {
             PersistenceStatus::Healthy => permit,
             PersistenceStatus::Degraded { .. } => {
                 drop(permit);
@@ -627,7 +718,10 @@ impl RuntimePersistence {
     }
 
     async fn apply(&mut self, batch: PersistBatch) -> Result<RuntimeWriteOutcome, WriterError> {
-        if self.skip_if_degraded(RuntimeCommandClass::Batch) {
+        if self
+            .skip_async_if_degraded(RuntimeCommandClass::Batch)
+            .await
+        {
             return Ok(RuntimeWriteOutcome::Skipped);
         }
         let result = self.writer.apply(batch).await;
@@ -635,7 +729,10 @@ impl RuntimePersistence {
     }
 
     async fn cleanup(&mut self, now_ms: i64) -> Result<RuntimeWriteOutcome, WriterError> {
-        if self.skip_if_degraded(RuntimeCommandClass::Batch) {
+        if self
+            .skip_async_if_degraded(RuntimeCommandClass::Batch)
+            .await
+        {
             return Ok(RuntimeWriteOutcome::Skipped);
         }
         let result = self.writer.cleanup(now_ms).await.map(|_| ());
@@ -674,6 +771,36 @@ impl RuntimePersistence {
         if self.snapshot.persistence == PersistenceStatus::Healthy {
             return false;
         }
+        self.record_skip(class);
+        true
+    }
+
+    async fn skip_async_if_degraded(&mut self, class: RuntimeCommandClass) -> bool {
+        self.observe_writer_health();
+        if self.snapshot.persistence == PersistenceStatus::Healthy {
+            return false;
+        }
+        self.drive_probe_if_due().await;
+        self.record_skip(class);
+        true
+    }
+
+    async fn drive_probe_if_due(&mut self) {
+        let Some(next_probe_at) = self.recovery.next_probe_at else {
+            return;
+        };
+        if Instant::now() < next_probe_at {
+            return;
+        }
+        self.recovery.probe_due = false;
+        let failed = self.writer.probe().await.is_err();
+        self.observe_writer_health();
+        if failed && !matches!(self.snapshot.persistence, PersistenceStatus::Healthy) {
+            self.recovery.arm_cooldown();
+        }
+    }
+
+    fn record_skip(&mut self, class: RuntimeCommandClass) {
         match class {
             RuntimeCommandClass::Batch => {
                 self.snapshot.persistence_counters.skipped_batches = self
@@ -692,14 +819,10 @@ impl RuntimePersistence {
             }
         }
         self.publish();
-        true
     }
 
     fn observe_writer_health(&mut self) {
-        let status = {
-            let status = self.writer_health.borrow();
-            *status
-        };
+        let health = self.writer_health.borrow().clone();
         let Self {
             snapshot,
             publisher,
@@ -708,10 +831,12 @@ impl RuntimePersistence {
             acceptor_diagnostics,
             enrichment_diagnostics,
             provider_diagnostics,
+            recovery,
             ..
         } = self;
         Self::ingest_writer_status(
-            status,
+            health.status,
+            health.detail,
             snapshot,
             publisher,
             occurrence_sink.as_ref(),
@@ -719,6 +844,7 @@ impl RuntimePersistence {
             acceptor_diagnostics,
             enrichment_diagnostics,
             provider_diagnostics,
+            recovery,
         );
     }
 
@@ -727,6 +853,7 @@ impl RuntimePersistence {
     #[allow(clippy::too_many_arguments)]
     fn ingest_writer_status(
         status: PersistenceStatus,
+        detail: Option<BoundedDetail>,
         snapshot: &mut RuntimeDiagnosticsSnapshot,
         publisher: &watch::Sender<RuntimeDiagnosticsSnapshot>,
         occurrence_sink: &dyn PersistenceOccurrenceSink,
@@ -734,29 +861,82 @@ impl RuntimePersistence {
         acceptor_diagnostics: &ControllerDiagnosticsHandle,
         enrichment_diagnostics: &EnrichmentDiagnosticsHandle,
         provider_diagnostics: &ProviderDiagnosticsHandle,
+        recovery: &mut PersistenceRecovery,
     ) {
-        if snapshot.persistence != PersistenceStatus::Healthy {
-            return;
-        }
-        if let PersistenceStatus::Degraded { failure } = status {
-            let class = if failure.operation
-                == crate::store::writer::PersistenceOperation::UpdateOwnerLocation
-            {
-                RuntimeCommandClass::OwnerLocation
-            } else {
-                RuntimeCommandClass::Batch
-            };
-            let _ = Self::record_facade_failure(
-                failure,
-                class,
-                snapshot,
-                publisher,
-                occurrence_sink,
-                occurrence_attempted,
-                acceptor_diagnostics,
-                enrichment_diagnostics,
-                provider_diagnostics,
-            );
+        match (snapshot.persistence, status) {
+            (PersistenceStatus::Healthy, PersistenceStatus::Healthy) => {}
+            (PersistenceStatus::Healthy, PersistenceStatus::Degraded { failure }) => {
+                let class = if failure.operation
+                    == crate::store::writer::PersistenceOperation::UpdateOwnerLocation
+                {
+                    RuntimeCommandClass::OwnerLocation
+                } else {
+                    RuntimeCommandClass::Batch
+                };
+                let _ = Self::record_facade_failure(
+                    failure,
+                    detail,
+                    class,
+                    snapshot,
+                    publisher,
+                    occurrence_sink,
+                    occurrence_attempted,
+                    acceptor_diagnostics,
+                    enrichment_diagnostics,
+                    provider_diagnostics,
+                    recovery,
+                );
+            }
+            (PersistenceStatus::Degraded { .. }, PersistenceStatus::Degraded { .. }) => {
+                if snapshot.persistence_detail != detail {
+                    snapshot.persistence_detail = detail;
+                    Self::publish_facade(
+                        snapshot,
+                        publisher,
+                        acceptor_diagnostics,
+                        enrichment_diagnostics,
+                        provider_diagnostics,
+                    );
+                }
+            }
+            (PersistenceStatus::Degraded { .. }, PersistenceStatus::Healthy) => {
+                snapshot.persistence = PersistenceStatus::Healthy;
+                snapshot.persistence_detail = None;
+                snapshot.controller_input = if recovery.acceptor_stop_pending {
+                    ControllerInputStatus::Unavailable {
+                        reason: ControllerInputUnavailableReason::AcceptorStopped,
+                    }
+                } else if matches!(
+                    snapshot.controller_input,
+                    ControllerInputStatus::Unavailable {
+                        reason: ControllerInputUnavailableReason::PersistenceUnavailable,
+                    }
+                ) {
+                    ControllerInputStatus::Available
+                } else {
+                    snapshot.controller_input
+                };
+                if snapshot.controller_input == ControllerInputStatus::Available {
+                    set_controller_coverage_available(&mut snapshot.source_coverage);
+                } else {
+                    set_controller_coverage_unavailable(&mut snapshot.source_coverage);
+                }
+                recovery.acceptor_stop_pending = false;
+                recovery.probe_due = false;
+                recovery.next_probe_at = None;
+                recovery.marker_pending = true;
+                tracing::warn!(
+                    warning_code = "persistence_recovered",
+                    "Persistence recovered after a successful writer probe"
+                );
+                Self::publish_facade(
+                    snapshot,
+                    publisher,
+                    acceptor_diagnostics,
+                    enrichment_diagnostics,
+                    provider_diagnostics,
+                );
+            }
         }
     }
 
@@ -765,8 +945,15 @@ impl RuntimePersistence {
         failure: PersistenceFailure,
         class: RuntimeCommandClass,
     ) -> RuntimeWriteOutcome {
+        let detail = {
+            let health = self.writer_health.borrow();
+            (health.status == PersistenceStatus::Degraded { failure })
+                .then(|| health.detail.clone())
+                .flatten()
+        };
         Self::record_facade_failure(
             failure,
+            detail,
             class,
             &mut self.snapshot,
             &self.publisher,
@@ -775,12 +962,14 @@ impl RuntimePersistence {
             &self.acceptor_diagnostics,
             &self.enrichment_diagnostics,
             &self.provider_diagnostics,
+            &mut self.recovery,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     fn record_facade_failure(
         failure: PersistenceFailure,
+        detail: Option<BoundedDetail>,
         class: RuntimeCommandClass,
         snapshot: &mut RuntimeDiagnosticsSnapshot,
         publisher: &watch::Sender<RuntimeDiagnosticsSnapshot>,
@@ -789,6 +978,7 @@ impl RuntimePersistence {
         acceptor_diagnostics: &ControllerDiagnosticsHandle,
         enrichment_diagnostics: &EnrichmentDiagnosticsHandle,
         provider_diagnostics: &ProviderDiagnosticsHandle,
+        recovery: &mut PersistenceRecovery,
     ) -> RuntimeWriteOutcome {
         let outcome = match failure.durability {
             DurabilityDisposition::Committed => RuntimeWriteOutcome::CommittedButDegraded(failure),
@@ -802,6 +992,13 @@ impl RuntimePersistence {
         }
 
         snapshot.persistence = PersistenceStatus::Degraded { failure };
+        snapshot.persistence_detail = detail;
+        recovery.arm_cooldown();
+        tracing::warn!(
+            warning_code = "persistence_degraded",
+            ?failure,
+            "Persistence degraded; writes will be skipped until recovery"
+        );
         snapshot.controller_input = ControllerInputStatus::Unavailable {
             reason: ControllerInputUnavailableReason::PersistenceUnavailable,
         };
@@ -837,6 +1034,7 @@ impl RuntimePersistence {
             let record = encode_persistence_occurrence(
                 unix_now_ms(),
                 failure,
+                snapshot.persistence_detail.clone(),
                 snapshot.persistence_counters,
             );
             snapshot.first_failure_log = if occurrence_sink.append(&record).is_ok() {
@@ -879,6 +1077,8 @@ impl RuntimePersistence {
             };
             set_controller_coverage_unavailable(&mut self.snapshot.source_coverage);
             self.publish();
+        } else {
+            self.recovery.acceptor_stop_pending = true;
         }
     }
 
@@ -978,7 +1178,34 @@ async fn persist_submission(
 ) -> Result<RuntimeWriteOutcome, WriterError> {
     let outcome = persistence.apply(batch).await?;
     reducer.complete_operator_submission(outcome);
+    persist_recovery_marker_if_pending(persistence, reducer).await?;
     Ok(outcome)
+}
+
+async fn persist_recovery_marker_if_pending(
+    persistence: &mut RuntimePersistence,
+    reducer: &mut Reducer,
+) -> Result<(), WriterError> {
+    if persistence.recovery.marker_pending {
+        persistence.recovery.marker_pending = false;
+        let marker = PersistOp::RecordCollectorGap(CollectorGap {
+            event_id: format!("collector-gap-{}", ulid::Ulid::new()),
+            herdr_session: persistence.session.clone(),
+            seen_at_ms: unix_now_ms(),
+            kind: GapKind::PersistenceOutage,
+        });
+        let marker_outcome = persistence.apply(vec![marker]).await?;
+        reducer.complete_operator_submission(marker_outcome);
+        if matches!(
+            marker_outcome,
+            RuntimeWriteOutcome::NotCommitted(_)
+                | RuntimeWriteOutcome::DurabilityUnknown(_)
+                | RuntimeWriteOutcome::Skipped
+        ) {
+            persistence.recovery.marker_pending = true;
+        }
+    }
+    Ok(())
 }
 
 fn set_controller_coverage_unavailable(coverage: &mut [SourceCoverageSnapshot]) {
@@ -987,6 +1214,15 @@ fn set_controller_coverage_unavailable(coverage: &mut [SourceCoverageSnapshot]) 
         .find(|snapshot| snapshot.source == DiagnosticSource::Controller)
     {
         controller.availability = InputAvailability::Unavailable;
+    }
+}
+
+fn set_controller_coverage_available(coverage: &mut [SourceCoverageSnapshot]) {
+    if let Some(controller) = coverage
+        .iter_mut()
+        .find(|snapshot| snapshot.source == DiagnosticSource::Controller)
+    {
+        controller.availability = InputAvailability::Available;
     }
 }
 
@@ -1238,6 +1474,7 @@ pub async fn spawn_workload_collector(
     let (coverage_sender, source_coverage) = watch::channel(initial_coverage);
     let (persistence, diagnostics) = RuntimePersistence::new(
         writer,
+        &session,
         &model.borrow(),
         &source_coverage.borrow(),
         Arc::new(UnavailableOccurrenceSink),
@@ -1617,6 +1854,7 @@ async fn spawn_configured_inner(
     let (coverage_sender, source_coverage) = watch::channel(initial_coverage);
     let (persistence, diagnostics) = RuntimePersistence::new(
         writer,
+        &session,
         &model.borrow(),
         &source_coverage.borrow(),
         occurrence_sink,
@@ -1785,6 +2023,7 @@ async fn run_collector(
             () = cancellation.cancelled() => break,
             _ = retention_cleanup.tick() => {
                 let _ = persistence.cleanup(unix_now_ms()).await?;
+                persist_recovery_marker_if_pending(&mut persistence, &mut reducer).await?;
                 persistence.refresh_pane_coverage(&shared.borrow());
                 persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
                 continue;
@@ -2723,6 +2962,7 @@ async fn monitor_live(
                     provider.publish_targets(shared);
                 }
                 let _ = persistence.cleanup(unix_now_ms()).await?;
+                persist_recovery_marker_if_pending(persistence, reducer).await?;
                 persistence.refresh_pane_coverage(&shared.borrow());
                 persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
                 continue;
@@ -2892,6 +3132,7 @@ async fn monitor_reconciling(
                     provider.publish_targets(shared);
                 }
                 let _ = persistence.cleanup(unix_now_ms()).await?;
+                persist_recovery_marker_if_pending(persistence, reducer).await?;
                 persistence.refresh_pane_coverage(&shared.borrow());
                 persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
                 continue;
@@ -7160,6 +7401,7 @@ mod tests {
         let initial_coverage = SourceCoverageRegistry::new(SourceAvailability::NotApplicable);
         let (persistence, mut diagnostics) = RuntimePersistence::new(
             writer,
+            "test",
             &shared.borrow(),
             &initial_coverage,
             Arc::new(RecordingOccurrenceSink::default()),
@@ -7338,6 +7580,57 @@ mod tests {
         let (lifecycle, writer) = spawn_writer(store).unwrap();
         let (runtime, diagnostics) = RuntimePersistence::new_for_test(writer, sink);
         (directory, lifecycle, runtime, diagnostics)
+    }
+
+    fn recoverable_runtime(
+        retry_interval: Duration,
+    ) -> (
+        tempfile::TempDir,
+        crate::lockfile::StateRoot,
+        crate::store::WriterLifecycle,
+        RuntimePersistence,
+        watch::Receiver<crate::diagnostics::RuntimeDiagnosticsSnapshot>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        store
+            .replace_owner(&OwnerRecord {
+                pid: 42,
+                started_at_ms: 1,
+                terminal_id: Some("terminal".to_owned()),
+                pane_id: Some("pane".to_owned()),
+            })
+            .unwrap();
+        rusqlite::Connection::open(crate::store::database_path(&root))
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_runtime_owner BEFORE UPDATE ON owner \
+                 BEGIN SELECT RAISE(ABORT, 'initial runtime failure'); END;",
+            )
+            .unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (runtime, diagnostics) = RuntimePersistence::new_for_test_with_retry_interval(
+            writer,
+            Arc::new(RecordingOccurrenceSink::default()),
+            retry_interval,
+        );
+        (directory, root, lifecycle, runtime, diagnostics)
+    }
+
+    fn replace_runtime_owner_trigger(root: &crate::lockfile::StateRoot, detail: Option<&str>) {
+        let connection = rusqlite::Connection::open(crate::store::database_path(root)).unwrap();
+        connection
+            .execute_batch("DROP TRIGGER IF EXISTS fail_runtime_owner;")
+            .unwrap();
+        if let Some(detail) = detail {
+            connection
+                .execute_batch(&format!(
+                    "CREATE TRIGGER fail_runtime_owner BEFORE UPDATE ON owner \
+                     BEGIN SELECT RAISE(ABORT, '{detail}'); END;"
+                ))
+                .unwrap();
+        }
     }
 
     async fn shutdown_writer(lifecycle: crate::store::WriterLifecycle) {
@@ -7556,6 +7849,7 @@ mod tests {
         );
         let (persistence, _diagnostics) = RuntimePersistence::new(
             writer,
+            "test",
             &shared.borrow(),
             &initial_coverage,
             Arc::new(RecordingOccurrenceSink::default()),
@@ -8553,6 +8847,285 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistence_recovery_restores_facade_and_persistence_unavailable_input_only() {
+        let (_directory, root, lifecycle, mut runtime, diagnostics) =
+            recoverable_runtime(Duration::from_secs(30));
+
+        assert!(matches!(
+            runtime
+                .update_owner_location("terminal-2", "pane-2")
+                .await
+                .unwrap(),
+            RuntimeWriteOutcome::NotCommitted(_)
+        ));
+        assert_eq!(
+            diagnostics.borrow().controller_input,
+            ControllerInputStatus::Unavailable {
+                reason: ControllerInputUnavailableReason::PersistenceUnavailable,
+            }
+        );
+        replace_runtime_owner_trigger(&root, None);
+        runtime.recovery.next_probe_at = Some(Instant::now());
+
+        assert_eq!(
+            runtime.apply(Vec::new()).await.unwrap(),
+            RuntimeWriteOutcome::Skipped,
+            "the batch that arrived while degraded must stay dropped"
+        );
+        let snapshot = diagnostics.borrow().clone();
+        assert_eq!(snapshot.persistence, PersistenceStatus::Healthy);
+        assert_eq!(snapshot.persistence_detail, None);
+        assert_eq!(snapshot.controller_input, ControllerInputStatus::Available);
+        assert_eq!(snapshot.owner, OwnerFreshness::Stale);
+        drop(snapshot);
+        assert_eq!(
+            runtime.apply(Vec::new()).await.unwrap(),
+            RuntimeWriteOutcome::Durable
+        );
+
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn acceptor_stop_during_outage_takes_precedence_at_recovery() {
+        let (_directory, root, lifecycle, mut runtime, diagnostics) =
+            recoverable_runtime(Duration::from_secs(30));
+        assert!(matches!(
+            runtime
+                .update_owner_location("terminal-2", "pane-2")
+                .await
+                .unwrap(),
+            RuntimeWriteOutcome::NotCommitted(_)
+        ));
+        runtime.mark_acceptor_stopped();
+        assert!(runtime.recovery.acceptor_stop_pending);
+        replace_runtime_owner_trigger(&root, None);
+        runtime.recovery.next_probe_at = Some(Instant::now());
+
+        assert_eq!(
+            runtime.cleanup(0).await.unwrap(),
+            RuntimeWriteOutcome::Skipped
+        );
+        let snapshot = diagnostics.borrow().clone();
+        assert_eq!(snapshot.persistence, PersistenceStatus::Healthy);
+        assert_eq!(
+            snapshot.controller_input,
+            ControllerInputStatus::Unavailable {
+                reason: ControllerInputUnavailableReason::AcceptorStopped,
+            }
+        );
+
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn reserve_enqueue_arms_probe_and_counts_refusal_while_cadence_gates_attempts() {
+        let retry_interval = Duration::from_millis(500);
+        let (_directory, root, lifecycle, mut runtime, diagnostics) =
+            recoverable_runtime(retry_interval);
+        assert!(matches!(
+            runtime
+                .update_owner_location("terminal-2", "pane-2")
+                .await
+                .unwrap(),
+            RuntimeWriteOutcome::NotCommitted(_)
+        ));
+        replace_runtime_owner_trigger(&root, Some("first probe detail"));
+
+        assert!(runtime.reserve_enqueue().is_none());
+        assert!(runtime.recovery.probe_due);
+        assert_eq!(
+            diagnostics.borrow().persistence_counters.skipped_enqueues,
+            1
+        );
+        assert!(
+            diagnostics
+                .borrow()
+                .persistence_detail
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .contains("initial runtime failure"),
+            "reserve_enqueue must not drive the probe itself"
+        );
+
+        tokio::time::sleep(retry_interval + Duration::from_millis(50)).await;
+        assert_eq!(
+            runtime.apply(Vec::new()).await.unwrap(),
+            RuntimeWriteOutcome::Skipped
+        );
+        assert!(!runtime.recovery.probe_due);
+        assert!(
+            diagnostics
+                .borrow()
+                .persistence_detail
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .contains("first probe detail")
+        );
+
+        replace_runtime_owner_trigger(&root, Some("too-soon probe detail"));
+        assert_eq!(
+            runtime.cleanup(0).await.unwrap(),
+            RuntimeWriteOutcome::Skipped
+        );
+        assert!(
+            diagnostics
+                .borrow()
+                .persistence_detail
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .contains("first probe detail"),
+            "a second probe must not run inside the cooldown"
+        );
+
+        replace_runtime_owner_trigger(&root, None);
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_enqueues_one_persistence_outage_gap_through_submission_path() {
+        let (_directory, root, lifecycle, mut runtime, _diagnostics) =
+            recoverable_runtime(Duration::from_secs(30));
+        assert!(matches!(
+            runtime
+                .update_owner_location("terminal-2", "pane-2")
+                .await
+                .unwrap(),
+            RuntimeWriteOutcome::NotCommitted(_)
+        ));
+        replace_runtime_owner_trigger(&root, None);
+        runtime.recovery.next_probe_at = Some(Instant::now());
+        let (mut reducer, _shared) = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+
+        assert_eq!(
+            persist_submission(&mut runtime, &mut reducer, Vec::new())
+                .await
+                .unwrap(),
+            RuntimeWriteOutcome::Skipped
+        );
+        let persisted: i64 = rusqlite::Connection::open(crate::store::database_path(&root))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE gap_kind = 'persistence_outage'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, 1);
+        assert!(!runtime.recovery.marker_pending);
+
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_driven_recovery_enqueues_the_pending_persistence_outage_gap() {
+        let (_directory, root, lifecycle, mut runtime, _diagnostics) =
+            recoverable_runtime(Duration::from_secs(30));
+        assert!(matches!(
+            runtime
+                .update_owner_location("terminal-2", "pane-2")
+                .await
+                .unwrap(),
+            RuntimeWriteOutcome::NotCommitted(_)
+        ));
+        replace_runtime_owner_trigger(&root, None);
+        runtime.recovery.next_probe_at = Some(Instant::now());
+        let (mut reducer, _shared) = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+
+        assert_eq!(
+            runtime.cleanup(0).await.unwrap(),
+            RuntimeWriteOutcome::Skipped
+        );
+        persist_recovery_marker_if_pending(&mut runtime, &mut reducer)
+            .await
+            .unwrap();
+        let persisted: i64 = rusqlite::Connection::open(crate::store::database_path(&root))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE gap_kind = 'persistence_outage'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, 1);
+        assert!(!runtime.recovery.marker_pending);
+
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn persistence_transition_warnings_emit_once_per_degrade_and_recover_transition() {
+        let (directory, root, lifecycle, mut runtime, _diagnostics) =
+            recoverable_runtime(Duration::from_secs(30));
+        let log_path = directory.path().join("persistence-transitions.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(log)
+            .finish();
+
+        async {
+            assert!(matches!(
+                runtime
+                    .update_owner_location("terminal-2", "pane-2")
+                    .await
+                    .unwrap(),
+                RuntimeWriteOutcome::NotCommitted(_)
+            ));
+            assert_eq!(
+                runtime.apply(Vec::new()).await.unwrap(),
+                RuntimeWriteOutcome::Skipped
+            );
+            assert!(runtime.reserve_enqueue().is_none());
+
+            replace_runtime_owner_trigger(&root, None);
+            runtime.recovery.next_probe_at = Some(Instant::now());
+            assert_eq!(
+                runtime.cleanup(0).await.unwrap(),
+                RuntimeWriteOutcome::Skipped
+            );
+            assert_eq!(
+                runtime.apply(Vec::new()).await.unwrap(),
+                RuntimeWriteOutcome::Durable
+            );
+            shutdown_writer(lifecycle).await;
+        }
+        .with_subscriber(subscriber)
+        .await;
+
+        let contents = std::fs::read_to_string(log_path).unwrap();
+        assert_eq!(
+            contents
+                .matches("warning_code=\"persistence_degraded\"")
+                .count(),
+            1,
+            "{contents}"
+        );
+        assert_eq!(
+            contents
+                .matches("warning_code=\"persistence_recovered\"")
+                .count(),
+            1,
+            "{contents}"
+        );
+    }
+
+    #[tokio::test]
     async fn i4_d3_accepted_not_committed_counts_without_rollback() {
         let sink = Arc::new(RecordingOccurrenceSink::default());
         let (_directory, lifecycle, mut runtime, diagnostics) = runtime_with_sink(sink);
@@ -8688,7 +9261,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn i4_d3_accepted_failure_log_excludes_raw_store_text() {
+    async fn i4_d3_accepted_failure_log_retains_bounded_store_text() {
         const RAW_STORE_TEXT: &str = "PRIVATE_SQLITE_ROW_AND_PATH_2A31";
         let sink = Arc::new(RecordingOccurrenceSink::default());
         let directory = tempfile::tempdir().unwrap();
@@ -8702,7 +9275,7 @@ mod tests {
             ))
             .unwrap();
         let (lifecycle, writer) = spawn_writer(store).unwrap();
-        let (mut runtime, _diagnostics) = RuntimePersistence::new_for_test(writer, sink.clone());
+        let (mut runtime, diagnostics) = RuntimePersistence::new_for_test(writer, sink.clone());
 
         let outcome = runtime
             .apply(vec![PersistOp::RecordCollectorGap(CollectorGap {
@@ -8716,10 +9289,19 @@ mod tests {
         assert!(matches!(outcome, RuntimeWriteOutcome::NotCommitted(_)));
 
         let text = String::from_utf8(sink.bytes.lock().unwrap().clone()).unwrap();
-        assert!(!text.contains(RAW_STORE_TEXT));
+        assert!(text.contains(RAW_STORE_TEXT));
         assert!(!text.contains("private-event-id"));
         assert!(!text.contains("private-session"));
         assert!(!text.contains(directory.path().to_string_lossy().as_ref()));
+        let detail = diagnostics
+            .borrow()
+            .persistence_detail
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .to_owned();
+        assert!(detail.contains(RAW_STORE_TEXT));
+        assert!(detail.len() <= crate::store::writer::PERSISTENCE_DETAIL_MAX_BYTES);
         shutdown_writer(lifecycle).await;
     }
 
@@ -12206,6 +12788,7 @@ mod tests {
         );
         let (persistence, mut diagnostics) = RuntimePersistence::new(
             writer,
+            "test",
             &shared.borrow(),
             &initial_coverage,
             Arc::new(RecordingOccurrenceSink::default()),
@@ -12868,6 +13451,7 @@ mod provider_integration_tests {
     fn test_diagnostics() -> watch::Receiver<RuntimeDiagnosticsSnapshot> {
         watch::channel(RuntimeDiagnosticsSnapshot {
             persistence: PersistenceStatus::Healthy,
+            persistence_detail: None,
             controller_input: ControllerInputStatus::Unavailable {
                 reason: ControllerInputUnavailableReason::ListenerUnavailable,
             },

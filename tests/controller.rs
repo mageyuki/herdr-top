@@ -46,7 +46,7 @@ struct RunningController {
     socket_path: PathBuf,
     collector: CollectorHandle,
     lifecycle: WriterLifecycle,
-    persistence: watch::Receiver<store::PersistenceStatus>,
+    persistence: watch::Receiver<store::PersistenceHealthSnapshot>,
 }
 
 struct RendezvousController {
@@ -210,7 +210,7 @@ impl RunningController {
         let mut diagnostics = self.collector.diagnostics.clone();
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                let writer_status = *persistence.borrow();
+                let writer_status = persistence.borrow().status;
                 let diagnostic_status = diagnostics.borrow().persistence;
                 if let (
                     store::PersistenceStatus::Degraded {
@@ -240,7 +240,7 @@ impl RunningController {
 
     async fn induce_persistence_failure(&self) {
         assert_eq!(
-            *self.persistence.borrow(),
+            self.persistence.borrow().status,
             store::PersistenceStatus::Healthy
         );
         assert_eq!(
@@ -394,7 +394,7 @@ async fn wait_for_durable_row_count_with_timeout(
     tokio::time::timeout(timeout, async {
         loop {
             assert_eq!(
-                *running.persistence.borrow(),
+                running.persistence.borrow().status,
                 store::PersistenceStatus::Healthy,
                 "persistence degraded while waiting for durable rows"
             );
@@ -485,6 +485,7 @@ fn controlled_diagnostics() -> (
     let controller_counters = ControllerCounterSnapshot::default();
     watch::channel(RuntimeDiagnosticsSnapshot {
         persistence: store::PersistenceStatus::Healthy,
+        persistence_detail: None,
         controller_input: ControllerInputStatus::Available,
         owner: OwnerFreshness::Current,
         persistence_counters: PersistenceCounters::default(),
@@ -2512,7 +2513,11 @@ async fn i4_d3_later_controller_event_is_retryable_without_change() {
         diagnostics["diagnostics"]["controller_input"],
         json!({"status": "unavailable", "reason": "persistence_unavailable"})
     );
-    assert!(!diagnostics.to_string().contains(PRIVATE_SQLITE_TEXT));
+    let detail = diagnostics["diagnostics"]["persistence_detail"]
+        .as_str()
+        .expect("store failures must retain bounded detail");
+    assert!(detail.contains(PRIVATE_SQLITE_TEXT));
+    assert!(detail.len() <= store::writer::PERSISTENCE_DETAIL_MAX_BYTES);
 
     assert_eq!(
         running.send_bounded(&first).await,

@@ -3559,14 +3559,14 @@ fn spawn_static_herdr(path: &std::path::Path, snapshot: Value) -> JoinHandle<()>
 }
 
 async fn wait_for_persistence_degradation(
-    persistence: &mut tokio::sync::watch::Receiver<herdr_top::store::PersistenceStatus>,
+    persistence: &mut tokio::sync::watch::Receiver<herdr_top::store::PersistenceHealthSnapshot>,
     diagnostics: &mut tokio::sync::watch::Receiver<
         herdr_top::diagnostics::RuntimeDiagnosticsSnapshot,
     >,
 ) -> herdr_top::store::PersistenceFailure {
     tokio::time::timeout(WAIT, async {
         loop {
-            let writer_status = *persistence.borrow();
+            let writer_status = persistence.borrow().status;
             let diagnostic_status = diagnostics.borrow().persistence;
             if let (
                 herdr_top::store::PersistenceStatus::Degraded {

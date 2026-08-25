@@ -1224,6 +1224,7 @@ pub enum GapKind {
     Startup,
     Reconnect,
     SocketReplacement,
+    PersistenceOutage,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -572,7 +572,7 @@ async fn workload_harness_writer_access_uses_owned_client() {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             assert_eq!(
-                *persistence.borrow(),
+                persistence.borrow().status,
                 herdr_top::store::PersistenceStatus::Healthy
             );
             assert_eq!(

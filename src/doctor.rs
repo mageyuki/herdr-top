@@ -33,8 +33,8 @@ use crate::provider;
 use crate::rendezvous::{self, ControllerRuntimeProbe, SocketPathLength};
 use crate::session_key::{self, ResolvedSession, ResolverSource};
 use crate::store::{
-    DurabilityDisposition, PersistenceFailure, PersistenceFailureCode, PersistenceOperation,
-    PersistencePhase, PersistenceStatus,
+    BoundedDetail, DurabilityDisposition, PersistenceFailure, PersistenceFailureCode,
+    PersistenceOperation, PersistencePhase, PersistenceStatus,
 };
 
 const SCHEMA_VERSION: u64 = 1;
@@ -298,6 +298,7 @@ pub struct CoverageObservation {
 pub struct PersistenceOccurrenceObservation {
     pub timestamp_ms: i64,
     pub failure: PersistenceFailure,
+    pub detail: Option<BoundedDetail>,
     pub counters: PersistenceCounters,
 }
 
@@ -915,6 +916,7 @@ fn persistence_occurrence_check(
             Some(PersistenceOccurrenceObservation {
                 timestamp_ms: observed.timestamp_ms,
                 failure: observed.failure,
+                detail: observed.detail,
                 counters: observed.counters,
             }),
         ),
@@ -1618,10 +1620,12 @@ fn parse_runtime_status(response: &Value) -> Option<RuntimeDiagnosticsSnapshot> 
 
 fn parse_runtime_snapshot(value: &Value) -> Option<RuntimeDiagnosticsSnapshot> {
     let object = value.as_object()?;
-    if object.len() != 10 {
+    if !matches!(object.len(), 10 | 11) {
         return None;
     }
-    let persistence = parse_persistence_status(object.get("persistence")?)?;
+    let (persistence, nested_detail) = parse_persistence_status(object.get("persistence")?)?;
+    let persistence_detail =
+        parse_optional_detail(object.get("persistence_detail"))?.or(nested_detail);
     let controller_input = parse_controller_input(object.get("controller_input")?)?;
     let owner = match object.get("owner")?.as_str()? {
         "current" => OwnerFreshness::Current,
@@ -1654,6 +1658,7 @@ fn parse_runtime_snapshot(value: &Value) -> Option<RuntimeDiagnosticsSnapshot> {
     };
     Some(RuntimeDiagnosticsSnapshot {
         persistence,
+        persistence_detail,
         controller_input,
         owner,
         persistence_counters,
@@ -1705,20 +1710,27 @@ fn parse_enrichment_counters(value: &Value) -> Option<EnrichmentCounterSnapshot>
     })
 }
 
-fn parse_persistence_status(value: &Value) -> Option<PersistenceStatus> {
+fn parse_persistence_status(value: &Value) -> Option<(PersistenceStatus, Option<BoundedDetail>)> {
     let object = value.as_object()?;
     match object.get("status")?.as_str()? {
-        "healthy" if object.len() == 1 => Some(PersistenceStatus::Healthy),
-        "degraded" if object.len() == 2 => Some(PersistenceStatus::Degraded {
-            failure: parse_persistence_failure(object.get("failure")?)?,
-        }),
+        "healthy" if matches!(object.len(), 1 | 2) => Some((
+            PersistenceStatus::Healthy,
+            parse_optional_detail(object.get("detail"))?,
+        )),
+        "degraded" if matches!(object.len(), 2 | 3) => {
+            let (failure, failure_detail) = parse_persistence_failure(object.get("failure")?)?;
+            Some((
+                PersistenceStatus::Degraded { failure },
+                parse_optional_detail(object.get("detail"))?.or(failure_detail),
+            ))
+        }
         _ => None,
     }
 }
 
-fn parse_persistence_failure(value: &Value) -> Option<PersistenceFailure> {
+fn parse_persistence_failure(value: &Value) -> Option<(PersistenceFailure, Option<BoundedDetail>)> {
     let object = value.as_object()?;
-    if object.len() != 4 {
+    if !matches!(object.len(), 4 | 5) {
         return None;
     }
     let operation = match object.get("operation")?.as_str()? {
@@ -1755,12 +1767,23 @@ fn parse_persistence_failure(value: &Value) -> Option<PersistenceFailure> {
         "unknown" => DurabilityDisposition::Unknown,
         _ => return None,
     };
-    Some(PersistenceFailure {
-        operation,
-        phase,
-        code,
-        durability,
-    })
+    Some((
+        PersistenceFailure {
+            operation,
+            phase,
+            code,
+            durability,
+        },
+        parse_optional_detail(object.get("detail"))?,
+    ))
+}
+
+fn parse_optional_detail(value: Option<&Value>) -> Option<Option<BoundedDetail>> {
+    match value {
+        None | Some(Value::Null) => Some(None),
+        Some(Value::String(detail)) => Some(Some(BoundedDetail::new(detail.clone()))),
+        Some(_) => None,
+    }
 }
 
 fn parse_controller_input(value: &Value) -> Option<ControllerInputStatus> {
@@ -1785,7 +1808,7 @@ fn parse_controller_input(value: &Value) -> Option<ControllerInputStatus> {
 
 fn parse_persistence_counters(value: &Value) -> Option<PersistenceCounters> {
     let object = value.as_object()?;
-    if object.len() != 5 {
+    if !matches!(object.len(), 5 | 6) {
         return None;
     }
     Some(PersistenceCounters {
@@ -1794,6 +1817,10 @@ fn parse_persistence_counters(value: &Value) -> Option<PersistenceCounters> {
         committed_but_degraded_batches: object.get("committed_but_degraded_batches")?.as_u64()?,
         skipped_batches: object.get("skipped_batches")?.as_u64()?,
         skipped_owner_updates: object.get("skipped_owner_updates")?.as_u64()?,
+        skipped_enqueues: match object.get("skipped_enqueues") {
+            Some(value) => value.as_u64()?,
+            None => 0,
+        },
     })
 }
 
@@ -2179,6 +2206,7 @@ mod tests {
     fn runtime(persistence: PersistenceStatus) -> RuntimeDiagnosticsSnapshot {
         RuntimeDiagnosticsSnapshot {
             persistence,
+            persistence_detail: None,
             controller_input: ControllerInputStatus::Available,
             owner: OwnerFreshness::Current,
             persistence_counters: PersistenceCounters::default(),
@@ -2443,6 +2471,7 @@ mod tests {
             persistence_occurrence_check(PersistenceLogVerdict::Found(LocalOccurrence {
                 timestamp_ms: 7,
                 failure: test_persistence_failure(),
+                detail: None,
                 counters: PersistenceCounters::default(),
             }));
         assert_eq!(healthy.code, "controller_live_healthy");
@@ -2506,6 +2535,46 @@ mod tests {
     }
 
     #[test]
+    fn runtime_parser_accepts_legacy_and_current_persistence_shapes() {
+        let mut legacy = serde_json::to_value(runtime(PersistenceStatus::Degraded {
+            failure: test_persistence_failure(),
+        }))
+        .unwrap();
+        let legacy = legacy.as_object_mut().unwrap();
+        legacy.remove("persistence_detail");
+        legacy
+            .get_mut("persistence_counters")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("skipped_enqueues");
+        let legacy = parse_runtime_snapshot(&Value::Object(legacy.clone()))
+            .expect("legacy runtime diagnostics must remain readable");
+        assert_eq!(legacy.persistence_detail, None);
+        assert_eq!(legacy.persistence_counters.skipped_enqueues, 0);
+
+        let mut current = serde_json::to_value(runtime(PersistenceStatus::Degraded {
+            failure: test_persistence_failure(),
+        }))
+        .unwrap();
+        current.as_object_mut().unwrap().insert(
+            "persistence_detail".to_owned(),
+            Value::String("database is temporarily read-only".to_owned()),
+        );
+        current["persistence_counters"]["skipped_enqueues"] = Value::from(9);
+        let current =
+            parse_runtime_snapshot(&current).expect("current runtime diagnostics must be readable");
+        assert_eq!(
+            current
+                .persistence_detail
+                .as_ref()
+                .map(BoundedDetail::as_str),
+            Some("database is temporarily read-only")
+        );
+        assert_eq!(current.persistence_counters.skipped_enqueues, 9);
+    }
+
+    #[test]
     fn i4_doctor_persistence_occurrence_verdict_matrix() {
         let absent = persistence_occurrence_check(PersistenceLogVerdict::Absent);
         assert_eq!(absent.status, CheckStatus::Ok);
@@ -2525,6 +2594,7 @@ mod tests {
         let found = persistence_occurrence_check(PersistenceLogVerdict::Found(LocalOccurrence {
             timestamp_ms: 11,
             failure: test_persistence_failure(),
+            detail: None,
             counters: PersistenceCounters::default(),
         }));
         assert_eq!(found.status, CheckStatus::Warning);

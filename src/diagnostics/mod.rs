@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use tracing_subscriber::fmt::MakeWriter;
 
 use crate::model::DomainModel;
-use crate::store::writer::{PersistenceFailure, PersistenceStatus};
+use crate::store::writer::{BoundedDetail, PersistenceFailure, PersistenceStatus};
 
 pub mod local;
 pub mod remote;
@@ -77,6 +77,7 @@ pub struct PersistenceCounters {
     pub committed_but_degraded_batches: u64,
     pub skipped_batches: u64,
     pub skipped_owner_updates: u64,
+    pub skipped_enqueues: u64,
 }
 
 /// Immutable copy of all Controller diagnostic counters.
@@ -178,6 +179,7 @@ pub enum OccurrenceLogStatus {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct RuntimeDiagnosticsSnapshot {
     pub persistence: PersistenceStatus,
+    pub persistence_detail: Option<BoundedDetail>,
     pub controller_input: ControllerInputStatus,
     pub owner: OwnerFreshness,
     pub persistence_counters: PersistenceCounters,
@@ -264,20 +266,28 @@ struct PersistenceOccurrenceV1 {
     schema_version: u64,
     kind: OccurrenceKind,
     timestamp_ms: i64,
-    failure: PersistenceFailure,
+    failure: PersistenceOccurrenceFailureV1,
     counters: PersistenceCounters,
+}
+
+#[derive(serde::Serialize)]
+struct PersistenceOccurrenceFailureV1 {
+    #[serde(flatten)]
+    failure: PersistenceFailure,
+    detail: Option<BoundedDetail>,
 }
 
 pub(crate) fn encode_persistence_occurrence(
     timestamp_ms: i64,
     failure: PersistenceFailure,
+    detail: Option<BoundedDetail>,
     counters: PersistenceCounters,
 ) -> Vec<u8> {
     let occurrence = PersistenceOccurrenceV1 {
         schema_version: 1,
         kind: OccurrenceKind::PersistenceDegraded,
         timestamp_ms,
-        failure,
+        failure: PersistenceOccurrenceFailureV1 { failure, detail },
         counters,
     };
     let mut record = Vec::with_capacity(256);
@@ -313,7 +323,8 @@ mod tests {
 
     use super::*;
     use crate::store::writer::{
-        DurabilityDisposition, PersistenceFailureCode, PersistenceOperation, PersistencePhase,
+        BoundedDetail, DurabilityDisposition, PersistenceFailureCode, PersistenceOperation,
+        PersistencePhase,
     };
 
     #[test]
@@ -326,6 +337,7 @@ mod tests {
         };
         let snapshot = RuntimeDiagnosticsSnapshot {
             persistence: PersistenceStatus::Degraded { failure },
+            persistence_detail: Some(BoundedDetail::new("database is temporarily read-only")),
             controller_input: ControllerInputStatus::Unavailable {
                 reason: ControllerInputUnavailableReason::PersistenceUnavailable,
             },
@@ -336,6 +348,7 @@ mod tests {
                 committed_but_degraded_batches: 3,
                 skipped_batches: 4,
                 skipped_owner_updates: 5,
+                skipped_enqueues: 6,
             },
             controller_counters: ControllerCounterSnapshot {
                 dangling_announcement_components: 7,
@@ -373,6 +386,7 @@ mod tests {
                         "durability": "committed"
                     }
                 },
+                "persistence_detail": "database is temporarily read-only",
                 "controller_input": {
                     "status": "unavailable",
                     "reason": "persistence_unavailable"
@@ -383,7 +397,8 @@ mod tests {
                     "durability_unknown_batches": 2,
                     "committed_but_degraded_batches": 3,
                     "skipped_batches": 4,
-                    "skipped_owner_updates": 5
+                    "skipped_owner_updates": 5,
+                    "skipped_enqueues": 6
                 },
                 "controller_counters": {
                     "binding_conflicts": 0,
@@ -435,8 +450,13 @@ mod tests {
             snapshot.dangling_announcement_components
         );
         assert_eq!(
-            encode_persistence_occurrence(123, failure, snapshot.persistence_counters),
-            br#"HERDR_TOP_PERSISTENCE_V1 {"schema_version":1,"kind":"persistence_degraded","timestamp_ms":123,"failure":{"operation":"cleanup","phase":"post_apply_commit","code":"sqlite","durability":"committed"},"counters":{"not_committed_batches":1,"durability_unknown_batches":2,"committed_but_degraded_batches":3,"skipped_batches":4,"skipped_owner_updates":5}}
+            encode_persistence_occurrence(
+                123,
+                failure,
+                snapshot.persistence_detail.clone(),
+                snapshot.persistence_counters,
+            ),
+            br#"HERDR_TOP_PERSISTENCE_V1 {"schema_version":1,"kind":"persistence_degraded","timestamp_ms":123,"failure":{"operation":"cleanup","phase":"post_apply_commit","code":"sqlite","durability":"committed","detail":"database is temporarily read-only"},"counters":{"not_committed_batches":1,"durability_unknown_batches":2,"committed_but_degraded_batches":3,"skipped_batches":4,"skipped_owner_updates":5,"skipped_enqueues":6}}
 "#,
         );
     }
