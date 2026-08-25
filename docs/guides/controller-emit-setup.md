@@ -389,10 +389,12 @@ responses.
 
 `coverage.native_sessions` consumes the lane-wide
 `pane_sessions_with_artifacts` count as a shared budget for identifier-kind
-panes in snapshot order. Only the aggregate `covered` and `uncovered` counts
-are contractual. The `by_provider` placement is not proof of artifact
-ownership, and a pane from one provider can consume a budget unit produced by
-the other provider.
+panes in snapshot order. Even the aggregate `covered` and `uncovered` counts
+are approximate and can be optimistic: path-kind panes contribute budget units
+without consuming one, and retained historical executions can fund a current
+pane. Treat the counts as a hint, not a guarantee. The `by_provider` placement
+is not proof of artifact ownership, and a pane from one provider can consume a
+budget unit produced by the other provider.
 
 The log-lane checks are:
 

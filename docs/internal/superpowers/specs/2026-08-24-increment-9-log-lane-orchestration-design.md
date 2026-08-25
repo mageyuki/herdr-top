@@ -37,11 +37,11 @@ codex lineage depends on the child's id appearing SOMEWHERE in the
 parent's artifacts (spawn command line, resume invocation, or quoted in a
 report); measured on this machine, bare spawn command lines carry the id
 in only a small minority of dispatches, while report-quoting workflows and
-resumes carry it reliably. Where no id evidence exists, the codex session
-renders under Unattached — honest degradation, never inference. The
-product documentation states this boundary and the one-line operational
-convention that closes it (have the dispatching agent echo the child's
-session id into its transcript).
+resumes carry it reliably. Where no id evidence exists, the codex child
+rollout is not admitted, so it is never discovered or tailed, never becomes
+a run, and is not displayed anywhere, including under Unattached — honest
+omission, never inference. A one-line operational convention closes this gap:
+have the dispatching agent echo the child's session id into its transcript.
 
 Non-goals: token persistence; hook-lane removal; upstream herdr changes;
 the installer/release-blocker work (reserved separately before the first
@@ -243,7 +243,9 @@ so a dead watcher cannot report fresh.
 
 Environment variables: as v1's table, with explicit parsing semantics:
 UTF-8 decimal i64; absent, malformed, non-positive, or overflowing values
-fall back to the default silently (doctor surfaces the effective values).
+fall back to the default silently (the resolved values are attached to an
+INFO-level startup trace event, which the shipped WARN-level subscriber filters
+out of the default log).
 
 ## 10. Integrated defect fixes
 
