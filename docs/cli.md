@@ -24,6 +24,31 @@ These two options are global and may be written before or after a subcommand.
 At the top level, `-h` or `--help` prints help and `-V` or `--version` prints
 the herdr-top version. Each named subcommand also provides `-h` and `--help`.
 
+## Environment variables
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HERDR_SESSION` | Unset | Non-empty named-session fallback when `--session` is absent. |
+| `HERDR_SOCKET_PATH` | Unset | Non-empty Herdr socket fallback when `--socket` is absent. |
+| `HERDR_ENV` | Unset | The exact value `1` marks a managed pane and permits the reserved `default` session fallback. |
+| `XDG_STATE_HOME` | `$HOME/.local/state` | Non-empty state base. When empty or absent, herdr-top uses `$HOME/.local/state`. |
+| `HERDR_TOP_ASCII_TREE` | Unicode connectors | The exact value `1` selects ASCII tree connectors; every other value leaves Unicode enabled. |
+| `HERDR_TOP_STALL_WARN_MS` | `300000` (5 minutes) | Activity silence after which a live row uses the stall glyph. |
+| `HERDR_TOP_HEADLESS_INACTIVITY_MS` | `600000` (10 minutes) | Append silence after which a log-lane run closes as `ended_unknown`. |
+| `HERDR_TOP_COMPLETE_GRACE_MS` | `30000` (30 seconds) | Delay before a provider-log completion becomes durable. |
+| `HERDR_TOP_GHOST_VISIBILITY_MS` | `300000` (5 minutes) | Time a ghost row remains visible. |
+| `HERDR_TOP_BACKFILL_WINDOW_MS` | `86400000` (24 hours) | Age window for admitting pre-existing provider artifacts at startup. |
+
+The five `HERDR_TOP_*_MS` lane values use identical parsing. A value must be
+valid UTF-8 and parse as a decimal `i64` millisecond count greater than zero.
+An absent, non-UTF-8, malformed, zero, negative, or overflowing value silently
+falls back to that variable's default. Monitor startup attaches the effective
+values to the INFO-level `resolved provider log lane startup configuration`
+trace event; `doctor` does not report them. The shipped file subscriber records
+WARN and ERROR, so the default `herdr-top.log` does not retain that INFO event;
+without an INFO-enabled subscriber, only the resulting timing behavior is
+observable.
+
 ## Commands
 
 | Command | Purpose |
@@ -109,7 +134,8 @@ above.
 
 Hook adapter mode accepts `claude-code` and `codex`, derives versioned envelopes
 from the JSON payload, and may emit zero, one, or two events depending on the
-hook event. See [Controller event hook setup](guides/controller-emit-setup.md)
+hook event. See the
+[optional Controller event precision layer](guides/controller-emit-setup.md)
 for the complete provider mapping and registration instructions.
 
 ## `doctor`
@@ -128,8 +154,9 @@ The global `--session <SESSION>` and `--socket <PATH>` options are also accepted
 
 Doctor checks session and state paths, Herdr reachability, Controller
 rendezvous, ownership, database schema, provider discovery, compatibility,
-native-session coverage, and logs. It exits with status 1 when any check has
-`error`; warnings alone do not produce a failing exit status.
+native-session coverage, provider-log lane health, and logs. It exits with
+status 1 when any check has `error`; warnings alone do not produce a failing
+exit status.
 
 Individual checks use the lowercase statuses `ok`, `warning`, `error`, and
 `not_applicable`. The last status is commonly emitted when a check does not
@@ -137,6 +164,31 @@ apply, such as the breadcrumb path check for a non-plugin install.
 `overall_status` appears in the human-readable header line and as a JSON field.
 It is the worst-of severity across the checks and has only `ok`, `warning`, or
 `error`; there is no `not_applicable` overall status.
+
+### Provider-log lane health
+
+Three checks describe the zero-configuration provider-log lane:
+
+| Check | Observation | Status and code |
+| --- | --- | --- |
+| `log_lane.readable` | A provider root exists but cannot be read | `warning` / `log_lane_roots_unreadable` |
+| `log_lane.readable` | At least one provider root exists and is readable | `ok` / `log_lane_roots_readable` |
+| `log_lane.readable` | No provider root exists | `not_applicable` / `log_lane_roots_absent` |
+| `log_lane.coverage` | Any provider-log targets were rejected; this takes precedence over every coverage state below | `warning` / `log_lane_targets_rejected` |
+| `log_lane.coverage` | No targets were rejected and no pane sessions are present | `not_applicable` / `log_lane_coverage_empty` |
+| `log_lane.coverage` | No targets were rejected and at least one pane session has no artifact | `warning` / `log_lane_coverage_partial` |
+| `log_lane.coverage` | No targets were rejected and every pane session has an artifact | `ok` / `log_lane_coverage_complete` |
+| `log_lane.freshness` | Latest watcher observation is at most 120000 ms old | `ok` / `log_lane_fresh` |
+| `log_lane.freshness` | Latest watcher observation is older than 120000 ms | `warning` / `log_lane_stale` |
+| `log_lane.freshness` | The watcher has never observed | `warning` / `log_lane_unobserved` |
+
+The coverage and freshness checks both return `warning` /
+`log_lane_runtime_unavailable` when runtime diagnostics are unavailable.
+Coverage reports `pane_sessions_total`, `pane_sessions_with_artifacts`,
+`pane_sessions_without_artifacts`, and `rejected_targets`. Freshness uses the
+watcher's own observation timestamp, never file modification times, so a dead
+watcher cannot report itself fresh. Its 120000 ms stale threshold is fixed and
+not configurable.
 
 ### Herdr protocol compatibility
 

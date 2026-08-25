@@ -1,26 +1,41 @@
-# Controller event hook setup
+# Optional Controller event precision layer
 
-Herdr Top can receive Claude Code and Codex hook events and add their execution
-structure to the live view. The integration reports session runs, subagent runs,
-and their lifecycle transitions. Claude Code also reports task-run creation and
-completion. The resulting `dispatch` edges show which session launched each
-subagent or task.
+The Herdr plugin's primary orchestration view requires no hook registration or
+`emit` wiring. Open its pane and herdr-top reads Claude Code and Codex provider
+session logs directly, synthesizing the session's agent tree, headless workers,
+run lifecycle, live activity, and token telemetry from those artifacts.
+
+Controller events are an optional precision layer over that view. Provider
+hooks add explicit lifecycle transitions, Controller-authored subjects, and
+dispatch edges that do not depend on session-ID evidence. Claude Code hooks can
+also report task-run creation and completion. Manual `emit` events can add
+explicit dependencies.
 
 The hook integration does not produce dependency edges. Neither provider's hook
 surface can derive semantic dependencies between runs. Add those relationships
 explicitly as described in [Add dependency edges manually](#add-dependency-edges-manually).
 
-This integration adds Controller task semantics to the live view: dispatch
-lineage, task subjects, and explicit lifecycle states for agent tasks and
-dispatched background work. Without it, herdr-top still monitors the session
-topology, pane-visible agents, and natively discovered task runs and sub-agent
-nodes.
+Claude Agent-tool children always carry full lineage because their
+`.meta.json` sidecars name the parent and agent type. Inner Codex lineage is
+available only when the child's session ID occurs in the parent's admitted
+artifacts, such as a spawn command, resume invocation, or quoted report. When
+the ID is present, herdr-top admits the child and attaches it in the tree. When
+the ID is absent, the rollout is not admitted and therefore is not displayed
+anywhere, including under `Unattached`; herdr-top never guesses from timing,
+neighboring panes, or shared paths. Measurements on the reference development
+machine found the ID in only a small minority of bare spawn command lines,
+while quoted reports and resumes carried it reliably. An optional convention
+closes this gap: have the dispatching agent echo the child session ID into its
+own transcript. For a headless Claude child, run
+`claude -p --output-format json ...` and retain the returned `session_id` in the
+parent transcript.
 
 ## Install the standalone CLI
 
-The managed Herdr plugin is sufficient for live monitoring. Hook and other
-Controller-event users must also install the standalone `herdr-top` binary from
-the same release, verify its checksum, and place it on `PATH`.
+The managed Herdr plugin is sufficient for zero-configuration live monitoring.
+Hook and other Controller-event users must also install the standalone
+`herdr-top` binary from the same release, verify its checksum, and place it on
+`PATH`.
 
 Run these commands from an interactive shell to verify the binary and its
 diagnostics:
@@ -367,15 +382,47 @@ from a flag, environment variable, or the `default` managed-pane rule;
 breadcrumb and `session-name.txt` validity; the runtime sentinel and current
 Controller-socket availability; socket-path length; the state lock and database
 schema; provider discovery; official Herdr integration versions; plugin and CLI
-compatibility; native-session coverage; and log locations. It queries versions
-from the relevant binary or server instead of inferring them from installation
-paths, and it does not print prompts or responses.
+compatibility; native-session coverage; provider-log lane health; and log
+locations. It queries versions from the relevant binary or server instead of
+inferring them from installation paths, and it does not print prompts or
+responses.
+
+`coverage.native_sessions` consumes the lane-wide
+`pane_sessions_with_artifacts` count as a shared budget for identifier-kind
+panes in snapshot order. Even the aggregate `covered` and `uncovered` counts
+are approximate and can be optimistic: path-kind panes contribute budget units
+without consuming one, and retained historical executions can fund a current
+pane. Treat the counts as a hint, not a guarantee. The `by_provider` placement
+is not proof of artifact ownership, and a pane from one provider can consume a
+budget unit produced by the other provider.
+
+The log-lane checks are:
+
+| Check | Outcomes |
+| --- | --- |
+| `log_lane.readable` | `warning` / `log_lane_roots_unreadable` when an existing root cannot be read; `ok` / `log_lane_roots_readable` when one exists and is readable; `not_applicable` / `log_lane_roots_absent` when none exists. |
+| `log_lane.coverage` | `warning` / `log_lane_targets_rejected` when any targets were rejected, taking precedence over coverage; `not_applicable` / `log_lane_coverage_empty` with no pane sessions; `warning` / `log_lane_coverage_partial` when some pane session lacks an artifact; otherwise `ok` / `log_lane_coverage_complete`. |
+| `log_lane.freshness` | `ok` / `log_lane_fresh` when the latest watcher observation is at most 120000 ms old; `warning` / `log_lane_stale` beyond that; `warning` / `log_lane_unobserved` before any watcher observation. |
+
+Coverage and freshness use `warning` / `log_lane_runtime_unavailable` when
+runtime diagnostics are unavailable. Freshness comes from the watcher's own
+observation timestamp, not file modification times. Coverage includes pane
+session totals, counts with and without artifacts, and rejected-target counts.
+The `rejected_targets` counter is cumulative for the process lifetime and is
+never reset. After any rejection, `log_lane.coverage` remains `warning` until
+herdr-top restarts, even if the cause is fixed; because rejection takes
+precedence, that warning also suppresses the `log_lane_coverage_partial` and
+`log_lane_coverage_complete` codes. The check's `observed` payload still carries
+the raw `pane_sessions_total`, `pane_sessions_with_artifacts`,
+`pane_sessions_without_artifacts`, and `rejected_targets` values.
 
 Use these checks for common symptoms:
 
 | Symptom | Check |
 | --- | --- |
-| Nothing appears in the TUI | Confirm that the same-release standalone binary is on the hook process's `PATH`, recheck the append-only registration, complete Codex hook trust, and inspect `doctor` session resolution and Controller-socket availability. Outside a managed pane, a clean no-delivery result is expected. |
+| Nothing appears in the TUI | Inspect `log_lane.readable`, `log_lane.coverage`, and `log_lane.freshness`, then confirm session resolution and Herdr reachability. Hook setup is not required for the primary view. |
+| The tree appears but optional Controller detail does not | Confirm that the same-release standalone binary is on the hook process's `PATH`, recheck the append-only registration, complete Codex hook trust, and inspect Controller-socket availability. Outside a managed pane, a clean no-delivery result is expected. |
 | Runs appear but stay unlinked | Inspect hook standard error for a failed `dispatch`, confirm that the relevant start hook remains registered, and review [Understand delivery behavior](#understand-delivery-behavior). A later terminal event can intentionally create a diagnostic-flagged forward reference. |
+| An admitted inner Codex run appears under `Unattached` | Preserve the child session ID in the parent's transcript, or use explicit Controller dispatch events. Herdr Top does not infer lineage without ID evidence. |
 | A subagent run has no label | Confirm that `SubagentStart` is registered and that its payload contains `agent_type`; the label comes only from that structural field. |
 | A manual hook test seems to hang | The adapter is waiting for standard-input EOF. Use a piped probe from [Test a hook without an agent](#test-a-hook-without-an-agent). |

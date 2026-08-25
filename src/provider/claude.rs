@@ -48,9 +48,21 @@ struct ParsedActivity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum PathTopology {
-    Main { thread_id: String },
-    Subagent,
+pub enum ClaudePathTopology {
+    Main {
+        thread_id: String,
+    },
+    Subagent {
+        parent_session: String,
+        agent_id: String,
+    },
+    SubagentsDir {
+        parent_session: String,
+    },
+    SubagentMeta {
+        parent_session: String,
+        agent_id: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -208,13 +220,13 @@ fn parse_activity(relative_path: &Path, record: &[u8]) -> Result<ParsedActivity,
 
     let topology = path_topology(relative_path).ok_or(StructuralError::Topology)?;
     let (thread_id, parent_thread_id, depth) = match topology {
-        PathTopology::Main { thread_id } => {
+        ClaudePathTopology::Main { thread_id } => {
             if is_sidechain || thread_id != session_id {
                 return Err(StructuralError::Topology);
             }
             (thread_id, None, 0)
         }
-        PathTopology::Subagent => {
+        ClaudePathTopology::Subagent { .. } => {
             if !is_sidechain {
                 return Err(StructuralError::Topology);
             }
@@ -223,6 +235,9 @@ fn parse_activity(relative_path: &Path, record: &[u8]) -> Result<ParsedActivity,
                 return Err(StructuralError::NativeId);
             }
             (agent_id, Some(session_id.clone()), 1)
+        }
+        ClaudePathTopology::SubagentsDir { .. } | ClaudePathTopology::SubagentMeta { .. } => {
+            return Err(StructuralError::Topology);
         }
     };
 
@@ -237,7 +252,7 @@ fn parse_activity(relative_path: &Path, record: &[u8]) -> Result<ParsedActivity,
     })
 }
 
-fn path_topology(relative_path: &Path) -> Option<PathTopology> {
+pub fn path_topology(relative_path: &Path) -> Option<ClaudePathTopology> {
     let components = relative_path
         .components()
         .map(|component| match component {
@@ -253,16 +268,39 @@ fn path_topology(relative_path: &Path) -> Option<PathTopology> {
                 return None;
             }
             let thread_id = path.file_stem()?.to_str()?.to_owned();
-            valid_native_id(&thread_id).then_some(PathTopology::Main { thread_id })
+            valid_native_id(&thread_id).then_some(ClaudePathTopology::Main { thread_id })
+        }
+        [_project, parent_session, subagents]
+            if *subagents == OsStr::new("subagents")
+                && valid_native_id(parent_session.to_str()?) =>
+        {
+            Some(ClaudePathTopology::SubagentsDir {
+                parent_session: parent_session.to_string_lossy().into_owned(),
+            })
         }
         [_project, parent_session, subagents, file_name]
             if *subagents == OsStr::new("subagents")
                 && valid_native_id(parent_session.to_str()?) =>
         {
-            let path = Path::new(file_name);
-            let stem = path.file_stem()?.to_str()?;
-            (path.extension() == Some(OsStr::new("jsonl")) && stem.starts_with("agent-"))
-                .then_some(PathTopology::Subagent)
+            let file_name = file_name.to_str()?;
+            if let Some(stem) = file_name.strip_suffix(".jsonl") {
+                let agent_id = stem
+                    .strip_prefix("agent-")
+                    .filter(|agent_id| !agent_id.is_empty())?;
+                return Some(ClaudePathTopology::Subagent {
+                    parent_session: parent_session.to_string_lossy().into_owned(),
+                    agent_id: agent_id.to_owned(),
+                });
+            }
+            file_name.strip_suffix(".meta.json").and_then(|stem| {
+                let agent_id = stem
+                    .strip_prefix("agent-")
+                    .filter(|agent_id| !agent_id.is_empty())?;
+                Some(ClaudePathTopology::SubagentMeta {
+                    parent_session: parent_session.to_string_lossy().into_owned(),
+                    agent_id: agent_id.to_owned(),
+                })
+            })
         }
         _ => None,
     }

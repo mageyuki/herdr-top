@@ -1,10 +1,12 @@
 mod common;
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
 use herdr_top::model::{ExecState, Provider};
 use herdr_top::provider::codex::{CodexAdapter, CodexBootstrapParser};
+use herdr_top::provider::lane::{Admission, AdmissionIndex};
 use herdr_top::provider::{
     BootstrapParser, DiscoveryIndex, DiscoveryRoot, MergeOutcome, PathInterner, PendingEvents,
     ProviderDiagnostics, ProviderEvent, SourcePosition, TailRecord,
@@ -22,18 +24,25 @@ const SENTINEL: &str = "PROMPT_SENTINEL_DO_NOT_EMIT_7A3B9C";
 struct FixtureIndex {
     _directory: tempfile::TempDir,
     index: DiscoveryIndex,
+    relative_paths: HashMap<String, String>,
 }
 
 impl FixtureIndex {
     fn new(file_names: &[&str]) -> Self {
         let directory = tempfile::tempdir().unwrap();
+        let mut admission = Admission::new(0);
+        let mut relative_paths = HashMap::new();
         for file_name in file_names {
             let mut bytes = Vec::new();
             for (_, record) in flat_jsonl_fixture(file_name) {
                 bytes.extend(record);
                 bytes.push(b'\n');
             }
-            fs::write(directory.path().join(file_name), bytes).unwrap();
+            let relative_path = fixture_artifact_name(file_name);
+            let path = directory.path().join(&relative_path);
+            fs::write(&path, bytes).unwrap();
+            assert!(admission.admit_pane_artifact(Provider::Codex, &path));
+            relative_paths.insert((*file_name).to_owned(), relative_path);
         }
         let mut index = DiscoveryIndex::new(vec![DiscoveryRoot {
             provider: Provider::Codex,
@@ -41,20 +50,38 @@ impl FixtureIndex {
         }])
         .unwrap();
         index
-            .scan(&mut CodexBootstrapParser, &mut PathInterner::default())
+            .scan_admitted(
+                &mut CodexBootstrapParser,
+                &mut PathInterner::default(),
+                &admission,
+                &mut AdmissionIndex::new(),
+                &ProviderDiagnostics::default(),
+            )
             .unwrap();
         Self {
             _directory: directory,
             index,
+            relative_paths,
         }
     }
 
     fn file(&self, file_name: &str) -> &herdr_top::provider::DiscoveredFile {
+        let relative_path = self
+            .relative_paths
+            .get(file_name)
+            .unwrap_or_else(|| panic!("fixture {file_name} has no artifact path"));
         self.index
             .files()
             .into_iter()
-            .find(|file| file.relative_path == Path::new(file_name))
+            .find(|file| file.relative_path == Path::new(relative_path))
             .unwrap_or_else(|| panic!("fixture {file_name} was not discovered"))
+    }
+
+    fn relative_path(&self, file_name: &str) -> &str {
+        self.relative_paths
+            .get(file_name)
+            .map(String::as_str)
+            .unwrap_or_else(|| panic!("fixture {file_name} has no artifact path"))
     }
 
     fn events(&self, file_name: &str, generation: u64) -> Vec<ProviderEvent> {
@@ -73,6 +100,23 @@ impl FixtureIndex {
         }
         events
     }
+}
+
+fn fixture_artifact_name(label: &str) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in label.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let rollout_id = format!(
+        "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
+        (hash >> 32) as u32,
+        (hash >> 16) as u16,
+        hash & 0x0fff,
+        (hash >> 12) & 0x0fff,
+        hash & 0xffff_ffff_ffff
+    );
+    format!("rollout-fixture-{rollout_id}.jsonl")
 }
 
 fn session<'a>(events: &'a [ProviderEvent], thread_id: &str) -> &'a ProviderEvent {
@@ -95,7 +139,12 @@ fn event_id(event: &ProviderEvent) -> Option<&str> {
         ProviderEvent::SessionResolved { event_id, .. }
         | ProviderEvent::AgentUpsert { event_id, .. }
         | ProviderEvent::Activity { event_id, .. } => Some(event_id),
-        ProviderEvent::SourceState { .. } | ProviderEvent::Malformed { .. } => None,
+        ProviderEvent::Synthesized(_)
+        | ProviderEvent::RunLiveness { .. }
+        | ProviderEvent::LaneClose { .. }
+        | ProviderEvent::Telemetry { .. }
+        | ProviderEvent::SourceState { .. }
+        | ProviderEvent::Malformed { .. } => None,
     }
 }
 
@@ -405,6 +454,7 @@ fn forked_from_without_parent_thread_id_creates_no_edge() {
 fn malformed_line_reports_context_and_next_record_still_lands() {
     let fixtures = FixtureIndex::new(&["codex-depth2-root.jsonl"]);
     let file = fixtures.file("codex-depth2-root.jsonl");
+    let expected_path = fixtures.relative_path("codex-depth2-root.jsonl");
     let good = br#"{"type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"call_after_malformed","occurred_at_ms":84,"agent_thread_id":"after-malformed-thread","agent_path":"/root/after_malformed","kind":"interacted"}}"#;
 
     let events = parse_inline(&fixtures.index, file, 9, &[(41, b"{malformed"), (52, good)]);
@@ -417,7 +467,7 @@ fn malformed_line_reports_context_and_next_record_still_lands() {
             generation: 9,
             byte_offset: 41,
             error_code: "codex_json",
-        } if path_display == "codex-depth2-root.jsonl"
+        } if path_display == expected_path
     ));
     assert!(
         events

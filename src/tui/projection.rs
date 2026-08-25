@@ -1,18 +1,20 @@
 //! Pure, privacy-safe TUI projection tests and implementation.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::Path;
 
 use crate::activity::{
     ActivityDurability, ActivityItem, DEFAULT_TERMINAL_VISIBILITY_MS,
-    HOOK_ONLY_STALE_VISIBILITY_MS, OperatorSnapshot, is_default_visible_task_run,
-    runs_with_executions,
+    HOOK_ONLY_STALE_VISIBILITY_MS, OperatorSnapshot, ghost_visibility_ms,
+    is_default_visible_task_run, runs_with_executions,
 };
 use crate::diagnostics::{ControllerInputStatus, RuntimeDiagnosticsSnapshot};
 use crate::herdr::collector::ObservationQuality;
-use crate::model::{DomainModel, ExecState, Provider, RunId, RunKey, TaskState};
+use crate::model::{
+    DomainModel, ExecState, Provider, RunId, RunKey, TaskRun, TaskState, TokenBreakdown, TurnAttr,
+};
 use crate::store::writer::PersistenceStatus;
 
 use super::app::{NodeKey, ViewMode};
@@ -21,10 +23,356 @@ use super::view::TreeRow;
 
 pub(crate) const DETAIL_ACTIVITY_LIMIT: usize = 100;
 
+/// Raw run-scoped inputs gathered during paint so elapsed values follow the paint clock.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RunMetricInputs {
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
+    pub(crate) output_tokens: Option<u64>,
+    pub(crate) started_wall_ms: Option<i64>,
+    pub(crate) created_at_ms: Option<i64>,
+    pub(crate) finished_at_ms: Option<i64>,
+    pub(crate) terminal: bool,
+}
+
+pub(crate) fn run_metric_inputs(model: &DomainModel, run: &TaskRun) -> RunMetricInputs {
+    let telemetry = model.telemetry(&run.run_id);
+    RunMetricInputs {
+        model: telemetry.and_then(|telemetry| telemetry.model.clone()),
+        effort: telemetry.and_then(|telemetry| telemetry.effort.clone()),
+        output_tokens: telemetry.map(|telemetry| telemetry.output_tokens),
+        started_wall_ms: telemetry.map(|telemetry| telemetry.started_wall_ms),
+        created_at_ms: run.created_at_ms,
+        finished_at_ms: run.finished_at_ms,
+        terminal: run.state.is_terminal(),
+    }
+}
+
+fn run_rate_terms(metrics: &RunMetricInputs, now_ms: i64) -> Option<(u64, i64)> {
+    let output_tokens = metrics.output_tokens?;
+    let started_wall_ms = metrics.started_wall_ms?;
+    let end_ms = if metrics.terminal {
+        metrics.finished_at_ms?
+    } else {
+        now_ms
+    };
+    let elapsed_ms = end_ms.checked_sub(started_wall_ms)?;
+    if elapsed_ms <= 0 {
+        return None;
+    }
+    Some((output_tokens, elapsed_ms))
+}
+
+pub(crate) fn run_token_rate(metrics: &RunMetricInputs, now_ms: i64) -> Option<f64> {
+    let (output_tokens, elapsed_ms) = run_rate_terms(metrics, now_ms)?;
+    Some(output_tokens as f64 / (elapsed_ms as f64 / 1_000.0))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SummaryScope {
+    SelectionWorkspace,
+    Session,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SummaryRow {
+    pub(crate) label: String,
+    pub(crate) run_count: usize,
+    pub(crate) live_count: usize,
+    pub(crate) total_duration_ms: i64,
+    pub(crate) mean_duration_ms: Option<i64>,
+    pub(crate) total_output_tokens: Option<u64>,
+    /// Total rated output tokens divided by total rated elapsed seconds.
+    pub(crate) mean_tokens_per_second: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SummaryProjection {
+    pub(crate) scope: SummaryScope,
+    pub(crate) workspace_id: Option<String>,
+    pub(crate) worker_kinds: Vec<SummaryRow>,
+    pub(crate) models: Vec<SummaryRow>,
+}
+
+#[derive(Default)]
+struct SummaryAccumulator {
+    run_count: usize,
+    live_count: usize,
+    total_duration_ms: i64,
+    timed_count: i64,
+    total_output_tokens: u64,
+    token_count: usize,
+    total_rated_output_tokens: u64,
+    total_rated_elapsed_ms: i64,
+}
+
+pub(crate) fn summary_projection(
+    model: &DomainModel,
+    rows: &[TreeRow],
+    selected: Option<&NodeKey>,
+    scope: SummaryScope,
+    now_ms: i64,
+) -> SummaryProjection {
+    let workspace_id = (scope == SummaryScope::SelectionWorkspace)
+        .then(|| selected.and_then(|selected| selected_workspace_id(model, selected)))
+        .flatten();
+    let workspace_runs = workspace_id
+        .as_deref()
+        .map(|workspace_id| workspace_run_ids(model, rows, workspace_id));
+    let runs = model
+        .task_runs()
+        .filter(|run| {
+            workspace_runs
+                .as_ref()
+                .is_none_or(|run_ids| run_ids.contains(&run.run_id))
+        })
+        .collect::<Vec<_>>();
+
+    let worker_kinds = aggregate_summary_rows(model, &runs, now_ms, |run, _| {
+        summary_worker_kind_label(model, run)
+    });
+    let models = aggregate_summary_rows(model, &runs, now_ms, |_, metrics| {
+        metrics
+            .model
+            .clone()
+            .unwrap_or_else(|| "unknown".to_owned())
+    });
+    SummaryProjection {
+        scope,
+        workspace_id,
+        worker_kinds,
+        models,
+    }
+}
+
+fn summary_worker_kind_label(model: &DomainModel, run: &TaskRun) -> String {
+    model
+        .task_run_bindings()
+        .find_map(|(key, run_id)| {
+            (*run_id == run.run_id)
+                .then(|| match key {
+                    RunKey::Native { provider, .. } | RunKey::NativePath { provider, .. } => {
+                        Some(provider_name(*provider).to_owned())
+                    }
+                    RunKey::Controller(_) | RunKey::Provisional { .. } => None,
+                })
+                .flatten()
+        })
+        .unwrap_or_else(|| worker_kind_label(run))
+}
+
+fn aggregate_summary_rows(
+    model: &DomainModel,
+    runs: &[&TaskRun],
+    now_ms: i64,
+    label: impl Fn(&TaskRun, &RunMetricInputs) -> String,
+) -> Vec<SummaryRow> {
+    let mut groups = HashMap::<String, SummaryAccumulator>::new();
+    for run in runs {
+        let metrics = run_metric_inputs(model, run);
+        let group = groups.entry(label(run, &metrics)).or_default();
+        group.run_count = group.run_count.saturating_add(1);
+        if !run.state.is_terminal() {
+            group.live_count = group.live_count.saturating_add(1);
+        }
+        if let Some(duration) = run
+            .state
+            .is_terminal()
+            .then(|| run.finished_at_ms.zip(run.created_at_ms))
+            .flatten()
+            .and_then(|(finished, created)| finished.checked_sub(created))
+            .filter(|duration| *duration >= 0)
+        {
+            group.total_duration_ms = group.total_duration_ms.saturating_add(duration);
+            group.timed_count = group.timed_count.saturating_add(1);
+        }
+        if let Some(output_tokens) = metrics.output_tokens {
+            group.total_output_tokens = group.total_output_tokens.saturating_add(output_tokens);
+            group.token_count = group.token_count.saturating_add(1);
+        }
+        if let Some((output_tokens, elapsed_ms)) = run_rate_terms(&metrics, now_ms) {
+            group.total_rated_output_tokens = group
+                .total_rated_output_tokens
+                .saturating_add(output_tokens);
+            group.total_rated_elapsed_ms = group.total_rated_elapsed_ms.saturating_add(elapsed_ms);
+        }
+    }
+
+    let mut rows = groups
+        .into_iter()
+        .map(|(label, group)| SummaryRow {
+            label,
+            run_count: group.run_count,
+            live_count: group.live_count,
+            total_duration_ms: group.total_duration_ms,
+            mean_duration_ms: (group.timed_count > 0)
+                .then(|| group.total_duration_ms / group.timed_count),
+            total_output_tokens: (group.token_count > 0).then_some(group.total_output_tokens),
+            mean_tokens_per_second: (group.total_rated_elapsed_ms > 0).then(|| {
+                group.total_rated_output_tokens as f64
+                    / (group.total_rated_elapsed_ms as f64 / 1_000.0)
+            }),
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .total_duration_ms
+            .cmp(&left.total_duration_ms)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    rows
+}
+
+fn selected_workspace_id(model: &DomainModel, selected: &NodeKey) -> Option<String> {
+    match selected {
+        NodeKey::Workspace(workspace_id) => Some(workspace_id.clone()),
+        NodeKey::Tab(tab_id) => model.tab(tab_id).map(|tab| tab.workspace_id.clone()),
+        NodeKey::Pane(pane_id) => model.pane(pane_id).map(|pane| pane.workspace_id.clone()),
+        NodeKey::Run { run_id, pane_id } => pane_id
+            .as_deref()
+            .and_then(|pane_id| model.pane(pane_id))
+            .map(|pane| pane.workspace_id.clone())
+            .or_else(|| run_workspace_id(model, *run_id)),
+        NodeKey::Agent {
+            agent_node_id,
+            pane_id,
+        } => pane_id
+            .as_deref()
+            .and_then(|pane_id| model.pane(pane_id))
+            .map(|pane| pane.workspace_id.clone())
+            .or_else(|| {
+                model
+                    .agent_node(agent_node_id)
+                    .and_then(|agent| run_workspace_id(model, agent.task_run_id))
+            }),
+        NodeKey::Session | NodeKey::UnattachedGroup => None,
+    }
+}
+
+fn run_workspace_id(model: &DomainModel, run_id: RunId) -> Option<String> {
+    // A run spanning multiple panes selects the lexicographically lowest workspace ID so the
+    // result is deterministic and independent of HashMap iteration order.
+    model
+        .executions()
+        .filter(|execution| execution.task_run_id == run_id)
+        .filter_map(|execution| model.pane(&execution.pane_id))
+        .map(|pane| pane.workspace_id.as_str())
+        .min()
+        .map(str::to_owned)
+}
+
+fn workspace_run_ids(model: &DomainModel, rows: &[TreeRow], workspace_id: &str) -> HashSet<RunId> {
+    let mut run_ids = HashSet::new();
+    if let Some(index) = rows
+        .iter()
+        .position(|row| row.key == NodeKey::Workspace(workspace_id.to_owned()))
+    {
+        let depth = rows[index].depth;
+        run_ids.extend(
+            rows[index + 1..]
+                .iter()
+                .take_while(|row| row.depth > depth)
+                .filter_map(|row| row.key.run_id()),
+        );
+    }
+    run_ids.extend(model.executions().filter_map(|execution| {
+        model
+            .pane(&execution.pane_id)
+            .is_some_and(|pane| pane.workspace_id == workspace_id)
+            .then_some(execution.task_run_id)
+    }));
+    run_ids
+}
+
+pub(crate) fn worker_kind_label(run: &TaskRun) -> String {
+    match &run.key {
+        RunKey::Native { provider, .. } | RunKey::NativePath { provider, .. } => {
+            provider_name(*provider).to_owned()
+        }
+        RunKey::Controller(name) => name
+            .strip_prefix("hook:")
+            .and_then(|suffix| suffix.split_once(':').map(|(selector, _)| selector))
+            .map_or_else(|| escape_controls(name), escape_controls),
+        RunKey::Provisional { .. } => "provisional".to_owned(),
+    }
+}
+
+pub(crate) fn run_kind_label(model: &DomainModel, run: &TaskRun) -> String {
+    model
+        .run_kind(&run.run_id)
+        .filter(|kind| !kind.is_empty())
+        .map_or_else(|| worker_kind_label(run), escape_controls)
+}
+
 #[derive(Debug)]
 pub(crate) struct RowProjection {
     pub(crate) rows: Vec<TreeRow>,
     pub(crate) next_expiry_ms: Option<i64>,
+}
+
+pub(crate) fn stalled_run_ids(
+    model: &DomainModel,
+    now_ms: i64,
+    stall_warn_ms: i64,
+) -> HashSet<RunId> {
+    let active = model
+        .task_runs()
+        .filter(|run| !run.state.is_terminal())
+        .filter(|run| {
+            run.updated_at_ms
+                .or(run.created_at_ms)
+                .is_some_and(|last_activity_ms| {
+                    now_ms < last_activity_ms.saturating_add(stall_warn_ms)
+                })
+        })
+        .map(|run| run.run_id)
+        .collect::<HashSet<_>>();
+    let mut children = HashMap::<RunId, Vec<RunId>>::new();
+    for edge in model.execution_edges() {
+        if model.task_run(&edge.parent_run_id).is_some()
+            && model.task_run(&edge.child_run_id).is_some()
+        {
+            children
+                .entry(edge.parent_run_id)
+                .or_default()
+                .push(edge.child_run_id);
+        }
+    }
+
+    model
+        .task_runs()
+        .filter(|run| !run.state.is_terminal())
+        .filter(|run| {
+            run.updated_at_ms
+                .or(run.created_at_ms)
+                .is_some_and(|last_activity_ms| {
+                    now_ms >= last_activity_ms.saturating_add(stall_warn_ms)
+                })
+        })
+        .filter(|run| !has_active_descendant(run.run_id, &children, &active))
+        .map(|run| run.run_id)
+        .collect()
+}
+
+fn has_active_descendant(
+    run_id: RunId,
+    children: &HashMap<RunId, Vec<RunId>>,
+    active: &HashSet<RunId>,
+) -> bool {
+    let mut pending = children.get(&run_id).cloned().unwrap_or_default();
+    let mut visited = HashSet::from([run_id]);
+    while let Some(descendant) = pending.pop() {
+        if !visited.insert(descendant) {
+            continue;
+        }
+        if active.contains(&descendant) {
+            return true;
+        }
+        if let Some(grandchildren) = children.get(&descendant) {
+            pending.extend(grandchildren);
+        }
+    }
+    false
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,6 +400,13 @@ pub(crate) enum DetailEntity {
         updated_at_ms: Option<i64>,
         finished_at_ms: Option<i64>,
         dismissed_at_ms: Option<i64>,
+        model: Option<String>,
+        effort: Option<String>,
+        sandbox: Option<String>,
+        evidence_paths: Vec<String>,
+        per_turn: Vec<TurnAttr>,
+        output_tokens: Option<u64>,
+        token_breakdown: Option<Box<TokenBreakdown>>,
     },
     Agent {
         agent_node_id: String,
@@ -152,7 +507,13 @@ pub(crate) fn project_rows(
             continue;
         };
         if is_default_visible_task_run(run, operator, &execution_run_ids, now_ms) {
-            if run.state.is_terminal()
+            if !run.state.is_terminal()
+                && let RunKey::Provisional { start_ms, .. } = &run.key
+            {
+                let last_observed_ms = run.updated_at_ms.or(run.created_at_ms).unwrap_or(*start_ms);
+                let expiry = last_observed_ms.saturating_add(ghost_visibility_ms());
+                next_expiry_ms = Some(next_expiry_ms.map_or(expiry, |current| current.min(expiry)));
+            } else if run.state.is_terminal()
                 && let Some(first_terminal_ms) = operator.terminal_times.get(&run_id).copied()
             {
                 let expiry = first_terminal_ms.saturating_add(DEFAULT_TERMINAL_VISIBILITY_MS);
@@ -236,7 +597,7 @@ fn apply_collapse(rows: &[TreeRow], collapsed: &HashSet<NodeKey>) -> Vec<TreeRow
         }
         hidden_below = None;
         output.push(row.clone());
-        if collapsed.contains(&row.key) {
+        if collapsed.contains(&row.key.collapse_key()) {
             hidden_below = Some(row.depth);
         }
     }
@@ -416,9 +777,19 @@ fn detail_entity(model: &DomainModel, selected: &NodeKey, home: Option<&OsStr>) 
                 })
         }
         NodeKey::Run { run_id, .. } => {
-            model
-                .task_run(run_id)
-                .map_or(DetailEntity::Missing, |run| DetailEntity::Run {
+            model.task_run(run_id).map_or(DetailEntity::Missing, |run| {
+                let telemetry = model.telemetry(run_id);
+                let mut evidence_paths = model
+                    .agent_nodes()
+                    .filter(|agent| agent.task_run_id == *run_id)
+                    .filter_map(|agent| agent.session_file.as_deref())
+                    .map(|path| {
+                        crate::diagnostics::local::format_operational_path(Path::new(path), home)
+                    })
+                    .collect::<Vec<_>>();
+                evidence_paths.sort();
+                evidence_paths.dedup();
+                DetailEntity::Run {
                     run_id: *run_id,
                     key: detail_run_key(run_id, &run.key),
                     name: safe_run_name(run_id, &run.key),
@@ -428,7 +799,18 @@ fn detail_entity(model: &DomainModel, selected: &NodeKey, home: Option<&OsStr>) 
                     updated_at_ms: run.updated_at_ms,
                     finished_at_ms: run.finished_at_ms,
                     dismissed_at_ms: run.dismissed_at_ms,
-                })
+                    model: telemetry.and_then(|telemetry| telemetry.model.clone()),
+                    effort: telemetry.and_then(|telemetry| telemetry.effort.clone()),
+                    sandbox: telemetry.and_then(|telemetry| telemetry.sandbox.clone()),
+                    evidence_paths,
+                    per_turn: telemetry
+                        .map(|telemetry| telemetry.per_turn.clone())
+                        .unwrap_or_default(),
+                    output_tokens: telemetry.map(|telemetry| telemetry.output_tokens),
+                    token_breakdown: telemetry
+                        .map(|telemetry| Box::new(telemetry.token_breakdown.clone())),
+                }
+            })
         }
         NodeKey::Agent { agent_node_id, .. } => {
             model
@@ -610,22 +992,102 @@ fn entity_lines(entity: &DetailEntity) -> Vec<String> {
             updated_at_ms,
             finished_at_ms,
             dismissed_at_ms,
-        } => vec![
-            "entity: task_run".to_owned(),
-            format!("key: {key}"),
-            format!("run_id: {run_id}"),
-            format!("name: {name}"),
-            format!(
-                "native_session_id: {}",
-                native_session_id.as_deref().unwrap_or("unknown")
-            ),
-            format!("state: {}", task_state_name(*state)),
-            format!("created_at_ms: {}", timestamp_text(*created_at_ms)),
-            format!("updated_at_ms: {}", timestamp_text(*updated_at_ms)),
-            format!("finished_at_ms: {}", timestamp_text(*finished_at_ms)),
-            format!("dismissed_at_ms: {}", timestamp_text(*dismissed_at_ms)),
-            "scope: semantic run and agent descendants".to_owned(),
-        ],
+            model,
+            effort,
+            sandbox,
+            evidence_paths,
+            per_turn,
+            output_tokens,
+            token_breakdown,
+        } => {
+            let mut lines = vec![
+                "entity: task_run".to_owned(),
+                format!("key: {key}"),
+                format!("run_id: {run_id}"),
+                format!("name: {name}"),
+                format!(
+                    "native_session_id: {}",
+                    native_session_id.as_deref().unwrap_or("unknown")
+                ),
+                format!("state: {}", task_state_name(*state)),
+                format!(
+                    "model: {}",
+                    model
+                        .as_deref()
+                        .map_or_else(|| "unknown".to_owned(), escape_controls)
+                ),
+                format!(
+                    "effort: {}",
+                    effort
+                        .as_deref()
+                        .map_or_else(|| "unknown".to_owned(), escape_controls)
+                ),
+                format!(
+                    "sandbox: {}",
+                    sandbox
+                        .as_deref()
+                        .map_or_else(|| "unknown".to_owned(), escape_controls)
+                ),
+                format!("created_at_ms: {}", timestamp_text(*created_at_ms)),
+                format!("updated_at_ms: {}", timestamp_text(*updated_at_ms)),
+                format!("finished_at_ms: {}", timestamp_text(*finished_at_ms)),
+                format!("dismissed_at_ms: {}", timestamp_text(*dismissed_at_ms)),
+                format!("evidence paths: {}", evidence_paths.len()),
+            ];
+            lines.extend(
+                evidence_paths
+                    .iter()
+                    .map(|path| format!("evidence path: {}", escape_controls(path))),
+            );
+            lines.push(format!("turn history: {}", per_turn.len()));
+            lines.extend(per_turn.iter().enumerate().map(|(index, turn)| {
+                format!(
+                    "turn {}: model={} effort={} sandbox={}",
+                    index.saturating_add(1),
+                    turn.model
+                        .as_deref()
+                        .map_or_else(|| "unknown".to_owned(), escape_controls),
+                    turn.effort
+                        .as_deref()
+                        .map_or_else(|| "unknown".to_owned(), escape_controls),
+                    turn.sandbox
+                        .as_deref()
+                        .map_or_else(|| "unknown".to_owned(), escape_controls),
+                )
+            }));
+            lines.push(format!(
+                "tokens.output: {}",
+                output_tokens
+                    .map_or_else(|| "not retained".to_owned(), |tokens| tokens.to_string())
+            ));
+            let token_breakdown = token_breakdown.as_ref();
+            lines.push(format!(
+                "tokens.input: {}",
+                reported_tokens(token_breakdown.and_then(|tokens| tokens.input_tokens))
+            ));
+            lines.push(format!(
+                "tokens.cached_input: {}",
+                reported_tokens(token_breakdown.and_then(|tokens| tokens.cached_input_tokens))
+            ));
+            lines.push(format!(
+                "tokens.cache_write_input: {}",
+                reported_tokens(token_breakdown.and_then(|tokens| tokens.cache_write_input_tokens))
+            ));
+            lines.push(format!(
+                "tokens.reasoning_output: {}",
+                reported_tokens(token_breakdown.and_then(|tokens| tokens.reasoning_output_tokens))
+            ));
+            lines.push(format!(
+                "tokens.total: {}",
+                reported_tokens(token_breakdown.and_then(|tokens| tokens.total_tokens))
+            ));
+            lines.push(format!(
+                "tokens.context_window: {}",
+                reported_tokens(token_breakdown.and_then(|tokens| tokens.context_window))
+            ));
+            lines.push("scope: semantic run and agent descendants".to_owned());
+            lines
+        }
         DetailEntity::Agent {
             agent_node_id,
             native_session_id,
@@ -663,6 +1125,10 @@ fn entity_lines(entity: &DetailEntity) -> Vec<String> {
         ],
         DetailEntity::Missing => vec!["entity: unavailable".to_owned()],
     }
+}
+
+fn reported_tokens(value: Option<u64>) -> String {
+    value.map_or_else(|| "not reported".to_owned(), |value| value.to_string())
 }
 
 pub(crate) fn activity_line(item: &ActivityItem) -> String {
@@ -820,6 +1286,8 @@ pub(crate) fn escape_controls(value: &str) -> String {
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::ffi::OsStr;
+    use std::fs;
+    use std::path::Path;
     use std::sync::Arc;
 
     use crate::activity::{ActivityDurability, ActivityIdentity, ActivityItem, OperatorSnapshot};
@@ -828,18 +1296,576 @@ mod tests {
         PersistenceCounters, RuntimeDiagnosticsSnapshot,
     };
     use crate::herdr::collector::ObservationQuality;
+    use crate::lockfile::StateRoot;
     use crate::model::{
-        AgentNode, DependencyEdge, DisplayOrdinal, DomainModel, ExecState, ExecutionEdge, Provider,
-        RunId, RunKey, TaskRun, TaskState,
+        AgentNode, DependencyEdge, DisplayOrdinal, DomainModel, ExecState, Execution,
+        ExecutionEdge, Pane, Provider, RunId, RunKey, TaskRun, TaskState, Workspace,
     };
+    use crate::provider::ProviderEvent;
+    use crate::provider::claude_facts::extract_claude_line;
+    use crate::provider::codex_facts::extract_codex_line;
+    use crate::provider::facts::SessionScope;
+    use crate::provider::lane::{Admission, AdmissionIndex, Synthesis};
+    use crate::reducer::Reducer;
+    use crate::store::RestoredState;
+    use crate::store::open_writer;
     use crate::store::writer::{
         DurabilityDisposition, PersistenceFailure, PersistenceFailureCode, PersistenceOperation,
         PersistencePhase, PersistenceStatus,
     };
+    use crate::store::writer::{WriterClient, spawn_writer};
     use crate::tui::app::{NodeKey, ViewMode};
     use crate::tui::view::TreeRow;
 
     use super::*;
+
+    async fn apply_fixture_events(
+        reducer: &mut Reducer,
+        writer: &mut WriterClient,
+        events: Vec<ProviderEvent>,
+    ) {
+        for event in events {
+            match event {
+                ProviderEvent::Synthesized(event) => {
+                    if writer.is_duplicate(&event.metadata.event_id) {
+                        continue;
+                    }
+                    let delta = reducer.validate_controller_event(&event).unwrap();
+                    let permit = writer.reserve_enqueue().unwrap();
+                    let pending = reducer.commit_staged(delta, permit).unwrap();
+                    writer.finish_pending(pending).await.unwrap();
+                }
+                ProviderEvent::RunLiveness { key, at_ms } => {
+                    let batch = reducer.touch_run_liveness(&key, at_ms);
+                    if !batch.is_empty() {
+                        writer.apply(batch).await.unwrap();
+                    }
+                }
+                ProviderEvent::LaneClose { key, at_ms } => {
+                    let batch = reducer.apply_lane_close(&key, at_ms);
+                    if !batch.is_empty() {
+                        writer.apply(batch).await.unwrap();
+                    }
+                }
+                ProviderEvent::Telemetry {
+                    key,
+                    at_ms,
+                    output_tokens,
+                    token_breakdown,
+                    model,
+                    effort,
+                    sandbox,
+                } => assert!(
+                    reducer
+                        .apply_telemetry_with_breakdown(
+                            &key,
+                            at_ms,
+                            output_tokens,
+                            token_breakdown,
+                            TurnAttr {
+                                model,
+                                effort,
+                                sandbox,
+                            },
+                        )
+                        .is_empty()
+                ),
+                ProviderEvent::Activity { .. }
+                | ProviderEvent::SessionResolved { .. }
+                | ProviderEvent::AgentUpsert { .. }
+                | ProviderEvent::SourceState { .. } => {
+                    // These collector-normalized projections do not contribute to Summary.
+                }
+                ProviderEvent::Malformed { .. } => {
+                    panic!("production fixtures must not contain malformed records")
+                }
+            }
+        }
+    }
+
+    async fn provider_fixture_model() -> DomainModel {
+        let fixture_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-logs");
+        let claude_artifact = fixture_root.join("claude-session.jsonl");
+        let codex_artifact = fixture_root.join("codex-exec-resume-appended.jsonl");
+        let claude_scope =
+            SessionScope::ClaudeRoot("13f03635-c1f6-46e2-8e52-83d217b6f01c".to_owned());
+        let codex_rollout = "745480a2-5bdc-483f-ab53-0b4fabc01781";
+        let claude_facts = fs::read_to_string(&claude_artifact)
+            .unwrap()
+            .lines()
+            .enumerate()
+            .flat_map(|(ordinal, line)| {
+                extract_claude_line(&claude_scope, line)
+                    .into_iter()
+                    .map(move |fact| (ordinal as u64, fact))
+            })
+            .collect::<Vec<_>>();
+        let codex_facts = fs::read_to_string(&codex_artifact)
+            .unwrap()
+            .lines()
+            .enumerate()
+            .flat_map(|(ordinal, line)| {
+                extract_codex_line(codex_rollout, ordinal as u64, line)
+                    .into_iter()
+                    .map(move |fact| (ordinal as u64, fact))
+            })
+            .collect::<Vec<_>>();
+
+        let mut admission = Admission::new(0);
+        let discovered = AdmissionIndex::new();
+        let claude_events = Synthesis::default().synthesize_batch(
+            &claude_artifact,
+            claude_facts,
+            &mut admission,
+            &discovered,
+        );
+        let mut codex_synthesis = Synthesis::default();
+        let mut codex_events = codex_synthesis.synthesize_batch(
+            &codex_artifact,
+            codex_facts,
+            &mut admission,
+            &discovered,
+        );
+        codex_events.extend(codex_synthesis.advance_lifecycle(1_787_544_930_300));
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = open_writer(&StateRoot(directory.path().to_path_buf())).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        apply_fixture_events(&mut reducer, &mut writer, claude_events).await;
+        apply_fixture_events(&mut reducer, &mut writer, codex_events).await;
+        let model = shared.borrow().as_ref().clone();
+        lifecycle.shutdown().await.unwrap();
+        model
+    }
+
+    #[tokio::test]
+    async fn summary_tables_driven_by_real_extraction() {
+        let fixture_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-logs");
+        let claude_artifact = fixture_root.join("claude-session.jsonl");
+        let codex_artifact = fixture_root.join("codex-exec-resume-appended.jsonl");
+        let claude_scope =
+            SessionScope::ClaudeRoot("13f03635-c1f6-46e2-8e52-83d217b6f01c".to_owned());
+        let codex_rollout = "745480a2-5bdc-483f-ab53-0b4fabc01781";
+        let claude_facts = fs::read_to_string(&claude_artifact)
+            .unwrap()
+            .lines()
+            .enumerate()
+            .flat_map(|(ordinal, line)| {
+                extract_claude_line(&claude_scope, line)
+                    .into_iter()
+                    .map(move |fact| (ordinal as u64, fact))
+            })
+            .collect::<Vec<_>>();
+        let codex_facts = fs::read_to_string(&codex_artifact)
+            .unwrap()
+            .lines()
+            .enumerate()
+            .flat_map(|(ordinal, line)| {
+                extract_codex_line(codex_rollout, ordinal as u64, line)
+                    .into_iter()
+                    .map(move |fact| (ordinal as u64, fact))
+            })
+            .collect::<Vec<_>>();
+
+        let mut admission = Admission::new(0);
+        let discovered = AdmissionIndex::new();
+        let claude_events = Synthesis::default().synthesize_batch(
+            &claude_artifact,
+            claude_facts,
+            &mut admission,
+            &discovered,
+        );
+        let mut codex_synthesis = Synthesis::default();
+        let mut codex_events = codex_synthesis.synthesize_batch(
+            &codex_artifact,
+            codex_facts,
+            &mut admission,
+            &discovered,
+        );
+        codex_events.extend(codex_synthesis.advance_lifecycle(1_787_544_930_300));
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = open_writer(&StateRoot(directory.path().to_path_buf())).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        apply_fixture_events(&mut reducer, &mut writer, claude_events).await;
+        apply_fixture_events(&mut reducer, &mut writer, codex_events).await;
+
+        let model = shared.borrow();
+        let summary = summary_projection(
+            &model,
+            &[],
+            Some(&NodeKey::Session),
+            SummaryScope::Session,
+            1_787_544_930_300,
+        );
+        let worker_tokens = summary
+            .worker_kinds
+            .iter()
+            .map(|row| (row.label.as_str(), row.total_output_tokens.unwrap()))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            worker_tokens.get("Claude"),
+            Some(&901),
+            "worker totals: {worker_tokens:?}"
+        );
+        assert_eq!(
+            worker_tokens.get("Codex"),
+            Some(&450),
+            "worker totals: {worker_tokens:?}"
+        );
+        let model_tokens = summary
+            .models
+            .iter()
+            .map(|row| (row.label.as_str(), row.total_output_tokens.unwrap()))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(model_tokens.get("claude-fable-5"), Some(&901));
+        assert_eq!(model_tokens.get("gpt-5.6-sol"), Some(&450));
+        assert_eq!(
+            summary
+                .worker_kinds
+                .iter()
+                .map(|row| row.run_count)
+                .sum::<usize>(),
+            2
+        );
+        assert!(
+            summary
+                .worker_kinds
+                .iter()
+                .all(|row| row.mean_tokens_per_second.is_some())
+        );
+        drop(model);
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn summary_mean_token_rate_weights_tokens_by_elapsed_time() {
+        let mut fast = run(
+            "hook:claude-code:session:task:fast",
+            1,
+            TaskState::Completed,
+        );
+        fast.finished_at_ms = Some(1_000);
+        let mut slow = run(
+            "hook:claude-code:session:task:slow",
+            2,
+            TaskState::Completed,
+        );
+        slow.finished_at_ms = Some(1_000_000);
+        let mut model = DomainModel::default();
+        model.insert_task_run(fast.clone());
+        model.insert_task_run(slow.clone());
+        model
+            .telemetry_entry(fast.run_id, 0)
+            .accumulate(100, None, None, None, false);
+        model
+            .telemetry_entry(slow.run_id, 0)
+            .accumulate(1_000, None, None, None, false);
+
+        let summary = summary_projection(
+            &model,
+            &[],
+            Some(&NodeKey::Session),
+            SummaryScope::Session,
+            1_000_000,
+        );
+        let rate = summary
+            .worker_kinds
+            .iter()
+            .find(|row| row.label == "claude-code")
+            .and_then(|row| row.mean_tokens_per_second)
+            .expect("the two rated runs produce one aggregate rate");
+        let expected = 1.098_901_098_901_099;
+        assert!(
+            (rate - expected).abs() < 1e-12,
+            "expected weighted 1100/1001 ~= {expected}, got {rate}"
+        );
+        assert!(
+            (rate - 50.5).abs() > 1e-12,
+            "aggregate rate must not be the arithmetic mean 50.5"
+        );
+    }
+
+    #[test]
+    fn dag_run_selection_resolves_workspace_through_model_execution() {
+        let task_run = run("dag", 1, TaskState::Running);
+        let mut model = DomainModel::default();
+        model.insert_workspace(Workspace {
+            workspace_id: "dag-workspace".to_owned(),
+        });
+        model.insert_pane(Pane {
+            pane_id: "dag-pane".to_owned(),
+            workspace_id: "dag-workspace".to_owned(),
+            tab_id: "dag-tab".to_owned(),
+            terminal_id: "dag-terminal".to_owned(),
+            display_name: None,
+        });
+        model.insert_task_run(task_run.clone());
+        model.insert_execution(Execution {
+            execution_id: "dag-execution".to_owned(),
+            pane_id: "dag-pane".to_owned(),
+            terminal_id: "dag-terminal".to_owned(),
+            task_run_id: task_run.run_id,
+            state: ExecState::Working,
+        });
+        let selected = NodeKey::Run {
+            run_id: task_run.run_id,
+            pane_id: None,
+        };
+
+        let summary = summary_projection(
+            &model,
+            &[],
+            Some(&selected),
+            SummaryScope::SelectionWorkspace,
+            10,
+        );
+
+        assert_eq!(summary.workspace_id.as_deref(), Some("dag-workspace"));
+    }
+
+    #[test]
+    fn summary_scope_follows_selection_w_toggles() {
+        let first = run("first", 1, TaskState::Running);
+        let second = run("second", 2, TaskState::Running);
+        let mut model = DomainModel::default();
+        for workspace_id in ["w1", "w2"] {
+            model.insert_workspace(Workspace {
+                workspace_id: workspace_id.to_owned(),
+            });
+        }
+        for (index, (workspace_id, task_run)) in
+            [("w1", &first), ("w2", &second)].into_iter().enumerate()
+        {
+            let pane_id = format!("p{}", index + 1);
+            model.insert_pane(Pane {
+                pane_id: pane_id.clone(),
+                workspace_id: workspace_id.to_owned(),
+                tab_id: format!("t{}", index + 1),
+                terminal_id: format!("term{}", index + 1),
+                display_name: None,
+            });
+            model.insert_task_run(task_run.clone());
+            model.insert_execution(Execution {
+                execution_id: format!("e{}", index + 1),
+                pane_id,
+                terminal_id: format!("term{}", index + 1),
+                task_run_id: task_run.run_id,
+                state: ExecState::Working,
+            });
+        }
+        let rows = vec![
+            row(NodeKey::Workspace("w1".to_owned()), 0, "w1"),
+            row(
+                NodeKey::Run {
+                    run_id: first.run_id,
+                    pane_id: Some("p1".to_owned()),
+                },
+                1,
+                "first",
+            ),
+            row(NodeKey::Workspace("w2".to_owned()), 0, "w2"),
+            row(
+                NodeKey::Run {
+                    run_id: second.run_id,
+                    pane_id: Some("p2".to_owned()),
+                },
+                1,
+                "second",
+            ),
+        ];
+        let selected = &rows[1].key;
+        let workspace = summary_projection(
+            &model,
+            &rows,
+            Some(selected),
+            SummaryScope::SelectionWorkspace,
+            10,
+        );
+        let session = summary_projection(&model, &rows, Some(selected), SummaryScope::Session, 10);
+        let toggled_back = summary_projection(
+            &model,
+            &rows,
+            Some(selected),
+            SummaryScope::SelectionWorkspace,
+            10,
+        );
+        assert_eq!(workspace.workspace_id.as_deref(), Some("w1"));
+        assert_eq!(
+            workspace
+                .worker_kinds
+                .iter()
+                .map(|row| row.run_count)
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            session
+                .worker_kinds
+                .iter()
+                .map(|row| row.run_count)
+                .sum::<usize>(),
+            2
+        );
+        assert_eq!(workspace, toggled_back);
+    }
+
+    #[tokio::test]
+    async fn detail_shows_effort_sandbox_evidence_and_breakdown() {
+        let task_run = run("detail", 1, TaskState::Running);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run.clone());
+        let telemetry = model.telemetry_entry(task_run.run_id, 100);
+        telemetry.accumulate(
+            42,
+            Some("gpt-5.6-terra".to_owned()),
+            Some("low".to_owned()),
+            Some("read-only".to_owned()),
+            true,
+        );
+        telemetry.accumulate(
+            8,
+            Some("gpt-5.6-sol".to_owned()),
+            Some("xhigh".to_owned()),
+            Some("workspace-write".to_owned()),
+            true,
+        );
+        for (id, path) in [
+            ("z", "/home/test/logs/z.jsonl"),
+            ("a", "/home/test/logs/a.jsonl"),
+            ("dup", "/home/test/logs/a.jsonl"),
+        ] {
+            model.insert_agent_node(AgentNode {
+                agent_node_id: id.to_owned(),
+                provider: Provider::Codex,
+                native_session_id: Some(id.to_owned()),
+                task_run_id: task_run.run_id,
+                display_ordinal: DisplayOrdinal::new(2),
+                parent_agent_node_id: None,
+                state: Some(ExecState::Working),
+                model_id: None,
+                last_event_kind: None,
+                last_tool_name: None,
+                last_item_count: None,
+                last_byte_count: None,
+                last_activity_at_ms: None,
+                session_file: Some(path.to_owned()),
+            });
+        }
+        let selected = NodeKey::Run {
+            run_id: task_run.run_id,
+            pane_id: None,
+        };
+        let detail = detail_projection(
+            &model,
+            &[],
+            &operator(Vec::new(), HashMap::new()),
+            &selected,
+            ViewMode::DependencyDag,
+            Some(OsStr::new("/home/test")),
+        );
+        let lines = detail_lines(&detail);
+        assert!(lines.contains(&"effort: xhigh".to_owned()));
+        assert!(lines.contains(&"sandbox: workspace-write".to_owned()));
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("evidence path:"))
+                .count(),
+            2
+        );
+        let a = lines
+            .iter()
+            .position(|line| line == "evidence path: ~/logs/a.jsonl")
+            .unwrap();
+        let z = lines
+            .iter()
+            .position(|line| line == "evidence path: ~/logs/z.jsonl")
+            .unwrap();
+        assert!(a < z);
+        let first_turn = lines
+            .iter()
+            .position(|line| {
+                line.contains("turn 1: model=gpt-5.6-terra effort=low sandbox=read-only")
+            })
+            .unwrap();
+        let second_turn = lines
+            .iter()
+            .position(|line| {
+                line.contains("turn 2: model=gpt-5.6-sol effort=xhigh sandbox=workspace-write")
+            })
+            .unwrap();
+        assert!(first_turn < second_turn);
+        assert!(lines.contains(&"tokens.output: 50".to_owned()));
+        assert!(!lines.contains(&"tokens.other: not retained".to_owned()));
+
+        let fixture_model = provider_fixture_model().await;
+        let fixture_detail_lines = |provider| {
+            let run = fixture_model
+                .task_runs()
+                .find(|run| {
+                    summary_worker_kind_label(&fixture_model, run) == provider_name(provider)
+                })
+                .expect("fixture provider run exists");
+            detail_lines(&detail_projection(
+                &fixture_model,
+                &[],
+                &operator(Vec::new(), HashMap::new()),
+                &NodeKey::Run {
+                    run_id: run.run_id,
+                    pane_id: None,
+                },
+                ViewMode::DependencyDag,
+                None,
+            ))
+        };
+
+        let claude_lines = fixture_detail_lines(Provider::Claude);
+        for expected in [
+            "tokens.input: 2770",
+            "tokens.cached_input: 1280",
+            "tokens.cache_write_input: 240",
+            "tokens.output: 901",
+            "tokens.reasoning_output: not reported",
+            "tokens.total: not reported",
+            "tokens.context_window: not reported",
+        ] {
+            assert!(
+                claude_lines.contains(&expected.to_owned()),
+                "missing Claude fixture breakdown line {expected:?}: {claude_lines:?}"
+            );
+        }
+
+        let codex_lines = fixture_detail_lines(Provider::Codex);
+        for expected in [
+            "tokens.input: 1270",
+            "tokens.cached_input: 160",
+            "tokens.cache_write_input: 16",
+            "tokens.output: 450",
+            "tokens.reasoning_output: 145",
+            "tokens.total: 1720",
+            "tokens.context_window: 200000",
+        ] {
+            assert!(
+                codex_lines.contains(&expected.to_owned()),
+                "missing Codex fixture breakdown line {expected:?}: {codex_lines:?}"
+            );
+        }
+    }
 
     fn run(label: &str, ordinal: i64, state: TaskState) -> TaskRun {
         TaskRun {
@@ -854,6 +1880,51 @@ mod tests {
             subject: None,
             dismissed_at_ms: None,
         }
+    }
+
+    #[test]
+    fn stable_run_kind_label_escapes_controls_and_empty_falls_back() {
+        let escaped = run("fallback", 1, TaskState::Running);
+        let fallback = run("hook:claude-code:session", 2, TaskState::Running);
+        let mut model = DomainModel::default();
+        model.insert_task_run(escaped.clone());
+        model.insert_task_run(fallback.clone());
+        model.set_run_kind(escaped.run_id, "reviewer\n\t".to_owned());
+        model.set_run_kind(fallback.run_id, String::new());
+
+        assert_eq!(run_kind_label(&model, &escaped), "reviewer\\n\\t");
+        assert_eq!(run_kind_label(&model, &fallback), "claude-code");
+    }
+
+    #[test]
+    fn stall_suppressed_while_descendant_active() {
+        let mut parent = run("parent", 1, TaskState::Running);
+        parent.updated_at_ms = Some(0);
+        let mut child = run("child", 2, TaskState::Running);
+        child.updated_at_ms = Some(900);
+        let mut model = DomainModel::default();
+        model.insert_task_run(parent.clone());
+        model.insert_task_run(child.clone());
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: parent.run_id,
+            child_run_id: child.run_id,
+        });
+
+        let stalled = stalled_run_ids(&model, 1_000, 500);
+        assert!(!stalled.contains(&parent.run_id));
+        assert!(!stalled.contains(&child.run_id));
+
+        child.updated_at_ms = Some(0);
+        model.insert_task_run(child.clone());
+        let stalled = stalled_run_ids(&model, 1_000, 500);
+        assert!(stalled.contains(&parent.run_id));
+        assert!(stalled.contains(&child.run_id));
+
+        child.updated_at_ms = None;
+        child.created_at_ms = Some(0);
+        model.insert_task_run(child.clone());
+        let stalled = stalled_run_ids(&model, 1_000, 500);
+        assert!(stalled.contains(&child.run_id));
     }
 
     fn row(key: NodeKey, depth: usize, label: &str) -> TreeRow {
@@ -926,6 +1997,7 @@ mod tests {
             persistence_counters: PersistenceCounters::default(),
             controller_counters: ControllerCounterSnapshot::default(),
             enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
+            provider_counters: crate::diagnostics::ProviderCounterSnapshot::default(),
             source_coverage: Vec::new(),
             dangling_announcement_components: 7,
             first_failure_log: OccurrenceLogStatus::NotAttempted,
@@ -1098,6 +2170,47 @@ mod tests {
 
         assert_eq!(projection.rows.len(), 1);
         assert_eq!(projection.next_expiry_ms, Some(86_400_010));
+    }
+
+    #[test]
+    fn terminal_provisional_schedules_terminal_instead_of_ghost_expiry() {
+        let updated_at_ms = 100;
+        let mut terminal = run("terminal-provisional", 1, TaskState::Completed);
+        terminal.key = RunKey::Provisional {
+            terminal_id: "terminal".to_owned(),
+            start_ms: updated_at_ms,
+            seq: 1,
+        };
+        terminal.updated_at_ms = Some(updated_at_ms);
+        let mut model = DomainModel::default();
+        model.insert_task_run(terminal.clone());
+        let rows = vec![row(
+            NodeKey::Run {
+                run_id: terminal.run_id,
+                pane_id: None,
+            },
+            0,
+            "terminal provisional",
+        )];
+
+        let projection = project_rows(
+            &model,
+            &rows,
+            &operator(
+                Vec::new(),
+                HashMap::from([(terminal.run_id, updated_at_ms)]),
+            ),
+            "",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            updated_at_ms + crate::activity::DEFAULT_GHOST_VISIBILITY_MS,
+        );
+
+        assert_eq!(projection.rows.len(), 1);
+        assert_eq!(
+            projection.next_expiry_ms,
+            Some(updated_at_ms + crate::activity::DEFAULT_TERMINAL_VISIBILITY_MS)
+        );
     }
 
     #[test]
@@ -1370,14 +2483,7 @@ mod tests {
             model.insert_agent_node(agent);
         }
 
-        let newest_agents = crate::tui::view::newest_agent_nodes(&model);
-        let label = crate::tui::view::task_run_label(
-            &model,
-            &selected,
-            false,
-            9_000,
-            newest_agents.get(&selected.run_id).copied(),
-        );
+        let label = crate::tui::view::task_run_label(&model, &selected, false, 9_000, false);
         assert!(!label.contains(full_key));
         let selected_row = row(
             NodeKey::Run {
@@ -1737,11 +2843,10 @@ mod tests {
             dependent_run_id: child.run_id,
         });
 
-        let tree_label = crate::tui::view::task_run_label(&model, &child, false, 0, None);
+        let tree_label = crate::tui::view::task_run_label(&model, &child, false, 0, false);
         let mut dag_order = crate::tui::dag::DagOrder::default();
         dag_order.recompute(&model);
-        let newest_agents = crate::tui::view::newest_agent_nodes(&model);
-        let dag_text = crate::tui::dag::build_rows(&model, &dag_order, 0, &newest_agents)
+        let dag_text = crate::tui::dag::build_rows(&model, &dag_order, 0)
             .into_iter()
             .flat_map(|row| {
                 std::iter::once(row.label)
@@ -1762,7 +2867,7 @@ mod tests {
                 pane_id: Some("pane".to_owned()),
             },
             0,
-            &crate::tui::view::task_run_label(&model, &child, false, 0, None),
+            &crate::tui::view::task_run_label(&model, &child, false, 0, false),
         );
         let tied = operator(
             vec![

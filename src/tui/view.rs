@@ -33,7 +33,66 @@ const MIN_WIDTH: u16 = 48;
 const MIN_HEIGHT: u16 = 14;
 type RunPlacement = (RunId, bool);
 type PaneRuns = HashMap<String, Vec<RunPlacement>>;
+type NestedRuns = HashMap<RunId, Vec<RunId>>;
 pub(crate) type NewestAgentNodes<'a> = HashMap<RunId, &'a AgentNode>;
+
+#[derive(Default)]
+pub(crate) struct LiveLineReadModel {
+    by_run: HashMap<RunId, String>,
+}
+
+impl LiveLineReadModel {
+    fn from_model(model: &DomainModel) -> Self {
+        let mut selected = HashMap::<RunId, (Option<i64>, String, String)>::new();
+        for agent in model.agent_nodes().filter(|agent| {
+            agent.last_event_kind.as_deref() == Some(crate::provider::lane::LIVE_LINE_EVENT_KIND)
+        }) {
+            let candidate = (
+                agent.last_activity_at_ms,
+                agent.agent_node_id.clone(),
+                agent.last_tool_name.clone().unwrap_or_default(),
+            );
+            selected
+                .entry(agent.task_run_id)
+                .and_modify(|current| {
+                    if (current.0, current.1.as_str()) < (candidate.0, candidate.1.as_str()) {
+                        current.clone_from(&candidate);
+                    }
+                })
+                .or_insert(candidate);
+        }
+        Self {
+            by_run: selected
+                .into_iter()
+                .filter_map(|(run_id, (_, _, line))| (!line.is_empty()).then_some((run_id, line)))
+                .collect(),
+        }
+    }
+
+    fn get(&self, run_id: &RunId) -> Option<&str> {
+        self.by_run.get(run_id).map(String::as_str)
+    }
+}
+
+struct RunRowSignals<'a> {
+    live_lines: &'a LiveLineReadModel,
+    stalled: bool,
+}
+
+struct RunRowContext<'model, 'data> {
+    model: &'model DomainModel,
+    nested_runs: &'data NestedRuns,
+    newest_agents: &'data NewestAgentNodes<'model>,
+    live_lines: &'data LiveLineReadModel,
+    stalled_runs: &'data HashSet<RunId>,
+    now_ms: i64,
+}
+
+#[derive(Default)]
+struct RunRenderState {
+    ancestors: HashSet<RunId>,
+    expanded_shared_runs: HashSet<RunId>,
+}
 
 #[cfg(test)]
 thread_local! {
@@ -62,6 +121,239 @@ pub(crate) struct TreeRow {
     pub(crate) label: String,
     pub(crate) prerequisites: Vec<String>,
     pub(crate) dependents: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetricColumn {
+    Model,
+    Effort,
+    Tok,
+    TokPerSecond,
+    Time,
+}
+
+impl MetricColumn {
+    const fn width(self) -> usize {
+        match self {
+            Self::Model => 11,
+            Self::Effort | Self::Tok | Self::TokPerSecond => 5,
+            Self::Time => 6,
+        }
+    }
+}
+
+const ALL_METRIC_COLUMNS: &[MetricColumn] = &[
+    MetricColumn::Model,
+    MetricColumn::Effort,
+    MetricColumn::Tok,
+    MetricColumn::TokPerSecond,
+    MetricColumn::Time,
+];
+const WITHOUT_MODEL_COLUMNS: &[MetricColumn] = &[
+    MetricColumn::Effort,
+    MetricColumn::Tok,
+    MetricColumn::TokPerSecond,
+    MetricColumn::Time,
+];
+const TOKEN_RATE_TIME_COLUMNS: &[MetricColumn] = &[
+    MetricColumn::Tok,
+    MetricColumn::TokPerSecond,
+    MetricColumn::Time,
+];
+const TOKEN_TIME_COLUMNS: &[MetricColumn] = &[MetricColumn::Tok, MetricColumn::Time];
+const TIME_COLUMN: &[MetricColumn] = &[MetricColumn::Time];
+
+/// Selects the fixed metric band for the total tree-row width.
+///
+/// Narrowing drops MODEL, then EFF, TOK-S, TOK, and finally TIME. Label text is
+/// truncated and deep indentation is compressed before the active band's columns
+/// are allowed to disappear at the next declared threshold.
+fn visible_metric_columns(width: usize) -> &'static [MetricColumn] {
+    match width {
+        120.. => ALL_METRIC_COLUMNS,
+        104..=119 => WITHOUT_MODEL_COLUMNS,
+        90..=103 => TOKEN_RATE_TIME_COLUMNS,
+        76..=89 => TOKEN_TIME_COLUMNS,
+        62..=75 => TIME_COLUMN,
+        _ => &[],
+    }
+}
+
+fn metric_block_width(columns: &[MetricColumn]) -> usize {
+    columns
+        .iter()
+        .copied()
+        .map(MetricColumn::width)
+        .sum::<usize>()
+        .saturating_add(columns.len().saturating_sub(1))
+}
+
+fn right_align_to_width(value: &str, width: usize) -> String {
+    let value = truncate_to_width(value, width);
+    let padding = width.saturating_sub(Span::raw(value.as_str()).width());
+    format!("{}{value}", " ".repeat(padding))
+}
+
+fn render_metric_block(
+    metrics: Option<&projection::RunMetricInputs>,
+    columns: &[MetricColumn],
+    now_ms: i64,
+) -> String {
+    columns
+        .iter()
+        .copied()
+        .map(|column| {
+            let value = metrics.map_or_else(String::new, |metrics| {
+                format_metric_value(column, metrics, now_ms)
+            });
+            right_align_to_width(&value, column.width())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn format_metric_value(
+    column: MetricColumn,
+    metrics: &projection::RunMetricInputs,
+    now_ms: i64,
+) -> String {
+    match column {
+        MetricColumn::Model => format_model_value(metrics.model.as_deref()),
+        MetricColumn::Effort => format_effort_value(metrics.effort.as_deref()),
+        MetricColumn::Tok => metrics
+            .output_tokens
+            .map_or_else(|| "—".to_owned(), format_token_count),
+        MetricColumn::TokPerSecond => format_token_rate_value(metrics, now_ms),
+        MetricColumn::Time => format_time_value(metrics, now_ms),
+    }
+}
+
+fn format_model_value(model: Option<&str>) -> String {
+    let Some(model) = model else {
+        return "—".to_owned();
+    };
+    let model = safe_text(model);
+    let shortened = model.strip_prefix("claude-").unwrap_or(&model);
+    let shortened = strip_model_date_suffix(shortened);
+    if shortened.is_empty() {
+        "—".to_owned()
+    } else {
+        truncate_to_width(shortened, MetricColumn::Model.width())
+    }
+}
+
+fn strip_model_date_suffix(model: &str) -> &str {
+    if let Some(prefix) = model.get(..model.len().saturating_sub(11))
+        && let Some(suffix) = model.get(model.len().saturating_sub(11)..)
+        && suffix.len() == 11
+        && suffix.starts_with('-')
+        && suffix.as_bytes()[1..5].iter().all(u8::is_ascii_digit)
+        && suffix.as_bytes()[5] == b'-'
+        && suffix.as_bytes()[6..8].iter().all(u8::is_ascii_digit)
+        && suffix.as_bytes()[8] == b'-'
+        && suffix.as_bytes()[9..11].iter().all(u8::is_ascii_digit)
+    {
+        return prefix;
+    }
+    if let Some(prefix) = model.get(..model.len().saturating_sub(9))
+        && let Some(suffix) = model.get(model.len().saturating_sub(9)..)
+        && suffix.len() == 9
+        && suffix.starts_with('-')
+        && suffix.as_bytes()[1..].iter().all(u8::is_ascii_digit)
+    {
+        return prefix;
+    }
+    if let Some(prefix) = model.get(..model.len().saturating_sub(8))
+        && let Some(suffix) = model.get(model.len().saturating_sub(8)..)
+        && suffix.len() == 8
+        && suffix.as_bytes().iter().all(u8::is_ascii_digit)
+    {
+        return prefix.trim_end_matches('-');
+    }
+    model
+}
+
+fn format_effort_value(effort: Option<&str>) -> String {
+    let Some(effort) = effort.filter(|effort| !effort.is_empty()) else {
+        return "—".to_owned();
+    };
+    let effort = safe_text(effort);
+    match effort.to_ascii_lowercase().as_str() {
+        "minimal" => "min".to_owned(),
+        "low" => "low".to_owned(),
+        "medium" => "med".to_owned(),
+        "high" => "high".to_owned(),
+        "xhigh" => "xhigh".to_owned(),
+        "max" => "max".to_owned(),
+        _ => truncate_to_width(&effort, MetricColumn::Effort.width()),
+    }
+}
+
+fn format_token_count(tokens: u64) -> String {
+    if tokens < 10_000 {
+        return tokens.to_string();
+    }
+    if tokens < 1_000_000 {
+        return format_scaled_token_count(tokens, 1_000, 'k');
+    }
+    format_scaled_token_count(tokens, 1_000_000, 'M')
+}
+
+fn format_scaled_token_count(tokens: u64, divisor: u64, suffix: char) -> String {
+    let scaled = tokens as f64 / divisor as f64;
+    if scaled < 100.0 {
+        let rounded = (scaled * 10.0).round() / 10.0;
+        if rounded < 100.0 {
+            return format!("{rounded:.1}{suffix}");
+        }
+    }
+    let rounded = scaled.round().clamp(0.0, 9_999.0);
+    format!("{rounded:.0}{suffix}")
+}
+
+fn format_token_rate_value(metrics: &projection::RunMetricInputs, now_ms: i64) -> String {
+    projection::run_token_rate(metrics, now_ms).map_or_else(|| "—".to_owned(), format_token_rate)
+}
+
+fn format_token_rate(rate: f64) -> String {
+    if rate < 10.0 {
+        let rounded = (rate * 10.0).round() / 10.0;
+        if rounded < 10.0 {
+            return format!("{rounded:.1}/s");
+        }
+    }
+    if rate < 1_000.0 {
+        let rounded = rate.round();
+        if rounded < 1_000.0 {
+            return format!("{rounded:.0}/s");
+        }
+    }
+    let thousands = (rate / 1_000.0).round().clamp(1.0, 99.0);
+    format!("{thousands:.0}k/s")
+}
+
+fn format_time_value(metrics: &projection::RunMetricInputs, now_ms: i64) -> String {
+    let Some(created_at_ms) = metrics.created_at_ms else {
+        return "—".to_owned();
+    };
+    let Some(end_ms) = metric_end_ms(metrics, now_ms) else {
+        return "—".to_owned();
+    };
+    let Some(elapsed_ms) = end_ms
+        .checked_sub(created_at_ms)
+        .filter(|elapsed_ms| *elapsed_ms >= 0)
+    else {
+        return "—".to_owned();
+    };
+    truncate_to_width(&format_duration(elapsed_ms), MetricColumn::Time.width())
+}
+
+fn metric_end_ms(metrics: &projection::RunMetricInputs, now_ms: i64) -> Option<i64> {
+    if metrics.terminal {
+        metrics.finished_at_ms
+    } else {
+        Some(now_ms)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -135,13 +427,25 @@ pub(super) fn render(
     );
     match state.view_mode() {
         ViewMode::ExecutionTree => {
-            render_tree(frame, tree_area, rows, state, setup.ascii_tree());
+            render_tree(
+                frame,
+                tree_area,
+                model,
+                rows,
+                state,
+                setup.ascii_tree(),
+                paint.now_ms,
+            );
         }
         ViewMode::DependencyDag => render_dag(frame, tree_area, rows, state),
     }
     render_activity(frame, activity_area, model, rows, state, diagnostics);
+    let committed_filter = (!state.filter_query().is_empty()).then(|| state.filter_query());
     frame.render_widget(
-        Paragraph::new(footer_line(usize::from(footer_area.width))),
+        Paragraph::new(footer_line(
+            usize::from(footer_area.width),
+            committed_filter,
+        )),
         footer_area,
     );
     render_interaction_layer(frame, area, model, paint, diagnostics, setup);
@@ -206,7 +510,15 @@ fn render_header(
     frame.render_widget(Paragraph::new(line).block(block), area);
 }
 
-fn render_tree(frame: &mut Frame<'_>, area: Rect, rows: &[TreeRow], state: &AppState, ascii: bool) {
+fn render_tree(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    model: &DomainModel,
+    rows: &[TreeRow],
+    state: &AppState,
+    ascii: bool,
+    now_ms: i64,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Execution tree ");
@@ -218,7 +530,10 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, rows: &[TreeRow], state: &AppS
     }
     let start = viewport_start(rows, state, viewport_height);
     let width = usize::from(inner.width);
-    let prefixes = tree_connector_prefixes(rows, ascii);
+    let end = start.saturating_add(viewport_height).min(rows.len());
+    let columns = visible_metric_columns(width);
+    let indent_style = tree_indent_style(&rows[start..end], width, columns);
+    let prefixes = tree_connector_prefixes_with_style(rows, ascii, indent_style);
     let lines = rows
         .iter()
         .zip(prefixes.iter())
@@ -227,7 +542,28 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, rows: &[TreeRow], state: &AppS
         .map(|(row, prefix)| {
             let selected = state.selected() == Some(&row.key);
             let marker = if selected { "> " } else { "  " };
-            let text = truncate_to_width(&format!("{marker}{prefix}{}", row.label), width);
+            let metrics = row
+                .key
+                .run_id()
+                .and_then(|run_id| model.task_run(&run_id))
+                .map(|run| projection::run_metric_inputs(model, run));
+            let metric_width = metric_block_width(columns);
+            let reserved_width = if columns.is_empty() {
+                0
+            } else {
+                metric_width.saturating_add(1)
+            };
+            let label_width = width.saturating_sub(reserved_width);
+            let label = truncate_to_width(&format!("{marker}{prefix}{}", row.label), label_width);
+            let text = if columns.is_empty() {
+                label
+            } else {
+                format!(
+                    "{} {}",
+                    pad_to_width(&label, label_width),
+                    render_metric_block(metrics.as_ref(), columns, now_ms)
+                )
+            };
             let style = if selected {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
@@ -239,7 +575,57 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, rows: &[TreeRow], state: &AppS
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+#[cfg(test)]
 fn tree_connector_prefixes(rows: &[TreeRow], ascii: bool) -> Vec<String> {
+    tree_connector_prefixes_with_style(rows, ascii, TreeIndentStyle::Normal)
+}
+
+const MIN_TREE_LABEL_WIDTH: usize = 20;
+const TREE_SELECTION_MARKER_WIDTH: usize = 2;
+
+/// One frame-wide connector shape keeps vertical guides aligned while deep trees narrow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TreeIndentStyle {
+    Normal,
+    Compressed,
+    Clamped { max_levels: usize },
+}
+
+fn tree_indent_style(
+    painted_rows: &[TreeRow],
+    width: usize,
+    columns: &[MetricColumn],
+) -> TreeIndentStyle {
+    let max_depth = painted_rows
+        .iter()
+        .map(|row| row.depth)
+        .max()
+        .unwrap_or_default();
+    let reserved_metrics = if columns.is_empty() {
+        0
+    } else {
+        metric_block_width(columns).saturating_add(1)
+    };
+    let indent_budget = width
+        .saturating_sub(reserved_metrics)
+        .saturating_sub(TREE_SELECTION_MARKER_WIDTH)
+        .saturating_sub(MIN_TREE_LABEL_WIDTH);
+    if max_depth.saturating_mul(4) <= indent_budget {
+        return TreeIndentStyle::Normal;
+    }
+    if max_depth.saturating_mul(2) <= indent_budget {
+        return TreeIndentStyle::Compressed;
+    }
+    TreeIndentStyle::Clamped {
+        max_levels: indent_budget.saturating_sub(1) / 2,
+    }
+}
+
+fn tree_connector_prefixes_with_style(
+    rows: &[TreeRow],
+    ascii: bool,
+    style: TreeIndentStyle,
+) -> Vec<String> {
     let mut last_child = vec![false; rows.len()];
     let mut next_at_depth = Vec::<Option<usize>>::new();
     for (index, row) in rows.iter().enumerate().rev() {
@@ -251,26 +637,40 @@ fn tree_connector_prefixes(rows: &[TreeRow], ascii: bool) -> Vec<String> {
         next_at_depth[row.depth] = Some(index);
     }
 
-    let (branch, last, vertical) = if ascii {
-        ("|-- ", "`-- ", "|   ")
+    let compressed = !matches!(style, TreeIndentStyle::Normal);
+    let (branch, last, vertical, blank) = if ascii && compressed {
+        ("|-", "`-", "| ", "  ")
+    } else if ascii {
+        ("|-- ", "`-- ", "|   ", "    ")
+    } else if compressed {
+        ("├─", "└─", "│ ", "  ")
     } else {
-        ("├── ", "└── ", "│   ")
+        ("├── ", "└── ", "│   ", "    ")
     };
     let mut ancestors = Vec::<Option<usize>>::new();
     let mut prefixes = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
         ancestors.truncate(row.depth);
         ancestors.resize(row.depth, None);
-        let mut prefix = String::with_capacity(row.depth.saturating_mul(4));
+        let mut components = Vec::with_capacity(row.depth);
         for ancestor in ancestors.iter().take(row.depth).skip(1) {
             if ancestor.is_some_and(|ancestor| !last_child[ancestor]) {
-                prefix.push_str(vertical);
+                components.push(vertical);
             } else {
-                prefix.push_str("    ");
+                components.push(blank);
             }
         }
         if row.depth > 0 {
-            prefix.push_str(if last_child[index] { last } else { branch });
+            components.push(if last_child[index] { last } else { branch });
+        }
+        let mut prefix = String::new();
+        if let TreeIndentStyle::Clamped { max_levels } = style
+            && components.len() > max_levels
+        {
+            prefix.push('…');
+            prefix.push_str(&components[components.len().saturating_sub(max_levels)..].concat());
+        } else {
+            prefix.push_str(&components.concat());
         }
         prefixes.push(prefix);
         ancestors.push(Some(index));
@@ -440,7 +840,7 @@ fn render_activity(
     );
 }
 
-fn footer_line(width: usize) -> String {
+fn footer_line(width: usize, committed_filter: Option<&str>) -> String {
     const FULL: &[&str] = &[
         "q: stop Top only; agents continue",
         "detach: Top runs",
@@ -453,6 +853,24 @@ fn footer_line(width: usize) -> String {
         "c clear",
     ];
     const COMPACT: &[&str] = &["q:stop Top; agents continue", "detach:Top runs"];
+    const COMMITTED_FILTER_MAX_WIDTH: usize = 32;
+    if let Some(query) = committed_filter {
+        let filter = truncate_to_width(
+            &format!("filter:{}", safe_text(query)),
+            width.min(COMMITTED_FILTER_MAX_WIDTH),
+        );
+        if Span::raw(filter.as_str()).width() >= width {
+            return truncate_to_width(&filter, width);
+        }
+        let hints = if width >= 70 { FULL } else { COMPACT };
+        for hint_count in (1..=hints.len()).rev() {
+            let candidate = format!("{filter} | {}", hints[..hint_count].join(" | "));
+            if Span::raw(candidate.as_str()).width() <= width {
+                return candidate;
+            }
+        }
+        return filter;
+    }
     let floor = COMPACT[0];
     if Span::raw(floor).width() > width {
         return truncate_to_width(floor, width);
@@ -504,7 +922,16 @@ fn render_interaction_layer(
     let (title, lines) = match overlay {
         Overlay::Notice => (" Setup notice ", notice_lines(setup)),
         Overlay::Help => (" Help ", help_lines(diagnostics, setup)),
-        Overlay::Summary => (" Summary ", summary_lines(model, paint.now_ms)),
+        Overlay::Summary => (
+            " Summary ",
+            summary_lines(
+                model,
+                paint.rows,
+                state.selected(),
+                state.summary_scope(),
+                paint.now_ms,
+            ),
+        ),
         Overlay::Detail => {
             let detail = state.selected().map_or_else(
                 || projection::DetailProjection {
@@ -546,23 +973,62 @@ fn render_interaction_layer(
     frame.render_widget(Paragraph::new(visible).block(block), modal);
 }
 
-fn summary_lines(model: &DomainModel, now_ms: i64) -> Vec<String> {
-    let mut lines =
-        vec!["worker kind | model | runs | live | total | mean | tok | tok/s".to_owned()];
-    lines.extend(summary_rows(model, now_ms).into_iter().map(|row| {
+fn summary_lines(
+    model: &DomainModel,
+    rows: &[TreeRow],
+    selected: Option<&NodeKey>,
+    scope: projection::SummaryScope,
+    now_ms: i64,
+) -> Vec<String> {
+    let summary = projection::summary_projection(model, rows, selected, scope, now_ms);
+    let mut lines = vec![match (&summary.scope, &summary.workspace_id) {
+        (projection::SummaryScope::SelectionWorkspace, Some(workspace_id)) => {
+            format!("scope: workspace {} (w: session)", safe_text(workspace_id))
+        }
+        (projection::SummaryScope::SelectionWorkspace, None) => {
+            "scope: session (selection has no workspace; w toggles scope mode)".to_owned()
+        }
+        (projection::SummaryScope::Session, _) => {
+            "scope: session (w: selection workspace)".to_owned()
+        }
+    }];
+    append_summary_table(&mut lines, "worker kind", summary.worker_kinds);
+    append_summary_table(&mut lines, "model", summary.models);
+    lines
+}
+
+fn append_summary_table(
+    lines: &mut Vec<String>,
+    dimension: &str,
+    rows: Vec<projection::SummaryRow>,
+) {
+    lines.push(String::new());
+    lines.push(format!("per {dimension}"));
+    lines.push(format!(
+        "{dimension} | runs | live | total | mean | tok | mean tok/s"
+    ));
+    if rows.is_empty() {
+        lines.push("- | 0 | 0 | 00s | - | - | -".to_owned());
+        return;
+    }
+    lines.extend(rows.into_iter().map(|row| {
         let mean = row
             .mean_duration_ms
             .map_or_else(|| "-".to_owned(), format_duration);
+        let tokens = row
+            .total_output_tokens
+            .map_or_else(|| "-".to_owned(), format_token_count);
+        let rate = row
+            .mean_tokens_per_second
+            .map_or_else(|| "-".to_owned(), format_token_rate);
         format!(
-            "{} | {} | {} | {} | {} | {mean} | - | -",
-            row.worker_kind,
-            row.model,
+            "{} | {} | {} | {} | {mean} | {tokens} | {rate}",
+            safe_text(&row.label),
             row.run_count,
             row.live_count,
             format_duration(row.total_duration_ms),
         )
     }));
-    lines
 }
 
 fn notice_lines(setup: &TuiSetup) -> Vec<String> {
@@ -585,7 +1051,8 @@ fn help_lines(diagnostics: &RuntimeDiagnosticsSnapshot, setup: &TuiSetup) -> Vec
         "Tree: Left collapse/parent; Right expand/child; Enter toggles branch".to_owned(),
         "Collapse is ignored while filtering and in DAG; stored state survives view toggles"
             .to_owned(),
-        "i detail; s summary; ? help; Esc/opening key closes; Up/Down scrolls overlays".to_owned(),
+        "i detail; s summary; w toggles Summary workspace/session scope; ? help".to_owned(),
+        "Esc/opening key closes; Up/Down scrolls overlays".to_owned(),
         "Follow pins selection and viewport to newest; manual navigation disables it".to_owned(),
         "Recovery: ancestor, stable neighbor, first; reasons are typed".to_owned(),
         "Controller input is optional capability; standalone setup is optional".to_owned(),
@@ -783,6 +1250,7 @@ struct HeaderField {
     prefix: &'static str,
     value: String,
     shrinkable: bool,
+    droppable: bool,
 }
 
 impl HeaderField {
@@ -810,35 +1278,41 @@ fn header_line(
             prefix: "host:",
             value: safe_text(&inputs.host),
             shrinkable: true,
+            droppable: true,
         });
     }
     fields.push(HeaderField {
         prefix: "session:",
         value: safe_text(&inputs.session),
         shrinkable: true,
+        droppable: false,
     });
     fields.push(HeaderField {
         prefix: "up:",
         value: format_session_elapsed(session_elapsed_ms),
-        shrinkable: false,
+        shrinkable: true,
+        droppable: true,
     });
     if screen_width >= 72 {
         fields.push(HeaderField {
             prefix: "workspaces:",
             value: model.workspaces().count().to_string(),
             shrinkable: true,
+            droppable: true,
         });
     }
     fields.push(HeaderField {
         prefix: "",
         value: quality_label(quality).to_owned(),
         shrinkable: false,
+        droppable: false,
     });
     if screen_width >= 88 {
         fields.push(HeaderField {
             prefix: "lag:",
             value: format!("{}ms", performance.snapshot.event_lag.as_millis()),
             shrinkable: true,
+            droppable: true,
         });
     }
     if !performance.snapshot.reasons.is_empty() {
@@ -853,6 +1327,7 @@ fn header_line(
                 .collect::<Vec<_>>()
                 .join("+"),
             shrinkable: true,
+            droppable: true,
         });
     }
     if screen_width >= 100 {
@@ -861,6 +1336,7 @@ fn header_line(
             prefix: "sources:",
             value: safe_text(&coverage),
             shrinkable: true,
+            droppable: true,
         });
     }
 
@@ -895,7 +1371,7 @@ fn format_session_elapsed(elapsed_ms: i64) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
-fn shrink_header_fields(fields: &mut [HeaderField], available_width: usize) {
+fn shrink_header_fields(fields: &mut Vec<HeaderField>, available_width: usize) {
     let priorities = [
         "sources:",
         "lag:",
@@ -903,6 +1379,7 @@ fn shrink_header_fields(fields: &mut [HeaderField], available_width: usize) {
         "host:",
         "session:",
         "perf:",
+        "up:",
     ];
     loop {
         let current = fields_width(fields);
@@ -929,7 +1406,20 @@ fn shrink_header_fields(fields: &mut [HeaderField], available_width: usize) {
             break;
         }
         if !changed {
+            break;
+        }
+    }
+
+    let drop_priorities = ["sources:", "lag:", "workspaces:", "host:", "perf:", "up:"];
+    for prefix in drop_priorities {
+        if fields_width(fields) <= available_width {
             return;
+        }
+        if let Some(index) = fields
+            .iter()
+            .position(|field| field.prefix == prefix && field.droppable)
+        {
+            fields.remove(index);
         }
     }
 }
@@ -1025,22 +1515,34 @@ pub(crate) fn build_uncollapsed_rows(model: &DomainModel, state: &AppState) -> V
 }
 
 fn build_full_rows(model: &DomainModel, state: &AppState) -> Vec<TreeRow> {
-    let newest_agents = newest_agent_nodes(model);
     match state.view_mode() {
-        ViewMode::ExecutionTree => build_tree_rows(model, state, &newest_agents),
-        ViewMode::DependencyDag => {
-            dag::build_rows(model, state.dag_order(), state.now_ms(), &newest_agents)
+        ViewMode::ExecutionTree => {
+            let newest_agents = newest_agent_nodes(model);
+            build_tree_rows(model, state, &newest_agents)
         }
+        ViewMode::DependencyDag => dag::build_rows(model, state.dag_order(), state.now_ms()),
     }
 }
 
-fn append_execution_tree_rows(
+fn append_execution_tree_rows<'model>(
     rows: &mut Vec<TreeRow>,
-    model: &DomainModel,
+    model: &'model DomainModel,
     state: &AppState,
-    newest_agents: &NewestAgentNodes<'_>,
+    newest_agents: &NewestAgentNodes<'model>,
 ) {
-    let (mut pane_runs, unattached) = place_runs(model, state);
+    let (mut pane_runs, unattached, nested_runs) = place_runs(model, state);
+    let live_lines = LiveLineReadModel::from_model(model);
+    let stalled_runs =
+        projection::stalled_run_ids(model, state.now_ms(), crate::activity::stall_warn_ms());
+    let run_row_context = RunRowContext {
+        model,
+        nested_runs: &nested_runs,
+        newest_agents,
+        live_lines: &live_lines,
+        stalled_runs: &stalled_runs,
+        now_ms: state.now_ms(),
+    };
+    let mut run_render_state = RunRenderState::default();
 
     let mut workspaces = model.workspaces().collect::<Vec<_>>();
     workspaces.sort_by_key(|workspace| {
@@ -1107,12 +1609,11 @@ fn append_execution_tree_rows(
                 if let Some(runs) = pane_runs.remove(&pane.pane_id) {
                     append_run_rows(
                         rows,
-                        model,
                         runs,
                         Some(&pane.pane_id),
                         4,
-                        state.now_ms(),
-                        newest_agents,
+                        &run_row_context,
+                        &mut run_render_state,
                     );
                 }
             }
@@ -1131,20 +1632,41 @@ fn append_execution_tree_rows(
             .into_iter()
             .map(|run_id| (run_id, false))
             .collect();
-        append_run_rows(rows, model, runs, None, 2, state.now_ms(), newest_agents);
+        append_run_rows(rows, runs, None, 2, &run_row_context, &mut run_render_state);
     }
 }
 
-fn place_runs(model: &DomainModel, state: &AppState) -> (PaneRuns, Vec<RunId>) {
+fn place_runs(model: &DomainModel, state: &AppState) -> (PaneRuns, Vec<RunId>, NestedRuns) {
     let mut pane_runs = PaneRuns::new();
     let mut unattached = Vec::new();
+    let mut unplaced = Vec::new();
+    let mut candidate_parents = HashMap::new();
     let mut runs = model.task_runs().collect::<Vec<_>>();
-    runs.sort_by_key(|run| (run.display_ordinal.get(), run.run_id));
+    // Keep discovery deterministic; each output collection owns its display ordering below.
+    runs.sort_by_key(|run| run.run_id);
+    let execution_run_ids = crate::activity::runs_with_executions(model);
+    let operator = state.operator_snapshot();
+    let default_visible_runs = runs
+        .iter()
+        .filter(|run| {
+            crate::activity::is_default_visible_task_run(
+                run,
+                &operator,
+                &execution_run_ids,
+                state.now_ms(),
+            )
+        })
+        .map(|run| run.run_id)
+        .collect::<HashSet<_>>();
 
     for run in runs {
-        let mut executions = model
+        let all_executions = model
             .executions()
             .filter(|execution| execution.task_run_id == run.run_id)
+            .collect::<Vec<_>>();
+        let has_execution_history = !all_executions.is_empty();
+        let mut executions = all_executions
+            .into_iter()
             .filter(|execution| pane_is_renderable(model, &execution.pane_id))
             .collect::<Vec<_>>();
         executions.sort_by_key(|execution| {
@@ -1177,7 +1699,23 @@ fn place_runs(model: &DomainModel, state: &AppState) -> (PaneRuns, Vec<RunId>) {
                 .or_default()
                 .push((run.run_id, false));
         } else {
-            unattached.push(run.run_id);
+            unplaced.push(run.run_id);
+            if !has_execution_history
+                && let Some(parent) = dispatch_parent_run(model, run.run_id)
+                && default_visible_runs.contains(&parent.run_id)
+            {
+                candidate_parents.insert(run.run_id, parent.run_id);
+            }
+        }
+    }
+    let mut nested_runs = NestedRuns::new();
+    for run_id in unplaced {
+        if let Some(parent_run_id) = candidate_parents.get(&run_id).copied()
+            && !parent_chain_has_cycle(run_id, &candidate_parents)
+        {
+            nested_runs.entry(parent_run_id).or_default().push(run_id);
+        } else {
+            unattached.push(run_id);
         }
     }
     for runs in pane_runs.values_mut() {
@@ -1189,7 +1727,35 @@ fn place_runs(model: &DomainModel, state: &AppState) -> (PaneRuns, Vec<RunId>) {
         });
         runs.dedup_by_key(|(run_id, _)| *run_id);
     }
-    (pane_runs, unattached)
+    for runs in nested_runs.values_mut() {
+        runs.sort_by_key(|run_id| {
+            model
+                .task_run(run_id)
+                .map(|run| (run.display_ordinal.get(), run.run_id))
+                .unwrap_or((i64::MAX, *run_id))
+        });
+        runs.dedup();
+    }
+    unattached.sort_by_key(|run_id| {
+        model
+            .task_run(run_id)
+            .map(|run| (run.display_ordinal.get(), run.run_id))
+            .unwrap_or((i64::MAX, *run_id))
+    });
+    unattached.dedup();
+    (pane_runs, unattached, nested_runs)
+}
+
+fn parent_chain_has_cycle(run_id: RunId, candidate_parents: &HashMap<RunId, RunId>) -> bool {
+    let mut seen = HashSet::new();
+    let mut current = run_id;
+    while seen.insert(current) {
+        let Some(parent_run_id) = candidate_parents.get(&current).copied() else {
+            return false;
+        };
+        current = parent_run_id;
+    }
+    true
 }
 
 fn pane_is_renderable(model: &DomainModel, pane_id: &str) -> bool {
@@ -1212,42 +1778,87 @@ fn topology_row_label(kind: &str, id: &str, name: Option<&str>) -> String {
 
 fn append_run_rows(
     rows: &mut Vec<TreeRow>,
-    model: &DomainModel,
     runs: Vec<RunPlacement>,
     pane_id: Option<&str>,
     depth: usize,
-    now_ms: i64,
-    newest_agents: &NewestAgentNodes<'_>,
+    context: &RunRowContext<'_, '_>,
+    render_state: &mut RunRenderState,
 ) {
-    for (run_id, shared) in runs {
-        let Some(run) = model.task_run(&run_id) else {
-            continue;
-        };
-        rows.push(TreeRow {
-            key: NodeKey::Run {
-                run_id,
-                pane_id: pane_id.map(str::to_owned),
-            },
+    for placement in runs {
+        append_run_subtree(
+            rows,
+            placement,
+            pane_id,
             depth,
-            label: task_run_label(
-                model,
-                run,
-                shared,
-                now_ms,
-                newest_agents.get(&run_id).copied(),
-            ),
-            prerequisites: Vec::new(),
-            dependents: Vec::new(),
-        });
-        let agents = model
-            .agent_nodes()
-            .filter(|agent| agent.task_run_id == run_id)
-            .filter(|agent| {
-                provider_from_key(&run.key).is_none_or(|provider| provider == agent.provider)
-            })
-            .collect::<Vec<_>>();
-        append_agent_rows(rows, agents, pane_id, depth.saturating_add(1));
+            pane_id.is_some(),
+            context,
+            render_state,
+        );
     }
+}
+
+fn append_run_subtree(
+    rows: &mut Vec<TreeRow>,
+    (run_id, shared): RunPlacement,
+    pane_id: Option<&str>,
+    depth: usize,
+    show_dispatch_parent: bool,
+    context: &RunRowContext<'_, '_>,
+    render_state: &mut RunRenderState,
+) {
+    if !render_state.ancestors.insert(run_id) {
+        return;
+    }
+    let Some(run) = context.model.task_run(&run_id) else {
+        render_state.ancestors.remove(&run_id);
+        return;
+    };
+    rows.push(TreeRow {
+        key: NodeKey::Run {
+            run_id,
+            pane_id: pane_id.map(str::to_owned),
+        },
+        depth,
+        label: task_run_label_for_placement(
+            context.model,
+            run,
+            shared,
+            context.now_ms,
+            context.newest_agents.get(&run_id).copied(),
+            show_dispatch_parent,
+            RunRowSignals {
+                live_lines: context.live_lines,
+                stalled: context.stalled_runs.contains(&run_id),
+            },
+        ),
+        prerequisites: Vec::new(),
+        dependents: Vec::new(),
+    });
+    let agents = context
+        .model
+        .agent_nodes()
+        .filter(|agent| agent.task_run_id == run_id)
+        .filter(|agent| !is_live_line_agent(agent))
+        .filter(|agent| {
+            provider_from_key(&run.key).is_none_or(|provider| provider == agent.provider)
+        })
+        .collect::<Vec<_>>();
+    append_agent_rows(rows, agents, pane_id, depth.saturating_add(1));
+    let expand_nested_runs = !shared || render_state.expanded_shared_runs.insert(run_id);
+    if expand_nested_runs && let Some(children) = context.nested_runs.get(&run_id) {
+        for child_run_id in children {
+            append_run_subtree(
+                rows,
+                (*child_run_id, false),
+                pane_id,
+                depth.saturating_add(1),
+                false,
+                context,
+                render_state,
+            );
+        }
+    }
+    render_state.ancestors.remove(&run_id);
 }
 
 fn append_agent_rows(
@@ -1350,19 +1961,44 @@ pub(crate) fn task_run_label(
     run: &TaskRun,
     shared: bool,
     now_ms: i64,
-    newest_agent: Option<&AgentNode>,
+    stalled: bool,
 ) -> String {
-    let mut label = run_row_label_with_agent(run, newest_agent, now_ms);
+    let mut label = run_row_head(model, run, stalled);
+    append_run_duration(&mut label, run, now_ms);
+    append_task_run_annotations(model, run, label, shared, true)
+}
+
+fn task_run_label_for_placement(
+    model: &DomainModel,
+    run: &TaskRun,
+    shared: bool,
+    now_ms: i64,
+    newest_agent: Option<&AgentNode>,
+    show_dispatch_parent: bool,
+    signals: RunRowSignals<'_>,
+) -> String {
+    let label = run_row_label_with_agent(
+        model,
+        run,
+        newest_agent,
+        now_ms,
+        signals.live_lines,
+        signals.stalled,
+    );
+    append_task_run_annotations(model, run, label, shared, show_dispatch_parent)
+}
+
+fn append_task_run_annotations(
+    model: &DomainModel,
+    run: &TaskRun,
+    mut label: String,
+    shared: bool,
+    show_dispatch_parent: bool,
+) -> String {
     if shared {
         label.push_str(" [shared]");
     }
-    let mut parents = model
-        .execution_edges()
-        .filter(|edge| edge.child_run_id == run.run_id)
-        .filter_map(|edge| model.task_run(&edge.parent_run_id))
-        .collect::<Vec<_>>();
-    parents.sort_by_key(|parent| (parent.display_ordinal.get(), parent.run_id));
-    if let Some(parent) = parents.first() {
+    if show_dispatch_parent && let Some(parent) = dispatch_parent_run(model, run.run_id) {
         label.push_str(&format!(" [dispatched by: {}]", short_run_name(parent)));
     }
     let linked = model
@@ -1377,90 +2013,24 @@ pub(crate) fn task_run_label(
     label
 }
 
-fn worker_kind_label(run: &TaskRun) -> String {
-    match &run.key {
-        RunKey::Native { provider, .. } | RunKey::NativePath { provider, .. } => {
-            provider_label(*provider).to_owned()
-        }
-        RunKey::Controller(name) => {
-            let label = name
-                .strip_prefix("hook:")
-                .and_then(|suffix| suffix.split_once(':').map(|(selector, _)| selector))
-                .unwrap_or(name);
-            safe_text(label)
-        }
-        RunKey::Provisional { .. } => "provisional".to_owned(),
-    }
-}
-
-pub(crate) struct SummaryRow {
-    pub(crate) worker_kind: String,
-    pub(crate) model: String,
-    pub(crate) run_count: usize,
-    pub(crate) live_count: usize,
-    pub(crate) total_duration_ms: i64,
-    pub(crate) mean_duration_ms: Option<i64>,
-}
-
-/// Aggregates runs for the Summary overlay; `_now_ms` is reserved for Increment 9 rates.
-pub(crate) fn summary_rows(model: &DomainModel, _now_ms: i64) -> Vec<SummaryRow> {
-    let newest_agents = newest_agent_nodes(model);
-    let mut groups = HashMap::<(String, String), (usize, usize, i64, i64)>::new();
-    for run in model.task_runs() {
-        let worker_kind = worker_kind_label(run);
-        let model = newest_agents
-            .get(&run.run_id)
-            .and_then(|agent| agent.model_id.as_deref())
-            .unwrap_or("unknown")
-            .to_owned();
-        let group = groups.entry((worker_kind, model)).or_default();
-        group.0 = group.0.saturating_add(1);
-        if !run.state.is_terminal() {
-            group.1 = group.1.saturating_add(1);
-            continue;
-        }
-        let Some(duration) = run
-            .finished_at_ms
-            .zip(run.created_at_ms)
-            .and_then(|(finished, created)| finished.checked_sub(created))
-            .filter(|duration| *duration >= 0)
-        else {
-            continue;
-        };
-        group.2 = group.2.saturating_add(duration);
-        group.3 = group.3.saturating_add(1);
-    }
-
-    let mut rows = groups
-        .into_iter()
-        .map(
-            |((worker_kind, model), (run_count, live_count, total_duration_ms, timed_count))| {
-                SummaryRow {
-                    worker_kind,
-                    model,
-                    run_count,
-                    live_count,
-                    total_duration_ms,
-                    mean_duration_ms: (timed_count > 0).then(|| total_duration_ms / timed_count),
-                }
-            },
-        )
+fn dispatch_parent_run(model: &DomainModel, child_run_id: RunId) -> Option<&TaskRun> {
+    let mut parents = model
+        .execution_edges()
+        .filter(|edge| edge.child_run_id == child_run_id)
+        .filter_map(|edge| model.task_run(&edge.parent_run_id))
         .collect::<Vec<_>>();
-    rows.sort_by(|left, right| {
-        right
-            .total_duration_ms
-            .cmp(&left.total_duration_ms)
-            .then_with(|| left.worker_kind.cmp(&right.worker_kind))
-            .then_with(|| left.model.cmp(&right.model))
-    });
-    rows
+    parents.sort_by_key(|parent| (parent.display_ordinal.get(), parent.run_id));
+    parents.into_iter().next()
 }
 
 pub(crate) fn newest_agent_nodes(model: &DomainModel) -> NewestAgentNodes<'_> {
     #[cfg(test)]
     record_newest_agent_scan();
     let mut newest = NewestAgentNodes::new();
-    for agent in model.agent_nodes() {
+    for agent in model
+        .agent_nodes()
+        .filter(|agent| !is_live_line_agent(agent))
+    {
         newest
             .entry(agent.task_run_id)
             .and_modify(|current| {
@@ -1475,6 +2045,10 @@ pub(crate) fn newest_agent_nodes(model: &DomainModel) -> NewestAgentNodes<'_> {
     newest
 }
 
+fn is_live_line_agent(agent: &AgentNode) -> bool {
+    agent.last_event_kind.as_deref() == Some(crate::provider::lane::LIVE_LINE_EVENT_KIND)
+}
+
 #[cfg(test)]
 fn newest_agent_node(model: &DomainModel, run_id: RunId) -> Option<&AgentNode> {
     newest_agent_nodes(model).get(&run_id).copied()
@@ -1483,41 +2057,75 @@ fn newest_agent_node(model: &DomainModel, run_id: RunId) -> Option<&AgentNode> {
 #[cfg(test)]
 fn run_row_label(model: &DomainModel, run: &TaskRun, now_ms: i64) -> String {
     let newest_agent = newest_agent_node(model, run.run_id);
-    run_row_label_with_agent(run, newest_agent, now_ms)
+    let stalled = projection::stalled_run_ids(model, now_ms, crate::activity::stall_warn_ms())
+        .contains(&run.run_id);
+    run_row_label_with_agent(
+        model,
+        run,
+        newest_agent,
+        now_ms,
+        &LiveLineReadModel::default(),
+        stalled,
+    )
 }
 
 fn run_row_label_with_agent(
+    model: &DomainModel,
     run: &TaskRun,
     newest_agent: Option<&AgentNode>,
     now_ms: i64,
+    live_lines: &LiveLineReadModel,
+    stalled: bool,
 ) -> String {
-    let mut label = worker_kind_label(run);
-    let subject = run
-        .subject
-        .as_deref()
-        .map_or_else(|| run_subject_fallback(run), safe_text);
+    let mut label = run_row_head(model, run, stalled);
+    let live_line = live_lines.get(&run.run_id).map(str::to_owned).or_else(|| {
+        newest_agent
+            .filter(|agent| run_uses_claude_tool_line(run, agent))
+            .and_then(|agent| {
+                agent
+                    .last_event_kind
+                    .as_deref()
+                    .map(|event_kind| (agent, event_kind))
+            })
+            .map(|(agent, event_kind)| {
+                let mut line = safe_text(event_kind);
+                if let Some(tool_name) = agent.last_tool_name.as_deref() {
+                    line.push_str(": ");
+                    line.push_str(&safe_text(tool_name));
+                }
+                line
+            })
+    });
+    if !run.state.is_terminal()
+        && let Some(live_line) = live_line
+    {
+        label.push_str(" — ");
+        label.push_str(&live_line);
+    }
+    append_run_duration(&mut label, run, now_ms);
+    label
+}
+
+fn run_row_head(model: &DomainModel, run: &TaskRun, stalled: bool) -> String {
+    let mut label = status_glyph(run.state, stalled).to_owned();
+    label.push(' ');
+    let run_kind = projection::run_kind_label(model, run);
+    label.push_str(&run_kind);
+    let subject = if is_codex_worker(model, run) {
+        String::new()
+    } else {
+        run.subject
+            .as_deref()
+            .map_or_else(|| run_subject_fallback(run), safe_text)
+    };
     if !subject.is_empty() {
         label.push(' ');
         label.push_str(&subject);
     }
+    label
+}
 
-    if !run.state.is_terminal()
-        && let Some(event_kind) = newest_agent.and_then(|agent| agent.last_event_kind.as_deref())
-    {
-        label.push_str(" — ");
-        label.push_str(&safe_text(event_kind));
-        if let Some(tool_name) = newest_agent.and_then(|agent| agent.last_tool_name.as_deref()) {
-            label.push_str(": ");
-            label.push_str(&safe_text(tool_name));
-        }
-    }
-    if let Some(model_id) = newest_agent.and_then(|agent| agent.model_id.as_deref()) {
-        label.push_str(" [model:");
-        label.push_str(&safe_text(model_id));
-        label.push(']');
-    }
-    label.push_str(&format!(" [{}]", task_state_label(run.state)));
-
+fn append_run_duration(label: &mut String, run: &TaskRun, now_ms: i64) {
     let elapsed_ms = run.created_at_ms.and_then(|created_at_ms| {
         let end_ms = if run.state.is_terminal() {
             run.finished_at_ms?
@@ -1532,12 +2140,51 @@ fn run_row_label_with_agent(
         label.push_str(" · ");
         label.push_str(&format_duration(elapsed_ms));
     }
-    label
+}
+
+fn run_uses_claude_tool_line(run: &TaskRun, agent: &AgentNode) -> bool {
+    match &run.key {
+        RunKey::Controller(name) => name.starts_with("hook:claude-code:"),
+        RunKey::Native { provider, .. } | RunKey::NativePath { provider, .. } => {
+            *provider == Provider::Claude
+        }
+        RunKey::Provisional { .. } => agent.provider == Provider::Claude,
+    }
+}
+
+fn is_codex_worker(model: &DomainModel, run: &TaskRun) -> bool {
+    matches!(
+        &run.key,
+        RunKey::Native {
+            provider: Provider::Codex,
+            ..
+        } | RunKey::NativePath {
+            provider: Provider::Codex,
+            ..
+        }
+    ) && model
+        .execution_edges()
+        .any(|edge| edge.child_run_id == run.run_id)
+}
+
+fn status_glyph(state: TaskState, stalled: bool) -> &'static str {
+    if stalled && !state.is_terminal() {
+        return "⚠";
+    }
+    match state {
+        TaskState::Running | TaskState::Blocked => "●",
+        TaskState::Completed => "✓",
+        TaskState::Failed | TaskState::Cancelled => "✗",
+        TaskState::Queued | TaskState::EndedUnknown => "◌",
+    }
 }
 
 fn run_subject_fallback(run: &TaskRun) -> String {
     match &run.key {
-        RunKey::Controller(_) => run_name(run),
+        RunKey::Controller(name) => name
+            .strip_prefix("hook:claude-code:")
+            .filter(|suffix| !suffix.contains(':'))
+            .map_or_else(|| run_name(run), safe_text),
         RunKey::Native { sid, .. } => safe_text(sid),
         RunKey::NativePath { .. } => run.run_id.to_string(),
         RunKey::Provisional {
@@ -1603,18 +2250,6 @@ fn provider_label(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "Claude",
         Provider::Codex => "Codex",
-    }
-}
-
-fn task_state_label(state: TaskState) -> &'static str {
-    match state {
-        TaskState::Queued => "queued",
-        TaskState::Running => "running",
-        TaskState::Blocked => "blocked",
-        TaskState::Completed => "completed",
-        TaskState::Failed => "failed",
-        TaskState::Cancelled => "cancelled",
-        TaskState::EndedUnknown => "ended_unknown",
     }
 }
 
@@ -1689,7 +2324,7 @@ mod tests {
     };
     use crate::performance::{PerformanceDegradationReason, PerformanceSnapshot};
     use crate::store::writer::PersistenceStatus;
-    use crate::tui::app::{App, AppState, HeaderInputs, SystemClock, TuiSetup};
+    use crate::tui::app::{App, AppState, Clock, HeaderInputs, SystemClock, TuiSetup};
 
     fn run_id(value: &str) -> RunId {
         RunId::parse(value).unwrap()
@@ -1803,6 +2438,119 @@ mod tests {
     }
 
     #[test]
+    fn glyph_reflects_state_and_stall() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let live_lines = LiveLineReadModel::default();
+        for (state, stalled, glyph) in [
+            (TaskState::Running, false, "●"),
+            (TaskState::Blocked, false, "●"),
+            (TaskState::Queued, false, "◌"),
+            (TaskState::Completed, false, "✓"),
+            (TaskState::Failed, false, "✗"),
+            (TaskState::Cancelled, false, "✗"),
+            (TaskState::EndedUnknown, false, "◌"),
+            (TaskState::Running, true, "⚠"),
+        ] {
+            let run = label_run(
+                run_id,
+                RunKey::Controller("hook:claude-code:session".to_owned()),
+                state,
+                None,
+                None,
+                Some("subject"),
+            );
+            let model = DomainModel::default();
+
+            assert_eq!(
+                run_row_label_with_agent(&model, &run, None, 1_000, &live_lines, stalled,),
+                format!("{glyph} claude-code subject")
+            );
+        }
+    }
+
+    #[test]
+    fn build_rows_marks_quiet_run_stalled() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let now_ms = SystemClock.now_ms();
+        let mut run = label_run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "quiet-session".to_owned(),
+            },
+            TaskState::Running,
+            None,
+            None,
+            Some("quiet work"),
+        );
+        run.updated_at_ms = Some(
+            now_ms
+                .saturating_sub(crate::activity::DEFAULT_STALL_WARN_MS)
+                .saturating_sub(1),
+        );
+        let mut model = DomainModel::default();
+        model.insert_task_run(run);
+        let (_sender, receiver) = watch::channel(Arc::new(model));
+        let app = App::new(receiver, HeaderInputs::default());
+
+        let row = build_rows(app.model(), app.state())
+            .into_iter()
+            .find(|row| row.key.run_id() == Some(run_id))
+            .expect("build_rows renders the quiet run");
+
+        assert!(
+            row.label.starts_with("⚠ "),
+            "quiet run did not render the stall glyph: {}",
+            row.label
+        );
+    }
+
+    #[test]
+    fn codex_worker_rows_have_no_subject() {
+        let root_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let worker_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let root = label_run(
+            root_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "root-session".to_owned(),
+            },
+            TaskState::Running,
+            None,
+            None,
+            Some("root subject"),
+        );
+        let worker = label_run(
+            worker_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "worker-session".to_owned(),
+            },
+            TaskState::Running,
+            None,
+            None,
+            Some("must not render"),
+        );
+        let mut model = DomainModel::default();
+        model.insert_task_run(root.clone());
+        model.insert_task_run(worker.clone());
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: root_id,
+            child_run_id: worker_id,
+        });
+        let live_lines = LiveLineReadModel::default();
+
+        assert_eq!(
+            run_row_label_with_agent(&model, &root, None, 0, &live_lines, false),
+            "● Codex root subject"
+        );
+        assert_eq!(
+            run_row_label_with_agent(&model, &worker, None, 0, &live_lines, false),
+            "● Codex"
+        );
+    }
+
+    #[test]
     fn summary_rows_group_all_runs_and_count_only_valid_terminal_durations() {
         let mut model = DomainModel::default();
         let fixtures = [
@@ -1885,92 +2633,149 @@ mod tests {
             ),
         ];
 
-        for (index, (id, key, state, created, finished, model_id)) in
-            fixtures.into_iter().enumerate()
-        {
+        for (id, key, state, created, finished, model_id) in fixtures {
             let run_id = run_id(id);
             model.insert_task_run(label_run(run_id, key, state, created, finished, None));
             if let Some(model_id) = model_id {
-                model.insert_agent_node(label_agent(
-                    &format!("agent-{index}"),
-                    run_id,
-                    Some(index as i64),
+                model.telemetry_entry(run_id, 0).accumulate(
+                    10,
+                    Some(model_id.to_owned()),
                     None,
                     None,
-                    Some(model_id),
-                ));
+                    false,
+                );
             }
         }
-        let first_run = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        model.insert_agent_node(label_agent(
-            "agent-older",
-            first_run,
-            Some(-1),
-            None,
-            None,
-            Some("model-b"),
-        ));
 
-        reset_newest_agent_scan_count();
-        let actual = summary_rows(&model, 123_456)
-            .into_iter()
+        let summary = projection::summary_projection(
+            &model,
+            &[],
+            None,
+            projection::SummaryScope::Session,
+            123_456,
+        );
+        let worker_kinds = summary
+            .worker_kinds
+            .iter()
             .map(|row| {
                 (
-                    row.worker_kind,
-                    row.model,
+                    row.label.clone(),
                     row.run_count,
                     row.live_count,
                     row.total_duration_ms,
                     row.mean_duration_ms,
+                    row.total_output_tokens,
                 )
             })
             .collect::<Vec<_>>();
-        assert_eq!(newest_agent_scan_count(), 1);
-
         assert_eq!(
-            actual,
+            worker_kinds,
             [
                 (
                     "claude-code".to_owned(),
-                    "model-a".to_owned(),
-                    3,
+                    4,
                     1,
-                    9_000,
-                    Some(9_000)
+                    16_000,
+                    Some(8_000),
+                    Some(40),
                 ),
-                (
-                    "Codex".to_owned(),
-                    "model-a".to_owned(),
-                    2,
-                    1,
-                    7_000,
-                    Some(7_000)
-                ),
-                (
-                    "Codex".to_owned(),
-                    "model-b".to_owned(),
-                    1,
-                    0,
-                    7_000,
-                    Some(7_000)
-                ),
-                (
-                    "claude-code".to_owned(),
-                    "model-b".to_owned(),
-                    1,
-                    0,
-                    7_000,
-                    Some(7_000)
-                ),
-                (
-                    "provisional".to_owned(),
-                    "unknown".to_owned(),
-                    1,
-                    0,
-                    0,
-                    None
-                ),
+                ("Codex".to_owned(), 3, 1, 14_000, Some(7_000), Some(30),),
+                ("provisional".to_owned(), 1, 0, 0, None, None,),
             ]
+        );
+        assert_eq!(
+            summary
+                .models
+                .iter()
+                .map(|row| (
+                    row.label.as_str(),
+                    row.run_count,
+                    row.total_duration_ms,
+                    row.total_output_tokens,
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("model-a", 5, 16_000, Some(50)),
+                ("model-b", 2, 14_000, Some(20)),
+                ("unknown", 1, 0, None),
+            ]
+        );
+        assert!(
+            summary
+                .worker_kinds
+                .iter()
+                .filter(|row| row.total_output_tokens.is_some())
+                .all(|row| row.mean_tokens_per_second.is_some())
+        );
+    }
+
+    #[test]
+    fn unattached_run_after_workspace_renders_honest_session_scope() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FB3");
+        let mut model = DomainModel::default();
+        model.insert_workspace(Workspace {
+            workspace_id: "preceding-workspace".to_owned(),
+        });
+        model.insert_task_run(label_run(
+            run_id,
+            RunKey::Controller("unattached".to_owned()),
+            TaskState::Running,
+            None,
+            None,
+            None,
+        ));
+        let selected = NodeKey::Run {
+            run_id,
+            pane_id: None,
+        };
+        let rows = vec![
+            TreeRow {
+                key: NodeKey::Workspace("preceding-workspace".to_owned()),
+                depth: 1,
+                label: "preceding-workspace".to_owned(),
+                prerequisites: Vec::new(),
+                dependents: Vec::new(),
+            },
+            TreeRow {
+                key: NodeKey::UnattachedGroup,
+                depth: 1,
+                label: "Unattached Task Runs".to_owned(),
+                prerequisites: Vec::new(),
+                dependents: Vec::new(),
+            },
+            TreeRow {
+                key: selected.clone(),
+                depth: 2,
+                label: "unattached".to_owned(),
+                prerequisites: Vec::new(),
+                dependents: Vec::new(),
+            },
+        ];
+
+        let summary = projection::summary_projection(
+            &model,
+            &rows,
+            Some(&selected),
+            projection::SummaryScope::SelectionWorkspace,
+            10,
+        );
+        let lines = summary_lines(
+            &model,
+            &rows,
+            Some(&selected),
+            projection::SummaryScope::SelectionWorkspace,
+            10,
+        );
+
+        assert_eq!(summary.workspace_id, None);
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("scope: session (selection has no workspace; w toggles scope mode)")
+        );
+        assert!(
+            lines
+                .first()
+                .is_some_and(|line| !line.starts_with("scope: workspace "))
         );
     }
 
@@ -1996,7 +2801,7 @@ mod tests {
                     Some("gpt-5.6-sol"),
                 )),
                 1_033_000,
-                "claude-code Implement I7 Task 2 wire tolerance — tool_use: Bash [model:gpt-5.6-sol] [running] · 17m03s",
+                "⚠ claude-code Implement I7 Task 2 wire tolerance — tool_use: Bash · 17m03s",
             ),
             (
                 label_run(
@@ -2009,7 +2814,7 @@ mod tests {
                 ),
                 None,
                 5_000,
-                "claude-code hook:claude-code:S:task:T [queued]",
+                "◌ claude-code hook:claude-code:S:task:T",
             ),
             (
                 label_run(
@@ -2029,7 +2834,7 @@ mod tests {
                     Some("gpt-terminal"),
                 )),
                 9_000_000,
-                "claude-code Finish work [model:gpt-terminal] [completed] · 1h01m",
+                "✓ claude-code Finish work · 1h01m",
             ),
             (
                 label_run(
@@ -2049,7 +2854,7 @@ mod tests {
                     None,
                 )),
                 5_000,
-                "claude-code No timing — message [running]",
+                "● claude-code No timing — message",
             ),
             (
                 label_run(
@@ -2062,7 +2867,7 @@ mod tests {
                 ),
                 None,
                 5_000,
-                "claude-code Clock skew [running]",
+                "● claude-code Clock skew",
             ),
         ];
 
@@ -2126,7 +2931,7 @@ mod tests {
         recency_model.insert_agent_node(newer);
         assert_eq!(
             run_row_label(&recency_model, &run, 1_000),
-            "claude-code Tie break — newer: Read [model:model-newer] [running]"
+            "● claude-code Tie break — newer: Read"
         );
 
         for agents in [
@@ -2141,7 +2946,7 @@ mod tests {
             for _ in 0..8 {
                 assert_eq!(
                     run_row_label(&tie_model, &run, 1_000),
-                    "claude-code Tie break — tie-high: Bash [model:model-high] [running]"
+                    "● claude-code Tie break — tie-high: Bash"
                 );
             }
         }
@@ -2224,12 +3029,12 @@ mod tests {
         });
 
         assert_eq!(
-            task_run_label(&model, &child, true, 10, None),
-            "claude-code Shared child [running] [shared] [dispatched by: Parent]"
+            task_run_label(&model, &child, true, 10, false),
+            "● claude-code Shared child [shared] [dispatched by: Parent]"
         );
         assert_eq!(
-            task_run_label(&model, &orphan, false, 10, None),
-            "codex Orphan [queued] [unlinked]"
+            task_run_label(&model, &orphan, false, 10, false),
+            "◌ codex Orphan [unlinked]"
         );
     }
 
@@ -2248,6 +3053,116 @@ mod tests {
     }
 
     #[test]
+    fn columns_shed_at_declared_thresholds() {
+        use MetricColumn::{Effort, Model, Time, Tok, TokPerSecond};
+
+        for (width, expected) in [
+            (usize::MAX, &[Model, Effort, Tok, TokPerSecond, Time][..]),
+            (120, &[Model, Effort, Tok, TokPerSecond, Time][..]),
+            (119, &[Effort, Tok, TokPerSecond, Time][..]),
+            (104, &[Effort, Tok, TokPerSecond, Time][..]),
+            (103, &[Tok, TokPerSecond, Time][..]),
+            (90, &[Tok, TokPerSecond, Time][..]),
+            (89, &[Tok, Time][..]),
+            (76, &[Tok, Time][..]),
+            (75, &[Time][..]),
+            (62, &[Time][..]),
+            (61, &[][..]),
+            (0, &[][..]),
+        ] {
+            assert_eq!(visible_metric_columns(width), expected, "width {width}");
+        }
+    }
+
+    #[test]
+    fn model_names_shorten_and_ellipsize() {
+        for (model, expected) in [
+            ("claude-fable-5", "fable-5"),
+            ("claude-3-5-sonnet-20241022", "3-5-sonnet"),
+            ("claude-sonnet-4-2025-01-01", "sonnet-4"),
+            ("gpt-4o-20240513", "gpt-4o"),
+            ("gpt4o20240513", "gpt4o"),
+            ("gpt-5.6-sol", "gpt-5.6-sol"),
+            ("gpt-5.6-terra", "gpt-5.6-te…"),
+            ("long-model-name", "long-model…"),
+        ] {
+            let formatted = format_model_value(Some(model));
+            assert_eq!(formatted, expected, "model {model}");
+            assert!(Span::raw(formatted.as_str()).width() <= 11);
+        }
+        assert_eq!(format_model_value(None), "—");
+        assert_eq!(
+            Span::raw(format_model_value(Some("gpt-5.6-terra"))).width(),
+            11
+        );
+    }
+
+    #[test]
+    fn effort_values_abbreviate_and_treat_empty_as_absent() {
+        assert_eq!(format_effort_value(Some("minimal")), "min");
+        assert_eq!(format_effort_value(Some("medium")), "med");
+        assert_eq!(format_effort_value(Some("xhigh")), "xhigh");
+        assert_eq!(format_effort_value(None), "—");
+        assert_eq!(format_effort_value(Some("")), "—");
+    }
+
+    #[test]
+    fn tok_output_only_and_mean_stable_across_completion() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let running = label_run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "telemetry".to_owned(),
+            },
+            TaskState::Running,
+            Some(0),
+            None,
+            Some("telemetry"),
+        );
+        let mut model = DomainModel::default();
+        model.telemetry_entry(run_id, 0).accumulate(
+            83,
+            Some("gpt-5.6-sol".to_owned()),
+            Some("xhigh".to_owned()),
+            None,
+            true,
+        );
+        let running_metrics = projection::run_metric_inputs(&model, &running);
+
+        assert_eq!(
+            format_metric_value(MetricColumn::Tok, &running_metrics, 10_000),
+            "83"
+        );
+        assert_eq!(
+            format_metric_value(MetricColumn::TokPerSecond, &running_metrics, 10_000),
+            "8.3/s"
+        );
+
+        let mut completed = running.clone();
+        completed.state = TaskState::Completed;
+        completed.finished_at_ms = Some(10_000);
+        let completed_metrics = projection::run_metric_inputs(&model, &completed);
+        assert_eq!(
+            format_metric_value(MetricColumn::TokPerSecond, &completed_metrics, 90_000),
+            "8.3/s",
+            "the cumulative mean must stop at the terminal timestamp"
+        );
+
+        let mut future_started = running_metrics.clone();
+        future_started.started_wall_ms = Some(10_001);
+        assert_eq!(
+            format_metric_value(MetricColumn::TokPerSecond, &future_started, 10_000),
+            "—"
+        );
+        future_started.started_wall_ms = Some(10_000);
+        assert_eq!(
+            format_metric_value(MetricColumn::TokPerSecond, &future_started, 10_000),
+            "—"
+        );
+    }
+
+    #[test]
     fn key_fallback_subject_does_not_repeat_native_or_provisional_worker_kind() {
         let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         for (key, expected) in [
@@ -2256,14 +3171,14 @@ mod tests {
                     provider: Provider::Codex,
                     sid: "native-session".to_owned(),
                 },
-                "Codex native-session [running]",
+                "● Codex native-session",
             ),
             (
                 RunKey::NativePath {
                     provider: Provider::Codex,
                     path: "/private/session.jsonl".to_owned(),
                 },
-                "Codex 01ARZ3NDEKTSV4RRFFQ69G5FAV [running]",
+                "● Codex 01ARZ3NDEKTSV4RRFFQ69G5FAV",
             ),
             (
                 RunKey::Provisional {
@@ -2271,11 +3186,11 @@ mod tests {
                     start_ms: 1,
                     seq: 2,
                 },
-                "provisional terminal:1:2 [running]",
+                "● provisional terminal:1:2",
             ),
             (
                 RunKey::Controller("hook:claude-code:S:task:T".to_owned()),
-                "claude-code hook:claude-code:S:task:T [running]",
+                "● claude-code hook:claude-code:S:task:T",
             ),
         ] {
             let run = label_run(run_id, key, TaskState::Running, None, None, None);
@@ -2326,7 +3241,58 @@ mod tests {
             ),
         ] {
             let run = label_run(run_id, key, TaskState::Running, None, None, None);
-            assert_eq!(worker_kind_label(&run), expected);
+            assert_eq!(projection::worker_kind_label(&run), expected);
+        }
+    }
+
+    #[test]
+    fn run_row_head_keeps_kind_for_every_current_run_class() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        for (key, expected_kind) in [
+            (
+                RunKey::Controller("hook:claude-code:root-session".to_owned()),
+                "claude-code",
+            ),
+            (
+                RunKey::Controller("hook:claude-code:root-session:agent:agent-7".to_owned()),
+                "claude-code",
+            ),
+            (
+                RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: "rollout".to_owned(),
+                },
+                "Codex",
+            ),
+            (
+                RunKey::Native {
+                    provider: Provider::Claude,
+                    sid: "session".to_owned(),
+                },
+                "Claude",
+            ),
+            (
+                RunKey::NativePath {
+                    provider: Provider::Codex,
+                    path: "/private/rollout.jsonl".to_owned(),
+                },
+                "Codex",
+            ),
+            (
+                RunKey::Provisional {
+                    terminal_id: "terminal".to_owned(),
+                    start_ms: 1,
+                    seq: 2,
+                },
+                "provisional",
+            ),
+        ] {
+            let run = label_run(run_id, key, TaskState::Running, None, None, Some("subject"));
+            let head = run_row_head(&DomainModel::default(), &run, false);
+            assert!(
+                head.starts_with(&format!("● {expected_kind}")),
+                "missing current kind {expected_kind}: {head}"
+            );
         }
     }
 
@@ -2529,8 +3495,8 @@ mod tests {
         assert_eq!(workspace_x, session_x + 4);
         assert_eq!(tab_x, workspace_x + 4);
         assert_eq!(pane_x, tab_x + 4);
-        assert_eq!(run_x, pane_x + 4);
-        assert_eq!(agent_x, run_x + 4);
+        assert_eq!(run_x, pane_x + 6);
+        assert_eq!(agent_x, run_x + 2);
     }
 
     #[test]
@@ -2624,6 +3590,143 @@ mod tests {
     }
 
     #[test]
+    fn compressed_tree_connector_prefixes_render_exact_shapes() {
+        assert_eq!(
+            tree_connector_prefixes_with_style(
+                &connector_fixture_rows(),
+                false,
+                TreeIndentStyle::Compressed,
+            ),
+            ["", "├─", "│ ├─", "│ │ └─", "│ └─", "└─", "  └─"]
+        );
+        assert_eq!(
+            tree_connector_prefixes_with_style(
+                &connector_fixture_rows(),
+                true,
+                TreeIndentStyle::Compressed,
+            ),
+            ["", "|-", "| |-", "| | `-", "| `-", "`-", "  `-"]
+        );
+    }
+
+    #[test]
+    fn clamped_tree_connector_prefixes_elide_leading_levels() {
+        let style = TreeIndentStyle::Clamped { max_levels: 2 };
+        assert_eq!(
+            tree_connector_prefixes_with_style(&connector_fixture_rows(), false, style),
+            ["", "├─", "│ ├─", "…│ └─", "│ └─", "└─", "  └─"]
+        );
+        assert_eq!(
+            tree_connector_prefixes_with_style(&connector_fixture_rows(), true, style),
+            ["", "|-", "| |-", "…| `-", "| `-", "`-", "  `-"]
+        );
+    }
+
+    #[test]
+    fn tree_indent_style_switches_at_exact_budget_boundaries() {
+        let max_depth = 4;
+        let rows = vec![TreeRow {
+            key: NodeKey::Session,
+            depth: max_depth,
+            label: "deep".to_owned(),
+            prerequisites: Vec::new(),
+            dependents: Vec::new(),
+        }];
+        let columns = &[MetricColumn::Time];
+        let fixed_width = metric_block_width(columns)
+            .saturating_add(1)
+            .saturating_add(TREE_SELECTION_MARKER_WIDTH)
+            .saturating_add(MIN_TREE_LABEL_WIDTH);
+        let normal_budget = max_depth * 4;
+        let compressed_budget = max_depth * 2;
+
+        assert_eq!(
+            tree_indent_style(&rows, fixed_width + normal_budget, columns),
+            TreeIndentStyle::Normal
+        );
+        assert_eq!(
+            tree_indent_style(&rows, fixed_width + normal_budget - 1, columns),
+            TreeIndentStyle::Compressed
+        );
+        assert_eq!(
+            tree_indent_style(&rows, fixed_width + compressed_budget, columns),
+            TreeIndentStyle::Compressed
+        );
+        assert_eq!(
+            tree_indent_style(&rows, fixed_width + compressed_budget - 1, columns),
+            TreeIndentStyle::Clamped { max_levels: 3 }
+        );
+    }
+
+    #[test]
+    fn deep_indent_compresses_when_narrow() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let run = label_run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "deep".to_owned(),
+            },
+            TaskState::Running,
+            Some(0),
+            None,
+            Some("deeply nested work"),
+        );
+        let mut model = DomainModel::default();
+        model.insert_task_run(run);
+        model.telemetry_entry(run_id, 0).accumulate(
+            83,
+            Some("gpt-5.6-sol".to_owned()),
+            Some("xhigh".to_owned()),
+            None,
+            true,
+        );
+        let rows = vec![TreeRow {
+            key: NodeKey::Run {
+                run_id,
+                pane_id: None,
+            },
+            depth: 12,
+            label: "● Codex deeply nested work".to_owned(),
+            prerequisites: Vec::new(),
+            dependents: Vec::new(),
+        }];
+        let width = 78;
+        let backend = TestBackend::new(width, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_tree(
+                    frame,
+                    Rect::new(0, 0, width, 3),
+                    &model,
+                    &rows,
+                    &AppState::default(),
+                    false,
+                    10_000,
+                );
+            })
+            .unwrap();
+        let rendered = buffer_rows(terminal.backend().buffer());
+        let row = rendered
+            .iter()
+            .find(|row| row.contains('●'))
+            .expect("the deeply nested status glyph remains visible");
+        let glyph_byte = row.find('●').unwrap();
+        let glyph_column = Span::raw(&row[..glyph_byte]).width();
+
+        assert_eq!(
+            glyph_column,
+            1 + TREE_SELECTION_MARKER_WIDTH + 12 * 2,
+            "compressed indent changed: {row}"
+        );
+        assert!(
+            row.contains("   83    10s"),
+            "metric columns missing: {row}"
+        );
+    }
+
+    #[test]
     fn execution_tree_row_depths_remain_unchanged() {
         let rows = build_rows(&populated_model(), &AppState::default());
         assert_eq!(
@@ -2706,15 +3809,15 @@ mod tests {
             "c clear",
         ];
         let compact = ["q:stop Top; agents continue", "detach:Top runs"];
-        assert_eq!(footer_line(140), full.join(" | "));
+        assert_eq!(footer_line(140, None), full.join(" | "));
         let without_clear = full[..full.len() - 1].join(" | ");
         assert_eq!(
-            footer_line(Span::raw(without_clear.as_str()).width()),
+            footer_line(Span::raw(without_clear.as_str()).width(), None),
             without_clear
         );
 
         for width in [100, 72, 69, 45, 27] {
-            let rendered = footer_line(width);
+            let rendered = footer_line(width, None);
             let expected_tier = if width >= 70 { &full[..] } else { &compact[..] };
             let pieces = rendered.split(" | ").collect::<Vec<_>>();
             assert_eq!(pieces, expected_tier[..pieces.len()], "width {width}");
@@ -2726,8 +3829,133 @@ mod tests {
     fn footer_preserves_mandated_floor() {
         const FLOOR: &str = "q:stop Top; agents continue";
         assert_eq!(Span::raw(FLOOR).width(), 27);
-        assert_eq!(footer_line(27), FLOOR);
-        assert_eq!(footer_line(26), truncate_to_width(FLOOR, 26));
+        assert_eq!(footer_line(27, None), FLOOR);
+        assert_eq!(footer_line(26, None), truncate_to_width(FLOOR, 26));
+    }
+
+    #[test]
+    fn committed_filter_indicator_persists_and_draft_overrides() {
+        let mut app = app(
+            DomainModel::default(),
+            ObservationQuality::Live,
+            "filter-footer",
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for character in "needle".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        for width in [48, 62, 76, 104, 160] {
+            let footer = render(&app, width, 18).pop().unwrap();
+            assert!(
+                footer.contains("filter:needle"),
+                "committed filter disappeared at width {width}: {footer}"
+            );
+            assert!(
+                !footer.contains("/ filter: needle"),
+                "width {width}: {footer}"
+            );
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let footer = render(&app, 104, 18).pop().unwrap();
+        assert!(footer.contains("/ filter: needlex"), "{footer}");
+        assert!(!footer.contains("filter:needle |"), "{footer}");
+    }
+
+    #[test]
+    fn header_fields_drop_in_declared_order_and_up_last() {
+        let model = populated_model();
+        let inputs = HeaderInputs::default();
+        let mut performance = inputs.performance.borrow().clone();
+        performance
+            .snapshot
+            .reasons
+            .insert(PerformanceDegradationReason::LivePanes);
+        let header_field_names = |available_width| {
+            let header = header_line(
+                160,
+                available_width,
+                &model,
+                ObservationQuality::Live,
+                &performance,
+                &inputs,
+                3_661_000,
+            )
+            .spans
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+            header
+                .split(" | ")
+                .map(|field| {
+                    if field == "LIVE" {
+                        "quality"
+                    } else {
+                        field.split_once(':').map_or(field, |(prefix, _)| prefix)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+
+        for (width, expected) in [
+            (
+                76,
+                "host | session | up | workspaces | quality | lag | perf | sources",
+            ),
+            (
+                75,
+                "host | session | up | workspaces | quality | lag | perf",
+            ),
+            (63, "host | session | up | workspaces | quality | perf"),
+            (55, "host | session | up | quality | perf"),
+            (40, "session | up | quality | perf"),
+            (31, "session | up | quality"),
+            (22, "session | quality"),
+        ] {
+            assert_eq!(header_field_names(width), expected, "width {width}");
+        }
+    }
+
+    #[test]
+    fn up_field_shrinks_and_drops_last() {
+        let model = populated_model();
+        let inputs = HeaderInputs::default();
+        let performance = inputs.performance.borrow().clone();
+        let render_header_text = |available_width| {
+            header_line(
+                160,
+                available_width,
+                &model,
+                ObservationQuality::Live,
+                &performance,
+                &inputs,
+                3_661_000,
+            )
+            .spans
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>()
+        };
+
+        let moderate = render_header_text(70);
+        assert!(moderate.contains("up:"), "{moderate}");
+        assert!(!moderate.contains("up:01:01:01"), "{moderate}");
+
+        let after_another_drop = render_header_text(58);
+        assert!(after_another_drop.contains("up:"), "{after_another_drop}");
+        assert!(
+            !after_another_drop.contains("sources:"),
+            "{after_another_drop}"
+        );
+
+        let extreme = render_header_text(18);
+        assert!(!extreme.contains("up:"), "{extreme}");
+        assert!(extreme.contains("session:"), "{extreme}");
+        assert!(extreme.contains("LIVE"), "{extreme}");
     }
 
     #[test]
@@ -3019,6 +4247,391 @@ mod tests {
         assert_eq!(hosting_pane, Some("pane-new"));
     }
 
+    fn placement_model(pane_ids: &[&str]) -> DomainModel {
+        let mut model = DomainModel::default();
+        model.insert_workspace(Workspace {
+            workspace_id: "workspace".to_owned(),
+        });
+        model.insert_tab(Tab {
+            tab_id: "tab".to_owned(),
+            workspace_id: "workspace".to_owned(),
+            label: None,
+        });
+        for (index, pane_id) in pane_ids.iter().enumerate() {
+            model.insert_pane(Pane {
+                pane_id: (*pane_id).to_owned(),
+                workspace_id: "workspace".to_owned(),
+                tab_id: "tab".to_owned(),
+                terminal_id: format!("terminal-{pane_id}"),
+                display_name: None,
+            });
+            model.set_pane_ordinal((*pane_id).to_owned(), DisplayOrdinal::new(index as i64 + 1));
+        }
+        model
+    }
+
+    fn insert_placement_run(model: &mut DomainModel, run_id: RunId, label: &str, ordinal: i64) {
+        model.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::Controller(label.to_owned()),
+            display_ordinal: DisplayOrdinal::new(ordinal),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+    }
+
+    fn insert_placement_execution(
+        model: &mut DomainModel,
+        run_id: RunId,
+        execution_id: &str,
+        pane_id: &str,
+        state: ExecState,
+    ) {
+        model.insert_execution(Execution {
+            execution_id: execution_id.to_owned(),
+            pane_id: pane_id.to_owned(),
+            terminal_id: format!("terminal-{pane_id}"),
+            task_run_id: run_id,
+            state,
+        });
+    }
+
+    fn only_run_row(rows: &[TreeRow], run_id: RunId) -> &TreeRow {
+        let matches = rows
+            .iter()
+            .filter(|row| row.key.run_id() == Some(run_id))
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "expected exactly one row for {run_id}");
+        matches[0]
+    }
+
+    #[test]
+    fn headless_child_nests_under_dispatch_parent() {
+        let parent = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let child = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let mut model = placement_model(&["pane-parent"]);
+        insert_placement_run(&mut model, parent, "parent", 1);
+        insert_placement_run(&mut model, child, "child", 2);
+        insert_placement_execution(
+            &mut model,
+            parent,
+            "parent-execution",
+            "pane-parent",
+            ExecState::Working,
+        );
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: parent,
+            child_run_id: child,
+        });
+
+        let newest_agents = newest_agent_nodes(&model);
+        let rows = build_tree_rows(&model, &AppState::default(), &newest_agents);
+        let parent_row = only_run_row(&rows, parent);
+        let child_row = only_run_row(&rows, child);
+        let parent_index = rows.iter().position(|row| row == parent_row).unwrap();
+        let child_index = rows.iter().position(|row| row == child_row).unwrap();
+
+        assert_eq!(parent_row.depth, 4);
+        assert_eq!(child_row.depth, 5);
+        assert_eq!(
+            child_row.key,
+            NodeKey::Run {
+                run_id: child,
+                pane_id: Some("pane-parent".to_owned()),
+            }
+        );
+        assert!(parent_index < child_index);
+        assert!(!child_row.label.contains("[dispatched by:"));
+        assert!(rows.iter().all(|row| row.key != NodeKey::UnattachedGroup));
+    }
+
+    #[test]
+    fn shared_parent_renders_nested_descendants_once() {
+        let parent = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let child = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let mut model = placement_model(&["pane-first", "pane-second"]);
+        insert_placement_run(&mut model, parent, "parent", 1);
+        insert_placement_run(&mut model, child, "child", 2);
+        for pane_id in ["pane-second", "pane-first"] {
+            insert_placement_execution(
+                &mut model,
+                parent,
+                &format!("parent-execution-{pane_id}"),
+                pane_id,
+                ExecState::Working,
+            );
+        }
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: parent,
+            child_run_id: child,
+        });
+
+        let newest_agents = newest_agent_nodes(&model);
+        let rows = build_tree_rows(&model, &AppState::default(), &newest_agents);
+        let parent_rows = rows
+            .iter()
+            .filter(|row| row.key.run_id() == Some(parent))
+            .collect::<Vec<_>>();
+        let child_rows = rows
+            .iter()
+            .filter(|row| row.key.run_id() == Some(child))
+            .collect::<Vec<_>>();
+
+        assert_eq!(parent_rows.len(), 2);
+        assert!(parent_rows.iter().all(|row| row.label.contains("[shared]")));
+        assert_eq!(child_rows.len(), 1);
+        assert_eq!(
+            child_rows[0].key,
+            NodeKey::Run {
+                run_id: child,
+                pane_id: Some("pane-first".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn ended_exec_pane_fallback_still_wins_over_parent() {
+        let parent = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let ended_child = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let headless_grandchild = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        let mut model = placement_model(&["pane-parent", "pane-ended"]);
+        insert_placement_run(&mut model, parent, "parent", 1);
+        insert_placement_run(&mut model, ended_child, "ended-child", 2);
+        insert_placement_run(&mut model, headless_grandchild, "headless-grandchild", 3);
+        insert_placement_execution(
+            &mut model,
+            parent,
+            "parent-execution",
+            "pane-parent",
+            ExecState::Working,
+        );
+        insert_placement_execution(
+            &mut model,
+            ended_child,
+            "ended-child-execution",
+            "pane-ended",
+            ExecState::Ended,
+        );
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: parent,
+            child_run_id: ended_child,
+        });
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: ended_child,
+            child_run_id: headless_grandchild,
+        });
+
+        let newest_agents = newest_agent_nodes(&model);
+        let rows = build_tree_rows(&model, &AppState::default(), &newest_agents);
+        let ended_row = only_run_row(&rows, ended_child);
+        let grandchild_row = only_run_row(&rows, headless_grandchild);
+
+        assert_eq!(ended_row.depth, 4);
+        assert_eq!(
+            ended_row.key,
+            NodeKey::Run {
+                run_id: ended_child,
+                pane_id: Some("pane-ended".to_owned()),
+            }
+        );
+        assert!(ended_row.label.contains("[dispatched by: parent]"));
+        assert_eq!(grandchild_row.depth, 5);
+        assert_eq!(
+            grandchild_row.key,
+            NodeKey::Run {
+                run_id: headless_grandchild,
+                pane_id: Some("pane-ended".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn three_level_chain_renders() {
+        let root = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let child = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let grandchild = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        let mut model = placement_model(&["pane-root"]);
+        for (run_id, label, ordinal) in [
+            (root, "root", 1),
+            (child, "child", 2),
+            (grandchild, "grandchild", 3),
+        ] {
+            insert_placement_run(&mut model, run_id, label, ordinal);
+        }
+        insert_placement_execution(
+            &mut model,
+            root,
+            "root-execution",
+            "pane-root",
+            ExecState::Working,
+        );
+        for (parent_run_id, child_run_id) in [(root, child), (child, grandchild)] {
+            model.insert_execution_edge(ExecutionEdge {
+                parent_run_id,
+                child_run_id,
+            });
+        }
+
+        let newest_agents = newest_agent_nodes(&model);
+        let rows = build_tree_rows(&model, &AppState::default(), &newest_agents);
+        let run_rows = rows
+            .iter()
+            .filter(|row| row.key.run_id().is_some())
+            .collect::<Vec<_>>();
+
+        assert_eq!(run_rows.len(), 3);
+        assert_eq!(
+            run_rows
+                .iter()
+                .map(|row| (row.key.run_id().unwrap(), row.depth))
+                .collect::<Vec<_>>(),
+            [(root, 4), (child, 5), (grandchild, 6)]
+        );
+        assert!(run_rows.iter().all(|row| {
+            matches!(
+                &row.key,
+                NodeKey::Run {
+                    pane_id: Some(pane_id),
+                    ..
+                } if pane_id == "pane-root"
+            )
+        }));
+    }
+
+    #[test]
+    fn hidden_parent_children_fall_to_unattached() {
+        let root = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let hidden_middle = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let visible_grandchild = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        let mut model = placement_model(&["pane-root"]);
+        insert_placement_run(&mut model, root, "root", 1);
+        model.insert_task_run(TaskRun {
+            run_id: hidden_middle,
+            key: RunKey::Controller("hidden-middle".to_owned()),
+            display_ordinal: DisplayOrdinal::new(2),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: Some(10),
+        });
+        insert_placement_run(&mut model, visible_grandchild, "visible-grandchild", 3);
+        insert_placement_execution(
+            &mut model,
+            root,
+            "root-execution",
+            "pane-root",
+            ExecState::Working,
+        );
+        for (parent_run_id, child_run_id) in
+            [(root, hidden_middle), (hidden_middle, visible_grandchild)]
+        {
+            model.insert_execution_edge(ExecutionEdge {
+                parent_run_id,
+                child_run_id,
+            });
+        }
+
+        let rows = build_uncollapsed_rows(&model, &AppState::default());
+        assert!(
+            rows.iter()
+                .all(|row| row.key.run_id() != Some(hidden_middle))
+        );
+        let grandchild_row = only_run_row(&rows, visible_grandchild);
+        assert_eq!(grandchild_row.depth, 2);
+        assert_eq!(
+            grandchild_row.key,
+            NodeKey::Run {
+                run_id: visible_grandchild,
+                pane_id: None,
+            }
+        );
+        assert!(!grandchild_row.label.contains("[dispatched by:"));
+        let unattached_index = rows
+            .iter()
+            .position(|row| row.key == NodeKey::UnattachedGroup)
+            .unwrap();
+        let grandchild_index = rows.iter().position(|row| row == grandchild_row).unwrap();
+        assert!(unattached_index < grandchild_index);
+    }
+
+    #[test]
+    fn cycle_bails_to_unattached() {
+        let first = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let second = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let mut model = placement_model(&[]);
+        insert_placement_run(&mut model, first, "first", 2);
+        insert_placement_run(&mut model, second, "second", 1);
+        for (parent_run_id, child_run_id) in [(first, second), (second, first)] {
+            model.insert_execution_edge(ExecutionEdge {
+                parent_run_id,
+                child_run_id,
+            });
+        }
+
+        let rows = build_uncollapsed_rows(&model, &AppState::default());
+        let run_rows = rows
+            .iter()
+            .filter(|row| row.key.run_id().is_some())
+            .collect::<Vec<_>>();
+
+        assert_eq!(run_rows.len(), 2);
+        assert_eq!(
+            run_rows
+                .iter()
+                .map(|row| (row.key.run_id().unwrap(), row.depth))
+                .collect::<Vec<_>>(),
+            [(second, 2), (first, 2)]
+        );
+        assert!(run_rows.iter().all(|row| {
+            matches!(row.key, NodeKey::Run { pane_id: None, .. })
+                && !row.label.contains("[dispatched by:")
+        }));
+    }
+
+    #[test]
+    fn sibling_order_is_dispatch_order() {
+        let parent = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let run_id_first = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let dispatch_first = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        let mut model = placement_model(&["pane-parent"]);
+        insert_placement_run(&mut model, parent, "parent", 1);
+        insert_placement_run(&mut model, run_id_first, "run-id-first", 3);
+        insert_placement_run(&mut model, dispatch_first, "dispatch-first", 2);
+        insert_placement_execution(
+            &mut model,
+            parent,
+            "parent-execution",
+            "pane-parent",
+            ExecState::Working,
+        );
+        for child_run_id in [run_id_first, dispatch_first] {
+            model.insert_execution_edge(ExecutionEdge {
+                parent_run_id: parent,
+                child_run_id,
+            });
+        }
+
+        let newest_agents = newest_agent_nodes(&model);
+        let rows = build_tree_rows(&model, &AppState::default(), &newest_agents);
+        let run_rows = rows
+            .iter()
+            .filter_map(|row| row.key.run_id().map(|run_id| (run_id, row.depth)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            run_rows,
+            [(parent, 4), (dispatch_first, 5), (run_id_first, 5),]
+        );
+    }
+
     #[test]
     fn agent_rows_follow_persisted_ordinals_and_render_recursive_parentage() {
         let mut model = populated_model();
@@ -3250,8 +4863,8 @@ mod tests {
         assert!(!dependent_columns[2].contains("前提"));
 
         let initial_activity = rows.iter().find(|row| row.contains("Selected:")).unwrap();
-        assert!(initial_activity.contains("Selected: 依存先🙂with-a-long-tail"));
-        assert!(!initial_activity.contains("Selected: 前提🙂"));
+        assert!(initial_activity.contains("Selected: ● 依存先🙂with-a-long-tail"));
+        assert!(!initial_activity.contains("Selected: ● 前提🙂"));
 
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(
@@ -3266,8 +4879,8 @@ mod tests {
             .iter()
             .find(|row| row.contains("Selected:"))
             .unwrap();
-        assert!(moved_activity.contains("Selected: 前提🙂"));
-        assert!(!moved_activity.contains("Selected: 依存先"));
+        assert!(moved_activity.contains("Selected: ● 前提🙂"));
+        assert!(!moved_activity.contains("Selected: ● 依存先"));
 
         let minimum_rows = render(&app, 48, 18);
         let screen = minimum_rows.join("\n");
@@ -3277,7 +4890,7 @@ mod tests {
         assert!(screen.contains("Prereqs"));
         assert!(screen.contains("Dependents"));
         assert!(screen.contains("前提"));
-        assert!(screen.contains("Selected: 前提"));
+        assert!(screen.contains("Selected: ● 前提"));
         for row in &minimum_rows {
             assert!(
                 Line::raw(row.as_str()).width() <= 48,
@@ -3394,6 +5007,7 @@ mod tests {
                 persistence_counters: PersistenceCounters::default(),
                 controller_counters: ControllerCounterSnapshot::default(),
                 enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
+                provider_counters: crate::diagnostics::ProviderCounterSnapshot::default(),
                 source_coverage: Vec::new(),
                 dangling_announcement_components: 0,
                 first_failure_log: OccurrenceLogStatus::NotAttempted,

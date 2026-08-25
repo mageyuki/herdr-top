@@ -791,6 +791,11 @@ fn merge_in_memory(
         aliases.push(task_run.key.clone());
     }
 
+    // The identity proof makes this fold double-count-safe: there is one telemetry key per
+    // scope, the lane is the sole Telemetry emitter, its (scope, sample_id) deduplication lasts
+    // for the process lifetime, and merged runs have disjoint ScopeKeys.
+    model.fold_telemetry(survivor, absorbed);
+    model.fold_run_kind(survivor, absorbed);
     model.remove_task_run_record(&absorbed);
     for execution in model.executions_mut() {
         if execution.task_run_id == absorbed {
@@ -897,6 +902,143 @@ mod tests {
         assert_eq!(persisted.created_at_ms, 100);
         assert_eq!(persisted.updated_at_ms, 2_000);
         assert_eq!(persisted.finished_at_ms, None);
+    }
+
+    #[test]
+    fn controller_native_merge_rekeys_lane_telemetry_without_a_phantom_entry() {
+        let mut model = DomainModel::default();
+        let survivor = insert_run(
+            &mut model,
+            RunKey::Controller("controller-survivor".to_owned()),
+            1,
+        );
+        let absorbed = insert_run(&mut model, native(Provider::Codex, "lane-rollout"), 2);
+        model.telemetry_entry(absorbed, 1_100).accumulate(
+            17,
+            Some("gpt-5.6-terra".to_owned()),
+            Some("high".to_owned()),
+            None,
+            true,
+        );
+        model.telemetry_entry(absorbed, 1_100).accumulate(
+            25,
+            Some("gpt-5.6-sol".to_owned()),
+            Some("xhigh".to_owned()),
+            None,
+            true,
+        );
+
+        let plan = plan_binding(
+            &model,
+            &BindingEvidence::ControllerNativeSession {
+                controller_run: survivor,
+                provider: Provider::Codex,
+                sid: "lane-rollout".to_owned(),
+            },
+        );
+        assert_eq!(plan, BindingPlan::Merge { survivor, absorbed });
+        apply_binding_plan_at(&mut model, plan, 2_000).unwrap();
+
+        assert_eq!(
+            model.telemetry(&survivor).map(|telemetry| (
+                telemetry.output_tokens,
+                telemetry.started_wall_ms,
+                telemetry.model.as_deref(),
+                telemetry.effort.as_deref(),
+                telemetry.per_turn.len(),
+            )),
+            Some((42, 1_100, Some("gpt-5.6-sol"), Some("xhigh"), 2))
+        );
+        assert!(model.telemetry(&absorbed).is_none());
+        assert_eq!(
+            model
+                .telemetry_entries()
+                .map(|(run_id, _)| *run_id)
+                .collect::<Vec<_>>(),
+            vec![survivor],
+            "the absorbed RunId must not survive as a phantom telemetry entry"
+        );
+    }
+
+    #[test]
+    fn merge_telemetry_fold_keeps_canonical_attribution_with_absorbed_fallbacks() {
+        let mut model = DomainModel::default();
+        let survivor = insert_run(
+            &mut model,
+            RunKey::Controller("controller-survivor".to_owned()),
+            1,
+        );
+        let absorbed = insert_run(&mut model, native(Provider::Codex, "lane-rollout"), 2);
+        model.telemetry_entry(survivor, 1_200).accumulate(
+            u64::MAX - 10,
+            Some("controller-model".to_owned()),
+            None,
+            None,
+            true,
+        );
+        model.telemetry_entry(absorbed, 1_100).accumulate(
+            17,
+            Some("controller-model".to_owned()),
+            None,
+            None,
+            true,
+        );
+        model.telemetry_entry(absorbed, 1_150).accumulate(
+            25,
+            Some("gpt-5.6-sol".to_owned()),
+            Some("xhigh".to_owned()),
+            None,
+            true,
+        );
+
+        apply_binding_plan_at(&mut model, BindingPlan::Merge { survivor, absorbed }, 2_000)
+            .unwrap();
+
+        let telemetry = model.telemetry(&survivor).unwrap();
+        assert_eq!(telemetry.output_tokens, u64::MAX);
+        assert_eq!(telemetry.started_wall_ms, 1_100);
+        assert_eq!(telemetry.model.as_deref(), Some("controller-model"));
+        assert_eq!(telemetry.effort.as_deref(), Some("xhigh"));
+        assert_eq!(telemetry.per_turn.len(), 2);
+        assert_eq!(
+            telemetry
+                .per_turn
+                .iter()
+                .map(|attribution| (attribution.model.as_deref(), attribution.effort.as_deref(),))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("controller-model"), None),
+                (Some("gpt-5.6-sol"), Some("xhigh")),
+            ],
+            "the identical attribution at the fold boundary must stay coalesced"
+        );
+        assert!(model.telemetry(&absorbed).is_none());
+    }
+
+    #[test]
+    fn merge_run_kind_keeps_canonical_value_or_adopts_absorbed_value() {
+        for (canonical_kind, expected) in [
+            (Some("canonical-kind"), "canonical-kind"),
+            (None, "absorbed-kind"),
+        ] {
+            let mut model = DomainModel::default();
+            let survivor = insert_run(
+                &mut model,
+                RunKey::Controller("controller-survivor".to_owned()),
+                1,
+            );
+            let absorbed = insert_run(&mut model, native(Provider::Codex, "lane-rollout"), 2);
+            if let Some(kind) = canonical_kind {
+                model.set_run_kind(survivor, kind.to_owned());
+            }
+            model.set_run_kind(absorbed, "absorbed-kind".to_owned());
+
+            apply_binding_plan_at(&mut model, BindingPlan::Merge { survivor, absorbed }, 2_000)
+                .unwrap();
+
+            assert_eq!(model.run_kind(&survivor), Some(expected));
+            assert_eq!(model.run_kind(&absorbed), None);
+        }
     }
 
     #[test]

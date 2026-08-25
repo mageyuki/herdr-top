@@ -23,6 +23,10 @@ use herdr_top::herdr::wire;
 use herdr_top::hook_adapter::{self, HookPayload};
 use herdr_top::lockfile::{self, LockError, OwnerRecord, StateRoot};
 use herdr_top::model::OperatorCommand;
+use herdr_top::provider::lane::{
+    LogLaneConfig, parse_backfill_window_ms, parse_complete_grace_ms, parse_ghost_visibility_ms,
+    parse_headless_inactivity_ms, parse_stall_warn_ms,
+};
 use herdr_top::rendezvous::{self, RvError};
 use herdr_top::session_key::{self, ResolvedSession, SessionKeyError};
 use herdr_top::store::{self, StoreError, WriterError};
@@ -385,6 +389,29 @@ async fn run_monitor(cli: &Cli, plugin_state_dir: Option<&OsStr>) -> Result<(), 
     let resolved = resolve_session(cli)?;
     let root = lockfile::state_root(resolved.session_key())?;
     let occurrence_sink = initialize_tracing(&root)?;
+    let backfill_window_ms =
+        parse_backfill_window_ms(env::var_os("HERDR_TOP_BACKFILL_WINDOW_MS").as_deref());
+    let complete_grace_ms =
+        parse_complete_grace_ms(env::var_os("HERDR_TOP_COMPLETE_GRACE_MS").as_deref());
+    let headless_inactivity_ms =
+        parse_headless_inactivity_ms(env::var_os("HERDR_TOP_HEADLESS_INACTIVITY_MS").as_deref());
+    let stall_warn_ms = parse_stall_warn_ms(env::var_os("HERDR_TOP_STALL_WARN_MS").as_deref());
+    let ghost_visibility_ms =
+        parse_ghost_visibility_ms(env::var_os("HERDR_TOP_GHOST_VISIBILITY_MS").as_deref());
+    herdr_top::activity::configure_display_timing(stall_warn_ms, ghost_visibility_ms);
+    tracing::info!(
+        backfill_window_ms,
+        complete_grace_ms,
+        headless_inactivity_ms,
+        stall_warn_ms,
+        ghost_visibility_ms,
+        "resolved provider log lane startup configuration"
+    );
+    let log_lane_config = LogLaneConfig {
+        backfill_window_ms,
+        complete_grace_ms,
+        headless_inactivity_ms,
+    };
     let (owner_lock, breadcrumb_status) =
         acquire_monitor_lock_with_plugin_dir(&root, plugin_state_dir)?;
     if let BreadcrumbLaunchStatus::Failed(error) = breadcrumb_status {
@@ -425,6 +452,8 @@ async fn run_monitor(cli: &Cli, plugin_state_dir: Option<&OsStr>) -> Result<(), 
     let store = store::open_writer(&root)?;
     let restored = store.load_restored_state()?;
     let restored_operator = store.load_restored_operator_state()?;
+    let terminal_event_sources = store.terminal_event_sources()?;
+    let non_lane_task_state_runs = store.non_lane_task_state_runs()?;
     let (lifecycle, writer) = store::spawn_writer(store)?;
     let session_name = resolved.session_key().name().to_owned();
     let (operator_commands, operator_command_receiver) =
@@ -439,6 +468,9 @@ async fn run_monitor(cli: &Cli, plugin_state_dir: Option<&OsStr>) -> Result<(), 
             controller_coverage,
             occurrence_sink,
             restored_operator,
+            terminal_event_sources,
+            non_lane_task_state_runs,
+            log_lane_config,
             operator_command_receiver,
         )
         .await

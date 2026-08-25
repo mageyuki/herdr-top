@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -80,6 +80,107 @@ impl TaskRun {
         }
     }
 }
+
+// These transient-only types intentionally omit serde derives. That compile-enforces the
+// never-persisted invariant if DomainModel ever gains a serialization derive.
+/// One model/effort/sandbox attribution observed for a Codex turn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TurnAttr {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub sandbox: Option<String>,
+}
+
+/// Provider-reported numeric token families beyond the output-token total.
+///
+/// Claude `cache_read_input_tokens` and Codex `cached_input_tokens` map to
+/// `cached_input_tokens`; Claude `cache_creation_input_tokens` and Codex
+/// `cache_write_input_tokens` map to `cache_write_input_tokens`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TokenBreakdown {
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub cache_write_input_tokens: Option<u64>,
+    pub reasoning_output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub context_window: Option<u64>,
+}
+
+impl TokenBreakdown {
+    pub(crate) fn accumulate(&mut self, sample: Self) {
+        accumulate_reported(&mut self.input_tokens, sample.input_tokens);
+        accumulate_reported(&mut self.cached_input_tokens, sample.cached_input_tokens);
+        accumulate_reported(
+            &mut self.cache_write_input_tokens,
+            sample.cache_write_input_tokens,
+        );
+        accumulate_reported(
+            &mut self.reasoning_output_tokens,
+            sample.reasoning_output_tokens,
+        );
+        accumulate_reported(&mut self.total_tokens, sample.total_tokens);
+        if sample.context_window.is_some() {
+            // A context window is a gauge: the last reported value replaces the prior value.
+            self.context_window = sample.context_window;
+        }
+    }
+}
+
+fn accumulate_reported(slot: &mut Option<u64>, sample: Option<u64>) {
+    if let Some(value) = sample {
+        *slot = Some(slot.unwrap_or(0).saturating_add(value));
+    }
+}
+
+/// Transient provider telemetry for one task run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunTelemetry {
+    pub output_tokens: u64,
+    pub token_breakdown: TokenBreakdown,
+    pub started_wall_ms: i64,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub sandbox: Option<String>,
+    pub per_turn: Vec<TurnAttr>,
+}
+
+impl RunTelemetry {
+    pub(crate) fn accumulate(
+        &mut self,
+        output_tokens: u64,
+        model: Option<String>,
+        effort: Option<String>,
+        sandbox: Option<String>,
+        retain_turn: bool,
+    ) {
+        self.output_tokens = self.output_tokens.saturating_add(output_tokens);
+        if model.is_none() && effort.is_none() && sandbox.is_none() {
+            return;
+        }
+
+        let attribution = TurnAttr {
+            model,
+            effort,
+            sandbox,
+        };
+        self.model.clone_from(&attribution.model);
+        self.effort.clone_from(&attribution.effort);
+        self.sandbox.clone_from(&attribution.sandbox);
+        // Telemetry carries attribution but no turn ID. Consecutive identical samples are
+        // therefore one observed turn context; changes retain their complete file order.
+        if retain_turn && self.per_turn.last() != Some(&attribution) {
+            self.per_turn.push(attribution);
+        }
+    }
+}
+
+pub type RunTelemetryMap = HashMap<RunId, RunTelemetry>;
+
+/// Stable provider run kinds recomputed from provider logs at startup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunKind(String);
+
+pub type RunKindMap = HashMap<RunId, RunKind>;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentNode {
@@ -306,6 +407,13 @@ impl ProviderDiagnostics {
         self.handle.baseline_approximations()
     }
 
+    /// Admission-approved provider file opens attempted by instrumented builds.
+    #[cfg(any(test, feature = "workload-harness"))]
+    #[must_use]
+    pub fn admission_open_attempts(&self) -> u64 {
+        self.handle.admission_open_attempts()
+    }
+
     /// Notify backends that failed creation and fell back to periodic polling.
     #[must_use]
     pub fn notify_creation_failures(&self) -> u64 {
@@ -342,9 +450,12 @@ pub struct ProviderDiagnosticsHandle {
     malformed_records: Arc<AtomicU64>,
     watch_cap_fallbacks: Arc<AtomicU64>,
     baseline_approximations: Arc<AtomicU64>,
+    #[cfg(any(test, feature = "workload-harness"))]
+    admission_open_attempts: Arc<AtomicU64>,
     notify_creation_failures: Arc<AtomicU64>,
     provider_cycles: Arc<AtomicU64>,
     provider_io_errors: Arc<AtomicU64>,
+    last_watcher_observation_ms: Arc<AtomicI64>,
 }
 
 impl ProviderDiagnosticsHandle {
@@ -395,6 +506,12 @@ impl ProviderDiagnosticsHandle {
         Self::increment(&self.baseline_approximations);
     }
 
+    /// Records one admission-approved attempt to open a provider artifact.
+    #[cfg(any(test, feature = "workload-harness"))]
+    pub fn record_admission_open_attempt(&self) {
+        Self::increment(&self.admission_open_attempts);
+    }
+
     /// Records one notify backend creation failure handled by polling fallback.
     pub fn record_notify_creation_failure(&self) {
         Self::increment(&self.notify_creation_failures);
@@ -406,6 +523,14 @@ impl ProviderDiagnosticsHandle {
 
     pub fn record_provider_io_error(&self) {
         Self::increment(&self.provider_io_errors);
+    }
+
+    pub fn record_watcher_observation(&self, at_ms: i64) {
+        let _ = self.last_watcher_observation_ms.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.max(at_ms)),
+        );
     }
 
     #[must_use]
@@ -458,6 +583,12 @@ impl ProviderDiagnosticsHandle {
         self.baseline_approximations.load(Ordering::Relaxed)
     }
 
+    #[cfg(any(test, feature = "workload-harness"))]
+    #[must_use]
+    pub fn admission_open_attempts(&self) -> u64 {
+        self.admission_open_attempts.load(Ordering::Relaxed)
+    }
+
     #[must_use]
     pub fn notify_creation_failures(&self) -> u64 {
         self.notify_creation_failures.load(Ordering::Relaxed)
@@ -471,6 +602,12 @@ impl ProviderDiagnosticsHandle {
     #[must_use]
     pub fn provider_io_errors(&self) -> u64 {
         self.provider_io_errors.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn last_watcher_observation_ms(&self) -> Option<i64> {
+        let observed = self.last_watcher_observation_ms.load(Ordering::Relaxed);
+        (observed > 0).then_some(observed)
     }
 }
 
@@ -544,6 +681,10 @@ pub struct DomainModel {
     topology_ordinals: HashMap<(TopologyKind, String), DisplayOrdinal>,
     task_runs: HashMap<RunId, TaskRun>,
     run_ids_by_key: HashMap<RunKey, RunId>,
+    /// Recomputed from provider logs at startup; no serialized or database projection owns it.
+    telemetry: RunTelemetryMap,
+    /// First provider kind per run; recomputed at startup and never persisted.
+    run_kinds: RunKindMap,
     executions: HashMap<String, Execution>,
     agent_nodes: HashMap<String, AgentNode>,
     execution_edges: HashSet<ExecutionEdge>,
@@ -717,6 +858,94 @@ impl DomainModel {
 
     pub fn task_runs(&self) -> impl Iterator<Item = &TaskRun> {
         self.task_runs.values()
+    }
+
+    /// Returns transient output-token telemetry for one run.
+    #[must_use]
+    pub fn telemetry(&self, run_id: &RunId) -> Option<&RunTelemetry> {
+        self.telemetry.get(run_id)
+    }
+
+    /// Iterates over all transient run telemetry.
+    pub fn telemetry_entries(&self) -> impl Iterator<Item = (&RunId, &RunTelemetry)> {
+        self.telemetry.iter()
+    }
+
+    pub(crate) fn telemetry_entry(&mut self, run_id: RunId, at_ms: i64) -> &mut RunTelemetry {
+        let telemetry = self
+            .telemetry
+            .entry(run_id)
+            .or_insert_with(|| RunTelemetry {
+                output_tokens: 0,
+                token_breakdown: TokenBreakdown::default(),
+                started_wall_ms: at_ms,
+                model: None,
+                effort: None,
+                sandbox: None,
+                per_turn: Vec::new(),
+            });
+        telemetry.started_wall_ms = telemetry.started_wall_ms.min(at_ms);
+        telemetry
+    }
+
+    pub(crate) fn fold_telemetry(&mut self, survivor: RunId, absorbed: RunId) {
+        let Some(mut absorbed_telemetry) = self.telemetry.remove(&absorbed) else {
+            return;
+        };
+        let Some(canonical) = self.telemetry.get_mut(&survivor) else {
+            self.telemetry.insert(survivor, absorbed_telemetry);
+            return;
+        };
+
+        canonical.output_tokens = canonical
+            .output_tokens
+            .saturating_add(absorbed_telemetry.output_tokens);
+        let canonical_context_window = canonical.token_breakdown.context_window;
+        let absorbed_context_window = absorbed_telemetry.token_breakdown.context_window;
+        canonical
+            .token_breakdown
+            .accumulate(absorbed_telemetry.token_breakdown);
+        // Per-turn accumulation treats this as a last-sample gauge, but a fold has no ordering:
+        // keep the canonical run's value unless it has no context-window evidence.
+        canonical.token_breakdown.context_window =
+            canonical_context_window.or(absorbed_context_window);
+        canonical.started_wall_ms = canonical
+            .started_wall_ms
+            .min(absorbed_telemetry.started_wall_ms);
+        if canonical.model.is_none() {
+            canonical.model = absorbed_telemetry.model.take();
+        }
+        if canonical.effort.is_none() {
+            canonical.effort = absorbed_telemetry.effort.take();
+        }
+        if canonical.sandbox.is_none() {
+            canonical.sandbox = absorbed_telemetry.sandbox.take();
+        }
+        for attribution in absorbed_telemetry.per_turn {
+            if canonical.per_turn.last() != Some(&attribution) {
+                canonical.per_turn.push(attribution);
+            }
+        }
+    }
+
+    /// Returns the stable transient provider kind for one run.
+    #[must_use]
+    pub fn run_kind(&self, run_id: &RunId) -> Option<&str> {
+        self.run_kinds.get(run_id).map(|kind| kind.0.as_str())
+    }
+
+    /// Records the first non-empty provider kind observed for one run.
+    pub(crate) fn set_run_kind(&mut self, run_id: RunId, kind: String) {
+        if !kind.is_empty() {
+            self.run_kinds.entry(run_id).or_insert(RunKind(kind));
+        }
+    }
+
+    pub(crate) fn fold_run_kind(&mut self, survivor: RunId, absorbed: RunId) {
+        let Some(absorbed_kind) = self.run_kinds.remove(&absorbed) else {
+            return;
+        };
+        self.run_kinds.entry(survivor).or_insert(absorbed_kind);
     }
 
     pub fn insert_execution(&mut self, execution: Execution) -> Option<Execution> {
@@ -1228,6 +1457,40 @@ mod tests {
         assert_eq!(quantize_progress(0.99995), Ok(10_000));
         assert_eq!(quantize_progress(-0.000_001), Err(ProgressOutOfRange));
         assert_eq!(quantize_progress(1.000_001), Err(ProgressOutOfRange));
+    }
+
+    #[test]
+    fn fold_telemetry_keeps_the_survivor_context_window() {
+        let mut model = DomainModel::default();
+        let survivor = RunId::new();
+        let absorbed = RunId::new();
+        let survivor_telemetry = model.telemetry_entry(survivor, 100);
+        survivor_telemetry.output_tokens = 7;
+        survivor_telemetry.token_breakdown.context_window = Some(200_000);
+        let absorbed_telemetry = model.telemetry_entry(absorbed, 200);
+        absorbed_telemetry.output_tokens = 11;
+        absorbed_telemetry.token_breakdown.context_window = Some(114_000);
+
+        model.fold_telemetry(survivor, absorbed);
+
+        let telemetry = model.telemetry(&survivor).unwrap();
+        assert_eq!(telemetry.output_tokens, 18);
+        assert_eq!(telemetry.token_breakdown.context_window, Some(200_000));
+
+        let survivor_without_context = RunId::new();
+        let absorbed_with_context = RunId::new();
+        model
+            .telemetry_entry(survivor_without_context, 300)
+            .output_tokens = 13;
+        let absorbed_telemetry = model.telemetry_entry(absorbed_with_context, 400);
+        absorbed_telemetry.output_tokens = 17;
+        absorbed_telemetry.token_breakdown.context_window = Some(114_000);
+
+        model.fold_telemetry(survivor_without_context, absorbed_with_context);
+
+        let telemetry = model.telemetry(&survivor_without_context).unwrap();
+        assert_eq!(telemetry.output_tokens, 30);
+        assert_eq!(telemetry.token_breakdown.context_window, Some(114_000));
     }
 
     #[test]

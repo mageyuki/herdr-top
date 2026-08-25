@@ -1,0 +1,41 @@
+{
+  "description": "Pins the multiset of Claude fixture record/content types and the reviewed 2.1.x transcript version prefix. Regenerate from tests/fixtures/provider-logs as documented in README.md.",
+  "version_prefix": "2.1.",
+  "record_types": [
+    {
+      "scope": "content",
+      "type": "text",
+      "occurrences": 3
+    },
+    {
+      "scope": "content",
+      "type": "tool_result",
+      "occurrences": 1
+    },
+    {
+      "scope": "content",
+      "type": "tool_use",
+      "occurrences": 2
+    },
+    {
+      "scope": "record",
+      "type": "ai-title",
+      "occurrences": 1
+    },
+    {
+      "scope": "record",
+      "type": "assistant",
+      "occurrences": 5
+    },
+    {
+      "scope": "record",
+      "type": "queue-operation",
+      "occurrences": 5
+    },
+    {
+      "scope": "record",
+      "type": "user",
+      "occurrences": 3
+    }
+  ]
+}

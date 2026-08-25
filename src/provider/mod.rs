@@ -14,15 +14,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
-use crate::model::{ExecState, MinimalProviderMetadata, Provider, ProviderDiagnosticsHandle};
+use crate::model::{
+    ControllerEvent, ExecState, MinimalProviderMetadata, Provider, ProviderDiagnosticsHandle,
+    RunKey, TokenBreakdown,
+};
 
 pub mod claude;
+pub mod claude_facts;
 pub mod codex;
+pub mod codex_facts;
+pub mod facts;
+pub mod lane;
 pub mod tail;
 
 pub use tail::{
@@ -63,8 +70,26 @@ pub enum ProviderSourceState {
 }
 
 /// Allowlisted event emitted by a provider adapter.
+// The plan intentionally carries the existing public `ControllerEvent` by value.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderEvent {
+    /// Controller-compatible lifecycle event synthesized from an admitted provider log.
+    Synthesized(ControllerEvent),
+    /// Append-time signal consumed by the lifecycle lane in Increment 9 Task 6.
+    RunLiveness { key: RunKey, at_ms: i64 },
+    /// Append-silence transition consumed through the lane-specific reducer close path.
+    LaneClose { key: RunKey, at_ms: i64 },
+    /// Allowlisted usage sample consumed by telemetry in Increment 9 Task 7.
+    Telemetry {
+        key: RunKey,
+        at_ms: i64,
+        output_tokens: u64,
+        token_breakdown: TokenBreakdown,
+        model: Option<String>,
+        effort: Option<String>,
+        sandbox: Option<String>,
+    },
     SessionResolved {
         provider: Provider,
         agent_thread_id: String,
@@ -112,6 +137,19 @@ pub enum ProviderEvent {
 }
 
 impl ProviderEvent {
+    pub(crate) const fn requires_admission(&self) -> bool {
+        match self {
+            Self::Synthesized(_)
+            | Self::RunLiveness { .. }
+            | Self::LaneClose { .. }
+            | Self::Telemetry { .. }
+            | Self::SessionResolved { .. }
+            | Self::AgentUpsert { .. }
+            | Self::Activity { .. } => true,
+            Self::SourceState { .. } | Self::Malformed { .. } => false,
+        }
+    }
+
     fn entity_key(&self) -> Option<EntityKey> {
         match self {
             Self::SessionResolved {
@@ -132,7 +170,12 @@ impl ProviderEvent {
                 provider: *provider,
                 thread_id: agent_thread_id.clone(),
             }),
-            Self::SourceState { .. } | Self::Malformed { .. } => None,
+            Self::Synthesized(_)
+            | Self::RunLiveness { .. }
+            | Self::LaneClose { .. }
+            | Self::Telemetry { .. }
+            | Self::SourceState { .. }
+            | Self::Malformed { .. } => None,
         }
     }
 
@@ -156,7 +199,12 @@ impl ProviderEvent {
                 position,
                 ..
             } => Some((event_id, *observed_at_ms, *position)),
-            Self::SourceState { .. } | Self::Malformed { .. } => None,
+            Self::Synthesized(_)
+            | Self::RunLiveness { .. }
+            | Self::LaneClose { .. }
+            | Self::Telemetry { .. }
+            | Self::SourceState { .. }
+            | Self::Malformed { .. } => None,
         }
     }
 }
@@ -193,15 +241,21 @@ impl ProviderEventSender {
                         return Err(tokio::sync::mpsc::error::TrySendError::Closed(event));
                     }
                 };
-                let admission = matches!(
-                    &event,
-                    ProviderEvent::SessionResolved { .. }
-                        | ProviderEvent::AgentUpsert { .. }
-                        | ProviderEvent::Activity { .. }
-                )
-                .then(|| ingress.admit());
+                let admission = event.requires_admission().then(|| ingress.admit());
                 permit.send(ProviderIngressEvent { event, admission });
                 Ok(())
+            }
+        }
+    }
+
+    fn blocking_send(&self, event: ProviderEvent) -> bool {
+        match self {
+            Self::Raw(sender) => sender.blocking_send(event).is_ok(),
+            Self::Tracked { sender, ingress } => {
+                let admission = event.requires_admission().then(|| ingress.admit());
+                sender
+                    .blocking_send(ProviderIngressEvent { event, admission })
+                    .is_ok()
             }
         }
     }
@@ -280,6 +334,8 @@ pub struct DiscoveredFile {
     pub provider: Provider,
     pub root: PathBuf,
     pub relative_path: PathBuf,
+    /// File mtime captured during directory discovery, before any descriptor is opened.
+    pub modified_ms: i64,
     pub path_id: u32,
     pub bootstrap: Option<BootstrapIdentity>,
 }
@@ -352,12 +408,12 @@ impl DiscoveryIndex {
     pub fn new(roots: Vec<DiscoveryRoot>) -> io::Result<Self> {
         let mut baseline = FirstSeenBaseline::default();
         for root in &roots {
-            let discovery = discover_artifacts(&root.path)?;
+            let discovery = discover_artifacts(&root.path, false)?;
             if discovery.had_errors {
                 return Err(io::Error::other("provider baseline discovery incomplete"));
             }
-            for relative in discovery.paths {
-                baseline.record(root.path.join(relative));
+            for artifact in discovery.artifacts {
+                baseline.record(root.path.join(artifact.relative_path));
             }
         }
         Ok(Self {
@@ -367,88 +423,6 @@ impl DiscoveryIndex {
             agent_paths: HashMap::new(),
             baseline,
         })
-    }
-
-    /// Rescans roots, bootstrapping only newly discovered allowlisted files.
-    pub fn scan(
-        &mut self,
-        parser: &mut impl BootstrapParser,
-        interner: &mut PathInterner,
-    ) -> io::Result<DiscoveryScanOutcome> {
-        let mut seen = HashSet::new();
-        let mut dirty_roots = HashSet::new();
-        let mut outcome = DiscoveryScanOutcome::default();
-        for root in self.roots.clone() {
-            let mut root_seen = HashSet::new();
-            let discovery = discover_artifacts(&root.path)?;
-            outcome.file_io_error |= discovery.had_errors;
-            if discovery.had_errors {
-                dirty_roots.insert(root.path.clone());
-            }
-            for relative in discovery.paths {
-                let absolute = root.path.join(&relative);
-                let file_key = (root.provider, absolute.clone());
-                root_seen.insert(absolute.clone());
-                seen.insert(file_key.clone());
-                if self.files.contains_key(&file_key) {
-                    continue;
-                }
-                let path_id = match interner.intern(&absolute) {
-                    Ok(path_id) => path_id,
-                    Err(_) => {
-                        outcome.file_io_error = true;
-                        continue;
-                    }
-                };
-                let bootstrap = match bootstrap_file(&root, &relative, parser) {
-                    Ok(bootstrap) => bootstrap,
-                    Err(_) => {
-                        outcome.file_io_error = true;
-                        continue;
-                    }
-                };
-                if let Some(identity) = bootstrap.as_ref()
-                    && valid_native_id(&identity.thread_id)
-                    && identity
-                        .parent_thread_id
-                        .as_deref()
-                        .is_none_or(valid_native_id)
-                {
-                    self.identities.insert(
-                        (root.provider, identity.thread_id.clone()),
-                        DiscoveredIdentity {
-                            path: absolute.clone(),
-                            parent_thread_id: identity.parent_thread_id.clone(),
-                        },
-                    );
-                }
-                self.files.insert(
-                    file_key,
-                    DiscoveredFile {
-                        provider: root.provider,
-                        root: root.path.clone(),
-                        relative_path: relative,
-                        path_id,
-                        bootstrap,
-                    },
-                );
-            }
-            if !discovery.had_errors {
-                self.baseline.retain_existing(&root.path, &root_seen);
-            }
-        }
-        self.files.retain(|key, file| {
-            if seen.contains(key) || dirty_roots.contains(&file.root) {
-                true
-            } else {
-                outcome.removed_path_ids.push(file.path_id);
-                false
-            }
-        });
-        outcome.removed_path_ids.sort_unstable();
-        outcome.removed_path_ids.dedup();
-        self.rebuild_identities();
-        Ok(outcome)
     }
 
     fn rebuild_identities(&mut self) {
@@ -522,12 +496,140 @@ impl DiscoveryIndex {
     }
 }
 
-fn bootstrap_file(
+impl DiscoveryIndex {
+    /// Production provider-lane rescan. Identity inventory is built from names only;
+    /// admission and mtime are checked before structural bootstrap opens a descriptor.
+    pub fn scan_admitted(
+        &mut self,
+        parser: &mut impl BootstrapParser,
+        interner: &mut PathInterner,
+        admission: &lane::Admission,
+        admission_index: &mut lane::AdmissionIndex,
+        diagnostics: &ProviderDiagnostics,
+    ) -> io::Result<DiscoveryScanOutcome> {
+        let mut seen = HashSet::new();
+        let mut dirty_roots = HashSet::new();
+        let mut outcome = DiscoveryScanOutcome::default();
+        for root in self.roots.clone() {
+            let mut root_seen = HashSet::new();
+            let discovery = discover_artifacts(&root.path, true)?;
+            outcome.file_io_error |= discovery.had_errors;
+            if discovery.had_errors {
+                dirty_roots.insert(root.path.clone());
+            }
+
+            let mut newest_pane_artifact: HashMap<(Provider, String), (i64, PathBuf)> =
+                HashMap::new();
+            for artifact in &discovery.artifacts {
+                let absolute = root.path.join(&artifact.relative_path);
+                admission_index.observe_discovered_path(root.provider, &absolute);
+                if let Some(identity) = admission.pane_root_identity(root.provider, &absolute) {
+                    let candidate = (artifact.modified_ms, absolute);
+                    newest_pane_artifact
+                        .entry((root.provider, identity))
+                        .and_modify(|current| {
+                            if candidate > *current {
+                                *current = candidate.clone();
+                            }
+                        })
+                        .or_insert(candidate);
+                }
+            }
+
+            for artifact in discovery.artifacts {
+                let relative = artifact.relative_path;
+                let absolute = root.path.join(&relative);
+                if !admission.is_admitted_file(&absolute, artifact.modified_ms) {
+                    continue;
+                }
+                if let Some(identity) = admission.pane_root_identity(root.provider, &absolute)
+                    && newest_pane_artifact
+                        .get(&(root.provider, identity))
+                        .is_some_and(|(_, newest)| newest != &absolute)
+                {
+                    continue;
+                }
+                let file_key = (root.provider, absolute.clone());
+                root_seen.insert(absolute.clone());
+                seen.insert(file_key.clone());
+                if let Some(existing) = self.files.get_mut(&file_key) {
+                    existing.modified_ms = artifact.modified_ms;
+                    continue;
+                }
+                let path_id = match interner.intern(&absolute) {
+                    Ok(path_id) => path_id,
+                    Err(_) => {
+                        outcome.file_io_error = true;
+                        continue;
+                    }
+                };
+                let is_meta = relative
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.ends_with(".meta.json"));
+                let bootstrap = if is_meta {
+                    None
+                } else {
+                    match bootstrap_file_admitted(&root, &relative, parser, admission, diagnostics)
+                    {
+                        Ok(bootstrap) => bootstrap,
+                        Err(_) => {
+                            outcome.file_io_error = true;
+                            continue;
+                        }
+                    }
+                };
+                self.files.insert(
+                    file_key,
+                    DiscoveredFile {
+                        provider: root.provider,
+                        root: root.path.clone(),
+                        relative_path: relative,
+                        modified_ms: artifact.modified_ms,
+                        path_id,
+                        bootstrap,
+                    },
+                );
+            }
+            if !discovery.had_errors {
+                self.baseline.retain_existing(&root.path, &root_seen);
+            }
+        }
+        self.files.retain(|key, file| {
+            if seen.contains(key) || dirty_roots.contains(&file.root) {
+                true
+            } else {
+                outcome.removed_path_ids.push(file.path_id);
+                false
+            }
+        });
+        outcome.removed_path_ids.sort_unstable();
+        outcome.removed_path_ids.dedup();
+        self.rebuild_identities();
+        Ok(outcome)
+    }
+}
+
+fn bootstrap_file_admitted(
     root: &DiscoveryRoot,
     relative: &Path,
     parser: &mut impl BootstrapParser,
+    admission: &lane::Admission,
+    diagnostics: &ProviderDiagnostics,
 ) -> io::Result<Option<BootstrapIdentity>> {
-    let mut file = open_contained_regular_file(&root.path, relative)?;
+    let Some(mut file) = open_admitted_regular_file(&root.path, relative, admission, diagnostics)?
+    else {
+        return Ok(None);
+    };
+    parse_bootstrap_prefix(root, relative, parser, &mut file)
+}
+
+fn parse_bootstrap_prefix(
+    root: &DiscoveryRoot,
+    relative: &Path,
+    parser: &mut impl BootstrapParser,
+    file: &mut File,
+) -> io::Result<Option<BootstrapIdentity>> {
     let mut bytes = Vec::new();
     file.by_ref()
         .take(BOOTSTRAP_MAX_BYTES as u64)
@@ -555,8 +657,14 @@ fn bootstrap_file(
 
 #[derive(Debug, Default)]
 struct ArtifactDiscovery {
-    paths: Vec<PathBuf>,
+    artifacts: Vec<DiscoveredArtifactEntry>,
     had_errors: bool,
+}
+
+#[derive(Debug)]
+struct DiscoveredArtifactEntry {
+    relative_path: PathBuf,
+    modified_ms: i64,
 }
 
 #[cfg(test)]
@@ -588,7 +696,7 @@ fn discovery_file_type(entry: &fs::DirEntry, path: &Path) -> io::Result<fs::File
     entry.file_type()
 }
 
-fn discover_artifacts(root: &Path) -> io::Result<ArtifactDiscovery> {
+fn discover_artifacts(root: &Path, include_meta: bool) -> io::Result<ArtifactDiscovery> {
     let mut found = Vec::new();
     let mut had_errors = false;
     let mut directories = vec![PathBuf::new()];
@@ -626,18 +734,43 @@ fn discover_artifacts(root: &Path) -> io::Result<ArtifactDiscovery> {
                     continue;
                 }
             };
-            if kind.is_dir() {
+            if kind.is_dir() && entry.file_name() != OsStr::new("tool-results") {
                 directories.push(relative);
-            } else if kind.is_file() && is_provider_artifact(&relative) {
-                found.push(relative);
+            } else if kind.is_file()
+                && (is_provider_artifact(&relative)
+                    || include_meta
+                        && relative
+                            .file_name()
+                            .and_then(OsStr::to_str)
+                            .is_some_and(|name| name.ends_with(".meta.json")))
+            {
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(_) => {
+                        had_errors = true;
+                        continue;
+                    }
+                };
+                found.push(DiscoveredArtifactEntry {
+                    relative_path: relative,
+                    modified_ms: system_time_ms(metadata.modified().unwrap_or(UNIX_EPOCH)),
+                });
             }
         }
     }
-    found.sort();
+    found.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(ArtifactDiscovery {
-        paths: found,
+        artifacts: found,
         had_errors,
     })
+}
+
+fn system_time_ms(time: SystemTime) -> i64 {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
+        Err(error) => -i64::try_from(error.duration().as_millis()).unwrap_or(i64::MAX),
+    }
 }
 
 /// Returns whether a discovered entry is an adapter input artifact.
@@ -668,6 +801,7 @@ struct PendingEntity {
     identity: Option<PendingSlot>,
     upsert: Option<PendingSlot>,
     activity: Option<PendingSlot>,
+    lane_activity: Option<PendingSlot>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -694,9 +828,11 @@ pub enum MergeOutcome {
 #[derive(Clone, Debug)]
 enum PendingToken {
     Source(Provider),
+    Lane,
     Identity(EntityKey),
     Upsert(EntityKey),
     Activity(EntityKey),
+    LaneActivity(EntityKey),
     Malformed(MalformedKey),
 }
 
@@ -705,6 +841,7 @@ enum PendingToken {
 pub struct PendingEvents {
     capacity: usize,
     sources: HashMap<Provider, ProviderEvent>,
+    lane: VecDeque<ProviderEvent>,
     entities: HashMap<EntityKey, PendingEntity>,
     malformed: HashMap<MalformedKey, PendingMalformed>,
     diagnostics: ProviderDiagnostics,
@@ -717,6 +854,7 @@ impl PendingEvents {
         Self {
             capacity: PENDING_ENTITY_CAPACITY,
             sources: HashMap::new(),
+            lane: VecDeque::new(),
             entities: HashMap::new(),
             malformed: HashMap::new(),
             diagnostics,
@@ -728,6 +866,7 @@ impl PendingEvents {
         Self {
             capacity,
             sources: HashMap::new(),
+            lane: VecDeque::new(),
             entities: HashMap::new(),
             malformed: HashMap::new(),
             diagnostics,
@@ -770,11 +909,27 @@ impl PendingEvents {
                     MergeOutcome::Coalesced
                 }
             }
+            event @ (ProviderEvent::Synthesized(_)
+            | ProviderEvent::RunLiveness { .. }
+            | ProviderEvent::LaneClose { .. }
+            | ProviderEvent::Telemetry { .. }) => {
+                if self.lane.len() >= self.capacity {
+                    MergeOutcome::AtCapacity(Box::new(event))
+                } else {
+                    self.lane.push_back(event);
+                    MergeOutcome::Accepted
+                }
+            }
             event => self.merge_entity(event),
         }
     }
 
     fn merge_entity(&mut self, event: ProviderEvent) -> MergeOutcome {
+        let lane_activity = matches!(
+            &event,
+            ProviderEvent::Activity { activity, .. }
+                if activity.event_kind.as_deref() == Some(lane::LIVE_LINE_EVENT_KIND)
+        );
         let key = event.entity_key().expect("entity event has a key");
         if !self.entities.contains_key(&key) && self.entities.len() >= self.capacity {
             return MergeOutcome::AtCapacity(Box::new(event));
@@ -783,8 +938,14 @@ impl PendingEvents {
         let existing_slot = match &event {
             ProviderEvent::SessionResolved { .. } => entity.identity.as_ref(),
             ProviderEvent::AgentUpsert { .. } => entity.upsert.as_ref(),
+            ProviderEvent::Activity { .. } if lane_activity => entity.lane_activity.as_ref(),
             ProviderEvent::Activity { .. } => entity.activity.as_ref(),
-            ProviderEvent::SourceState { .. } | ProviderEvent::Malformed { .. } => unreachable!(),
+            ProviderEvent::Synthesized(_)
+            | ProviderEvent::RunLiveness { .. }
+            | ProviderEvent::LaneClose { .. }
+            | ProviderEvent::Telemetry { .. }
+            | ProviderEvent::SourceState { .. }
+            | ProviderEvent::Malformed { .. } => unreachable!(),
         };
         if existing_slot.is_some_and(|stored| {
             stored.event.slot_details().map(|details| details.0)
@@ -822,7 +983,12 @@ impl PendingEvents {
                 }
                 activity.parent_agent_id.clone()
             }
-            ProviderEvent::SourceState { .. } | ProviderEvent::Malformed { .. } => None,
+            ProviderEvent::Synthesized(_)
+            | ProviderEvent::RunLiveness { .. }
+            | ProviderEvent::LaneClose { .. }
+            | ProviderEvent::Telemetry { .. }
+            | ProviderEvent::SourceState { .. }
+            | ProviderEvent::Malformed { .. } => None,
         };
         if incoming_parent.is_some() {
             entity.parent = incoming_parent;
@@ -831,8 +997,14 @@ impl PendingEvents {
         let slot = match event {
             ProviderEvent::SessionResolved { .. } => &mut entity.identity,
             ProviderEvent::AgentUpsert { .. } => &mut entity.upsert,
+            ProviderEvent::Activity { .. } if lane_activity => &mut entity.lane_activity,
             ProviderEvent::Activity { .. } => &mut entity.activity,
-            ProviderEvent::SourceState { .. } | ProviderEvent::Malformed { .. } => unreachable!(),
+            ProviderEvent::Synthesized(_)
+            | ProviderEvent::RunLiveness { .. }
+            | ProviderEvent::LaneClose { .. }
+            | ProviderEvent::Telemetry { .. }
+            | ProviderEvent::SourceState { .. }
+            | ProviderEvent::Malformed { .. } => unreachable!(),
         };
         merge_slot(slot, event, &self.diagnostics)
     }
@@ -877,6 +1049,10 @@ impl PendingEvents {
             }
         }
 
+        if let Some(event) = self.lane.front() {
+            return Some((PendingToken::Lane, event.clone()));
+        }
+
         let mut keys = self.entities.keys().collect::<Vec<_>>();
         keys.sort_by(|left, right| {
             let left_depth = self.entities[left].depth;
@@ -898,6 +1074,9 @@ impl PendingEvents {
             }
             if let Some(slot) = entity.activity.as_ref() {
                 return Some((PendingToken::Activity(key.clone()), slot.event.clone()));
+            }
+            if let Some(slot) = entity.lane_activity.as_ref() {
+                return Some((PendingToken::LaneActivity(key.clone()), slot.event.clone()));
             }
         }
 
@@ -921,6 +1100,9 @@ impl PendingEvents {
             PendingToken::Source(provider) => {
                 self.sources.remove(&provider);
             }
+            PendingToken::Lane => {
+                self.lane.pop_front();
+            }
             PendingToken::Identity(key) => {
                 if let Some(entity) = self.entities.get_mut(&key) {
                     entity.identity = None;
@@ -939,6 +1121,12 @@ impl PendingEvents {
                 }
                 self.remove_empty_entity(&key);
             }
+            PendingToken::LaneActivity(key) => {
+                if let Some(entity) = self.entities.get_mut(&key) {
+                    entity.lane_activity = None;
+                }
+                self.remove_empty_entity(&key);
+            }
             PendingToken::Malformed(key) => {
                 if let Some(pending) = self.malformed.get_mut(&key) {
                     pending.samples.pop_front();
@@ -952,7 +1140,10 @@ impl PendingEvents {
 
     fn remove_empty_entity(&mut self, key: &EntityKey) {
         if self.entities.get(key).is_some_and(|entity| {
-            entity.identity.is_none() && entity.upsert.is_none() && entity.activity.is_none()
+            entity.identity.is_none()
+                && entity.upsert.is_none()
+                && entity.activity.is_none()
+                && entity.lane_activity.is_none()
         }) {
             self.entities.remove(key);
         }
@@ -1039,6 +1230,10 @@ impl ProviderDiagnostics {
     pub(crate) fn record_baseline_approximation(&self) {
         self.0.record_baseline_approximation();
     }
+    #[cfg(any(test, feature = "workload-harness"))]
+    pub(crate) fn record_admission_open_attempt(&self) {
+        self.0.record_admission_open_attempt();
+    }
     fn record_notify_creation_failure(&self) {
         self.0.record_notify_creation_failure();
     }
@@ -1048,6 +1243,9 @@ impl ProviderDiagnostics {
     fn record_io_error(&self) {
         self.0.record_provider_io_error();
     }
+    fn record_watcher_observation(&self, at_ms: i64) {
+        self.0.record_watcher_observation(at_ms);
+    }
 
     #[must_use]
     pub fn dropped_hints(&self) -> u64 {
@@ -1056,6 +1254,10 @@ impl ProviderDiagnostics {
     #[must_use]
     pub fn coalesced_updates(&self) -> u64 {
         self.0.coalesced_updates()
+    }
+    #[must_use]
+    pub fn last_watcher_observation_ms(&self) -> Option<i64> {
+        self.0.last_watcher_observation_ms()
     }
     #[must_use]
     pub fn duplicate_events(&self) -> u64 {
@@ -1088,6 +1290,11 @@ impl ProviderDiagnostics {
     #[must_use]
     pub fn baseline_approximations(&self) -> u64 {
         self.0.baseline_approximations()
+    }
+    #[cfg(any(test, feature = "workload-harness"))]
+    #[must_use]
+    pub fn admission_open_attempts(&self) -> u64 {
+        self.0.admission_open_attempts()
     }
     #[must_use]
     pub fn notify_creation_failures(&self) -> u64 {
@@ -1263,6 +1470,7 @@ pub struct ProviderTarget {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TargetSet {
     targets: HashSet<ProviderTarget>,
+    sessions: HashSet<(Provider, String)>,
 }
 
 impl TargetSet {
@@ -1270,12 +1478,31 @@ impl TargetSet {
     pub fn new(targets: impl IntoIterator<Item = ProviderTarget>) -> Self {
         Self {
             targets: targets.into_iter().collect(),
+            sessions: HashSet::new(),
+        }
+    }
+
+    /// Creates a target set from provider paths and pane-session identities.
+    pub fn new_with_sessions(
+        targets: impl IntoIterator<Item = ProviderTarget>,
+        sessions: impl IntoIterator<Item = (Provider, String)>,
+    ) -> Self {
+        Self {
+            targets: targets.into_iter().collect(),
+            sessions: sessions.into_iter().collect(),
         }
     }
 
     /// Returns provider-attributed targets.
     pub fn iter(&self) -> impl Iterator<Item = &ProviderTarget> {
         self.targets.iter()
+    }
+
+    /// Returns provider-attributed pane-session identities.
+    pub fn sessions(&self) -> impl Iterator<Item = (Provider, &str)> {
+        self.sessions
+            .iter()
+            .map(|(provider, session_id)| (*provider, session_id.as_str()))
     }
 }
 
@@ -1341,6 +1568,11 @@ pub(crate) fn test_provider_cycle_with_stop<'a>(
 /// Adapter-owned discovery, tailing, and parsing work executed on the provider thread.
 pub trait ProviderWorker: Send + 'static {
     fn process(&mut self, cycle: &mut ProviderCycle<'_>) -> io::Result<()>;
+
+    /// Emits final provider events that must traverse normal egress on graceful shutdown.
+    fn graceful_stop(&mut self) -> Vec<ProviderEvent> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug)]
@@ -1650,16 +1882,28 @@ fn provider_thread_main(
 
     loop {
         let control = receiver.recv_timeout(rescan_interval);
-        if stop_flag.load(Ordering::Acquire) {
-            break;
-        }
         let (hint, timed_out) = match control {
-            Ok(Control::Stop) => break,
+            Ok(Control::Stop) => {
+                for event in worker.graceful_stop() {
+                    if !egress.blocking_send(event) {
+                        break;
+                    }
+                }
+                break;
+            }
             Ok(Control::Hint(path)) => (Some(path), false),
             Ok(Control::TargetsUpdated) => (None, false),
             Err(mpsc::RecvTimeoutError::Timeout) => (None, true),
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        if stop_flag.load(Ordering::Acquire) {
+            for event in worker.graceful_stop() {
+                if !egress.blocking_send(event) {
+                    break;
+                }
+            }
+            break;
+        }
         run_provider_cycle(
             &mut worker,
             &egress,
@@ -1703,6 +1947,7 @@ fn run_provider_cycle(
     if worker.process(&mut cycle).is_err() {
         diagnostics.record_io_error();
     }
+    diagnostics.record_watcher_observation(system_time_ms(SystemTime::now()));
     if let Some(registry) = lock_unpoisoned(watcher).as_mut() {
         for directory in watch_requests {
             if registry.add(directory).is_err() {
@@ -1775,6 +2020,23 @@ fn open_contained_regular_file(root: &Path, relative: &Path) -> io::Result<File>
     Ok(File::from(file))
 }
 
+/// Admission seam that Task 5 routes the existing provider worker through before opening.
+pub(crate) fn open_admitted_regular_file(
+    root: &Path,
+    relative: &Path,
+    admission: &lane::Admission,
+    diagnostics: &ProviderDiagnostics,
+) -> io::Result<Option<File>> {
+    if !admission.is_admitted_path(&root.join(relative)) {
+        return Ok(None);
+    }
+    #[cfg(any(test, feature = "workload-harness"))]
+    diagnostics.record_admission_open_attempt();
+    #[cfg(not(any(test, feature = "workload-harness")))]
+    let _ = diagnostics;
+    open_contained_regular_file(root, relative).map(Some)
+}
+
 fn path_cstring(path: &Path) -> io::Result<CString> {
     CString::new(path.as_os_str().as_bytes()).map_err(|_| {
         io::Error::new(
@@ -1840,6 +2102,10 @@ mod tests {
     use crate::model::DomainModel;
     use crate::performance::{TestPerformanceClock, performance_tracker};
 
+    const CLAUDE_FIXTURE_A: &str = "11111111-1111-4111-8111-111111111111";
+    const CLAUDE_FIXTURE_B: &str = "22222222-2222-4222-8222-222222222222";
+    const CODEX_FIXTURE: &str = "rollout-fixture-33333333-3333-4333-8333-333333333333.jsonl";
+
     // I2a test list, written before implementation:
     // - bootstrap skips non-structural lines and obeys byte/record caps
     // - discovery filters non-jsonl artifacts and maps thread IDs to paths/parents
@@ -1880,11 +2146,33 @@ mod tests {
         }
     }
 
+    fn scan_admitted_fixture(
+        index: &mut DiscoveryIndex,
+        parser: &mut impl BootstrapParser,
+        interner: &mut PathInterner,
+    ) -> io::Result<DiscoveryScanOutcome> {
+        let mut admission = lane::Admission::new(0);
+        for root in index.roots.clone() {
+            for artifact in discover_artifacts(&root.path, false)?.artifacts {
+                let _ = admission
+                    .admit_pane_artifact(root.provider, &root.path.join(artifact.relative_path));
+            }
+        }
+        index.scan_admitted(
+            parser,
+            interner,
+            &admission,
+            &mut lane::AdmissionIndex::new(),
+            &ProviderDiagnostics::default(),
+        )
+    }
+
     #[test]
     fn bootstrap_skips_non_structural_first_line_and_obeys_caps() {
         let directory = tempfile::tempdir().unwrap();
+        let session_file = format!("{CLAUDE_FIXTURE_A}.jsonl");
         fs::write(
-            directory.path().join("session.jsonl"),
+            directory.path().join(&session_file),
             b"last-prompt\nstruct:thread-1\nignored\n",
         )
         .unwrap();
@@ -1896,13 +2184,13 @@ mod tests {
         let mut parser = LineParser { calls: 0 };
         let mut interner = PathInterner::default();
 
-        index.scan(&mut parser, &mut interner).unwrap();
+        scan_admitted_fixture(&mut index, &mut parser, &mut interner).unwrap();
 
         assert_eq!(parser.calls, 2);
         assert_eq!(
             index.resolve(Provider::Claude, "thread-1").unwrap(),
             &DiscoveredIdentity {
-                path: directory.path().join("session.jsonl"),
+                path: directory.path().join(session_file),
                 parent_thread_id: Some("parent-1".to_owned())
             }
         );
@@ -1910,9 +2198,11 @@ mod tests {
         let capped = tempfile::tempdir().unwrap();
         let mut records = vec![b"noise\n".to_vec(); BOOTSTRAP_MAX_RECORDS];
         records.push(b"struct:too-late\n".to_vec());
-        fs::write(capped.path().join("record-cap.jsonl"), records.concat()).unwrap();
+        fs::write(capped.path().join(CODEX_FIXTURE), records.concat()).unwrap();
         fs::write(
-            capped.path().join("byte-cap.jsonl"),
+            capped
+                .path()
+                .join("rollout-byte-cap-44444444-4444-4444-8444-444444444444.jsonl"),
             [
                 vec![b'x'; BOOTSTRAP_MAX_BYTES],
                 b"\nstruct:past-byte-cap\n".to_vec(),
@@ -1928,9 +2218,7 @@ mod tests {
         let mut capped_parser = LineParser { calls: 0 };
         let mut capped_interner = PathInterner::default();
 
-        capped_index
-            .scan(&mut capped_parser, &mut capped_interner)
-            .unwrap();
+        scan_admitted_fixture(&mut capped_index, &mut capped_parser, &mut capped_interner).unwrap();
 
         assert!(capped_index.resolve(Provider::Codex, "too-late").is_none());
         assert!(
@@ -1944,7 +2232,11 @@ mod tests {
     fn discovery_filters_artifacts_and_preserves_path_ids() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("subagents")).unwrap();
-        fs::write(directory.path().join("main.jsonl"), b"struct:main\n").unwrap();
+        fs::write(
+            directory.path().join(format!("{CLAUDE_FIXTURE_A}.jsonl")),
+            b"struct:main\n",
+        )
+        .unwrap();
         fs::write(directory.path().join("ignored.txt"), b"struct:no\n").unwrap();
         fs::write(
             directory.path().join("subagents/agent.meta.json"),
@@ -1959,9 +2251,9 @@ mod tests {
         let mut parser = LineParser { calls: 0 };
         let mut interner = PathInterner::default();
 
-        index.scan(&mut parser, &mut interner).unwrap();
+        scan_admitted_fixture(&mut index, &mut parser, &mut interner).unwrap();
         let original_id = index.files()[0].path_id;
-        index.scan(&mut parser, &mut interner).unwrap();
+        scan_admitted_fixture(&mut index, &mut parser, &mut interner).unwrap();
 
         assert_eq!(index.files().len(), 1);
         assert_eq!(index.files()[0].path_id, original_id);
@@ -1969,11 +2261,46 @@ mod tests {
     }
 
     #[test]
+    fn scan_admitted_never_bootstraps_an_unadmitted_fixture() {
+        let directory = tempfile::tempdir().unwrap();
+        let admitted = directory.path().join(format!("{CLAUDE_FIXTURE_A}.jsonl"));
+        let stranger = directory.path().join(format!("{CLAUDE_FIXTURE_B}.jsonl"));
+        fs::write(&admitted, b"struct:admitted\n").unwrap();
+        fs::write(&stranger, b"struct:stranger\n").unwrap();
+        let mut index = DiscoveryIndex::new(vec![DiscoveryRoot {
+            provider: Provider::Claude,
+            path: directory.path().to_path_buf(),
+        }])
+        .unwrap();
+        let mut admission = lane::Admission::new(0);
+        assert!(admission.admit_pane_artifact(Provider::Claude, &admitted));
+        let mut parser = LineParser { calls: 0 };
+
+        index
+            .scan_admitted(
+                &mut parser,
+                &mut PathInterner::default(),
+                &admission,
+                &mut lane::AdmissionIndex::new(),
+                &ProviderDiagnostics::default(),
+            )
+            .unwrap();
+
+        assert_eq!(parser.calls, 1);
+        assert_eq!(index.files().len(), 1);
+        assert_eq!(
+            index.files()[0].relative_path,
+            Path::new(&format!("{CLAUDE_FIXTURE_A}.jsonl"))
+        );
+        assert!(index.resolve(Provider::Claude, "stranger").is_none());
+    }
+
+    #[test]
     fn same_provider_files_in_different_roots_use_distinct_path_ids_for_freshness() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        fs::write(first.path().join("session.jsonl"), b"struct:first\n").unwrap();
-        fs::write(second.path().join("session.jsonl"), b"struct:second\n").unwrap();
+        fs::write(first.path().join(CODEX_FIXTURE), b"struct:first\n").unwrap();
+        fs::write(second.path().join(CODEX_FIXTURE), b"struct:second\n").unwrap();
         let mut first_index = DiscoveryIndex::new(vec![DiscoveryRoot {
             provider: Provider::Codex,
             path: first.path().to_path_buf(),
@@ -1986,8 +2313,8 @@ mod tests {
         .unwrap();
         let mut parser = LineParser { calls: 0 };
         let mut interner = PathInterner::default();
-        first_index.scan(&mut parser, &mut interner).unwrap();
-        second_index.scan(&mut parser, &mut interner).unwrap();
+        scan_admitted_fixture(&mut first_index, &mut parser, &mut interner).unwrap();
+        scan_admitted_fixture(&mut second_index, &mut parser, &mut interner).unwrap();
         let first_path_id = first_index.files()[0].path_id;
         let second_path_id = second_index.files()[0].path_id;
 
@@ -2028,10 +2355,10 @@ mod tests {
         .unwrap();
         let mut parser = LineParser { calls: 0 };
         let mut interner = PathInterner::default();
-        index.scan(&mut parser, &mut interner).unwrap();
+        scan_admitted_fixture(&mut index, &mut parser, &mut interner).unwrap();
 
         fs::remove_file(&path).unwrap();
-        index.scan(&mut parser, &mut interner).unwrap();
+        scan_admitted_fixture(&mut index, &mut parser, &mut interner).unwrap();
 
         assert!(!index.baseline().contained(directory.path(), relative));
     }
@@ -2135,6 +2462,10 @@ mod tests {
 
     fn event_kind(event: ProviderEvent) -> String {
         match event {
+            ProviderEvent::Synthesized(_) => "synthesized".to_owned(),
+            ProviderEvent::RunLiveness { .. } => "liveness".to_owned(),
+            ProviderEvent::LaneClose { .. } => "lane-close".to_owned(),
+            ProviderEvent::Telemetry { .. } => "telemetry".to_owned(),
             ProviderEvent::Activity { activity, .. } => activity.event_kind.unwrap(),
             ProviderEvent::SessionResolved {
                 agent_thread_id, ..

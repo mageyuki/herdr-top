@@ -272,6 +272,17 @@ impl NodeKey {
             | Self::UnattachedGroup => None,
         }
     }
+
+    /// Ignores a run's hosting pane so parent expiry does not churn collapse membership.
+    pub(crate) fn collapse_key(&self) -> Self {
+        match self {
+            Self::Run { run_id, .. } => Self::Run {
+                run_id: *run_id,
+                pane_id: None,
+            },
+            _ => self.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -353,6 +364,7 @@ pub(crate) struct AppState {
     filter_query: String,
     filter_draft: Option<String>,
     overlay: Option<Overlay>,
+    summary_session_wide: bool,
     overlay_scroll: AtomicUsize,
     overlay_scroll_max: AtomicUsize,
     safe_warning: Option<&'static str>,
@@ -416,6 +428,14 @@ impl AppState {
 
     pub(super) const fn overlay(&self) -> Option<Overlay> {
         self.overlay
+    }
+
+    pub(super) const fn summary_scope(&self) -> super::projection::SummaryScope {
+        if self.summary_session_wide {
+            super::projection::SummaryScope::Session
+        } else {
+            super::projection::SummaryScope::SelectionWorkspace
+        }
     }
 
     pub(super) fn overlay_scroll(&self) -> usize {
@@ -490,7 +510,7 @@ impl AppState {
 
     #[cfg(test)]
     fn is_collapsed(&self, key: &NodeKey) -> bool {
-        self.collapsed.contains(key)
+        self.collapsed.contains(&key.collapse_key())
     }
 
     #[cfg(test)]
@@ -509,6 +529,7 @@ fn default_diagnostics() -> RuntimeDiagnosticsSnapshot {
         persistence_counters: PersistenceCounters::default(),
         controller_counters: ControllerCounterSnapshot::default(),
         enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
+        provider_counters: crate::diagnostics::ProviderCounterSnapshot::default(),
         source_coverage: Vec::new(),
         dangling_announcement_components: 0,
         first_failure_log: OccurrenceLogStatus::NotAttempted,
@@ -786,6 +807,7 @@ impl App {
             }
             KeyCode::Char('s') if key.modifiers.is_empty() => {
                 self.state.overlay = Some(Overlay::Summary);
+                self.state.summary_session_wide = false;
                 self.state.reset_overlay_scroll();
                 LoopControl::Continue
             }
@@ -965,6 +987,10 @@ impl App {
                 // Modifier-blind closing stays local because it is a reversible UI-only toggle.
                 self.state.overlay = None;
             }
+            Overlay::Summary if code == KeyCode::Char('w') => {
+                self.state.summary_session_wide = !self.state.summary_session_wide;
+                self.state.reset_overlay_scroll();
+            }
             Overlay::Help | Overlay::Detail | Overlay::Summary => match code {
                 KeyCode::Up => self.state.scroll_overlay_up(),
                 KeyCode::Down => self.state.scroll_overlay_down(),
@@ -1031,10 +1057,11 @@ impl App {
         }
         self.state.follow = false;
         self.state.selection_reason = None;
-        let collapsed = if self.state.collapsed.remove(&key) {
+        let collapse_key = key.collapse_key();
+        let collapsed = if self.state.collapsed.remove(&collapse_key) {
             false
         } else {
-            self.state.collapsed.insert(key);
+            self.state.collapsed.insert(collapse_key);
             true
         };
         let new_rows = self.rebuild_rows();
@@ -1050,7 +1077,7 @@ impl App {
         let Some(selected) = self.state.selected.clone() else {
             return;
         };
-        if self.state.collapsed.contains(&selected) {
+        if self.state.collapsed.contains(&selected.collapse_key()) {
             self.toggle_collapse(selected);
             return;
         }
@@ -1081,7 +1108,7 @@ impl App {
             return;
         };
         let depth = rows[index].depth;
-        let expanded_branch = !self.state.collapsed.contains(&selected)
+        let expanded_branch = !self.state.collapsed.contains(&selected.collapse_key())
             && rows
                 .get(index.saturating_add(1))
                 .is_some_and(|next| next.depth > depth);
@@ -1260,6 +1287,18 @@ impl App {
             self.state.selection_reason = (survivor_id != old_run_id)
                 .then_some(SelectionReason::Merged)
                 .or(reason_hint);
+            return;
+        }
+
+        // A candidate already present in the old rows is a separate occurrence that survived;
+        // only a newly introduced key represents this occurrence being re-parented.
+        if let Some(run_id) = selected.run_id()
+            && let Some(row) = preferred_run_row(new_rows, run_id, &selected)
+            && !old_rows.iter().any(|old_row| old_row.key == row.key)
+        {
+            let replacement = row.key.clone();
+            self.set_selection(Some(replacement));
+            self.state.selection_reason = None;
             return;
         }
 
@@ -1634,6 +1673,7 @@ mod tests {
         DurabilityDisposition, PersistenceFailure, PersistenceFailureCode, PersistenceOperation,
         PersistencePhase, PersistenceStatus,
     };
+    use crate::tui::projection::SummaryScope;
 
     fn run_id(value: &str) -> RunId {
         RunId::parse(value).unwrap()
@@ -1865,6 +1905,17 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         assert_eq!(app.state().overlay(), Some(Overlay::Summary));
+        assert_eq!(
+            app.state().summary_scope(),
+            SummaryScope::SelectionWorkspace
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert_eq!(app.state().summary_scope(), SummaryScope::Session);
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert_eq!(
+            app.state().summary_scope(),
+            SummaryScope::SelectionWorkspace
+        );
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.state().overlay_scroll(), 1);
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
@@ -1876,6 +1927,8 @@ mod tests {
         assert_eq!(app.state().overlay(), Some(Overlay::Summary));
         assert_eq!(app.state().overlay_scroll(), 0);
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.state().overlay(), None);
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
         assert_eq!(app.state().overlay(), None);
     }
 
@@ -1929,15 +1982,17 @@ mod tests {
         let lines = render_lines(&app, 160, 18);
         let screen = lines.join("\n");
         assert!(screen.contains(" Summary "));
-        assert!(screen.contains("worker kind | model | runs | live | total | mean | tok | tok/s"));
+        assert!(screen.contains("worker kind | runs | live | total | mean | tok | mean tok/s"));
+        assert!(screen.contains("model | runs | live | total | mean | tok | mean tok/s"));
         let data_rows = lines
             .iter()
-            .filter(|line| line.contains("model-alpha") || line.contains("model-beta"))
+            .filter(|line| line.contains("claude-code |") || line.contains("Codex |"))
             .collect::<Vec<_>>();
         assert_eq!(data_rows.len(), 2, "{screen}");
         assert!(data_rows.iter().all(|line| line.contains(" | - | -")));
-        assert!(screen.contains("claude-code | model-alpha | 1 | 0 | 01m00s | 01m00s | - | -"));
-        assert!(screen.contains("Codex | model-beta | 1 | 1 | 00s | - | - | -"));
+        assert!(screen.contains("claude-code | 1 | 0 | 01m00s | 01m00s | - | -"));
+        assert!(screen.contains("Codex | 1 | 1 | 00s | - | - | -"));
+        assert!(screen.contains("unknown | 2 | 1 | 01m00s | 01m00s | - | -"));
     }
 
     #[test]
@@ -2041,6 +2096,7 @@ mod tests {
             persistence_counters: PersistenceCounters::default(),
             controller_counters: ControllerCounterSnapshot::default(),
             enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
+            provider_counters: crate::diagnostics::ProviderCounterSnapshot::default(),
             source_coverage: Vec::new(),
             dangling_announcement_components: 0,
             first_failure_log: OccurrenceLogStatus::NotAttempted,
@@ -2393,6 +2449,129 @@ mod tests {
         assert!(!manual_missing.is_following());
         assert_eq!(manual_missing.selected_run_id(), Some(first));
         assert_eq!(manual_missing.state().selection_reason(), None);
+    }
+
+    #[test]
+    fn selection_survives_parent_expiry_rekey() {
+        let selected_run = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let neighbor_run = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let initial = model_with_runs(&[
+            (selected_run, "selected", 1, TaskState::Running),
+            (neighbor_run, "neighbor", 2, TaskState::Running),
+        ]);
+        let mut expired = initial.clone();
+        expired.remove_pane("pane");
+        let old_key = NodeKey::Run {
+            run_id: selected_run,
+            pane_id: Some("pane".to_owned()),
+        };
+        let new_key = NodeKey::Run {
+            run_id: selected_run,
+            pane_id: None,
+        };
+        let neighbor_key = NodeKey::Run {
+            run_id: neighbor_run,
+            pane_id: None,
+        };
+        let (mut app, model_sender) = app_with_model(initial);
+        app.state.follow = false;
+        app.set_selection(Some(old_key.clone()));
+        assert!(
+            view::build_rows(app.model(), app.state())
+                .iter()
+                .any(|row| row.key == old_key),
+            "the selected run must start nested under its pane"
+        );
+
+        model_sender.send(Arc::new(expired)).unwrap();
+        app.refresh();
+
+        let new_rows = view::build_rows(app.model(), app.state());
+        assert!(
+            new_rows.iter().any(|row| row.key == new_key),
+            "the same run must remain visible under the Unattached group"
+        );
+        assert_eq!(app.state().selected(), Some(&new_key));
+        assert_eq!(
+            app.state().selected().and_then(NodeKey::run_id),
+            Some(selected_run)
+        );
+        assert_eq!(app.state().selection_reason(), None);
+        assert_ne!(app.state().selected(), Some(&neighbor_key));
+        assert_ne!(app.state().selected(), new_rows.first().map(|row| &row.key));
+        assert!(
+            !matches!(
+                app.state().selected(),
+                Some(NodeKey::Session)
+                    | Some(NodeKey::Workspace(_))
+                    | Some(NodeKey::Tab(_))
+                    | Some(NodeKey::Pane(_))
+            ),
+            "selection must not fall back to an ancestor"
+        );
+    }
+
+    #[test]
+    fn collapse_survives_parent_expiry_rekey() {
+        let run = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut initial = model_with_runs(&[(run, "run", 1, TaskState::Running)]);
+        initial.insert_agent_node(AgentNode {
+            agent_node_id: "agent-child".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some("agent-native".to_owned()),
+            task_run_id: run,
+            display_ordinal: DisplayOrdinal::new(2),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Working),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
+        });
+        let mut expired = initial.clone();
+        expired.remove_pane("pane");
+        let old_key = NodeKey::Run {
+            run_id: run,
+            pane_id: Some("pane".to_owned()),
+        };
+        let new_key = NodeKey::Run {
+            run_id: run,
+            pane_id: None,
+        };
+        let new_agent_key = NodeKey::Agent {
+            agent_node_id: "agent-child".to_owned(),
+            pane_id: None,
+        };
+        let old_agent_key = NodeKey::Agent {
+            agent_node_id: "agent-child".to_owned(),
+            pane_id: Some("pane".to_owned()),
+        };
+        let (mut app, model_sender) = app_with_model(initial);
+        app.state.follow = false;
+        app.set_selection(Some(old_key.clone()));
+        assert!(
+            view::build_rows(app.model(), app.state())
+                .iter()
+                .any(|row| row.key == old_agent_key),
+            "the run must begin as a collapsible branch"
+        );
+        app.toggle_collapse(old_key.clone());
+        assert!(app.state().is_collapsed(&old_key));
+
+        model_sender.send(Arc::new(expired)).unwrap();
+        app.refresh();
+
+        assert_eq!(app.state().selected(), Some(&new_key));
+        assert!(app.state().is_collapsed(&new_key));
+        assert!(
+            !view::build_rows(app.model(), app.state())
+                .iter()
+                .any(|row| row.key == new_agent_key),
+            "the re-keyed run's child must remain hidden"
+        );
     }
 
     #[test]
@@ -2767,6 +2946,7 @@ mod tests {
                 accept_failures: 18,
             },
             enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
+            provider_counters: crate::diagnostics::ProviderCounterSnapshot::default(),
             source_coverage: vec![
                 SourceCoverageSnapshot {
                     source: DiagnosticSource::Herdr,
@@ -3546,7 +3726,7 @@ mod tests {
                 pane_id: None,
             })
         );
-        assert!(render(&app).contains("Selected: first first"));
+        assert!(render(&app).contains("Selected: ● first first"));
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.state().view_mode(), ViewMode::ExecutionTree);
@@ -3796,7 +3976,7 @@ mod tests {
         let following_rows = render_lines(&following, 100, 14);
         let following_view = following_rows[3..9].join("\n");
         assert!(following_view.contains("Dependency DAG"));
-        assert!(!following_view.contains("> run-0 run-0"));
+        assert!(!following_view.contains("> ● run-0 run-0"));
         assert!(following_view.contains("run-7 run-7"));
 
         let (mut manual, _sender) = app_with_model(edgeful_model());
@@ -3808,7 +3988,7 @@ mod tests {
         manual.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let manual_rows = render_lines(&manual, 100, 14);
         let manual_view = manual_rows[3..9].join("\n");
-        assert!(manual_view.contains("> run-0 run-0"));
+        assert!(manual_view.contains("> ● run-0 run-0"));
     }
 
     #[test]

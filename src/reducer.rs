@@ -1,6 +1,6 @@
 //! T7 reducer state machines, ordinal allocator, and gap reconciliation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -250,6 +250,8 @@ pub struct ControllerDiagnosticDeltas {
 pub struct MaterializedDelta {
     pub post_model: DomainModel,
     pub post_next_ordinal: i64,
+    pub post_terminal_event_sources: HashMap<RunId, String>,
+    pub post_non_lane_task_state_runs: HashSet<RunId>,
     pub diagnostic_deltas: ControllerDiagnosticDeltas,
     pub batch: PersistBatch,
 }
@@ -266,6 +268,8 @@ pub struct Reducer {
     model: DomainModel,
     next_ordinal: i64,
     next_ingest_seq: Option<i64>,
+    terminal_event_sources: HashMap<RunId, String>,
+    non_lane_task_state_runs: HashSet<RunId>,
     publisher: watch::Sender<Arc<DomainModel>>,
     operator: OperatorProjection,
     #[cfg(test)]
@@ -327,6 +331,8 @@ impl Reducer {
                 model,
                 next_ordinal: restored.next_ordinal,
                 next_ingest_seq: restored.next_ingest_seq,
+                terminal_event_sources: HashMap::new(),
+                non_lane_task_state_runs: HashSet::new(),
                 publisher,
                 operator,
                 #[cfg(test)]
@@ -420,6 +426,8 @@ impl Reducer {
         // increment5-workload-harness: end observed apply scope start
         let original_model = self.model.clone();
         let original_next_ordinal = self.next_ordinal;
+        let original_terminal_event_sources = self.terminal_event_sources.clone();
+        let original_non_lane_task_state_runs = self.non_lane_task_state_runs.clone();
         let mut persist = Vec::new();
         for event in events {
             match self.apply_inner(event) {
@@ -427,11 +435,15 @@ impl Reducer {
                 Err(ReducerError::BindingConflict(conflict)) => {
                     self.model = original_model;
                     self.next_ordinal = original_next_ordinal;
+                    self.terminal_event_sources = original_terminal_event_sources;
+                    self.non_lane_task_state_runs = original_non_lane_task_state_runs;
                     return Ok(ApplyOutcome::DroppedBindingConflict(conflict));
                 }
                 Err(error) => {
                     self.model = original_model;
                     self.next_ordinal = original_next_ordinal;
+                    self.terminal_event_sources = original_terminal_event_sources;
+                    self.non_lane_task_state_runs = original_non_lane_task_state_runs;
                     return Err(error);
                 }
             }
@@ -481,6 +493,162 @@ impl Reducer {
         self.model
             .task_run_by_key(&RunKey::Controller(raw.to_owned()))
             .map(|run| run.run_id)
+    }
+
+    /// Rebuilds transient reducer state from a durable-ledger duplicate during log replay.
+    pub(crate) fn restore_replayed_controller_transients(&mut self, event: &ControllerEvent) {
+        if event.metadata.source != crate::provider::lane::SOURCE_LOG_LANE {
+            return;
+        }
+        let Some(run_id) = self.resolve_controller_run(&event.task_run_id) else {
+            return;
+        };
+        match &event.event {
+            ControllerEventKind::Dispatch { .. } | ControllerEventKind::TaskStarted => {
+                let Some(kind) = event
+                    .metadata
+                    .provider_metadata
+                    .as_ref()
+                    .and_then(|provider| provider.event_kind.as_ref())
+                else {
+                    return;
+                };
+                if self.model.run_kind(&run_id).is_none() && !kind.is_empty() {
+                    self.model.set_run_kind(run_id, kind.clone());
+                    self.publish();
+                }
+            }
+            ControllerEventKind::Complete
+            | ControllerEventKind::Failed
+            | ControllerEventKind::Cancelled => {
+                self.terminal_event_sources
+                    .entry(run_id)
+                    .or_insert_with(|| crate::provider::lane::SOURCE_LOG_LANE.to_owned());
+            }
+            _ => {}
+        }
+    }
+
+    /// Installs terminal-event provenance reconstructed from the durable event read model.
+    pub fn restore_terminal_event_sources(&mut self, mut sources: HashMap<RunId, String>) {
+        sources.retain(|run_id, _| self.model.task_run(run_id).is_some());
+        self.terminal_event_sources = sources;
+    }
+
+    /// Installs non-lane task-state ownership reconstructed from the durable event read model.
+    pub fn restore_non_lane_task_state_runs(&mut self, mut runs: HashSet<RunId>) {
+        runs.retain(|run_id| self.model.task_run(run_id).is_some());
+        self.non_lane_task_state_runs = runs;
+    }
+
+    /// Refreshes one visible, non-terminal run from a provider-log append.
+    ///
+    /// Dismissal is checked before [`TaskRun::touch`] because a non-terminal touch clears it.
+    pub fn touch_run_liveness(&mut self, key: &RunKey, at_ms: i64) -> Vec<PersistOp> {
+        let Some(mut task_run) = self.model.task_run_by_key(key).cloned() else {
+            return Vec::new();
+        };
+        if task_run.dismissed_at_ms.is_some()
+            || task_run.state.is_terminal()
+            || task_run
+                .updated_at_ms
+                .is_some_and(|updated_at_ms| updated_at_ms >= at_ms)
+        {
+            return Vec::new();
+        }
+        Self::touch_task_run(&mut task_run, at_ms);
+        self.model.insert_task_run(task_run.clone());
+        let persist = vec![self.persist_task_run(task_run, at_ms)];
+        self.operator.apply_submission(&persist);
+        self.publish();
+        persist
+    }
+
+    /// Accumulates one lane-deduplicated output-token delta in transient model state.
+    ///
+    /// Telemetry deliberately emits no persistence operations. The provider lane owns usage
+    /// sample deduplication, so this path adds every delta it receives exactly once.
+    #[cfg(test)]
+    pub(crate) fn apply_telemetry(
+        &mut self,
+        key: &RunKey,
+        at_ms: i64,
+        output_tokens: u64,
+        model: Option<String>,
+        effort: Option<String>,
+        sandbox: Option<String>,
+    ) -> Vec<PersistOp> {
+        self.apply_telemetry_with_breakdown(
+            key,
+            at_ms,
+            output_tokens,
+            crate::model::TokenBreakdown::default(),
+            crate::model::TurnAttr {
+                model,
+                effort,
+                sandbox,
+            },
+        )
+    }
+
+    /// Accumulates one lane-deduplicated token sample in transient model state.
+    pub fn apply_telemetry_with_breakdown(
+        &mut self,
+        key: &RunKey,
+        at_ms: i64,
+        output_tokens: u64,
+        token_breakdown: crate::model::TokenBreakdown,
+        attribution: crate::model::TurnAttr,
+    ) -> Vec<PersistOp> {
+        let Some(task_run) = self.model.task_run_by_key(key) else {
+            return Vec::new();
+        };
+        let run_id = task_run.run_id;
+        let retain_turn = matches!(
+            key,
+            RunKey::Native {
+                provider: Provider::Codex,
+                ..
+            }
+        );
+        let telemetry = self.model.telemetry_entry(run_id, at_ms);
+        telemetry.token_breakdown.accumulate(token_breakdown);
+        telemetry.accumulate(
+            output_tokens,
+            attribution.model,
+            attribution.effort,
+            attribution.sandbox,
+            retain_turn,
+        );
+        self.publish();
+        Vec::new()
+    }
+
+    /// Closes one active provider-log run after append inactivity.
+    ///
+    /// This lane-specific path deliberately ignores `has_controller_task_state_event`, which is
+    /// set by synthesized events and makes the observation-close path unsuitable here.
+    pub fn apply_lane_close(&mut self, key: &RunKey, at_ms: i64) -> Vec<PersistOp> {
+        let Some(mut task_run) = self.model.task_run_by_key(key).cloned() else {
+            return Vec::new();
+        };
+        let has_live_execution = self.model.executions().any(|execution| {
+            execution.task_run_id == task_run.run_id && !execution.state.is_terminal()
+        });
+        if task_run.dismissed_at_ms.is_some()
+            || task_run.state.is_terminal()
+            || has_live_execution
+            || self.non_lane_task_state_runs.contains(&task_run.run_id)
+        {
+            return Vec::new();
+        }
+        task_run.state = TaskState::EndedUnknown;
+        Self::touch_task_run(&mut task_run, at_ms);
+        self.model.insert_task_run(task_run.clone());
+        let persist = vec![self.persist_task_run(task_run, at_ms)];
+        self.operator.apply_submission(&persist);
+        self.publish();
+        persist
     }
 
     /// Executes the complete Controller mutation sequence on one throwaway clone.
@@ -565,6 +733,8 @@ impl Reducer {
             next_ingest_seq: self.next_ingest_seq,
             event_ledger: Vec::new(),
         });
+        scratch.terminal_event_sources = self.terminal_event_sources.clone();
+        scratch.non_lane_task_state_runs = self.non_lane_task_state_runs.clone();
         if matches!(event.event, ControllerEventKind::Dismiss) && subject_was_unknown {
             metadata.task_run_id = None;
         }
@@ -591,6 +761,8 @@ impl Reducer {
             return Ok(MaterializedDelta {
                 post_model: scratch.model,
                 post_next_ordinal: scratch.next_ordinal,
+                post_terminal_event_sources: scratch.terminal_event_sources,
+                post_non_lane_task_state_runs: scratch.non_lane_task_state_runs,
                 diagnostic_deltas,
                 batch: persist,
             });
@@ -640,6 +812,12 @@ impl Reducer {
             _ => {}
         }
 
+        let allow_lane_reopen = scratch.lane_reopen_allowed(
+            &event.event,
+            subject,
+            &metadata.source,
+            metadata.timestamp_ms,
+        );
         let mut diagnostic_deltas = validate_controller_transition(
             &scratch.model,
             &event.event,
@@ -647,8 +825,9 @@ impl Reducer {
             subject_was_unknown,
             metadata.execution_parent.as_ref(),
             metadata.dependency.as_ref(),
+            allow_lane_reopen,
         )?;
-        scratch.apply_controller_metadata(&metadata, &mut persist);
+        scratch.apply_controller_metadata(&metadata, allow_lane_reopen, &mut persist);
         scratch
             .apply_event_body(&normalized, &metadata, &mut persist)
             .map_err(|_| RejectReason::Conflict)?;
@@ -659,6 +838,7 @@ impl Reducer {
                 ReducerError::OrdinalExhausted => RejectReason::Conflict,
             })?;
         scratch.persist_event_execution(&normalized, metadata.receipt_time_ms, &mut persist);
+        scratch.update_terminal_event_source(&normalized);
         persist.push(PersistOp::RecordEvent {
             event: Box::new(normalized),
             seen_at_ms: metadata.receipt_time_ms,
@@ -677,6 +857,8 @@ impl Reducer {
         Ok(MaterializedDelta {
             post_model: scratch.model,
             post_next_ordinal: scratch.next_ordinal,
+            post_terminal_event_sources: scratch.terminal_event_sources,
+            post_non_lane_task_state_runs: scratch.non_lane_task_state_runs,
             diagnostic_deltas,
             batch: persist,
         })
@@ -713,6 +895,8 @@ impl Reducer {
 
         self.model = delta.post_model;
         self.next_ordinal = delta.post_next_ordinal;
+        self.terminal_event_sources = delta.post_terminal_event_sources;
+        self.non_lane_task_state_runs = delta.post_non_lane_task_state_runs;
         self.next_ingest_seq = ingest_seq.checked_add(1);
         self.apply_controller_diagnostic_deltas(delta.diagnostic_deltas);
         self.operator.apply_submission(&batch);
@@ -735,10 +919,19 @@ impl Reducer {
         let mut persist = Vec::new();
 
         self.ensure_event_runs(&event, &metadata, &mut persist)?;
-        self.apply_controller_metadata(&metadata, &mut persist);
+        let allow_lane_reopen = match &event {
+            NormalizedEvent::ControllerEvent { event, .. } => {
+                metadata.task_run_id.is_some_and(|run_id| {
+                    self.lane_reopen_allowed(event, run_id, &metadata.source, metadata.timestamp_ms)
+                })
+            }
+            _ => false,
+        };
+        self.apply_controller_metadata(&metadata, allow_lane_reopen, &mut persist);
         self.apply_event_body(&event, &metadata, &mut persist)?;
         self.apply_identity_metadata(&event, &metadata, &mut persist)?;
         self.persist_event_execution(&event, metadata.receipt_time_ms, &mut persist);
+        self.update_terminal_event_source(&event);
         persist.push(PersistOp::RecordEvent {
             event: Box::new(event),
             seen_at_ms: metadata.receipt_time_ms,
@@ -787,6 +980,9 @@ impl Reducer {
         pre_gap_runs.dedup();
 
         for mut execution in pre_gap_executions {
+            if execution.state.is_terminal() {
+                continue;
+            }
             execution.state = ExecState::Ended;
             self.model.insert_execution(execution.clone());
             persist.push(persist_execution(execution, now_ms));
@@ -808,8 +1004,19 @@ impl Reducer {
                 (reference.kind == AgentSessionReferenceKind::Id && !reference.value.is_empty())
                     .then(|| reference.value.clone())
             });
-            let existing_run = match (provider, native_sid.as_deref()) {
-                (Some(provider), Some(sid)) => self.run_for_native_session(provider, sid),
+            let native_path = pane.agent_session.as_ref().and_then(|reference| {
+                (reference.kind == AgentSessionReferenceKind::Path && !reference.value.is_empty())
+                    .then_some(reference.value.as_str())
+            });
+            let existing_run = match (provider, native_sid.as_deref(), native_path) {
+                (Some(provider), Some(sid), _) => self.run_for_native_session(provider, sid),
+                (Some(provider), None, Some(path)) => self
+                    .model
+                    .task_run_by_key(&RunKey::NativePath {
+                        provider,
+                        path: path.to_owned(),
+                    })
+                    .map(|task_run| task_run.run_id),
                 _ => None,
             };
             let run_id = match existing_run {
@@ -817,18 +1024,25 @@ impl Reducer {
                 None => self.insert_snapshot_run(
                     provider,
                     native_sid.as_deref(),
-                    pane.agent_session.as_ref().and_then(|reference| {
-                        (reference.kind == AgentSessionReferenceKind::Path
-                            && !reference.value.is_empty())
-                        .then_some(reference.value.as_str())
-                    }),
+                    native_path,
                     &pane.terminal_id,
                     now_ms,
                     &mut persist,
                 )?,
             };
+            let existing_execution_id = self
+                .model
+                .executions()
+                .filter(|execution| {
+                    execution.pane_id.as_str() == pane.pane_id.as_str()
+                        && execution.terminal_id.as_str() == pane.terminal_id.as_str()
+                        && execution.task_run_id == run_id
+                })
+                .min_by_key(|execution| execution.execution_id.as_str())
+                .map(|execution| execution.execution_id.clone());
             let token = RunId::new().to_string();
-            let execution_id = format!("gap-execution-{token}");
+            let execution_id =
+                existing_execution_id.unwrap_or_else(|| format!("gap-execution-{token}"));
             let execution = Execution {
                 execution_id: execution_id.clone(),
                 pane_id: pane.pane_id,
@@ -843,20 +1057,29 @@ impl Reducer {
             }
 
             if let Some(provider) = provider {
-                let existing_node = native_sid
-                    .as_deref()
-                    .filter(|sid| !sid.is_empty())
-                    .and_then(|sid| {
-                        self.model
-                            .agent_nodes()
-                            .filter(|node| {
-                                node.task_run_id == run_id
-                                    && node.provider == provider
-                                    && node.native_session_id.as_deref() == Some(sid)
-                            })
-                            .min_by_key(|node| node.agent_node_id.as_str())
-                            .cloned()
-                    });
+                let existing_node = match native_sid.as_deref().filter(|sid| !sid.is_empty()) {
+                    Some(sid) => self
+                        .model
+                        .agent_nodes()
+                        .filter(|node| {
+                            node.task_run_id == run_id
+                                && node.provider == provider
+                                && node.native_session_id.as_deref() == Some(sid)
+                        })
+                        .min_by_key(|node| node.agent_node_id.as_str())
+                        .cloned(),
+                    None => self
+                        .model
+                        .agent_nodes()
+                        .filter(|node| node.task_run_id == run_id && node.provider == provider)
+                        .min_by_key(|node| {
+                            (
+                                node.native_session_id.is_none(),
+                                node.agent_node_id.as_str(),
+                            )
+                        })
+                        .cloned(),
+                };
                 let agent_node = match existing_node {
                     Some(node) => node,
                     None => AgentNode {
@@ -1077,14 +1300,31 @@ impl Reducer {
         Ok(())
     }
 
-    fn apply_controller_metadata(&mut self, metadata: &EventMetadata, persist: &mut PersistBatch) {
+    fn apply_controller_metadata(
+        &mut self,
+        metadata: &EventMetadata,
+        allow_lane_reopen: bool,
+        persist: &mut PersistBatch,
+    ) {
         if let (Some(run_id), Some(target)) = (metadata.task_run_id, metadata.task_state)
             && let Some(mut task_run) = self.model.task_run(&run_id).cloned()
         {
             task_run.has_controller_task_state_event = true;
-            task_run.state =
-                controller_task_transition(task_run.state, &metadata.source_event_type, target);
-            if task_run.subject.is_none()
+            if metadata.source != crate::provider::lane::SOURCE_LOG_LANE {
+                self.non_lane_task_state_runs.insert(run_id);
+            }
+            task_run.state = controller_task_transition(
+                task_run.state,
+                &metadata.source_event_type,
+                target,
+                allow_lane_reopen,
+            );
+            let lane_claude_root_subject = metadata.source
+                == crate::provider::lane::SOURCE_LOG_LANE
+                && metadata.source_event_type == "progress"
+                && metadata.provider == Some(Provider::Claude)
+                && metadata.native_session_id.is_some();
+            if (task_run.subject.is_none() || lane_claude_root_subject)
                 && let Some(label) = metadata.label.as_ref().filter(|label| !label.is_empty())
             {
                 task_run.subject = Some(label.clone());
@@ -1112,6 +1352,58 @@ impl Reducer {
         }
     }
 
+    fn lane_reopen_allowed(
+        &self,
+        event: &ControllerEventKind,
+        run_id: RunId,
+        source: &str,
+        source_timestamp_ms: i64,
+    ) -> bool {
+        // Source time is otherwise display-only. Replay receipt time is "now", so this narrow
+        // comparison is the only way to distinguish a genuine resume from replayed history.
+        let start_follows_completion = self.model.task_run(&run_id).is_some_and(|run| {
+            run.state == TaskState::Completed
+                && run
+                    .finished_at_ms
+                    .is_some_and(|finished_at_ms| source_timestamp_ms > finished_at_ms)
+        });
+        matches!(event, ControllerEventKind::TaskStarted)
+            && source == crate::provider::lane::SOURCE_LOG_LANE
+            && start_follows_completion
+            && self
+                .terminal_event_sources
+                .get(&run_id)
+                .is_some_and(|terminal_source| {
+                    terminal_source == crate::provider::lane::SOURCE_LOG_LANE
+                })
+    }
+
+    fn update_terminal_event_source(&mut self, event: &NormalizedEvent) {
+        let NormalizedEvent::ControllerEvent { metadata, event } = event else {
+            return;
+        };
+        let Some(run_id) = metadata.task_run_id else {
+            return;
+        };
+        match event {
+            ControllerEventKind::Complete
+            | ControllerEventKind::Failed
+            | ControllerEventKind::Cancelled => {
+                self.terminal_event_sources
+                    .insert(run_id, metadata.source.clone());
+            }
+            ControllerEventKind::TaskStarted
+                if self
+                    .model
+                    .task_run(&run_id)
+                    .is_some_and(|run| !run.state.is_terminal()) =>
+            {
+                self.terminal_event_sources.remove(&run_id);
+            }
+            _ => {}
+        }
+    }
+
     fn apply_event_body(
         &mut self,
         event: &NormalizedEvent,
@@ -1119,7 +1411,19 @@ impl Reducer {
         persist: &mut PersistBatch,
     ) -> Result<(), ReducerError> {
         match event {
-            NormalizedEvent::ControllerEvent { .. } => {}
+            NormalizedEvent::ControllerEvent { event, .. } => {
+                if matches!(
+                    event,
+                    ControllerEventKind::Dispatch { .. } | ControllerEventKind::TaskStarted
+                ) && let Some(run_id) = metadata.task_run_id
+                    && let Some(kind) = metadata
+                        .provider_metadata
+                        .as_ref()
+                        .and_then(|provider| provider.event_kind.as_ref())
+                {
+                    self.model.set_run_kind(run_id, kind.clone());
+                }
+            }
             NormalizedEvent::TopologyUpsert { entity, .. } => match entity {
                 TopologyEntity::Workspace(workspace) => {
                     let display_ordinal =
@@ -2030,6 +2334,7 @@ fn validate_controller_transition(
     subject_was_unknown: bool,
     execution_edge: Option<&ExecutionEdge>,
     dependency_edge: Option<&DependencyEdge>,
+    allow_lane_reopen: bool,
 ) -> Result<ControllerDiagnosticDeltas, RejectReason> {
     let mut deltas = ControllerDiagnosticDeltas::default();
     let state = model
@@ -2055,7 +2360,8 @@ fn validate_controller_transition(
             if matches!(
                 state,
                 TaskState::Completed | TaskState::Failed | TaskState::Cancelled
-            ) {
+            ) && !allow_lane_reopen
+            {
                 return Err(RejectReason::StaleEvent);
             }
         }
@@ -2200,10 +2506,12 @@ fn controller_task_transition(
     current: TaskState,
     source_event_type: &str,
     supplied: TaskState,
+    allow_lane_reopen: bool,
 ) -> TaskState {
     match controller_event_kind(source_event_type) {
         LegacyControllerEventKind::Started => match current {
             TaskState::Queued | TaskState::Blocked | TaskState::EndedUnknown => TaskState::Running,
+            TaskState::Completed if allow_lane_reopen => TaskState::Running,
             _ => current,
         },
         LegacyControllerEventKind::Blocked => match current {
@@ -2393,6 +2701,8 @@ fn unix_now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::path::Path;
     use std::sync::Arc;
 
     use crate::diagnostics::RuntimeWriteOutcome;
@@ -2403,14 +2713,19 @@ mod tests {
         EventMetadata, ExecState, Execution, ExecutionEdge, GapKind, MinimalProviderMetadata,
         NormalizedEvent, OperatorCommand, Pane, PaneSnapshot, Provider, ReconcileBatch, RunId,
         RunKey, SharedModel, SnapshotAgent, Tab, TaskRun, TaskState, TopologyEntity,
-        TopologyEntityId, TopologySnapshot, Workspace,
+        TopologyEntityId, TopologySnapshot, TurnAttr, Workspace,
     };
+    use crate::provider::ProviderEvent;
+    use crate::provider::facts::{LogFact, SessionScope};
+    use crate::provider::lane::{Admission, AdmissionIndex, SOURCE_LOG_LANE, Synthesis};
     use crate::store::{
         NativeSessionBinding, PersistOp, PersistTaskRun, RestoredState, WriterClient,
         database_path, open_reader, open_writer, spawn_writer,
     };
 
-    use super::{ApplyOutcome, CommitStagedError, Reducer, ReducerError, RejectReason};
+    use super::{
+        ApplyOutcome, CommitStagedError, Reducer, ReducerError, RejectReason, unix_now_ms,
+    };
 
     #[test]
     fn i4_operator_merge_triggering_record_round_trips_canonical_lineage() {
@@ -2712,6 +3027,870 @@ mod tests {
             state,
         ));
         (model, run_id)
+    }
+
+    #[tokio::test]
+    async fn reopen_only_for_lane_provenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        for (raw_run_id, source) in [
+            ("hook-terminal", "hook"),
+            ("lane-terminal", SOURCE_LOG_LANE),
+        ] {
+            let mut started = controller_event(
+                &format!("{raw_run_id}-started"),
+                raw_run_id,
+                ControllerEventKind::TaskStarted,
+            );
+            started.metadata.source = source.to_owned();
+            commit_controller(&mut reducer, &mut writer, started).await;
+            let mut complete = controller_event(
+                &format!("{raw_run_id}-complete"),
+                raw_run_id,
+                ControllerEventKind::Complete,
+            );
+            complete.metadata.source = source.to_owned();
+            commit_controller(&mut reducer, &mut writer, complete).await;
+        }
+
+        let mut hook_reopen = controller_event(
+            "hook-terminal-reopen",
+            "hook-terminal",
+            ControllerEventKind::TaskStarted,
+        );
+        hook_reopen.metadata.source = SOURCE_LOG_LANE.to_owned();
+        hook_reopen.metadata.timestamp_ms = 21;
+        assert!(matches!(
+            reducer.validate_controller_event(&hook_reopen),
+            Err(RejectReason::StaleEvent)
+        ));
+
+        let mut lane_reopen = controller_event(
+            "lane-terminal-reopen",
+            "lane-terminal",
+            ControllerEventKind::TaskStarted,
+        );
+        lane_reopen.metadata.source = SOURCE_LOG_LANE.to_owned();
+        lane_reopen.metadata.timestamp_ms = 21;
+        let reopened = reducer.validate_controller_event(&lane_reopen).unwrap();
+        let run_id = reducer.resolve_controller_run("lane-terminal").unwrap();
+        assert_eq!(
+            reopened.post_model.task_run(&run_id).unwrap().state,
+            TaskState::Running
+        );
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn lane_reopen_requires_timestamp_strictly_after_finish() {
+        for (case, finished_at_ms, timestamp_ms, expected_state) in [
+            ("before", Some(100), 99, None),
+            ("equal", Some(100), 100, None),
+            ("after", Some(100), 101, Some(TaskState::Running)),
+            ("missing-finish", None, 101, None),
+        ] {
+            let (mut model, run_id) = controller_model(case, TaskState::Completed);
+            let mut run = model.task_run(&run_id).unwrap().clone();
+            run.finished_at_ms = finished_at_ms;
+            model.insert_task_run(run);
+            let (mut reducer, _shared) = Reducer::new(restored(model, 2));
+            reducer.restore_terminal_event_sources(HashMap::from([(
+                run_id,
+                SOURCE_LOG_LANE.to_owned(),
+            )]));
+            let mut reopen = controller_event(
+                &format!("lane-reopen-{case}"),
+                case,
+                ControllerEventKind::TaskStarted,
+            );
+            reopen.metadata.source = SOURCE_LOG_LANE.to_owned();
+            reopen.metadata.timestamp_ms = timestamp_ms;
+
+            let result = reducer.validate_controller_event(&reopen);
+            match expected_state {
+                Some(expected_state) => assert_eq!(
+                    result
+                        .expect("a strictly newer lane start must reopen")
+                        .post_model
+                        .task_run(&run_id)
+                        .unwrap()
+                        .state,
+                    expected_state,
+                    "case {case}"
+                ),
+                None => assert!(
+                    matches!(result, Err(RejectReason::StaleEvent)),
+                    "case {case} unexpectedly reopened"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn replayed_lane_terminal_restores_only_missing_provenance() {
+        for (case, terminal_event) in [
+            ("complete", ControllerEventKind::Complete),
+            ("failed", ControllerEventKind::Failed),
+            ("cancelled", ControllerEventKind::Cancelled),
+        ] {
+            let (mut model, run_id) = controller_model(case, TaskState::Completed);
+            let mut run = model.task_run(&run_id).unwrap().clone();
+            run.finished_at_ms = Some(100);
+            model.insert_task_run(run);
+            let (mut reducer, _shared) = Reducer::new(restored(model, 2));
+            let mut replayed_terminal =
+                controller_event(&format!("replayed-{case}"), case, terminal_event);
+            replayed_terminal.metadata.source = SOURCE_LOG_LANE.to_owned();
+
+            reducer.restore_replayed_controller_transients(&replayed_terminal);
+
+            assert_eq!(
+                reducer
+                    .terminal_event_sources
+                    .get(&run_id)
+                    .map(String::as_str),
+                Some(SOURCE_LOG_LANE),
+                "replayed {case} did not rebuild missing lane provenance"
+            );
+            let mut historical_start = controller_event(
+                &format!("historical-start-after-{case}"),
+                case,
+                ControllerEventKind::TaskStarted,
+            );
+            historical_start.metadata.source = SOURCE_LOG_LANE.to_owned();
+            historical_start.metadata.timestamp_ms = 99;
+            assert!(
+                matches!(
+                    reducer.validate_controller_event(&historical_start),
+                    Err(RejectReason::StaleEvent)
+                ),
+                "rebuilt {case} provenance allowed a historical start to reopen"
+            );
+            let mut resumed_start = controller_event(
+                &format!("resumed-start-after-{case}"),
+                case,
+                ControllerEventKind::TaskStarted,
+            );
+            resumed_start.metadata.source = SOURCE_LOG_LANE.to_owned();
+            resumed_start.metadata.timestamp_ms = 101;
+            assert_eq!(
+                reducer
+                    .validate_controller_event(&resumed_start)
+                    .expect("a new start must use rebuilt lane provenance")
+                    .post_model
+                    .task_run(&run_id)
+                    .unwrap()
+                    .state,
+                TaskState::Running,
+                "replayed {case} did not permit a genuine resume"
+            );
+        }
+
+        let (mut model, run_id) = controller_model("hook", TaskState::Completed);
+        let mut run = model.task_run(&run_id).unwrap().clone();
+        run.finished_at_ms = Some(100);
+        model.insert_task_run(run);
+        let (mut reducer, _shared) = Reducer::new(restored(model, 2));
+        reducer.restore_terminal_event_sources(HashMap::from([(run_id, "hook".to_owned())]));
+        let mut replayed_terminal = controller_event(
+            "replayed-lane-complete",
+            "hook",
+            ControllerEventKind::Complete,
+        );
+        replayed_terminal.metadata.source = SOURCE_LOG_LANE.to_owned();
+
+        reducer.restore_replayed_controller_transients(&replayed_terminal);
+
+        assert_eq!(
+            reducer
+                .terminal_event_sources
+                .get(&run_id)
+                .map(String::as_str),
+            Some("hook"),
+            "log replay overwrote existing hook provenance"
+        );
+        let mut attempted_reopen = controller_event(
+            "hook-reopen-after-lane-replay",
+            "hook",
+            ControllerEventKind::TaskStarted,
+        );
+        attempted_reopen.metadata.source = SOURCE_LOG_LANE.to_owned();
+        attempted_reopen.metadata.timestamp_ms = 101;
+        assert!(matches!(
+            reducer.validate_controller_event(&attempted_reopen),
+            Err(RejectReason::StaleEvent)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reopen_provenance_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+        for (event_id, kind) in [
+            ("restart-lane-started", ControllerEventKind::TaskStarted),
+            ("restart-lane-complete", ControllerEventKind::Complete),
+        ] {
+            let mut event = controller_event(event_id, "restart-lane", kind);
+            event.metadata.source = SOURCE_LOG_LANE.to_owned();
+            event.metadata.timestamp_ms = unix_now_ms();
+            event.metadata.receipt_time_ms = event.metadata.timestamp_ms;
+            commit_controller(&mut reducer, &mut writer, event).await;
+        }
+        lifecycle.shutdown().await.unwrap();
+
+        let store = open_reader(&root).unwrap();
+        let terminal_sources = store.terminal_event_sources().unwrap();
+        let restored = store.load_restored_state().unwrap();
+        let run_id = restored
+            .model
+            .task_run_by_key(&RunKey::Controller("restart-lane".to_owned()))
+            .unwrap()
+            .run_id;
+        assert_eq!(
+            terminal_sources.get(&run_id).map(String::as_str),
+            Some(SOURCE_LOG_LANE)
+        );
+        let finished_at_ms = restored
+            .model
+            .task_run(&run_id)
+            .unwrap()
+            .finished_at_ms
+            .unwrap();
+        let (mut reducer, _shared) = Reducer::new(restored);
+        reducer.restore_terminal_event_sources(terminal_sources);
+        let mut reopen = controller_event(
+            "restart-lane-reopen",
+            "restart-lane",
+            ControllerEventKind::TaskStarted,
+        );
+        reopen.metadata.source = SOURCE_LOG_LANE.to_owned();
+        reopen.metadata.timestamp_ms = finished_at_ms + 1;
+
+        let reopened = reducer.validate_controller_event(&reopen).unwrap();
+        assert_eq!(
+            reopened.post_model.task_run(&run_id).unwrap().state,
+            TaskState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn non_lane_task_state_evidence_survives_restart_and_blocks_lane_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let mut started = controller_event(
+            "restart-hook-started",
+            "restart-hook-managed",
+            ControllerEventKind::TaskStarted,
+        );
+        started.metadata.source = "hook".to_owned();
+        started.metadata.timestamp_ms = unix_now_ms();
+        started.metadata.receipt_time_ms = started.metadata.timestamp_ms;
+        commit_controller(&mut reducer, &mut writer, started).await;
+        lifecycle.shutdown().await.unwrap();
+
+        let store = open_reader(&root).unwrap();
+        let non_lane_runs = store.non_lane_task_state_runs().unwrap();
+        let restored = store.load_restored_state().unwrap();
+        let key = RunKey::Controller("restart-hook-managed".to_owned());
+        let run_id = restored.model.task_run_by_key(&key).unwrap().run_id;
+        assert!(
+            non_lane_runs.contains(&run_id),
+            "restored non-lane runs {non_lane_runs:?} did not contain {run_id}"
+        );
+        let (mut reducer, shared) = Reducer::new(restored);
+        reducer.restore_non_lane_task_state_runs(non_lane_runs);
+
+        assert!(reducer.apply_lane_close(&key, 700).is_empty());
+        assert_eq!(
+            shared.borrow().task_run(&run_id).unwrap().state,
+            TaskState::Running
+        );
+    }
+
+    #[test]
+    fn inactivity_closes_lane_created_runs() {
+        let run_id = RunId::new();
+        let key = RunKey::Controller("lane-created".to_owned());
+        let mut lane_created =
+            run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
+        lane_created.updated_at_ms = Some(100);
+        let mut model = DomainModel::default();
+        model.insert_task_run(lane_created);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        let persist = reducer.apply_lane_close(&key, 700);
+
+        assert_eq!(
+            shared.borrow().task_run(&run_id).unwrap().state,
+            TaskState::EndedUnknown
+        );
+        assert!(matches!(
+            persist.as_slice(),
+            [PersistOp::UpsertTaskRun(value)]
+                if value.task_run.run_id == run_id
+                    && value.task_run.state == TaskState::EndedUnknown
+        ));
+    }
+
+    #[tokio::test]
+    async fn ended_unknown_reopens_on_append_triggered_task_started() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let run_id = RunId::new();
+        let key = RunKey::Controller("lane-resume".to_owned());
+        let mut lane_created =
+            run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
+        lane_created.updated_at_ms = Some(100);
+        let mut model = DomainModel::default();
+        model.insert_task_run(lane_created);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        assert!(!reducer.apply_lane_close(&key, 700).is_empty());
+        assert_eq!(
+            shared.borrow().task_run(&run_id).unwrap().state,
+            TaskState::EndedUnknown
+        );
+
+        let mut append_resume = controller_event(
+            "lane-resume-append",
+            "lane-resume",
+            ControllerEventKind::TaskStarted,
+        );
+        append_resume.metadata.source = SOURCE_LOG_LANE.to_owned();
+        append_resume.metadata.timestamp_ms = 800;
+        append_resume.metadata.receipt_time_ms = 800;
+        commit_controller(&mut reducer, &mut writer, append_resume).await;
+
+        assert_eq!(
+            shared.borrow().task_run(&run_id).unwrap().state,
+            TaskState::Running
+        );
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn lane_close_skips_runs_with_executions() {
+        let run_id = RunId::new();
+        let key = RunKey::Controller("pane-occupied".to_owned());
+        let mut task_run = run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
+        task_run.updated_at_ms = Some(100);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run.clone());
+        model.insert_execution(execution(run_id, "live-pane", ExecState::Working));
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        assert!(reducer.apply_lane_close(&key, 700).is_empty());
+        assert_eq!(shared.borrow().task_run(&run_id), Some(&task_run));
+    }
+
+    #[test]
+    fn lane_close_allows_runs_with_only_terminal_executions() {
+        let run_id = RunId::new();
+        let key = RunKey::Controller("pane-ended".to_owned());
+        let mut task_run = run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
+        task_run.updated_at_ms = Some(100);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        model.insert_execution(execution(run_id, "ended-pane", ExecState::Ended));
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        let persist = reducer.apply_lane_close(&key, 700);
+
+        assert!(!persist.is_empty());
+        assert_eq!(
+            shared.borrow().task_run(&run_id).unwrap().state,
+            TaskState::EndedUnknown
+        );
+    }
+
+    #[test]
+    fn lane_close_skips_runs_with_non_lane_task_state_evidence() {
+        let run_id = RunId::new();
+        let key = RunKey::Controller("hook-managed".to_owned());
+        let mut task_run = run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
+        task_run.updated_at_ms = Some(100);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+        let mut hook_started = metadata("hook-managed-started", 200);
+        hook_started.source = "hook".to_owned();
+        hook_started.source_event_type = "task_started".to_owned();
+        hook_started.task_run_id = Some(run_id);
+        hook_started.task_state = Some(TaskState::Running);
+        reducer
+            .apply(NormalizedEvent::ControllerEvent {
+                metadata: hook_started,
+                event: ControllerEventKind::TaskStarted,
+            })
+            .unwrap();
+
+        assert!(reducer.apply_lane_close(&key, 700).is_empty());
+        assert_eq!(
+            shared.borrow().task_run(&run_id).unwrap().state,
+            TaskState::Running
+        );
+    }
+
+    #[test]
+    fn lane_close_never_touches_terminal_or_dismissed() {
+        let cases = [
+            ("completed", TaskState::Completed, false),
+            ("failed", TaskState::Failed, false),
+            ("cancelled", TaskState::Cancelled, false),
+            ("ended-unknown", TaskState::EndedUnknown, false),
+            ("dismissed", TaskState::Running, true),
+        ];
+        let mut model = DomainModel::default();
+        let mut expected = HashMap::new();
+        let mut keys = Vec::new();
+        for (ordinal, (name, state, dismissed)) in cases.into_iter().enumerate() {
+            let run_id = RunId::new();
+            let key = RunKey::Controller(name.to_owned());
+            let mut task_run =
+                run_with_controller_evidence(run_id, key.clone(), ordinal as i64 + 1, state);
+            task_run.updated_at_ms = Some(100);
+            task_run.finished_at_ms = state.is_terminal().then_some(100);
+            task_run.dismissed_at_ms = dismissed.then_some(110);
+            expected.insert(run_id, task_run.clone());
+            keys.push(key);
+            model.insert_task_run(task_run);
+        }
+        let (mut reducer, shared) = Reducer::new(restored(model, 6));
+
+        for key in keys {
+            assert!(reducer.apply_lane_close(&key, 700).is_empty());
+        }
+
+        let snapshot = shared.borrow();
+        for (run_id, task_run) in expected {
+            assert_eq!(snapshot.task_run(&run_id), Some(&task_run));
+        }
+    }
+
+    #[test]
+    fn liveness_touch_checks_dismissal_first() {
+        let run_id = RunId::new();
+        let key = RunKey::Controller("dismissed-live".to_owned());
+        let mut dismissed =
+            run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
+        dismissed.updated_at_ms = Some(100);
+        dismissed.dismissed_at_ms = Some(110);
+        let expected = dismissed.clone();
+        let mut model = DomainModel::default();
+        model.insert_task_run(dismissed);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        assert!(reducer.touch_run_liveness(&key, 200).is_empty());
+        assert_eq!(shared.borrow().task_run(&run_id), Some(&expected));
+    }
+
+    #[test]
+    fn liveness_touch_does_not_regress_restored_timestamp() {
+        let run_id = RunId::new();
+        let key = RunKey::Controller("restored-live".to_owned());
+        let mut restored_run =
+            run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
+        restored_run.updated_at_ms = Some(200);
+        let mut model = DomainModel::default();
+        model.insert_task_run(restored_run);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        assert!(reducer.touch_run_liveness(&key, 100).is_empty());
+        assert_eq!(
+            shared.borrow().task_run(&run_id).unwrap().updated_at_ms,
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn telemetry_accumulates_deduped_output_tokens() {
+        let run_id = RunId::new();
+        let key = RunKey::Controller("telemetry-run".to_owned());
+        let task_run = run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        assert!(
+            reducer
+                .apply_telemetry(
+                    &key,
+                    1_100,
+                    17,
+                    Some("claude-opus-4-1".to_owned()),
+                    Some("high".to_owned()),
+                    None,
+                )
+                .is_empty()
+        );
+        assert!(
+            reducer
+                .apply_telemetry(
+                    &key,
+                    1_200,
+                    25,
+                    Some("claude-opus-4-1".to_owned()),
+                    Some("high".to_owned()),
+                    None,
+                )
+                .is_empty()
+        );
+
+        let snapshot = shared.borrow();
+        let telemetry = snapshot.telemetry(&run_id).unwrap();
+        assert_eq!(telemetry.output_tokens, 42);
+        assert_eq!(telemetry.started_wall_ms, 1_100);
+    }
+
+    #[test]
+    fn telemetry_uses_earliest_log_time_after_late_monitor_start() {
+        let run_id = RunId::new();
+        let key = RunKey::Controller("late-backfill".to_owned());
+        let mut task_run = run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
+        task_run.created_at_ms = Some(50_000);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        assert!(
+            reducer
+                .apply_telemetry(&key, 1_000, 17, None, None, None)
+                .is_empty()
+        );
+        assert!(
+            reducer
+                .apply_telemetry(&key, 2_000, 25, None, None, None)
+                .is_empty()
+        );
+
+        assert_eq!(
+            shared.borrow().telemetry(&run_id).unwrap().started_wall_ms,
+            1_000
+        );
+    }
+
+    #[tokio::test]
+    async fn telemetry_survives_backfill_replay_identically() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        apply_telemetry_fixture_events(&mut reducer, &mut writer, synthesize_telemetry_fixture())
+            .await;
+        let key = telemetry_fixture_key();
+        let run_id = shared.borrow().task_run_by_key(&key).unwrap().run_id;
+        let first = shared.borrow().telemetry(&run_id).unwrap().clone();
+        assert_eq!(first.output_tokens, 42);
+        assert_eq!(first.started_wall_ms, 1_100);
+        assert_eq!(first.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(first.effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            first.per_turn.as_slice(),
+            &[
+                TurnAttr {
+                    model: Some("gpt-5.6-terra".to_owned()),
+                    effort: Some("high".to_owned()),
+                    sandbox: Some("workspace-write".to_owned()),
+                },
+                TurnAttr {
+                    model: Some("gpt-5.6-sol".to_owned()),
+                    effort: Some("xhigh".to_owned()),
+                    sandbox: Some("workspace-write".to_owned()),
+                },
+            ]
+        );
+        lifecycle.shutdown().await.unwrap();
+
+        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+        assert!(
+            restored.model.telemetry(&run_id).is_none(),
+            "the persisted restart seed must not contain transient telemetry"
+        );
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored);
+
+        apply_telemetry_fixture_events(&mut reducer, &mut writer, synthesize_telemetry_fixture())
+            .await;
+        {
+            let snapshot = shared.borrow();
+            let second = snapshot.telemetry(&run_id).unwrap();
+            assert_eq!(second, &first);
+        }
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn telemetry_is_not_persisted() {
+        let run_id = RunId::new();
+        let key = RunKey::Controller("transient-telemetry".to_owned());
+        let task_run = run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        let persist = reducer.apply_telemetry(
+            &key,
+            4_000,
+            9_876_543_210,
+            Some("distinctive-transient-model".to_owned()),
+            Some("distinctive-transient-effort".to_owned()),
+            None,
+        );
+        assert!(persist.is_empty());
+        let snapshot = shared.borrow();
+        assert_eq!(
+            snapshot.telemetry(&run_id).unwrap().output_tokens,
+            9_876_543_210
+        );
+        assert_eq!(snapshot.telemetry(&run_id).unwrap().started_wall_ms, 4_000);
+
+        // RunTelemetry has no serde implementation, which compile-enforces the transient
+        // invariant. TaskRun is the serializable projection that reaches persistence, so the
+        // real persistence surface is still checked alongside the empty PersistOp batch.
+        let serialized = serde_json::to_string(snapshot.task_run(&run_id).unwrap()).unwrap();
+        assert!(!serialized.contains("\"telemetry\":"));
+        assert!(!serialized.contains("\"output_tokens\":"));
+        assert!(!serialized.contains("9876543210"));
+        assert!(!serialized.contains("distinctive-transient-model"));
+        assert!(!serialized.contains("distinctive-transient-effort"));
+    }
+
+    #[test]
+    fn per_turn_model_effort_latest_wins_for_display() {
+        let run_id = RunId::new();
+        let key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "per-turn-rollout".to_owned(),
+        };
+        let task_run = run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        for (at_ms, tokens, model, effort) in [
+            (2_000, 10, "gpt-5.6-terra", "high"),
+            (2_100, 20, "gpt-5.6-terra", "high"),
+            (2_200, 30, "gpt-5.6-sol", "xhigh"),
+        ] {
+            assert!(
+                reducer
+                    .apply_telemetry(
+                        &key,
+                        at_ms,
+                        tokens,
+                        Some(model.to_owned()),
+                        Some(effort.to_owned()),
+                        Some("workspace-write".to_owned()),
+                    )
+                    .is_empty()
+            );
+        }
+
+        let snapshot = shared.borrow();
+        let telemetry = snapshot.telemetry(&run_id).unwrap();
+        assert_eq!(telemetry.output_tokens, 60);
+        assert_eq!(telemetry.started_wall_ms, 2_000);
+        assert_eq!(telemetry.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(telemetry.effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            telemetry.per_turn,
+            vec![
+                TurnAttr {
+                    model: Some("gpt-5.6-terra".to_owned()),
+                    effort: Some("high".to_owned()),
+                    sandbox: Some("workspace-write".to_owned()),
+                },
+                TurnAttr {
+                    model: Some("gpt-5.6-sol".to_owned()),
+                    effort: Some("xhigh".to_owned()),
+                    sandbox: Some("workspace-write".to_owned()),
+                },
+            ],
+            "consecutive identical attributions are one observed turn context"
+        );
+    }
+
+    fn telemetry_fixture_key() -> RunKey {
+        RunKey::Native {
+            provider: Provider::Codex,
+            sid: "telemetry-replay-rollout".to_owned(),
+        }
+    }
+
+    fn synthesize_telemetry_fixture() -> Vec<ProviderEvent> {
+        let rollout_id = "telemetry-replay-rollout";
+        let scope = SessionScope::Codex {
+            rollout_id: rollout_id.to_owned(),
+        };
+        let facts = [
+            (
+                0,
+                LogFact::Append {
+                    scope: scope.clone(),
+                    at_ms: 1_000,
+                },
+            ),
+            (
+                1,
+                LogFact::CodexMeta {
+                    rollout_id: rollout_id.to_owned(),
+                    cwd: "/workspace".to_owned(),
+                    originator: "codex_cli_rs".to_owned(),
+                    internal: None,
+                    cli_version: "0.1.0".to_owned(),
+                },
+            ),
+            (
+                2,
+                LogFact::CodexTurn {
+                    rollout_id: rollout_id.to_owned(),
+                    turn_id: "turn-1".to_owned(),
+                    model: "gpt-5.6-terra".to_owned(),
+                    effort: Some("high".to_owned()),
+                    sandbox: Some("workspace-write".to_owned()),
+                },
+            ),
+            (
+                3,
+                LogFact::Usage {
+                    scope: scope.clone(),
+                    at_ms: 1_100,
+                    sample_id: "turn-1:sample".to_owned(),
+                    output_tokens: 17,
+                    token_breakdown: crate::model::TokenBreakdown::default(),
+                    model: None,
+                    effort: None,
+                },
+            ),
+            (
+                4,
+                // The repeated (scope, sample_id) is deliberately poisoned: lane deduplication
+                // excludes 999, so the fixture total proves 42 = 17 + 25.
+                LogFact::Usage {
+                    scope: scope.clone(),
+                    at_ms: 1_101,
+                    sample_id: "turn-1:sample".to_owned(),
+                    output_tokens: 999,
+                    token_breakdown: crate::model::TokenBreakdown::default(),
+                    model: None,
+                    effort: None,
+                },
+            ),
+            (
+                5,
+                LogFact::CodexTurn {
+                    rollout_id: rollout_id.to_owned(),
+                    turn_id: "turn-2".to_owned(),
+                    model: "gpt-5.6-sol".to_owned(),
+                    effort: Some("xhigh".to_owned()),
+                    sandbox: Some("workspace-write".to_owned()),
+                },
+            ),
+            (
+                6,
+                LogFact::Usage {
+                    scope,
+                    at_ms: 1_200,
+                    sample_id: "turn-2:sample".to_owned(),
+                    output_tokens: 25,
+                    token_breakdown: crate::model::TokenBreakdown::default(),
+                    model: None,
+                    effort: None,
+                },
+            ),
+        ];
+        Synthesis::default().synthesize_batch(
+            Path::new("rollout-telemetry-replay.jsonl"),
+            facts,
+            &mut Admission::new(0),
+            &AdmissionIndex::new(),
+        )
+    }
+
+    async fn apply_telemetry_fixture_events(
+        reducer: &mut Reducer,
+        writer: &mut WriterClient,
+        events: Vec<ProviderEvent>,
+    ) {
+        for event in events {
+            match event {
+                ProviderEvent::Synthesized(event) => {
+                    if !writer.is_duplicate(&event.metadata.event_id) {
+                        commit_controller(reducer, writer, event).await;
+                    }
+                }
+                ProviderEvent::RunLiveness { key, at_ms } => {
+                    let persist = reducer.touch_run_liveness(&key, at_ms);
+                    if !persist.is_empty() {
+                        writer.apply(persist).await.unwrap();
+                    }
+                }
+                ProviderEvent::Telemetry {
+                    key,
+                    at_ms,
+                    output_tokens,
+                    token_breakdown,
+                    model,
+                    effort,
+                    sandbox,
+                } => {
+                    assert!(
+                        reducer
+                            .apply_telemetry_with_breakdown(
+                                &key,
+                                at_ms,
+                                output_tokens,
+                                token_breakdown,
+                                crate::model::TurnAttr {
+                                    model,
+                                    effort,
+                                    sandbox,
+                                },
+                            )
+                            .is_empty()
+                    );
+                }
+                other => panic!("unexpected telemetry fixture event: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn root_liveness_defers_hook_only_expiry() {
+        let run_id = RunId::new();
+        let key = RunKey::Controller("hook-root".to_owned());
+        let mut root = run_with_controller_evidence(run_id, key.clone(), 1, TaskState::Running);
+        root.updated_at_ms = Some(100);
+        let mut model = DomainModel::default();
+        model.insert_task_run(root);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+        let old_expiry = 100 + crate::activity::HOOK_ONLY_STALE_VISIBILITY_MS;
+
+        assert_eq!(reducer.touch_run_liveness(&key, old_expiry - 1).len(), 1);
+        assert!(
+            reducer
+                .apply_operator_command(OperatorCommand::DismissClearable, old_expiry)
+                .is_empty()
+        );
+        let snapshot = shared.borrow();
+        let root = snapshot.task_run(&run_id).unwrap();
+        assert_eq!(root.updated_at_ms, Some(old_expiry - 1));
+        assert_eq!(root.dismissed_at_ms, None);
     }
 
     #[test]
@@ -4112,6 +5291,234 @@ mod tests {
         }
     }
 
+    fn path_snapshot(path: &str) -> TopologySnapshot {
+        let mut snapshot = native_snapshot(path);
+        snapshot.panes[0].agent_session.as_mut().unwrap().kind = AgentSessionReferenceKind::Path;
+        snapshot
+    }
+
+    fn provisional_snapshot() -> TopologySnapshot {
+        let mut snapshot = native_snapshot("");
+        snapshot.panes[0].agent.as_mut().unwrap().agent_name = "unknown".to_owned();
+        snapshot.panes[0].agent_session = None;
+        snapshot
+    }
+
+    #[test]
+    fn path_keyed_occupant_reuses_run_and_execution() {
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: path_snapshot("/tmp/session.jsonl"),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let (first_run_id, first_execution_id, first_agent_node_id, first_display_ordinal) = {
+            let model = shared.borrow();
+            let execution = model
+                .executions()
+                .find(|execution| !execution.state.is_terminal())
+                .unwrap();
+            let agent_node = model.agent_nodes().next().unwrap();
+            assert_eq!(model.task_runs().count(), 1);
+            assert_eq!(model.executions().count(), 1);
+            (
+                execution.task_run_id,
+                execution.execution_id.clone(),
+                agent_node.agent_node_id.clone(),
+                agent_node.display_ordinal,
+            )
+        };
+
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: path_snapshot("/tmp/session.jsonl"),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let model = shared.borrow();
+        let live_executions = model
+            .executions()
+            .filter(|execution| !execution.state.is_terminal())
+            .collect::<Vec<_>>();
+
+        assert_eq!(model.task_runs().count(), 1);
+        assert_eq!(model.executions().count(), 1);
+        assert_eq!(live_executions.len(), 1);
+        assert_eq!(live_executions[0].task_run_id, first_run_id);
+        assert_eq!(live_executions[0].execution_id, first_execution_id);
+        assert_eq!(model.agent_nodes().count(), 1);
+        let agent_node = model.agent_nodes().next().unwrap();
+        assert_eq!(agent_node.agent_node_id, first_agent_node_id);
+        assert_eq!(agent_node.display_ordinal, first_display_ordinal);
+    }
+
+    #[test]
+    fn provisional_occupant_keeps_minting_per_observation() {
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: provisional_snapshot(),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let first_execution_id = shared
+            .borrow()
+            .executions()
+            .find(|execution| !execution.state.is_terminal())
+            .unwrap()
+            .execution_id
+            .clone();
+
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: provisional_snapshot(),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let model = shared.borrow();
+        let live_execution = model
+            .executions()
+            .find(|execution| !execution.state.is_terminal())
+            .unwrap();
+
+        assert_eq!(model.task_runs().count(), 2);
+        assert_eq!(model.executions().count(), 2);
+        assert_ne!(live_execution.execution_id, first_execution_id);
+    }
+
+    #[test]
+    fn reconnect_reuses_gap_execution_same_occupant() {
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: native_snapshot("sid-1"),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let (first_count, first_execution_id) = {
+            let model = shared.borrow();
+            let execution = model
+                .executions()
+                .find(|execution| !execution.state.is_terminal())
+                .unwrap();
+            (model.executions().count(), execution.execution_id.clone())
+        };
+
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: native_snapshot("sid-1"),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let model = shared.borrow();
+        let execution = model
+            .executions()
+            .find(|execution| !execution.state.is_terminal())
+            .unwrap();
+
+        assert_eq!(model.executions().count(), first_count);
+        assert_eq!(execution.execution_id, first_execution_id);
+    }
+
+    #[test]
+    fn occupant_change_mints_new_execution() {
+        let first_run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            first_run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "sid-1".to_owned(),
+            },
+            1,
+            TaskState::Running,
+        ));
+        model.insert_execution(execution(
+            first_run_id,
+            "gap-execution-existing",
+            ExecState::Working,
+        ));
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: native_snapshot("sid-1"),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let first_execution_id = shared
+            .borrow()
+            .executions()
+            .find(|execution| !execution.state.is_terminal())
+            .unwrap()
+            .execution_id
+            .clone();
+
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: native_snapshot("sid-2"),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let model = shared.borrow();
+        let new_execution = model
+            .executions()
+            .find(|execution| !execution.state.is_terminal())
+            .unwrap();
+        let previous_execution = model.execution(&first_execution_id).unwrap();
+
+        assert_ne!(new_execution.execution_id, first_execution_id);
+        // Store upserts rewrite `task_run_id` on execution-id conflict, so preserving the old
+        // execution id and owner is what protects the previous occupant's history.
+        assert_eq!(previous_execution.task_run_id, first_run_id);
+        assert_eq!(previous_execution.state, ExecState::Ended);
+        assert_ne!(new_execution.task_run_id, first_run_id);
+        assert_eq!(model.executions().count(), 2);
+    }
+
+    #[test]
+    fn terminal_executions_not_repersisted() {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "sid-1".to_owned(),
+            },
+            1,
+            TaskState::Running,
+        ));
+        model.insert_execution(execution(run_id, "pre-gap", ExecState::Working));
+        let (mut reducer, _shared) = Reducer::new(restored(model, 2));
+
+        let first = reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: TopologySnapshot::default(),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let second = reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: TopologySnapshot::default(),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let execution_ops = |batch: &[PersistOp]| {
+            batch
+                .iter()
+                .filter(|operation| matches!(operation, PersistOp::UpsertExecution(_)))
+                .count()
+        };
+
+        assert_eq!(execution_ops(&first), 1);
+        assert_eq!(execution_ops(&second), 0);
+    }
+
     #[test]
     fn done_maps_to_idle_never_ended() {
         let run_id = RunId::new();
@@ -4268,9 +5675,11 @@ mod tests {
             shared.borrow().task_run(&run_id).unwrap().state,
             TaskState::Running
         );
+        // The same occupant reuses its pre-gap execution while remaining live throughout the
+        // reconciliation batch.
         assert!(shared.borrow().executions().any(|value| {
             value.task_run_id == run_id
-                && value.execution_id != "pre-gap"
+                && value.execution_id == "pre-gap"
                 && !value.state.is_terminal()
         }));
         assert!(!batch.iter().any(|operation| matches!(

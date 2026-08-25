@@ -6,6 +6,8 @@ Herdr Top is a Herdr-native terminal UI for observing Claude Code and Codex mult
 
 The tool runs inside a pane managed by the target Herdr session and observes that session's workspaces, tabs, panes, agent sessions, task runs, dependencies, and recent activity. It complements Herdr instead of replacing its session, terminal, workspace, or worktree management.
 
+The orchestration-visibility core is zero-configuration: installing the Herdr plugin and opening its pane exposes the agent tree, including headless workers, by reading provider session artifacts directly. Controller hooks and `emit` are an optional precision layer for explicit lifecycle transitions, Controller-authored subjects, dispatch edges that do not depend on session-ID evidence, and dependencies.
+
 Repository: [mageyuki/herdr-top](https://github.com/mageyuki/herdr-top)
 
 ## 2. Decision summary
@@ -21,22 +23,22 @@ Repository: [mageyuki/herdr-top](https://github.com/mageyuki/herdr-top)
 | Primary view | Fixed-screen, htop-style live TUI |
 | Hierarchy | Herdr physical topology plus Task Run and native sub-agent nesting |
 | Physical pane identity | Herdr `terminal_id` is stable within one server run; public `pane_id` is the current address; no physical identity survives a cold restart |
-| Cross-pane relationship | Independent and `unlinked` unless an explicit Controller relationship event links it |
+| Cross-pane relationship | Linked only by provider-artifact lineage evidence or an explicit Controller relationship event; otherwise independent and `unlinked` |
 | Dependency representation | A DAG separate from the execution tree |
-| Data acquisition | Herdr snapshot/events, including reported native sessions, plus non-invasive Claude/Codex local metadata observation |
+| Data acquisition | Herdr snapshot/events plus direct, non-invasive Claude/Codex provider-session artifact observation; Controller events are optional precision |
 | Provider fallback | Two-second rescan when file watching is unavailable; no terminal-output scraping |
 | Task Run identity | Explicit `task_run_id`, then native session reference with Herdr-reported identity preferred, then provisional `terminal_id + start time + collector sequence` |
 | Controller protocol | Versioned JSON over a session-scoped Unix domain socket through `herdr-top emit` |
-| Persistence | Session-scoped SQLite as the source of truth |
+| Persistence | Session-scoped SQLite for the durable semantic model and event ledger; provider telemetry and turn context are recomputed transiently |
 | State root | `${XDG_STATE_HOME:-$HOME/.local/state}/herdr-top/sessions/<session-key>`, keyed by the resolved session name; the collector socket lives in a runtime directory to respect socket-path length limits |
 | Retention | Finished Task Runs 30 days; activity events ring-bounded at 100,000 per session and 7 days; `event_id` dedup ledger 7 days |
 | Process model | One collector, reducer, SQLite writer, event socket, and TUI process per Herdr session |
 | Second launch | Focus the existing Herdr Top pane instead of starting another collector |
 | Quit | `q` stops Herdr Top only; Claude/Codex agents keep running |
-| Restart behavior | Detach keeps the collector alive; cold server restart requires the next manual Herdr Top launch to restore and reconcile |
+| Restart behavior | Detach keeps the collector alive; cold server restart requires the next manual Herdr Top launch to restore, backfill provider artifacts, and reconcile |
 | Implementation language | Rust |
 | Initial platforms | macOS arm64/x86_64 and Linux arm64/x86_64 |
-| Distribution | Herdr managed GitHub plugin plus optional standalone CLI for Controller integration |
+| Distribution | Herdr managed GitHub plugin plus optional standalone CLI for the Controller precision layer |
 | License | MIT |
 
 ## 3. Goals
@@ -46,7 +48,7 @@ The MVP must:
 - Run as a regular Herdr plugin pane or tab within the Herdr session being observed.
 - Show current Claude Code and Codex activity across the same Herdr session.
 - Make workspace, tab, pane, Task Run, and native sub-agent relationships understandable.
-- Show cross-pane task relationships and dependencies only when explicitly recorded.
+- Show cross-pane execution relationships only with provider lineage evidence or explicit Controller edges, and show dependencies only when explicitly recorded.
 - Keep execution topology and task dependencies as separate views.
 - Reflect watched Herdr or provider changes within one second at the 95th percentile under target load; fallback scanning adds at most one two-second polling interval.
 - Show observation scope, freshness, source coverage, and degraded states in the fixed header.
@@ -179,11 +181,11 @@ Session
 
 The physical hierarchy is rendered with computed Unicode box-drawing connectors: `├── ` for a non-final child, `└── ` for a final child, and `│   ` while an ancestor has later siblings. `HERDR_TOP_ASCII_TREE=1` selects the corresponding `|-- `, `` `-- ``, and `|   ` forms; every other value leaves Unicode enabled. The environment variable is read once while constructing the TUI at startup, never during a frame render.
 
-Each Task Run row has the shipped grammar `<worker-kind> <subject> — <event_kind: tool> [model:...] [status] · <duration>`; for example, `claude-code Implement I7 Task 2 wire tolerance — tool_use: Bash [model:gpt-5.6-sol] [running] · 17m03s`. Worker kind always comes from the run key. A missing captured subject falls back to the key-derived name rather than leaving an empty segment. The activity segment appears only for a non-terminal run whose newest Agent Node has `last_event_kind`, and its `: tool` suffix appears only when that node also has `last_tool_name`; terminal runs omit the entire activity segment. The model segment appears only when the same newest node has `model_id`, status always appears, and duration appears only when the available start and live-or-finished end timestamps produce a non-negative interval. “Newest” means the greatest `(last_activity_at_ms, agent_node_id)` tuple, making the result deterministic even when activity timestamps tie. Existing `[shared]`, `[dispatched by: …]`, and `[unlinked]` annotations remain appended in that order when applicable. A captured subject keeps the UUID and run key out of the row, while the no-subject fallback can still be identity-shaped — a Controller key, native session ID, or UUID for a path-keyed native run; the Detail overlay is the complete identity surface and always shows the full key, `run_id`, bound native session ID, and lifecycle timestamps.
+Each Task Run row has the shipped grammar `<glyph> <worker-kind>[ <subject>][ — <live line>][ · <duration>][ annotations]`; for example, `● Claude Implement wire tolerance — tool_use: Bash · 17m03s`. The glyph is `⚠` for a stalled non-terminal run, `●` for `running` or `blocked`, `✓` for `completed`, `✗` for `failed` or `cancelled`, and `◌` for `queued` or `ended_unknown`; the stall override never replaces a terminal glyph. Worker kind comes from the projected run kind and falls back to the run key. A missing captured subject falls back to the key-derived name rather than leaving an empty segment, except that a native or native-path Codex run below an execution edge renders the kind alone. The live line appears only for a non-terminal run, from the lane live-line read model or, for a Claude-flavoured run, from the newest Agent Node's `last_event_kind` with a `: tool` suffix when `last_tool_name` is present. Duration appears only when the available start and live-or-finished end timestamps produce a non-negative interval. Existing `[shared]`, `[dispatched by: …]`, and `[unlinked]` annotations remain appended in that order when applicable. Model, effort, output tokens, output-token rate, and time render in separate right-aligned metric columns rather than inside the row label, and the lifecycle state is carried by the glyph. A captured subject keeps the UUID and run key out of the row, while the no-subject fallback can still be identity-shaped — a Controller key, native session ID, or UUID for a path-keyed native run; the Detail overlay is the complete identity surface and always shows the full key, `run_id`, bound native session ID, and lifecycle timestamps.
 
 Tab and pane rows retain their stable IDs and append a captured display name in parentheses. A tab uses its non-empty sanitized `label`. A pane uses its non-empty sanitized `label`, otherwise its non-empty `terminal_title_stripped`, otherwise no display name. Both values are escaped and truncated UTF-8-safely at capture to the same 256-byte limit as Controller display text.
 
-Native sub-agent nesting appears only beneath a Task Run of the same provider, because provider metadata is the only source of native parent-child edges and no provider's metadata can establish a cross-provider edge. A Controller `dispatch` links Task Runs across panes with an execution edge; the execution tree remains the physical tree and renders that edge as a `[dispatched by: …]` annotation on the child rather than re-parenting it. Each execution has one physical parent — the pane hosting it; the tree shows a Task Run under the pane of its most recent live execution, and a run with concurrent executions appears under each hosting pane with a shared-run marker. A Task Run has at most one semantic dispatch parent, so the execution view stays a tree because semantic parentage is annotation, not position. Grouping by dispatch parent belongs to the dependency view.
+Native sub-agent nesting appears only beneath a Task Run of the same provider, because provider metadata is the only source of native parent-child edges and no provider's metadata can establish a cross-provider edge. Run placement is ordered: every pane hosting a live execution; otherwise the pane of the latest ended execution; otherwise, for a run with no execution history, its default-visible dispatch parent; otherwise `Unattached`. A dispatch-nested child shows parentage by position and carries no `[dispatched by: …]` text; that annotation appears only on pane-placed runs. A dismissed or expired parent never hides its children, which fall back to `Unattached` for that frame, and a malformed parent cycle does the same. A run with concurrent live executions appears under each hosting pane with `[shared]`, but its descendants expand only on the first occurrence.
 
 ### 6.2 Task dependency DAG
 
@@ -195,6 +197,8 @@ investigate ──> implement ──> test ──> review
 ```
 
 Nesting must not be used to represent every dependency. A Task Run can depend on multiple other Task Runs, so dependencies form a DAG rather than a strict tree. When no dependency edge exists, the view replaces its columns with the exact placeholder `no dependency edges recorded`.
+
+The dependency DAG uses the same status glyph and label grammar as the execution tree, but omits the live line.
 
 ### 6.3 Unlinked rule
 
@@ -239,22 +243,23 @@ References: [Herdr CLI reference](https://herdr.dev/docs/cli-reference/), [Herdr
 
 Provider adapters use a non-invasive hybrid strategy:
 
-1. Watch locally available native session metadata with filesystem notification and tail files incrementally: a per-file byte offset advances on append and only appended bytes are read, while an inode change or size regression signals rotation or truncation, resets the offset state, and reopens the file. Discovery performs one bounded bootstrap read per file — the first complete structural record, such as Codex's `session_meta`, parsed for allowlisted identity and topology fields only, with Claude topology derived from path structure alone — and historical activity is never replayed: ongoing tailing starts at the current end of file for files that predate the collector run, while files created or rotated during observation are read from byte zero. Incomplete trailing records buffer until their terminating newline.
-2. Normalize provider, native session ID, model when available, recursive native sub-agent nesting, lifecycle signals, and allowlisted activity summaries.
-3. Fall back to a two-second rescan when file notification is unavailable or unreliable; the rescan stats directories and files for mtime and size changes and tails only what changed — it never re-reads whole files, keeping the idle CPU budget of section 15 honest against hundreds of megabytes of local metadata.
-4. Never scrape terminal output.
+1. Discover and admit Claude Code `~/.claude/projects/**/<uuid>.jsonl` artifacts with `.meta.json` sub-agent sidecars and Codex `~/.codex/sessions/**/rollout-*.jsonl` artifacts only through pane identity or explicit lineage evidence.
+2. At startup, select admitted artifacts through the bounded backfill rules in section 10.1 and read each selected artifact from byte zero; during live observation, watch for changes and tail appended records incrementally. Incomplete trailing records buffer until their terminating newline.
+3. Normalize provider and native-session identity, recursive native sub-agent nesting, run kind and subject, lifecycle signals, one-line live activity, per-turn model/effort/sandbox context, and output-token telemetry. The full token breakdown remains available in Detail.
+4. Fall back to a two-second rescan when file notification is unavailable or unreliable; the rescan stats directories and files for mtime and size changes and tails only what changed, keeping the idle CPU budget of section 15 honest against hundreds of megabytes of local metadata.
+5. Never scrape terminal output.
 
-The common baseline is provider identity, native session identity, execution state, recent normalized activity, and native sub-agent nesting when exposed. Missing fields remain unavailable rather than fabricated.
+The common baseline is provider identity, native session identity, execution state, recent normalized activity, token telemetry, and native sub-agent nesting when exposed. Missing fields remain unavailable rather than fabricated.
 
 Provider activity content is built from an explicit field allowlist and nothing else: provider, native session and agent identifiers, model ID, lifecycle and event kind, tool name without arguments, item and byte counts, and timestamps. The normalized identity, topology, relationship, and coverage fields of section 8.5 — workspace, tab, and pane IDs, `terminal_id`, Task Run and Agent Node IDs, edge endpoints, and source coverage — are always included, as are the identity references of section 5.4, including path-kind `agent_session` values, and the owner record of section 9.3. Operational paths — the session file an agent maps to, discovery diagnostics, log locations, and the section 10 breadcrumb — are persisted locally under the section 14 permissions and shown only in detail and `doctor` views, home-abbreviated and control-character-escaped. No value extracted from prompt text, response text, or tool arguments and results is persisted or displayed anywhere — including paths, URLs, and environment values found inside them; the same string remains legal when it arrives from an independent operational source — except for the agent-authored task subject allowed below as a Controller label. Controller-supplied `label` and `reason` strings are display text, capped at 256 bytes, control-character-escaped, and truncated UTF-8-safely; their provenance is operator-provided except that, as the sole agent-generated carve-out, `label` may carry the task subject (the task's one-line name) and nothing else agent-generated, as recorded in the [Controller label provenance ADR](../adr/2026-08-19-controller-label-provenance.md). Fixtures with sentinel strings prove the exclusions in section 15 by scanning the database, WAL, backups, logs — including malformed-record diagnostics — and rendered output. Malformed-record diagnostics are not activity content; their own allowlist is provider, the independently discovered, home-abbreviated, escaped source path, byte offset, and parser error code.
 
-Agent Nodes form a recursive tree rather than a fixed one-level list, and deeper structures are tolerated wherever metadata establishes them — but observed reality is shallow: local evidence shows Codex nesting to depth two and Claude Code to depth one, and no depth field exists in either format. A native parent-child edge is created only when provider metadata establishes it. If an agent is observable but its immediate parent is not, it remains directly under the Task Run without an inferred Agent Node parent.
+Agent Nodes form a recursive tree rather than a fixed one-level list, and deeper structures are tolerated wherever metadata establishes them. A native parent-child edge is created only when provider metadata or admitted identifier evidence establishes it. If an agent is observable but its immediate parent is not, it remains directly under the Task Run without an inferred Agent Node parent.
 
-Claude Code hooks or OpenTelemetry may be added as optional higher-fidelity inputs. Core monitoring must not require Claude settings mutation, an OTLP exporter, or beta telemetry. Claude-local task or lifecycle events never create cross-pane Controller execution or dependency edges by themselves.
+Claude Code and Codex hooks are an optional precision layer. They add explicit lifecycle transitions, Controller-authored subjects, and dispatch edges that do not depend on session-ID evidence; manual Controller events also add explicit dependencies. Core monitoring must not require provider settings mutation, `emit` wiring, an OTLP exporter, or beta telemetry.
 
 Provider formats are unstable external formats. Adapters accept optional and unknown fields, isolate parsing failures, and expose source coverage. If an adapter cannot read its source, the TUI remains usable in `DEGRADED / Herdr-only` mode.
 
-The two discovery models are inverted and the adapters do not share a strategy. Claude Code stores each sub-agent in its own file under the parent session's `subagents/` directory, so topology is path-derived without content parsing; sub-agents are effectively always background, fan-out is high, spawn results can arrive long after the spawn or never, and named spawns vary the filename pattern. Codex stores every agent as an identically shaped rollout file whose first `session_meta` line carries `agent_path` and `parent_thread_id`; parents and children can sit in different date directories; `forked_from_id` marks forking rather than parenting and never creates an edge; and the parent's own rollout emits `sub_agent_activity` events — the preferred liveness signal, cheaper than opening every child file. Ephemeral side artifacts such as spawn output files are not data sources.
+Claude Agent-tool sub-agents always carry full lineage because the `.meta.json` sidecar names the parent and agent type. Inner Codex lineage requires the child session ID to appear somewhere in the parent's admitted artifacts, whether in a spawn command, resume invocation, or quoted report; UUID-shaped tokens and `CLAUDE_CONFIG_DIR=` paths are scanned only in admitted records. With that evidence, the child rollout is admitted and attached in the tree. Without it, the rollout is not admitted and therefore is not displayed anywhere, including under `Unattached`. Herdr Top deliberately does not infer lineage from timing, neighboring panes, or shared paths. As an optional operational convention, the dispatching agent can echo the child session ID into its own transcript. For headless Claude children, `claude -p` prints only assistant text by default, so `claude -p --output-format json ...` exposes a returned `session_id` that can be retained in the parent transcript. Ephemeral side artifacts such as spawn output files are not data sources.
 
 ### 7.3 Explicit Controller events
 
@@ -297,7 +302,7 @@ Controller task-state events are `task_started`, `blocked`, `progress`, `complet
 
 Relationship-only placeholder runs — runs with no execution and no task-state event — never close automatically: edges never propagate terminality, and closing announced work without evidence would be inference. They stay `queued` until a task-state event or an execution bound under the section 5.4 rules arrives. A maximal weakly connected component of such runs across execution and dependency edges is a dangling announcement when it has no non-terminal outside neighbor, surfaced through a diagnostic counter. A run in `ended_unknown` that gains a new execution — the same native session resuming — reactivates to `running`.
 
-Controller events are optional for read-only live monitoring but required for a complete cross-pane execution relationship or task DAG.
+Controller events are optional for the orchestration-visibility core. They sharpen log-derived state with explicit lifecycle transitions, Controller-authored subjects, dispatch edges that do not depend on identifier evidence, and task-DAG edges.
 
 ## 8. State model
 
@@ -449,7 +454,11 @@ After every successful owner launch:
 6. Subscribe to Herdr events and buffer pushed events.
 7. Fetch a fresh workspace, tab, pane, terminal, and agent snapshot.
 8. Reconcile: physical executions never survive an observation gap. Every persisted execution is retired as `ended`, and fresh executions are constructed from the snapshot. Corroborated identity preserves the Task Run, not the execution record: a fresh execution attaches to an existing Task Run only when both sides carry equal, non-empty native session identities — the live side preferring Herdr's reported `agent_session` and falling back to the provider adapter's resolved identity. A disagreement between those two sources is not corroboration and is surfaced as a diagnostic, a kind-`path` reference that has not resolved to an ID never corroborates, and provisional runs from before the gap gain no new execution because they carry no identity to match. Retirement and attachment are evaluated together: automatic closure per section 8.2 applies only to runs left with no live execution after reconciliation. Semantic nodes reconcile only by the identity rules in sections 5.3 and 5.4.
-9. Replay the buffered events idempotently, subscribe to provider changes, and enter the TUI.
+9. Replay the buffered Herdr events idempotently, start provider backfill and live watching, and enter the TUI.
+
+Provider backfill re-reads every admitted artifact selected by the window from byte zero; no per-file byte offset is persisted. Its hard anchor is `max(earliest database event, now - HERDR_TOP_BACKFILL_WINDOW_MS)`. The anchor bounds file selection, not record selection, so an admitted in-window file is read in full and contributes complete run totals. Pane-root artifacts and lineage-linked artifacts are exempt from the anchor. Replay converges idempotently through the durable event ledger. Token telemetry, subjects, run kind, and turn context are transient and are recomputed from artifacts rather than restored from SQLite.
+
+A completed-then-resumed session has one fail-safe backfill residual. When both halves arrive in one backfill pass, the row remains `completed` until genuinely new activity appears. The lane reopen gate requires the reopening `TaskStarted` source-clock timestamp to be strictly newer than the run's `finished_at_ms`, but `TaskRun::touch` records `finished_at_ms` from the receipt clock, which is “now” during replay. The historical resume start is therefore older and the gate denies it. Denial avoids an incorrect reopen on every restart; a durable fix requires a source-clock completion timestamp and therefore a schema change.
 
 A second invocation does not reconcile because it does not acquire the lock.
 
@@ -457,11 +466,11 @@ A second invocation does not reconcile because it does not acquire the lock.
 
 - Detach and reattach: owner keeps running.
 - Cold Herdr restart: arbitrary monitor processes end; Herdr Top is not auto-started.
-- Next manual launch: load SQLite, subscribe, fetch a fresh snapshot, and reconcile.
+- Next manual launch: load SQLite, backfill provider artifacts, subscribe, fetch a fresh snapshot, and reconcile.
 - Live Herdr handoff or socket replacement: enter `RECONCILING`, reconnect with the subscribe-buffer-snapshot sequence, record a collector-attested event gap for the disconnected interval, and apply section 10.1 step 8's retirement and attachment rule before replay; server-side continuity is never assumed.
 - Provider source loss: retain Herdr topology in `DEGRADED / Herdr-only` mode.
 
-Herdr restores its own topology and supported agent sessions. Herdr Top restores only its semantic model.
+Herdr restores its own topology and supported agent sessions. Herdr Top restores its durable semantic model and reconstructs transient provider-derived state through backfill.
 
 ### 10.3 Retention and default visibility
 
@@ -503,7 +512,7 @@ Required behavior:
 - distinct `unlinked`, `blocked`, `stale`, `ended`, `ended_unknown`, and other terminal task states;
 - selection moves to a surviving ancestor or neighbor when its node closes, and follows the surviving run through an identity merge, with the reason shown;
 - with no overlay or filter draft active, unmodified `s` opens the Summary overlay and unmodified `c` sends one non-blocking clear command; modifier-bearing `s` and `c` do neither. `Esc` or any `s` key code closes an already-open Summary overlay, because overlay-local closing is deliberately modifier-blind;
-- the Summary overlay groups by worker kind and model and renders `worker kind | model | runs | live | total | mean | tok | tok/s`; `runs` and `live` count all group members, `total` and `mean` use only terminal runs with valid timing, and `tok` and `tok/s` render `-` until token metrics exist;
+- the Summary overlay prints a `scope:` line, then groups by worker kind and model in two separate tables headed `per worker kind` and `per model`; their exact header lines are `worker kind | runs | live | total | mean | tok | mean tok/s` and `model | runs | live | total | mean | tok | mean tok/s`; `runs` and `live` count all group members, `total` and `mean` use only terminal runs with valid timing, `tok` is accumulated output tokens, and `mean tok/s` is total rated output tokens divided by total rated elapsed seconds rather than an unweighted mean of per-run rates; either token field renders `-` only when the required telemetry is unavailable;
 - a wall-aligned once-per-second paint tick redraws clock-derived surfaces without rebuilding the row projection. Projection rebuilding remains separately gated by model/operator changes and cached visibility or visible-live-duration deadlines, so elapsed Task Run labels advance only when their projected row actually requires that refresh;
 - `?` opens key help and setup guidance;
 - minimum-size screen and safe truncation for narrow panes and wide Unicode;
@@ -511,7 +520,7 @@ Required behavior:
 
 Direct `herdr-top` uses the current pane and returns to its shell on `q`. The plugin entrypoint opens or focuses a dedicated regular tab or pane. It does not use a popup because popups have no Herdr pane identity.
 
-On first TUI launch only, if a compatible standalone CLI is not discoverable in `PATH`, show a dismissible Controller-integration notice. Basic monitoring remains fully functional. `?` keeps the standalone CLI and `emit` setup instructions available.
+On first TUI launch only, if a compatible standalone CLI is not discoverable in `PATH`, show a dismissible optional Controller-precision notice. Zero-configuration monitoring remains fully functional. `?` keeps the standalone CLI and `emit` setup instructions available.
 
 ## 12. Herdr plugin packaging
 
@@ -572,7 +581,7 @@ Herdr 0.8.0 has no supported post-install caveat field and does not show success
 
 ### 12.3 Optional standalone CLI and diagnostics
 
-The managed plugin is sufficient for live monitoring. Controller-event users explicitly install the same release's standalone binary into `PATH`.
+The managed plugin is sufficient for zero-configuration orchestration monitoring. Users of the optional Controller precision layer explicitly install the same release's standalone binary into `PATH`.
 
 ```sh
 herdr-top --version
@@ -587,7 +596,7 @@ Herdr logs remain available through:
 herdr plugin log list --plugin mageyuki.herdr-top
 ```
 
-`doctor` checks Herdr socket, session key and its resolver source (flag, environment, or `default`), breadcrumb validity, the state-root `session-name.txt` record, the runtime sentinel, current Controller-socket availability and its reason, socket-path length, lock, database schema, provider discovery, Herdr official-integration versions, plugin/CLI compatibility, native-session coverage, and log locations without printing prompts or responses. Protocol compatibility is three-tiered: protocols below the minimum are an Error (`herdr_protocol_mismatch`), protocols in the reviewed set are compatible, and protocols newer than every reviewed one are a Warning (`herdr_protocol_newer_unreviewed`) — monitoring continues because every inbound wire surface, the event-push envelope included, tolerates additive fields. The reviewed set is extended only through `scripts/review-herdr-protocol.sh`, which diffs a candidate herdr's bundled schema against the committed baseline in `tests/fixtures/herdr-schema/`. No newer-protocol socket feature is used anywhere; any future use must be gated on the handshake protocol at the call site. Every executable, integration, or protocol version `doctor` reports is queried from the relevant binary or server — and reported as unavailable when that source cannot answer — never inferred from an installation path; self-updating installs make path-derived versions lie. For Herdr 0.8.0 native session restore, it compares legacy integer versions against the Claude Code integration version 6 and Codex integration version 5 minimums, while accepting date-era dot-separated all-digit versions such as `2026.08.12.1` as current without a floor comparison. Missing or older integrations do not block Herdr-only monitoring, but diagnostics explain the unavailable `agent_session` and restore coverage.
+`doctor` checks Herdr socket, session key and its resolver source (flag, environment, or `default`), breadcrumb validity, the state-root `session-name.txt` record, the runtime sentinel, current Controller-socket availability and its reason, socket-path length, lock, database schema, provider discovery, provider-log root readability, pane-session artifact coverage, watcher freshness, Herdr official-integration versions, plugin/CLI compatibility, native-session coverage, and log locations without printing prompts or responses. Log-lane freshness uses the watcher's own observation timestamp with a fixed 120,000 ms stale threshold, never file modification times. Protocol compatibility is three-tiered: protocols below the minimum are an Error (`herdr_protocol_mismatch`), protocols in the reviewed set are compatible, and protocols newer than every reviewed one are a Warning (`herdr_protocol_newer_unreviewed`) — monitoring continues because every inbound wire surface, the event-push envelope included, tolerates additive fields. The reviewed set is extended only through `scripts/review-herdr-protocol.sh`, which diffs a candidate herdr's bundled schema against the committed baseline in `tests/fixtures/herdr-schema/`. No newer-protocol socket feature is used anywhere; any future use must be gated on the handshake protocol at the call site. Every executable, integration, or protocol version `doctor` reports is queried from the relevant binary or server — and reported as unavailable when that source cannot answer — never inferred from an installation path; self-updating installs make path-derived versions lie. For Herdr 0.8.0 native session restore, it compares legacy integer versions against the Claude Code integration version 6 and Codex integration version 5 minimums, while accepting date-era dot-separated all-digit versions such as `2026.08.12.1` as current without a floor comparison. Missing or older integrations do not block Herdr-only monitoring, but diagnostics explain the unavailable `agent_session` and restore coverage.
 
 ## 13. Technology stack
 
@@ -725,7 +734,7 @@ Herdr Top's differentiating combination is:
 1. A regular managed pane or tab connects to its Herdr named session.
 2. Live workspaces, tabs, panes, Claude/Codex executions, and available recursively nested native sub-agents are shown.
 3. `terminal_id` preserves identity across pane moves while the server runs; after a cold restart, reconciliation relies on Task Run identity rules alone and never on stale physical identifiers.
-4. Cross-pane runs remain `unlinked` without an explicit Controller relationship event; execution and dependency edges are the only linking evidence.
+4. Cross-pane runs remain `unlinked` without provider-artifact lineage evidence or an explicit Controller relationship event; execution and dependency edges are the only linking evidence.
 5. `dispatch` and `depends_on` create distinct persisted execution and dependency edges.
 6. Duplicate events are idempotent and cycles are rejected.
 7. Watched changes reach the screen within one second at the 95th percentile under target load; the fallback scan adds at most its two-second interval.
@@ -739,7 +748,7 @@ Herdr Top's differentiating combination is:
 15. At or above the standard width of 100 columns the header shows host, session, session elapsed time (`up:`), workspace count, quality, lag, and coverage; below it, down to the minimum supported width of 48 columns, fields truncate in the fixed order coverage, lag, workspace count, host — session, `up:`, and quality are never dropped.
 16. `q` stops only Herdr Top; agents continue.
 17. Detach/reattach keeps the collector running.
-18. Cold restart stops the collector; next manual launch restores from SQLite and reconciles.
+18. Cold restart stops the collector; next manual launch restores from SQLite, backfills admitted provider artifacts, and reconciles.
 19. Live handoff reconnects with the subscribe-buffer-snapshot sequence, and the disconnected interval is recorded and shown as a collector-attested event gap.
 20. Second launch focuses the owner and creates no second writer.
 21. Launches from different directories in the same named session — including the unnamed `default` session — share state through the session-key rule; different named sessions remain isolated.
@@ -749,7 +758,7 @@ Herdr Top's differentiating combination is:
 25. `emit` is best-effort by default and supports `--strict`.
 26. No prompt, response, or scrollback is persisted or transmitted.
 27. macOS/Linux artifacts install through Herdr without Rust.
-28. `doctor` reports health, Herdr integration versions, and native-session coverage without exposing content.
+28. `doctor` reports health, provider-log root readability, pane-session artifact coverage, watcher freshness, Herdr integration versions, and native-session coverage without exposing content.
 29. On the reference machine the target load meets every budget in section 15, and twice the target load sustained for 60 seconds degrades visibly without losing Task Runs or edges.
 
 ## 18. Deferred capabilities
@@ -758,7 +767,7 @@ Herdr Top's differentiating combination is:
 - web dashboard;
 - remote aggregation across hosts or named sessions;
 - hosted telemetry export;
-- optional Claude Code hook and OpenTelemetry provider inputs;
+- optional additional provider inputs such as OpenTelemetry;
 - additional providers;
 - long-term analytics and configurable retention;
 - manual history purge and export;
