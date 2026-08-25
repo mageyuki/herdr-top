@@ -194,6 +194,14 @@ pub(crate) fn build_rows(model: &DomainModel, order: &DagOrder, now_ms: i64) -> 
             prerequisites: neighbor_names(prerequisites.get(&run.run_id)),
             dependents: neighbor_names(dependents.get(&run.run_id)),
         })
+        // DAG rows are run-only today. Keep the shared Agent Node boundary on the final row
+        // stream so a future Agent row cannot bypass the tree's display-staleness rule.
+        .filter(|row| match &row.key {
+            NodeKey::Agent { agent_node_id, .. } => model
+                .agent_node(agent_node_id)
+                .is_none_or(|agent| !super::projection::agent_node_is_display_stale(agent, now_ms)),
+            _ => true,
+        })
         .collect()
 }
 
@@ -235,8 +243,8 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::model::{
-        AgentNode, DependencyEdge, DisplayOrdinal, DomainModel, ExecutionEdge, Provider, RunId,
-        RunKey, TaskRun, TaskState, Workspace,
+        AgentNode, DependencyEdge, DisplayOrdinal, DomainModel, ExecState, ExecutionEdge, Provider,
+        RunId, RunKey, TaskRun, TaskState, Workspace,
     };
 
     use super::DagOrder;
@@ -561,6 +569,40 @@ mod tests {
             })
             .unwrap();
         assert_eq!(unlinked.label, "◌ U U [unlinked]");
+    }
+
+    #[test]
+    fn display_stale_unknown_agent_is_absent_from_dag_rows() {
+        let (mut model, ids) = model(&[("run", 1)], &[]);
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "stale-unknown".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some("stale-unknown".to_owned()),
+            task_run_id: ids["run"],
+            display_ordinal: DisplayOrdinal::new(2),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Unknown),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: Some(0),
+            session_file: None,
+        });
+        let mut order = DagOrder::default();
+        order.recompute(&model);
+
+        let rows = super::build_rows(
+            &model,
+            &order,
+            crate::provider::lane::DEFAULT_HEADLESS_INACTIVITY_MS,
+        );
+
+        assert!(
+            rows.iter()
+                .all(|row| !matches!(row.key, crate::tui::app::NodeKey::Agent { .. }))
+        );
     }
 
     #[test]

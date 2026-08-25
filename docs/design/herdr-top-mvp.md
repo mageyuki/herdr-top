@@ -476,6 +476,7 @@ Herdr restores its own topology and supported agent sessions. Herdr Top restores
 
 - Active and non-terminal Task Runs are never auto-pruned. A Controller-keyed run with no execution is hidden from the default view once its last `updated_at_ms` is at least `HOOK_ONLY_STALE_VISIBILITY_MS = 24 * 60 * 60 * 1_000` ms old; native-keyed runs and Controller runs with an execution do not use this expiry.
 - A fresh `running` or `blocked` Task Run without live execution remains visible.
+- An Agent Node in `unknown` or `ended` state is hidden from tree and DAG row projections once its recorded last activity is at least `HERDR_TOP_HEADLESS_INACTIVITY_MS` old. Missing activity timestamps and known states, including `stale`, remain visible. A visible child of a hidden Agent Node is re-parented to the owning Task Run for display. The complete Agent Node model remains retained and available to Detail projection.
 - Finished Task Runs and unreferenced edges are retained for 30 days.
 - Events form an activity ring bounded to 100,000 per named session and 7 days; under the target sustained load the count bound dominates at roughly 83 minutes, which is intentional — semantic state never depends on event retention. The `event_id` deduplication ledger is stored separately and keeps IDs for the full 7 days regardless of ring eviction.
 - Parents or dependencies referenced by active Task Runs are not pruned.

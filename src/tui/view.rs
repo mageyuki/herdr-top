@@ -1840,6 +1840,7 @@ fn append_run_subtree(
         .agent_nodes()
         .filter(|agent| agent.task_run_id == run_id)
         .filter(|agent| !is_live_line_agent(agent))
+        .filter(|agent| !projection::agent_node_is_display_stale(agent, context.now_ms))
         .filter(|agent| {
             provider_from_key(&run.key).is_none_or(|provider| provider == agent.provider)
         })
@@ -1868,6 +1869,8 @@ fn append_agent_rows(
     pane_id: Option<&str>,
     depth: usize,
 ) {
+    // Filtering happens before this hierarchy is built. A visible child whose stale parent was
+    // removed therefore becomes a root under the owning run instead of being silently orphaned.
     let by_id = agents
         .iter()
         .map(|agent| (agent.agent_node_id.as_str(), *agent))
@@ -2436,6 +2439,44 @@ mod tests {
             last_activity_at_ms,
             session_file: None,
         }
+    }
+
+    fn visibility_agent(
+        agent_node_id: &str,
+        run_id: RunId,
+        ordinal: i64,
+        state: Option<ExecState>,
+        last_activity_at_ms: Option<i64>,
+        parent_agent_node_id: Option<&str>,
+    ) -> AgentNode {
+        AgentNode {
+            agent_node_id: agent_node_id.to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some(agent_node_id.to_owned()),
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(ordinal),
+            parent_agent_node_id: parent_agent_node_id.map(str::to_owned),
+            state,
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms,
+            session_file: None,
+        }
+    }
+
+    fn has_agent_row(rows: &[TreeRow], agent_node_id: &str) -> bool {
+        rows.iter().any(|row| {
+            matches!(
+                &row.key,
+                NodeKey::Agent {
+                    agent_node_id: candidate,
+                    ..
+                } if candidate == agent_node_id
+            )
+        })
     }
 
     #[test]
@@ -4687,6 +4728,153 @@ mod tests {
         assert!(agent_rows[1].label.contains("last:99ms"));
         assert_eq!(agent_rows[0].depth, agent_rows[2].depth);
         assert!(agent_rows[2].label.contains("orphan"));
+    }
+
+    #[test]
+    fn display_stale_unknown_agent_is_absent_from_tree_rows() {
+        let mut model = populated_model();
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        model.insert_agent_node(visibility_agent(
+            "stale-unknown",
+            run_id,
+            9,
+            Some(ExecState::Unknown),
+            Some(-crate::provider::lane::DEFAULT_HEADLESS_INACTIVITY_MS),
+            None,
+        ));
+
+        let rows = build_rows(&model, &AppState::default());
+
+        assert!(
+            !has_agent_row(&rows, "stale-unknown"),
+            "an unknown agent at the inactivity boundary must be hidden"
+        );
+    }
+
+    #[test]
+    fn recent_unknown_agent_remains_in_tree_rows() {
+        let mut model = populated_model();
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        model.insert_agent_node(visibility_agent(
+            "recent-unknown",
+            run_id,
+            9,
+            Some(ExecState::Unknown),
+            Some(1_i64.saturating_sub(crate::provider::lane::DEFAULT_HEADLESS_INACTIVITY_MS)),
+            None,
+        ));
+
+        let rows = build_rows(&model, &AppState::default());
+
+        assert!(has_agent_row(&rows, "recent-unknown"));
+    }
+
+    #[test]
+    fn old_working_agent_remains_in_tree_rows() {
+        let mut model = populated_model();
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        model.insert_agent_node(visibility_agent(
+            "old-working",
+            run_id,
+            9,
+            Some(ExecState::Working),
+            Some(-crate::provider::lane::DEFAULT_HEADLESS_INACTIVITY_MS),
+            None,
+        ));
+
+        let rows = build_rows(&model, &AppState::default());
+
+        assert!(has_agent_row(&rows, "old-working"));
+    }
+
+    #[test]
+    fn display_stale_ended_agent_is_absent_from_tree_rows() {
+        let mut model = populated_model();
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        model.insert_agent_node(visibility_agent(
+            "stale-ended",
+            run_id,
+            9,
+            Some(ExecState::Ended),
+            Some(-crate::provider::lane::DEFAULT_HEADLESS_INACTIVITY_MS),
+            None,
+        ));
+
+        let rows = build_rows(&model, &AppState::default());
+
+        assert!(
+            !has_agent_row(&rows, "stale-ended"),
+            "an ended agent at the inactivity boundary must be hidden"
+        );
+    }
+
+    #[test]
+    fn unknown_without_activity_and_old_stale_agent_remain_in_tree_rows() {
+        let mut model = populated_model();
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        model.insert_agent_node(visibility_agent(
+            "unknown-without-activity",
+            run_id,
+            9,
+            Some(ExecState::Unknown),
+            None,
+            None,
+        ));
+        model.insert_agent_node(visibility_agent(
+            "known-stale",
+            run_id,
+            10,
+            Some(ExecState::Stale { since_ms: 0 }),
+            Some(-crate::provider::lane::DEFAULT_HEADLESS_INACTIVITY_MS),
+            None,
+        ));
+
+        let rows = build_rows(&model, &AppState::default());
+
+        assert!(has_agent_row(&rows, "unknown-without-activity"));
+        assert!(has_agent_row(&rows, "known-stale"));
+    }
+
+    #[test]
+    fn live_child_of_display_stale_parent_is_reparented_to_the_run() {
+        let mut model = populated_model();
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        model.insert_agent_node(visibility_agent(
+            "stale-parent",
+            run_id,
+            9,
+            Some(ExecState::Unknown),
+            Some(-crate::provider::lane::DEFAULT_HEADLESS_INACTIVITY_MS),
+            None,
+        ));
+        model.insert_agent_node(visibility_agent(
+            "live-child",
+            run_id,
+            10,
+            Some(ExecState::Working),
+            Some(-crate::provider::lane::DEFAULT_HEADLESS_INACTIVITY_MS),
+            Some("stale-parent"),
+        ));
+
+        let rows = build_rows(&model, &AppState::default());
+        let run_depth = rows
+            .iter()
+            .find(|row| row.key.run_id() == Some(run_id))
+            .expect("owning run renders")
+            .depth;
+        let child_depth = rows
+            .iter()
+            .find(|row| {
+                matches!(
+                    &row.key,
+                    NodeKey::Agent { agent_node_id, .. } if agent_node_id == "live-child"
+                )
+            })
+            .expect("live child renders")
+            .depth;
+
+        assert!(!has_agent_row(&rows, "stale-parent"));
+        assert_eq!(child_depth, run_depth + 1);
     }
 
     #[test]

@@ -10,14 +10,22 @@ pub const DEFAULT_TERMINAL_VISIBILITY_MS: i64 = 60 * 60 * 1_000;
 pub const HOOK_ONLY_STALE_VISIBILITY_MS: i64 = 24 * 60 * 60 * 1_000;
 pub const DEFAULT_STALL_WARN_MS: i64 = 300_000;
 pub const DEFAULT_GHOST_VISIBILITY_MS: i64 = 300_000;
+pub const DEFAULT_HEADLESS_INACTIVITY_MS: i64 =
+    crate::provider::lane::DEFAULT_HEADLESS_INACTIVITY_MS;
 
 static STALL_WARN_MS: AtomicI64 = AtomicI64::new(DEFAULT_STALL_WARN_MS);
 static GHOST_VISIBILITY_MS: AtomicI64 = AtomicI64::new(DEFAULT_GHOST_VISIBILITY_MS);
+static HEADLESS_INACTIVITY_MS: AtomicI64 = AtomicI64::new(DEFAULT_HEADLESS_INACTIVITY_MS);
 
 /// Installs process-wide display timing resolved once by the monitor entrypoint.
-pub fn configure_display_timing(stall_warn_ms: i64, ghost_visibility_ms: i64) {
+pub fn configure_display_timing(
+    stall_warn_ms: i64,
+    ghost_visibility_ms: i64,
+    headless_inactivity_ms: i64,
+) {
     STALL_WARN_MS.store(stall_warn_ms, Ordering::Relaxed);
     GHOST_VISIBILITY_MS.store(ghost_visibility_ms, Ordering::Relaxed);
+    HEADLESS_INACTIVITY_MS.store(headless_inactivity_ms, Ordering::Relaxed);
 }
 
 #[must_use]
@@ -28,6 +36,11 @@ pub(crate) fn stall_warn_ms() -> i64 {
 #[must_use]
 pub(crate) fn ghost_visibility_ms() -> i64 {
     GHOST_VISIBILITY_MS.load(Ordering::Relaxed)
+}
+
+#[must_use]
+pub(crate) fn headless_inactivity_ms() -> i64 {
+    HEADLESS_INACTIVITY_MS.load(Ordering::Relaxed)
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
