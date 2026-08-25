@@ -1518,7 +1518,7 @@ pub(crate) fn build_uncollapsed_rows(model: &DomainModel, state: &AppState) -> V
 fn build_full_rows(model: &DomainModel, state: &AppState) -> Vec<TreeRow> {
     match state.view_mode() {
         ViewMode::ExecutionTree => {
-            let newest_agents = newest_agent_nodes(model);
+            let newest_agents = newest_agent_nodes(model, state.now_ms());
             build_tree_rows(model, state, &newest_agents)
         }
         ViewMode::DependencyDag => dag::build_rows(model, state.dag_order(), state.now_ms()),
@@ -2027,13 +2027,14 @@ fn dispatch_parent_run(model: &DomainModel, child_run_id: RunId) -> Option<&Task
     parents.into_iter().next()
 }
 
-pub(crate) fn newest_agent_nodes(model: &DomainModel) -> NewestAgentNodes<'_> {
+pub(crate) fn newest_agent_nodes(model: &DomainModel, now_ms: i64) -> NewestAgentNodes<'_> {
     #[cfg(test)]
     record_newest_agent_scan();
     let mut newest = NewestAgentNodes::new();
     for agent in model
         .agent_nodes()
         .filter(|agent| !is_live_line_agent(agent))
+        .filter(|agent| !projection::agent_node_is_display_stale(agent, now_ms))
     {
         newest
             .entry(agent.task_run_id)
@@ -2054,13 +2055,13 @@ fn is_live_line_agent(agent: &AgentNode) -> bool {
 }
 
 #[cfg(test)]
-fn newest_agent_node(model: &DomainModel, run_id: RunId) -> Option<&AgentNode> {
-    newest_agent_nodes(model).get(&run_id).copied()
+fn newest_agent_node(model: &DomainModel, run_id: RunId, now_ms: i64) -> Option<&AgentNode> {
+    newest_agent_nodes(model, now_ms).get(&run_id).copied()
 }
 
 #[cfg(test)]
 fn run_row_label(model: &DomainModel, run: &TaskRun, now_ms: i64) -> String {
-    let newest_agent = newest_agent_node(model, run.run_id);
+    let newest_agent = newest_agent_node(model, run.run_id, now_ms);
     let stalled = projection::stalled_run_ids(model, now_ms, crate::activity::stall_warn_ms())
         .contains(&run.run_id);
     run_row_label_with_agent(
@@ -2992,6 +2993,116 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn display_stale_newest_agent_does_not_supply_run_live_line_fallback() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let run = label_run(
+            run_id,
+            RunKey::Controller("hook:claude-code:S:task:T".to_owned()),
+            TaskState::Running,
+            None,
+            None,
+            Some("Fallback source"),
+        );
+        let mut hidden_stale = label_agent(
+            "hidden-stale",
+            run_id,
+            Some(100),
+            Some("hidden-stale-event"),
+            Some("Bash"),
+            None,
+        );
+        hidden_stale.state = Some(ExecState::Ended);
+        let visible_fresh = label_agent(
+            "visible-fresh",
+            run_id,
+            Some(50),
+            Some("visible-fresh-event"),
+            Some("Read"),
+            None,
+        );
+        let mut model = DomainModel::default();
+        model.insert_task_run(run.clone());
+        model.insert_agent_node(hidden_stale);
+        model.insert_agent_node(visible_fresh);
+        let now_ms = 100_i64.saturating_add(crate::provider::lane::DEFAULT_HEADLESS_INACTIVITY_MS);
+
+        let label = run_row_label(&model, &run, now_ms);
+
+        assert!(
+            label.contains("visible-fresh-event: Read"),
+            "visible fresh agent fallback missing from run row: {label}"
+        );
+        assert!(
+            !label.contains("hidden-stale-event: Bash"),
+            "display-stale agent fallback leaked into run row: {label}"
+        );
+    }
+
+    #[test]
+    fn only_display_stale_agent_supplies_no_run_live_line_fallback() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let run = label_run(
+            run_id,
+            RunKey::Controller("hook:claude-code:S:task:T".to_owned()),
+            TaskState::Running,
+            None,
+            None,
+            Some("Only stale"),
+        );
+        let mut hidden_stale = label_agent(
+            "hidden-stale",
+            run_id,
+            Some(100),
+            Some("hidden-only-event"),
+            Some("Bash"),
+            None,
+        );
+        hidden_stale.state = Some(ExecState::Ended);
+        let mut model = DomainModel::default();
+        model.insert_task_run(run.clone());
+        model.insert_agent_node(hidden_stale);
+        let now_ms = 100_i64.saturating_add(crate::provider::lane::DEFAULT_HEADLESS_INACTIVITY_MS);
+
+        let label = run_row_label(&model, &run, now_ms);
+
+        assert_eq!(label, "● claude-code Only stale");
+        assert!(
+            !label.contains("hidden-only-event: Bash"),
+            "display-stale only agent leaked into run row: {label}"
+        );
+    }
+
+    #[test]
+    fn visible_agent_keeps_run_live_line_fallback() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let run = label_run(
+            run_id,
+            RunKey::Controller("hook:claude-code:S:task:T".to_owned()),
+            TaskState::Running,
+            None,
+            None,
+            Some("Visible fallback"),
+        );
+        let visible = label_agent(
+            "visible",
+            run_id,
+            Some(50),
+            Some("visible-event"),
+            Some("Read"),
+            None,
+        );
+        let mut model = DomainModel::default();
+        model.insert_task_run(run.clone());
+        model.insert_agent_node(visible);
+        let now_ms = 100_i64.saturating_add(crate::provider::lane::DEFAULT_HEADLESS_INACTIVITY_MS);
+
+        assert_eq!(
+            run_row_label(&model, &run, now_ms),
+            "● claude-code Visible fallback — visible-event: Read"
+        );
     }
 
     #[test]
@@ -4197,8 +4308,9 @@ mod tests {
             model.set_pane_ordinal(pane_id.to_owned(), DisplayOrdinal::new(ordinal));
         }
 
-        let newest_agents = newest_agent_nodes(&model);
-        let rows = build_tree_rows(&model, &AppState::default(), &newest_agents);
+        let state = AppState::default();
+        let newest_agents = newest_agent_nodes(&model, state.now_ms());
+        let rows = build_tree_rows(&model, &state, &newest_agents);
         let topology = rows
             .iter()
             .filter_map(|row| match &row.key {
@@ -4276,7 +4388,7 @@ mod tests {
 
         model_sender.send(Arc::new(refreshed)).unwrap();
         app.refresh();
-        let newest_agents = newest_agent_nodes(app.model());
+        let newest_agents = newest_agent_nodes(app.model(), app.state().now_ms());
         let rows = build_tree_rows(app.model(), app.state(), &newest_agents);
         let hosting_pane = rows.iter().find_map(|row| match &row.key {
             NodeKey::Run {
@@ -4371,8 +4483,9 @@ mod tests {
             child_run_id: child,
         });
 
-        let newest_agents = newest_agent_nodes(&model);
-        let rows = build_tree_rows(&model, &AppState::default(), &newest_agents);
+        let state = AppState::default();
+        let newest_agents = newest_agent_nodes(&model, state.now_ms());
+        let rows = build_tree_rows(&model, &state, &newest_agents);
         let parent_row = only_run_row(&rows, parent);
         let child_row = only_run_row(&rows, child);
         let parent_index = rows.iter().position(|row| row == parent_row).unwrap();
@@ -4413,8 +4526,9 @@ mod tests {
             child_run_id: child,
         });
 
-        let newest_agents = newest_agent_nodes(&model);
-        let rows = build_tree_rows(&model, &AppState::default(), &newest_agents);
+        let state = AppState::default();
+        let newest_agents = newest_agent_nodes(&model, state.now_ms());
+        let rows = build_tree_rows(&model, &state, &newest_agents);
         let parent_rows = rows
             .iter()
             .filter(|row| row.key.run_id() == Some(parent))
@@ -4468,8 +4582,9 @@ mod tests {
             child_run_id: headless_grandchild,
         });
 
-        let newest_agents = newest_agent_nodes(&model);
-        let rows = build_tree_rows(&model, &AppState::default(), &newest_agents);
+        let state = AppState::default();
+        let newest_agents = newest_agent_nodes(&model, state.now_ms());
+        let rows = build_tree_rows(&model, &state, &newest_agents);
         let ended_row = only_run_row(&rows, ended_child);
         let grandchild_row = only_run_row(&rows, headless_grandchild);
 
@@ -4519,8 +4634,9 @@ mod tests {
             });
         }
 
-        let newest_agents = newest_agent_nodes(&model);
-        let rows = build_tree_rows(&model, &AppState::default(), &newest_agents);
+        let state = AppState::default();
+        let newest_agents = newest_agent_nodes(&model, state.now_ms());
+        let rows = build_tree_rows(&model, &state, &newest_agents);
         let run_rows = rows
             .iter()
             .filter(|row| row.key.run_id().is_some())
@@ -4661,8 +4777,9 @@ mod tests {
             });
         }
 
-        let newest_agents = newest_agent_nodes(&model);
-        let rows = build_tree_rows(&model, &AppState::default(), &newest_agents);
+        let state = AppState::default();
+        let newest_agents = newest_agent_nodes(&model, state.now_ms());
+        let rows = build_tree_rows(&model, &state, &newest_agents);
         let run_rows = rows
             .iter()
             .filter_map(|row| row.key.run_id().map(|run_id| (run_id, row.depth)))
@@ -4712,7 +4829,7 @@ mod tests {
         });
         let app = app(model, ObservationQuality::Live, "demo");
 
-        let newest_agents = newest_agent_nodes(app.model());
+        let newest_agents = newest_agent_nodes(app.model(), app.state().now_ms());
         let rows = build_tree_rows(app.model(), app.state(), &newest_agents);
         let agent_rows = rows
             .iter()
@@ -4964,7 +5081,7 @@ mod tests {
             child_run_id: shared,
         });
         let app = app(model, ObservationQuality::Live, "session");
-        let newest_agents = newest_agent_nodes(app.model());
+        let newest_agents = newest_agent_nodes(app.model(), app.state().now_ms());
         let rows = build_tree_rows(app.model(), app.state(), &newest_agents);
         let labels = rows
             .iter()

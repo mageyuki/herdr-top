@@ -360,7 +360,7 @@ pub(crate) fn stalled_run_ids(
 /// A missing activity timestamp remains visible because there is no evidence that the node has
 /// crossed the inactivity interval; this also prevents a just-created node from disappearing
 /// before its first timestamped event. `ExecState::Stale` remains visible because it is a known
-/// state, while the display rule deliberately applies only to unknown and ended states.
+/// state, while the display rule deliberately applies only when state is absent, unknown, or ended.
 pub(crate) fn agent_node_is_display_stale(agent: &AgentNode, now_ms: i64) -> bool {
     matches!(
         agent.state.as_ref(),

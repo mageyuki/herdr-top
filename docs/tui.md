@@ -235,13 +235,14 @@ Native agent rows use this form:
 ```
 
 Agent nodes nest recursively only where provider metadata establishes a parent.
-An Agent Node in `unknown` or `ended` state is hidden after its recorded last
-activity has been silent for `HERDR_TOP_HEADLESS_INACTIVITY_MS`. A node without
-an activity timestamp remains visible, as do known states such as `stale` and
-`working`. When a hidden parent has a visible child, the child is re-parented
-directly beneath the owning Task Run for display. This rule removes no model or
-SQLite data, and the Selected detail projection continues to use the complete,
-unfiltered Agent Node model.
+An Agent Node whose state is absent, unknown, or ended is hidden after its
+recorded last activity has been silent for `HERDR_TOP_HEADLESS_INACTIVITY_MS`.
+A node without an activity timestamp remains visible, as do known states such
+as `stale` and `working`. When a hidden parent has a visible child, the child is
+re-parented directly beneath the owning Task Run for display. This rule removes
+no model or SQLite data, and the Selected detail projection continues to use
+the complete, unfiltered Agent Node model. The Task Run live-line fallback
+likewise ignores display-stale Agent Nodes.
 The dependency view remains separate: it lists each Task Run with its explicit
 prerequisites and dependents, or displays `no dependency edges recorded` when
 there are none. DAG rows share the status-glyph and label grammar, but omit the
