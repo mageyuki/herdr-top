@@ -584,17 +584,35 @@ fn command_activity(command: &[String], cwd: &str) -> Option<String> {
     let sanitized = sanitize_controller_text(&script);
     let relative = sanitized
         .split_whitespace()
-        .map(|token| {
-            if token.starts_with('/') {
-                repo_relative(token, cwd)
-            } else {
-                token.to_owned()
-            }
-        })
+        .map(|token| relativize_command_token(token, cwd))
         .collect::<Vec<_>>()
         .join(" ");
     let line = sanitize_command_script(&relative);
     (!line.is_empty()).then_some(line)
+}
+
+fn relativize_command_token(token: &str, cwd: &str) -> String {
+    if let Some(relative) = relativize_absolute_fragment(token, cwd) {
+        return relative;
+    }
+    if let Some((prefix, path)) = token.rsplit_once('=')
+        && let Some(relative) = relativize_absolute_fragment(path, cwd)
+    {
+        return format!("{prefix}={relative}");
+    }
+    token.to_owned()
+}
+
+fn relativize_absolute_fragment(fragment: &str, cwd: &str) -> Option<String> {
+    if fragment.starts_with('/') {
+        return Some(repo_relative(fragment, cwd));
+    }
+    let quote @ ('\'' | '"') = fragment.chars().next()? else {
+        return None;
+    };
+    let path = fragment.strip_prefix(quote)?.strip_suffix(quote)?;
+    path.starts_with('/')
+        .then(|| format!("{quote}{}{quote}", repo_relative(path, cwd)))
 }
 
 #[cfg(test)]
@@ -895,6 +913,71 @@ mod tests {
                 line: "cargo test src/provider/facts.rs".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn command_activity_strips_env_wrapped_secret_assignments() {
+        let secret = "sk-live-x";
+        let command = [
+            "/bin/bash".to_owned(),
+            "-lc".to_owned(),
+            format!("env API_TOKEN={secret} curl https://example.test"),
+        ];
+
+        let head = command_activity(&command, "/repo").expect("command head");
+
+        assert!(!head.contains(secret), "secret leaked in {head:?}");
+        assert_eq!(head, "curl https://example.test");
+    }
+
+    #[test]
+    fn command_activity_relativizes_equals_embedded_absolute_path() {
+        let absolute = "/repo/src/private.rs";
+        let command = [
+            "/bin/bash".to_owned(),
+            "-lc".to_owned(),
+            format!("cargo test --file={absolute}"),
+        ];
+
+        let head = command_activity(&command, "/repo").expect("command head");
+
+        assert!(head.contains("--file=src/private.rs"), "head was {head:?}");
+        assert!(!head.contains(absolute), "absolute path leaked in {head:?}");
+    }
+
+    #[test]
+    fn command_activity_relativizes_quoted_absolute_path() {
+        let absolute = "/repo/src/private.rs";
+        let command = [
+            "/bin/bash".to_owned(),
+            "-lc".to_owned(),
+            format!("cargo test '{absolute}'"),
+        ];
+
+        let head = command_activity(&command, "/repo").expect("command head");
+
+        assert!(head.contains("'src/private.rs'"), "head was {head:?}");
+        assert!(!head.contains(absolute), "absolute path leaked in {head:?}");
+    }
+
+    #[test]
+    fn command_activity_preserves_quotes_around_equals_embedded_paths() {
+        for quote in ['\'', '"'] {
+            let absolute = "/repo/src/private.rs";
+            let command = [
+                "/bin/bash".to_owned(),
+                "-lc".to_owned(),
+                format!("cargo test --file={quote}{absolute}{quote}"),
+            ];
+
+            let head = command_activity(&command, "/repo").expect("command head");
+
+            assert!(
+                head.contains(&format!("--file={quote}src/private.rs{quote}")),
+                "head was {head:?}"
+            );
+            assert!(!head.contains(absolute), "absolute path leaked in {head:?}");
+        }
     }
 
     #[test]

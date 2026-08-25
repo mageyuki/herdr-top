@@ -250,12 +250,14 @@ pub fn scan_raw_ids(line: &str) -> Vec<EvidenceId> {
     found
 }
 
-/// Removes leading environment assignments and bounds a command to 60 characters.
+/// Removes leading environment assignments and supported `env` wrappers, then bounds a command.
 #[must_use]
 pub fn sanitize_command_script(script: &str) -> String {
     let mut remainder = script;
-    while let Some(after_assignment) = strip_assignment_prefix(remainder) {
-        remainder = after_assignment.trim_start_matches(char::is_whitespace);
+    while let Some(after_prefix) =
+        strip_assignment_prefix(remainder).or_else(|| strip_env_wrapper_prefix(remainder))
+    {
+        remainder = after_prefix.trim_start_matches(char::is_whitespace);
     }
     truncate_60(remainder)
 }
@@ -358,6 +360,48 @@ fn strip_assignment_prefix(script: &str) -> Option<&str> {
     Some(&script[value_end..])
 }
 
+fn strip_env_wrapper_prefix(script: &str) -> Option<&str> {
+    let (command, mut remainder) = leading_token(script)?;
+    if command != "env" {
+        return None;
+    }
+    remainder = remainder.trim_start_matches(char::is_whitespace);
+
+    loop {
+        let (option_or_command, after_token) = leading_token(remainder)?;
+        match option_or_command {
+            "-" | "-i" | "--ignore-environment" => {
+                remainder = after_token.trim_start_matches(char::is_whitespace);
+            }
+            "-u" | "--unset" => {
+                let (_, after_name) =
+                    leading_token(after_token.trim_start_matches(char::is_whitespace))?;
+                remainder = after_name.trim_start_matches(char::is_whitespace);
+            }
+            "--" => {
+                let command = after_token.trim_start_matches(char::is_whitespace);
+                return (!command.is_empty()).then_some(command);
+            }
+            option if option.starts_with("--unset=") && option.len() > "--unset=".len() => {
+                remainder = after_token.trim_start_matches(char::is_whitespace);
+            }
+            option if option.starts_with('-') => return None,
+            _ => return Some(remainder),
+        }
+    }
+}
+
+fn leading_token(value: &str) -> Option<(&str, &str)> {
+    if value.is_empty() {
+        return None;
+    }
+    let end = value
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map_or(value.len(), |(index, _)| index);
+    Some((&value[..end], &value[end..]))
+}
+
 fn is_word(ch: char) -> bool {
     ch == '_' || ch.is_alphanumeric()
 }
@@ -454,5 +498,29 @@ mod tests {
 
         assert!(sanitized.starts_with("codex exec resume "));
         assert_eq!(sanitized.chars().count(), 60);
+    }
+
+    #[test]
+    fn command_sanitizer_strips_supported_env_wrapper_forms() {
+        for script in [
+            "env API_TOKEN=secret curl",
+            "env -i API_TOKEN=secret curl",
+            "env - API_TOKEN=secret curl",
+            "env --ignore-environment API_TOKEN=secret curl",
+            "env -u API_TOKEN API_TOKEN=secret curl",
+            "env --unset API_TOKEN API_TOKEN=secret curl",
+            "env --unset=API_TOKEN API_TOKEN=secret curl",
+            "env -- API_TOKEN=secret curl",
+            "OUTER=value env -i INNER=secret env -- curl",
+        ] {
+            assert_eq!(sanitize_command_script(script), "curl", "script: {script}");
+        }
+    }
+
+    #[test]
+    fn command_sanitizer_preserves_unknown_env_options() {
+        let script = "env -C /tmp API_TOKEN=secret curl";
+
+        assert_eq!(sanitize_command_script(script), script);
     }
 }

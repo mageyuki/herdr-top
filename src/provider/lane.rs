@@ -3414,7 +3414,54 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
+        assert_eq!(batched.len(), 2);
         assert_eq!(batched, separate);
+    }
+
+    #[test]
+    fn live_line_event_ids_distinguish_activity_facts_at_the_same_ordinal() {
+        let scope = SessionScope::Codex {
+            rollout_id: ROLLOUT.to_owned(),
+        };
+        let event_ids = synthesize(
+            &mut Synthesis::default(),
+            "rollout.jsonl",
+            [
+                (
+                    7,
+                    LogFact::Activity {
+                        scope: scope.clone(),
+                        at_ms: 1,
+                        source: ActivitySource::Command,
+                        line: "command".to_owned(),
+                    },
+                ),
+                (
+                    7,
+                    LogFact::Activity {
+                        scope,
+                        at_ms: 2,
+                        source: ActivitySource::Commentary,
+                        line: "commentary".to_owned(),
+                    },
+                ),
+            ],
+        )
+        .into_iter()
+        .filter_map(|event| match event {
+            ProviderEvent::Activity { event_id, .. } => Some(event_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+        assert_ne!(event_ids[0], event_ids[1]);
+        assert_eq!(
+            event_ids,
+            [
+                format!("log:rollout.jsonl:7:activity:{ROLLOUT}:0"),
+                format!("log:rollout.jsonl:7:activity:{ROLLOUT}:1"),
+            ]
+        );
     }
 
     #[test]
