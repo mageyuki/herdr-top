@@ -735,7 +735,17 @@ impl Reducer {
         });
         scratch.terminal_event_sources = self.terminal_event_sources.clone();
         scratch.non_lane_task_state_runs = self.non_lane_task_state_runs.clone();
-        if matches!(event.event, ControllerEventKind::Dismiss) && subject_was_unknown {
+        let drops_unknown_lane_terminal = subject_was_unknown
+            && metadata.source == crate::provider::lane::SOURCE_LOG_LANE
+            && matches!(
+                event.event,
+                ControllerEventKind::Complete
+                    | ControllerEventKind::Failed
+                    | ControllerEventKind::Cancelled
+            );
+        if matches!(event.event, ControllerEventKind::Dismiss) && subject_was_unknown
+            || drops_unknown_lane_terminal
+        {
             metadata.task_run_id = None;
         }
         let normalized = NormalizedEvent::ControllerEvent {
@@ -743,8 +753,10 @@ impl Reducer {
             event: event.event.clone(),
         };
         let mut persist = Vec::new();
-        if matches!(event.event, ControllerEventKind::Dismiss) {
-            if let Some(mut task_run) = scratch.model.task_run(&subject).cloned() {
+        if matches!(event.event, ControllerEventKind::Dismiss) || drops_unknown_lane_terminal {
+            if matches!(event.event, ControllerEventKind::Dismiss)
+                && let Some(mut task_run) = scratch.model.task_run(&subject).cloned()
+            {
                 task_run.dismissed_at_ms = Some(metadata.receipt_time_ms);
                 scratch.model.insert_task_run(task_run.clone());
                 persist.push(scratch.persist_task_run(task_run, metadata.receipt_time_ms));
@@ -3975,6 +3987,100 @@ mod tests {
             })
             .unwrap();
         assert_eq!(recorded.task_run_id, None);
+    }
+
+    #[test]
+    fn lane_terminal_events_for_unknown_runs_are_ledgered_without_placeholders() {
+        for (event_slug, event_kind) in [
+            ("complete", ControllerEventKind::Complete),
+            ("failed", ControllerEventKind::Failed),
+            ("cancelled", ControllerEventKind::Cancelled),
+        ] {
+            let controller_key = format!("unknown-lane-{event_slug}");
+            let (reducer, _) = Reducer::new(restored(DomainModel::default(), 41));
+            let mut event =
+                controller_event(&format!("lane-{event_slug}"), &controller_key, event_kind);
+            event.metadata.source = SOURCE_LOG_LANE.to_owned();
+
+            let delta = reducer
+                .validate_controller_event(&event)
+                .expect("a dropped lane terminal must be handled without rejection");
+
+            assert_eq!(
+                delta.post_model.task_runs().count(),
+                0,
+                "an unknown lane {event_slug} must not create a run"
+            );
+            assert!(
+                delta
+                    .post_model
+                    .task_run_by_key(&RunKey::Controller(controller_key.clone()))
+                    .is_none(),
+                "the exact lane {event_slug} Controller key must remain absent"
+            );
+            assert_eq!(
+                delta.post_next_ordinal, 41,
+                "dropping lane {event_slug} must not consume a display ordinal"
+            );
+            assert_eq!(
+                delta.diagnostic_deltas.terminal_forward_reference_creations, 0,
+                "a dropped lane {event_slug} is not a terminal forward-reference creation"
+            );
+            assert!(
+                delta
+                    .batch
+                    .iter()
+                    .all(|operation| matches!(operation, PersistOp::RecordEvent { .. })),
+                "dropping lane {event_slug} must not persist runs, executions, or edges"
+            );
+            let recorded = delta
+                .batch
+                .iter()
+                .find_map(|operation| match operation {
+                    PersistOp::RecordEvent { event, .. } => Some(super::event_metadata(event)),
+                    _ => None,
+                })
+                .expect("the dropped lane terminal must retain its deterministic ledger entry");
+            assert_eq!(
+                recorded.task_run_id, None,
+                "the dropped lane {event_slug} ledger entry must not reference a run"
+            );
+            assert_eq!(recorded.source, SOURCE_LOG_LANE);
+        }
+    }
+
+    #[test]
+    fn non_lane_terminal_for_unknown_run_keeps_forward_reference_creation() {
+        let controller_key = "hook-terminal-forward-reference";
+        let (reducer, _) = Reducer::new(restored(DomainModel::default(), 1));
+
+        let delta = reducer
+            .validate_controller_event(&controller_event(
+                "hook-complete-unknown",
+                controller_key,
+                ControllerEventKind::Complete,
+            ))
+            .expect("a hook terminal forward reference must retain existing semantics");
+
+        let run = delta
+            .post_model
+            .task_run_by_key(&RunKey::Controller(controller_key.to_owned()))
+            .expect("the non-lane terminal must create its Controller run");
+        assert_eq!(run.state, TaskState::Completed);
+        assert_eq!(delta.post_next_ordinal, 2);
+        assert_eq!(
+            delta.diagnostic_deltas.terminal_forward_reference_creations,
+            1
+        );
+        let recorded = delta
+            .batch
+            .iter()
+            .find_map(|operation| match operation {
+                PersistOp::RecordEvent { event, .. } => Some(super::event_metadata(event)),
+                _ => None,
+            })
+            .expect("the hook terminal must be recorded");
+        assert_eq!(recorded.task_run_id, Some(run.run_id));
     }
 
     #[tokio::test]
