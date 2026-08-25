@@ -114,11 +114,22 @@ directories (raw tool output), and any file class not named in §5.
 Backfill anchor (v2, resolves a plan/spec conflict): the anchor is
 `max(earliest own-DB event for this session, now − HERDR_TOP_BACKFILL_WINDOW_MS)`
 — the window is a hard scan bound; the DB can only narrow it, never widen
-it. Files strictly older than the anchor are skipped unless admitted by
-lineage evidence. Pane-root artifacts (the transcript or rollout of an
-admitted pane session) are likewise exempt from the anchor — a live but
-idle pane's own artifact must not become invisible when its mtime falls
-behind the window.
+it. Lineage evidence admits an artifact's identity for descendant
+discovery and attachment, but reading that artifact still honors the
+anchor. An evidence-admitted artifact whose mtime is strictly older than
+the anchor is not read. Pane-root artifacts (the transcript or rollout of
+an admitted pane session) are likewise exempt from the anchor — a live
+but idle pane's own artifact must not become invisible when its mtime
+falls behind the window.
+
+Known accepted residual: within-window UUID echoes can still cause a
+false attachment. A fresh tool output that merely names a concurrently
+active unrelated session can admit that session's artifact while its
+mtime remains inside the window. Window-bounding removes the multi-day
+replay and limits the blast radius, but it does not eliminate the class.
+A full fix requires dispatch-shaped context parsing that distinguishes a
+UUID in an actual dispatch or spawn record from one merely embedded in
+tool output; that parsing is deliberately out of scope here.
 
 Watching: the existing worker's notify + rescan machinery; per-file
 `SourcePosition` offsets; polling degradation. Idle cost stays

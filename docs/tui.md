@@ -267,8 +267,8 @@ backfill window from byte zero; it does not restore a per-file byte offset. The
 selection anchor is the later of the earliest database event and
 `now - HERDR_TOP_BACKFILL_WINDOW_MS`. The window selects files, not records, so
 every selected artifact is read in full and its run totals are complete.
-Pane-root artifacts and artifacts admitted through lineage evidence are exempt
-from the anchor.
+Pane-root artifacts are exempt from the anchor. Lineage evidence still admits
+an artifact's identity, but reading that artifact must satisfy the anchor.
 
 Replay is idempotent through the durable event ledger. Token telemetry,
 subjects, run kind, and per-turn context are transient and are recomputed from

@@ -4179,7 +4179,7 @@ impl ProviderWorker for AdapterProviderWorker {
                 let tail = match TailFile::open(
                     &file.root,
                     &file.relative_path,
-                    // Admission applies the anchor plus pane-root and explicit-lineage exemptions.
+                    // Admission applies the anchor except to pane-root identities.
                     // Read each admitted artifact from zero to reconstruct transient lane state.
                     &crate::provider::FirstSeenBaseline::default(),
                     generation,

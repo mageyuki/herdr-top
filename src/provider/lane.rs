@@ -1380,12 +1380,12 @@ impl Admission {
             .any(|session_id| claude_session_path_matches(path, session_id))
     }
 
-    /// Applies the hard backfill anchor to an otherwise admitted regular file.
+    /// Applies the hard backfill anchor to every admitted regular file except a
+    /// pane-root or exact pane-path identity.
     #[must_use]
     pub fn is_admitted_file(&self, path: &Path, modified_ms: i64) -> bool {
         self.is_admitted_path(path)
             && (modified_ms >= self.anchor_ms
-                || self.admitted_paths.contains(path)
                 || self.pane_paths.contains(path)
                 || self.is_pane_root_path(path))
     }
@@ -3752,7 +3752,7 @@ mod tests {
     }
 
     #[test]
-    fn per_file_anchor_bounds_descendants_but_not_exact_or_pane_roots() {
+    fn per_file_anchor_only_exempts_pane_roots() {
         let mut admission = Admission::new(1_000);
         admission.admit_pane_session(Provider::Claude, PARENT);
         let pane_root = PathBuf::from(format!("/logs/workspace/{PARENT}.jsonl"));
@@ -3774,9 +3774,23 @@ mod tests {
                 .is_some()
         );
 
-        assert!(admission.is_admitted_file(&pane_root, 100));
+        assert!(
+            admission.is_admitted_path(&evidence_path),
+            "lineage evidence must still admit the artifact identity"
+        );
+        assert!(
+            admission.is_admitted_file(&pane_root, 100),
+            "pane roots must remain readable before the anchor"
+        );
         assert!(!admission.is_admitted_file(&subagent, 999));
-        assert!(admission.is_admitted_file(&evidence_path, 100));
+        assert!(
+            !admission.is_admitted_file(&evidence_path, 100),
+            "old evidence-admitted artifacts must honor the anchor"
+        );
+        assert!(
+            admission.is_admitted_file(&evidence_path, 1_000),
+            "fresh evidence-admitted artifacts must remain readable"
+        );
         assert!(admission.is_admitted_file(&subagent, 1_000));
     }
 
