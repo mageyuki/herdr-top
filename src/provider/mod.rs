@@ -78,7 +78,7 @@ pub enum ProviderEvent {
     Synthesized(ControllerEvent),
     /// Append-time signal consumed by the lifecycle lane in Increment 9 Task 6.
     RunLiveness { key: RunKey, at_ms: i64 },
-    /// Append-silence transition consumed through the lane-specific reducer close path.
+    /// Inactivity transition consumed through the lane-specific reducer close path.
     LaneClose { key: RunKey, at_ms: i64 },
     /// Allowlisted usage sample consumed by telemetry in Increment 9 Task 7.
     Telemetry {

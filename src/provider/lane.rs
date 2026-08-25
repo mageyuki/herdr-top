@@ -1,5 +1,6 @@
 //! Evidence-gated provider log admission.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirEntry, FileType};
@@ -23,7 +24,7 @@ use std::cell::RefCell;
 pub const DEFAULT_BACKFILL_WINDOW_MS: i64 = 86_400_000;
 /// Default delay before a provider-log Complete becomes durable.
 pub const DEFAULT_COMPLETE_GRACE_MS: i64 = 30_000;
-/// Default append-silence interval before a provider-log run closes without a terminal fact.
+/// Default inactivity interval before a provider-log run closes without a terminal fact.
 pub const DEFAULT_HEADLESS_INACTIVITY_MS: i64 = 600_000;
 /// Event-source marker reserved for facts synthesized from provider log artifacts.
 pub const SOURCE_LOG_LANE: &str = "provider-log";
@@ -37,7 +38,7 @@ pub struct LogLaneConfig {
     pub backfill_window_ms: i64,
     /// Delay that allows a later failure or resume to supersede a Complete.
     pub complete_grace_ms: i64,
-    /// Append-silence interval before an active lane run becomes `ended_unknown`.
+    /// Inactivity interval before an active lane run becomes `ended_unknown`.
     pub headless_inactivity_ms: i64,
 }
 
@@ -104,7 +105,7 @@ pub struct Synthesis {
     ai_titles: HashMap<String, String>,
     claude_cwds: HashMap<String, String>,
     published_subjects: HashMap<String, String>,
-    started: HashSet<ScopeKey>,
+    started: HashMap<ScopeKey, i64>,
     usage_samples: HashSet<(ScopeKey, String)>,
     subagent_ends: HashMap<(String, String), bool>,
     lineage: HashSet<(ScopeKey, ScopeKey)>,
@@ -146,7 +147,7 @@ impl Synthesis {
             ai_titles: HashMap::new(),
             claude_cwds: HashMap::new(),
             published_subjects: HashMap::new(),
-            started: HashSet::new(),
+            started: HashMap::new(),
             usage_samples: HashSet::new(),
             subagent_ends: HashMap::new(),
             lineage: HashSet::new(),
@@ -166,14 +167,20 @@ impl Synthesis {
         self.flush_due_completes(now_ms, &mut events);
 
         let mut inactive = self
-            .last_append_ms
+            .started
             .iter()
-            .filter(|(scope, at_ms)| {
-                self.started.contains(*scope)
-                    && !self.inactivity_closed.contains(*scope)
-                    && now_ms.saturating_sub(**at_ms) >= self.headless_inactivity_ms
+            .filter_map(|(scope, started_at_ms)| {
+                let anchor_ms = self
+                    .last_append_ms
+                    .get(scope)
+                    .copied()
+                    .unwrap_or(*started_at_ms);
+                (!self.inactivity_closed.contains(scope)
+                    && !self.pending_completes.contains_key(scope)
+                    && !self.completed.contains(scope)
+                    && now_ms.saturating_sub(anchor_ms) >= self.headless_inactivity_ms)
+                    .then(|| scope.clone())
             })
-            .map(|(scope, _)| scope.clone())
             .collect::<Vec<_>>();
         inactive.sort();
         for scope in inactive {
@@ -243,6 +250,21 @@ impl Synthesis {
 
     fn hold_complete(&mut self, scope: ScopeKey, event: ControllerEvent) {
         self.pending_completes.entry(scope).or_insert(event);
+    }
+
+    fn start_scope(&mut self, scope: ScopeKey, source_at_ms: i64) -> bool {
+        let started_at_ms = if source_at_ms > 0 {
+            source_at_ms
+        } else {
+            self.latest_lifecycle_ms.max(1)
+        };
+        match self.started.entry(scope) {
+            Entry::Vacant(entry) => {
+                entry.insert(started_at_ms);
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
     }
 
     /// Consumes a file-order batch of facts from one artifact.
@@ -345,7 +367,7 @@ impl Synthesis {
                     at_ms,
                 });
                 if (matches!(scope, SessionScope::ClaudeRoot(_)) || reopen)
-                    && self.started.insert(key)
+                    && self.start_scope(key, at_ms)
                 {
                     events.push(ProviderEvent::Synthesized(controller_event(
                         artifact,
@@ -402,7 +424,7 @@ impl Synthesis {
                     .unwrap_or_default();
                 let scope_key = ScopeKey::from(&scope);
                 let _ = self.prepare_resume(&scope_key, at_ms, events);
-                self.started.insert(scope_key);
+                self.start_scope(scope_key, at_ms);
                 events.push(ProviderEvent::Synthesized(controller_event(
                     artifact,
                     ordinal,
@@ -441,7 +463,7 @@ impl Synthesis {
                         artifact, ordinal, sequence, &scope, at_ms, None,
                     ));
                 }
-                if self.started.insert(scope_key) {
+                if self.start_scope(scope_key, at_ms) {
                     events.push(ProviderEvent::Synthesized(controller_event(
                         artifact,
                         ordinal,
@@ -524,7 +546,7 @@ impl Synthesis {
                     Some(description),
                     Some(provider_metadata),
                 )));
-                self.started.insert(child_key);
+                self.start_scope(child_key, at_ms);
             }
             LogFact::SubagentEnded {
                 parent,
@@ -1905,6 +1927,36 @@ mod tests {
             &mut Admission::new(0),
             &AdmissionIndex::new(),
         )
+    }
+
+    fn synthesize_subagent_start(
+        synthesis: &mut Synthesis,
+        agent_id: &str,
+        source_at_ms: Option<i64>,
+    ) -> (SessionScope, Vec<ProviderEvent>) {
+        if let Some(source_at_ms) = source_at_ms {
+            synthesis
+                .last_append_ms
+                .insert(ScopeKey::ClaudeRoot(PARENT.to_owned()), source_at_ms);
+        }
+        let scope = SessionScope::ClaudeSubagent {
+            parent: PARENT.to_owned(),
+            agent_id: agent_id.to_owned(),
+        };
+        let events = synthesize(
+            synthesis,
+            "agent-child.meta.json",
+            [(
+                1,
+                LogFact::SubagentAppeared {
+                    parent: PARENT.to_owned(),
+                    agent_id: agent_id.to_owned(),
+                    agent_type: "reviewer".to_owned(),
+                    description: format!("Review {agent_id} lifecycle"),
+                },
+            )],
+        );
+        (scope, events)
     }
 
     fn synthesized_events(events: &[ProviderEvent]) -> Vec<&ControllerEvent> {
@@ -3298,6 +3350,124 @@ mod tests {
                 if key == &run_key_for_scope(&scope) && *at_ms == 150
         ));
         assert!(synthesis.advance_lifecycle(200).is_empty());
+    }
+
+    #[test]
+    fn appendless_started_scope_closes_once_at_start_time_boundary() {
+        let mut synthesis = Synthesis::with_lifecycle_timing_at(30, 50, 1);
+        let (scope, started) =
+            synthesize_subagent_start(&mut synthesis, "appendless-child", Some(100));
+        let child_events = synthesized_events(&started)
+            .into_iter()
+            .filter(|event| event.task_run_id == controller_key_for_scope(&scope))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            child_events.as_slice(),
+            [dispatch, task_started]
+                if matches!(dispatch.event, ControllerEventKind::Dispatch { .. })
+                    && matches!(task_started.event, ControllerEventKind::TaskStarted)
+                    && dispatch.metadata.timestamp_ms == 100
+                    && task_started.metadata.timestamp_ms == 100
+        ));
+
+        assert!(
+            synthesis.advance_lifecycle(149).is_empty(),
+            "an append-less scope must remain active before its start-time threshold"
+        );
+        assert_eq!(
+            synthesis.advance_lifecycle(150),
+            vec![ProviderEvent::LaneClose {
+                key: run_key_for_scope(&scope),
+                at_ms: 150,
+            }],
+            "an append-less started scope must close at its start-time threshold"
+        );
+        assert!(
+            synthesis.advance_lifecycle(200).is_empty(),
+            "an inactivity-closed scope must not close again"
+        );
+    }
+
+    #[test]
+    fn appendless_start_without_source_time_uses_injected_lifecycle_clock() {
+        let mut synthesis = Synthesis::with_lifecycle_timing_at(30, 50, 100);
+        let (scope, _) = synthesize_subagent_start(&mut synthesis, "clock-anchored-child", None);
+
+        assert!(
+            synthesis.advance_lifecycle(100).is_empty(),
+            "a fresh start without a source timestamp must not close immediately"
+        );
+        assert!(synthesis.advance_lifecycle(149).is_empty());
+        assert_eq!(
+            synthesis.advance_lifecycle(150),
+            vec![ProviderEvent::LaneClose {
+                key: run_key_for_scope(&scope),
+                at_ms: 150,
+            }]
+        );
+    }
+
+    #[test]
+    fn append_bearing_scope_closes_relative_to_last_append() {
+        let mut synthesis = Synthesis::with_lifecycle_timing_at(30, 50, 1);
+        let (scope, _) = synthesize_subagent_start(&mut synthesis, "active-child", Some(100));
+        let _ = synthesize(
+            &mut synthesis,
+            "agent-active-child.jsonl",
+            [(
+                2,
+                LogFact::Append {
+                    scope: scope.clone(),
+                    at_ms: 140,
+                },
+            )],
+        );
+
+        assert!(
+            synthesis.advance_lifecycle(150).is_empty(),
+            "the start-time threshold must not close a scope with a newer append"
+        );
+        assert_eq!(
+            synthesis.advance_lifecycle(190),
+            vec![ProviderEvent::LaneClose {
+                key: run_key_for_scope(&scope),
+                at_ms: 190,
+            }]
+        );
+    }
+
+    #[test]
+    fn appendless_pending_complete_is_never_inactivity_closed() {
+        let mut synthesis = Synthesis::with_lifecycle_timing_at(100, 50, 1);
+        let (scope, _) = synthesize_subagent_start(&mut synthesis, "completing-child", Some(100));
+        let held = synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                2,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "completing-child".to_owned(),
+                    failed: false,
+                },
+            )],
+        );
+        assert!(synthesized_events(&held).is_empty());
+
+        assert!(
+            synthesis.advance_lifecycle(150).is_empty(),
+            "a grace-held completion must suppress inactivity close"
+        );
+        assert!(matches!(
+            synthesis.advance_lifecycle(200).as_slice(),
+            [ProviderEvent::Synthesized(event)]
+                if event.task_run_id == controller_key_for_scope(&scope)
+                    && matches!(event.event, ControllerEventKind::Complete)
+        ));
+        assert!(
+            synthesis.advance_lifecycle(250).is_empty(),
+            "a completed scope must not be inactivity-closed later"
+        );
     }
 
     #[test]
