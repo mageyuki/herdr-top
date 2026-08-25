@@ -15234,9 +15234,11 @@ mod provider_integration_tests {
         worker
             .log_admission
             .admit_pane_session(Provider::Codex, "pane-owner");
-        worker
-            .admission_index
-            .insert_codex_rollout("shared-owner", shared.clone());
+        worker.admission_index.insert_codex_rollout(
+            "shared-owner",
+            shared.clone(),
+            worker.log_admission.anchor_ms(),
+        );
         assert!(
             worker
                 .log_admission

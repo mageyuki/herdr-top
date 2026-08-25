@@ -398,7 +398,11 @@ async fn run_monitor(cli: &Cli, plugin_state_dir: Option<&OsStr>) -> Result<(), 
     let stall_warn_ms = parse_stall_warn_ms(env::var_os("HERDR_TOP_STALL_WARN_MS").as_deref());
     let ghost_visibility_ms =
         parse_ghost_visibility_ms(env::var_os("HERDR_TOP_GHOST_VISIBILITY_MS").as_deref());
-    herdr_top::activity::configure_display_timing(stall_warn_ms, ghost_visibility_ms);
+    herdr_top::activity::configure_display_timing(
+        stall_warn_ms,
+        ghost_visibility_ms,
+        headless_inactivity_ms,
+    );
     tracing::info!(
         backfill_window_ms,
         complete_grace_ms,

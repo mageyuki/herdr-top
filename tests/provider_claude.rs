@@ -149,7 +149,7 @@ fn scan(root: &Path, admitted_paths: impl IntoIterator<Item = PathBuf>) -> Disco
         else {
             continue;
         };
-        evidence.insert_claude_subagent(ROOT_ID, agent_id, path.clone());
+        evidence.insert_claude_subagent(ROOT_ID, agent_id, path.clone(), 0);
         assert!(
             admission
                 .on_evidence(&parent, &EvidenceId::Uuid(agent_id.to_owned()), &evidence,)

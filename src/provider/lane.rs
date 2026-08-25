@@ -1,5 +1,6 @@
 //! Evidence-gated provider log admission.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirEntry, FileType};
@@ -23,7 +24,7 @@ use std::cell::RefCell;
 pub const DEFAULT_BACKFILL_WINDOW_MS: i64 = 86_400_000;
 /// Default delay before a provider-log Complete becomes durable.
 pub const DEFAULT_COMPLETE_GRACE_MS: i64 = 30_000;
-/// Default append-silence interval before a provider-log run closes without a terminal fact.
+/// Default inactivity interval before a provider-log run closes without a terminal fact.
 pub const DEFAULT_HEADLESS_INACTIVITY_MS: i64 = 600_000;
 /// Event-source marker reserved for facts synthesized from provider log artifacts.
 pub const SOURCE_LOG_LANE: &str = "provider-log";
@@ -37,7 +38,7 @@ pub struct LogLaneConfig {
     pub backfill_window_ms: i64,
     /// Delay that allows a later failure or resume to supersede a Complete.
     pub complete_grace_ms: i64,
-    /// Append-silence interval before an active lane run becomes `ended_unknown`.
+    /// Inactivity interval before an active lane run becomes `ended_unknown`.
     pub headless_inactivity_ms: i64,
 }
 
@@ -104,7 +105,7 @@ pub struct Synthesis {
     ai_titles: HashMap<String, String>,
     claude_cwds: HashMap<String, String>,
     published_subjects: HashMap<String, String>,
-    started: HashSet<ScopeKey>,
+    started: HashMap<ScopeKey, i64>,
     usage_samples: HashSet<(ScopeKey, String)>,
     subagent_ends: HashMap<(String, String), bool>,
     lineage: HashSet<(ScopeKey, ScopeKey)>,
@@ -146,7 +147,7 @@ impl Synthesis {
             ai_titles: HashMap::new(),
             claude_cwds: HashMap::new(),
             published_subjects: HashMap::new(),
-            started: HashSet::new(),
+            started: HashMap::new(),
             usage_samples: HashSet::new(),
             subagent_ends: HashMap::new(),
             lineage: HashSet::new(),
@@ -166,14 +167,20 @@ impl Synthesis {
         self.flush_due_completes(now_ms, &mut events);
 
         let mut inactive = self
-            .last_append_ms
+            .started
             .iter()
-            .filter(|(scope, at_ms)| {
-                self.started.contains(*scope)
-                    && !self.inactivity_closed.contains(*scope)
-                    && now_ms.saturating_sub(**at_ms) >= self.headless_inactivity_ms
+            .filter_map(|(scope, started_at_ms)| {
+                let anchor_ms = self
+                    .last_append_ms
+                    .get(scope)
+                    .copied()
+                    .unwrap_or(*started_at_ms);
+                (!self.inactivity_closed.contains(scope)
+                    && !self.pending_completes.contains_key(scope)
+                    && !self.completed.contains(scope)
+                    && now_ms.saturating_sub(anchor_ms) >= self.headless_inactivity_ms)
+                    .then(|| scope.clone())
             })
-            .map(|(scope, _)| scope.clone())
             .collect::<Vec<_>>();
         inactive.sort();
         for scope in inactive {
@@ -243,6 +250,21 @@ impl Synthesis {
 
     fn hold_complete(&mut self, scope: ScopeKey, event: ControllerEvent) {
         self.pending_completes.entry(scope).or_insert(event);
+    }
+
+    fn start_scope(&mut self, scope: ScopeKey, source_at_ms: i64) -> bool {
+        let started_at_ms = if source_at_ms > 0 {
+            source_at_ms
+        } else {
+            self.latest_lifecycle_ms.max(1)
+        };
+        match self.started.entry(scope) {
+            Entry::Vacant(entry) => {
+                entry.insert(started_at_ms);
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
     }
 
     /// Consumes a file-order batch of facts from one artifact.
@@ -345,7 +367,7 @@ impl Synthesis {
                     at_ms,
                 });
                 if (matches!(scope, SessionScope::ClaudeRoot(_)) || reopen)
-                    && self.started.insert(key)
+                    && self.start_scope(key, at_ms)
                 {
                     events.push(ProviderEvent::Synthesized(controller_event(
                         artifact,
@@ -402,7 +424,7 @@ impl Synthesis {
                     .unwrap_or_default();
                 let scope_key = ScopeKey::from(&scope);
                 let _ = self.prepare_resume(&scope_key, at_ms, events);
-                self.started.insert(scope_key);
+                self.start_scope(scope_key, at_ms);
                 events.push(ProviderEvent::Synthesized(controller_event(
                     artifact,
                     ordinal,
@@ -441,7 +463,7 @@ impl Synthesis {
                         artifact, ordinal, sequence, &scope, at_ms, None,
                     ));
                 }
-                if self.started.insert(scope_key) {
+                if self.start_scope(scope_key, at_ms) {
                     events.push(ProviderEvent::Synthesized(controller_event(
                         artifact,
                         ordinal,
@@ -524,7 +546,7 @@ impl Synthesis {
                     Some(description),
                     Some(provider_metadata),
                 )));
-                self.started.insert(child_key);
+                self.start_scope(child_key, at_ms);
             }
             LogFact::SubagentEnded {
                 parent,
@@ -958,6 +980,8 @@ pub struct DiscoveredArtifact {
     pub provider: Provider,
     /// Absolute path observed during discovery.
     pub path: PathBuf,
+    /// Filesystem modification time observed during discovery, in Unix milliseconds.
+    pub modified_ms: i64,
     /// Provider-specific artifact identity and kind.
     pub kind: DiscoveredArtifactKind,
 }
@@ -977,12 +1001,13 @@ impl AdmissionIndex {
     }
 
     /// Records one discovered Claude root transcript.
-    pub fn insert_claude_session(&mut self, session_id: &str, path: PathBuf) {
+    pub fn insert_claude_session(&mut self, session_id: &str, path: PathBuf, modified_ms: i64) {
         self.insert(
             session_id,
             DiscoveredArtifact {
                 provider: Provider::Claude,
                 path,
+                modified_ms,
                 kind: DiscoveredArtifactKind::ClaudeSession {
                     session_id: session_id.to_owned(),
                 },
@@ -991,12 +1016,19 @@ impl AdmissionIndex {
     }
 
     /// Records one discovered Claude subagent transcript or metadata sidecar.
-    pub fn insert_claude_subagent(&mut self, parent: &str, agent_id: &str, path: PathBuf) {
+    pub fn insert_claude_subagent(
+        &mut self,
+        parent: &str,
+        agent_id: &str,
+        path: PathBuf,
+        modified_ms: i64,
+    ) {
         self.insert(
             agent_id,
             DiscoveredArtifact {
                 provider: Provider::Claude,
                 path,
+                modified_ms,
                 kind: DiscoveredArtifactKind::ClaudeSubagent {
                     parent: parent.to_owned(),
                     agent_id: agent_id.to_owned(),
@@ -1006,12 +1038,13 @@ impl AdmissionIndex {
     }
 
     /// Records one discovered Codex rollout transcript.
-    pub fn insert_codex_rollout(&mut self, rollout_id: &str, path: PathBuf) {
+    pub fn insert_codex_rollout(&mut self, rollout_id: &str, path: PathBuf, modified_ms: i64) {
         self.insert(
             rollout_id,
             DiscoveredArtifact {
                 provider: Provider::Codex,
                 path,
+                modified_ms,
                 kind: DiscoveredArtifactKind::CodexRollout {
                     rollout_id: rollout_id.to_owned(),
                 },
@@ -1024,7 +1057,13 @@ impl AdmissionIndex {
             return;
         }
         let artifacts = self.by_identity.entry(identity.to_owned()).or_default();
-        if !artifacts.contains(&artifact) {
+        if let Some(existing) = artifacts.iter_mut().find(|existing| {
+            existing.provider == artifact.provider
+                && existing.path == artifact.path
+                && existing.kind == artifact.kind
+        }) {
+            existing.modified_ms = artifact.modified_ms;
+        } else {
             artifacts.push(artifact);
         }
     }
@@ -1135,6 +1174,21 @@ impl AdmissionIndex {
                         {
                             continue;
                         }
+                        let metadata = match artifact.metadata() {
+                            Ok(metadata) => metadata,
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                            Err(_) => {
+                                index.had_errors = true;
+                                continue;
+                            }
+                        };
+                        let modified_ms = match metadata.modified() {
+                            Ok(modified) => super::system_time_ms(modified),
+                            Err(_) => {
+                                index.had_errors = true;
+                                continue;
+                            }
+                        };
                         let rollout_id = super::facts::scan_raw_ids(file_name)
                             .into_iter()
                             .filter_map(|id| match id {
@@ -1143,7 +1197,7 @@ impl AdmissionIndex {
                             })
                             .next_back();
                         if let Some(rollout_id) = rollout_id {
-                            index.insert_codex_rollout(&rollout_id, artifact_path);
+                            index.insert_codex_rollout(&rollout_id, artifact_path, modified_ms);
                         }
                     }
                 }
@@ -1170,9 +1224,14 @@ impl AdmissionIndex {
         self.by_identity.get(uuid).map_or(&[], Vec::as_slice)
     }
 
-    /// Indexes an artifact by provider-native identity using path topology only.
+    /// Indexes an artifact by provider-native identity using path topology and discovery mtime.
     /// This operation never opens or parses the artifact.
-    pub(crate) fn observe_discovered_path(&mut self, provider: Provider, path: &Path) {
+    pub(crate) fn observe_discovered_path(
+        &mut self,
+        provider: Provider,
+        path: &Path,
+        modified_ms: i64,
+    ) {
         match provider {
             Provider::Claude => {
                 let components = normal_components(path).unwrap_or_default();
@@ -1186,14 +1245,14 @@ impl AdmissionIndex {
                     && let (Some(parent), Some(agent_id)) =
                         (parent.to_str(), subagent_artifact_id(file_name))
                 {
-                    self.insert_claude_subagent(parent, agent_id, path.to_path_buf());
+                    self.insert_claude_subagent(parent, agent_id, path.to_path_buf(), modified_ms);
                     return;
                 }
                 if path.extension() == Some(OsStr::new("jsonl"))
                     && let Some(session_id) = path.file_stem().and_then(OsStr::to_str)
                     && super::valid_native_id(session_id)
                 {
-                    self.insert_claude_session(session_id, path.to_path_buf());
+                    self.insert_claude_session(session_id, path.to_path_buf(), modified_ms);
                 }
             }
             Provider::Codex => {
@@ -1208,7 +1267,7 @@ impl AdmissionIndex {
                     })
                     .next_back()
                 {
-                    self.insert_codex_rollout(&rollout_id, path.to_path_buf());
+                    self.insert_codex_rollout(&rollout_id, path.to_path_buf(), modified_ms);
                 }
             }
         }
@@ -1314,8 +1373,11 @@ impl Admission {
 
     /// Applies one allowlisted evidence ID emitted by an already-admitted parent scope.
     ///
-    /// UUID evidence admits only exact paths present in `discovered`. Configuration-directory
-    /// evidence derives a provider root without enumerating or opening it.
+    /// UUID evidence admits only exact, in-window paths present in `discovered`.
+    /// When one UUID matches multiple artifacts, all artifacts must identify the same scope and
+    /// at least one must be in-window; this lets a live transcript admit its scope when a sidecar
+    /// lags, while stale paths remain unattached. Configuration-directory evidence derives a
+    /// provider root without enumerating or opening it.
     pub fn on_evidence(
         &mut self,
         parent: &SessionScope,
@@ -1348,7 +1410,16 @@ impl Admission {
                 if artifacts.iter().any(|artifact| artifact.scope() != scope) {
                     return None;
                 }
-                for artifact in artifacts {
+                if !artifacts
+                    .iter()
+                    .any(|artifact| artifact.modified_ms >= self.anchor_ms)
+                {
+                    return None;
+                }
+                for artifact in artifacts
+                    .iter()
+                    .filter(|artifact| artifact.modified_ms >= self.anchor_ms)
+                {
                     self.admitted_paths.insert(artifact.path.clone());
                 }
                 self.admitted_scopes.insert(ScopeKey::from(&scope));
@@ -1791,10 +1862,11 @@ fn subagent_artifact_id(file_name: &OsStr) -> Option<&str> {
 mod tests {
     use std::collections::HashSet;
     use std::ffi::OsStr;
-    use std::fs::{self, OpenOptions};
+    use std::fs::{self, FileTimes, OpenOptions};
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, UNIX_EPOCH};
 
     use crate::hook_adapter::{HookPayload, HookProvider, map_hook_payload};
     use crate::model::{
@@ -1819,6 +1891,31 @@ mod tests {
     const ROLLOUT: &str = "22222222-2222-4222-8222-222222222222";
     const STRANGER: &str = "33333333-3333-4333-8333-333333333333";
 
+    fn discover_codex_rollout_with_mtime(
+        root: &Path,
+        rollout_id: &str,
+        modified_ms: i64,
+        anchor_ms: i64,
+    ) -> (AdmissionIndex, PathBuf) {
+        let shard = root.join("2026/08/23");
+        fs::create_dir_all(&shard).unwrap();
+        let path = shard.join(format!("rollout-2026-08-23T13-00-00-{rollout_id}.jsonl"));
+        fs::write(&path, b"{}\n").unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(
+                FileTimes::new()
+                    .set_modified(UNIX_EPOCH + Duration::from_millis(modified_ms as u64)),
+            )
+            .unwrap();
+        (
+            AdmissionIndex::discover_codex_date_shards(root, anchor_ms).unwrap(),
+            path,
+        )
+    }
+
     fn synthesize(
         synthesis: &mut Synthesis,
         artifact: &str,
@@ -1830,6 +1927,36 @@ mod tests {
             &mut Admission::new(0),
             &AdmissionIndex::new(),
         )
+    }
+
+    fn synthesize_subagent_start(
+        synthesis: &mut Synthesis,
+        agent_id: &str,
+        source_at_ms: Option<i64>,
+    ) -> (SessionScope, Vec<ProviderEvent>) {
+        if let Some(source_at_ms) = source_at_ms {
+            synthesis
+                .last_append_ms
+                .insert(ScopeKey::ClaudeRoot(PARENT.to_owned()), source_at_ms);
+        }
+        let scope = SessionScope::ClaudeSubagent {
+            parent: PARENT.to_owned(),
+            agent_id: agent_id.to_owned(),
+        };
+        let events = synthesize(
+            synthesis,
+            "agent-child.meta.json",
+            [(
+                1,
+                LogFact::SubagentAppeared {
+                    parent: PARENT.to_owned(),
+                    agent_id: agent_id.to_owned(),
+                    agent_type: "reviewer".to_owned(),
+                    description: format!("Review {agent_id} lifecycle"),
+                },
+            )],
+        );
+        (scope, events)
     }
 
     fn synthesized_events(events: &[ProviderEvent]) -> Vec<&ControllerEvent> {
@@ -3226,6 +3353,124 @@ mod tests {
     }
 
     #[test]
+    fn appendless_started_scope_closes_once_at_start_time_boundary() {
+        let mut synthesis = Synthesis::with_lifecycle_timing_at(30, 50, 1);
+        let (scope, started) =
+            synthesize_subagent_start(&mut synthesis, "appendless-child", Some(100));
+        let child_events = synthesized_events(&started)
+            .into_iter()
+            .filter(|event| event.task_run_id == controller_key_for_scope(&scope))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            child_events.as_slice(),
+            [dispatch, task_started]
+                if matches!(dispatch.event, ControllerEventKind::Dispatch { .. })
+                    && matches!(task_started.event, ControllerEventKind::TaskStarted)
+                    && dispatch.metadata.timestamp_ms == 100
+                    && task_started.metadata.timestamp_ms == 100
+        ));
+
+        assert!(
+            synthesis.advance_lifecycle(149).is_empty(),
+            "an append-less scope must remain active before its start-time threshold"
+        );
+        assert_eq!(
+            synthesis.advance_lifecycle(150),
+            vec![ProviderEvent::LaneClose {
+                key: run_key_for_scope(&scope),
+                at_ms: 150,
+            }],
+            "an append-less started scope must close at its start-time threshold"
+        );
+        assert!(
+            synthesis.advance_lifecycle(200).is_empty(),
+            "an inactivity-closed scope must not close again"
+        );
+    }
+
+    #[test]
+    fn appendless_start_without_source_time_uses_injected_lifecycle_clock() {
+        let mut synthesis = Synthesis::with_lifecycle_timing_at(30, 50, 100);
+        let (scope, _) = synthesize_subagent_start(&mut synthesis, "clock-anchored-child", None);
+
+        assert!(
+            synthesis.advance_lifecycle(100).is_empty(),
+            "a fresh start without a source timestamp must not close immediately"
+        );
+        assert!(synthesis.advance_lifecycle(149).is_empty());
+        assert_eq!(
+            synthesis.advance_lifecycle(150),
+            vec![ProviderEvent::LaneClose {
+                key: run_key_for_scope(&scope),
+                at_ms: 150,
+            }]
+        );
+    }
+
+    #[test]
+    fn append_bearing_scope_closes_relative_to_last_append() {
+        let mut synthesis = Synthesis::with_lifecycle_timing_at(30, 50, 1);
+        let (scope, _) = synthesize_subagent_start(&mut synthesis, "active-child", Some(100));
+        let _ = synthesize(
+            &mut synthesis,
+            "agent-active-child.jsonl",
+            [(
+                2,
+                LogFact::Append {
+                    scope: scope.clone(),
+                    at_ms: 140,
+                },
+            )],
+        );
+
+        assert!(
+            synthesis.advance_lifecycle(150).is_empty(),
+            "the start-time threshold must not close a scope with a newer append"
+        );
+        assert_eq!(
+            synthesis.advance_lifecycle(190),
+            vec![ProviderEvent::LaneClose {
+                key: run_key_for_scope(&scope),
+                at_ms: 190,
+            }]
+        );
+    }
+
+    #[test]
+    fn appendless_pending_complete_is_never_inactivity_closed() {
+        let mut synthesis = Synthesis::with_lifecycle_timing_at(100, 50, 1);
+        let (scope, _) = synthesize_subagent_start(&mut synthesis, "completing-child", Some(100));
+        let held = synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                2,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "completing-child".to_owned(),
+                    failed: false,
+                },
+            )],
+        );
+        assert!(synthesized_events(&held).is_empty());
+
+        assert!(
+            synthesis.advance_lifecycle(150).is_empty(),
+            "a grace-held completion must suppress inactivity close"
+        );
+        assert!(matches!(
+            synthesis.advance_lifecycle(200).as_slice(),
+            [ProviderEvent::Synthesized(event)]
+                if event.task_run_id == controller_key_for_scope(&scope)
+                    && matches!(event.event, ControllerEventKind::Complete)
+        ));
+        assert!(
+            synthesis.advance_lifecycle(250).is_empty(),
+            "a completed scope must not be inactivity-closed later"
+        );
+    }
+
+    #[test]
     fn append_after_inactivity_close_reopens_and_clears_close_state() {
         let scope = SessionScope::ClaudeRoot(PARENT.to_owned());
         let mut synthesis = Synthesis::with_lifecycle_timing(30, 50);
@@ -3303,10 +3548,12 @@ mod tests {
         discovered.insert_codex_rollout(
             ROLLOUT,
             PathBuf::from(format!("/sessions/rollout-{ROLLOUT}.jsonl")),
+            0,
         );
         discovered.insert_codex_rollout(
             STRANGER,
             PathBuf::from(format!("/sessions/rollout-{STRANGER}.jsonl")),
+            0,
         );
         let events = Synthesis::default().synthesize_batch(
             Path::new("parent.jsonl"),
@@ -3355,10 +3602,12 @@ mod tests {
         discovered.insert_claude_session(
             ROLLOUT,
             PathBuf::from(format!("/projects/workspace/{ROLLOUT}.jsonl")),
+            0,
         );
         discovered.insert_claude_session(
             STRANGER,
             PathBuf::from(format!("/projects/workspace/{STRANGER}.jsonl")),
+            0,
         );
         let events = Synthesis::default().synthesize_batch(
             Path::new("parent.jsonl"),
@@ -3405,6 +3654,7 @@ mod tests {
         discovered.insert_codex_rollout(
             ROLLOUT,
             PathBuf::from(format!("/sessions/rollout-{ROLLOUT}.jsonl")),
+            0,
         );
         let mut synthesis = Synthesis::default();
         let unmatched = synthesis.synthesize_batch(
@@ -3842,7 +4092,7 @@ mod tests {
             "/home/user/.codex/sessions/2026/08/24/rollout-2026-08-24T00-00-00-{ROLLOUT}.jsonl"
         ));
         let mut discovered = AdmissionIndex::new();
-        discovered.insert_codex_rollout(ROLLOUT, rollout_path.clone());
+        discovered.insert_codex_rollout(ROLLOUT, rollout_path.clone(), 0);
         let parent = SessionScope::ClaudeRoot(PARENT.to_owned());
         let mut admission = Admission::new(0);
         admission.admit_pane_session(Provider::Claude, PARENT);
@@ -3862,13 +4112,129 @@ mod tests {
     }
 
     #[test]
+    fn evidence_uuid_older_than_anchor_is_not_admitted() {
+        const ANCHOR_MS: i64 = 1_787_486_400_000;
+        let directory = tempfile::tempdir().unwrap();
+        let (discovered, rollout_path) =
+            discover_codex_rollout_with_mtime(directory.path(), ROLLOUT, ANCHOR_MS - 1, ANCHOR_MS);
+        let parent = SessionScope::ClaudeRoot(PARENT.to_owned());
+        let rollout_scope = SessionScope::Codex {
+            rollout_id: ROLLOUT.to_owned(),
+        };
+        let mut admission = Admission::new(ANCHOR_MS);
+        admission.admit_pane_session(Provider::Claude, PARENT);
+
+        assert_eq!(
+            admission.on_evidence(&parent, &EvidenceId::Uuid(ROLLOUT.to_owned()), &discovered),
+            None,
+            "out-of-window UUID evidence must not attach its scope"
+        );
+        assert!(
+            !admission.is_admitted_path(&rollout_path),
+            "out-of-window UUID evidence must not admit its artifact path"
+        );
+        assert_eq!(
+            admission.on_evidence(
+                &rollout_scope,
+                &EvidenceId::ConfigDir(PathBuf::from("/tmp/stale-child")),
+                &discovered,
+            ),
+            None,
+            "an out-of-window evidence scope must not become an admitted parent"
+        );
+    }
+
+    #[test]
+    fn evidence_uuid_newer_than_anchor_is_admitted() {
+        const ANCHOR_MS: i64 = 1_787_486_400_000;
+        let directory = tempfile::tempdir().unwrap();
+        let (discovered, rollout_path) =
+            discover_codex_rollout_with_mtime(directory.path(), ROLLOUT, ANCHOR_MS + 1, ANCHOR_MS);
+        let parent = SessionScope::ClaudeRoot(PARENT.to_owned());
+        let expected = SessionScope::Codex {
+            rollout_id: ROLLOUT.to_owned(),
+        };
+        let mut admission = Admission::new(ANCHOR_MS);
+        admission.admit_pane_session(Provider::Claude, PARENT);
+
+        assert_eq!(
+            admission.on_evidence(&parent, &EvidenceId::Uuid(ROLLOUT.to_owned()), &discovered),
+            Some(expected)
+        );
+        assert!(admission.is_admitted_path(&rollout_path));
+    }
+
+    #[test]
+    fn evidence_uuid_at_anchor_is_admitted() {
+        const ANCHOR_MS: i64 = 1_787_486_400_000;
+        let directory = tempfile::tempdir().unwrap();
+        let (discovered, rollout_path) =
+            discover_codex_rollout_with_mtime(directory.path(), ROLLOUT, ANCHOR_MS, ANCHOR_MS);
+        let parent = SessionScope::ClaudeRoot(PARENT.to_owned());
+        let expected = SessionScope::Codex {
+            rollout_id: ROLLOUT.to_owned(),
+        };
+        let mut admission = Admission::new(ANCHOR_MS);
+        admission.admit_pane_session(Provider::Claude, PARENT);
+
+        assert_eq!(
+            admission.on_evidence(&parent, &EvidenceId::Uuid(ROLLOUT.to_owned()), &discovered),
+            Some(expected)
+        );
+        assert!(admission.is_admitted_path(&rollout_path));
+    }
+
+    #[test]
+    fn evidence_uuid_with_multiple_artifacts_admits_only_in_window_paths() {
+        const ANCHOR_MS: i64 = 1_787_486_400_000;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let stale_path = root.join(format!(
+            "2026/08/23/rollout-2026-08-23T13-00-00-{ROLLOUT}.jsonl"
+        ));
+        let fresh_path = root.join(format!(
+            "2026/08/24/rollout-2026-08-24T13-00-00-{ROLLOUT}.jsonl"
+        ));
+        for (path, modified_ms) in [(&stale_path, ANCHOR_MS - 1), (&fresh_path, ANCHOR_MS)] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"{}\n").unwrap();
+            OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    FileTimes::new()
+                        .set_modified(UNIX_EPOCH + Duration::from_millis(modified_ms as u64)),
+                )
+                .unwrap();
+        }
+        let discovered = AdmissionIndex::discover_codex_date_shards(root, ANCHOR_MS).unwrap();
+        let parent = SessionScope::ClaudeRoot(PARENT.to_owned());
+        let expected = SessionScope::Codex {
+            rollout_id: ROLLOUT.to_owned(),
+        };
+        let mut admission = Admission::new(ANCHOR_MS);
+        admission.admit_pane_session(Provider::Claude, PARENT);
+
+        assert_eq!(
+            admission.on_evidence(&parent, &EvidenceId::Uuid(ROLLOUT.to_owned()), &discovered),
+            Some(expected)
+        );
+        assert!(admission.is_admitted_path(&fresh_path));
+        assert!(
+            !admission.is_admitted_path(&stale_path),
+            "a fresh sidecar must not cause a stale artifact path to attach"
+        );
+    }
+
+    #[test]
     fn evidence_admission_is_path_exact_across_shards() {
         let file_name = format!("rollout-2026-08-24T00-00-00-{ROLLOUT}.jsonl");
         let admitted_path = PathBuf::from("/home/user/.codex/sessions/2026/08/24").join(&file_name);
         let anchored_out_copy =
             PathBuf::from("/home/user/.codex/sessions/2026/08/20").join(&file_name);
         let mut discovered = AdmissionIndex::new();
-        discovered.insert_codex_rollout(ROLLOUT, admitted_path.clone());
+        discovered.insert_codex_rollout(ROLLOUT, admitted_path.clone(), 0);
         let parent = SessionScope::ClaudeRoot(PARENT.to_owned());
         let mut admission = Admission::new(0);
         admission.admit_pane_session(Provider::Claude, PARENT);
@@ -3888,7 +4254,7 @@ mod tests {
             "/home/user/.codex/sessions/2026/08/24/rollout-2026-08-24T00-00-00-{ROLLOUT}.jsonl"
         ));
         let mut discovered = AdmissionIndex::new();
-        discovered.insert_codex_rollout(ROLLOUT, rollout_path.clone());
+        discovered.insert_codex_rollout(ROLLOUT, rollout_path.clone(), 0);
         let mut admission = Admission::new(0);
 
         assert_eq!(
@@ -3948,7 +4314,7 @@ mod tests {
             "/logs/sessions/2026/08/24/rollout-2026-08-24T12-00-00-{ROLLOUT}.jsonl"
         ));
         let mut index = AdmissionIndex::new();
-        index.insert_codex_rollout(ROLLOUT, evidence_path.clone());
+        index.insert_codex_rollout(ROLLOUT, evidence_path.clone(), 1_000);
         assert!(
             admission
                 .on_evidence(
@@ -3961,7 +4327,7 @@ mod tests {
 
         assert!(
             admission.is_admitted_path(&evidence_path),
-            "lineage evidence must still admit the artifact identity"
+            "in-window lineage evidence must admit the artifact identity"
         );
         assert!(
             admission.is_admitted_file(&pane_root, 100),

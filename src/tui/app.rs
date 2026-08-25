@@ -3238,6 +3238,55 @@ mod tests {
     }
 
     #[test]
+    fn display_stale_selected_agent_recovers_to_a_real_row_at_its_deadline() {
+        let run = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut model = model_with_runs(&[(run, "run", 1, TaskState::Running)]);
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "selected-agent".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some("selected-agent".to_owned()),
+            task_run_id: run,
+            display_ordinal: DisplayOrdinal::new(2),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Unknown),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: Some(0),
+            session_file: None,
+        });
+        let deadline = crate::provider::lane::DEFAULT_HEADLESS_INACTIVITY_MS;
+        let clock = TestClock::at(deadline - 1);
+        let (mut app, _senders) = app_with_runtime(
+            model,
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+        let selected_agent = NodeKey::Agent {
+            agent_node_id: "selected-agent".to_owned(),
+            pane_id: Some("pane".to_owned()),
+        };
+        app.state.follow = false;
+        app.set_selection(Some(selected_agent.clone()));
+
+        assert_eq!(app.next_expiry_ms(), Some(deadline));
+        clock.set(deadline);
+        assert!(app.refresh_if_changed().unwrap());
+        let rows = view::build_rows(app.model(), app.state());
+
+        assert!(!rows.iter().any(|row| row.key == selected_agent));
+        assert!(
+            app.state()
+                .selected()
+                .is_some_and(|selected| rows.iter().any(|row| &row.key == selected)),
+            "selection must recover to a row that still exists"
+        );
+    }
+
+    #[test]
     fn idle_without_visible_live_duration_never_rebuilds_or_zero_polls() {
         let live = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let clock = TestClock::at(0);

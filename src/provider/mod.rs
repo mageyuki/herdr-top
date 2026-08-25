@@ -78,7 +78,7 @@ pub enum ProviderEvent {
     Synthesized(ControllerEvent),
     /// Append-time signal consumed by the lifecycle lane in Increment 9 Task 6.
     RunLiveness { key: RunKey, at_ms: i64 },
-    /// Append-silence transition consumed through the lane-specific reducer close path.
+    /// Inactivity transition consumed through the lane-specific reducer close path.
     LaneClose { key: RunKey, at_ms: i64 },
     /// Allowlisted usage sample consumed by telemetry in Increment 9 Task 7.
     Telemetry {
@@ -497,8 +497,8 @@ impl DiscoveryIndex {
 }
 
 impl DiscoveryIndex {
-    /// Production provider-lane rescan. Identity inventory is built from names only;
-    /// admission and mtime are checked before structural bootstrap opens a descriptor.
+    /// Production provider-lane rescan. Identity inventory is built from names and discovery
+    /// metadata; admission is checked before structural bootstrap opens a descriptor.
     pub fn scan_admitted(
         &mut self,
         parser: &mut impl BootstrapParser,
@@ -522,7 +522,11 @@ impl DiscoveryIndex {
                 HashMap::new();
             for artifact in &discovery.artifacts {
                 let absolute = root.path.join(&artifact.relative_path);
-                admission_index.observe_discovered_path(root.provider, &absolute);
+                admission_index.observe_discovered_path(
+                    root.provider,
+                    &absolute,
+                    artifact.modified_ms,
+                );
                 if let Some(identity) = admission.pane_root_identity(root.provider, &absolute) {
                     let candidate = (artifact.modified_ms, absolute);
                     newest_pane_artifact

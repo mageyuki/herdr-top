@@ -13,7 +13,8 @@ use crate::activity::{
 use crate::diagnostics::{ControllerInputStatus, RuntimeDiagnosticsSnapshot};
 use crate::herdr::collector::ObservationQuality;
 use crate::model::{
-    DomainModel, ExecState, Provider, RunId, RunKey, TaskRun, TaskState, TokenBreakdown, TurnAttr,
+    AgentNode, DomainModel, ExecState, Provider, RunId, RunKey, TaskRun, TaskState, TokenBreakdown,
+    TurnAttr,
 };
 use crate::store::writer::PersistenceStatus;
 
@@ -354,6 +355,40 @@ pub(crate) fn stalled_run_ids(
         .collect()
 }
 
+/// Returns whether an Agent Node has aged out of the tree presentation.
+///
+/// A missing activity timestamp remains visible because there is no evidence that the node has
+/// crossed the inactivity interval; this also prevents a just-created node from disappearing
+/// before its first timestamped event. `ExecState::Stale` remains visible because it is a known
+/// state, while the display rule deliberately applies only when state is absent, unknown, or ended.
+pub(crate) fn agent_node_is_display_stale(agent: &AgentNode, now_ms: i64) -> bool {
+    matches!(
+        agent.state.as_ref(),
+        None | Some(ExecState::Unknown) | Some(ExecState::Ended)
+    ) && agent
+        .last_activity_at_ms
+        .is_some_and(|last_activity_at_ms| {
+            now_ms.saturating_sub(last_activity_at_ms) >= crate::activity::headless_inactivity_ms()
+        })
+}
+
+fn next_agent_visibility_expiry_ms(model: &DomainModel, now_ms: i64) -> Option<i64> {
+    model
+        .agent_nodes()
+        .filter(|agent| {
+            matches!(
+                agent.state.as_ref(),
+                None | Some(ExecState::Unknown) | Some(ExecState::Ended)
+            )
+        })
+        .filter(|agent| !agent_node_is_display_stale(agent, now_ms))
+        .filter_map(|agent| agent.last_activity_at_ms)
+        .map(|last_activity_at_ms| {
+            last_activity_at_ms.saturating_add(crate::activity::headless_inactivity_ms())
+        })
+        .min()
+}
+
 fn has_active_descendant(
     run_id: RunId,
     children: &HashMap<RunId, Vec<RunId>>,
@@ -453,6 +488,9 @@ pub(crate) fn project_rows(
     mode: ViewMode,
     now_ms: i64,
 ) -> RowProjection {
+    let agent_expiry_ms = (mode == ViewMode::ExecutionTree)
+        .then(|| next_agent_visibility_expiry_ms(model, now_ms))
+        .flatten();
     if !query.is_empty() {
         let direct = full_rows
             .iter()
@@ -485,14 +523,17 @@ pub(crate) fn project_rows(
             }
         };
         return RowProjection {
-            next_expiry_ms: next_live_duration_expiry_ms(model, &rows, now_ms),
+            next_expiry_ms: min_expiry(
+                agent_expiry_ms,
+                next_live_duration_expiry_ms(model, &rows, now_ms),
+            ),
             rows,
         };
     }
 
     let mut visible = Vec::with_capacity(full_rows.len());
     let mut hidden_subtree_depth = None;
-    let mut next_expiry_ms: Option<i64> = None;
+    let mut next_expiry_ms = agent_expiry_ms;
     let execution_run_ids = runs_with_executions(model);
     for row in full_rows {
         if hidden_subtree_depth.is_some_and(|depth| row.depth > depth) {
@@ -545,6 +586,14 @@ pub(crate) fn project_rows(
     RowProjection {
         rows,
         next_expiry_ms,
+    }
+}
+
+fn min_expiry(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(expiry), None) | (None, Some(expiry)) => Some(expiry),
+        (None, None) => None,
     }
 }
 
@@ -3005,6 +3054,60 @@ mod tests {
                 .contains("~/private/SECRET_SESSION_FILE.jsonl")
         );
         assert!(!row_matches(&model, &rows[0], "secret_session_file"));
+    }
+
+    #[test]
+    fn detail_projection_still_lists_display_stale_and_fresh_agents() {
+        let selected = run("selected", 1, TaskState::Running);
+        let mut model = DomainModel::default();
+        model.insert_task_run(selected.clone());
+        for (agent_node_id, last_activity_at_ms) in [
+            (
+                "stale-agent",
+                -crate::provider::lane::DEFAULT_HEADLESS_INACTIVITY_MS,
+            ),
+            ("fresh-agent", 0),
+        ] {
+            model.insert_agent_node(AgentNode {
+                agent_node_id: agent_node_id.to_owned(),
+                provider: Provider::Codex,
+                native_session_id: Some(agent_node_id.to_owned()),
+                task_run_id: selected.run_id,
+                display_ordinal: DisplayOrdinal::new(last_activity_at_ms),
+                parent_agent_node_id: None,
+                state: Some(ExecState::Unknown),
+                model_id: None,
+                last_event_kind: None,
+                last_tool_name: None,
+                last_item_count: None,
+                last_byte_count: None,
+                last_activity_at_ms: Some(last_activity_at_ms),
+                session_file: None,
+            });
+        }
+
+        let rendered = ["stale-agent", "fresh-agent"]
+            .into_iter()
+            .flat_map(|agent_node_id| {
+                let detail = detail_projection(
+                    &model,
+                    &[],
+                    &operator(Vec::new(), HashMap::new()),
+                    &NodeKey::Agent {
+                        agent_node_id: agent_node_id.to_owned(),
+                        pane_id: None,
+                    },
+                    ViewMode::ExecutionTree,
+                    None,
+                );
+                detail_lines(&detail)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("agent_node_id: stale-agent"));
+        assert!(rendered.contains("agent_node_id: fresh-agent"));
+        assert_eq!(model.agent_nodes().count(), 2);
     }
 
     #[test]
