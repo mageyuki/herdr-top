@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
@@ -38,6 +38,7 @@ pub use tail::{
 
 /// Provider filesystem fallback interval.
 pub const RESCAN_INTERVAL: Duration = Duration::from_secs(2);
+const HINT_DEBOUNCE: Duration = Duration::from_millis(150);
 /// Fixed control-channel capacity.
 pub const CONTROL_CHANNEL_CAPACITY: usize = 256;
 /// Maximum number of entities retained before file advancement must pause.
@@ -1375,18 +1376,29 @@ pub struct RecommendedNotifyFactory;
 
 impl NotifyFactory for RecommendedNotifyFactory {
     fn create(self: Box<Self>, sink: NotifySink) -> notify::Result<Box<dyn NotifyWatcher>> {
-        let watcher =
-            notify::recommended_watcher(
-                move |result: notify::Result<notify::Event>| match result {
-                    Ok(event) => {
-                        for path in event.paths {
-                            sink.hint(path);
-                        }
-                    }
-                    Err(_) => sink.force_rescan(),
-                },
-            )?;
+        let watcher = notify::recommended_watcher(move |result| {
+            forward_notify_event(&sink, result);
+        })?;
         Ok(Box::new(watcher))
+    }
+}
+
+fn forward_notify_event(sink: &NotifySink, result: notify::Result<notify::Event>) {
+    match result {
+        Ok(event) => {
+            if matches!(
+                event.kind,
+                notify::EventKind::Access(kind)
+                    if kind
+                        != notify::event::AccessKind::Close(notify::event::AccessMode::Write)
+            ) {
+                return;
+            }
+            for path in event.paths {
+                sink.hint(path);
+            }
+        }
+        Err(_) => sink.force_rescan(),
     }
 }
 
@@ -1878,6 +1890,7 @@ fn provider_thread_main(
     rescan_interval: Duration,
 ) {
     let mut pending = PendingEvents::new(diagnostics.clone());
+    force_rescan.swap(false, Ordering::AcqRel);
     run_provider_cycle(
         &mut worker,
         &egress,
@@ -1890,29 +1903,116 @@ fn provider_thread_main(
         None,
         true,
     );
+    let mut last_full_rescan = Instant::now();
 
-    loop {
-        let control = receiver.recv_timeout(rescan_interval);
-        let (hint, timed_out) = match control {
+    'provider: loop {
+        if stop_flag.load(Ordering::Acquire) {
+            flush_graceful_stop(&mut worker, &egress);
+            break;
+        }
+        let until_periodic_rescan = rescan_interval.saturating_sub(last_full_rescan.elapsed());
+        let control = receiver.recv_timeout(until_periodic_rescan);
+        let first_control = match control {
             Ok(Control::Stop) => {
-                for event in worker.graceful_stop() {
-                    if !egress.blocking_send(event) {
+                flush_graceful_stop(&mut worker, &egress);
+                break;
+            }
+            Ok(control) => control,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                force_rescan.swap(false, Ordering::AcqRel);
+                if stop_flag.load(Ordering::Acquire) {
+                    flush_graceful_stop(&mut worker, &egress);
+                    break;
+                }
+                run_provider_cycle(
+                    &mut worker,
+                    &egress,
+                    &targets,
+                    &force_rescan,
+                    &stop_flag,
+                    &watcher,
+                    &diagnostics,
+                    &mut pending,
+                    None,
+                    true,
+                );
+                last_full_rescan = Instant::now();
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        let debounce_hints = matches!(first_control, Control::Hint(_));
+        let mut hints = HashSet::new();
+        if let Control::Hint(path) = first_control {
+            hints.insert(path);
+        }
+        let effective_debounce = if debounce_hints {
+            HINT_DEBOUNCE.min(rescan_interval)
+        } else {
+            Duration::ZERO
+        };
+        let debounce_deadline = Instant::now() + effective_debounce;
+        let periodic_deadline = last_full_rescan + rescan_interval;
+        let collection_deadline = debounce_deadline.min(periodic_deadline);
+        let mut disconnected = false;
+        loop {
+            while Instant::now() < collection_deadline {
+                if stop_flag.load(Ordering::Acquire) {
+                    flush_graceful_stop(&mut worker, &egress);
+                    break 'provider;
+                }
+                match receiver.try_recv() {
+                    Ok(Control::Stop) => {
+                        flush_graceful_stop(&mut worker, &egress);
+                        break 'provider;
+                    }
+                    Ok(Control::Hint(path)) => {
+                        hints.insert(path);
+                    }
+                    Ok(Control::TargetsUpdated) => {}
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
                         break;
                     }
                 }
+            }
+            if disconnected {
                 break;
             }
-            Ok(Control::Hint(path)) => (Some(path), false),
-            Ok(Control::TargetsUpdated) => (None, false),
-            Err(mpsc::RecvTimeoutError::Timeout) => (None, true),
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        };
-        if stop_flag.load(Ordering::Acquire) {
-            for event in worker.graceful_stop() {
-                if !egress.blocking_send(event) {
+            let Some(remaining) = collection_deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            match receiver.recv_timeout(remaining) {
+                Ok(Control::Stop) => {
+                    flush_graceful_stop(&mut worker, &egress);
+                    break 'provider;
+                }
+                Ok(Control::Hint(path)) => {
+                    hints.insert(path);
+                }
+                Ok(Control::TargetsUpdated) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    disconnected = true;
                     break;
                 }
             }
+        }
+
+        let full_rescan = last_full_rescan.elapsed() >= rescan_interval;
+        let hint = if !full_rescan && hints.len() == 1 {
+            hints.iter().next().map(PathBuf::as_path)
+        } else {
+            None
+        };
+        if full_rescan {
+            // Periodic full rescans guarantee recovery for force requests.
+            force_rescan.swap(false, Ordering::AcqRel);
+        }
+        if stop_flag.load(Ordering::Acquire) {
+            flush_graceful_stop(&mut worker, &egress);
             break;
         }
         run_provider_cycle(
@@ -1924,9 +2024,23 @@ fn provider_thread_main(
             &watcher,
             &diagnostics,
             &mut pending,
-            hint.as_deref(),
-            timed_out,
+            hint,
+            full_rescan,
         );
+        if full_rescan {
+            last_full_rescan = Instant::now();
+        }
+        if disconnected {
+            break;
+        }
+    }
+}
+
+fn flush_graceful_stop(worker: &mut impl ProviderWorker, egress: &ProviderEventSender) {
+    for event in worker.graceful_stop() {
+        if !egress.blocking_send(event) {
+            break;
+        }
     }
 }
 
@@ -1941,16 +2055,15 @@ fn run_provider_cycle(
     diagnostics: &ProviderDiagnostics,
     pending: &mut PendingEvents,
     hint: Option<&Path>,
-    timed_out: bool,
+    force_rescan_cycle: bool,
 ) {
     pending.flush_to_sender(egress);
     let current_targets = lock_unpoisoned(targets).clone().unwrap_or_default();
-    let force = force_rescan.swap(false, Ordering::AcqRel) || timed_out;
     let mut watch_requests = Vec::new();
     let mut cycle = ProviderCycle {
         targets: &current_targets,
         hint,
-        force_rescan: force,
+        force_rescan: force_rescan_cycle,
         pending,
         stop_flag,
         watch_requests: &mut watch_requests,
@@ -2870,6 +2983,93 @@ mod tests {
         }
     }
 
+    fn notify_test_sink() -> (NotifySink, Receiver<Control>, Arc<AtomicBool>) {
+        let (control, receiver) = mpsc::sync_channel(8);
+        let force_rescan = Arc::new(AtomicBool::new(false));
+        (
+            NotifySink {
+                control,
+                force_rescan: Arc::clone(&force_rescan),
+                diagnostics: ProviderDiagnostics::default(),
+            },
+            receiver,
+            force_rescan,
+        )
+    }
+
+    #[test]
+    fn notify_access_open_and_read_close_events_are_ignored() {
+        use notify::event::{AccessKind, AccessMode};
+
+        for kind in [
+            notify::EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            notify::EventKind::Access(AccessKind::Open(AccessMode::Read)),
+            notify::EventKind::Access(AccessKind::Close(AccessMode::Read)),
+        ] {
+            let (sink, receiver, force_rescan) = notify_test_sink();
+
+            forward_notify_event(
+                &sink,
+                Ok(notify::Event::new(kind).add_path(PathBuf::from("scan.jsonl"))),
+            );
+
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            assert!(!force_rescan.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn notify_mutations_and_write_close_forward_every_path() {
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, DataChange, ModifyKind, RemoveKind,
+        };
+
+        for kind in [
+            notify::EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            notify::EventKind::Create(CreateKind::File),
+            notify::EventKind::Remove(RemoveKind::File),
+            notify::EventKind::Access(AccessKind::Close(AccessMode::Write)),
+        ] {
+            let (sink, receiver, force_rescan) = notify_test_sink();
+            let first = PathBuf::from("first.jsonl");
+            let second = PathBuf::from("second.jsonl");
+
+            forward_notify_event(
+                &sink,
+                Ok(notify::Event::new(kind)
+                    .add_path(first.clone())
+                    .add_path(second.clone())),
+            );
+
+            assert!(matches!(receiver.try_recv(), Ok(Control::Hint(path)) if path == first));
+            assert!(matches!(receiver.try_recv(), Ok(Control::Hint(path)) if path == second));
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            assert!(!force_rescan.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn notify_error_requests_a_full_rescan() {
+        let (sink, receiver, force_rescan) = notify_test_sink();
+
+        forward_notify_event(
+            &sink,
+            Err(notify::Error::generic("synthetic notify failure")),
+        );
+
+        assert!(force_rescan.load(Ordering::Acquire));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
     struct AppendDetectingWorker {
         path: PathBuf,
         observed_len: u64,
@@ -2910,6 +3110,63 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct ObservedCycle {
+        at: Instant,
+        hint: Option<PathBuf>,
+        force_rescan: bool,
+    }
+
+    struct CycleRecordingWorker {
+        cycles: Arc<Mutex<Vec<ObservedCycle>>>,
+    }
+
+    impl ProviderWorker for CycleRecordingWorker {
+        fn process(&mut self, cycle: &mut ProviderCycle<'_>) -> io::Result<()> {
+            lock_unpoisoned(&self.cycles).push(ObservedCycle {
+                at: Instant::now(),
+                hint: cycle.hint.map(Path::to_path_buf),
+                force_rescan: cycle.force_rescan,
+            });
+            Ok(())
+        }
+    }
+
+    struct GatedCycleRecordingWorker {
+        cycles: Arc<Mutex<Vec<ObservedCycle>>>,
+        entered: SyncSender<()>,
+        release: Receiver<()>,
+        remaining_gates: usize,
+    }
+
+    impl ProviderWorker for GatedCycleRecordingWorker {
+        fn process(&mut self, cycle: &mut ProviderCycle<'_>) -> io::Result<()> {
+            lock_unpoisoned(&self.cycles).push(ObservedCycle {
+                at: Instant::now(),
+                hint: cycle.hint.map(Path::to_path_buf),
+                force_rescan: cycle.force_rescan,
+            });
+            if self.remaining_gates > 0 {
+                self.remaining_gates -= 1;
+                self.entered
+                    .send(())
+                    .map_err(|_| io::Error::other("cycle gate observer disconnected"))?;
+                self.release
+                    .recv()
+                    .map_err(|_| io::Error::other("cycle gate release disconnected"))?;
+            }
+            Ok(())
+        }
+    }
+
+    fn wait_for_initial_cycle(cycles: &Mutex<Vec<ObservedCycle>>) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while lock_unpoisoned(cycles).is_empty() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(!lock_unpoisoned(cycles).is_empty());
+    }
+
     fn run_bounded(name: &'static str, body: impl FnOnce() + Send + 'static) {
         let (sender, receiver) = mpsc::channel();
         let helper = thread::spawn(move || {
@@ -2921,6 +3178,230 @@ mod tests {
             .unwrap_or_else(|error| panic!("{name} timed out: {error}"));
         outcome.unwrap_or_else(|panic| panic::resume_unwind(panic));
         helper.join().unwrap();
+    }
+
+    #[test]
+    fn sustained_hint_overflow_respects_full_rescan_cooldown() {
+        run_bounded("sustained hint overflow cooldown", || {
+            const MEASURED_CYCLES: usize = 8;
+
+            let rescan_interval = Duration::from_secs(1);
+            let cycles = Arc::new(Mutex::new(Vec::new()));
+            let (entered_sender, entered_receiver) = mpsc::sync_channel(0);
+            let (release_sender, release_receiver) = mpsc::channel();
+            let worker = GatedCycleRecordingWorker {
+                cycles: Arc::clone(&cycles),
+                entered: entered_sender,
+                release: release_receiver,
+                remaining_gates: MEASURED_CYCLES + 1,
+            };
+            let (egress, _events) = tokio_mpsc::channel(1);
+            let handle =
+                spawn_provider_thread_with_rescan_interval(worker, egress, None, rescan_interval)
+                    .unwrap();
+            let diagnostics = handle.diagnostics();
+            let flood_sink = NotifySink {
+                control: handle.control.clone(),
+                force_rescan: Arc::clone(&handle.force_rescan),
+                diagnostics: diagnostics.clone(),
+            };
+            let mut gate_error = entered_receiver.recv_timeout(Duration::from_secs(1)).err();
+            let started = Instant::now();
+            for _ in 0..MEASURED_CYCLES {
+                if gate_error.is_some() {
+                    break;
+                }
+                for _ in 0..=CONTROL_CHANNEL_CAPACITY {
+                    flood_sink.hint(PathBuf::from("overflow.jsonl"));
+                }
+                if release_sender.send(()).is_err() {
+                    gate_error = Some(mpsc::RecvTimeoutError::Disconnected);
+                    break;
+                }
+                gate_error = entered_receiver.recv_timeout(Duration::from_secs(1)).err();
+            }
+            let elapsed = started.elapsed();
+
+            for _ in 0..=MEASURED_CYCLES {
+                let _ = release_sender.send(());
+            }
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(handle.stop())
+                .unwrap();
+
+            assert!(gate_error.is_none(), "provider cycle gate timed out");
+            let full_rescans = lock_unpoisoned(&cycles)
+                .iter()
+                .filter(|cycle| cycle.at >= started && cycle.force_rescan)
+                .count();
+            let loose_bound = elapsed.as_millis() / rescan_interval.as_millis() + 2;
+            assert!(
+                diagnostics.dropped_hints() > 0,
+                "the gated flood never saturated the channel"
+            );
+            assert!(full_rescans > 0, "the periodic fallback never ran");
+            assert!(
+                full_rescans as u128 <= loose_bound,
+                "{full_rescans} full rescans exceeded cooldown bound {loose_bound} in {elapsed:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn rapid_duplicate_hints_are_debounced_and_deduplicated() {
+        run_bounded("duplicate hint debounce", || {
+            let cycles = Arc::new(Mutex::new(Vec::new()));
+            let worker = CycleRecordingWorker {
+                cycles: Arc::clone(&cycles),
+            };
+            let (egress, _events) = tokio_mpsc::channel(1);
+            let handle = spawn_provider_thread_with_rescan_interval(
+                worker,
+                egress,
+                None,
+                Duration::from_secs(1),
+            )
+            .unwrap();
+            wait_for_initial_cycle(&cycles);
+            let path = PathBuf::from("same.jsonl");
+            let burst_started = Instant::now();
+
+            for _ in 0..64 {
+                handle.hint(path.clone());
+            }
+            thread::sleep(Duration::from_millis(350));
+            let mixed_started = Instant::now();
+            for _ in 0..32 {
+                handle.hint(PathBuf::from("first.jsonl"));
+                handle.hint(PathBuf::from("second.jsonl"));
+            }
+            thread::sleep(Duration::from_millis(350));
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(handle.stop())
+                .unwrap();
+
+            let recorded = lock_unpoisoned(&cycles);
+            let single_path_cycles = recorded
+                .iter()
+                .filter(|cycle| cycle.at >= burst_started && cycle.at < mixed_started)
+                .collect::<Vec<_>>();
+            assert!(
+                single_path_cycles
+                    .iter()
+                    .any(|cycle| cycle.hint.as_ref() == Some(&path)),
+                "the single-path hint was never processed"
+            );
+            assert!(
+                single_path_cycles.len() <= 3,
+                "duplicate burst produced {} cycles",
+                single_path_cycles.len()
+            );
+            let mixed_cycles = recorded
+                .iter()
+                .filter(|cycle| cycle.at >= mixed_started && !cycle.force_rescan)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                mixed_cycles.len(),
+                1,
+                "mixed burst must produce one non-full cycle"
+            );
+            assert!(
+                mixed_cycles[0].hint.is_none(),
+                "mixed burst must not select one arbitrary hint"
+            );
+        });
+    }
+
+    #[test]
+    fn force_request_inside_cooldown_is_deferred_but_not_lost() {
+        run_bounded("deferred force rescan", || {
+            let rescan_interval = Duration::from_secs(1);
+            let cycles = Arc::new(Mutex::new(Vec::new()));
+            let (entered_sender, entered_receiver) = mpsc::sync_channel(0);
+            let (release_sender, release_receiver) = mpsc::channel();
+            let worker = GatedCycleRecordingWorker {
+                cycles: Arc::clone(&cycles),
+                entered: entered_sender,
+                release: release_receiver,
+                remaining_gates: 2,
+            };
+            let (egress, _events) = tokio_mpsc::channel(1);
+            let handle =
+                spawn_provider_thread_with_rescan_interval(worker, egress, None, rescan_interval)
+                    .unwrap();
+            let path = PathBuf::from("deferred.jsonl");
+            let initial_gate_error = entered_receiver.recv_timeout(Duration::from_secs(1)).err();
+            let requested_at = Instant::now();
+            if initial_gate_error.is_none() {
+                handle.force_rescan.store(true, Ordering::Release);
+                handle.hint(path.clone());
+            }
+            let _ = release_sender.send(());
+
+            let scoped_gate_error = if initial_gate_error.is_none() {
+                entered_receiver.recv_timeout(Duration::from_secs(2)).err()
+            } else {
+                Some(mpsc::RecvTimeoutError::Disconnected)
+            };
+            // Observe the deferred request while the scoped cycle cannot advance and clear it.
+            let scoped_cycle = scoped_gate_error
+                .is_none()
+                .then(|| lock_unpoisoned(&cycles).last().cloned())
+                .flatten();
+            let force_request_pending =
+                scoped_gate_error.is_none() && handle.force_rescan.load(Ordering::Acquire);
+
+            let full_wait_started = Instant::now();
+            let _ = release_sender.send(());
+            let full_deadline = full_wait_started + rescan_interval + Duration::from_secs(2);
+            let mut deferred_full_rescan_observed = false;
+            if scoped_gate_error.is_none() {
+                while Instant::now() < full_deadline {
+                    if lock_unpoisoned(&cycles)
+                        .iter()
+                        .any(|cycle| cycle.at >= requested_at && cycle.force_rescan)
+                    {
+                        deferred_full_rescan_observed = true;
+                        break;
+                    }
+                    thread::yield_now();
+                }
+            }
+
+            let stop_result = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(handle.stop());
+
+            assert!(
+                initial_gate_error.is_none(),
+                "initial provider cycle gate timed out: {initial_gate_error:?}"
+            );
+            assert!(
+                scoped_gate_error.is_none(),
+                "scoped provider cycle gate timed out: {scoped_gate_error:?}"
+            );
+            stop_result.unwrap();
+            let scoped_cycle = scoped_cycle.expect("scoped cycle was not recorded");
+            assert_eq!(
+                scoped_cycle.hint.as_ref(),
+                Some(&path),
+                "the gated scoped cycle did not carry the queued hint"
+            );
+            assert!(
+                !scoped_cycle.force_rescan,
+                "force request bypassed the cooldown"
+            );
+            assert!(
+                force_request_pending,
+                "deferred force request was cleared inside the cooldown"
+            );
+            assert!(
+                deferred_full_rescan_observed,
+                "deferred full rescan was lost"
+            );
+        });
     }
 
     #[test]
@@ -2939,12 +3420,16 @@ mod tests {
                 })
                 .unwrap();
             let handle = spawn_provider_thread(worker, egress, None).unwrap();
-            for index in 0..12 {
-                handle.hint(PathBuf::from(format!("hint-{index}")));
-            }
             let deadline = Instant::now() + Duration::from_secs(1);
-            while calls.load(Ordering::Relaxed) < 4 && Instant::now() < deadline {
+            while calls.load(Ordering::Relaxed) < 1 && Instant::now() < deadline {
                 thread::yield_now();
+            }
+            for index in 0..3 {
+                let previous_calls = calls.load(Ordering::Relaxed);
+                handle.hint(PathBuf::from(format!("hint-{index}")));
+                while calls.load(Ordering::Relaxed) == previous_calls && Instant::now() < deadline {
+                    thread::yield_now();
+                }
             }
             assert!(calls.load(Ordering::Relaxed) >= 4);
             assert!(handle.diagnostics().egress_saturations() > 0);
