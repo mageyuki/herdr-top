@@ -46,10 +46,10 @@ use crate::provider::lane::LogLaneConfig;
 use crate::provider::spawn_provider_thread_with_diagnostics;
 use crate::provider::{
     BootstrapIdentity, BootstrapParser, CodexPaneBinding, CodexPaneTarget, DiscoveryIndex,
-    DiscoveryRoot, FsReadBoundary, MergeOutcome, PathInterner, PendingEvents, ProviderCycle,
-    ProviderEvent, ProviderIngressEvent, ProviderSourceState, ProviderSpawnError, ProviderTarget,
-    ProviderTargetPublisher, ProviderThreadError, ProviderThreadHandle, ProviderWorker,
-    RecommendedNotifyFactory, TailFile, TargetSet,
+    DiscoveryRoot, DiscoveryScanStatus, FsReadBoundary, MergeOutcome, PathInterner, PendingEvents,
+    ProviderCycle, ProviderEvent, ProviderIngressEvent, ProviderSourceState, ProviderSpawnError,
+    ProviderTarget, ProviderTargetPublisher, ProviderThreadError, ProviderThreadHandle,
+    ProviderWorker, RecommendedNotifyFactory, TailFile, TargetSet,
     spawn_provider_thread_with_diagnostics_and_performance,
 };
 use crate::reducer::{ApplyOutcome, CommitStagedError, Reducer, ReducerError};
@@ -4435,16 +4435,18 @@ impl ProviderWorker for AdapterProviderWorker {
                     .get_mut(&root_key)
                     .expect("root state inserted before scan");
                 let mut parser = AdapterBootstrapParser::default();
-                state.discovery.scan_admitted(
+                state.discovery.scan_admitted_interruptible(
                     &mut parser,
                     &mut self.interner,
                     &self.log_admission,
                     &mut self.admission_index,
                     &self.diagnostics,
+                    || cycle.should_stop(),
                 )
             };
             let scan_outcome = match scan_result {
-                Ok(outcome) => outcome,
+                Ok(DiscoveryScanStatus::Completed(outcome)) => outcome,
+                Ok(DiscoveryScanStatus::Interrupted) => return Ok(()),
                 Err(error) => {
                     if error.kind() != io::ErrorKind::NotFound {
                         self.record_sweep_failure(
@@ -7737,6 +7739,77 @@ mod tests {
         assert_eq!(backoff.consecutive_failures, 0);
         assert_eq!(backoff.on_watchdog_silence(), 1_000);
         assert_eq!(backoff.consecutive_failures, 1);
+    }
+
+    #[test]
+    fn provider_stop_interrupts_codex_discovery() {
+        const TARGET_NAME: &str =
+            "rollout-2026-08-27T00-00-00-00000000-0000-4000-8000-000000000000.jsonl";
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join(TARGET_NAME);
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path: target.clone(),
+        }]);
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let mut pending = PendingEvents::new(diagnostics.clone());
+        let mut watch_requests = Vec::new();
+        let mut cycle =
+            crate::provider::test_provider_cycle(&targets, &mut pending, &mut watch_requests);
+        worker.process(&mut cycle).unwrap();
+        let (sender, mut receiver) = mpsc::channel(16);
+        pending.flush_to(&sender);
+        while receiver.try_recv().is_ok() {}
+
+        std::fs::write(&target, b"").unwrap();
+        for index in 1..32 {
+            let name = format!(
+                "rollout-2026-08-27T00-00-{index:02}-00000000-0000-4000-8000-{index:012}.jsonl"
+            );
+            std::fs::write(root.join(name), b"").unwrap();
+        }
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let hook_stop = Arc::clone(&stop_flag);
+        crate::provider::set_discovery_file_type_hook(move |_| {
+            hook_stop.store(true, Ordering::Release);
+            Ok(())
+        });
+        let mut watch_requests = Vec::new();
+        let mut cycle = crate::provider::test_provider_cycle_with_stop(
+            &targets,
+            &mut pending,
+            &stop_flag,
+            &mut watch_requests,
+        );
+
+        worker.process(&mut cycle).unwrap();
+
+        assert!(stop_flag.load(Ordering::Acquire));
+        assert!(
+            worker
+                .roots
+                .get(&(Provider::Codex, root))
+                .unwrap()
+                .discovery
+                .files()
+                .is_empty(),
+            "shutdown waited for and published the discovery inventory"
+        );
+        assert_eq!(
+            diagnostics.admission_open_attempts(),
+            0,
+            "shutdown allowed discovery to open an artifact"
+        );
     }
 
     #[tokio::test]

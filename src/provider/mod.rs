@@ -399,6 +399,15 @@ pub struct DiscoveryScanOutcome {
     removed_path_ids: Vec<u32>,
 }
 
+/// Completion state for a discovery scan that may be interrupted between artifacts.
+#[derive(Debug)]
+pub enum DiscoveryScanStatus {
+    /// The complete inventory was scanned and cleanup was applied.
+    Completed(DiscoveryScanOutcome),
+    /// The supplied stop predicate requested interruption before scan cleanup.
+    Interrupted,
+}
+
 impl DiscoveryScanOutcome {
     /// Reports whether any individual file could not be interned or bootstrapped.
     #[must_use]
@@ -507,22 +516,27 @@ impl DiscoveryIndex {
 }
 
 impl DiscoveryIndex {
-    /// Production provider-lane rescan. Identity inventory is built from names and discovery
-    /// metadata; admission is checked before structural bootstrap opens a descriptor.
-    pub fn scan_admitted(
+    /// Provider-lane rescan that may stop cooperatively between artifacts.
+    pub fn scan_admitted_interruptible(
         &mut self,
         parser: &mut impl BootstrapParser,
         interner: &mut PathInterner,
         admission: &lane::Admission,
         admission_index: &mut lane::AdmissionIndex,
         diagnostics: &ProviderDiagnostics,
-    ) -> io::Result<DiscoveryScanOutcome> {
+        should_stop: impl FnMut() -> bool,
+    ) -> io::Result<DiscoveryScanStatus> {
+        let mut should_stop = should_stop;
         let mut seen = HashSet::new();
         let mut dirty_roots = HashSet::new();
+        let mut clean_root_seen = Vec::new();
         let mut outcome = DiscoveryScanOutcome::default();
         for root in self.roots.clone() {
             let mut root_seen = HashSet::new();
             let discovery = discover_artifacts(&root.path, true)?;
+            if should_stop() {
+                return Ok(DiscoveryScanStatus::Interrupted);
+            }
             outcome.file_io_error |= discovery.had_errors;
             if discovery.had_errors {
                 dirty_roots.insert(root.path.clone());
@@ -531,6 +545,9 @@ impl DiscoveryIndex {
             let mut newest_pane_artifact: HashMap<(Provider, String), (i64, PathBuf)> =
                 HashMap::new();
             for artifact in &discovery.artifacts {
+                if should_stop() {
+                    return Ok(DiscoveryScanStatus::Interrupted);
+                }
                 let absolute = root.path.join(&artifact.relative_path);
                 admission_index.observe_discovered_path(
                     root.provider,
@@ -550,7 +567,13 @@ impl DiscoveryIndex {
                 }
             }
 
+            if should_stop() {
+                return Ok(DiscoveryScanStatus::Interrupted);
+            }
             for artifact in discovery.artifacts {
+                if should_stop() {
+                    return Ok(DiscoveryScanStatus::Interrupted);
+                }
                 let relative = artifact.relative_path;
                 let absolute = root.path.join(&relative);
                 if !admission.is_admitted_file(&absolute, artifact.modified_ms) {
@@ -605,9 +628,18 @@ impl DiscoveryIndex {
                     },
                 );
             }
-            if !discovery.had_errors {
-                self.baseline.retain_existing(&root.path, &root_seen);
+            if should_stop() {
+                return Ok(DiscoveryScanStatus::Interrupted);
             }
+            if !discovery.had_errors {
+                clean_root_seen.push((root.path, root_seen));
+            }
+        }
+        if should_stop() {
+            return Ok(DiscoveryScanStatus::Interrupted);
+        }
+        for (root, root_seen) in clean_root_seen {
+            self.baseline.retain_existing(&root, &root_seen);
         }
         self.files.retain(|key, file| {
             if seen.contains(key) || dirty_roots.contains(&file.root) {
@@ -620,7 +652,32 @@ impl DiscoveryIndex {
         outcome.removed_path_ids.sort_unstable();
         outcome.removed_path_ids.dedup();
         self.rebuild_identities();
-        Ok(outcome)
+        Ok(DiscoveryScanStatus::Completed(outcome))
+    }
+
+    /// Production provider-lane rescan. Identity inventory is built from names and discovery
+    /// metadata; admission is checked before structural bootstrap opens a descriptor.
+    pub fn scan_admitted(
+        &mut self,
+        parser: &mut impl BootstrapParser,
+        interner: &mut PathInterner,
+        admission: &lane::Admission,
+        admission_index: &mut lane::AdmissionIndex,
+        diagnostics: &ProviderDiagnostics,
+    ) -> io::Result<DiscoveryScanOutcome> {
+        match self.scan_admitted_interruptible(
+            parser,
+            interner,
+            admission,
+            admission_index,
+            diagnostics,
+            || false,
+        )? {
+            DiscoveryScanStatus::Completed(outcome) => Ok(outcome),
+            DiscoveryScanStatus::Interrupted => {
+                unreachable!("non-interruptible provider discovery cannot be interrupted")
+            }
+        }
     }
 }
 
@@ -2532,6 +2589,113 @@ mod tests {
         scan_admitted_fixture(&mut index, &mut parser, &mut interner).unwrap();
 
         assert!(!index.baseline().contained(directory.path(), relative));
+    }
+
+    #[test]
+    fn scan_admitted_interrupts_between_artifacts_without_partial_cleanup() {
+        const CLAUDE_FIXTURE_C: &str = "33333333-3333-4333-8333-333333333333";
+
+        struct CountingLineParser {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl BootstrapParser for CountingLineParser {
+            fn parse_structural(
+                &mut self,
+                _provider: Provider,
+                _relative_path: &Path,
+                record: &[u8],
+            ) -> Option<BootstrapIdentity> {
+                self.calls.fetch_add(1, Ordering::Release);
+                let text = std::str::from_utf8(record).ok()?;
+                let thread_id = text.strip_prefix("struct:")?;
+                Some(BootstrapIdentity {
+                    thread_id: thread_id.to_owned(),
+                    owner_session_id: None,
+                    parent_thread_id: None,
+                    model_id: None,
+                    depth: None,
+                    agent_path: None,
+                    byte_offset: 0,
+                })
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let removed_relative = PathBuf::from(format!("{CLAUDE_FIXTURE_A}.jsonl"));
+        let added_relative = PathBuf::from(format!("{CLAUDE_FIXTURE_B}.jsonl"));
+        let retained_relative = PathBuf::from(format!("{CLAUDE_FIXTURE_C}.jsonl"));
+        fs::write(
+            directory.path().join(&removed_relative),
+            b"struct:removed-identity\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(&retained_relative),
+            b"struct:retained-identity\n",
+        )
+        .unwrap();
+        let mut index = DiscoveryIndex::new(vec![DiscoveryRoot {
+            provider: Provider::Claude,
+            path: directory.path().to_path_buf(),
+        }])
+        .unwrap();
+        let mut parser = LineParser { calls: 0 };
+        let mut interner = PathInterner::default();
+        scan_admitted_fixture(&mut index, &mut parser, &mut interner).unwrap();
+
+        fs::remove_file(directory.path().join(&removed_relative)).unwrap();
+        fs::write(
+            directory.path().join(&added_relative),
+            b"struct:added-identity\n",
+        )
+        .unwrap();
+        let mut admission = lane::Admission::new(0);
+        for relative in [&added_relative, &retained_relative] {
+            assert!(
+                admission.admit_pane_artifact(Provider::Claude, &directory.path().join(relative))
+            );
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut parser = CountingLineParser {
+            calls: Arc::clone(&calls),
+        };
+
+        let result = index
+            .scan_admitted_interruptible(
+                &mut parser,
+                &mut interner,
+                &admission,
+                &mut lane::AdmissionIndex::new(),
+                &ProviderDiagnostics::default(),
+                || calls.load(Ordering::Acquire) > 0,
+            )
+            .unwrap();
+
+        assert!(matches!(result, DiscoveryScanStatus::Interrupted));
+        assert!(
+            index
+                .files()
+                .iter()
+                .any(|file| file.relative_path == removed_relative),
+            "partial seen coverage removed an unvisited file"
+        );
+        assert!(
+            index
+                .baseline()
+                .contained(directory.path(), &removed_relative),
+            "partial root coverage pruned the run baseline"
+        );
+        assert!(
+            index
+                .resolve(Provider::Claude, "removed-identity")
+                .is_some(),
+            "interrupted scan rebuilt identities from partial coverage"
+        );
+        assert!(
+            index.resolve(Provider::Claude, "added-identity").is_none(),
+            "interrupted scan published a partially rebuilt identity"
+        );
     }
 
     fn position(path_id: u32, generation: u64, offset: u64) -> SourcePosition {
