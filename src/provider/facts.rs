@@ -158,7 +158,7 @@ pub enum LogFact {
     /// Identifier produced by one position in the closed lineage-evidence grammar.
     ///
     /// `lane::Admission::on_evidence` exact-matches UUIDs against `AdmissionIndex`;
-    /// synthesis discards identifiers that do not name a discovered artifact.
+    /// synthesis discards UUIDs that do not name a discovered artifact.
     EvidenceId {
         /// Session whose typed evidence position contained the identifier.
         parent: SessionScope,

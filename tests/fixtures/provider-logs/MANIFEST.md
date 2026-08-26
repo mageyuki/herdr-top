@@ -38,15 +38,6 @@ contains `CLAUDE_CONFIG_DIR=/home/user/.claude-secondary` and quotes Codex
 rollout id `6f9bdfa0-1502-4a37-97aa-c45591141130`; that id is the identity in
 `codex-exec.jsonl`.
 
-### `../provider/claude-lineage-evidence.jsonl`
-
-Pins the closed command-evidence grammar with six record shapes: a pasted UUID
-inside a tool-result directory listing, a printed resume lookalike, env-wrapped
-`codex exec resume` plus `CLAUDE_CONFIG_DIR=`, env-wrapped `claude --resume`,
-bare spawn commands carrying unrelated UUID arguments, and a printed
-configuration-directory lookalike. Only the two resume UUIDs and the real
-leading configuration assignment are evidence.
-
 ### `claude-subagent-meta.json`
 
 Mirrors `agent-<agentId>.meta.json`. `agentType`, `description`, `toolUseId`,

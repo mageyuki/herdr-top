@@ -3,7 +3,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::model::{TokenBreakdown, sanitize_controller_text};
 
@@ -62,11 +62,22 @@ struct ContentBlock {
 struct ToolInput {
     description: Option<String>,
     file_path: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_private_command")]
     command: Option<PrivateCommand>,
 }
 
 #[derive(Deserialize)]
 struct PrivateCommand(String);
+
+fn deserialize_private_command<'de, D>(deserializer: D) -> Result<Option<PrivateCommand>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(command) => Some(PrivateCommand(command)),
+        _ => None,
+    })
+}
 
 impl fmt::Debug for PrivateCommand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -158,6 +169,15 @@ fn extract_assistant(scope: &SessionScope, line: &str, facts: &mut Vec<LogFact>)
         return;
     };
     let Some(at_ms) = record.timestamp.as_deref().and_then(parse_timestamp_ms) else {
+        if let Some(content) = record
+            .message
+            .as_ref()
+            .and_then(|message| message.content.as_ref())
+        {
+            for block in content {
+                facts.extend(command_evidence(scope, block));
+            }
+        }
         return;
     };
 
@@ -836,6 +856,28 @@ mod tests {
     }
 
     #[test]
+    fn non_string_bash_command_preserves_usage_without_evidence() {
+        let line = r#"{"type":"assistant","timestamp":"2026-08-24T01:00:03.000Z","message":{"id":"msg_non_string_command","usage":{"output_tokens":42},"content":[{"type":"tool_use","name":"Bash","input":{"command":["ls","-la"]}}]}}"#;
+        let facts = extract_claude_line(&root_scope(), line);
+
+        assert!(facts.iter().any(|fact| {
+            matches!(
+                fact,
+                LogFact::Usage {
+                    sample_id,
+                    output_tokens: 42,
+                    ..
+                } if sample_id == "msg_non_string_command"
+            )
+        }));
+        assert!(
+            facts
+                .iter()
+                .all(|fact| !matches!(fact, LogFact::EvidenceId { .. }))
+        );
+    }
+
+    #[test]
     fn effort_extracted_from_assistant_records() {
         let usage = fixture("claude-session.jsonl")
             .lines()
@@ -1125,6 +1167,19 @@ mod tests {
     }
 
     #[test]
+    fn resume_command_evidence_does_not_require_timestamp() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"claude --resume 77777777-7777-4777-8777-777777777777"}}]}}"#;
+
+        assert_eq!(
+            extract_claude_line(&root_scope(), line),
+            vec![LogFact::EvidenceId {
+                parent: root_scope(),
+                id: EvidenceId::Uuid("77777777-7777-4777-8777-777777777777".to_owned()),
+            }]
+        );
+    }
+
+    #[test]
     fn subagent_scope_uses_own_activity_scope_and_parent_for_ending() {
         let scope = SessionScope::ClaudeSubagent {
             parent: PARENT.to_owned(),
@@ -1162,7 +1217,7 @@ mod tests {
 
     #[test]
     fn pasted_tool_result_uuid_is_not_lineage_evidence() {
-        let input = provider_fixture("claude-lineage-evidence.jsonl");
+        let input = provider_fixture("claude-lineage-evidence-synthetic.jsonl");
         let line = input.lines().next().expect("fixture has pasted listing");
 
         assert!(
@@ -1174,7 +1229,7 @@ mod tests {
 
     #[test]
     fn quoted_resume_lookalike_is_not_lineage_evidence() {
-        let input = provider_fixture("claude-lineage-evidence.jsonl");
+        let input = provider_fixture("claude-lineage-evidence-synthetic.jsonl");
         let line = input.lines().nth(1).expect("fixture has quoted lookalike");
 
         assert!(
@@ -1186,7 +1241,7 @@ mod tests {
 
     #[test]
     fn resume_invocations_emit_only_the_typed_child_ids() {
-        let evidence = provider_fixture("claude-lineage-evidence.jsonl")
+        let evidence = provider_fixture("claude-lineage-evidence-synthetic.jsonl")
             .lines()
             .flat_map(|line| extract_claude_line(&root_scope(), line))
             .filter_map(|fact| match fact {
@@ -1213,7 +1268,7 @@ mod tests {
 
     #[test]
     fn config_dir_evidence_is_preserved_from_bash_command_assignment() {
-        let facts = provider_fixture("claude-lineage-evidence.jsonl")
+        let facts = provider_fixture("claude-lineage-evidence-synthetic.jsonl")
             .lines()
             .flat_map(|line| extract_claude_line(&root_scope(), line))
             .collect::<Vec<_>>();
