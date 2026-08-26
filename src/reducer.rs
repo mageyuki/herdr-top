@@ -670,7 +670,9 @@ impl Reducer {
 
     fn enqueue_pending_telemetry(&mut self, key: RunKey, sample: PendingTelemetry) {
         while self.pending_telemetry_count >= PENDING_TELEMETRY_SAMPLE_CAPACITY {
-            self.evict_oldest_pending_telemetry();
+            if !self.evict_oldest_pending_telemetry() {
+                break;
+            }
         }
         self.pending_telemetry
             .entry(key.clone())
@@ -680,7 +682,7 @@ impl Reducer {
         self.pending_telemetry_count += 1;
     }
 
-    fn evict_oldest_pending_telemetry(&mut self) {
+    fn evict_oldest_pending_telemetry(&mut self) -> bool {
         while let Some(key) = self.pending_telemetry_order.pop_front() {
             let Some(samples) = self.pending_telemetry.get_mut(&key) else {
                 continue;
@@ -692,9 +694,10 @@ impl Reducer {
             if samples.is_empty() {
                 self.pending_telemetry.remove(&key);
             }
-            return;
+            return true;
         }
         debug_assert_eq!(self.pending_telemetry_count, 0);
+        false
     }
 
     fn apply_pending_telemetry_for_known_runs(&mut self) {
@@ -702,18 +705,19 @@ impl Reducer {
         let ready = self
             .pending_telemetry_order
             .iter()
-            .filter(|key| seen.insert((*key).clone()))
             .filter(|key| self.model.task_run_by_key(key).is_some())
+            .filter(|key| seen.insert((*key).clone()))
             .cloned()
             .collect::<Vec<_>>();
+        let ready_keys = ready.iter().cloned().collect::<HashSet<_>>();
+        self.pending_telemetry_order
+            .retain(|pending_key| !ready_keys.contains(pending_key));
         for key in ready {
             let Some(samples) = self.pending_telemetry.remove(&key) else {
                 continue;
             };
             self.pending_telemetry_count =
                 self.pending_telemetry_count.saturating_sub(samples.len());
-            self.pending_telemetry_order
-                .retain(|pending_key| pending_key != &key);
             for sample in samples {
                 let applied = self.accumulate_telemetry(&key, sample);
                 debug_assert!(
@@ -4304,7 +4308,7 @@ mod tests {
 
     #[test]
     fn pending_telemetry_fifo_evicts_oldest_sample_at_cap() {
-        const PENDING_CAP: usize = 4_096;
+        const PENDING_CAP: usize = super::PENDING_TELEMETRY_SAMPLE_CAPACITY;
         let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
         for index in 0..=PENDING_CAP {
             let key = RunKey::Controller(format!("pending-{index}"));
@@ -4323,8 +4327,10 @@ mod tests {
         }
 
         let oldest_key = RunKey::Controller("pending-0".to_owned());
+        let second_oldest_key = RunKey::Controller("pending-1".to_owned());
         let newest_key = RunKey::Controller(format!("pending-{PENDING_CAP}"));
         let oldest_id = RunId::new();
+        let second_oldest_id = RunId::new();
         let newest_id = RunId::new();
         reducer.model.insert_task_run(run_with_controller_evidence(
             oldest_id,
@@ -4333,9 +4339,15 @@ mod tests {
             TaskState::Running,
         ));
         reducer.model.insert_task_run(run_with_controller_evidence(
+            second_oldest_id,
+            second_oldest_key,
+            2,
+            TaskState::Running,
+        ));
+        reducer.model.insert_task_run(run_with_controller_evidence(
             newest_id,
             newest_key,
-            2,
+            3,
             TaskState::Running,
         ));
         reducer.publish();
@@ -4345,10 +4357,149 @@ mod tests {
             snapshot.telemetry(&oldest_id).is_none(),
             "the global FIFO cap must evict the oldest pending sample"
         );
+        let second_oldest = snapshot
+            .telemetry(&second_oldest_id)
+            .expect("the second-oldest pending sample must survive FIFO eviction");
+        assert_eq!(second_oldest.output_tokens, 2);
         let newest = snapshot
             .telemetry(&newest_id)
             .expect("the newest pending sample must survive FIFO eviction");
         assert_eq!(newest.output_tokens, 4_097);
+    }
+
+    #[test]
+    fn pending_telemetry_retains_multiple_samples_for_one_scope() {
+        let key = RunKey::Controller("pending-multiple".to_owned());
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        for (at_ms, output_tokens) in [(1_000, 11), (1_100, 13), (1_200, 17)] {
+            assert!(
+                reducer
+                    .apply_telemetry(
+                        &key,
+                        at_ms,
+                        output_tokens,
+                        Some(WORKER_MODEL.to_owned()),
+                        Some(WORKER_EFFORT.to_owned()),
+                        None,
+                    )
+                    .is_empty()
+            );
+        }
+        assert_eq!(reducer.pending_telemetry_count, 3);
+        assert_eq!(reducer.pending_telemetry.get(&key).unwrap().len(), 3);
+
+        let run_id = RunId::new();
+        reducer.model.insert_task_run(run_with_controller_evidence(
+            run_id,
+            key,
+            1,
+            TaskState::Running,
+        ));
+        reducer.publish();
+        assert_eq!(reducer.pending_telemetry_count, 0);
+        assert!(reducer.pending_telemetry.is_empty());
+        assert!(reducer.pending_telemetry_order.is_empty());
+
+        let snapshot = shared.borrow();
+        let telemetry = snapshot
+            .telemetry(&run_id)
+            .expect("all pending samples for one scope must be attributed");
+        assert_eq!(telemetry.output_tokens, 41);
+        assert_eq!(telemetry.started_wall_ms, 1_000);
+    }
+
+    #[test]
+    fn pending_telemetry_resolves_through_promotion_alias() {
+        let native_key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "pending-promotion".to_owned(),
+        };
+        let provisional_key = RunKey::Provisional {
+            terminal_id: "pending-promotion-terminal".to_owned(),
+            start_ms: 1_000,
+            seq: 1,
+        };
+        let run_id = RunId::new();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        assert!(
+            reducer
+                .apply_telemetry(
+                    &native_key,
+                    1_100,
+                    37,
+                    Some("gpt-5.6-sol".to_owned()),
+                    Some("xhigh".to_owned()),
+                    Some("workspace-write".to_owned()),
+                )
+                .is_empty()
+        );
+        reducer
+            .model
+            .insert_task_run(run(run_id, provisional_key.clone(), 1, TaskState::Running));
+        reducer.publish();
+        assert!(
+            shared.borrow().telemetry(&run_id).is_none(),
+            "a different provisional key must not consume native-key telemetry"
+        );
+        assert_eq!(reducer.pending_telemetry_count, 1);
+
+        let mut promoted = reducer.model.task_run(&run_id).unwrap().clone();
+        promoted.key = native_key;
+        reducer.model.insert_task_run(promoted);
+        reducer.model.insert_task_run_alias(provisional_key, run_id);
+        reducer.publish();
+
+        let snapshot = shared.borrow();
+        let telemetry = snapshot
+            .telemetry(&run_id)
+            .expect("promotion must resolve pending native-key telemetry");
+        assert_eq!(telemetry.output_tokens, 37);
+        assert_eq!(telemetry.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(telemetry.per_turn.len(), 1);
+    }
+
+    #[test]
+    fn pending_telemetry_resolves_through_merge_alias() {
+        let absorbed_key = RunKey::Controller("pending-absorbed".to_owned());
+        let survivor_key = RunKey::Controller("pending-survivor".to_owned());
+        let absorbed_id = RunId::new();
+        let survivor_id = RunId::new();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        assert!(
+            reducer
+                .apply_telemetry(
+                    &absorbed_key,
+                    1_100,
+                    53,
+                    Some(WORKER_MODEL.to_owned()),
+                    Some(WORKER_EFFORT.to_owned()),
+                    None,
+                )
+                .is_empty()
+        );
+        reducer
+            .model
+            .insert_task_run(run(survivor_id, survivor_key, 1, TaskState::Running));
+        reducer.model.insert_task_run(run(
+            absorbed_id,
+            absorbed_key.clone(),
+            2,
+            TaskState::Running,
+        ));
+        reducer.model.remove_task_run_record(&absorbed_id);
+        reducer
+            .model
+            .insert_task_run_alias(absorbed_key, survivor_id);
+        reducer.publish();
+
+        let snapshot = shared.borrow();
+        let telemetry = snapshot
+            .telemetry(&survivor_id)
+            .expect("merge alias must route absorbed-key telemetry to the survivor");
+        assert_eq!(telemetry.output_tokens, 53);
     }
 
     #[test]
