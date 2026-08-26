@@ -102,62 +102,54 @@ defects, all observed on a running monitor:
 
 ### G2: lineage requires a typed evidence grammar
 
-- G2a. Evidence positions (closed whitelist), replacing raw line scanning:
+- G2a. Evidence positions (closed whitelist), replacing raw line scanning
+  — THREE positions (final, decided with the user after the Task 0 gate
+  fired twice against richer designs):
   1. Subagent `meta.json` records (existing `SubagentAppeared`).
-  2. Wrapper invocations parsed from the transcript's tool-use `command`
-     field: recognized spawn/resume command grammars (`codex exec`,
-     `codex exec resume <uuid>`, `claude --resume <uuid>`), including
-     `CLAUDE_CONFIG_DIR=` prefixes — only inside such commands. (A bare
-     `claude -p` spawn cannot carry the child id — the child assigns it —
-     so it is NOT part of the grammar; that family is covered by
-     position 4.)
+  2. RESUME invocations and config-dir markers parsed transiently from
+     the transcript's tool-use `command` field: `codex exec resume
+     <uuid>`, `claude --resume <uuid>`, and `CLAUDE_CONFIG_DIR=`
+     assignments — only inside the command text. These carry the child
+     id by definition. Bare spawns (`codex exec` without resume,
+     `claude -p`) are NOT evidence — the child assigns its own id, and
+     Task 0 measured 0/12 spawn commands carrying it. The classifier
+     must recognize the command as a shell invocation (leading
+     assignments/`env` wrappers tolerated per the `sanitize_command_script`
+     precedent), not as a substring anywhere in the script — a
+     `printf 'codex exec resume ...'` must not arm it; and the existing
+     defense stays: an extracted id yields evidence only when it matches
+     an already-discovered artifact id.
   3. Codex structural child references (`sub_agent_activity`
      `agent_thread_id` payloads) in codex_facts.
-  4. SPAWN-CORRELATED RESULT PARSING (revised after the Task 0 gate
-     fired: no typed tool-result session field exists — a scan of 16,158
-     real tool-result records found zero `session*` keys; the child id
-     lives only inside the result's stdout text). When a tool-use
-     `command` matches the SPAWN grammar (`codex exec` without resume;
-     `claude -p`), the tool RESULT that is structurally paired to that
-     tool use (by the transcript's tool-use linkage) has its output
-     parsed with THAT CLI's known output grammar to extract exactly one
-     child id: for `claude -p --output-format json`, JSON-parse the
-     result text and take the top-level snake_case `session_id` field
-     (wire spelling pinned by Task 0); for `codex exec`, the exact
-     output pattern carrying the rollout id is pinned during Task 1's
-     VERIFY from real transcripts (Task 0 confirmed the id appears in
-     the spawn's stdout) — an unrecognized output shape yields NO
-     evidence. This is structural twice over — command-grammar
-     correlation plus known-output parsing — and categorically distinct
-     from scanning arbitrary free text: a UUID pasted in a NON-spawn
-     command's output is never scanned.
-- G2b. General free-text UUID scanning is RETIRED. Product decision,
-  revised once after the Task 0 gate fired (both wrapper families carry
-  the child id ONLY in spawn stdout, never in commands or typed fields):
-  positions 1-3 cover meta.json subagents, resume invocations, and codex
-  structural refs; position 4's spawn-correlated result parsing covers
-  both wrapper families through their real, measured evidence channel.
-  What is lost is lineage existing nowhere except prose OUTSIDE a
-  spawn's own output — exactly the false-positive channel (pasted
-  listings and dumps in unrelated tool results) observed live. Task 0's
-  findings (committed as inner-codex-notes.md) are the empirical basis;
-  its FAIL verdict against the previous typed-field design is what
-  produced this revision.
-- G2b'. Privacy carve-in (deliberate, bounded, POLICY-level): positions 2
-  and 4 read fields that the accepted ADR
+- G2b. General free-text UUID scanning is RETIRED, and NO spawn-output
+  parsing replaces it. Final product decision (user-confirmed): the two
+  spawn-child families (inner `codex exec`, headless `claude -p`) are
+  DEFERRED to a future increment — Task 0 proved their ids surface only
+  in spawn stdout (backgrounded and log-redirected for codex; truncation-
+  prone for claude), and neither family renders a correct link TODAY, so
+  deferral loses nothing that currently works. What this increment loses
+  is only the false-positive channel (pasted listings and dumps in
+  unrelated tool results — the live contamination) and latent links that
+  today produce zombies. Task 0's committed notes are the design basis
+  for the future child-linking increment.
+- G2b'. Privacy carve-in (deliberate, bounded, POLICY-level): position 2
+  reads a field the accepted ADR
   `docs/adr/2026-08-24-provider-log-allowlist.md` currently forbids (its
-  read list omits `input.command` and any tool-result `session_id`, and
-  its never-read section names Bash command bodies and tool-result bodies
-  outright). The ADR's read list and never-read section are AMENDED in the
-  same commit, recording the bounded carve-in there: the tool-use
-  `command` and — only for spawn-grammar-matched tool uses — the paired
-  tool result's output text are parsed TRANSIENTLY, retaining only the
-  extracted UUID / config-dir / child session id (the
-  `sanitize_command_script` precedent; non-Debug-exposed transient parse
-  or redacted Debug). The
-  existing privacy test `bash_without_description_uses_bare_tool_name`
-  (command body never reaches the envelope's Debug output) is PRESERVED,
-  not retargeted. `README.md`'s "quoted report" lineage sentence and
+  read list omits `input.command`; its never-read section names Bash
+  command bodies; and its "Pattern-extraction-only carve-ins" section's
+  carve-in 1 is the written license for the raw UUID scan this increment
+  retires). The ADR is AMENDED in the same commit: carve-in 1 is
+  REWRITTEN from "raw transcript lines may be pattern-scanned" to the
+  narrowed command-text-only grammar (adjusting the "exactly three"
+  count/wording as needed), the read list gains `input.command`
+  (transient parse retaining only the extracted UUID / config-dir), and
+  the never-read section is updated consistently. ALL THREE existing
+  privacy tests are PRESERVED, not retargeted:
+  `bash_without_description_uses_bare_tool_name`,
+  `user_record_debug_excludes_message_and_tool_result_bodies`, and
+  `tool_use_result_debug_excludes_non_allowlisted_body_fields` (the
+  transient parse must be non-Debug-exposed or use a redacted Debug).
+  `README.md`'s "quoted report" lineage sentence and
   `tests/fixtures/provider-logs/MANIFEST.md`'s read-list mirror are
   updated in the same commit.
 - G2c. `scan_raw_ids` remains a pure tokenizer (FIVE production call
@@ -191,16 +183,19 @@ defects, all observed on a running monitor:
   inner-codex wrapper transcript + rollout, and (ii) a headless-Claude
   (`claude -p`) wrapper + child transcript. For each: what identity the
   child artifact carries, and whether the parent transcript references it
-  in a G2-grammar position (positions 2-4: spawn/resume command,
-  config-dir marker, spawn-correlated result content for position 4 —
-  pinning the actual wire spelling and location of the child id) or only
-  in prose. A proposed third-tier design sketch is produced for the
-  inner-codex pair only. Its findings gate G2. STATUS: COMPLETED — the
-  committed `inner-codex-notes.md` fired the gate against the original
-  typed-field design (both families: id only in spawn stdout; no typed
-  session field exists) and produced the current spawn-correlated
-  position 4; the Claude wire spelling is snake_case `session_id` inside
-  the spawn result's JSON output text.
+  in a G2-grammar position (spawn/resume command, config-dir marker, or
+  any typed/structural field — pinning the actual wire spelling and
+  location of the child id) or only in prose. A proposed third-tier
+  design sketch is produced for the inner-codex pair only. Its findings
+  gate G2. STATUS: COMPLETED — the committed `inner-codex-notes.md`
+  fired the gate TWICE (no typed session field exists across 16,158 real
+  tool-result records; both families carry the id only in spawn stdout,
+  which is backgrounded/log-redirected for codex and truncation-prone
+  for claude), which led to the user-confirmed final G2: retire
+  free-text scanning, keep positions 1-3 only, and DEFER spawn-child
+  linking to a future increment with these notes as its design basis.
+  The pinned Claude wire spelling (snake_case `session_id` inside the
+  spawn result's JSON output text) is recorded for that future work.
 
 ### G5: metrics attribution must survive ordering
 
@@ -272,6 +267,11 @@ defects, all observed on a running monitor:
 - Store migration of existing false-lineage or receipt-stamped rows.
 - Widening backfill/admission windows.
 - Implementing the inner-codex third tier (G4 is investigation only).
+- Spawn-child linking for both wrapper families (inner `codex exec` and
+  headless `claude -p`): DEFERRED to a future increment per the
+  user-confirmed G2 decision, designed from `inner-codex-notes.md`.
+  Until then those children appear only via meta.json/structural
+  evidence (or not at all), never via free-text scanning.
 - Doctor/diagnostics schema changes; persisted source-coverage literals.
 - Heuristic re-binding / unmerge machinery.
 

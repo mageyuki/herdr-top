@@ -19,22 +19,25 @@ directory) and (ii) a headless-Claude pair (a `claude -p` wrapper, e.g.
 claude-git-operator, + the child transcript). Answer for each: (a) identity
 carried by the child artifact; (b) does the parent transcript reference it
 in a G2-grammar position (spawn/resume command in tool-use `command`,
-config-dir marker, spawn-correlated result content — pin the actual wire
+config-dir marker, or any typed/structural field — pin the actual wire
 spelling and location of the child id) or only in prose? (c) a proposed
 third-tier design sketch — for the inner-codex pair only. Finding (b)
-GATES G2. STATUS: COMPLETED (commit 7d24295) — the gate FIRED against the
-original typed-field position 4 (both families carry the id only in spawn
-stdout; zero typed session fields across 16,158 real tool-result
-records), and G2 was re-planned to spawn-correlated result parsing.
-Claude wire spelling: snake_case `session_id` inside the spawn result's
-JSON output text.
+GATES G2. STATUS: COMPLETED (commit 7d24295) — the gate FIRED TWICE:
+first against the original typed-field position 4 (zero typed session
+fields across 16,158 real tool-result records), then against the
+spawn-correlated re-plan (both families carry the id only in spawn
+stdout, which the codex wrapper backgrounds and log-redirects and the
+claude wrapper truncates — neither real pair would have been admitted).
+Final user-confirmed G2: positions 1-3 only; spawn-child linking
+DEFERRED to a future increment designed from `inner-codex-notes.md`.
+Pinned for that future work: Claude wire spelling is snake_case
+`session_id` inside the spawn result's JSON output text.
 
 ## Task 1 — G2: typed lineage evidence grammar
 
 Expected files: `src/provider/claude_facts.rs` (transient command-grammar
-parsing with the privacy carve-in; spawn-correlated result parsing —
-tool-use/tool-result pairing plus per-CLI output-grammar extraction;
-extractor stops raw-line scanning), `src/provider/codex_facts.rs` (same
+parsing with the privacy carve-in; extractor stops raw-line scanning),
+`src/provider/codex_facts.rs` (same
 restriction on its raw scan; structural `sub_agent_activity.agent_thread_id`
 retained), `src/provider/facts.rs` (unconditionally: the `LogFact::EvidenceId`
 doc comment describes the retired over-emitting behavior and must change;
@@ -42,49 +45,46 @@ scanner semantics stay a pure tokenizer), `src/provider/lane.rs` (only if
 evidence admission call sites need signature changes),
 `docs/design/herdr-top-mvp.md` (lineage paragraph),
 `docs/guides/controller-emit-setup.md` (evidence description),
-`docs/adr/2026-08-24-provider-log-allowlist.md` (read list + never-read
-section amended with the bounded carve-in — spec G2b'), `README.md` (the
+`docs/adr/2026-08-24-provider-log-allowlist.md` (read list, never-read
+section, AND the "Pattern-extraction-only carve-ins" section: carve-in 1
+— the license for the retired raw scan — is rewritten to the narrowed
+command-text-only grammar and the "exactly three" count adjusted — spec
+G2b'), `README.md` (the
 "quoted report" lineage sentence), `tests/fixtures/provider-logs/MANIFEST.md`
 (read-list mirror), `tests/provider_claude.rs`, `tests/provider_codex.rs`,
 new fixtures under `tests/fixtures/provider-logs/` /
-`tests/fixtures/provider/` — including position-4 fixtures built from the
-REAL shapes Task 0 recorded: a spawn tool use (`claude -p
---output-format json`) with its paired result whose stdout JSON carries
-`session_id` (admits), and a NON-spawn tool use whose result stdout
-contains unrelated UUIDs (does not admit), so the pair pins both sides
-of the correlation rule.
+`tests/fixtures/provider/`. No spawn-result parsing and no tool-use/
+tool-result correlation state anywhere: all admitted command evidence
+(resume ids, config-dir markers) is same-line, so the stateless
+single-line extraction in `claude_facts.rs` suffices unchanged in shape.
 
 1. VERIFY: enumerate the raw-scan call sites (`claude_facts.rs` pre-parse
    scan; `codex_facts.rs` scan) and the FIVE filename-parsing production
    users of `scan_raw_ids` that must remain untouched (lane.rs ×4,
    collector.rs ×1). Enumerate the tests pinning current evidence (incl.
-   `config_dir_evidence_is_preserved_from_bash_raw_line` and the privacy
-   test `bash_without_description_uses_bare_tool_name`) and the fixture
-   line shapes.
-2. Implement the closed grammar (spec G2a positions 1-4): meta.json
+   `config_dir_evidence_is_preserved_from_bash_raw_line` and the three
+   privacy tests `bash_without_description_uses_bare_tool_name`,
+   `user_record_debug_excludes_message_and_tool_result_bodies`,
+   `tool_use_result_debug_excludes_non_allowlisted_body_fields`) and the
+   fixture line shapes.
+2. Implement the closed grammar (spec G2a positions 1-3): meta.json
    (unchanged); command grammar parsed TRANSIENTLY from the tool-use
    `command` (codex exec resume <uuid> / claude --resume <uuid>, optional
-   `CLAUDE_CONFIG_DIR=` prefix) under the privacy carve-in (spec G2b');
-   position 4 SPAWN-CORRELATED RESULT PARSING: when the command matches
-   the spawn grammar (`codex exec` without resume; `claude -p`), the
-   structurally paired tool result's output is parsed with that CLI's
-   known output grammar — `claude -p --output-format json` → JSON-parse,
-   take top-level snake_case `session_id` (wire spelling pinned by
-   Task 0); `codex exec` → pin the exact id-carrying output pattern at
-   VERIFY from real transcripts (Task 0 confirmed presence in stdout);
-   unrecognized shape → no evidence. Pairing uses the transcript's
-   tool-use linkage (VERIFY how tool results reference their tool use in
-   the real schema — tool_use_id or positional — and pin it). Codex
+   `CLAUDE_CONFIG_DIR=` prefix) under the privacy carve-in (spec G2b'),
+   recognizing shell invocations, not substrings (a quoted/printed
+   `codex exec resume ...` must not arm); codex
    structural child refs unchanged. General free-text scanning of record
-   bodies is removed from evidence production.
+   bodies is removed from evidence production. No spawn grammar and no
+   result parsing (deferred increment).
 3. Retarget `config_dir_evidence_is_preserved_from_bash_raw_line` to the
-   command grammar; update both docs in the same commit.
+   command grammar; update the ADR (carve-in 1 rewrite included), both
+   guides, README, and MANIFEST in the same commit; preserve all three
+   privacy tests unretargeted.
 4. Tests (red first): pasted-UUID fixture (directory-listing text inside a
-   tool-result body) yields NO admission; spawn-command fixture yields
-   admission; resume-invocation fixture yields admission; codex structural
-   ref yields admission; POSITION-4 pair on ONE record — the typed
-   tool-result `session_id` admits while unrelated UUIDs in the same
-   record's free text do not; END-TO-END admission test that starts from
+   tool-result body) yields NO admission; quoted resume-lookalike inside a
+   non-invocation command yields NO admission; resume-invocation fixture
+   yields admission; config-dir fixture yields admission; codex structural
+   ref yields admission; END-TO-END admission test that starts from
    only the pane root admitted (no hand pre-admission — the existing
    helpers pre-admit children and cannot prove production behavior).
 
@@ -239,11 +239,15 @@ line and metric-columns section).
 
 ## Risks
 
-- G2 retires quoted-report free-text evidence (product decision, spec
-  G2b): what is lost is only lineage existing nowhere except prose; Task 0
-  verifies both wrapper families link via typed positions (commands for
-  inner codex, tool-result `session_id` for headless Claude) before
-  Task 1 starts.
+- G2 retires quoted-report free-text evidence with NO replacement linking
+  mechanism this increment (user-confirmed product decision, spec G2b):
+  nothing that renders correctly today is lost (Task 0 showed neither
+  spawn-child family links via the retired scan's real channels), but the
+  deferred spawn-child linking increment is now a known display gap for
+  wrapper children lacking meta.json/structural evidence. The
+  resume-grammar's substring-arming risk is bounded by requiring shell
+  invocations and by the existing exact-match-to-discovered-artifact
+  admission filter.
 - G1a threads timestamps into three fact types — signature changes ripple
   through lane/collector/claude_facts; the declared sets cover them, and
   the epoch-0 guard pins the worst failure mode.
