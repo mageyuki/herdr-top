@@ -50,23 +50,23 @@ scope, and the footer keeps the primary controls visible.
 
 ```text
 ┌ Herdr Top ─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│host:devbox | session:default | up:00:17:42 | workspaces:2 | LIVE | lag:12ms | sources:herdr=available;controller=avail…│
+│host:devbox | session:default | up:00:17:42 | workspaces:2 | LIVE | lag:12ms | sources:herdr=available;ctl=avail…       │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Execution tree ────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │  Session: default                                                                                                      │
 │  ├── Workspace: api                                                                                                    │
 │  │   └── Tab: implementation                                                                                           │
 │  │       ├── Pane: w1:p1 (controller)                                                                                  │
-│  │       │   └── ● Claude controller — tool_use: Agent · 17m03s                        fable-5  high  8400 8.2/s 17m03s│
-│  │       │       └── ● Codex — running command · 03m14s                            gpt-5.6-sol xhigh  2140  11/s 03m14s│
+│  │       │   └── ● Claude controller — tool_use: Agent                                 fable-5  high  8400 8.2/s 17m03s│
+│  │       │       └── ● Codex — running command                                     gpt-5.6-sol xhigh  2140  11/s 03m14s│
 │  │       ├── Pane: w1:p2 (review)                                                                                      │
-│  │       │   └── ⚠ Claude Review failures — tool_use: Bash · 08m01s                 sonnet-4-5  high   920 1.9/s 08m01s│
+│  │       │   └── ⚠ Claude Review failures — tool_use: Bash                          sonnet-4-5  high   920 1.9/s 08m01s│
 │  │       └── Pane: w1:p3 (tests)                                                                                       │
-│  │           └── ✓ Codex Run unit tests · 02m48s                                   gpt-5.6-sol xhigh  1975  12/s 02m48s│
+│  │           └── ✓ Codex Run unit tests                                            gpt-5.6-sol xhigh  1975  12/s 02m48s│
 │  ├── Workspace: docs                                                                                                   │
 │  │   └── Tab: review                                                                                                   │
 │  │       └── Pane: w2:p1                                                                                               │
-│  │           └── ◌ Claude Draft guide outline · 00m42s                               haiku-4-5   low   310 7.4/s 00m42s│
+│  │           └── ◌ Claude Draft guide outline                                        haiku-4-5   low   310 7.4/s 00m42s│
 │  └── Unattached Task Runs                                                                                              │
 │      └── ◌ Codex orphan-session [unlinked]                                         gpt-5.6-sol  high     —     —      —│
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
