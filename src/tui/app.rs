@@ -522,6 +522,7 @@ impl AppState {
 fn default_diagnostics() -> RuntimeDiagnosticsSnapshot {
     RuntimeDiagnosticsSnapshot {
         persistence: PersistenceStatus::Healthy,
+        persistence_detail: None,
         controller_input: ControllerInputStatus::Unavailable {
             reason: crate::diagnostics::ControllerInputUnavailableReason::ListenerUnavailable,
         },
@@ -2091,6 +2092,7 @@ mod tests {
     fn healthy_diagnostics() -> RuntimeDiagnosticsSnapshot {
         RuntimeDiagnosticsSnapshot {
             persistence: PersistenceStatus::Healthy,
+            persistence_detail: None,
             controller_input: ControllerInputStatus::Available,
             owner: OwnerFreshness::Current,
             persistence_counters: PersistenceCounters::default(),
@@ -2923,6 +2925,7 @@ mod tests {
                     durability: DurabilityDisposition::Committed,
                 },
             },
+            persistence_detail: None,
             controller_input: ControllerInputStatus::Unavailable {
                 reason: ControllerInputUnavailableReason::PersistenceUnavailable,
             },
@@ -2933,6 +2936,7 @@ mod tests {
                 committed_but_degraded_batches: 3,
                 skipped_batches: 4,
                 skipped_owner_updates: 5,
+                skipped_enqueues: 6,
             },
             controller_counters: ControllerCounterSnapshot {
                 binding_conflicts: 11,

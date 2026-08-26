@@ -13,6 +13,8 @@ use crate::lockfile::OwnerRecord;
 use super::{CleanupStats, LedgerEntry, PersistBatch, PersistOp, Store, StoreError};
 
 const WRITER_QUEUE_CAPACITY: usize = 256;
+/// Maximum UTF-8 byte length retained for a persistence error detail.
+pub const PERSISTENCE_DETAIL_MAX_BYTES: usize = 240;
 
 /// Persistence command whose failure determines writer health.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
@@ -77,6 +79,56 @@ pub enum PersistenceStatus {
     Degraded { failure: PersistenceFailure },
 }
 
+/// UTF-8 persistence detail capped to a fixed byte budget.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(transparent)]
+pub struct BoundedDetail(String);
+
+impl BoundedDetail {
+    /// Captures the longest valid UTF-8 prefix within the persistence detail budget.
+    #[must_use]
+    pub fn new(detail: impl Into<String>) -> Self {
+        let mut detail = detail.into();
+        if detail.len() > PERSISTENCE_DETAIL_MAX_BYTES {
+            let mut end = PERSISTENCE_DETAIL_MAX_BYTES;
+            while !detail.is_char_boundary(end) {
+                end -= 1;
+            }
+            detail.truncate(end);
+        }
+        Self(detail)
+    }
+
+    /// Returns the retained detail text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Current writer health and optional detail for the transition that produced it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistenceHealthSnapshot {
+    pub status: PersistenceStatus,
+    pub detail: Option<BoundedDetail>,
+}
+
+impl PersistenceHealthSnapshot {
+    const fn healthy() -> Self {
+        Self {
+            status: PersistenceStatus::Healthy,
+            detail: None,
+        }
+    }
+
+    fn degraded(failure: PersistenceFailure, detail: Option<BoundedDetail>) -> Self {
+        Self {
+            status: PersistenceStatus::Degraded { failure },
+            detail,
+        }
+    }
+}
+
 /// Errors produced by the dedicated SQLite writer.
 #[derive(Debug, Error)]
 pub enum WriterError {
@@ -123,30 +175,66 @@ pub struct WriterClient {
 
 #[derive(Clone)]
 struct PersistenceHealth {
-    sender: watch::Sender<PersistenceStatus>,
+    sender: watch::Sender<PersistenceHealthSnapshot>,
 }
 
 impl PersistenceHealth {
     fn new() -> Self {
-        let (sender, _receiver) = watch::channel(PersistenceStatus::Healthy);
+        let (sender, _receiver) = watch::channel(PersistenceHealthSnapshot::healthy());
         Self { sender }
     }
 
     fn status(&self) -> PersistenceStatus {
-        *self.sender.borrow()
+        self.sender.borrow().status
     }
 
-    fn subscribe(&self) -> watch::Receiver<PersistenceStatus> {
+    #[cfg(test)]
+    fn snapshot(&self) -> PersistenceHealthSnapshot {
+        self.sender.borrow().clone()
+    }
+
+    fn subscribe(&self) -> watch::Receiver<PersistenceHealthSnapshot> {
         self.sender.subscribe()
     }
 
     fn publish_failure(&self, failure: PersistenceFailure) {
-        self.sender.send_if_modified(|status| match status {
-            PersistenceStatus::Healthy => {
-                *status = PersistenceStatus::Degraded { failure };
-                true
+        self.publish_failure_with_detail(failure, None);
+    }
+
+    fn publish_failure_with_detail(
+        &self,
+        failure: PersistenceFailure,
+        detail: Option<BoundedDetail>,
+    ) {
+        self.sender
+            .send_if_modified(|snapshot| match snapshot.status {
+                PersistenceStatus::Healthy => {
+                    *snapshot = PersistenceHealthSnapshot::degraded(failure, detail);
+                    true
+                }
+                PersistenceStatus::Degraded { .. } => false,
+            });
+    }
+
+    fn publish_probe_failure(&self, detail: BoundedDetail) {
+        self.sender.send_if_modified(|snapshot| {
+            if !matches!(snapshot.status, PersistenceStatus::Degraded { .. })
+                || snapshot.detail.as_ref() == Some(&detail)
+            {
+                return false;
             }
-            PersistenceStatus::Degraded { .. } => false,
+            snapshot.detail = Some(detail);
+            true
+        });
+    }
+
+    fn publish_recovery(&self) {
+        self.sender.send_if_modified(|snapshot| {
+            if matches!(snapshot.status, PersistenceStatus::Healthy) {
+                return false;
+            }
+            *snapshot = PersistenceHealthSnapshot::healthy();
+            true
         });
     }
 
@@ -506,7 +594,7 @@ pub struct PendingEnqueue {
 struct AcknowledgementWaiter<T> {
     response: oneshot::Receiver<Result<T, PersistenceFailure>>,
     health_publisher: PersistenceHealth,
-    health: watch::Receiver<PersistenceStatus>,
+    health: watch::Receiver<PersistenceHealthSnapshot>,
     operation: PersistenceOperation,
     acknowledgement_observation: Option<AcknowledgementObservationGuard>,
     #[cfg(test)]
@@ -587,7 +675,7 @@ impl<T> AcknowledgementWaiter<T> {
         self.disarm();
         self.health_publisher
             .publish_failure(acknowledgement_failure(self.operation));
-        let failure = match *self.health.borrow() {
+        let failure = match self.health.borrow().status {
             PersistenceStatus::Healthy => acknowledgement_failure(self.operation),
             PersistenceStatus::Degraded { failure } => failure,
         };
@@ -603,7 +691,7 @@ impl<T> AcknowledgementWaiter<T> {
                 Err(oneshot::error::TryRecvError::Empty) => {}
             }
 
-            let status = *self.health.borrow();
+            let status = self.health.borrow().status;
             if let PersistenceStatus::Degraded { failure } = status {
                 return self.classify_failure(failure);
             }
@@ -626,7 +714,6 @@ impl<T> AcknowledgementWaiter<T> {
     }
 
     async fn wait_response_only(mut self) -> Result<T, WriterError> {
-        debug_assert_eq!(self.operation, PersistenceOperation::Checkpoint);
         match (&mut self.response).await {
             Ok(result) => self.classify_result(result),
             Err(_) => {
@@ -673,7 +760,7 @@ impl WriterClient {
 
     /// Subscribes to persistence health without exposing mutation or command capability.
     #[must_use]
-    pub fn subscribe_persistence(&self) -> watch::Receiver<PersistenceStatus> {
+    pub fn subscribe_persistence(&self) -> watch::Receiver<PersistenceHealthSnapshot> {
         self.health.subscribe()
     }
 
@@ -828,6 +915,22 @@ impl WriterClient {
             WriterCommand::Barrier { acknowledgement }
         })
         .await
+    }
+
+    pub(crate) async fn probe(&self) -> Result<(), WriterError> {
+        let operation = PersistenceOperation::ReplaceOwner;
+        let (acknowledgement, response) = oneshot::channel();
+        let mut waiter = self.waiter(response, operation);
+        if self
+            .sender
+            .send(WriterCommand::Probe { acknowledgement })
+            .await
+            .is_err()
+        {
+            return Err(self.health.runtime_error(queue_failure(operation)));
+        }
+        waiter.arm();
+        waiter.wait_response_only().await
     }
 
     async fn request(
@@ -1054,6 +1157,9 @@ enum WriterCommand {
     Barrier {
         acknowledgement: oneshot::Sender<Result<(), PersistenceFailure>>,
     },
+    Probe {
+        acknowledgement: oneshot::Sender<Result<(), PersistenceFailure>>,
+    },
     Shutdown {
         acknowledgement: oneshot::Sender<Result<(), PersistenceFailure>>,
     },
@@ -1098,7 +1204,7 @@ fn writer_main(
                         &error,
                     )),
                 };
-                publish_result_failure(&result, &health);
+                let result = publish_store_result(result, &health);
                 #[cfg(test)]
                 if let Some(control) = &acknowledgement_test_control
                     && control.before_acknowledgement(PersistenceOperation::Apply, result.is_err())
@@ -1137,7 +1243,7 @@ fn writer_main(
                             &error,
                         )
                     });
-                publish_result_failure(&result, &health);
+                let result = publish_store_result(result, &health);
                 #[cfg(test)]
                 if let Some(control) = &acknowledgement_test_control
                     && control
@@ -1179,7 +1285,7 @@ fn writer_main(
                             &error,
                         )
                     });
-                publish_result_failure(&result, &health);
+                let result = publish_store_result(result, &health);
                 #[cfg(test)]
                 if let Some(control) = &acknowledgement_test_control
                     && control.before_acknowledgement(
@@ -1218,7 +1324,7 @@ fn writer_main(
                         &error,
                     )
                 });
-                publish_result_failure(&result, &health);
+                let result = publish_store_result(result, &health);
                 #[cfg(test)]
                 if let Some(control) = &acknowledgement_test_control
                     && control
@@ -1252,6 +1358,31 @@ fn writer_main(
                     control.acknowledgement_attempted(PersistenceOperation::Barrier);
                 }
             }
+            WriterCommand::Probe { acknowledgement } => {
+                let result = store
+                    .read_owner()
+                    .and_then(|owner| owner.ok_or(StoreError::OwnerAbsent))
+                    .and_then(|owner| store.replace_owner(&owner))
+                    .map_err(|error| {
+                        store_failure(
+                            PersistenceOperation::ReplaceOwner,
+                            PersistencePhase::CommandExecution,
+                            DurabilityDisposition::NotCommitted,
+                            &error,
+                        )
+                    });
+                let result = match result {
+                    Ok(()) => {
+                        health.publish_recovery();
+                        Ok(())
+                    }
+                    Err(store_failure) => {
+                        health.publish_probe_failure(store_failure.detail);
+                        Err(store_failure.failure)
+                    }
+                };
+                let _ = acknowledgement.send(result);
+            }
             WriterCommand::Shutdown { acknowledgement } => {
                 #[cfg(test)]
                 if let Some(control) = &acknowledgement_test_control {
@@ -1268,7 +1399,7 @@ fn writer_main(
                         &error,
                     )
                 });
-                publish_result_failure(&result, &health);
+                let result = publish_store_result(result, &health);
                 #[cfg(test)]
                 if let Some(control) = &acknowledgement_test_control
                     && control
@@ -1291,10 +1422,15 @@ fn writer_main(
     }
 }
 
-fn publish_result_failure<T>(result: &Result<T, PersistenceFailure>, health: &PersistenceHealth) {
-    if let Err(failure) = result {
-        health.publish_failure(*failure);
-    }
+fn publish_store_result<T>(
+    result: Result<T, StoreFailure>,
+    health: &PersistenceHealth,
+) -> Result<T, PersistenceFailure> {
+    result.map_err(|store_failure| {
+        health
+            .publish_failure_with_detail(store_failure.failure, Some(store_failure.detail.clone()));
+        store_failure.failure
+    })
 }
 
 const fn persistence_failure(
@@ -1316,8 +1452,16 @@ fn store_failure(
     phase: PersistencePhase,
     durability: DurabilityDisposition,
     error: &StoreError,
-) -> PersistenceFailure {
-    persistence_failure(operation, phase, classify_store_error(error), durability)
+) -> StoreFailure {
+    StoreFailure {
+        failure: persistence_failure(operation, phase, classify_store_error(error), durability),
+        detail: BoundedDetail::new(error.to_string()),
+    }
+}
+
+struct StoreFailure {
+    failure: PersistenceFailure,
+    detail: BoundedDetail,
 }
 
 const fn queue_failure(operation: PersistenceOperation) -> PersistenceFailure {
@@ -1514,6 +1658,39 @@ mod tests {
             .unwrap();
     }
 
+    fn install_failure_trigger(store: &Store, name: &str, action: &str, table: &str) {
+        store
+            .connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER {name} BEFORE {action} ON {table} \
+                 BEGIN SELECT RAISE(ABORT, 'injected probe failure'); END;"
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn i4_writer_store_failure_detail_is_utf8_bounded_and_synthesized_failures_have_none() {
+        let raw = format!("clock detail {}", "界".repeat(100));
+        let error = StoreError::Clock(raw);
+        let displayed = error.to_string();
+        let captured = store_failure(
+            PersistenceOperation::Apply,
+            PersistencePhase::CommandExecution,
+            DurabilityDisposition::NotCommitted,
+            &error,
+        );
+
+        assert_eq!(captured.failure.code, PersistenceFailureCode::Clock);
+        let detail = &captured.detail;
+        assert!(detail.as_str().len() <= PERSISTENCE_DETAIL_MAX_BYTES);
+        assert!(displayed.starts_with(detail.as_str()));
+        assert!(std::str::from_utf8(detail.as_str().as_bytes()).is_ok());
+
+        let health = PersistenceHealth::new();
+        health.publish_failure(queue_failure(PersistenceOperation::Apply));
+        assert_eq!(health.snapshot().detail, None);
+    }
+
     fn event_with_ingest_sequence(event_id: &str, seen_at_ms: i64, ingest_seq: u64) -> PersistOp {
         let mut operation = provider_event(event_id, seen_at_ms);
         let PersistOp::RecordEvent { event, .. } = &mut operation else {
@@ -1576,7 +1753,7 @@ mod tests {
 
         assert_eq!(writer.persistence_status(), PersistenceStatus::Healthy);
         let subscription = writer.subscribe_persistence();
-        assert_eq!(*subscription.borrow(), PersistenceStatus::Healthy);
+        assert_eq!(subscription.borrow().status, PersistenceStatus::Healthy);
         assert!(!subscription.has_changed().unwrap());
 
         lifecycle.shutdown().await.unwrap();
@@ -1678,16 +1855,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn i4_writer_first_failure_is_sticky_and_watch_wakes_exactly_once() {
+    async fn i4_writer_first_failure_is_sticky_until_probe_and_each_recovery_wakes_once() {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
-        let store = open_writer(&root).unwrap();
-        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let mut store = open_writer(&root).unwrap();
+        store.replace_owner(&owner_record()).unwrap();
+        install_failure_trigger(&store, "fail_owner_update", "UPDATE", "owner");
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
         let mut subscription = writer.subscribe_persistence();
         let first = expected_failure(
             PersistenceOperation::UpdateOwnerLocation,
             PersistencePhase::CommandExecution,
-            PersistenceFailureCode::OwnerAbsent,
+            PersistenceFailureCode::Sqlite,
             DurabilityDisposition::NotCommitted,
         );
 
@@ -1697,28 +1876,102 @@ mod tests {
         );
         subscription.changed().await.unwrap();
         assert_eq!(
-            *subscription.borrow_and_update(),
-            PersistenceStatus::Degraded { failure: first }
-        );
-        assert!(writer.reserve_enqueue().is_none());
-
-        lifecycle.shutdown().await.unwrap();
-        let later = expected_failure(
-            PersistenceOperation::Barrier,
-            PersistencePhase::QueueAdmission,
-            PersistenceFailureCode::ChannelClosed,
-            DurabilityDisposition::NotApplicable,
-        );
-        assert_persistence_error(writer.barrier().await, later);
-        assert_eq!(
-            writer.persistence_status(),
+            subscription.borrow_and_update().status,
             PersistenceStatus::Degraded { failure: first }
         );
         assert!(
             tokio::time::timeout(Duration::from_millis(50), subscription.changed())
                 .await
-                .is_err()
+                .is_err(),
+            "degradation must not recover without a probe"
         );
+
+        rusqlite::Connection::open(super::super::database_path(&root))
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_owner_update;")
+            .unwrap();
+        writer.probe().await.unwrap();
+        subscription.changed().await.unwrap();
+        assert_eq!(
+            subscription.borrow_and_update().status,
+            PersistenceStatus::Healthy
+        );
+        writer.probe().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), subscription.changed())
+                .await
+                .is_err(),
+            "a successful probe while healthy must not publish another transition"
+        );
+
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn i4_writer_failed_probe_returns_failure_without_publishing_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        store.replace_owner(&owner_record()).unwrap();
+        install_failure_trigger(&store, "fail_owner_probe", "UPDATE", "owner");
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut subscription = writer.subscribe_persistence();
+        let expected = expected_failure(
+            PersistenceOperation::UpdateOwnerLocation,
+            PersistencePhase::CommandExecution,
+            PersistenceFailureCode::Sqlite,
+            DurabilityDisposition::NotCommitted,
+        );
+
+        assert_persistence_error(
+            writer.update_owner_location("terminal", "pane").await,
+            expected,
+        );
+        subscription.changed().await.unwrap();
+        let _ = subscription.borrow_and_update();
+        rusqlite::Connection::open(super::super::database_path(&root))
+            .unwrap()
+            .execute_batch(
+                "DROP TRIGGER fail_owner_probe; \
+                 CREATE TRIGGER fail_owner_probe_refresh BEFORE UPDATE ON owner \
+                 BEGIN SELECT RAISE(ABORT, 'refreshed probe failure'); END;",
+            )
+            .unwrap();
+        assert_persistence_error(
+            writer.probe().await,
+            expected_failure(
+                PersistenceOperation::ReplaceOwner,
+                PersistencePhase::CommandExecution,
+                PersistenceFailureCode::Sqlite,
+                DurabilityDisposition::NotCommitted,
+            ),
+        );
+        subscription.changed().await.unwrap();
+        let health = subscription.borrow_and_update().clone();
+        assert_eq!(
+            health.status,
+            PersistenceStatus::Degraded { failure: expected }
+        );
+        assert!(
+            health
+                .detail
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .contains("refreshed probe failure")
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), subscription.changed())
+                .await
+                .is_err(),
+            "a failed probe must not publish recovery after refreshing detail"
+        );
+
+        rusqlite::Connection::open(super::super::database_path(&root))
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_owner_probe_refresh;")
+            .unwrap();
+        lifecycle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1894,7 +2147,7 @@ mod tests {
             DurabilityDisposition::Unknown,
         );
         assert_eq!(
-            *subscription.borrow_and_update(),
+            subscription.borrow_and_update().status,
             PersistenceStatus::Degraded { failure: expected }
         );
         assert!(writer.is_duplicate("late-unread"));
@@ -1971,7 +2224,7 @@ mod tests {
             .expect("owner unwind must publish acknowledgement failure")
             .unwrap();
         assert_eq!(
-            *health.borrow_and_update(),
+            health.borrow_and_update().status,
             PersistenceStatus::Degraded { failure: expected }
         );
         assert!(
@@ -2364,7 +2617,7 @@ mod tests {
             .unwrap();
         let expected = acknowledgement_failure(PersistenceOperation::Apply);
         assert_eq!(
-            *health.borrow_and_update(),
+            health.borrow_and_update().status,
             PersistenceStatus::Degraded { failure: expected }
         );
         assert_persistence_error(pending_result, expected);
@@ -2408,7 +2661,7 @@ mod tests {
         let expected = acknowledgement_failure(PersistenceOperation::Apply);
         assert_persistence_error(result, expected);
         assert_eq!(
-            *health.borrow_and_update(),
+            health.borrow_and_update().status,
             PersistenceStatus::Degraded { failure: expected }
         );
         assert!(matches!(

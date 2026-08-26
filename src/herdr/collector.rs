@@ -53,8 +53,8 @@ use crate::provider::{
 };
 use crate::reducer::{ApplyOutcome, CommitStagedError, Reducer, ReducerError};
 use crate::store::writer::{
-    DurabilityDisposition, PendingEnqueue, PersistenceFailure, PersistenceStatus, WriterClient,
-    WriterError,
+    BoundedDetail, DurabilityDisposition, PendingEnqueue, PersistenceFailure,
+    PersistenceHealthSnapshot, PersistenceStatus, WriterClient, WriterError,
 };
 use crate::store::{CollectorGap, PersistBatch, PersistOp, RestoredState};
 
@@ -73,6 +73,7 @@ const DRAIN_QUIET_PERIOD: Duration = Duration::from_millis(5);
 const STALE_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const PERFORMANCE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
+const PERSISTENCE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LivenessPolicy {
@@ -497,9 +498,32 @@ impl PersistenceOccurrenceSink for UnavailableOccurrenceSink {
     }
 }
 
+struct PersistenceRecovery {
+    retry_interval: Duration,
+    next_probe_at: Option<Instant>,
+    acceptor_stop_pending: bool,
+    marker_pending: bool,
+}
+
+impl PersistenceRecovery {
+    fn new(retry_interval: Duration) -> Self {
+        Self {
+            retry_interval,
+            next_probe_at: None,
+            acceptor_stop_pending: false,
+            marker_pending: false,
+        }
+    }
+
+    fn arm_cooldown(&mut self) {
+        self.next_probe_at = Some(Instant::now() + self.retry_interval);
+    }
+}
+
 pub(crate) struct RuntimePersistence {
     writer: WriterClient,
-    writer_health: watch::Receiver<PersistenceStatus>,
+    session: String,
+    writer_health: watch::Receiver<PersistenceHealthSnapshot>,
     snapshot: RuntimeDiagnosticsSnapshot,
     publisher: watch::Sender<RuntimeDiagnosticsSnapshot>,
     occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
@@ -507,16 +531,37 @@ pub(crate) struct RuntimePersistence {
     acceptor_diagnostics: ControllerDiagnosticsHandle,
     enrichment_diagnostics: EnrichmentDiagnosticsHandle,
     provider_diagnostics: ProviderDiagnosticsHandle,
+    recovery: PersistenceRecovery,
 }
 
 impl RuntimePersistence {
     fn new(
         writer: WriterClient,
+        session: &str,
         model: &DomainModel,
         coverage: &SourceCoverageRegistry,
         occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
     ) -> (Self, watch::Receiver<RuntimeDiagnosticsSnapshot>) {
+        Self::new_with_retry_interval(
+            writer,
+            session,
+            model,
+            coverage,
+            occurrence_sink,
+            PERSISTENCE_RETRY_INTERVAL,
+        )
+    }
+
+    fn new_with_retry_interval(
+        writer: WriterClient,
+        session: &str,
+        model: &DomainModel,
+        coverage: &SourceCoverageRegistry,
+        occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
+        retry_interval: Duration,
+    ) -> (Self, watch::Receiver<RuntimeDiagnosticsSnapshot>) {
         let writer_health = writer.subscribe_persistence();
+        let initial_health = writer_health.borrow().clone();
         let controller_input =
             controller_input_from_coverage(coverage.state(CoverageSource::Controller));
         let controller_counters = controller_counter_snapshot(model);
@@ -524,7 +569,8 @@ impl RuntimePersistence {
         let enrichment_diagnostics = EnrichmentDiagnosticsHandle::default();
         let provider_diagnostics = model.provider_diagnostics().handle();
         let snapshot = RuntimeDiagnosticsSnapshot {
-            persistence: writer.persistence_status(),
+            persistence: initial_health.status,
+            persistence_detail: initial_health.detail,
             controller_input,
             owner: OwnerFreshness::Current,
             persistence_counters: PersistenceCounters::default(),
@@ -538,6 +584,7 @@ impl RuntimePersistence {
         let (publisher, diagnostics) = watch::channel(snapshot.clone());
         let mut persistence = Self {
             writer,
+            session: session.to_owned(),
             writer_health,
             snapshot,
             publisher,
@@ -546,6 +593,7 @@ impl RuntimePersistence {
             acceptor_diagnostics,
             enrichment_diagnostics,
             provider_diagnostics,
+            recovery: PersistenceRecovery::new(retry_interval),
         };
         persistence.refresh_pane_coverage(model);
         persistence.publish();
@@ -559,9 +607,26 @@ impl RuntimePersistence {
     ) -> (Self, watch::Receiver<RuntimeDiagnosticsSnapshot>) {
         Self::new(
             writer,
+            "test",
             &DomainModel::default(),
             &SourceCoverageRegistry::new(SourceAvailability::Available),
             occurrence_sink,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_for_test_with_retry_interval(
+        writer: WriterClient,
+        occurrence_sink: Arc<dyn PersistenceOccurrenceSink>,
+        retry_interval: Duration,
+    ) -> (Self, watch::Receiver<RuntimeDiagnosticsSnapshot>) {
+        Self::new_with_retry_interval(
+            writer,
+            "test",
+            &DomainModel::default(),
+            &SourceCoverageRegistry::new(SourceAvailability::Available),
+            occurrence_sink,
+            retry_interval,
         )
     }
 
@@ -580,6 +645,12 @@ impl RuntimePersistence {
     pub(crate) fn reserve_enqueue(&mut self) -> Option<crate::store::EnqueuePermit<'_>> {
         self.observe_writer_health();
         if self.snapshot.persistence != PersistenceStatus::Healthy {
+            self.snapshot.persistence_counters.skipped_enqueues = self
+                .snapshot
+                .persistence_counters
+                .skipped_enqueues
+                .saturating_add(1);
+            self.publish();
             return None;
         }
 
@@ -593,14 +664,14 @@ impl RuntimePersistence {
             acceptor_diagnostics,
             enrichment_diagnostics,
             provider_diagnostics,
+            recovery,
+            session: _,
         } = self;
         let permit = writer.reserve_enqueue();
-        let status = {
-            let status = writer_health.borrow();
-            *status
-        };
+        let health = writer_health.borrow().clone();
         Self::ingest_writer_status(
-            status,
+            health.status,
+            health.detail,
             snapshot,
             publisher,
             occurrence_sink.as_ref(),
@@ -608,8 +679,22 @@ impl RuntimePersistence {
             acceptor_diagnostics,
             enrichment_diagnostics,
             provider_diagnostics,
+            recovery,
         );
-        match status {
+        if permit.is_none() || !matches!(health.status, PersistenceStatus::Healthy) {
+            snapshot.persistence_counters.skipped_enqueues = snapshot
+                .persistence_counters
+                .skipped_enqueues
+                .saturating_add(1);
+            Self::publish_facade(
+                snapshot,
+                publisher,
+                acceptor_diagnostics,
+                enrichment_diagnostics,
+                provider_diagnostics,
+            );
+        }
+        match health.status {
             PersistenceStatus::Healthy => permit,
             PersistenceStatus::Degraded { .. } => {
                 drop(permit);
@@ -627,7 +712,10 @@ impl RuntimePersistence {
     }
 
     async fn apply(&mut self, batch: PersistBatch) -> Result<RuntimeWriteOutcome, WriterError> {
-        if self.skip_if_degraded(RuntimeCommandClass::Batch) {
+        if self
+            .skip_async_if_degraded(RuntimeCommandClass::Batch)
+            .await
+        {
             return Ok(RuntimeWriteOutcome::Skipped);
         }
         let result = self.writer.apply(batch).await;
@@ -635,7 +723,10 @@ impl RuntimePersistence {
     }
 
     async fn cleanup(&mut self, now_ms: i64) -> Result<RuntimeWriteOutcome, WriterError> {
-        if self.skip_if_degraded(RuntimeCommandClass::Batch) {
+        if self
+            .skip_async_if_degraded(RuntimeCommandClass::Batch)
+            .await
+        {
             return Ok(RuntimeWriteOutcome::Skipped);
         }
         let result = self.writer.cleanup(now_ms).await.map(|_| ());
@@ -674,6 +765,35 @@ impl RuntimePersistence {
         if self.snapshot.persistence == PersistenceStatus::Healthy {
             return false;
         }
+        self.record_skip(class);
+        true
+    }
+
+    async fn skip_async_if_degraded(&mut self, class: RuntimeCommandClass) -> bool {
+        self.observe_writer_health();
+        if self.snapshot.persistence == PersistenceStatus::Healthy {
+            return false;
+        }
+        self.drive_probe_if_due().await;
+        self.record_skip(class);
+        true
+    }
+
+    async fn drive_probe_if_due(&mut self) {
+        let Some(next_probe_at) = self.recovery.next_probe_at else {
+            return;
+        };
+        if Instant::now() < next_probe_at {
+            return;
+        }
+        let failed = self.writer.probe().await.is_err();
+        self.observe_writer_health();
+        if failed && !matches!(self.snapshot.persistence, PersistenceStatus::Healthy) {
+            self.recovery.arm_cooldown();
+        }
+    }
+
+    fn record_skip(&mut self, class: RuntimeCommandClass) {
         match class {
             RuntimeCommandClass::Batch => {
                 self.snapshot.persistence_counters.skipped_batches = self
@@ -692,14 +812,10 @@ impl RuntimePersistence {
             }
         }
         self.publish();
-        true
     }
 
     fn observe_writer_health(&mut self) {
-        let status = {
-            let status = self.writer_health.borrow();
-            *status
-        };
+        let health = self.writer_health.borrow().clone();
         let Self {
             snapshot,
             publisher,
@@ -708,10 +824,12 @@ impl RuntimePersistence {
             acceptor_diagnostics,
             enrichment_diagnostics,
             provider_diagnostics,
+            recovery,
             ..
         } = self;
         Self::ingest_writer_status(
-            status,
+            health.status,
+            health.detail,
             snapshot,
             publisher,
             occurrence_sink.as_ref(),
@@ -719,6 +837,7 @@ impl RuntimePersistence {
             acceptor_diagnostics,
             enrichment_diagnostics,
             provider_diagnostics,
+            recovery,
         );
     }
 
@@ -727,6 +846,7 @@ impl RuntimePersistence {
     #[allow(clippy::too_many_arguments)]
     fn ingest_writer_status(
         status: PersistenceStatus,
+        detail: Option<BoundedDetail>,
         snapshot: &mut RuntimeDiagnosticsSnapshot,
         publisher: &watch::Sender<RuntimeDiagnosticsSnapshot>,
         occurrence_sink: &dyn PersistenceOccurrenceSink,
@@ -734,29 +854,81 @@ impl RuntimePersistence {
         acceptor_diagnostics: &ControllerDiagnosticsHandle,
         enrichment_diagnostics: &EnrichmentDiagnosticsHandle,
         provider_diagnostics: &ProviderDiagnosticsHandle,
+        recovery: &mut PersistenceRecovery,
     ) {
-        if snapshot.persistence != PersistenceStatus::Healthy {
-            return;
-        }
-        if let PersistenceStatus::Degraded { failure } = status {
-            let class = if failure.operation
-                == crate::store::writer::PersistenceOperation::UpdateOwnerLocation
-            {
-                RuntimeCommandClass::OwnerLocation
-            } else {
-                RuntimeCommandClass::Batch
-            };
-            let _ = Self::record_facade_failure(
-                failure,
-                class,
-                snapshot,
-                publisher,
-                occurrence_sink,
-                occurrence_attempted,
-                acceptor_diagnostics,
-                enrichment_diagnostics,
-                provider_diagnostics,
-            );
+        match (snapshot.persistence, status) {
+            (PersistenceStatus::Healthy, PersistenceStatus::Healthy) => {}
+            (PersistenceStatus::Healthy, PersistenceStatus::Degraded { failure }) => {
+                let class = if failure.operation
+                    == crate::store::writer::PersistenceOperation::UpdateOwnerLocation
+                {
+                    RuntimeCommandClass::OwnerLocation
+                } else {
+                    RuntimeCommandClass::Batch
+                };
+                let _ = Self::record_facade_failure(
+                    failure,
+                    detail,
+                    class,
+                    snapshot,
+                    publisher,
+                    occurrence_sink,
+                    occurrence_attempted,
+                    acceptor_diagnostics,
+                    enrichment_diagnostics,
+                    provider_diagnostics,
+                    recovery,
+                );
+            }
+            (PersistenceStatus::Degraded { .. }, PersistenceStatus::Degraded { .. }) => {
+                if snapshot.persistence_detail != detail {
+                    snapshot.persistence_detail = detail;
+                    Self::publish_facade(
+                        snapshot,
+                        publisher,
+                        acceptor_diagnostics,
+                        enrichment_diagnostics,
+                        provider_diagnostics,
+                    );
+                }
+            }
+            (PersistenceStatus::Degraded { .. }, PersistenceStatus::Healthy) => {
+                snapshot.persistence = PersistenceStatus::Healthy;
+                snapshot.persistence_detail = None;
+                snapshot.controller_input = if recovery.acceptor_stop_pending {
+                    ControllerInputStatus::Unavailable {
+                        reason: ControllerInputUnavailableReason::AcceptorStopped,
+                    }
+                } else if matches!(
+                    snapshot.controller_input,
+                    ControllerInputStatus::Unavailable {
+                        reason: ControllerInputUnavailableReason::PersistenceUnavailable,
+                    }
+                ) {
+                    ControllerInputStatus::Available
+                } else {
+                    snapshot.controller_input
+                };
+                if snapshot.controller_input == ControllerInputStatus::Available {
+                    set_controller_coverage_available(&mut snapshot.source_coverage);
+                } else {
+                    set_controller_coverage_unavailable(&mut snapshot.source_coverage);
+                }
+                recovery.acceptor_stop_pending = false;
+                recovery.next_probe_at = None;
+                recovery.marker_pending = true;
+                tracing::warn!(
+                    warning_code = "persistence_recovered",
+                    "Persistence recovered after a successful writer probe"
+                );
+                Self::publish_facade(
+                    snapshot,
+                    publisher,
+                    acceptor_diagnostics,
+                    enrichment_diagnostics,
+                    provider_diagnostics,
+                );
+            }
         }
     }
 
@@ -765,8 +937,15 @@ impl RuntimePersistence {
         failure: PersistenceFailure,
         class: RuntimeCommandClass,
     ) -> RuntimeWriteOutcome {
+        let detail = {
+            let health = self.writer_health.borrow();
+            (health.status == PersistenceStatus::Degraded { failure })
+                .then(|| health.detail.clone())
+                .flatten()
+        };
         Self::record_facade_failure(
             failure,
+            detail,
             class,
             &mut self.snapshot,
             &self.publisher,
@@ -775,12 +954,14 @@ impl RuntimePersistence {
             &self.acceptor_diagnostics,
             &self.enrichment_diagnostics,
             &self.provider_diagnostics,
+            &mut self.recovery,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     fn record_facade_failure(
         failure: PersistenceFailure,
+        detail: Option<BoundedDetail>,
         class: RuntimeCommandClass,
         snapshot: &mut RuntimeDiagnosticsSnapshot,
         publisher: &watch::Sender<RuntimeDiagnosticsSnapshot>,
@@ -789,6 +970,7 @@ impl RuntimePersistence {
         acceptor_diagnostics: &ControllerDiagnosticsHandle,
         enrichment_diagnostics: &EnrichmentDiagnosticsHandle,
         provider_diagnostics: &ProviderDiagnosticsHandle,
+        recovery: &mut PersistenceRecovery,
     ) -> RuntimeWriteOutcome {
         let outcome = match failure.durability {
             DurabilityDisposition::Committed => RuntimeWriteOutcome::CommittedButDegraded(failure),
@@ -802,9 +984,28 @@ impl RuntimePersistence {
         }
 
         snapshot.persistence = PersistenceStatus::Degraded { failure };
-        snapshot.controller_input = ControllerInputStatus::Unavailable {
-            reason: ControllerInputUnavailableReason::PersistenceUnavailable,
-        };
+        snapshot.persistence_detail = detail;
+        recovery.arm_cooldown();
+        tracing::warn!(
+            warning_code = "persistence_degraded",
+            ?failure,
+            "Persistence degraded; writes will be skipped until recovery"
+        );
+        if matches!(
+            snapshot.controller_input,
+            ControllerInputStatus::Unavailable {
+                reason: ControllerInputUnavailableReason::AcceptorStopped,
+            }
+        ) {
+            // The one-shot acceptor cannot recover with persistence, so its stop must survive.
+            recovery.acceptor_stop_pending = true;
+        } else if snapshot.controller_input == ControllerInputStatus::Available {
+            // Only pre-outage availability may become persistence-unavailable, so recovery can
+            // safely restore availability from this reason.
+            snapshot.controller_input = ControllerInputStatus::Unavailable {
+                reason: ControllerInputUnavailableReason::PersistenceUnavailable,
+            };
+        }
         set_controller_coverage_unavailable(&mut snapshot.source_coverage);
         match class {
             RuntimeCommandClass::OwnerLocation => {
@@ -837,6 +1038,7 @@ impl RuntimePersistence {
             let record = encode_persistence_occurrence(
                 unix_now_ms(),
                 failure,
+                snapshot.persistence_detail.clone(),
                 snapshot.persistence_counters,
             );
             snapshot.first_failure_log = if occurrence_sink.append(&record).is_ok() {
@@ -879,6 +1081,8 @@ impl RuntimePersistence {
             };
             set_controller_coverage_unavailable(&mut self.snapshot.source_coverage);
             self.publish();
+        } else {
+            self.recovery.acceptor_stop_pending = true;
         }
     }
 
@@ -978,7 +1182,34 @@ async fn persist_submission(
 ) -> Result<RuntimeWriteOutcome, WriterError> {
     let outcome = persistence.apply(batch).await?;
     reducer.complete_operator_submission(outcome);
+    persist_recovery_marker_if_pending(persistence, reducer).await?;
     Ok(outcome)
+}
+
+async fn persist_recovery_marker_if_pending(
+    persistence: &mut RuntimePersistence,
+    reducer: &mut Reducer,
+) -> Result<(), WriterError> {
+    if persistence.recovery.marker_pending {
+        persistence.recovery.marker_pending = false;
+        let marker = PersistOp::RecordCollectorGap(CollectorGap {
+            event_id: format!("collector-gap-{}", ulid::Ulid::new()),
+            herdr_session: persistence.session.clone(),
+            seen_at_ms: unix_now_ms(),
+            kind: GapKind::PersistenceOutage,
+        });
+        let marker_outcome = persistence.apply(vec![marker]).await?;
+        reducer.complete_operator_submission(marker_outcome);
+        if matches!(
+            marker_outcome,
+            RuntimeWriteOutcome::NotCommitted(_)
+                | RuntimeWriteOutcome::DurabilityUnknown(_)
+                | RuntimeWriteOutcome::Skipped
+        ) {
+            persistence.recovery.marker_pending = true;
+        }
+    }
+    Ok(())
 }
 
 fn set_controller_coverage_unavailable(coverage: &mut [SourceCoverageSnapshot]) {
@@ -987,6 +1218,15 @@ fn set_controller_coverage_unavailable(coverage: &mut [SourceCoverageSnapshot]) 
         .find(|snapshot| snapshot.source == DiagnosticSource::Controller)
     {
         controller.availability = InputAvailability::Unavailable;
+    }
+}
+
+fn set_controller_coverage_available(coverage: &mut [SourceCoverageSnapshot]) {
+    if let Some(controller) = coverage
+        .iter_mut()
+        .find(|snapshot| snapshot.source == DiagnosticSource::Controller)
+    {
+        controller.availability = InputAvailability::Available;
     }
 }
 
@@ -1238,6 +1478,7 @@ pub async fn spawn_workload_collector(
     let (coverage_sender, source_coverage) = watch::channel(initial_coverage);
     let (persistence, diagnostics) = RuntimePersistence::new(
         writer,
+        &session,
         &model.borrow(),
         &source_coverage.borrow(),
         Arc::new(UnavailableOccurrenceSink),
@@ -1617,6 +1858,7 @@ async fn spawn_configured_inner(
     let (coverage_sender, source_coverage) = watch::channel(initial_coverage);
     let (persistence, diagnostics) = RuntimePersistence::new(
         writer,
+        &session,
         &model.borrow(),
         &source_coverage.borrow(),
         occurrence_sink,
@@ -1785,6 +2027,7 @@ async fn run_collector(
             () = cancellation.cancelled() => break,
             _ = retention_cleanup.tick() => {
                 let _ = persistence.cleanup(unix_now_ms()).await?;
+                persist_recovery_marker_if_pending(&mut persistence, &mut reducer).await?;
                 persistence.refresh_pane_coverage(&shared.borrow());
                 persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
                 continue;
@@ -2264,7 +2507,7 @@ async fn replay_generation(
                 &mut closures,
                 &mut candidates,
             );
-            apply_received_event(
+            let _ = apply_received_event(
                 reducer,
                 shared,
                 persistence,
@@ -2723,6 +2966,7 @@ async fn monitor_live(
                     provider.publish_targets(shared);
                 }
                 let _ = persistence.cleanup(unix_now_ms()).await?;
+                persist_recovery_marker_if_pending(persistence, reducer).await?;
                 persistence.refresh_pane_coverage(&shared.borrow());
                 persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
                 continue;
@@ -2743,13 +2987,12 @@ async fn monitor_live(
                 continue;
             }
             LiveReceipt::Primary(received) => {
-                watchdog_probe = None;
-                watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
                 let (received, admission) = received.into_parts();
                 let target_delta = enrichment_target_delta(&received, shared);
-                let anomalous =
-                    updated_entity(&received).is_some_and(|entity| !entity_exists(shared, &entity));
-                apply_received_event(
+                let anomalous = !is_focus_frame(&received.event)
+                    && updated_entity(&received)
+                        .is_some_and(|entity| !entity_exists(shared, &entity));
+                let produced_observations = apply_received_event(
                     reducer,
                     shared,
                     persistence,
@@ -2761,6 +3004,10 @@ async fn monitor_live(
                     provider,
                 )
                 .await?;
+                if produced_observations {
+                    watchdog_probe = None;
+                    watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
+                }
                 enrichment.apply_target_delta(target_delta);
                 if anomalous || overflowed.swap(false, Ordering::AcqRel) {
                     return Ok(ReplayOutcome::Dirty);
@@ -2892,17 +3139,16 @@ async fn monitor_reconciling(
                     provider.publish_targets(shared);
                 }
                 let _ = persistence.cleanup(unix_now_ms()).await?;
+                persist_recovery_marker_if_pending(persistence, reducer).await?;
                 persistence.refresh_pane_coverage(&shared.borrow());
                 persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
                 continue;
             }
             ReconcilingReceipt::Primary(received) => received,
         };
-        watchdog_probe = None;
-        watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
         let (received, admission) = received.into_parts();
         let target_delta = enrichment_target_delta(&received, shared);
-        apply_received_event(
+        let produced_observations = apply_received_event(
             reducer,
             shared,
             persistence,
@@ -2914,6 +3160,10 @@ async fn monitor_reconciling(
             provider,
         )
         .await?;
+        if produced_observations {
+            watchdog_probe = None;
+            watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
+        }
         enrichment.apply_target_delta(target_delta);
     }
 }
@@ -4791,7 +5041,7 @@ async fn apply_received_event(
     admission: Admission,
     pending_closures: &mut PendingTopologyClosures,
     provider: &mut ProviderIntegration,
-) -> Result<(), CollectorError> {
+) -> Result<bool, CollectorError> {
     if received.event == "pane_moved"
         && let Err(error) = owner.refresh_from_move(&received.data, persistence).await
     {
@@ -4805,11 +5055,12 @@ async fn apply_received_event(
             return Err(error);
         }
     };
+    let produced_observations = !normalized.is_empty();
     let outcome = apply_collector_observation(reducer, normalized);
     admission.complete();
     let Some(persist) = outcome? else {
         persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
-        return Ok(());
+        return Ok(produced_observations);
     };
     if !persist.is_empty() {
         let _ = persist_submission(persistence, reducer, persist).await?;
@@ -4817,7 +5068,7 @@ async fn apply_received_event(
     persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
     provider.publish_targets(shared);
     cancel_pending_topology_closures(&received, pending_closures);
-    Ok(())
+    Ok(produced_observations)
 }
 
 fn cancel_pending_pane_closure(pane_id: &str, pending: &mut PendingTopologyClosures) {
@@ -6447,7 +6698,9 @@ fn record_replay_facts(
     for entity in closed_entities(received) {
         closures.entry(entity).or_default().push(index);
     }
-    if let Some(entity) = updated_entity(received) {
+    if !is_focus_frame(&received.event)
+        && let Some(entity) = updated_entity(received)
+    {
         candidates.push((index, entity));
     }
 }
@@ -6540,6 +6793,10 @@ fn updated_entity(received: &ReceivedEvent) -> Option<EntityKey> {
             .map(EntityKey::Pane),
         _ => None,
     }
+}
+
+fn is_focus_frame(event: &str) -> bool {
+    matches!(event, "workspace_focused" | "tab_focused" | "pane_focused")
 }
 
 fn entity_exists(shared: &SharedModel, entity: &EntityKey) -> bool {
@@ -7160,6 +7417,7 @@ mod tests {
         let initial_coverage = SourceCoverageRegistry::new(SourceAvailability::NotApplicable);
         let (persistence, mut diagnostics) = RuntimePersistence::new(
             writer,
+            "test",
             &shared.borrow(),
             &initial_coverage,
             Arc::new(RecordingOccurrenceSink::default()),
@@ -7338,6 +7596,57 @@ mod tests {
         let (lifecycle, writer) = spawn_writer(store).unwrap();
         let (runtime, diagnostics) = RuntimePersistence::new_for_test(writer, sink);
         (directory, lifecycle, runtime, diagnostics)
+    }
+
+    fn recoverable_runtime(
+        retry_interval: Duration,
+    ) -> (
+        tempfile::TempDir,
+        crate::lockfile::StateRoot,
+        crate::store::WriterLifecycle,
+        RuntimePersistence,
+        watch::Receiver<crate::diagnostics::RuntimeDiagnosticsSnapshot>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        store
+            .replace_owner(&OwnerRecord {
+                pid: 42,
+                started_at_ms: 1,
+                terminal_id: Some("terminal".to_owned()),
+                pane_id: Some("pane".to_owned()),
+            })
+            .unwrap();
+        rusqlite::Connection::open(crate::store::database_path(&root))
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_runtime_owner BEFORE UPDATE ON owner \
+                 BEGIN SELECT RAISE(ABORT, 'initial runtime failure'); END;",
+            )
+            .unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (runtime, diagnostics) = RuntimePersistence::new_for_test_with_retry_interval(
+            writer,
+            Arc::new(RecordingOccurrenceSink::default()),
+            retry_interval,
+        );
+        (directory, root, lifecycle, runtime, diagnostics)
+    }
+
+    fn replace_runtime_owner_trigger(root: &crate::lockfile::StateRoot, detail: Option<&str>) {
+        let connection = rusqlite::Connection::open(crate::store::database_path(root)).unwrap();
+        connection
+            .execute_batch("DROP TRIGGER IF EXISTS fail_runtime_owner;")
+            .unwrap();
+        if let Some(detail) = detail {
+            connection
+                .execute_batch(&format!(
+                    "CREATE TRIGGER fail_runtime_owner BEFORE UPDATE ON owner \
+                     BEGIN SELECT RAISE(ABORT, '{detail}'); END;"
+                ))
+                .unwrap();
+        }
     }
 
     async fn shutdown_writer(lifecycle: crate::store::WriterLifecycle) {
@@ -7556,6 +7865,7 @@ mod tests {
         );
         let (persistence, _diagnostics) = RuntimePersistence::new(
             writer,
+            "test",
             &shared.borrow(),
             &initial_coverage,
             Arc::new(RecordingOccurrenceSink::default()),
@@ -8553,6 +8863,354 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistence_recovery_restores_facade_and_persistence_unavailable_input_only() {
+        let (_directory, root, lifecycle, mut runtime, diagnostics) =
+            recoverable_runtime(Duration::from_secs(30));
+
+        assert!(matches!(
+            runtime
+                .update_owner_location("terminal-2", "pane-2")
+                .await
+                .unwrap(),
+            RuntimeWriteOutcome::NotCommitted(_)
+        ));
+        assert_eq!(
+            diagnostics.borrow().controller_input,
+            ControllerInputStatus::Unavailable {
+                reason: ControllerInputUnavailableReason::PersistenceUnavailable,
+            }
+        );
+        replace_runtime_owner_trigger(&root, None);
+        runtime.recovery.next_probe_at = Some(Instant::now());
+
+        assert_eq!(
+            runtime.apply(Vec::new()).await.unwrap(),
+            RuntimeWriteOutcome::Skipped,
+            "the batch that arrived while degraded must stay dropped"
+        );
+        let snapshot = diagnostics.borrow().clone();
+        assert_eq!(snapshot.persistence, PersistenceStatus::Healthy);
+        assert_eq!(snapshot.persistence_detail, None);
+        assert_eq!(snapshot.controller_input, ControllerInputStatus::Available);
+        assert_eq!(snapshot.owner, OwnerFreshness::Stale);
+        drop(snapshot);
+        assert_eq!(
+            runtime.apply(Vec::new()).await.unwrap(),
+            RuntimeWriteOutcome::Durable
+        );
+
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn persistence_recovery_preserves_preexisting_runtime_unsafe_input() {
+        let (_directory, root, lifecycle, mut runtime, diagnostics) =
+            recoverable_runtime(Duration::from_secs(30));
+        runtime.snapshot.controller_input = ControllerInputStatus::Unavailable {
+            reason: ControllerInputUnavailableReason::RuntimeUnsafe,
+        };
+
+        assert!(matches!(
+            runtime
+                .update_owner_location("terminal-2", "pane-2")
+                .await
+                .unwrap(),
+            RuntimeWriteOutcome::NotCommitted(_)
+        ));
+        replace_runtime_owner_trigger(&root, None);
+        runtime.recovery.next_probe_at = Some(Instant::now());
+
+        assert_eq!(
+            runtime.cleanup(0).await.unwrap(),
+            RuntimeWriteOutcome::Skipped
+        );
+        let snapshot = diagnostics.borrow().clone();
+        assert_eq!(snapshot.persistence, PersistenceStatus::Healthy);
+        assert_eq!(
+            snapshot.controller_input,
+            ControllerInputStatus::Unavailable {
+                reason: ControllerInputUnavailableReason::RuntimeUnsafe,
+            }
+        );
+
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn acceptor_stop_during_outage_takes_precedence_at_recovery() {
+        let (_directory, root, lifecycle, mut runtime, diagnostics) =
+            recoverable_runtime(Duration::from_secs(30));
+        assert!(matches!(
+            runtime
+                .update_owner_location("terminal-2", "pane-2")
+                .await
+                .unwrap(),
+            RuntimeWriteOutcome::NotCommitted(_)
+        ));
+        runtime.mark_acceptor_stopped();
+        assert!(runtime.recovery.acceptor_stop_pending);
+        replace_runtime_owner_trigger(&root, None);
+        runtime.recovery.next_probe_at = Some(Instant::now());
+
+        assert_eq!(
+            runtime.cleanup(0).await.unwrap(),
+            RuntimeWriteOutcome::Skipped
+        );
+        let snapshot = diagnostics.borrow().clone();
+        assert_eq!(snapshot.persistence, PersistenceStatus::Healthy);
+        assert_eq!(
+            snapshot.controller_input,
+            ControllerInputStatus::Unavailable {
+                reason: ControllerInputUnavailableReason::AcceptorStopped,
+            }
+        );
+
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn acceptor_stop_before_outage_takes_precedence_at_recovery() {
+        let (_directory, root, lifecycle, mut runtime, diagnostics) =
+            recoverable_runtime(Duration::from_secs(30));
+        runtime.mark_acceptor_stopped();
+        assert_eq!(
+            diagnostics.borrow().controller_input,
+            ControllerInputStatus::Unavailable {
+                reason: ControllerInputUnavailableReason::AcceptorStopped,
+            }
+        );
+        assert!(matches!(
+            runtime
+                .update_owner_location("terminal-2", "pane-2")
+                .await
+                .unwrap(),
+            RuntimeWriteOutcome::NotCommitted(_)
+        ));
+        replace_runtime_owner_trigger(&root, None);
+        runtime.recovery.next_probe_at = Some(Instant::now());
+
+        assert_eq!(
+            runtime.cleanup(0).await.unwrap(),
+            RuntimeWriteOutcome::Skipped
+        );
+        let snapshot = diagnostics.borrow().clone();
+        assert_eq!(snapshot.persistence, PersistenceStatus::Healthy);
+        assert_eq!(
+            snapshot.controller_input,
+            ControllerInputStatus::Unavailable {
+                reason: ControllerInputUnavailableReason::AcceptorStopped,
+            }
+        );
+
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn reserve_enqueue_counts_refusal_while_cadence_gates_attempts() {
+        let retry_interval = Duration::from_millis(500);
+        let (_directory, root, lifecycle, mut runtime, diagnostics) =
+            recoverable_runtime(retry_interval);
+        assert!(matches!(
+            runtime
+                .update_owner_location("terminal-2", "pane-2")
+                .await
+                .unwrap(),
+            RuntimeWriteOutcome::NotCommitted(_)
+        ));
+        replace_runtime_owner_trigger(&root, Some("first probe detail"));
+
+        assert!(runtime.reserve_enqueue().is_none());
+        assert_eq!(
+            diagnostics.borrow().persistence_counters.skipped_enqueues,
+            1
+        );
+        assert!(
+            diagnostics
+                .borrow()
+                .persistence_detail
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .contains("initial runtime failure"),
+            "reserve_enqueue must not drive the probe itself"
+        );
+
+        tokio::time::sleep(retry_interval + Duration::from_millis(50)).await;
+        assert_eq!(
+            runtime.apply(Vec::new()).await.unwrap(),
+            RuntimeWriteOutcome::Skipped
+        );
+        assert!(
+            diagnostics
+                .borrow()
+                .persistence_detail
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .contains("first probe detail")
+        );
+
+        replace_runtime_owner_trigger(&root, Some("too-soon probe detail"));
+        assert_eq!(
+            runtime.cleanup(0).await.unwrap(),
+            RuntimeWriteOutcome::Skipped
+        );
+        assert!(
+            diagnostics
+                .borrow()
+                .persistence_detail
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .contains("first probe detail"),
+            "a second probe must not run inside the cooldown"
+        );
+
+        replace_runtime_owner_trigger(&root, None);
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_enqueues_one_persistence_outage_gap_through_submission_path() {
+        let (_directory, root, lifecycle, mut runtime, _diagnostics) =
+            recoverable_runtime(Duration::from_secs(30));
+        assert!(matches!(
+            runtime
+                .update_owner_location("terminal-2", "pane-2")
+                .await
+                .unwrap(),
+            RuntimeWriteOutcome::NotCommitted(_)
+        ));
+        replace_runtime_owner_trigger(&root, None);
+        runtime.recovery.next_probe_at = Some(Instant::now());
+        let (mut reducer, _shared) = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+
+        assert_eq!(
+            persist_submission(&mut runtime, &mut reducer, Vec::new())
+                .await
+                .unwrap(),
+            RuntimeWriteOutcome::Skipped
+        );
+        let persisted: i64 = rusqlite::Connection::open(crate::store::database_path(&root))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE gap_kind = 'persistence_outage'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, 1);
+        assert!(!runtime.recovery.marker_pending);
+
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_driven_recovery_enqueues_the_pending_persistence_outage_gap() {
+        let (_directory, root, lifecycle, mut runtime, _diagnostics) =
+            recoverable_runtime(Duration::from_secs(30));
+        assert!(matches!(
+            runtime
+                .update_owner_location("terminal-2", "pane-2")
+                .await
+                .unwrap(),
+            RuntimeWriteOutcome::NotCommitted(_)
+        ));
+        replace_runtime_owner_trigger(&root, None);
+        runtime.recovery.next_probe_at = Some(Instant::now());
+        let (mut reducer, _shared) = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+
+        assert_eq!(
+            runtime.cleanup(0).await.unwrap(),
+            RuntimeWriteOutcome::Skipped
+        );
+        persist_recovery_marker_if_pending(&mut runtime, &mut reducer)
+            .await
+            .unwrap();
+        let persisted: i64 = rusqlite::Connection::open(crate::store::database_path(&root))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE gap_kind = 'persistence_outage'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, 1);
+        assert!(!runtime.recovery.marker_pending);
+
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn persistence_transition_warnings_emit_once_per_degrade_and_recover_transition() {
+        let (directory, root, lifecycle, mut runtime, _diagnostics) =
+            recoverable_runtime(Duration::from_secs(30));
+        let log_path = directory.path().join("persistence-transitions.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(log)
+            .finish();
+
+        async {
+            assert!(matches!(
+                runtime
+                    .update_owner_location("terminal-2", "pane-2")
+                    .await
+                    .unwrap(),
+                RuntimeWriteOutcome::NotCommitted(_)
+            ));
+            assert_eq!(
+                runtime.apply(Vec::new()).await.unwrap(),
+                RuntimeWriteOutcome::Skipped
+            );
+            assert!(runtime.reserve_enqueue().is_none());
+
+            replace_runtime_owner_trigger(&root, None);
+            runtime.recovery.next_probe_at = Some(Instant::now());
+            assert_eq!(
+                runtime.cleanup(0).await.unwrap(),
+                RuntimeWriteOutcome::Skipped
+            );
+            assert_eq!(
+                runtime.apply(Vec::new()).await.unwrap(),
+                RuntimeWriteOutcome::Durable
+            );
+            shutdown_writer(lifecycle).await;
+        }
+        .with_subscriber(subscriber)
+        .await;
+
+        let contents = std::fs::read_to_string(log_path).unwrap();
+        assert_eq!(
+            contents
+                .matches("warning_code=\"persistence_degraded\"")
+                .count(),
+            1,
+            "{contents}"
+        );
+        assert_eq!(
+            contents
+                .matches("warning_code=\"persistence_recovered\"")
+                .count(),
+            1,
+            "{contents}"
+        );
+    }
+
+    #[tokio::test]
     async fn i4_d3_accepted_not_committed_counts_without_rollback() {
         let sink = Arc::new(RecordingOccurrenceSink::default());
         let (_directory, lifecycle, mut runtime, diagnostics) = runtime_with_sink(sink);
@@ -8688,7 +9346,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn i4_d3_accepted_failure_log_excludes_raw_store_text() {
+    async fn i4_d3_accepted_failure_log_retains_bounded_store_text() {
         const RAW_STORE_TEXT: &str = "PRIVATE_SQLITE_ROW_AND_PATH_2A31";
         let sink = Arc::new(RecordingOccurrenceSink::default());
         let directory = tempfile::tempdir().unwrap();
@@ -8702,7 +9360,7 @@ mod tests {
             ))
             .unwrap();
         let (lifecycle, writer) = spawn_writer(store).unwrap();
-        let (mut runtime, _diagnostics) = RuntimePersistence::new_for_test(writer, sink.clone());
+        let (mut runtime, diagnostics) = RuntimePersistence::new_for_test(writer, sink.clone());
 
         let outcome = runtime
             .apply(vec![PersistOp::RecordCollectorGap(CollectorGap {
@@ -8716,10 +9374,19 @@ mod tests {
         assert!(matches!(outcome, RuntimeWriteOutcome::NotCommitted(_)));
 
         let text = String::from_utf8(sink.bytes.lock().unwrap().clone()).unwrap();
-        assert!(!text.contains(RAW_STORE_TEXT));
+        assert!(text.contains(RAW_STORE_TEXT));
         assert!(!text.contains("private-event-id"));
         assert!(!text.contains("private-session"));
         assert!(!text.contains(directory.path().to_string_lossy().as_ref()));
+        let detail = diagnostics
+            .borrow()
+            .persistence_detail
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .to_owned();
+        assert!(detail.contains(RAW_STORE_TEXT));
+        assert!(detail.len() <= crate::store::writer::PERSISTENCE_DETAIL_MAX_BYTES);
         shutdown_writer(lifecycle).await;
     }
 
@@ -9377,6 +10044,572 @@ mod tests {
             .unwrap()
     }
 
+    async fn write_unknown_focus_frames(reader: &mut tokio::io::BufReader<tokio::net::UnixStream>) {
+        for frame in [
+            json!({
+                "event": "workspace_focused",
+                "data": {"workspace_id": "missing-workspace"},
+            }),
+            json!({
+                "event": "tab_focused",
+                "data": {"tab_id": "missing-tab"},
+            }),
+            json!({
+                "event": "pane_focused",
+                "data": {"pane_id": "missing-pane"},
+            }),
+        ] {
+            write_wire_frame(reader, &frame).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn flood_focus_frames_during_replay_do_not_force_dirty() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("focus-replay-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mut harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "focus-replay.log",
+            LivenessPolicy { timeout_ms: 2_000 },
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let snapshot_requests = Arc::new(AtomicUsize::new(0));
+        let observed_snapshot_requests = Arc::clone(&snapshot_requests);
+        let server = tokio::spawn(async move {
+            let mut primary_stream = None;
+            let mut held_streams = Vec::new();
+            loop {
+                let (mut reader, request) = tokio::select! {
+                    () = server_cancellation.cancelled() => break,
+                    accepted = accept_wire_request(&listener) => accepted,
+                };
+                match request["method"].as_str() {
+                    Some("events.subscribe") => {
+                        write_wire_frame(
+                            &mut reader,
+                            &json!({
+                                "id": request["id"],
+                                "result": {"type": "subscription_started"},
+                            }),
+                        )
+                        .await;
+                        if primary_subscription_is_scoped(&request) {
+                            held_streams.push(reader);
+                        } else {
+                            assert!(
+                                primary_stream.replace(reader).is_none(),
+                                "focus replay unexpectedly replaced the primary stream"
+                            );
+                        }
+                    }
+                    Some("session.snapshot") => {
+                        let snapshots =
+                            observed_snapshot_requests.fetch_add(1, Ordering::AcqRel) + 1;
+                        if snapshots == 1 {
+                            write_unknown_focus_frames(
+                                primary_stream
+                                    .as_mut()
+                                    .expect("snapshot arrived before the primary subscription"),
+                            )
+                            .await;
+                        }
+                        write_wire_frame(
+                            &mut reader,
+                            &watchdog_snapshot_frame(&request, false, "claude"),
+                        )
+                        .await;
+                    }
+                    method => panic!("unexpected focus replay request: {method:?}"),
+                }
+            }
+            drop(primary_stream);
+            drop(held_streams);
+        });
+
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "focus replay convergence",
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            snapshot_requests.load(Ordering::Acquire),
+            1,
+            "unknown focus frames made replay request a replacement snapshot"
+        );
+
+        let contents = harness.stop().await;
+        join_fake_server(server, "focus replay").await;
+        assert!(
+            !contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            "focus replay emitted a watchdog warning: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn flood_focus_frames_during_live_do_not_force_dirty() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("focus-live-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (focus_sender, mut focus_receiver) = mpsc::unbounded_channel();
+        let mut harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "focus-live.log",
+            LivenessPolicy { timeout_ms: 2_000 },
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let snapshot_requests = Arc::new(AtomicUsize::new(0));
+        let observed_snapshot_requests = Arc::clone(&snapshot_requests);
+        let server = tokio::spawn(async move {
+            let mut primary_stream = None;
+            let mut held_streams = Vec::new();
+            loop {
+                tokio::select! {
+                    () = server_cancellation.cancelled() => break,
+                    focus = focus_receiver.recv() => {
+                        let Some(()) = focus else {
+                            continue;
+                        };
+                        write_unknown_focus_frames(
+                            primary_stream
+                                .as_mut()
+                                .expect("live focus requested before the primary subscription"),
+                        )
+                        .await;
+                    }
+                    accepted = accept_wire_request(&listener) => {
+                        let (mut reader, request) = accepted;
+                        match request["method"].as_str() {
+                            Some("events.subscribe") => {
+                                write_wire_frame(
+                                    &mut reader,
+                                    &json!({
+                                        "id": request["id"],
+                                        "result": {"type": "subscription_started"},
+                                    }),
+                                )
+                                .await;
+                                if primary_subscription_is_scoped(&request) {
+                                    held_streams.push(reader);
+                                } else {
+                                    assert!(
+                                        primary_stream.replace(reader).is_none(),
+                                        "live focus unexpectedly replaced the primary stream"
+                                    );
+                                }
+                            }
+                            Some("session.snapshot") => {
+                                observed_snapshot_requests.fetch_add(1, Ordering::AcqRel);
+                                write_wire_frame(
+                                    &mut reader,
+                                    &watchdog_snapshot_frame(&request, false, "claude"),
+                                )
+                                .await;
+                            }
+                            method => panic!("unexpected live focus request: {method:?}"),
+                        }
+                    }
+                }
+            }
+            drop(primary_stream);
+            drop(held_streams);
+        });
+
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "initial live focus generation",
+        )
+        .await;
+        focus_sender
+            .send(())
+            .expect("focus server stopped before the live frames were requested");
+        let unexpectedly_resnapshotted = tokio::time::timeout(Duration::from_millis(250), async {
+            while snapshot_requests.load(Ordering::Acquire) == 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            !unexpectedly_resnapshotted,
+            "unknown live focus frames forced a replacement snapshot"
+        );
+        assert_eq!(*harness.source_quality.borrow(), ObservationQuality::Live);
+
+        drop(focus_sender);
+        let contents = harness.stop().await;
+        join_fake_server(server, "live focus").await;
+        assert!(
+            !contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            "live focus emitted a watchdog warning: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn flood_zero_observation_frames_allow_reconciling_probe_to_complete() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("reconciling-flood-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (restarted_sender, restarted_receiver) = tokio::sync::oneshot::channel();
+        let mut harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "reconciling-flood.log",
+            LivenessPolicy { timeout_ms: 120 },
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let server = tokio::spawn(async move {
+            let mut snapshots = 0;
+            let mut restarted_sender = Some(restarted_sender);
+            let mut primary_stream = None;
+            let mut focus_pulse = None;
+            let mut held_streams = Vec::new();
+            loop {
+                let (mut reader, request) = tokio::select! {
+                    () = server_cancellation.cancelled() => break,
+                    accepted = accept_wire_request(&listener) => accepted,
+                };
+                match request["method"].as_str() {
+                    Some("events.subscribe") => {
+                        write_wire_frame(
+                            &mut reader,
+                            &json!({
+                                "id": request["id"],
+                                "result": {"type": "subscription_started"},
+                            }),
+                        )
+                        .await;
+                        if primary_subscription_is_scoped(&request) {
+                            held_streams.push(reader);
+                        } else {
+                            assert!(
+                                primary_stream.replace(reader).is_none(),
+                                "reconciling flood unexpectedly replaced the primary stream"
+                            );
+                        }
+                    }
+                    Some("session.snapshot") => {
+                        snapshots += 1;
+                        if snapshots == RESNAPSHOT_ATTEMPTS + 2 {
+                            tokio::time::sleep(Duration::from_millis(60)).await;
+                        }
+                        write_wire_frame(
+                            &mut reader,
+                            &watchdog_snapshot_frame(&request, false, "claude"),
+                        )
+                        .await;
+                        if snapshots <= RESNAPSHOT_ATTEMPTS + 1 {
+                            write_wire_frame(
+                                primary_stream
+                                    .as_mut()
+                                    .expect("snapshot arrived before the primary subscription"),
+                                &json!({
+                                    "event": "pane_agent_status_changed",
+                                    "data": {
+                                        "pane_id": format!("missing-pane-{snapshots}"),
+                                        "agent_status": "working",
+                                    },
+                                }),
+                            )
+                            .await;
+                            if snapshots == RESNAPSHOT_ATTEMPTS + 1 {
+                                let pulse_cancellation = server_cancellation.clone();
+                                let mut stream = primary_stream
+                                    .take()
+                                    .expect("reconciling flood lost the primary stream")
+                                    .into_inner();
+                                focus_pulse = Some(tokio::spawn(async move {
+                                    let mut interval =
+                                        tokio::time::interval(Duration::from_millis(20));
+                                    interval.set_missed_tick_behavior(
+                                        tokio::time::MissedTickBehavior::Delay,
+                                    );
+                                    let mut frame = serde_json::to_vec(&json!({
+                                        "event": "pane_focused",
+                                        "data": {"pane_id": "missing-pane"},
+                                    }))
+                                    .expect("focus pulse did not serialize");
+                                    frame.push(b'\n');
+                                    loop {
+                                        tokio::select! {
+                                            () = pulse_cancellation.cancelled() => break,
+                                            _ = interval.tick() => {
+                                                if stream.write_all(&frame).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }));
+                            }
+                        } else if snapshots == RESNAPSHOT_ATTEMPTS + 3
+                            && let Some(sender) = restarted_sender.take()
+                        {
+                            sender.send(()).unwrap();
+                        }
+                    }
+                    method => panic!("unexpected reconciling flood request: {method:?}"),
+                }
+            }
+            drop(primary_stream);
+            if let Some(pulse) = focus_pulse {
+                pulse.await.expect("focus pulse task panicked");
+            }
+            drop(held_streams);
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), restarted_receiver)
+            .await
+            .expect("reconciling flood prevented the watchdog probe from completing")
+            .expect("restart-generation observer was dropped");
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "post-flood restart generation",
+        )
+        .await;
+
+        let contents = harness.stop().await;
+        join_fake_server(server, "reconciling focus flood").await;
+        assert!(
+            !contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            "reconciling focus flood emitted a watchdog warning: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn flood_observation_receipt_cancels_probe_and_resets_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("observation-reset-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (cancelled_sender, cancelled_receiver) = tokio::sync::oneshot::channel();
+        let (reprobe_sender, reprobe_receiver) = tokio::sync::oneshot::channel();
+        let liveness_policy = LivenessPolicy { timeout_ms: 300 };
+        let mut harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "observation-reset.log",
+            liveness_policy,
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let server = tokio::spawn(async move {
+            let mut snapshots = 0;
+            let mut cancelled_sender = Some(cancelled_sender);
+            let mut reprobe_sender = Some(reprobe_sender);
+            let mut observation_sent_at = None;
+            let mut primary_stream = None;
+            let mut held_streams = Vec::new();
+            loop {
+                let (mut reader, request) = tokio::select! {
+                    () = server_cancellation.cancelled() => break,
+                    accepted = accept_wire_request(&listener) => accepted,
+                };
+                match request["method"].as_str() {
+                    Some("events.subscribe") => {
+                        write_wire_frame(
+                            &mut reader,
+                            &json!({
+                                "id": request["id"],
+                                "result": {"type": "subscription_started"},
+                            }),
+                        )
+                        .await;
+                        if primary_subscription_is_scoped(&request) {
+                            held_streams.push(reader);
+                        } else {
+                            assert!(
+                                primary_stream.replace(reader).is_none(),
+                                "observation reset unexpectedly replaced the primary stream"
+                            );
+                        }
+                    }
+                    Some("session.snapshot") => {
+                        snapshots += 1;
+                        if snapshots == 1 {
+                            write_wire_frame(
+                                &mut reader,
+                                &watchdog_snapshot_frame(&request, false, "claude"),
+                            )
+                            .await;
+                        } else if snapshots == 2 {
+                            observation_sent_at = Some(Instant::now());
+                            write_wire_frame(
+                                primary_stream
+                                    .as_mut()
+                                    .expect("probe arrived before the primary subscription"),
+                                &json!({
+                                    "event": "workspace_created",
+                                    "data": {
+                                        "workspace": {"workspace_id": "w2"},
+                                    },
+                                }),
+                            )
+                            .await;
+                            let mut line = String::new();
+                            let cancelled = tokio::time::timeout(
+                                Duration::from_millis(100),
+                                reader.read_line(&mut line),
+                            )
+                            .await
+                            .is_ok_and(|result| result.is_ok_and(|bytes_read| bytes_read == 0));
+                            if let Some(sender) = cancelled_sender.take() {
+                                sender.send(cancelled).unwrap();
+                            }
+                            if !cancelled {
+                                break;
+                            }
+                        } else if snapshots == 3 {
+                            let elapsed = observation_sent_at
+                                .expect("replacement probe arrived before the observation")
+                                .elapsed();
+                            if let Some(sender) = reprobe_sender.take() {
+                                sender.send(elapsed).unwrap();
+                            }
+                            held_streams.push(reader);
+                        } else {
+                            panic!("observation reset requested unexpected snapshot {snapshots}");
+                        }
+                    }
+                    method => panic!("unexpected observation reset request: {method:?}"),
+                }
+            }
+            drop(primary_stream);
+            drop(held_streams);
+        });
+
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "initial observation-reset generation",
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), cancelled_receiver)
+                .await
+                .expect("observation did not resolve the pending-probe cancellation check")
+                .expect("pending-probe cancellation observer was dropped"),
+            "observation-producing receipt did not cancel the in-flight probe"
+        );
+        let reprobe_elapsed = tokio::time::timeout(Duration::from_secs(3), reprobe_receiver)
+            .await
+            .expect("observation-producing receipt did not allow a replacement probe")
+            .expect("replacement-probe observer was dropped");
+        assert!(
+            reprobe_elapsed >= liveness_timeout(&liveness_policy),
+            "replacement probe arrived before the reset deadline: {reprobe_elapsed:?}"
+        );
+
+        let contents = harness.stop().await;
+        join_fake_server(server, "observation reset").await;
+        assert!(
+            !contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            "observation reset emitted a watchdog warning: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn flood_overflow_burst_still_forces_dirty() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("overflow-guard-herdr.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (burst_sender, mut burst_receiver) = mpsc::unbounded_channel();
+        let mut harness = spawn_primary_collector_harness_with_policy(
+            &directory,
+            socket,
+            "overflow-guard.log",
+            LivenessPolicy { timeout_ms: 2_000 },
+        );
+        let server_cancellation = harness.cancellation.clone();
+        let server = tokio::spawn(async move {
+            let mut snapshots = 0;
+            let mut primary_stream = None;
+            let mut held_streams = Vec::new();
+            loop {
+                tokio::select! {
+                    () = server_cancellation.cancelled() => break,
+                    burst = burst_receiver.recv() => {
+                        let Some(()) = burst else {
+                            continue;
+                        };
+                        write_primary_overflow_burst(
+                            primary_stream
+                                .as_mut()
+                                .expect("overflow requested before the primary subscription"),
+                        )
+                        .await;
+                    }
+                    accepted = accept_wire_request(&listener) => {
+                        let (mut reader, request) = accepted;
+                        match request["method"].as_str() {
+                            Some("events.subscribe") => {
+                                write_wire_frame(
+                                    &mut reader,
+                                    &json!({
+                                        "id": request["id"],
+                                        "result": {"type": "subscription_started"},
+                                    }),
+                                )
+                                .await;
+                                if primary_subscription_is_scoped(&request) {
+                                    held_streams.push(reader);
+                                } else {
+                                    assert!(
+                                        primary_stream.replace(reader).is_none(),
+                                        "overflow guard unexpectedly replaced the primary stream"
+                                    );
+                                }
+                            }
+                            Some("session.snapshot") => {
+                                snapshots += 1;
+                                if snapshots == 1 {
+                                    write_wire_frame(
+                                        &mut reader,
+                                        &watchdog_snapshot_frame(&request, false, "claude"),
+                                    )
+                                    .await;
+                                } else {
+                                    held_streams.push(reader);
+                                }
+                            }
+                            method => panic!("unexpected overflow guard request: {method:?}"),
+                        }
+                    }
+                }
+            }
+            drop(primary_stream);
+            drop(held_streams);
+        });
+
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "initial overflow-guard generation",
+        )
+        .await;
+        burst_sender
+            .send(())
+            .expect("overflow server stopped before the burst was requested");
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Reconciling,
+            "overflow burst dirty outcome",
+        )
+        .await;
+
+        drop(burst_sender);
+        let contents = harness.stop().await;
+        join_fake_server(server, "overflow guard").await;
+        assert!(
+            !contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            "overflow guard emitted a watchdog warning: {contents}"
+        );
+    }
+
     #[tokio::test]
     async fn watchdog_matching_probes_keep_idle_subscription_and_model_stable() {
         let directory = tempfile::tempdir().unwrap();
@@ -9551,8 +10784,11 @@ mod tests {
                             write_wire_frame(
                                 primary_stream,
                                 &json!({
-                                    "event": "pane_focused",
-                                    "data": {"pane_id": format!("missing-pane-{snapshots}")},
+                                    "event": "pane_agent_status_changed",
+                                    "data": {
+                                        "pane_id": format!("missing-pane-{snapshots}"),
+                                        "agent_status": "working",
+                                    },
                                 }),
                             )
                             .await;
@@ -12206,6 +13442,7 @@ mod tests {
         );
         let (persistence, mut diagnostics) = RuntimePersistence::new(
             writer,
+            "test",
             &shared.borrow(),
             &initial_coverage,
             Arc::new(RecordingOccurrenceSink::default()),
@@ -12868,6 +14105,7 @@ mod provider_integration_tests {
     fn test_diagnostics() -> watch::Receiver<RuntimeDiagnosticsSnapshot> {
         watch::channel(RuntimeDiagnosticsSnapshot {
             persistence: PersistenceStatus::Healthy,
+            persistence_detail: None,
             controller_input: ControllerInputStatus::Unavailable {
                 reason: ControllerInputUnavailableReason::ListenerUnavailable,
             },

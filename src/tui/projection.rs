@@ -2041,6 +2041,7 @@ mod tests {
     ) -> RuntimeDiagnosticsSnapshot {
         RuntimeDiagnosticsSnapshot {
             persistence,
+            persistence_detail: None,
             controller_input,
             owner: OwnerFreshness::Current,
             persistence_counters: PersistenceCounters::default(),

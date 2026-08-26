@@ -5308,6 +5308,7 @@ mod tests {
         let (_diagnostics_sender, diagnostics_receiver) =
             watch::channel(RuntimeDiagnosticsSnapshot {
                 persistence: PersistenceStatus::Healthy,
+                persistence_detail: None,
                 controller_input: ControllerInputStatus::Available,
                 owner: OwnerFreshness::Current,
                 persistence_counters: PersistenceCounters::default(),

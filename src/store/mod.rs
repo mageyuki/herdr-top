@@ -20,9 +20,9 @@ pub mod writer;
 
 pub use schema::{SchemaVerdict, database_path, preflight_schema};
 pub use writer::{
-    DurabilityDisposition, EnqueuePermit, EventLedgerCache, PendingEnqueue, PersistenceFailure,
-    PersistenceFailureCode, PersistenceOperation, PersistencePhase, PersistenceStatus,
-    WriterClient, WriterError, WriterLifecycle, spawn_writer,
+    BoundedDetail, DurabilityDisposition, EnqueuePermit, EventLedgerCache, PendingEnqueue,
+    PersistenceFailure, PersistenceFailureCode, PersistenceHealthSnapshot, PersistenceOperation,
+    PersistencePhase, PersistenceStatus, WriterClient, WriterError, WriterLifecycle, spawn_writer,
 };
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2296,6 +2296,7 @@ const fn gap_kind_text(kind: GapKind) -> &'static str {
         GapKind::Startup => "startup",
         GapKind::Reconnect => "reconnect",
         GapKind::SocketReplacement => "socket_replacement",
+        GapKind::PersistenceOutage => "persistence_outage",
     }
 }
 

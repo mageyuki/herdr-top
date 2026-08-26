@@ -18,8 +18,8 @@ use crate::session_key::SessionKey;
 use crate::store::StoreError;
 use crate::store::schema::SchemaVersionVerdict;
 use crate::store::writer::{
-    DurabilityDisposition, PersistenceFailure, PersistenceFailureCode, PersistenceOperation,
-    PersistencePhase,
+    BoundedDetail, DurabilityDisposition, PersistenceFailure, PersistenceFailureCode,
+    PersistenceOperation, PersistencePhase,
 };
 
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
@@ -80,15 +80,16 @@ pub enum SchemaProbeVerdict {
 }
 
 /// One validated historical persistence-degradation occurrence.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistenceOccurrenceObservation {
     pub timestamp_ms: i64,
     pub failure: PersistenceFailure,
+    pub detail: Option<BoundedDetail>,
     pub counters: PersistenceCounters,
 }
 
 /// Bounded persistence-log observation without raw lines or parse errors.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PersistenceLogVerdict {
     Absent,
     Unreadable,
@@ -600,6 +601,7 @@ struct RawOccurrence {
     kind: RawOccurrenceKind,
     timestamp_ms: i64,
     failure: RawFailure,
+    detail: Option<String>,
     counters: RawCounters,
 }
 
@@ -616,6 +618,7 @@ struct RawFailure {
     phase: RawPhase,
     code: RawFailureCode,
     durability: RawDurability,
+    detail: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -668,6 +671,7 @@ struct RawCounters {
     committed_but_degraded_batches: u64,
     skipped_batches: u64,
     skipped_owner_updates: u64,
+    skipped_enqueues: Option<u64>,
 }
 
 fn parse_occurrence(line: &[u8]) -> Option<PersistenceOccurrenceObservation> {
@@ -676,6 +680,7 @@ fn parse_occurrence(line: &[u8]) -> Option<PersistenceOccurrenceObservation> {
     if raw.schema_version != 1 || !matches!(raw.kind, RawOccurrenceKind::PersistenceDegraded) {
         return None;
     }
+    let detail = raw.failure.detail.or(raw.detail).map(BoundedDetail::new);
     Some(PersistenceOccurrenceObservation {
         timestamp_ms: raw.timestamp_ms,
         failure: PersistenceFailure {
@@ -712,12 +717,14 @@ fn parse_occurrence(line: &[u8]) -> Option<PersistenceOccurrenceObservation> {
                 RawDurability::Unknown => DurabilityDisposition::Unknown,
             },
         },
+        detail,
         counters: PersistenceCounters {
             not_committed_batches: raw.counters.not_committed_batches,
             durability_unknown_batches: raw.counters.durability_unknown_batches,
             committed_but_degraded_batches: raw.counters.committed_but_degraded_batches,
             skipped_batches: raw.counters.skipped_batches,
             skipped_owner_updates: raw.counters.skipped_owner_updates,
+            skipped_enqueues: raw.counters.skipped_enqueues.unwrap_or(0),
         },
     })
 }
@@ -820,6 +827,23 @@ mod tests {
         format!(
             "HERDR_TOP_PERSISTENCE_V1 {{\"schema_version\":1,\"kind\":\"persistence_degraded\",\"timestamp_ms\":{timestamp_ms},\"failure\":{{\"operation\":\"{operation}\",\"phase\":\"command_execution\",\"code\":\"sqlite\",\"durability\":\"not_committed\"}},\"counters\":{{\"not_committed_batches\":1,\"durability_unknown_batches\":2,\"committed_but_degraded_batches\":3,\"skipped_batches\":4,\"skipped_owner_updates\":5}}}}\n"
         )
+    }
+
+    #[test]
+    fn i4_local_persistence_occurrence_accepts_legacy_and_current_failure_counter_shapes() {
+        let legacy = br#"HERDR_TOP_PERSISTENCE_V1 {"schema_version":1,"kind":"persistence_degraded","timestamp_ms":7,"failure":{"operation":"apply","phase":"command_execution","code":"sqlite","durability":"not_committed"},"counters":{"not_committed_batches":1,"durability_unknown_batches":2,"committed_but_degraded_batches":3,"skipped_batches":4,"skipped_owner_updates":5}}"#;
+        let current = br#"HERDR_TOP_PERSISTENCE_V1 {"schema_version":1,"kind":"persistence_degraded","timestamp_ms":8,"failure":{"operation":"apply","phase":"command_execution","code":"sqlite","durability":"not_committed","detail":"database is temporarily read-only"},"counters":{"not_committed_batches":1,"durability_unknown_batches":2,"committed_but_degraded_batches":3,"skipped_batches":4,"skipped_owner_updates":5,"skipped_enqueues":6}}"#;
+
+        let legacy = parse_occurrence(legacy).expect("legacy occurrence must remain readable");
+        assert_eq!(legacy.detail, None);
+        assert_eq!(legacy.counters.skipped_enqueues, 0);
+
+        let current = parse_occurrence(current).expect("current occurrence must be readable");
+        assert_eq!(
+            current.detail.as_ref().map(BoundedDetail::as_str),
+            Some("database is temporarily read-only")
+        );
+        assert_eq!(current.counters.skipped_enqueues, 6);
     }
 
     struct WalHolderChild {
@@ -1563,12 +1587,14 @@ mod tests {
                 code: PersistenceFailureCode::Sqlite,
                 durability: DurabilityDisposition::NotCommitted,
             },
+            detail: None,
             counters: PersistenceCounters {
                 not_committed_batches: 1,
                 durability_unknown_batches: 2,
                 committed_but_degraded_batches: 3,
                 skipped_batches: 4,
                 skipped_owner_updates: 5,
+                skipped_enqueues: 0,
             },
         };
         let verdict = probe_persistence_log(&root);
@@ -1600,12 +1626,14 @@ mod tests {
                     code: PersistenceFailureCode::Sqlite,
                     durability: DurabilityDisposition::NotCommitted,
                 },
+                detail: None,
                 counters: PersistenceCounters {
                     not_committed_batches: 1,
                     durability_unknown_batches: 2,
                     committed_but_degraded_batches: 3,
                     skipped_batches: 4,
                     skipped_owner_updates: 5,
+                    skipped_enqueues: 0,
                 },
             })
         );
