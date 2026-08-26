@@ -95,6 +95,13 @@ impl ActivitySelection {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SubagentEnd {
+    failed: bool,
+    ordinal: u64,
+    at_ms: i64,
+}
+
 /// Stateful fact consumer that emits deterministic provider-lane events.
 #[derive(Clone, Debug)]
 pub struct Synthesis {
@@ -107,7 +114,7 @@ pub struct Synthesis {
     published_subjects: HashMap<String, String>,
     started: HashMap<ScopeKey, i64>,
     usage_samples: HashSet<(ScopeKey, String)>,
-    subagent_ends: HashMap<(String, String), (bool, i64)>,
+    subagent_ends: HashMap<(String, String), SubagentEnd>,
     lineage: HashSet<(ScopeKey, ScopeKey)>,
     last_append_ms: HashMap<ScopeKey, i64>,
     /// Grace-held outcomes flush on graceful shutdown. After a crash, `EndedUnknown` is the
@@ -556,24 +563,33 @@ impl Synthesis {
                 at_ms,
             } => {
                 let terminal_key = (parent.clone(), agent_id.clone());
-                if let Some(previous) = self.subagent_ends.get(&terminal_key)
-                    && (previous.0 || !failed)
+                let previous = self.subagent_ends.get(&terminal_key).copied();
+                let terminal = *self
+                    .subagent_ends
+                    .entry(terminal_key)
+                    .and_modify(|current| {
+                        current.failed |= failed;
+                        current.ordinal = current.ordinal.min(ordinal);
+                        current.at_ms = current.at_ms.min(at_ms);
+                    })
+                    .or_insert(SubagentEnd {
+                        failed,
+                        ordinal,
+                        at_ms,
+                    });
+                let scope = SessionScope::ClaudeSubagent { parent, agent_id };
+                let scope_key = ScopeKey::from(&scope);
+                // Durable terminals cannot be rewritten; only a grace-held Complete is mutable.
+                if previous.is_some_and(|previous| previous.failed)
+                    || self.completed.contains(&scope_key)
                 {
                     return;
                 }
-                self.subagent_ends
-                    .entry(terminal_key)
-                    .and_modify(|current| {
-                        current.0 |= failed;
-                        current.1 = current.1.min(at_ms);
-                    })
-                    .or_insert((failed, at_ms));
-                let at_ms = self
-                    .subagent_ends
-                    .get(&(parent.clone(), agent_id.clone()))
-                    .map_or(at_ms, |(_, earliest_at_ms)| *earliest_at_ms);
-                let scope = SessionScope::ClaudeSubagent { parent, agent_id };
-                let scope_key = ScopeKey::from(&scope);
+                let SubagentEnd {
+                    failed,
+                    ordinal,
+                    at_ms,
+                } = terminal;
                 self.flush_due_completes(at_ms, events);
                 let event = controller_event(
                     artifact,
@@ -594,7 +610,8 @@ impl Synthesis {
                     self.started.remove(&scope_key);
                     events.push(ProviderEvent::Synthesized(event));
                 } else {
-                    self.hold_complete(scope_key, event);
+                    // Refresh the held event from the accumulated ordinal and timestamp.
+                    self.pending_completes.insert(scope_key, event);
                 }
             }
             LogFact::Activity {
@@ -2084,41 +2101,131 @@ mod tests {
     }
 
     #[test]
-    fn subagent_end_coalescing_keeps_earliest_ordinal_and_timestamp() {
-        let mut synthesis = Synthesis::default();
+    fn subagent_end_coalescing_keeps_earliest_ordinal_and_timestamp_across_batches() {
+        let mut synthesis = Synthesis::with_lifecycle_timing(30, 600);
         let _ = synthesize_subagent_start(&mut synthesis, "coalesced", Some(50));
 
-        let events = synthesize(
+        let mut events = synthesize(
             &mut synthesis,
             "queue.jsonl",
-            [
-                (
-                    9,
-                    LogFact::SubagentEnded {
-                        parent: PARENT.to_owned(),
-                        agent_id: "coalesced".to_owned(),
-                        failed: false,
-                        at_ms: 200,
-                    },
-                ),
-                (
-                    3,
-                    LogFact::SubagentEnded {
-                        parent: PARENT.to_owned(),
-                        agent_id: "coalesced".to_owned(),
-                        failed: true,
-                        at_ms: 100,
-                    },
-                ),
-            ],
+            [(
+                9,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "coalesced".to_owned(),
+                    failed: false,
+                    at_ms: 200,
+                },
+            )],
         );
+        events.extend(synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                3,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "coalesced".to_owned(),
+                    failed: false,
+                    at_ms: 100,
+                },
+            )],
+        ));
+        events.extend(synthesis.advance_lifecycle(129));
+        events.extend(synthesis.advance_lifecycle(130));
+        events.extend(synthesis.advance_lifecycle(300));
 
         assert!(matches!(
             synthesized_events(&events).as_slice(),
             [event]
-                if event.metadata.event_id == "log:queue.jsonl:3:failed:coalesced"
+                if event.metadata.event_id == "log:queue.jsonl:3:complete:coalesced"
+                    && event.metadata.timestamp_ms == 100
+                    && matches!(event.event, ControllerEventKind::Complete)
+        ));
+    }
+
+    #[test]
+    fn earlier_failed_subagent_end_supersedes_cross_batch_complete() {
+        let mut synthesis = Synthesis::with_lifecycle_timing(30, 600);
+        let _ = synthesize_subagent_start(&mut synthesis, "failed-coalesced", Some(50));
+
+        let mut events = synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                3,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "failed-coalesced".to_owned(),
+                    failed: false,
+                    at_ms: 200,
+                },
+            )],
+        );
+        events.extend(synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                9,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "failed-coalesced".to_owned(),
+                    failed: true,
+                    at_ms: 100,
+                },
+            )],
+        ));
+        events.extend(synthesis.advance_lifecycle(300));
+
+        assert!(matches!(
+            synthesized_events(&events).as_slice(),
+            [event]
+                if event.metadata.event_id == "log:queue.jsonl:3:failed:failed-coalesced"
                     && event.metadata.timestamp_ms == 100
                     && matches!(event.event, ControllerEventKind::Failed)
+        ));
+    }
+
+    #[test]
+    fn published_subagent_complete_ignores_retroactive_duplicate() {
+        let mut synthesis = Synthesis::with_lifecycle_timing(30, 600);
+        let _ = synthesize_subagent_start(&mut synthesis, "published", Some(50));
+
+        let mut events = synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                9,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "published".to_owned(),
+                    failed: false,
+                    at_ms: 200,
+                },
+            )],
+        );
+        events.extend(synthesis.advance_lifecycle(230));
+        events.extend(synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                3,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "published".to_owned(),
+                    failed: false,
+                    at_ms: 100,
+                },
+            )],
+        ));
+        events.extend(synthesis.advance_lifecycle(300));
+
+        assert!(matches!(
+            synthesized_events(&events).as_slice(),
+            [event]
+                if event.metadata.event_id == "log:queue.jsonl:9:complete:published"
+                    && event.metadata.timestamp_ms == 200
+                    && matches!(event.event, ControllerEventKind::Complete)
         ));
     }
 
