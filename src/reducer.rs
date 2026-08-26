@@ -2270,16 +2270,53 @@ impl Reducer {
                 _ => None,
             })
             .collect();
-        if execution_ids.is_empty() {
-            return Vec::new();
-        }
         let mut persist = Vec::new();
         for execution_id in execution_ids {
             self.end_execution(&execution_id, now_ms, &mut persist);
         }
+        // Dispatch-only closure must run even when no execution reaches its stale deadline.
+        persist.extend(self.close_inactive_dispatch_only_runs(now_ms));
+        if persist.is_empty() {
+            return persist;
+        }
         self.recompute_dangling_announcement_components();
         self.operator.apply_submission(&persist);
         self.publish();
+        persist
+    }
+
+    fn close_inactive_dispatch_only_runs(&mut self, now_ms: i64) -> PersistBatch {
+        let runs_with_executions = activity::runs_with_executions(&self.model);
+        let mut run_ids: Vec<_> = self
+            .model
+            .task_runs()
+            .filter(|run| matches!(run.key, RunKey::Controller(_)))
+            .filter(|run| !runs_with_executions.contains(&run.run_id))
+            .filter(|run| run.state == TaskState::Queued)
+            .filter(|run| run.dismissed_at_ms.is_none())
+            .filter(|run| {
+                // Missing restored timestamps are not evidence that the run is old enough.
+                let Some(anchor_ms) = run.updated_at_ms.or(run.created_at_ms) else {
+                    return false;
+                };
+                now_ms.saturating_sub(anchor_ms) >= activity::headless_inactivity_ms()
+            })
+            .map(|run| run.run_id)
+            .collect();
+        run_ids.sort_unstable();
+
+        let mut persist = Vec::with_capacity(run_ids.len());
+        for run_id in run_ids {
+            let mut task_run = self
+                .model
+                .task_run(&run_id)
+                .cloned()
+                .expect("collected task run must remain present");
+            task_run.state = TaskState::EndedUnknown;
+            Self::touch_task_run(&mut task_run, now_ms);
+            self.model.insert_task_run(task_run.clone());
+            persist.push(self.persist_task_run(task_run, now_ms));
+        }
         persist
     }
 
@@ -6186,6 +6223,515 @@ mod tests {
         assert_eq!(
             shared.borrow().execution("stale-execution").unwrap().state,
             ExecState::Ended
+        );
+    }
+
+    #[test]
+    fn stale_sweep_closes_dispatch_only_run_at_updated_inactivity_boundary() {
+        let anchor_ms = 100;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let dispatch_only = RunId::new();
+        let stale_run = RunId::new();
+        let mut task_run = run_with_controller_evidence(
+            dispatch_only,
+            RunKey::Controller("updated-anchor".to_owned()),
+            1,
+            TaskState::Queued,
+        );
+        task_run.created_at_ms = Some(50);
+        task_run.updated_at_ms = Some(anchor_ms);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        model.insert_task_run(run(
+            stale_run,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "updated-anchor-stale".to_owned(),
+            },
+            2,
+            TaskState::Running,
+        ));
+        model.insert_execution(execution(
+            stale_run,
+            "updated-anchor-stale",
+            ExecState::Stale {
+                since_ms: now_ms - super::STALE_GRACE_MS,
+            },
+        ));
+        let (mut reducer, shared) = Reducer::new(restored(model, 3));
+
+        let publish_count = reducer.publish_count.get();
+        assert!(reducer.sweep_stale(now_ms - 1).is_empty());
+        assert_eq!(reducer.publish_count.get(), publish_count);
+        assert_eq!(
+            shared.borrow().task_run(&dispatch_only).unwrap().state,
+            TaskState::Queued
+        );
+
+        let persist = reducer.sweep_stale(now_ms);
+
+        let snapshot = shared.borrow();
+        let closed = snapshot.task_run(&dispatch_only).unwrap();
+        assert_eq!(closed.state, TaskState::EndedUnknown);
+        assert_eq!(closed.updated_at_ms, Some(now_ms));
+        assert_eq!(closed.finished_at_ms, Some(now_ms));
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertTaskRun(value)
+                if value.task_run.run_id == dispatch_only
+                    && value.task_run.state == TaskState::EndedUnknown
+                    && value.task_run.finished_at_ms == Some(now_ms)
+        )));
+    }
+
+    #[test]
+    fn stale_sweep_uses_created_at_when_dispatch_only_run_has_no_update() {
+        let anchor_ms = 200;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let dispatch_only = RunId::new();
+        let stale_run = RunId::new();
+        let mut task_run = run_with_controller_evidence(
+            dispatch_only,
+            RunKey::Controller("created-anchor".to_owned()),
+            1,
+            TaskState::Queued,
+        );
+        task_run.created_at_ms = Some(anchor_ms);
+        task_run.updated_at_ms = None;
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        model.insert_task_run(run(
+            stale_run,
+            RunKey::Native {
+                provider: Provider::Claude,
+                sid: "created-anchor-stale".to_owned(),
+            },
+            2,
+            TaskState::Running,
+        ));
+        model.insert_execution(execution(
+            stale_run,
+            "created-anchor-stale",
+            ExecState::Stale {
+                since_ms: now_ms - super::STALE_GRACE_MS,
+            },
+        ));
+        let (mut reducer, shared) = Reducer::new(restored(model, 3));
+
+        let persist = reducer.sweep_stale(now_ms);
+
+        let snapshot = shared.borrow();
+        let closed = snapshot.task_run(&dispatch_only).unwrap();
+        assert_eq!(closed.state, TaskState::EndedUnknown);
+        assert_eq!(closed.finished_at_ms, Some(now_ms));
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertTaskRun(value) if value.task_run.run_id == dispatch_only
+        )));
+    }
+
+    #[test]
+    fn stale_sweep_leaves_unanchored_dispatch_only_run_open() {
+        let now_ms = crate::activity::headless_inactivity_ms() + 500;
+        let unanchored = RunId::new();
+        let anchored = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run_with_controller_evidence(
+            unanchored,
+            RunKey::Controller("unanchored".to_owned()),
+            1,
+            TaskState::Queued,
+        ));
+        let mut anchored_run = run_with_controller_evidence(
+            anchored,
+            RunKey::Controller("anchored-control".to_owned()),
+            2,
+            TaskState::Queued,
+        );
+        anchored_run.updated_at_ms = Some(500);
+        model.insert_task_run(anchored_run);
+        let (mut reducer, shared) = Reducer::new(restored(model, 3));
+
+        let persist = reducer.sweep_stale(now_ms);
+
+        let snapshot = shared.borrow();
+        assert_eq!(
+            snapshot.task_run(&unanchored).unwrap().state,
+            TaskState::Queued
+        );
+        assert_eq!(
+            snapshot.task_run(&anchored).unwrap().state,
+            TaskState::EndedUnknown
+        );
+        assert!(persist.iter().all(|operation| !matches!(
+            operation,
+            PersistOp::UpsertTaskRun(value) if value.task_run.run_id == unanchored
+        )));
+    }
+
+    #[test]
+    fn stale_sweep_only_closes_controller_queued_runs() {
+        let anchor_ms = 700;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let queued = RunId::new();
+        let running = RunId::new();
+        let blocked = RunId::new();
+        let native = RunId::new();
+        let mut model = DomainModel::default();
+        for (ordinal, (run_id, name, state)) in [
+            (queued, "queued", TaskState::Queued),
+            (running, "running", TaskState::Running),
+            (blocked, "blocked", TaskState::Blocked),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut task_run = run_with_controller_evidence(
+                run_id,
+                RunKey::Controller(name.to_owned()),
+                ordinal as i64 + 1,
+                state,
+            );
+            task_run.updated_at_ms = Some(anchor_ms);
+            model.insert_task_run(task_run);
+        }
+        let mut native_run = run(
+            native,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "native-queued".to_owned(),
+            },
+            4,
+            TaskState::Queued,
+        );
+        native_run.updated_at_ms = Some(anchor_ms);
+        model.insert_task_run(native_run);
+        let (mut reducer, shared) = Reducer::new(restored(model, 5));
+
+        reducer.sweep_stale(now_ms);
+
+        let snapshot = shared.borrow();
+        assert_eq!(
+            snapshot.task_run(&queued).unwrap().state,
+            TaskState::EndedUnknown
+        );
+        assert_eq!(
+            snapshot.task_run(&running).unwrap().state,
+            TaskState::Running
+        );
+        assert_eq!(
+            snapshot.task_run(&blocked).unwrap().state,
+            TaskState::Blocked
+        );
+        assert_eq!(snapshot.task_run(&native).unwrap().state, TaskState::Queued);
+    }
+
+    #[test]
+    fn stale_sweep_leaves_dispatch_only_run_with_execution_open() {
+        let anchor_ms = 800;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let attached = RunId::new();
+        let unattached = RunId::new();
+        let mut model = DomainModel::default();
+        for (ordinal, (run_id, name)) in [(attached, "attached"), (unattached, "unattached")]
+            .into_iter()
+            .enumerate()
+        {
+            let mut task_run = run_with_controller_evidence(
+                run_id,
+                RunKey::Controller(name.to_owned()),
+                ordinal as i64 + 1,
+                TaskState::Queued,
+            );
+            task_run.updated_at_ms = Some(anchor_ms);
+            model.insert_task_run(task_run);
+        }
+        model.insert_execution(execution(attached, "live-attached", ExecState::Working));
+        let (mut reducer, shared) = Reducer::new(restored(model, 3));
+
+        reducer.sweep_stale(now_ms);
+
+        let snapshot = shared.borrow();
+        assert_eq!(
+            snapshot.task_run(&attached).unwrap().state,
+            TaskState::Queued
+        );
+        assert_eq!(
+            snapshot.task_run(&unattached).unwrap().state,
+            TaskState::EndedUnknown
+        );
+    }
+
+    #[test]
+    fn stale_sweep_leaves_dismissed_and_terminal_dispatch_only_runs_unchanged() {
+        let anchor_ms = 900;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let eligible = RunId::new();
+        let dismissed = RunId::new();
+        let terminal_states = [
+            TaskState::Completed,
+            TaskState::Failed,
+            TaskState::Cancelled,
+            TaskState::EndedUnknown,
+        ];
+        let mut model = DomainModel::default();
+        let mut eligible_run = run_with_controller_evidence(
+            eligible,
+            RunKey::Controller("eligible".to_owned()),
+            1,
+            TaskState::Queued,
+        );
+        eligible_run.updated_at_ms = Some(anchor_ms);
+        model.insert_task_run(eligible_run);
+        let mut dismissed_run = run_with_controller_evidence(
+            dismissed,
+            RunKey::Controller("dismissed-queued".to_owned()),
+            2,
+            TaskState::Queued,
+        );
+        dismissed_run.updated_at_ms = Some(anchor_ms);
+        dismissed_run.dismissed_at_ms = Some(anchor_ms + 1);
+        let expected_dismissed = dismissed_run.clone();
+        model.insert_task_run(dismissed_run);
+        let mut expected_terminal = HashMap::new();
+        for (index, state) in terminal_states.into_iter().enumerate() {
+            let run_id = RunId::new();
+            let mut task_run = run_with_controller_evidence(
+                run_id,
+                RunKey::Controller(format!("terminal-{state:?}")),
+                index as i64 + 3,
+                state,
+            );
+            task_run.updated_at_ms = Some(anchor_ms);
+            task_run.finished_at_ms = Some(anchor_ms);
+            expected_terminal.insert(run_id, task_run.clone());
+            model.insert_task_run(task_run);
+        }
+        let (mut reducer, shared) = Reducer::new(restored(model, 7));
+
+        reducer.sweep_stale(now_ms);
+
+        let snapshot = shared.borrow();
+        assert_eq!(
+            snapshot.task_run(&eligible).unwrap().state,
+            TaskState::EndedUnknown
+        );
+        assert_eq!(snapshot.task_run(&dismissed), Some(&expected_dismissed));
+        for (run_id, expected) in expected_terminal {
+            assert_eq!(snapshot.task_run(&run_id), Some(&expected));
+        }
+    }
+
+    #[test]
+    fn stale_sweep_closes_dispatch_only_run_without_stale_executions() {
+        let anchor_ms = 1_000;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let run_id = RunId::new();
+        let mut task_run = run_with_controller_evidence(
+            run_id,
+            RunKey::Controller("no-executions".to_owned()),
+            1,
+            TaskState::Queued,
+        );
+        task_run.updated_at_ms = Some(anchor_ms);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        assert_eq!(model.executions().count(), 0);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+        let publish_count = reducer.publish_count.get();
+
+        let persist = reducer.sweep_stale(now_ms);
+
+        assert_eq!(persist.len(), 1);
+        assert_eq!(reducer.publish_count.get() - publish_count, 1);
+        assert_eq!(
+            shared.borrow().task_run(&run_id).unwrap().state,
+            TaskState::EndedUnknown
+        );
+    }
+
+    #[test]
+    fn stale_sweep_combines_execution_and_dispatch_only_closures_in_one_publish() {
+        let anchor_ms = 1_100;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let dispatch_only = RunId::new();
+        let stale_run = RunId::new();
+        let mut dispatch_run = run_with_controller_evidence(
+            dispatch_only,
+            RunKey::Controller("combined-dispatch".to_owned()),
+            1,
+            TaskState::Queued,
+        );
+        dispatch_run.updated_at_ms = Some(anchor_ms);
+        let mut model = DomainModel::default();
+        model.insert_task_run(dispatch_run);
+        model.insert_task_run(run(
+            stale_run,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "combined-stale".to_owned(),
+            },
+            2,
+            TaskState::Running,
+        ));
+        model.insert_execution(execution(
+            stale_run,
+            "combined-stale",
+            ExecState::Stale {
+                since_ms: now_ms - super::STALE_GRACE_MS,
+            },
+        ));
+        let (mut reducer, shared) = Reducer::new(restored(model, 3));
+        let publish_count = reducer.publish_count.get();
+
+        let persist = reducer.sweep_stale(now_ms);
+
+        assert_eq!(reducer.publish_count.get() - publish_count, 1);
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertExecution(value)
+                if value.execution.execution_id == "combined-stale"
+                    && value.execution.state == ExecState::Ended
+        )));
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertTaskRun(value) if value.task_run.run_id == dispatch_only
+        )));
+        let snapshot = shared.borrow();
+        assert_eq!(
+            snapshot.task_run(&dispatch_only).unwrap().state,
+            TaskState::EndedUnknown
+        );
+        assert_eq!(
+            snapshot.execution("combined-stale").unwrap().state,
+            ExecState::Ended
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_only_closure_reopens_on_controller_task_started() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let anchor_ms = 1_200;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let run_id = RunId::new();
+        let mut task_run = run_with_controller_evidence(
+            run_id,
+            RunKey::Controller("reopen-started".to_owned()),
+            1,
+            TaskState::Queued,
+        );
+        task_run.updated_at_ms = Some(anchor_ms);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        assert!(!reducer.sweep_stale(now_ms).is_empty());
+        assert_eq!(
+            shared.borrow().task_run(&run_id).unwrap().state,
+            TaskState::EndedUnknown
+        );
+
+        let mut started = controller_event(
+            "reopen-started-event",
+            "reopen-started",
+            ControllerEventKind::TaskStarted,
+        );
+        started.metadata.timestamp_ms = now_ms + 1;
+        started.metadata.receipt_time_ms = now_ms + 1;
+        commit_controller(&mut reducer, &mut writer, started).await;
+
+        let snapshot = shared.borrow();
+        let reopened = snapshot.task_run(&run_id).unwrap();
+        assert_eq!(reopened.state, TaskState::Running);
+        assert_eq!(reopened.finished_at_ms, None);
+        assert_eq!(reopened.updated_at_ms, Some(now_ms + 1));
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn dispatch_only_closure_reopens_on_execution_begin() {
+        let anchor_ms = 1_300;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let run_id = RunId::new();
+        let mut task_run = run_with_controller_evidence(
+            run_id,
+            RunKey::Controller("reopen-execution".to_owned()),
+            1,
+            TaskState::Queued,
+        );
+        task_run.updated_at_ms = Some(anchor_ms);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        assert!(!reducer.sweep_stale(now_ms).is_empty());
+        assert_eq!(
+            shared.borrow().task_run(&run_id).unwrap().state,
+            TaskState::EndedUnknown
+        );
+        let mut begin_metadata = metadata("reopen-execution-event", now_ms + 1);
+        begin_metadata.terminal_id = Some("terminal-reopen".to_owned());
+
+        let outcome = reducer
+            .apply(NormalizedEvent::ExecutionBegin {
+                metadata: begin_metadata,
+                execution: Execution {
+                    execution_id: "reopen-execution-live".to_owned(),
+                    pane_id: "pane-reopen".to_owned(),
+                    terminal_id: "terminal-reopen".to_owned(),
+                    task_run_id: run_id,
+                    state: ExecState::Working,
+                },
+            })
+            .unwrap();
+        let ApplyOutcome::Applied(persist) = outcome else {
+            panic!("execution begin must apply");
+        };
+
+        let snapshot = shared.borrow();
+        let reopened = snapshot.task_run(&run_id).unwrap();
+        assert_eq!(reopened.state, TaskState::Running);
+        assert_eq!(reopened.finished_at_ms, None);
+        assert_eq!(reopened.updated_at_ms, Some(now_ms + 1));
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertTaskRun(value)
+                if value.task_run.run_id == run_id
+                    && value.task_run.state == TaskState::Running
+        )));
+    }
+
+    #[test]
+    fn dispatch_only_closure_is_immediately_dismissible() {
+        let anchor_ms = 1_400;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let run_id = RunId::new();
+        let mut task_run = run_with_controller_evidence(
+            run_id,
+            RunKey::Controller("immediately-clearable".to_owned()),
+            1,
+            TaskState::Queued,
+        );
+        task_run.updated_at_ms = Some(anchor_ms);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        assert!(!reducer.sweep_stale(now_ms).is_empty());
+        assert_eq!(
+            shared.borrow().task_run(&run_id).unwrap().state,
+            TaskState::EndedUnknown
+        );
+
+        let persist = reducer.apply_operator_command(OperatorCommand::DismissClearable, now_ms + 1);
+
+        assert_eq!(persist.len(), 1);
+        assert_eq!(
+            shared.borrow().task_run(&run_id).unwrap().dismissed_at_ms,
+            Some(now_ms + 1)
         );
     }
 
