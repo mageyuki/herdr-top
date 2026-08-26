@@ -74,9 +74,11 @@ impl LiveLineReadModel {
     }
 }
 
+#[derive(Clone, Copy)]
 struct RunRowSignals<'a> {
     live_lines: &'a LiveLineReadModel,
     stalled: bool,
+    show_duration_suffix: bool,
 }
 
 struct RunRowContext<'model, 'data> {
@@ -119,6 +121,7 @@ pub(crate) struct TreeRow {
     pub(crate) key: NodeKey,
     pub(crate) depth: usize,
     pub(crate) label: String,
+    pub(crate) label_without_duration_suffix: Option<String>,
     pub(crate) prerequisites: Vec<String>,
     pub(crate) dependents: Vec<String>,
 }
@@ -554,7 +557,14 @@ fn render_tree(
                 metric_width.saturating_add(1)
             };
             let label_width = width.saturating_sub(reserved_width);
-            let label = truncate_to_width(&format!("{marker}{prefix}{}", row.label), label_width);
+            let painted_label = if columns.contains(&MetricColumn::Time) {
+                row.label_without_duration_suffix
+                    .as_deref()
+                    .unwrap_or(&row.label)
+            } else {
+                &row.label
+            };
+            let label = truncate_to_width(&format!("{marker}{prefix}{painted_label}"), label_width);
             let text = if columns.is_empty() {
                 label
             } else {
@@ -1473,6 +1483,7 @@ pub(crate) fn build_tree_rows(
         key: NodeKey::Session,
         depth: 0,
         label: format!("Session: {}", state.session_display_name()),
+        label_without_duration_suffix: None,
         prerequisites: Vec::new(),
         dependents: Vec::new(),
     }];
@@ -1560,6 +1571,7 @@ fn append_execution_tree_rows<'model>(
             key: NodeKey::Workspace(workspace.workspace_id.clone()),
             depth: 1,
             label: format!("Workspace: {}", safe_text(&workspace.workspace_id)),
+            label_without_duration_suffix: None,
             prerequisites: Vec::new(),
             dependents: Vec::new(),
         });
@@ -1581,6 +1593,7 @@ fn append_execution_tree_rows<'model>(
                 key: NodeKey::Tab(tab.tab_id.clone()),
                 depth: 2,
                 label: topology_row_label("Tab", &tab.tab_id, tab.label.as_deref()),
+                label_without_duration_suffix: None,
                 prerequisites: Vec::new(),
                 dependents: Vec::new(),
             });
@@ -1604,6 +1617,7 @@ fn append_execution_tree_rows<'model>(
                     key: NodeKey::Pane(pane.pane_id.clone()),
                     depth: 3,
                     label: topology_row_label("Pane", &pane.pane_id, pane.display_name.as_deref()),
+                    label_without_duration_suffix: None,
                     prerequisites: Vec::new(),
                     dependents: Vec::new(),
                 });
@@ -1626,6 +1640,7 @@ fn append_execution_tree_rows<'model>(
             key: NodeKey::UnattachedGroup,
             depth: 1,
             label: "Unattached Task Runs".to_owned(),
+            label_without_duration_suffix: None,
             prerequisites: Vec::new(),
             dependents: Vec::new(),
         });
@@ -1814,6 +1829,12 @@ fn append_run_subtree(
         render_state.ancestors.remove(&run_id);
         return;
     };
+    let newest_agent = context.newest_agents.get(&run_id).copied();
+    let signals = RunRowSignals {
+        live_lines: context.live_lines,
+        stalled: context.stalled_runs.contains(&run_id),
+        show_duration_suffix: true,
+    };
     rows.push(TreeRow {
         key: NodeKey::Run {
             run_id,
@@ -1825,13 +1846,22 @@ fn append_run_subtree(
             run,
             shared,
             context.now_ms,
-            context.newest_agents.get(&run_id).copied(),
+            newest_agent,
+            show_dispatch_parent,
+            signals,
+        ),
+        label_without_duration_suffix: Some(task_run_label_for_placement(
+            context.model,
+            run,
+            shared,
+            context.now_ms,
+            newest_agent,
             show_dispatch_parent,
             RunRowSignals {
-                live_lines: context.live_lines,
-                stalled: context.stalled_runs.contains(&run_id),
+                show_duration_suffix: false,
+                ..signals
             },
-        ),
+        )),
         prerequisites: Vec::new(),
         dependents: Vec::new(),
     });
@@ -1918,6 +1948,7 @@ fn append_agent_subtree(
         },
         depth,
         label: agent_node_label(agent),
+        label_without_duration_suffix: None,
         prerequisites: Vec::new(),
         dependents: Vec::new(),
     });
@@ -1966,9 +1997,12 @@ pub(crate) fn task_run_label(
     shared: bool,
     now_ms: i64,
     stalled: bool,
+    show_duration_suffix: bool,
 ) -> String {
     let mut label = run_row_head(model, run, stalled);
-    append_run_duration(&mut label, run, now_ms);
+    if show_duration_suffix {
+        append_run_duration(&mut label, run, now_ms);
+    }
     append_task_run_annotations(model, run, label, shared, true)
 }
 
@@ -1988,6 +2022,7 @@ fn task_run_label_for_placement(
         now_ms,
         signals.live_lines,
         signals.stalled,
+        signals.show_duration_suffix,
     );
     append_task_run_annotations(model, run, label, shared, show_dispatch_parent)
 }
@@ -2071,6 +2106,7 @@ fn run_row_label(model: &DomainModel, run: &TaskRun, now_ms: i64) -> String {
         now_ms,
         &LiveLineReadModel::default(),
         stalled,
+        true,
     )
 }
 
@@ -2081,6 +2117,7 @@ fn run_row_label_with_agent(
     now_ms: i64,
     live_lines: &LiveLineReadModel,
     stalled: bool,
+    show_duration_suffix: bool,
 ) -> String {
     let mut label = run_row_head(model, run, stalled);
     let live_line = live_lines.get(&run.run_id).map(str::to_owned).or_else(|| {
@@ -2107,7 +2144,9 @@ fn run_row_label_with_agent(
         label.push_str(" — ");
         label.push_str(&live_line);
     }
-    append_run_duration(&mut label, run, now_ms);
+    if show_duration_suffix {
+        append_run_duration(&mut label, run, now_ms);
+    }
     label
 }
 
@@ -2505,7 +2544,7 @@ mod tests {
             let model = DomainModel::default();
 
             assert_eq!(
-                run_row_label_with_agent(&model, &run, None, 1_000, &live_lines, stalled,),
+                run_row_label_with_agent(&model, &run, None, 1_000, &live_lines, stalled, true,),
                 format!("{glyph} claude-code subject")
             );
         }
@@ -2584,11 +2623,11 @@ mod tests {
         let live_lines = LiveLineReadModel::default();
 
         assert_eq!(
-            run_row_label_with_agent(&model, &root, None, 0, &live_lines, false),
+            run_row_label_with_agent(&model, &root, None, 0, &live_lines, false, true),
             "● Codex root subject"
         );
         assert_eq!(
-            run_row_label_with_agent(&model, &worker, None, 0, &live_lines, false),
+            run_row_label_with_agent(&model, &worker, None, 0, &live_lines, false, true),
             "● Codex"
         );
     }
@@ -2776,6 +2815,7 @@ mod tests {
                 key: NodeKey::Workspace("preceding-workspace".to_owned()),
                 depth: 1,
                 label: "preceding-workspace".to_owned(),
+                label_without_duration_suffix: None,
                 prerequisites: Vec::new(),
                 dependents: Vec::new(),
             },
@@ -2783,6 +2823,7 @@ mod tests {
                 key: NodeKey::UnattachedGroup,
                 depth: 1,
                 label: "Unattached Task Runs".to_owned(),
+                label_without_duration_suffix: None,
                 prerequisites: Vec::new(),
                 dependents: Vec::new(),
             },
@@ -2790,6 +2831,7 @@ mod tests {
                 key: selected.clone(),
                 depth: 2,
                 label: "unattached".to_owned(),
+                label_without_duration_suffix: None,
                 prerequisites: Vec::new(),
                 dependents: Vec::new(),
             },
@@ -3182,11 +3224,11 @@ mod tests {
         });
 
         assert_eq!(
-            task_run_label(&model, &child, true, 10, false),
+            task_run_label(&model, &child, true, 10, false, true),
             "● claude-code Shared child [shared] [dispatched by: Parent]"
         );
         assert_eq!(
-            task_run_label(&model, &orphan, false, 10, false),
+            task_run_label(&model, &orphan, false, 10, false, true),
             "◌ codex Orphan [unlinked]"
         );
     }
@@ -3704,6 +3746,7 @@ mod tests {
             key,
             depth,
             label: label.to_owned(),
+            label_without_duration_suffix: None,
             prerequisites: Vec::new(),
             dependents: Vec::new(),
         })
@@ -3782,6 +3825,7 @@ mod tests {
             key: NodeKey::Session,
             depth: max_depth,
             label: "deep".to_owned(),
+            label_without_duration_suffix: None,
             prerequisites: Vec::new(),
             dependents: Vec::new(),
         }];
@@ -3841,6 +3885,7 @@ mod tests {
             },
             depth: 12,
             label: "● Codex deeply nested work".to_owned(),
+            label_without_duration_suffix: None,
             prerequisites: Vec::new(),
             dependents: Vec::new(),
         }];

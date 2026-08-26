@@ -1,6 +1,6 @@
 //! T7 reducer state machines, ordinal allocator, and gap reconciliation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -264,6 +264,20 @@ pub enum CommitStagedError {
     IngestSequenceExhausted,
 }
 
+/// Maximum unattributed provider-usage samples retained across all run scopes.
+///
+/// The reducer evicts the globally oldest sample first. Since each retained sample has exactly
+/// one [`RunKey`], this also bounds the number of pending scopes.
+const PENDING_TELEMETRY_SAMPLE_CAPACITY: usize = 4_096;
+
+#[derive(Clone, Debug)]
+struct PendingTelemetry {
+    at_ms: i64,
+    output_tokens: u64,
+    token_breakdown: crate::model::TokenBreakdown,
+    attribution: crate::model::TurnAttr,
+}
+
 /// Serialized owner of domain transitions and display-ordinal allocation.
 pub struct Reducer {
     model: DomainModel,
@@ -271,6 +285,9 @@ pub struct Reducer {
     next_ingest_seq: Option<i64>,
     terminal_event_sources: HashMap<RunId, String>,
     non_lane_task_state_runs: HashSet<RunId>,
+    pending_telemetry: HashMap<RunKey, VecDeque<PendingTelemetry>>,
+    pending_telemetry_order: VecDeque<RunKey>,
+    pending_telemetry_count: usize,
     publisher: watch::Sender<Arc<DomainModel>>,
     operator: OperatorProjection,
     #[cfg(test)]
@@ -334,6 +351,9 @@ impl Reducer {
                 next_ingest_seq: restored.next_ingest_seq,
                 terminal_event_sources: HashMap::new(),
                 non_lane_task_state_runs: HashSet::new(),
+                pending_telemetry: HashMap::new(),
+                pending_telemetry_order: VecDeque::new(),
+                pending_telemetry_count: 0,
                 publisher,
                 operator,
                 #[cfg(test)]
@@ -393,6 +413,28 @@ impl Reducer {
     /// Applies one normalized event and publishes exactly one resulting snapshot.
     pub fn apply(&mut self, event: NormalizedEvent) -> Result<ApplyOutcome, ReducerError> {
         self.apply_observation(vec![event])
+    }
+
+    /// Applies one globally unambiguous sessionless Codex pane binding.
+    pub(crate) fn apply_heuristic_binding(
+        &mut self,
+        run: RunId,
+        sid: String,
+        bookkeeping_time_ms: i64,
+    ) -> ApplyOutcome {
+        let plan = plan_binding(
+            &self.model,
+            &BindingEvidence::HeuristicNativeSession { run, sid },
+        );
+        let mut persist = match apply_binding_plan_at(&mut self.model, plan, bookkeeping_time_ms) {
+            Ok(persist) => persist,
+            Err(conflict) => return ApplyOutcome::DroppedBindingConflict(conflict),
+        };
+        self.recompute_dangling_announcement_components();
+        normalize_persist_batch_lineage(&mut persist);
+        self.operator.apply_submission(&persist);
+        self.publish();
+        ApplyOutcome::Applied(persist)
     }
 
     /// Applies one source observation and publishes exactly one resulting snapshot.
@@ -593,6 +635,10 @@ impl Reducer {
     }
 
     /// Accumulates one lane-deduplicated token sample in transient model state.
+    ///
+    /// Samples observed before their run exists remain transiently queued until any subsequent
+    /// model publication exposes that run. The pending queue is globally FIFO-bounded by
+    /// [`PENDING_TELEMETRY_SAMPLE_CAPACITY`].
     pub fn apply_telemetry_with_breakdown(
         &mut self,
         key: &RunKey,
@@ -601,10 +647,30 @@ impl Reducer {
         token_breakdown: crate::model::TokenBreakdown,
         attribution: crate::model::TurnAttr,
     ) -> Vec<PersistOp> {
-        let Some(task_run) = self.model.task_run_by_key(key) else {
-            return Vec::new();
+        let sample = PendingTelemetry {
+            at_ms,
+            output_tokens,
+            token_breakdown,
+            attribution,
         };
-        let run_id = task_run.run_id;
+        if self.model.task_run_by_key(key).is_some() {
+            let applied = self.accumulate_telemetry(key, sample);
+            debug_assert!(applied, "an existing telemetry run must remain resolvable");
+            self.publish();
+        } else {
+            self.enqueue_pending_telemetry(key.clone(), sample);
+        }
+        Vec::new()
+    }
+
+    fn accumulate_telemetry(&mut self, key: &RunKey, sample: PendingTelemetry) -> bool {
+        let Some(run_id) = self
+            .model
+            .task_run_by_key(key)
+            .map(|task_run| task_run.run_id)
+        else {
+            return false;
+        };
         let retain_turn = matches!(
             key,
             RunKey::Native {
@@ -612,17 +678,78 @@ impl Reducer {
                 ..
             }
         );
-        let telemetry = self.model.telemetry_entry(run_id, at_ms);
-        telemetry.token_breakdown.accumulate(token_breakdown);
+        let telemetry = self.model.telemetry_entry(run_id, sample.at_ms);
+        telemetry.token_breakdown.accumulate(sample.token_breakdown);
         telemetry.accumulate(
-            output_tokens,
-            attribution.model,
-            attribution.effort,
-            attribution.sandbox,
+            sample.output_tokens,
+            sample.attribution.model,
+            sample.attribution.effort,
+            sample.attribution.sandbox,
             retain_turn,
         );
-        self.publish();
-        Vec::new()
+        true
+    }
+
+    fn enqueue_pending_telemetry(&mut self, key: RunKey, sample: PendingTelemetry) {
+        while self.pending_telemetry_count >= PENDING_TELEMETRY_SAMPLE_CAPACITY {
+            if !self.evict_oldest_pending_telemetry() {
+                break;
+            }
+        }
+        self.pending_telemetry
+            .entry(key.clone())
+            .or_default()
+            .push_back(sample);
+        self.pending_telemetry_order.push_back(key);
+        self.pending_telemetry_count += 1;
+    }
+
+    fn evict_oldest_pending_telemetry(&mut self) -> bool {
+        while let Some(key) = self.pending_telemetry_order.pop_front() {
+            let Some(samples) = self.pending_telemetry.get_mut(&key) else {
+                continue;
+            };
+            if samples.pop_front().is_none() {
+                continue;
+            }
+            self.pending_telemetry_count -= 1;
+            if samples.is_empty() {
+                self.pending_telemetry.remove(&key);
+            }
+            return true;
+        }
+        debug_assert_eq!(self.pending_telemetry_count, 0);
+        // Self-heal the counter after exhausting the authoritative eviction order.
+        self.pending_telemetry_count = 0;
+        false
+    }
+
+    fn apply_pending_telemetry_for_known_runs(&mut self) {
+        let mut seen = HashSet::new();
+        let ready = self
+            .pending_telemetry_order
+            .iter()
+            .filter(|key| self.model.task_run_by_key(key).is_some())
+            .filter(|key| seen.insert((*key).clone()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let ready_keys = ready.iter().cloned().collect::<HashSet<_>>();
+        self.pending_telemetry_order
+            .retain(|pending_key| !ready_keys.contains(pending_key));
+        for key in ready {
+            let Some(samples) = self.pending_telemetry.remove(&key) else {
+                continue;
+            };
+            self.pending_telemetry_count =
+                self.pending_telemetry_count.saturating_sub(samples.len());
+            for sample in samples {
+                let applied = self.accumulate_telemetry(&key, sample);
+                debug_assert!(
+                    applied,
+                    "a ready pending-telemetry run must remain resolvable"
+                );
+            }
+        }
     }
 
     /// Closes one active provider-log run after append inactivity.
@@ -666,6 +793,8 @@ impl Reducer {
             || event.metadata.source.is_empty()
             || event.task_run_id.is_empty()
             || event.metadata.native_session_id.is_some() && event.metadata.provider.is_none()
+            || event.metadata.source == crate::provider::lane::SOURCE_LOG_LANE
+                && event.metadata.timestamp_ms <= 0
             || event
                 .metadata
                 .progress
@@ -817,7 +946,7 @@ impl Reducer {
                     .ensure_controller_placeholder(
                         edge.parent_run_id,
                         Some(parent_task_run_id),
-                        metadata.receipt_time_ms,
+                        Self::run_bookkeeping_time_ms(&metadata),
                         &mut persist,
                     )
                     .map_err(|_| RejectReason::Conflict)?;
@@ -827,7 +956,7 @@ impl Reducer {
                     .ensure_controller_placeholder(
                         edge.prerequisite_run_id,
                         Some(depends_on_id),
-                        metadata.receipt_time_ms,
+                        Self::run_bookkeeping_time_ms(&metadata),
                         &mut persist,
                     )
                     .map_err(|_| RejectReason::Conflict)?;
@@ -1176,13 +1305,13 @@ impl Reducer {
             self.ensure_controller_placeholder(
                 edge.parent_run_id,
                 None,
-                metadata.receipt_time_ms,
+                Self::run_bookkeeping_time_ms(metadata),
                 persist,
             )?;
             self.ensure_controller_placeholder(
                 edge.child_run_id,
                 None,
-                metadata.receipt_time_ms,
+                Self::run_bookkeeping_time_ms(metadata),
                 persist,
             )?;
         }
@@ -1190,13 +1319,13 @@ impl Reducer {
             self.ensure_controller_placeholder(
                 edge.prerequisite_run_id,
                 None,
-                metadata.receipt_time_ms,
+                Self::run_bookkeeping_time_ms(metadata),
                 persist,
             )?;
             self.ensure_controller_placeholder(
                 edge.dependent_run_id,
                 None,
-                metadata.receipt_time_ms,
+                Self::run_bookkeeping_time_ms(metadata),
                 persist,
             )?;
         }
@@ -1212,6 +1341,7 @@ impl Reducer {
         if self.model.task_run(&execution.task_run_id).is_some() {
             return Ok(());
         }
+        let timestamp_ms = Self::run_bookkeeping_time_ms(metadata);
         let ordinal = self.allocate_ordinal()?;
         let native_key = metadata
             .provider
@@ -1223,7 +1353,7 @@ impl Reducer {
             });
         let key = match native_key {
             Some(key) if self.model.task_run_by_key(&key).is_none() => key,
-            _ => provisional_key(&execution.terminal_id, metadata.receipt_time_ms, ordinal),
+            _ => provisional_key(&execution.terminal_id, timestamp_ms, ordinal),
         };
         let mut task_run = TaskRun {
             run_id: execution.task_run_id,
@@ -1237,9 +1367,9 @@ impl Reducer {
             subject: None,
             dismissed_at_ms: None,
         };
-        Self::stamp_new_task_run(&mut task_run, metadata.receipt_time_ms);
+        Self::stamp_new_task_run(&mut task_run, timestamp_ms);
         self.model.insert_task_run(task_run.clone());
-        persist.push(self.persist_task_run(task_run, metadata.receipt_time_ms));
+        persist.push(self.persist_task_run(task_run, timestamp_ms));
         Ok(())
     }
 
@@ -1255,6 +1385,7 @@ impl Reducer {
         if self.model.task_run(&run_id).is_some() {
             return Ok(());
         }
+        let timestamp_ms = Self::run_bookkeeping_time_ms(metadata);
         let ordinal = self.allocate_ordinal()?;
         let native_key = metadata
             .provider
@@ -1274,7 +1405,7 @@ impl Reducer {
                         .terminal_id
                         .as_deref()
                         .map_or("unknown-terminal", |terminal_id| terminal_id),
-                    metadata.receipt_time_ms,
+                    timestamp_ms,
                     ordinal,
                 ),
             }
@@ -1291,9 +1422,9 @@ impl Reducer {
             subject: None,
             dismissed_at_ms: None,
         };
-        Self::stamp_new_task_run(&mut task_run, metadata.receipt_time_ms);
+        Self::stamp_new_task_run(&mut task_run, timestamp_ms);
         self.model.insert_task_run(task_run.clone());
-        persist.push(self.persist_task_run(task_run, metadata.receipt_time_ms));
+        persist.push(self.persist_task_run(task_run, timestamp_ms));
         Ok(())
     }
 
@@ -1334,6 +1465,7 @@ impl Reducer {
         allow_lane_reopen: bool,
         persist: &mut PersistBatch,
     ) {
+        let timestamp_ms = Self::run_bookkeeping_time_ms(metadata);
         if let (Some(run_id), Some(target)) = (metadata.task_run_id, metadata.task_state)
             && let Some(mut task_run) = self.model.task_run(&run_id).cloned()
         {
@@ -1357,9 +1489,9 @@ impl Reducer {
             {
                 task_run.subject = Some(label.clone());
             }
-            Self::touch_task_run(&mut task_run, metadata.receipt_time_ms);
+            Self::touch_task_run(&mut task_run, timestamp_ms);
             self.model.insert_task_run(task_run.clone());
-            persist.push(self.persist_task_run(task_run, metadata.receipt_time_ms));
+            persist.push(self.persist_task_run(task_run, timestamp_ms));
         }
 
         if let Some(edge) = &metadata.execution_parent
@@ -1387,8 +1519,8 @@ impl Reducer {
         source: &str,
         source_timestamp_ms: i64,
     ) -> bool {
-        // Source time is otherwise display-only. Replay receipt time is "now", so this narrow
-        // comparison is the only way to distinguish a genuine resume from replayed history.
+        // A strictly newer source fact is the only way to distinguish a genuine resume from
+        // replayed history after a lane-authored terminal.
         let start_follows_completion = self.model.task_run(&run_id).is_some_and(|run| {
             run.state == TaskState::Completed
                 && run
@@ -1824,6 +1956,7 @@ impl Reducer {
         metadata: &EventMetadata,
         persist: &mut PersistBatch,
     ) -> Result<(), ReducerError> {
+        let timestamp_ms = Self::run_bookkeeping_time_ms(metadata);
         let event_run = match event {
             NormalizedEvent::ControllerEvent { .. } => None,
             NormalizedEvent::ExecutionBegin { execution, .. } => Some(execution.task_run_id),
@@ -1873,7 +2006,7 @@ impl Reducer {
                     sid: sid.to_owned(),
                 }
             };
-            self.apply_binding(evidence, metadata.receipt_time_ms, persist)?;
+            self.apply_binding(evidence, timestamp_ms, persist)?;
         }
 
         if matches!(
@@ -1887,7 +2020,7 @@ impl Reducer {
                     controller_run: run_id,
                     terminal_id: terminal_id.to_owned(),
                 },
-                metadata.receipt_time_ms,
+                timestamp_ms,
                 persist,
             )?;
         }
@@ -1896,11 +2029,7 @@ impl Reducer {
             && let Some(current) = self.model.execution(&execution.execution_id)
             && !current.state.is_terminal()
         {
-            self.activate_for_live_execution(
-                current.task_run_id,
-                metadata.receipt_time_ms,
-                persist,
-            );
+            self.activate_for_live_execution(current.task_run_id, timestamp_ms, persist);
         }
         Ok(())
     }
@@ -1908,14 +2037,14 @@ impl Reducer {
     fn apply_binding(
         &mut self,
         evidence: BindingEvidence,
-        receipt_time_ms: i64,
+        bookkeeping_time_ms: i64,
         persist: &mut PersistBatch,
     ) -> Result<(), ReducerError> {
         let plan = plan_binding(&self.model, &evidence);
         persist.extend(apply_binding_plan_at(
             &mut self.model,
             plan,
-            receipt_time_ms,
+            bookkeeping_time_ms,
         )?);
         Ok(())
     }
@@ -2219,7 +2348,20 @@ impl Reducer {
     }
 
     fn touch_task_run(task_run: &mut TaskRun, timestamp_ms: i64) {
-        task_run.touch(timestamp_ms);
+        task_run.touch(
+            task_run
+                .updated_at_ms
+                .unwrap_or(timestamp_ms)
+                .max(timestamp_ms),
+        );
+    }
+
+    fn run_bookkeeping_time_ms(metadata: &EventMetadata) -> i64 {
+        if metadata.source == crate::provider::lane::SOURCE_LOG_LANE {
+            metadata.timestamp_ms
+        } else {
+            metadata.receipt_time_ms
+        }
     }
 
     fn allocate_ordinal(&mut self) -> Result<DisplayOrdinal, ReducerError> {
@@ -2282,6 +2424,7 @@ impl Reducer {
         }
         // Dispatch-only closure must run even when no execution reaches its stale deadline.
         persist.extend(self.close_inactive_dispatch_only_runs(now_ms));
+        persist.extend(self.close_inactive_fact_timed_runs(now_ms));
         if persist.is_empty() {
             return persist;
         }
@@ -2322,6 +2465,49 @@ impl Reducer {
             Self::touch_task_run(&mut task_run, now_ms);
             self.model.insert_task_run(task_run.clone());
             persist.push(self.persist_task_run(task_run, now_ms));
+        }
+        persist
+    }
+
+    fn close_inactive_fact_timed_runs(&mut self, now_ms: i64) -> PersistBatch {
+        let runs_with_live_executions: HashSet<_> = self
+            .model
+            .executions()
+            .filter(|execution| !execution.state.is_terminal())
+            .map(|execution| execution.task_run_id)
+            .collect();
+        let mut candidates: Vec<_> = self
+            .model
+            .task_runs()
+            .filter(|run| {
+                matches!(
+                    (&run.key, run.state),
+                    (RunKey::Controller(_), TaskState::Running)
+                        | (RunKey::Provisional { .. }, TaskState::Running)
+                )
+            })
+            .filter(|run| run.dismissed_at_ms.is_none())
+            .filter(|run| !self.non_lane_task_state_runs.contains(&run.run_id))
+            .filter(|run| !runs_with_live_executions.contains(&run.run_id))
+            .filter_map(|run| {
+                let anchor_ms = run.updated_at_ms.or(run.created_at_ms)?;
+                (now_ms.saturating_sub(anchor_ms) >= activity::headless_inactivity_ms())
+                    .then_some((run.run_id, anchor_ms))
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|(run_id, _)| *run_id);
+
+        let mut persist = Vec::with_capacity(candidates.len());
+        for (run_id, anchor_ms) in candidates {
+            let mut task_run = self
+                .model
+                .task_run(&run_id)
+                .cloned()
+                .expect("collected task run must remain present");
+            task_run.state = TaskState::EndedUnknown;
+            Self::touch_task_run(&mut task_run, anchor_ms);
+            self.model.insert_task_run(task_run.clone());
+            persist.push(self.persist_task_run(task_run, anchor_ms));
         }
         persist
     }
@@ -2380,7 +2566,8 @@ impl Reducer {
             .set_dangling_announcement_components(count);
     }
 
-    fn publish(&self) {
+    fn publish(&mut self) {
+        self.apply_pending_telemetry_for_known_runs();
         #[cfg(test)]
         self.publish_count.set(self.publish_count.get() + 1);
         // increment5-workload-harness: begin reducer clone publication timing start
@@ -2787,8 +2974,11 @@ mod tests {
         TopologyEntityId, TopologySnapshot, TurnAttr, Workspace,
     };
     use crate::provider::ProviderEvent;
-    use crate::provider::facts::{LogFact, SessionScope};
-    use crate::provider::lane::{Admission, AdmissionIndex, SOURCE_LOG_LANE, Synthesis};
+    use crate::provider::claude_facts::{extract_claude_line, extract_meta_json};
+    use crate::provider::facts::{EvidenceId, LogFact, SessionScope};
+    use crate::provider::lane::{
+        Admission, AdmissionIndex, SOURCE_LOG_LANE, Synthesis, run_key_for_scope,
+    };
     use crate::store::{
         NativeSessionBinding, PersistOp, PersistTaskRun, RestoredState, WriterClient,
         database_path, open_reader, open_writer, spawn_writer,
@@ -3019,6 +3209,20 @@ mod tests {
         }
     }
 
+    fn provider_lane_event(
+        event_id: &str,
+        raw_run_id: &str,
+        event: ControllerEventKind,
+        timestamp_ms: i64,
+        receipt_time_ms: i64,
+    ) -> ControllerEvent {
+        let mut event = controller_event(event_id, raw_run_id, event);
+        event.metadata.source = SOURCE_LOG_LANE.to_owned();
+        event.metadata.timestamp_ms = timestamp_ms;
+        event.metadata.receipt_time_ms = receipt_time_ms;
+        event
+    }
+
     #[test]
     fn provider_diagnostics_handle_lands_counters_in_shared_model() {
         let (reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
@@ -3086,6 +3290,103 @@ mod tests {
             reducer.validate_controller_event(&event),
             Err(RejectReason::Invalid)
         ));
+    }
+
+    #[test]
+    fn provider_lane_run_uses_fact_time_while_event_keeps_receipt_time() {
+        let fact_time_ms = 100;
+        let receipt_time_ms = 10_000;
+        let reducer = Reducer::new(restored(DomainModel::default(), 1)).0;
+        let delta = reducer
+            .validate_controller_event(&provider_lane_event(
+                "fact-time-started",
+                "fact-time-run",
+                ControllerEventKind::TaskStarted,
+                fact_time_ms,
+                receipt_time_ms,
+            ))
+            .unwrap();
+
+        let run = delta
+            .post_model
+            .task_run_by_key(&RunKey::Controller("fact-time-run".to_owned()))
+            .unwrap();
+        assert_eq!(run.created_at_ms, Some(fact_time_ms));
+        assert_eq!(run.updated_at_ms, Some(fact_time_ms));
+        assert!(delta.batch.iter().any(|operation| matches!(
+            operation,
+            PersistOp::RecordEvent { seen_at_ms, event }
+                if *seen_at_ms == receipt_time_ms
+                    && super::event_metadata(event).receipt_time_ms == receipt_time_ms
+                    && super::event_metadata(event).timestamp_ms == fact_time_ms
+        )));
+    }
+
+    #[test]
+    fn provider_lane_zero_fact_time_is_rejected_before_run_minting() {
+        let reducer = Reducer::new(restored(DomainModel::default(), 1)).0;
+
+        assert!(matches!(
+            reducer.validate_controller_event(&provider_lane_event(
+                "zero-fact-time",
+                "zero-fact-time-run",
+                ControllerEventKind::TaskStarted,
+                0,
+                10_000,
+            )),
+            Err(RejectReason::Invalid)
+        ));
+        assert!(
+            reducer
+                .model
+                .task_run_by_key(&RunKey::Controller("zero-fact-time-run".to_owned()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn older_provider_fact_does_not_regress_run_timestamp() {
+        let reducer = Reducer::new(restored(DomainModel::default(), 1)).0;
+        let started = reducer
+            .validate_controller_event(&provider_lane_event(
+                "monotonic-started",
+                "monotonic-run",
+                ControllerEventKind::TaskStarted,
+                200,
+                1_000,
+            ))
+            .unwrap();
+        let run_id = started
+            .post_model
+            .task_run_by_key(&RunKey::Controller("monotonic-run".to_owned()))
+            .unwrap()
+            .run_id;
+        let reducer = Reducer::new(RestoredState {
+            model: started.post_model,
+            next_ordinal: started.post_next_ordinal,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        })
+        .0;
+
+        let progressed = reducer
+            .validate_controller_event(&provider_lane_event(
+                "monotonic-older-progress",
+                "monotonic-run",
+                ControllerEventKind::Progress,
+                100,
+                2_000,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            progressed
+                .post_model
+                .task_run(&run_id)
+                .unwrap()
+                .updated_at_ms,
+            Some(200)
+        );
     }
 
     fn controller_model(raw_run_id: &str, state: TaskState) -> (DomainModel, RunId) {
@@ -3703,6 +4004,530 @@ mod tests {
             assert_eq!(second, &first);
         }
         lifecycle.shutdown().await.unwrap();
+    }
+
+    const WORKER_PARENT: &str = "13f03635-c1f6-46e2-8e52-83d217b6f01c";
+    const WORKER_AGENT: &str = "a7189abbf3c5741ac";
+    const WORKER_MODEL: &str = "claude-sonnet-5";
+    const WORKER_EFFORT: &str = "high";
+    const WORKER_OUTPUT_TOKENS: u64 = 843;
+
+    fn worker_scope(agent_id: &str) -> SessionScope {
+        SessionScope::ClaudeSubagent {
+            parent: WORKER_PARENT.to_owned(),
+            agent_id: agent_id.to_owned(),
+        }
+    }
+
+    fn worker_transcript_events(
+        synthesis: &mut Synthesis,
+        scope: &SessionScope,
+        artifact: &Path,
+        admission: &mut Admission,
+        discovered: &AdmissionIndex,
+    ) -> Vec<ProviderEvent> {
+        let facts = include_str!("../tests/fixtures/provider-logs/claude-subagent.jsonl")
+            .lines()
+            .enumerate()
+            .flat_map(|(ordinal, line)| {
+                extract_claude_line(scope, line)
+                    .into_iter()
+                    .map(move |fact| (u64::try_from(ordinal).unwrap(), fact))
+            })
+            .collect::<Vec<_>>();
+        synthesis.synthesize_batch(artifact, facts, admission, discovered)
+    }
+
+    fn worker_meta_events(
+        synthesis: &mut Synthesis,
+        agent_id: &str,
+        artifact: &Path,
+        modified_ms: i64,
+        admission: &mut Admission,
+        discovered: &AdmissionIndex,
+    ) -> Vec<ProviderEvent> {
+        let fact = extract_meta_json(
+            WORKER_PARENT,
+            agent_id,
+            modified_ms,
+            include_bytes!("../tests/fixtures/provider-logs/claude-subagent-meta.json"),
+        )
+        .expect("the real-shape worker metadata fixture must parse");
+        synthesis.synthesize_batch(artifact, [(0, fact)], admission, discovered)
+    }
+
+    fn assert_worker_telemetry(telemetry: &crate::model::RunTelemetry) {
+        assert_eq!(telemetry.model.as_deref(), Some(WORKER_MODEL));
+        assert_eq!(telemetry.effort.as_deref(), Some(WORKER_EFFORT));
+        assert_eq!(telemetry.output_tokens, WORKER_OUTPUT_TOKENS);
+        assert_eq!(telemetry.token_breakdown.input_tokens, Some(663));
+        assert_eq!(telemetry.token_breakdown.cached_input_tokens, Some(224));
+        assert_eq!(telemetry.token_breakdown.cache_write_input_tokens, Some(96));
+    }
+
+    async fn apply_worker_transcript_then_meta(
+        reducer: &mut Reducer,
+        writer: &mut WriterClient,
+        synthesis: &mut Synthesis,
+        scope: &SessionScope,
+        admission: &mut Admission,
+        discovered: &AdmissionIndex,
+    ) {
+        let SessionScope::ClaudeSubagent { agent_id, .. } = scope else {
+            panic!("worker fixture scope must be a Claude lineage child");
+        };
+        let transcript = std::path::PathBuf::from(format!("agent-{agent_id}.jsonl"));
+        let transcript_events =
+            worker_transcript_events(synthesis, scope, &transcript, admission, discovered);
+        apply_telemetry_fixture_events(reducer, writer, transcript_events).await;
+        let meta = std::path::PathBuf::from(format!("agent-{agent_id}.meta.json"));
+        let meta_events = worker_meta_events(
+            synthesis,
+            agent_id,
+            &meta,
+            1_800_000_000_000,
+            admission,
+            discovered,
+        );
+        apply_telemetry_fixture_events(reducer, writer, meta_events).await;
+    }
+
+    #[tokio::test]
+    async fn real_shape_worker_usage_preceding_meta_is_attributed() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let scope = worker_scope(WORKER_AGENT);
+        let mut synthesis = Synthesis::default();
+        let mut admission = Admission::new(0);
+        let discovered = AdmissionIndex::new();
+
+        apply_worker_transcript_then_meta(
+            &mut reducer,
+            &mut writer,
+            &mut synthesis,
+            &scope,
+            &mut admission,
+            &discovered,
+        )
+        .await;
+
+        let snapshot = shared.borrow();
+        let run = snapshot
+            .task_run_by_key(&run_key_for_scope(&scope))
+            .expect("worker metadata must mint the lineage-child run");
+        let telemetry = snapshot
+            .telemetry(&run.run_id)
+            .expect("usage preceding worker metadata must be attributed");
+        assert_worker_telemetry(telemetry);
+        drop(snapshot);
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn real_shape_worker_restart_rebackfill_is_identical() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let scope = worker_scope(WORKER_AGENT);
+        let key = run_key_for_scope(&scope);
+
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let mut synthesis = Synthesis::default();
+        let mut admission = Admission::new(0);
+        apply_worker_transcript_then_meta(
+            &mut reducer,
+            &mut writer,
+            &mut synthesis,
+            &scope,
+            &mut admission,
+            &AdmissionIndex::new(),
+        )
+        .await;
+        let run_id = shared.borrow().task_run_by_key(&key).unwrap().run_id;
+        let first = shared.borrow().telemetry(&run_id).cloned();
+        lifecycle.shutdown().await.unwrap();
+
+        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+        assert!(restored.model.telemetry(&run_id).is_none());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored);
+        let mut synthesis = Synthesis::default();
+        let mut admission = Admission::new(0);
+        apply_worker_transcript_then_meta(
+            &mut reducer,
+            &mut writer,
+            &mut synthesis,
+            &scope,
+            &mut admission,
+            &AdmissionIndex::new(),
+        )
+        .await;
+        let second = shared.borrow().telemetry(&run_id).cloned();
+
+        assert_eq!(second, first, "restart replay must reproduce exact totals");
+        assert_worker_telemetry(first.as_ref().expect("first pass telemetry must exist"));
+        assert_worker_telemetry(second.as_ref().expect("restart telemetry must exist"));
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_worker_meta_cycle_applies_retained_usage() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let scope = worker_scope(WORKER_AGENT);
+        let key = run_key_for_scope(&scope);
+        let mut synthesis = Synthesis::default();
+        let mut admission = Admission::new(0);
+        let discovered = AdmissionIndex::new();
+
+        let transcript_events = worker_transcript_events(
+            &mut synthesis,
+            &scope,
+            Path::new("agent-a7189abbf3c5741ac.jsonl"),
+            &mut admission,
+            &discovered,
+        );
+        apply_telemetry_fixture_events(&mut reducer, &mut writer, transcript_events).await;
+        assert!(
+            shared.borrow().task_run_by_key(&key).is_none(),
+            "the transcript-only cycle must precede run-minting metadata"
+        );
+
+        let meta_events = worker_meta_events(
+            &mut synthesis,
+            WORKER_AGENT,
+            Path::new("agent-a7189abbf3c5741ac.meta.json"),
+            1_800_000_000_000,
+            &mut admission,
+            &discovered,
+        );
+        apply_telemetry_fixture_events(&mut reducer, &mut writer, meta_events).await;
+
+        let snapshot = shared.borrow();
+        let run_id = snapshot.task_run_by_key(&key).unwrap().run_id;
+        assert_worker_telemetry(
+            snapshot
+                .telemetry(&run_id)
+                .expect("a later metadata cycle must apply retained usage"),
+        );
+        drop(snapshot);
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn out_of_window_lineage_child_stays_unattributed() {
+        const ANCHOR_MS: i64 = 1_800_000_000_000;
+        const FRESH_AGENT: &str = "feedfacefeedface";
+        const STALE_AGENT: &str = "deadbeefdeadbeef";
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&state_root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let artifact_root = directory.path().join(WORKER_PARENT).join("subagents");
+        let fresh_transcript = artifact_root.join(format!("agent-{FRESH_AGENT}.jsonl"));
+        let fresh_meta = artifact_root.join(format!("agent-{FRESH_AGENT}.meta.json"));
+        let stale_transcript = artifact_root.join(format!("agent-{STALE_AGENT}.jsonl"));
+        let stale_meta = artifact_root.join(format!("agent-{STALE_AGENT}.meta.json"));
+        let mut discovered = AdmissionIndex::new();
+        discovered.insert_claude_subagent(
+            WORKER_PARENT,
+            FRESH_AGENT,
+            fresh_transcript.clone(),
+            ANCHOR_MS,
+        );
+        discovered.insert_claude_subagent(
+            WORKER_PARENT,
+            FRESH_AGENT,
+            fresh_meta.clone(),
+            ANCHOR_MS,
+        );
+        discovered.insert_claude_subagent(
+            WORKER_PARENT,
+            STALE_AGENT,
+            stale_transcript.clone(),
+            ANCHOR_MS - 1,
+        );
+        discovered.insert_claude_subagent(
+            WORKER_PARENT,
+            STALE_AGENT,
+            stale_meta.clone(),
+            ANCHOR_MS,
+        );
+        let parent = SessionScope::ClaudeRoot(WORKER_PARENT.to_owned());
+        let mut admission = Admission::new(ANCHOR_MS);
+        admission.admit_pane_session(Provider::Claude, WORKER_PARENT);
+        assert!(
+            admission
+                .on_evidence(
+                    &parent,
+                    &EvidenceId::Uuid(FRESH_AGENT.to_owned()),
+                    &discovered,
+                )
+                .is_some()
+        );
+        assert!(
+            admission
+                .on_evidence(
+                    &parent,
+                    &EvidenceId::Uuid(STALE_AGENT.to_owned()),
+                    &discovered,
+                )
+                .is_some()
+        );
+        assert!(admission.is_admitted_file(&fresh_transcript, ANCHOR_MS));
+        assert!(
+            !admission.is_admitted_file(&stale_transcript, ANCHOR_MS - 1),
+            "the out-of-window artifact must be a lineage child, not an anchor-exempt pane root"
+        );
+
+        let mut synthesis = Synthesis::default();
+        let fresh_scope = worker_scope(FRESH_AGENT);
+        let fresh_events = worker_transcript_events(
+            &mut synthesis,
+            &fresh_scope,
+            &fresh_transcript,
+            &mut admission,
+            &discovered,
+        );
+        apply_telemetry_fixture_events(&mut reducer, &mut writer, fresh_events).await;
+        for (agent_id, meta) in [(FRESH_AGENT, &fresh_meta), (STALE_AGENT, &stale_meta)] {
+            let events = worker_meta_events(
+                &mut synthesis,
+                agent_id,
+                meta,
+                ANCHOR_MS,
+                &mut admission,
+                &discovered,
+            );
+            apply_telemetry_fixture_events(&mut reducer, &mut writer, events).await;
+        }
+
+        let snapshot = shared.borrow();
+        let fresh_run = snapshot
+            .task_run_by_key(&run_key_for_scope(&fresh_scope))
+            .unwrap();
+        assert_worker_telemetry(
+            snapshot
+                .telemetry(&fresh_run.run_id)
+                .expect("the in-window lineage child is the positive control"),
+        );
+        let stale_scope = worker_scope(STALE_AGENT);
+        let stale_run = snapshot
+            .task_run_by_key(&run_key_for_scope(&stale_scope))
+            .unwrap();
+        assert!(
+            snapshot.telemetry(&stale_run.run_id).is_none(),
+            "the out-of-window lineage child must keep the metrics placeholder"
+        );
+        drop(snapshot);
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn pending_telemetry_fifo_evicts_oldest_sample_at_cap() {
+        const PENDING_CAP: usize = super::PENDING_TELEMETRY_SAMPLE_CAPACITY;
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        for index in 0..=PENDING_CAP {
+            let key = RunKey::Controller(format!("pending-{index}"));
+            assert!(
+                reducer
+                    .apply_telemetry(
+                        &key,
+                        i64::try_from(index).unwrap(),
+                        u64::try_from(index + 1).unwrap(),
+                        Some(WORKER_MODEL.to_owned()),
+                        Some(WORKER_EFFORT.to_owned()),
+                        None,
+                    )
+                    .is_empty()
+            );
+        }
+
+        let oldest_key = RunKey::Controller("pending-0".to_owned());
+        let second_oldest_key = RunKey::Controller("pending-1".to_owned());
+        let newest_key = RunKey::Controller(format!("pending-{PENDING_CAP}"));
+        let oldest_id = RunId::new();
+        let second_oldest_id = RunId::new();
+        let newest_id = RunId::new();
+        reducer.model.insert_task_run(run_with_controller_evidence(
+            oldest_id,
+            oldest_key,
+            1,
+            TaskState::Running,
+        ));
+        reducer.model.insert_task_run(run_with_controller_evidence(
+            second_oldest_id,
+            second_oldest_key,
+            2,
+            TaskState::Running,
+        ));
+        reducer.model.insert_task_run(run_with_controller_evidence(
+            newest_id,
+            newest_key,
+            3,
+            TaskState::Running,
+        ));
+        reducer.publish();
+
+        let snapshot = shared.borrow();
+        assert!(
+            snapshot.telemetry(&oldest_id).is_none(),
+            "the global FIFO cap must evict the oldest pending sample"
+        );
+        let second_oldest = snapshot
+            .telemetry(&second_oldest_id)
+            .expect("the second-oldest pending sample must survive FIFO eviction");
+        assert_eq!(second_oldest.output_tokens, 2);
+        let newest = snapshot
+            .telemetry(&newest_id)
+            .expect("the newest pending sample must survive FIFO eviction");
+        // Hard-coded on purpose as the exact-capacity pin; deriving this from
+        // PENDING_CAP would defeat the pin.
+        assert_eq!(newest.output_tokens, 4_097);
+    }
+
+    #[test]
+    fn pending_telemetry_retains_multiple_samples_for_one_scope() {
+        let key = RunKey::Controller("pending-multiple".to_owned());
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        for (at_ms, output_tokens) in [(1_000, 11), (1_100, 13), (1_200, 17)] {
+            assert!(
+                reducer
+                    .apply_telemetry(
+                        &key,
+                        at_ms,
+                        output_tokens,
+                        Some(WORKER_MODEL.to_owned()),
+                        Some(WORKER_EFFORT.to_owned()),
+                        None,
+                    )
+                    .is_empty()
+            );
+        }
+        assert_eq!(reducer.pending_telemetry_count, 3);
+        assert_eq!(reducer.pending_telemetry.get(&key).unwrap().len(), 3);
+
+        let run_id = RunId::new();
+        reducer.model.insert_task_run(run_with_controller_evidence(
+            run_id,
+            key,
+            1,
+            TaskState::Running,
+        ));
+        reducer.publish();
+        assert_eq!(reducer.pending_telemetry_count, 0);
+        assert!(reducer.pending_telemetry.is_empty());
+        assert!(reducer.pending_telemetry_order.is_empty());
+
+        let snapshot = shared.borrow();
+        let telemetry = snapshot
+            .telemetry(&run_id)
+            .expect("all pending samples for one scope must be attributed");
+        assert_eq!(telemetry.output_tokens, 41);
+        assert_eq!(telemetry.started_wall_ms, 1_000);
+    }
+
+    #[test]
+    fn pending_telemetry_resolves_through_promotion_rekey() {
+        let native_key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "pending-promotion".to_owned(),
+        };
+        let provisional_key = RunKey::Provisional {
+            terminal_id: "pending-promotion-terminal".to_owned(),
+            start_ms: 1_000,
+            seq: 1,
+        };
+        let run_id = RunId::new();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        assert!(
+            reducer
+                .apply_telemetry(
+                    &native_key,
+                    1_100,
+                    37,
+                    Some("gpt-5.6-sol".to_owned()),
+                    Some("xhigh".to_owned()),
+                    Some("workspace-write".to_owned()),
+                )
+                .is_empty()
+        );
+        reducer
+            .model
+            .insert_task_run(run(run_id, provisional_key.clone(), 1, TaskState::Running));
+        reducer.publish();
+        assert!(
+            shared.borrow().telemetry(&run_id).is_none(),
+            "a different provisional key must not consume native-key telemetry"
+        );
+        assert_eq!(reducer.pending_telemetry_count, 1);
+
+        let mut promoted = reducer.model.task_run(&run_id).unwrap().clone();
+        promoted.key = native_key;
+        reducer.model.insert_task_run(promoted);
+        reducer.model.insert_task_run_alias(provisional_key, run_id);
+        reducer.publish();
+
+        let snapshot = shared.borrow();
+        let telemetry = snapshot
+            .telemetry(&run_id)
+            .expect("promotion must resolve pending native-key telemetry");
+        assert_eq!(telemetry.output_tokens, 37);
+        assert_eq!(telemetry.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(telemetry.per_turn.len(), 1);
+    }
+
+    #[test]
+    fn pending_telemetry_resolves_through_merge_alias() {
+        let absorbed_key = RunKey::Controller("pending-absorbed".to_owned());
+        let survivor_key = RunKey::Controller("pending-survivor".to_owned());
+        let absorbed_id = RunId::new();
+        let survivor_id = RunId::new();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+
+        assert!(
+            reducer
+                .apply_telemetry(
+                    &absorbed_key,
+                    1_100,
+                    53,
+                    Some(WORKER_MODEL.to_owned()),
+                    Some(WORKER_EFFORT.to_owned()),
+                    None,
+                )
+                .is_empty()
+        );
+        reducer
+            .model
+            .insert_task_run(run(survivor_id, survivor_key, 1, TaskState::Running));
+        reducer.model.insert_task_run(run(
+            absorbed_id,
+            absorbed_key.clone(),
+            2,
+            TaskState::Running,
+        ));
+        reducer.model.remove_task_run_record(&absorbed_id);
+        reducer
+            .model
+            .insert_task_run_alias(absorbed_key, survivor_id);
+        reducer.publish();
+
+        let snapshot = shared.borrow();
+        let telemetry = snapshot
+            .telemetry(&survivor_id)
+            .expect("merge alias must route absorbed-key telemetry to the survivor");
+        assert_eq!(telemetry.output_tokens, 53);
     }
 
     #[test]
@@ -6469,6 +7294,314 @@ mod tests {
     }
 
     #[test]
+    fn hours_old_replayed_running_run_closes_with_only_terminal_execution() {
+        let anchor_ms = 100;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let reducer = Reducer::new(restored(DomainModel::default(), 1)).0;
+        let started = reducer
+            .validate_controller_event(&provider_lane_event(
+                "aged-replay-started",
+                "aged-replay",
+                ControllerEventKind::TaskStarted,
+                anchor_ms,
+                now_ms,
+            ))
+            .unwrap();
+        let run_id = started
+            .post_model
+            .task_run_by_key(&RunKey::Controller("aged-replay".to_owned()))
+            .unwrap()
+            .run_id;
+        let mut model = started.post_model;
+        model.insert_execution(execution(run_id, "aged-terminal", ExecState::Ended));
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model,
+            next_ordinal: started.post_next_ordinal,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+
+        reducer.sweep_stale(now_ms);
+
+        assert_eq!(
+            shared.borrow().task_run(&run_id).unwrap().state,
+            TaskState::EndedUnknown
+        );
+    }
+
+    #[test]
+    fn fact_timed_sweep_uses_post_expiry_live_execution_set() {
+        let anchor_ms = 200;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let working = RunId::new();
+        let terminal = RunId::new();
+        let expiring = RunId::new();
+        let mut model = DomainModel::default();
+        for (run_id, key, ordinal) in [
+            (working, RunKey::Controller("fact-working".to_owned()), 1),
+            (
+                terminal,
+                RunKey::Provisional {
+                    terminal_id: "fact-terminal".to_owned(),
+                    start_ms: anchor_ms,
+                    seq: 2,
+                },
+                2,
+            ),
+            (expiring, RunKey::Controller("fact-expiring".to_owned()), 3),
+        ] {
+            let mut task_run =
+                run_with_controller_evidence(run_id, key, ordinal, TaskState::Running);
+            task_run.created_at_ms = Some(anchor_ms);
+            task_run.updated_at_ms = Some(anchor_ms);
+            model.insert_task_run(task_run);
+        }
+        model.insert_execution(execution(working, "fact-working", ExecState::Working));
+        model.insert_execution(execution(terminal, "fact-terminal", ExecState::Ended));
+        model.insert_execution(execution(
+            expiring,
+            "fact-expiring",
+            ExecState::Stale {
+                since_ms: now_ms - super::STALE_GRACE_MS,
+            },
+        ));
+        let (mut reducer, shared) = Reducer::new(restored(model, 4));
+
+        let publish_count = reducer.publish_count.get();
+        let persist = reducer.sweep_stale(now_ms);
+
+        assert_eq!(reducer.publish_count.get(), publish_count + 1);
+        let snapshot = shared.borrow();
+        assert_eq!(
+            snapshot.task_run(&working).unwrap().state,
+            TaskState::Running
+        );
+        for run_id in [terminal, expiring] {
+            let task_run = snapshot.task_run(&run_id).unwrap();
+            assert_eq!(task_run.state, TaskState::EndedUnknown);
+            assert_eq!(task_run.updated_at_ms, Some(anchor_ms));
+            assert_eq!(task_run.finished_at_ms, Some(anchor_ms));
+        }
+        assert_eq!(
+            snapshot.execution("fact-expiring").unwrap().state,
+            ExecState::Ended
+        );
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertExecution(value)
+                if value.execution.execution_id == "fact-expiring"
+                    && value.execution.state == ExecState::Ended
+                    && value.ended_at_ms == Some(now_ms)
+        )));
+        assert_eq!(
+            persist
+                .iter()
+                .filter(|operation| matches!(
+                    operation,
+                    PersistOp::UpsertTaskRun(value)
+                        if [terminal, expiring].contains(&value.task_run.run_id)
+                            && value.task_run.state == TaskState::EndedUnknown
+                            && value.updated_at_ms == anchor_ms
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_hook_ownership_protects_only_owned_stale_running_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let anchor_ms = 200;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let (mut reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let mut started = controller_event(
+            "restored-owned-hook-started",
+            "restored-owned-hook",
+            ControllerEventKind::TaskStarted,
+        );
+        started.metadata.source = "hook".to_owned();
+        started.metadata.timestamp_ms = unix_now_ms();
+        started.metadata.receipt_time_ms = started.metadata.timestamp_ms;
+        commit_controller(&mut reducer, &mut writer, started).await;
+        lifecycle.shutdown().await.unwrap();
+
+        let store = open_reader(&root).unwrap();
+        let ownership = store.non_lane_task_state_runs().unwrap();
+        let mut restored = store.load_restored_state().unwrap();
+        let owned = restored
+            .model
+            .task_run_by_key(&RunKey::Controller("restored-owned-hook".to_owned()))
+            .unwrap()
+            .run_id;
+        assert!(
+            ownership.contains(&owned),
+            "restored ownership: {ownership:?}"
+        );
+        let mut owned_run = restored.model.task_run(&owned).unwrap().clone();
+        owned_run.created_at_ms = Some(anchor_ms);
+        owned_run.updated_at_ms = Some(anchor_ms);
+        restored.model.insert_task_run(owned_run);
+        let unowned = RunId::new();
+        let mut unowned_run = run_with_controller_evidence(
+            unowned,
+            RunKey::Controller("restored-unowned-lane".to_owned()),
+            restored.next_ordinal,
+            TaskState::Running,
+        );
+        unowned_run.created_at_ms = Some(anchor_ms);
+        unowned_run.updated_at_ms = Some(anchor_ms);
+        restored.model.insert_task_run(unowned_run);
+        restored.next_ordinal += 1;
+        let (mut reducer, shared) = Reducer::new(restored);
+        reducer.restore_non_lane_task_state_runs(ownership);
+
+        reducer.sweep_stale(now_ms);
+
+        let snapshot = shared.borrow();
+        assert_eq!(snapshot.task_run(&owned).unwrap().state, TaskState::Running);
+        assert_eq!(
+            snapshot.task_run(&unowned).unwrap().state,
+            TaskState::EndedUnknown
+        );
+    }
+
+    #[test]
+    fn stale_provisional_run_closes_and_dismisses_while_unanchored_stays_open() {
+        let anchor_ms = 300;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let anchored = RunId::new();
+        let unanchored = RunId::new();
+        let mut anchored_run = run(
+            anchored,
+            RunKey::Provisional {
+                terminal_id: "anchored-terminal".to_owned(),
+                start_ms: anchor_ms,
+                seq: 1,
+            },
+            1,
+            TaskState::Running,
+        );
+        anchored_run.created_at_ms = Some(anchor_ms);
+        anchored_run.updated_at_ms = Some(anchor_ms);
+        let unanchored_run = run(
+            unanchored,
+            RunKey::Provisional {
+                terminal_id: "unanchored-terminal".to_owned(),
+                start_ms: anchor_ms,
+                seq: 2,
+            },
+            2,
+            TaskState::Running,
+        );
+        let mut model = DomainModel::default();
+        model.insert_task_run(anchored_run);
+        model.insert_task_run(unanchored_run);
+        model.insert_execution(execution(anchored, "anchored-ended", ExecState::Ended));
+        model.insert_execution(execution(unanchored, "unanchored-ended", ExecState::Ended));
+        let (mut reducer, shared) = Reducer::new(restored(model, 3));
+
+        reducer.sweep_stale(now_ms);
+        assert_eq!(
+            shared.borrow().task_run(&anchored).unwrap().state,
+            TaskState::EndedUnknown
+        );
+        assert_eq!(
+            shared.borrow().task_run(&unanchored).unwrap().state,
+            TaskState::Running
+        );
+
+        reducer.apply_operator_command(OperatorCommand::DismissClearable, now_ms + 1);
+        let snapshot = shared.borrow();
+        assert_eq!(
+            snapshot.task_run(&anchored).unwrap().dismissed_at_ms,
+            Some(now_ms + 1)
+        );
+        assert_eq!(
+            snapshot.task_run(&unanchored).unwrap().dismissed_at_ms,
+            None
+        );
+    }
+
+    #[test]
+    fn fact_timed_closure_uses_last_fact_while_queued_closure_uses_sweep_time() {
+        let anchor_ms = 400;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let queued = RunId::new();
+        let running = RunId::new();
+        let mut queued_run = run_with_controller_evidence(
+            queued,
+            RunKey::Controller("queued-anchor".to_owned()),
+            1,
+            TaskState::Queued,
+        );
+        queued_run.created_at_ms = Some(anchor_ms);
+        queued_run.updated_at_ms = Some(anchor_ms);
+        let mut running_run = run_with_controller_evidence(
+            running,
+            RunKey::Controller("running-anchor".to_owned()),
+            2,
+            TaskState::Running,
+        );
+        running_run.created_at_ms = Some(anchor_ms);
+        running_run.updated_at_ms = Some(anchor_ms);
+        let mut model = DomainModel::default();
+        model.insert_task_run(queued_run);
+        model.insert_task_run(running_run);
+        let (mut reducer, shared) = Reducer::new(restored(model, 3));
+
+        reducer.sweep_stale(now_ms);
+
+        let snapshot = shared.borrow();
+        let queued = snapshot.task_run(&queued).unwrap();
+        let running = snapshot.task_run(&running).unwrap();
+        assert_eq!(queued.state, TaskState::EndedUnknown);
+        assert_eq!(queued.finished_at_ms, Some(now_ms));
+        assert_eq!(running.state, TaskState::EndedUnknown);
+        assert_eq!(running.finished_at_ms, Some(anchor_ms));
+    }
+
+    #[test]
+    fn fact_timed_running_closure_reopens_on_newer_task_started() {
+        let anchor_ms = 500;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let run_id = RunId::new();
+        let mut task_run = run_with_controller_evidence(
+            run_id,
+            RunKey::Controller("fact-reopen".to_owned()),
+            1,
+            TaskState::Running,
+        );
+        task_run.created_at_ms = Some(anchor_ms);
+        task_run.updated_at_ms = Some(anchor_ms);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        reducer.sweep_stale(now_ms);
+        assert_eq!(
+            shared.borrow().task_run(&run_id).unwrap().state,
+            TaskState::EndedUnknown
+        );
+
+        let reopened = reducer
+            .validate_controller_event(&provider_lane_event(
+                "fact-reopen-started",
+                "fact-reopen",
+                ControllerEventKind::TaskStarted,
+                now_ms + 1,
+                now_ms + 100,
+            ))
+            .unwrap();
+        let run = reopened.post_model.task_run(&run_id).unwrap();
+        assert_eq!(run.state, TaskState::Running);
+        assert_eq!(run.finished_at_ms, None);
+        assert_eq!(run.updated_at_ms, Some(now_ms + 1));
+    }
+
+    #[test]
     fn stale_sweep_closes_dispatch_only_run_at_updated_inactivity_boundary() {
         let anchor_ms = 100;
         let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
@@ -6612,7 +7745,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_sweep_only_closes_controller_queued_runs() {
+    fn stale_sweep_closes_controller_queued_and_unowned_running_runs() {
         let anchor_ms = 700;
         let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
         let queued = RunId::new();
@@ -6659,7 +7792,7 @@ mod tests {
         );
         assert_eq!(
             snapshot.task_run(&running).unwrap().state,
-            TaskState::Running
+            TaskState::EndedUnknown
         );
         assert_eq!(
             snapshot.task_run(&blocked).unwrap().state,

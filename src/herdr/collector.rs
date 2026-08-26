@@ -45,11 +45,12 @@ use crate::provider::lane::LogLaneConfig;
 #[cfg(test)]
 use crate::provider::spawn_provider_thread_with_diagnostics;
 use crate::provider::{
-    BootstrapIdentity, BootstrapParser, DiscoveryIndex, DiscoveryRoot, FsReadBoundary,
-    MergeOutcome, PathInterner, PendingEvents, ProviderCycle, ProviderEvent, ProviderIngressEvent,
-    ProviderSourceState, ProviderSpawnError, ProviderTarget, ProviderTargetPublisher,
-    ProviderThreadError, ProviderThreadHandle, ProviderWorker, RecommendedNotifyFactory, TailFile,
-    TargetSet, spawn_provider_thread_with_diagnostics_and_performance,
+    BootstrapIdentity, BootstrapParser, CodexPaneBinding, CodexPaneTarget, DiscoveryIndex,
+    DiscoveryRoot, DiscoveryScanStatus, FsReadBoundary, MergeOutcome, PathInterner, PendingEvents,
+    ProviderCycle, ProviderEvent, ProviderIngressEvent, ProviderSourceState, ProviderSpawnError,
+    ProviderTarget, ProviderTargetPublisher, ProviderThreadError, ProviderThreadHandle,
+    ProviderWorker, RecommendedNotifyFactory, TailFile, TargetSet,
+    spawn_provider_thread_with_diagnostics_and_performance,
 };
 use crate::reducer::{ApplyOutcome, CommitStagedError, Reducer, ReducerError};
 use crate::store::writer::{
@@ -382,6 +383,8 @@ pub struct SourceCoverageRegistry {
     controller: SourceAvailability,
     claude: SourceAvailability,
     codex: SourceAvailability,
+    claude_targeted_sessions: usize,
+    codex_targeted_sessions: usize,
 }
 
 impl SourceCoverageRegistry {
@@ -393,6 +396,8 @@ impl SourceCoverageRegistry {
             controller,
             claude: SourceAvailability::NotApplicable,
             codex: SourceAvailability::NotApplicable,
+            claude_targeted_sessions: 0,
+            codex_targeted_sessions: 0,
         }
     }
 
@@ -417,18 +422,37 @@ impl SourceCoverageRegistry {
         } = state;
     }
 
+    fn set_targeted_session_counts(&mut self, targets: &TargetSet) -> bool {
+        let claude = targets
+            .sessions()
+            .filter(|(provider, _)| *provider == Provider::Claude)
+            .count();
+        let codex = targets
+            .sessions()
+            .filter(|(provider, _)| *provider == Provider::Codex)
+            .count();
+        let changed =
+            self.claude_targeted_sessions != claude || self.codex_targeted_sessions != codex;
+        self.claude_targeted_sessions = claude;
+        self.codex_targeted_sessions = codex;
+        changed
+    }
+
     /// Stable header summary without operational paths.
     #[must_use]
     pub fn summary(&self) -> String {
         [
-            ("herdr", &self.herdr),
-            ("controller", &self.controller),
-            ("claude", &self.claude),
-            ("codex", &self.codex),
+            ("herdr", &self.herdr, None),
+            ("ctl", &self.controller, None),
+            ("claude", &self.claude, Some(self.claude_targeted_sessions)),
+            ("codex", &self.codex, Some(self.codex_targeted_sessions)),
         ]
         .into_iter()
-        .map(|(name, state)| match state {
-            SourceAvailability::Available => format!("{name}=available"),
+        .map(|(name, state, targeted_sessions)| match state {
+            SourceAvailability::Available => targeted_sessions.map_or_else(
+                || format!("{name}=available"),
+                |count| format!("{name}={count}"),
+            ),
             SourceAvailability::Unavailable { detail } => {
                 format!("{name}=unavailable({detail})")
             }
@@ -1511,8 +1535,9 @@ pub async fn spawn_workload_collector(
     let provider_publisher = provider_thread.target_publisher();
     let restored_targets = derive_provider_targets(&model.borrow());
     provider_publisher.update_targets(restored_targets.clone());
-    let coverage =
+    let mut coverage =
         CoverageTracker::new(controller_coverage, coverage_sender, source_quality_sender);
+    coverage.update_targeted_session_counts(&restored_targets);
     let (provider_events_drained_sender, provider_events_drained) = oneshot::channel();
     let provider_integration = ProviderIntegration::new_with_drain_acknowledgement(
         provider_events,
@@ -1917,8 +1942,9 @@ async fn spawn_configured_inner(
     let provider_publisher = provider_thread.target_publisher();
     let restored_targets = derive_provider_targets(&model.borrow());
     provider_publisher.update_targets(restored_targets.clone());
-    let coverage =
+    let mut coverage =
         CoverageTracker::new(controller_coverage, coverage_sender, source_quality_sender);
+    coverage.update_targeted_session_counts(&restored_targets);
     let (provider_events_drained_sender, provider_events_drained) = oneshot::channel();
     let provider_integration = ProviderIntegration::new_with_drain_acknowledgement(
         provider_events,
@@ -2306,6 +2332,19 @@ async fn converge(
             }
         };
         let topology = topology_from_snapshot(&snapshot)?;
+        let sessionless_codex_terminals = topology
+            .panes
+            .iter()
+            .filter(|pane| {
+                pane.agent_session.is_none()
+                    && pane
+                        .agent
+                        .as_ref()
+                        .and_then(|agent| snapshot_provider_name(&agent.agent_name, None))
+                        == Some(Provider::Codex)
+            })
+            .map(|pane| pane.terminal_id.clone())
+            .collect::<HashSet<_>>();
         let mut batch = if first_generation {
             pending_closures = PendingTopologyClosures::default();
             let mut batch = reducer.reconcile_gap(ReconcileBatch { topology, gap_kind })?;
@@ -2320,6 +2359,7 @@ async fn converge(
         } else {
             apply_snapshot_in_place(reducer, shared, topology, session, &mut pending_closures)?
         };
+        provider.observe_sessionless_codex_terminals(shared, &sessionless_codex_terminals);
         let _ = persist_submission(persistence, reducer, std::mem::take(&mut batch)).await?;
         enrichment.replace_targets(
             snapshot
@@ -2826,6 +2866,26 @@ fn current_execution_identity(
     )
 }
 
+enum PrimaryProviderReceipt {
+    Primary(Option<Admitted<ReceivedEvent>>),
+    Provider,
+}
+
+async fn receive_primary_or_provider(
+    primary: &mut mpsc::Receiver<Admitted<ReceivedEvent>>,
+    provider: &mut Option<mpsc::Receiver<ProviderIngressEvent>>,
+    provider_event: &mut Option<ProviderIngressEvent>,
+) -> PrimaryProviderReceipt {
+    tokio::select! {
+        biased;
+        received = primary.recv() => PrimaryProviderReceipt::Primary(received),
+        event = receive_provider(provider) => {
+            *provider_event = event;
+            PrimaryProviderReceipt::Provider
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn monitor_live(
     sock: &Path,
@@ -2860,6 +2920,7 @@ async fn monitor_live(
     let mut enrichment_events_open = true;
     let mut enrichment_prunes_open = true;
     loop {
+        let mut provider_event = None;
         let received = tokio::select! {
             () = cancellation.cancelled() => return Ok(ReplayOutcome::Cancelled),
             request = receive_controller(controller_requests) => {
@@ -2888,21 +2949,25 @@ async fn monitor_live(
                 }
                 continue;
             }
-            event = receive_provider(&mut provider.events) => {
-                service_provider_event(
-                    event,
-                    provider,
-                    session,
-                    reducer,
-                    shared,
-                    persistence,
-                ).await?;
-                provider.publish_targets(shared);
-                continue;
-            }
-            received = events.recv() => match received {
-                Some(received) => LiveReceipt::Primary(received),
-                None => return Ok(ReplayOutcome::Ended),
+            receipt = receive_primary_or_provider(
+                events,
+                &mut provider.events,
+                &mut provider_event,
+            ) => match receipt {
+                PrimaryProviderReceipt::Primary(Some(received)) => LiveReceipt::Primary(received),
+                PrimaryProviderReceipt::Primary(None) => return Ok(ReplayOutcome::Ended),
+                PrimaryProviderReceipt::Provider => {
+                    service_provider_event(
+                        provider_event.take(),
+                        provider,
+                        session,
+                        reducer,
+                        shared,
+                        persistence,
+                    ).await?;
+                    provider.publish_targets(shared);
+                    continue;
+                }
             },
             payload = enrichment.events.recv(), if enrichment_events_open => match payload {
                 Some(payload) => LiveReceipt::Enrichment(payload),
@@ -3048,6 +3113,7 @@ async fn monitor_reconciling(
     let mut watchdog_probe: Option<WatchdogProbeFuture<'_>> = None;
     loop {
         enrichment.discard_episode_payloads();
+        let mut provider_event = None;
         let received = tokio::select! {
             () = cancellation.cancelled() => return Ok(ReconcilingOutcome::Cancelled),
             request = receive_controller(controller_requests) => {
@@ -3076,21 +3142,27 @@ async fn monitor_reconciling(
                 }
                 continue;
             }
-            event = receive_provider(&mut provider.events) => {
-                service_provider_event(
-                    event,
-                    provider,
-                    session,
-                    reducer,
-                    shared,
-                    persistence,
-                ).await?;
-                provider.publish_targets(shared);
-                continue;
-            }
-            received = events.recv() => match received {
-                Some(received) => ReconcilingReceipt::Primary(received),
-                None => return Ok(ReconcilingOutcome::Ended),
+            receipt = receive_primary_or_provider(
+                events,
+                &mut provider.events,
+                &mut provider_event,
+            ) => match receipt {
+                PrimaryProviderReceipt::Primary(Some(received)) => {
+                    ReconcilingReceipt::Primary(received)
+                }
+                PrimaryProviderReceipt::Primary(None) => return Ok(ReconcilingOutcome::Ended),
+                PrimaryProviderReceipt::Provider => {
+                    service_provider_event(
+                        provider_event.take(),
+                        provider,
+                        session,
+                        reducer,
+                        shared,
+                        persistence,
+                    ).await?;
+                    provider.publish_targets(shared);
+                    continue;
+                }
             },
             probe = async {
                 match watchdog_probe.as_mut() {
@@ -3982,6 +4054,7 @@ impl AdapterProviderWorker {
         &mut self,
         universes: &HashMap<Provider, HashSet<AvailabilitySweepMember>>,
         applicable_providers: &HashSet<Provider>,
+        codex_bindings: &[(RunId, String, i64)],
         pending: &mut PendingEvents,
     ) {
         for provider in [Provider::Claude, Provider::Codex] {
@@ -3996,7 +4069,20 @@ impl AdapterProviderWorker {
             let state = sweep.failure.map_or_else(
                 || {
                     if applicable_providers.contains(&provider) {
-                        ProviderSourceState::Available
+                        if provider == Provider::Codex && !codex_bindings.is_empty() {
+                            ProviderSourceState::AvailableWithBindings {
+                                bindings: codex_bindings
+                                    .iter()
+                                    .map(|(run_id, sid, detected_at_ms)| CodexPaneBinding {
+                                        run_id: *run_id,
+                                        sid: sid.clone(),
+                                        observed_at_ms: *detected_at_ms,
+                                    })
+                                    .collect(),
+                            }
+                        } else {
+                            ProviderSourceState::Available
+                        }
                     } else {
                         ProviderSourceState::NotApplicable
                     }
@@ -4057,7 +4143,11 @@ impl AdapterProviderWorker {
                     },
                     _ => return events,
                 };
-                crate::provider::claude_facts::extract_claude_line(&scope, line)
+                crate::provider::claude_facts::extract_claude_line_at(
+                    &scope,
+                    line,
+                    item.file.modified_ms,
+                )
             }
             Provider::Codex => {
                 let Some(rollout_id) = codex_rollout_id(&item.file.relative_path) else {
@@ -4082,12 +4172,129 @@ impl Default for AdapterProviderWorker {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CodexRolloutCandidate {
+    sid: String,
+    path: PathBuf,
+    creation_ms: i64,
+}
+
+fn codex_detection_second_ms(detected_at_ms: i64) -> i64 {
+    detected_at_ms
+        .max(0)
+        .div_euclid(1_000)
+        .saturating_mul(1_000)
+}
+
+fn unambiguous_codex_bindings(
+    panes: &[CodexPaneTarget],
+    rollouts: &[CodexRolloutCandidate],
+) -> Vec<(RunId, String, i64)> {
+    let pane_candidates = panes
+        .iter()
+        .map(|pane| {
+            let detection_second_ms = codex_detection_second_ms(pane.detected_at_ms);
+            rollouts
+                .iter()
+                .enumerate()
+                .filter_map(|(index, rollout)| {
+                    (rollout.creation_ms >= detection_second_ms).then_some(index)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut claimant_counts = vec![0_usize; rollouts.len()];
+    for candidates in &pane_candidates {
+        for candidate in candidates {
+            claimant_counts[*candidate] = claimant_counts[*candidate].saturating_add(1);
+        }
+    }
+    let mut bindings = panes
+        .iter()
+        .zip(pane_candidates)
+        .filter_map(|(pane, candidates)| {
+            let [candidate] = candidates.as_slice() else {
+                return None;
+            };
+            (claimant_counts[*candidate] == 1).then(|| {
+                (
+                    pane.run_id,
+                    rollouts[*candidate].sid.clone(),
+                    pane.detected_at_ms,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    bindings.sort_by_key(|(run_id, sid, detected_at_ms)| (*run_id, sid.clone(), *detected_at_ms));
+    bindings
+}
+
+fn discover_codex_bindings(
+    roots: &[DiscoveryRoot],
+    panes: &[CodexPaneTarget],
+    owned_codex_sessions: &HashSet<String>,
+) -> Vec<(RunId, String, i64)> {
+    let Some(anchor_ms) = panes
+        .iter()
+        .map(|pane| codex_detection_second_ms(pane.detected_at_ms))
+        .min()
+    else {
+        return Vec::new();
+    };
+    let mut rollouts = Vec::new();
+    for root in roots.iter().filter(|root| root.provider == Provider::Codex) {
+        let index = match crate::provider::lane::AdmissionIndex::discover_codex_date_shards(
+            &root.path, anchor_ms,
+        ) {
+            Ok(index) if !index.had_errors() => index,
+            Ok(_) => return Vec::new(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return Vec::new(),
+        };
+        rollouts.extend(
+            index
+                .codex_rollouts()
+                .into_iter()
+                .filter_map(|(sid, artifact)| {
+                    if owned_codex_sessions.contains(sid) {
+                        return None;
+                    }
+                    artifact
+                        .creation_ms
+                        .map(|creation_ms| CodexRolloutCandidate {
+                            sid: sid.to_owned(),
+                            path: artifact.path.clone(),
+                            creation_ms,
+                        })
+                }),
+        );
+    }
+    rollouts.sort_by(|left, right| {
+        (&left.sid, &left.path, left.creation_ms).cmp(&(&right.sid, &right.path, right.creation_ms))
+    });
+    rollouts.dedup();
+    unambiguous_codex_bindings(panes, &rollouts)
+}
+
 impl ProviderWorker for AdapterProviderWorker {
     fn process(&mut self, cycle: &mut ProviderCycle<'_>) -> io::Result<()> {
         let baseline_failures = self.initialize_standard_baselines();
         let mut targets_by_root: HashMap<(Provider, PathBuf), HashSet<PathBuf>> = HashMap::new();
         let mut providers_with_session_admissions = HashSet::new();
         self.log_admission.begin_pane_cycle();
+        let mut codex_panes = cycle.targets.codex_panes().collect::<Vec<_>>();
+        codex_panes.sort_by_key(|pane| pane.run_id);
+        let owned_codex_sessions = cycle
+            .targets
+            .owned_codex_sessions()
+            .map(str::to_owned)
+            .collect();
+        let codex_bindings =
+            discover_codex_bindings(&self.standard_roots, &codex_panes, &owned_codex_sessions);
+        for (_, sid, _) in &codex_bindings {
+            self.log_admission.admit_pane_session(Provider::Codex, sid);
+            providers_with_session_admissions.insert(Provider::Codex);
+        }
         for (provider, session_id) in cycle.targets.sessions() {
             if session_id.is_empty() {
                 continue;
@@ -4112,11 +4319,10 @@ impl ProviderWorker for AdapterProviderWorker {
                 .or_default()
                 .insert(target.path.clone());
         }
-        for root in self
-            .standard_roots
-            .iter()
-            .filter(|root| providers_with_session_admissions.contains(&root.provider))
-        {
+        for root in self.standard_roots.iter().filter(|root| {
+            providers_with_session_admissions.contains(&root.provider)
+                || root.provider == Provider::Codex && !codex_panes.is_empty()
+        }) {
             targets_by_root
                 .entry((root.provider, root.path.clone()))
                 .or_default();
@@ -4134,6 +4340,7 @@ impl ProviderWorker for AdapterProviderWorker {
         }
         for provider in [Provider::Claude, Provider::Codex] {
             let targeted = providers_with_session_admissions.contains(&provider)
+                || provider == Provider::Codex && !codex_panes.is_empty()
                 || targets_by_root
                     .keys()
                     .any(|(current, _)| *current == provider);
@@ -4228,16 +4435,18 @@ impl ProviderWorker for AdapterProviderWorker {
                     .get_mut(&root_key)
                     .expect("root state inserted before scan");
                 let mut parser = AdapterBootstrapParser::default();
-                state.discovery.scan_admitted(
+                state.discovery.scan_admitted_interruptible(
                     &mut parser,
                     &mut self.interner,
                     &self.log_admission,
                     &mut self.admission_index,
                     &self.diagnostics,
+                    || cycle.should_stop(),
                 )
             };
             let scan_outcome = match scan_result {
-                Ok(outcome) => outcome,
+                Ok(DiscoveryScanStatus::Completed(outcome)) => outcome,
+                Ok(DiscoveryScanStatus::Interrupted) => return Ok(()),
                 Err(error) => {
                     if error.kind() != io::ErrorKind::NotFound {
                         self.record_sweep_failure(
@@ -4328,7 +4537,12 @@ impl ProviderWorker for AdapterProviderWorker {
             }
         });
         if work.is_empty() {
-            self.finish_completed_sweeps(&universes, &applicable_providers, cycle.pending);
+            self.finish_completed_sweeps(
+                &universes,
+                &applicable_providers,
+                &codex_bindings,
+                cycle.pending,
+            );
             self.emit_due_lifecycle_events(cycle.pending);
             return Ok(());
         }
@@ -4372,6 +4586,7 @@ impl ProviderWorker for AdapterProviderWorker {
                                 Ok(_) => crate::provider::claude_facts::extract_meta_json(
                                     &parent_session,
                                     &agent_id,
+                                    file.modified_ms,
                                     &bytes,
                                 ),
                                 Err(_) => {
@@ -4406,6 +4621,7 @@ impl ProviderWorker for AdapterProviderWorker {
                             self.finish_completed_sweeps(
                                 &universes,
                                 &applicable_providers,
+                                &codex_bindings,
                                 cycle.pending,
                             );
                             return Ok(());
@@ -4521,7 +4737,12 @@ impl ProviderWorker for AdapterProviderWorker {
                     )
                 {
                     self.resume_cursor = Some(cursor_for_work(item));
-                    self.finish_completed_sweeps(&universes, &applicable_providers, cycle.pending);
+                    self.finish_completed_sweeps(
+                        &universes,
+                        &applicable_providers,
+                        &codex_bindings,
+                        cycle.pending,
+                    );
                     return Ok(());
                 }
             }
@@ -4592,6 +4813,7 @@ impl ProviderWorker for AdapterProviderWorker {
                         self.finish_completed_sweeps(
                             &universes,
                             &applicable_providers,
+                            &codex_bindings,
                             cycle.pending,
                         );
                         return Ok(());
@@ -4631,7 +4853,12 @@ impl ProviderWorker for AdapterProviderWorker {
             }
         }
         self.resume_cursor = None;
-        self.finish_completed_sweeps(&universes, &applicable_providers, cycle.pending);
+        self.finish_completed_sweeps(
+            &universes,
+            &applicable_providers,
+            &codex_bindings,
+            cycle.pending,
+        );
         self.emit_due_lifecycle_events(cycle.pending);
         Ok(())
     }
@@ -4744,6 +4971,8 @@ struct ProviderIntegration {
     events_drained: Option<oneshot::Sender<()>>,
     target_publisher: ProviderTargetPublisher,
     published_targets: TargetSet,
+    sessionless_codex_detections: HashMap<RunId, i64>,
+    sessionless_codex_detection_history: HashMap<RunId, i64>,
     coverage: CoverageTracker,
 }
 
@@ -4788,7 +5017,9 @@ impl CoverageTracker {
             Provider::Codex => CoverageSource::Codex,
         };
         let state = match state {
-            ProviderSourceState::Available => SourceAvailability::Available,
+            ProviderSourceState::Available | ProviderSourceState::AvailableWithBindings { .. } => {
+                SourceAvailability::Available
+            }
             ProviderSourceState::Unavailable { detail } => {
                 SourceAvailability::Unavailable { detail }
             }
@@ -4815,6 +5046,12 @@ impl CoverageTracker {
         self.publish();
     }
 
+    fn update_targeted_session_counts(&mut self, targets: &TargetSet) {
+        if self.registry.set_targeted_session_counts(targets) {
+            self.publish();
+        }
+    }
+
     fn publish(&self) {
         self.coverage_sender.send_replace(self.registry.clone());
         self.source_quality_sender
@@ -4835,6 +5072,8 @@ impl ProviderIntegration {
             events_drained: None,
             target_publisher,
             published_targets,
+            sessionless_codex_detections: HashMap::new(),
+            sessionless_codex_detection_history: HashMap::new(),
             coverage,
         }
     }
@@ -4851,6 +5090,8 @@ impl ProviderIntegration {
             events_drained: Some(events_drained),
             target_publisher,
             published_targets,
+            sessionless_codex_detections: HashMap::new(),
+            sessionless_codex_detection_history: HashMap::new(),
             coverage,
         }
     }
@@ -4876,15 +5117,125 @@ impl ProviderIntegration {
     }
 
     fn publish_targets(&mut self, shared: &SharedModel) {
-        let targets = derive_provider_targets(&shared.borrow());
+        let live_provisional_run_ids = {
+            let model = shared.borrow();
+            model
+                .executions()
+                .filter(|execution| !execution.state.is_terminal())
+                .filter_map(|execution| {
+                    matches!(
+                        model.task_run(&execution.task_run_id).map(|run| &run.key),
+                        Some(RunKey::Provisional { .. })
+                    )
+                    .then_some(execution.task_run_id)
+                })
+                .collect::<HashSet<_>>()
+        };
+        self.sessionless_codex_detections
+            .retain(|run_id, _| live_provisional_run_ids.contains(run_id));
+        self.sessionless_codex_detection_history
+            .retain(|run_id, _| live_provisional_run_ids.contains(run_id));
+        let targets = derive_provider_targets_with_codex_panes(
+            &shared.borrow(),
+            &self.sessionless_codex_detections,
+        );
+        self.coverage.update_targeted_session_counts(&targets);
         if targets != self.published_targets {
             self.target_publisher.update_targets(targets.clone());
             self.published_targets = targets;
         }
     }
+
+    fn admit_sessionless_codex_detection(&mut self, run_id: RunId, observed_at_ms: i64) {
+        if let Some(active_detection_ms) = self.sessionless_codex_detections.get(&run_id).copied() {
+            self.sessionless_codex_detection_history
+                .entry(run_id)
+                .or_insert(active_detection_ms);
+            return;
+        }
+        if observed_at_ms <= 0
+            || self
+                .sessionless_codex_detection_history
+                .get(&run_id)
+                .is_some_and(|last_admitted_ms| observed_at_ms <= *last_admitted_ms)
+        {
+            return;
+        }
+        self.sessionless_codex_detections
+            .insert(run_id, observed_at_ms);
+        self.sessionless_codex_detection_history
+            .insert(run_id, observed_at_ms);
+    }
+
+    fn observe_sessionless_codex_events(
+        &mut self,
+        events: &[NormalizedEvent],
+        raw_sessionless_codex_pane: bool,
+    ) {
+        for event in events {
+            let NormalizedEvent::ExecutionBegin {
+                metadata,
+                execution,
+            } = event
+            else {
+                continue;
+            };
+            if metadata.provider == Some(Provider::Codex)
+                && metadata.native_session_id.is_none()
+                && raw_sessionless_codex_pane
+                && metadata.receipt_time_ms > 0
+            {
+                self.admit_sessionless_codex_detection(
+                    execution.task_run_id,
+                    metadata.receipt_time_ms,
+                );
+            } else {
+                self.sessionless_codex_detections
+                    .remove(&execution.task_run_id);
+            }
+        }
+    }
+
+    fn observe_sessionless_codex_terminals(
+        &mut self,
+        shared: &SharedModel,
+        terminal_ids: &HashSet<String>,
+    ) {
+        let observed_at_ms = unix_now_ms();
+        let sessionless_run_ids = {
+            let model = shared.borrow();
+            model
+                .executions()
+                .filter(|execution| {
+                    terminal_ids.contains(&execution.terminal_id) && !execution.state.is_terminal()
+                })
+                .filter_map(|execution| {
+                    matches!(
+                        model.task_run(&execution.task_run_id).map(|run| &run.key),
+                        Some(RunKey::Provisional { .. })
+                    )
+                    .then_some(execution.task_run_id)
+                })
+                .collect::<HashSet<_>>()
+        };
+        self.sessionless_codex_detections
+            .retain(|run_id, _| sessionless_run_ids.contains(run_id));
+        if observed_at_ms > 0 {
+            for run_id in sessionless_run_ids {
+                self.admit_sessionless_codex_detection(run_id, observed_at_ms);
+            }
+        }
+    }
 }
 
 fn derive_provider_targets(model: &DomainModel) -> TargetSet {
+    derive_provider_targets_with_codex_panes(model, &HashMap::new())
+}
+
+fn derive_provider_targets_with_codex_panes(
+    model: &DomainModel,
+    sessionless_codex_detections: &HashMap<RunId, i64>,
+) -> TargetSet {
     let run_targets = model.task_runs().filter_map(|run| match &run.key {
         RunKey::NativePath { provider, path } if !path.is_empty() => Some(ProviderTarget {
             provider: *provider,
@@ -4933,7 +5284,44 @@ fn derive_provider_targets(model: &DomainModel) -> TargetSet {
                 .map(|(_, sid, provider)| (provider, sid)),
         }
     });
-    TargetSet::new_with_sessions(run_targets.chain(node_targets), session_targets)
+    let codex_panes = model.executions().filter_map(|execution| {
+        if execution.state.is_terminal() {
+            return None;
+        }
+        let detected_at_ms = sessionless_codex_detections.get(&execution.task_run_id)?;
+        let run = model.task_run(&execution.task_run_id)?;
+        let RunKey::Provisional { .. } = run.key else {
+            return None;
+        };
+        Some(CodexPaneTarget {
+            run_id: execution.task_run_id,
+            detected_at_ms: *detected_at_ms,
+        })
+    });
+    let owned_codex_sessions = model
+        .task_run_bindings()
+        .filter_map(|(key, _)| match key {
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid,
+            } if !sid.is_empty() => Some(sid.clone()),
+            RunKey::Controller(_)
+            | RunKey::Native { .. }
+            | RunKey::NativePath { .. }
+            | RunKey::Provisional { .. } => None,
+        })
+        .chain(model.agent_nodes().filter_map(|node| {
+            (node.provider == Provider::Codex)
+                .then_some(node.native_session_id.as_ref())?
+                .filter(|sid| !sid.is_empty())
+                .cloned()
+        }));
+    TargetSet::new_with_sessions_and_codex_panes(
+        run_targets.chain(node_targets),
+        session_targets,
+        codex_panes,
+        owned_codex_sessions,
+    )
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -5070,6 +5458,10 @@ async fn apply_received_event(
             return Err(error);
         }
     };
+    provider.observe_sessionless_codex_events(
+        &normalized,
+        received_has_sessionless_codex_pane(&received),
+    );
     let produced_observations = !normalized.is_empty();
     let outcome = apply_collector_observation(reducer, normalized);
     admission.complete();
@@ -5084,6 +5476,17 @@ async fn apply_received_event(
     provider.publish_targets(shared);
     cancel_pending_topology_closures(&received, pending_closures);
     Ok(produced_observations)
+}
+
+fn received_has_sessionless_codex_pane(received: &ReceivedEvent) -> bool {
+    received
+        .data
+        .get("pane")
+        .and_then(|value| serde_json::from_value::<PaneInfo>(value.clone()).ok())
+        .is_some_and(|pane| {
+            pane.agent_session.is_none()
+                && pane.agent.as_deref().and_then(provider_from_name) == Some(Provider::Codex)
+        })
 }
 
 fn cancel_pending_pane_closure(pane_id: &str, pending: &mut PendingTopologyClosures) {
@@ -5157,16 +5560,42 @@ async fn apply_provider_event(
     persistence: &mut RuntimePersistence,
     coverage: &SourceCoverageRegistry,
 ) -> Result<(), CollectorError> {
-    apply_provider_event_with_admission(
-        event,
+    let provider_diagnostics = crate::provider::ProviderDiagnostics::default();
+    let (ignored_events, _ignored_receiver) = mpsc::channel(1);
+    let provider_thread = spawn_provider_thread_with_diagnostics(
+        AdapterProviderWorker::new(Vec::new(), provider_diagnostics.clone()),
+        ignored_events,
         None,
+        provider_diagnostics,
+    )?;
+    let (_provider_sender, provider_events) = mpsc::channel(1);
+    let (coverage_sender, _source_coverage) = watch::channel(coverage.clone());
+    let (source_quality_sender, _source_quality) = watch::channel(ObservationQuality::Reconciling);
+    let tracker = CoverageTracker {
+        registry: coverage.clone(),
+        herdr_quality: ObservationQuality::Reconciling,
+        coverage_sender,
+        source_quality_sender,
+    };
+    let mut provider = ProviderIntegration::new(
+        provider_events,
+        provider_thread.target_publisher(),
+        TargetSet::default(),
+        tracker,
+    );
+    let (performance, _sampler) = performance_tracker(Arc::new(SystemPerformanceClock::new()));
+    let admission = event.requires_admission().then(|| performance.admit());
+    let result = service_provider_event(
+        Some(ProviderIngressEvent { event, admission }),
+        &mut provider,
         session,
         reducer,
         shared,
         persistence,
-        coverage,
     )
-    .await
+    .await;
+    provider_thread.stop().await?;
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5289,6 +5718,60 @@ async fn apply_provider_event_with_admission(
             .await
         }
     }
+}
+
+async fn apply_heuristic_bindings(
+    bindings: Vec<CodexPaneBinding>,
+    sessionless_codex_detections: &HashMap<RunId, i64>,
+    reducer: &mut Reducer,
+    shared: &SharedModel,
+    persistence: &mut RuntimePersistence,
+    coverage: &SourceCoverageRegistry,
+) -> Result<(), CollectorError> {
+    for binding in bindings {
+        let stale = {
+            let model = shared.borrow();
+            sessionless_codex_detections.get(&binding.run_id) != Some(&binding.observed_at_ms)
+                || !matches!(
+                    model.task_run(&binding.run_id).map(|run| &run.key),
+                    Some(RunKey::Provisional { .. })
+                )
+                || model.agent_nodes().any(|node| {
+                    node.task_run_id == binding.run_id
+                        && node.provider == Provider::Codex
+                        && node
+                            .native_session_id
+                            .as_ref()
+                            .is_some_and(|sid| !sid.is_empty())
+                })
+                || (!binding.sid.is_empty()
+                    && (model
+                        .task_run_by_key(&RunKey::Native {
+                            provider: Provider::Codex,
+                            sid: binding.sid.clone(),
+                        })
+                        .is_some()
+                        || model.agent_nodes().any(|node| {
+                            node.provider == Provider::Codex
+                                && node
+                                    .native_session_id
+                                    .as_ref()
+                                    .is_some_and(|sid| !sid.is_empty() && sid == &binding.sid)
+                        })))
+        };
+        if stale {
+            continue;
+        }
+        let outcome =
+            reducer.apply_heuristic_binding(binding.run_id, binding.sid, binding.observed_at_ms);
+        if let Some(persist) = collector_apply_outcome(reducer, outcome)
+            && !persist.is_empty()
+        {
+            let _ = persist_submission(persistence, reducer, persist).await?;
+        }
+    }
+    persistence.refresh_snapshot(&shared.borrow(), coverage);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7038,6 +7521,22 @@ async fn service_provider_event(
                 admission.is_none(),
                 "provider source-state controls must not carry performance admissions"
             );
+            let state = match state {
+                ProviderSourceState::AvailableWithBindings { bindings } => {
+                    let coverage = provider.coverage.registry.clone();
+                    apply_heuristic_bindings(
+                        bindings,
+                        &provider.sessionless_codex_detections,
+                        reducer,
+                        shared,
+                        persistence,
+                        &coverage,
+                    )
+                    .await?;
+                    ProviderSourceState::Available
+                }
+                state => state,
+            };
             provider.update_source_state(source, state);
             Ok(())
         }
@@ -7240,6 +7739,77 @@ mod tests {
         assert_eq!(backoff.consecutive_failures, 0);
         assert_eq!(backoff.on_watchdog_silence(), 1_000);
         assert_eq!(backoff.consecutive_failures, 1);
+    }
+
+    #[test]
+    fn provider_stop_interrupts_codex_discovery() {
+        const TARGET_NAME: &str =
+            "rollout-2026-08-27T00-00-00-00000000-0000-4000-8000-000000000000.jsonl";
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join(TARGET_NAME);
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path: target.clone(),
+        }]);
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.clone(),
+            }],
+            diagnostics.clone(),
+        );
+        let mut pending = PendingEvents::new(diagnostics.clone());
+        let mut watch_requests = Vec::new();
+        let mut cycle =
+            crate::provider::test_provider_cycle(&targets, &mut pending, &mut watch_requests);
+        worker.process(&mut cycle).unwrap();
+        let (sender, mut receiver) = mpsc::channel(16);
+        pending.flush_to(&sender);
+        while receiver.try_recv().is_ok() {}
+
+        std::fs::write(&target, b"").unwrap();
+        for index in 1..32 {
+            let name = format!(
+                "rollout-2026-08-27T00-00-{index:02}-00000000-0000-4000-8000-{index:012}.jsonl"
+            );
+            std::fs::write(root.join(name), b"").unwrap();
+        }
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let hook_stop = Arc::clone(&stop_flag);
+        crate::provider::set_discovery_file_type_hook(move |_| {
+            hook_stop.store(true, Ordering::Release);
+            Ok(())
+        });
+        let mut watch_requests = Vec::new();
+        let mut cycle = crate::provider::test_provider_cycle_with_stop(
+            &targets,
+            &mut pending,
+            &stop_flag,
+            &mut watch_requests,
+        );
+
+        worker.process(&mut cycle).unwrap();
+
+        assert!(stop_flag.load(Ordering::Acquire));
+        assert!(
+            worker
+                .roots
+                .get(&(Provider::Codex, root))
+                .unwrap()
+                .discovery
+                .files()
+                .is_empty(),
+            "shutdown waited for and published the discovery inventory"
+        );
+        assert_eq!(
+            diagnostics.admission_open_attempts(),
+            0,
+            "shutdown allowed discovery to open an artifact"
+        );
     }
 
     #[tokio::test]
@@ -13366,6 +13936,57 @@ mod tests {
         (provider_sender, provider, provider_thread)
     }
 
+    #[tokio::test]
+    async fn targeted_pane_session_counts_publish_from_derived_targets() {
+        let (provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+        let mut model = DomainModel::default();
+        for (provider_kind, sid, ordinal) in [
+            (Provider::Claude, "claude-one", 1),
+            (Provider::Claude, "claude-two", 2),
+            (Provider::Codex, "codex-one", 3),
+        ] {
+            let run_id = RunId::new();
+            model.insert_task_run(TaskRun {
+                run_id,
+                key: RunKey::Native {
+                    provider: provider_kind,
+                    sid: sid.to_owned(),
+                },
+                display_ordinal: DisplayOrdinal::new(ordinal),
+                state: TaskState::Running,
+                has_controller_task_state_event: false,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
+            });
+            model.insert_execution(Execution {
+                execution_id: format!("execution-{sid}"),
+                pane_id: format!("pane-{sid}"),
+                terminal_id: format!("terminal-{sid}"),
+                task_run_id: run_id,
+                state: ExecState::Working,
+            });
+        }
+        let (_model_sender, shared) = watch::channel(Arc::new(model));
+
+        provider.publish_targets(&shared);
+        provider
+            .coverage
+            .update_provider_state(Provider::Claude, ProviderSourceState::Available);
+        provider
+            .coverage
+            .update_provider_state(Provider::Codex, ProviderSourceState::Available);
+
+        assert_eq!(
+            provider.coverage.registry.summary(),
+            "herdr=available;ctl=n/a;claude=2;codex=1"
+        );
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+    }
+
     #[test]
     fn live_status_expands_per_differing_execution_with_distinct_receipt_identity() {
         let shared = status_model(&[
@@ -13808,14 +14429,23 @@ mod provider_integration_tests {
 
     impl LaneModelHarness {
         fn new() -> Self {
+            Self::with_model(DomainModel::default())
+        }
+
+        fn with_model(model: DomainModel) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let root = StateRoot(directory.path().to_path_buf());
             let store = open_writer(&root).unwrap();
             let (lifecycle, writer) = spawn_writer(store).unwrap();
             let persistence = test_runtime(writer);
             let (reducer, shared) = Reducer::new(RestoredState {
-                model: DomainModel::default(),
-                next_ordinal: 1,
+                next_ordinal: model
+                    .task_runs()
+                    .map(|run| run.display_ordinal.get())
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1),
+                model,
                 next_ingest_seq: Some(1),
                 event_ledger: Vec::new(),
             });
@@ -14282,6 +14912,7 @@ mod provider_integration_tests {
         let meta_fact = extract_meta_json(
             META_PARENT,
             META_AGENT,
+            unix_now_ms(),
             br#"{"agentType":"reviewer","description":"Review the meta-derived subject","toolUseId":"tool-meta","spawnDepth":1}"#,
         )
         .expect("meta fixture yields an allowlisted appearance fact");
@@ -15333,6 +15964,1642 @@ mod provider_integration_tests {
             "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"sub_agent_activity\",\"event_id\":\"{event}\",\"occurred_at_ms\":2,\"agent_thread_id\":\"{agent}\",\"agent_path\":\"/root/{agent}\",\"kind\":\"interacted\"}}}}"
         )
         .unwrap();
+    }
+
+    const G7_DETECTION_MS: i64 = 1_787_745_600_500;
+
+    fn g7_provisional(
+        terminal_id: &str,
+        ordinal: i64,
+        detected_at_ms: i64,
+    ) -> (RunId, RunKey, TaskRun, Execution) {
+        let run_id = RunId::new();
+        let key = RunKey::Provisional {
+            terminal_id: terminal_id.to_owned(),
+            start_ms: detected_at_ms,
+            seq: u64::try_from(ordinal).unwrap(),
+        };
+        (
+            run_id,
+            key.clone(),
+            TaskRun {
+                run_id,
+                key,
+                display_ordinal: DisplayOrdinal::new(ordinal),
+                state: TaskState::Running,
+                has_controller_task_state_event: false,
+                created_at_ms: Some(detected_at_ms),
+                updated_at_ms: Some(detected_at_ms),
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
+            },
+            Execution {
+                execution_id: format!("g7-execution-{terminal_id}"),
+                pane_id: format!("g7-pane-{terminal_id}"),
+                terminal_id: terminal_id.to_owned(),
+                task_run_id: run_id,
+                state: ExecState::Working,
+            },
+        )
+    }
+
+    fn g7_model(runs: &[(RunId, RunKey, TaskRun, Execution)]) -> DomainModel {
+        let mut model = DomainModel::default();
+        for (_, _, task_run, execution) in runs {
+            model.insert_task_run(task_run.clone());
+            model.insert_execution(execution.clone());
+        }
+        model
+    }
+
+    fn g7_execution_observation(
+        run: &(RunId, RunKey, TaskRun, Execution),
+        provider: Provider,
+        native_session_id: Option<&str>,
+        observed_at_ms: i64,
+    ) -> NormalizedEvent {
+        let mut metadata = metadata("session", "pane_agent_detected");
+        metadata.timestamp_ms = observed_at_ms;
+        metadata.receipt_time_ms = observed_at_ms;
+        metadata.provider = Some(provider);
+        metadata.native_session_id = native_session_id.map(str::to_owned);
+        metadata.task_run_id = Some(run.0);
+        NormalizedEvent::ExecutionBegin {
+            metadata,
+            execution: run.3.clone(),
+        }
+    }
+
+    fn g7_targets(model: &DomainModel, runs: &[RunId]) -> TargetSet {
+        let detections = runs
+            .iter()
+            .filter_map(|run_id| {
+                let run = model.task_run(run_id)?;
+                let RunKey::Provisional { start_ms, .. } = run.key else {
+                    return None;
+                };
+                Some((*run_id, start_ms))
+            })
+            .collect();
+        derive_provider_targets_with_codex_panes(model, &detections)
+    }
+
+    fn g7_worker(root: &Path) -> (AdapterProviderWorker, PendingEvents) {
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        (
+            AdapterProviderWorker::new(
+                vec![DiscoveryRoot {
+                    provider: Provider::Codex,
+                    path: root.to_path_buf(),
+                }],
+                diagnostics.clone(),
+            ),
+            PendingEvents::new(diagnostics),
+        )
+    }
+
+    fn g7_provider_integration() -> (
+        mpsc::Sender<ProviderIngressEvent>,
+        ProviderIntegration,
+        ProviderThreadHandle,
+    ) {
+        let provider_diagnostics = crate::provider::ProviderDiagnostics::default();
+        let (ignored_events, _ignored_receiver) = mpsc::channel(1);
+        let provider_thread = spawn_provider_thread_with_diagnostics(
+            AdapterProviderWorker::new(Vec::new(), provider_diagnostics.clone()),
+            ignored_events,
+            None,
+            provider_diagnostics,
+        )
+        .unwrap();
+        let (provider_sender, provider_events) = mpsc::channel(1);
+        let initial_coverage = SourceCoverageRegistry::default();
+        let (coverage_sender, _source_coverage) = watch::channel(initial_coverage);
+        let (source_quality_sender, _source_quality) =
+            watch::channel(ObservationQuality::Reconciling);
+        let coverage = CoverageTracker::new(
+            SourceAvailability::NotApplicable,
+            coverage_sender,
+            source_quality_sender,
+        );
+        let provider = ProviderIntegration::new(
+            provider_events,
+            provider_thread.target_publisher(),
+            TargetSet::default(),
+            coverage,
+        );
+        (provider_sender, provider, provider_thread)
+    }
+
+    fn g7_pane_event(event: &str, agent: &str, agent_session: Option<Value>) -> ReceivedEvent {
+        let mut pane = json!({
+            "agent": agent,
+            "agent_status": "working",
+            "pane_id": "g7-event-pane",
+            "tab_id": "g7-event-tab",
+            "terminal_id": "g7-event-terminal",
+            "workspace_id": "g7-event-workspace"
+        });
+        if let Some(agent_session) = agent_session {
+            pane["agent_session"] = agent_session;
+        }
+        ReceivedEvent {
+            event: event.to_owned(),
+            data: json!({ "pane": pane }),
+            primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
+        }
+    }
+
+    fn g7_pane_exited_event() -> ReceivedEvent {
+        ReceivedEvent {
+            event: "pane_exited".to_owned(),
+            data: json!({ "pane_id": "g7-event-pane" }),
+            primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
+        }
+    }
+
+    async fn g7_apply_received_event(
+        harness: &mut LaneModelHarness,
+        provider: &mut ProviderIntegration,
+        owner: &mut OwnerTracker,
+        pending_closures: &mut PendingTopologyClosures,
+        received: ReceivedEvent,
+    ) {
+        let (performance, _sampler) = performance_tracker(Arc::new(SystemPerformanceClock::new()));
+        apply_received_event(
+            &mut harness.reducer,
+            &harness.shared,
+            &mut harness.persistence,
+            owner,
+            "session",
+            received,
+            performance.admit(),
+            pending_closures,
+            provider,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn g7_prepare_pane_topology(
+        harness: &mut LaneModelHarness,
+        provider: &mut ProviderIntegration,
+        owner: &mut OwnerTracker,
+        pending_closures: &mut PendingTopologyClosures,
+    ) {
+        for received in [
+            ReceivedEvent {
+                event: "workspace_created".to_owned(),
+                data: json!({
+                    "workspace": {
+                        "workspace_id": "g7-event-workspace"
+                    }
+                }),
+                primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
+            },
+            ReceivedEvent {
+                event: "tab_created".to_owned(),
+                data: json!({
+                    "tab": {
+                        "tab_id": "g7-event-tab",
+                        "workspace_id": "g7-event-workspace"
+                    }
+                }),
+                primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
+            },
+        ] {
+            g7_apply_received_event(harness, provider, owner, pending_closures, received).await;
+        }
+    }
+
+    async fn g7_service_binding(
+        harness: &mut LaneModelHarness,
+        provider: &mut ProviderIntegration,
+        binding: CodexPaneBinding,
+    ) {
+        service_provider_event(
+            Some(ProviderIngressEvent {
+                event: ProviderEvent::SourceState {
+                    provider: Provider::Codex,
+                    state: ProviderSourceState::AvailableWithBindings {
+                        bindings: vec![binding],
+                    },
+                },
+                admission: None,
+            }),
+            provider,
+            "session",
+            &mut harness.reducer,
+            &harness.shared,
+            &mut harness.persistence,
+        )
+        .await
+        .unwrap();
+    }
+
+    fn g7_rollout(root: &Path, creation_ms: i64, label: &str) -> (PathBuf, String) {
+        let (day, timestamp) = crate::provider::lane::local_rollout_fixture_parts(creation_ms);
+        let day = root.join(day);
+        std::fs::create_dir_all(&day).unwrap();
+        let path = codex_artifact(&day, &format!("{timestamp}-{label}"));
+        let rollout_id = codex_rollout_id(&path).expect("fixture filename carries a rollout UUID");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"timestamp\":\"2026-08-26T12:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{rollout_id}\",\"session_id\":\"{rollout_id}\",\"model\":\"gpt-rollout\",\"cwd\":\"/repo\",\"originator\":\"codex_cli_rs\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        (path, rollout_id)
+    }
+
+    fn g7_binding_records(events: &[ProviderEvent]) -> Vec<CodexPaneBinding> {
+        events
+            .iter()
+            .flat_map(|event| match event {
+                ProviderEvent::SourceState {
+                    state: ProviderSourceState::AvailableWithBindings { bindings },
+                    ..
+                } => bindings.clone(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    fn g7_bindings(events: &[ProviderEvent]) -> Vec<(RunId, String)> {
+        g7_binding_records(events)
+            .into_iter()
+            .map(|binding| (binding.run_id, binding.sid))
+            .collect()
+    }
+
+    #[test]
+    fn g7_round2_worker_binding_carries_detection_episode_timestamp() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        let (_, sid) = g7_rollout(&root, G7_DETECTION_MS + 500, "episode-timestamp");
+        let run = g7_provisional("episode-timestamp", 1, G7_DETECTION_MS - 10_000);
+        let model = g7_model(std::slice::from_ref(&run));
+        let targets = derive_provider_targets_with_codex_panes(
+            &model,
+            &[(run.0, G7_DETECTION_MS)].into_iter().collect(),
+        );
+        let (mut worker, mut pending) = g7_worker(&root);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+
+        assert_eq!(
+            g7_binding_records(&drain_pending(&mut pending)),
+            vec![CodexPaneBinding {
+                run_id: run.0,
+                sid,
+                observed_at_ms: G7_DETECTION_MS,
+            }],
+            "the queued binding must preserve the exact target detection episode"
+        );
+    }
+
+    #[tokio::test]
+    async fn g7_round3_ready_primary_precedes_and_preserves_ready_provider_event() {
+        for attempt in 0..64 {
+            let (performance, _sampler) =
+                performance_tracker(Arc::new(SystemPerformanceClock::new()));
+            let (primary_sender, mut primary_events) = admitted_channel(1, performance);
+            let (provider_sender, provider_events) = mpsc::channel(1);
+            let mut provider_events = Some(provider_events);
+            let mut provider_event = None;
+
+            primary_sender
+                .send(g7_pane_event("pane_updated", "claude", None))
+                .await
+                .unwrap();
+            provider_sender
+                .send(ProviderIngressEvent {
+                    event: ProviderEvent::SourceState {
+                        provider: Provider::Codex,
+                        state: ProviderSourceState::Available,
+                    },
+                    admission: None,
+                })
+                .await
+                .unwrap();
+
+            let first = receive_primary_or_provider(
+                &mut primary_events,
+                &mut provider_events,
+                &mut provider_event,
+            )
+            .await;
+            let PrimaryProviderReceipt::Primary(Some(primary)) = first else {
+                panic!("ready provider event won attempt {attempt} before ready primary event");
+            };
+            let (primary, admission) = primary.into_parts();
+            admission.complete();
+            assert_eq!(primary.event, "pane_updated");
+            assert!(
+                provider_event.is_none(),
+                "ready provider event must remain queued after primary wins"
+            );
+
+            let second = receive_primary_or_provider(
+                &mut primary_events,
+                &mut provider_events,
+                &mut provider_event,
+            )
+            .await;
+            assert!(matches!(second, PrimaryProviderReceipt::Provider));
+            assert!(matches!(
+                provider_event,
+                Some(ProviderIngressEvent {
+                    event: ProviderEvent::SourceState {
+                        provider: Provider::Codex,
+                        state: ProviderSourceState::Available,
+                    },
+                    admission: None,
+                })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn g7_round2_explicit_path_event_clears_sessionless_detection() {
+        let mut harness = LaneModelHarness::new();
+        let (provider_sender, mut provider, provider_thread) = g7_provider_integration();
+        let mut owner = OwnerTracker::from_environment();
+        let mut pending_closures = PendingTopologyClosures::default();
+
+        g7_prepare_pane_topology(
+            &mut harness,
+            &mut provider,
+            &mut owner,
+            &mut pending_closures,
+        )
+        .await;
+
+        g7_apply_received_event(
+            &mut harness,
+            &mut provider,
+            &mut owner,
+            &mut pending_closures,
+            g7_pane_event("pane_created", "codex", None),
+        )
+        .await;
+        let target = provider
+            .published_targets
+            .codex_panes()
+            .next()
+            .expect("sessionless Codex pane must publish before explicit path arrives");
+        let provisional_key = harness
+            .shared
+            .borrow()
+            .task_run(&target.run_id)
+            .expect("published pane target must own a task run")
+            .key
+            .clone();
+        let stale_sid = "55555555-5555-4555-8555-555555555555";
+        let queued = CodexPaneBinding {
+            run_id: target.run_id,
+            sid: stale_sid.to_owned(),
+            observed_at_ms: target.detected_at_ms,
+        };
+
+        g7_apply_received_event(
+            &mut harness,
+            &mut provider,
+            &mut owner,
+            &mut pending_closures,
+            g7_pane_event(
+                "pane_updated",
+                "codex",
+                Some(json!({
+                    "source": "herdr",
+                    "agent": "codex",
+                    "kind": "path",
+                    "value": "/tmp/explicit-rollout.jsonl"
+                })),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            provider.published_targets.codex_panes().count(),
+            0,
+            "any explicit agent-session reference must suppress the sessionless heuristic"
+        );
+        g7_service_binding(&mut harness, &mut provider, queued).await;
+        let snapshot = harness.shared.borrow();
+        assert_eq!(
+            snapshot.task_run(&target.run_id).map(|run| &run.key),
+            Some(&provisional_key),
+            "the explicit path event must not heuristically promote the pane run"
+        );
+        assert!(snapshot.task_run_bindings().all(|(key, owner)| {
+            *owner != target.run_id
+                || !matches!(
+                    key,
+                    RunKey::Native {
+                        provider: Provider::Codex,
+                        ..
+                    }
+                )
+        }));
+        assert!(
+            snapshot
+                .task_run_by_key(&RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: stale_sid.to_owned(),
+                })
+                .is_none(),
+            "a binding queued before the explicit path must not gain a durable owner"
+        );
+        drop(snapshot);
+
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn g7_round2_queued_binding_drops_after_provider_transition() {
+        let mut harness = LaneModelHarness::new();
+        let (provider_sender, mut provider, provider_thread) = g7_provider_integration();
+        let mut owner = OwnerTracker::from_environment();
+        let mut pending_closures = PendingTopologyClosures::default();
+        let stale_sid = "66666666-6666-4666-8666-666666666666";
+
+        g7_prepare_pane_topology(
+            &mut harness,
+            &mut provider,
+            &mut owner,
+            &mut pending_closures,
+        )
+        .await;
+
+        g7_apply_received_event(
+            &mut harness,
+            &mut provider,
+            &mut owner,
+            &mut pending_closures,
+            g7_pane_event("pane_created", "codex", None),
+        )
+        .await;
+        let target = provider
+            .published_targets
+            .codex_panes()
+            .next()
+            .expect("sessionless Codex pane must publish a target");
+        let provisional_key = harness
+            .shared
+            .borrow()
+            .task_run(&target.run_id)
+            .expect("published pane target must own a task run")
+            .key
+            .clone();
+        let queued = CodexPaneBinding {
+            run_id: target.run_id,
+            sid: stale_sid.to_owned(),
+            observed_at_ms: target.detected_at_ms,
+        };
+
+        g7_apply_received_event(
+            &mut harness,
+            &mut provider,
+            &mut owner,
+            &mut pending_closures,
+            g7_pane_event("pane_updated", "claude", None),
+        )
+        .await;
+        assert_eq!(provider.published_targets.codex_panes().count(), 0);
+        g7_service_binding(&mut harness, &mut provider, queued).await;
+
+        let snapshot = harness.shared.borrow();
+        assert_eq!(
+            snapshot.task_run(&target.run_id).map(|run| &run.key),
+            Some(&provisional_key),
+            "a queued Codex binding must not survive a real provider transition"
+        );
+        assert!(
+            snapshot
+                .task_run_by_key(&RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: stale_sid.to_owned(),
+                })
+                .is_none(),
+            "the stale queued SID must not gain a durable owner"
+        );
+        drop(snapshot);
+
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn g7_round3_same_or_older_redetection_cannot_reuse_episode_timestamp() {
+        let first_detection_ms = G7_DETECTION_MS;
+        let run = g7_provisional(
+            "same-millisecond-redetection",
+            1,
+            first_detection_ms - 10_000,
+        );
+        let mut harness = LaneModelHarness::with_model(g7_model(std::slice::from_ref(&run)));
+        let (provider_sender, mut provider, provider_thread) = g7_provider_integration();
+        let stale_sid = "77777777-7777-4777-8777-777777777777";
+        let current_sid = "88888888-8888-4888-8888-888888888888";
+
+        provider.observe_sessionless_codex_events(
+            &[g7_execution_observation(
+                &run,
+                Provider::Codex,
+                None,
+                first_detection_ms,
+            )],
+            true,
+        );
+        provider.publish_targets(&harness.shared);
+        let episode_a = provider
+            .published_targets
+            .codex_panes()
+            .next()
+            .expect("episode A must publish");
+        assert_eq!(episode_a.detected_at_ms, first_detection_ms);
+        let queued = CodexPaneBinding {
+            run_id: episode_a.run_id,
+            sid: stale_sid.to_owned(),
+            observed_at_ms: episode_a.detected_at_ms,
+        };
+
+        provider.observe_sessionless_codex_events(
+            &[g7_execution_observation(
+                &run,
+                Provider::Claude,
+                None,
+                first_detection_ms,
+            )],
+            false,
+        );
+        provider.publish_targets(&harness.shared);
+        assert_eq!(provider.published_targets.codex_panes().count(), 0);
+
+        for redetection_ms in [first_detection_ms, first_detection_ms - 1] {
+            provider.observe_sessionless_codex_events(
+                &[g7_execution_observation(
+                    &run,
+                    Provider::Codex,
+                    None,
+                    redetection_ms,
+                )],
+                true,
+            );
+            provider.publish_targets(&harness.shared);
+            assert_eq!(
+                provider.published_targets.codex_panes().count(),
+                0,
+                "same-millisecond or regressed time must not reactivate eligibility"
+            );
+        }
+
+        g7_service_binding(&mut harness, &mut provider, queued).await;
+        assert_eq!(
+            harness
+                .shared
+                .borrow()
+                .task_run(&episode_a.run_id)
+                .map(|run| &run.key),
+            Some(&run.1),
+            "episode A's queued binding must remain stale after rejected re-entry"
+        );
+
+        let later_detection_ms = first_detection_ms + 1;
+        provider.observe_sessionless_codex_events(
+            &[g7_execution_observation(
+                &run,
+                Provider::Codex,
+                None,
+                later_detection_ms,
+            )],
+            true,
+        );
+        provider.publish_targets(&harness.shared);
+        let episode_b = provider
+            .published_targets
+            .codex_panes()
+            .next()
+            .expect("strictly later episode B must publish");
+        assert_eq!(episode_b.run_id, episode_a.run_id);
+        assert_eq!(episode_b.detected_at_ms, later_detection_ms);
+
+        g7_service_binding(
+            &mut harness,
+            &mut provider,
+            CodexPaneBinding {
+                run_id: episode_b.run_id,
+                sid: current_sid.to_owned(),
+                observed_at_ms: episode_b.detected_at_ms,
+            },
+        )
+        .await;
+
+        let snapshot = harness.shared.borrow();
+        assert_eq!(
+            snapshot.task_run(&episode_b.run_id).map(|run| &run.key),
+            Some(&RunKey::Native {
+                provider: Provider::Codex,
+                sid: current_sid.to_owned(),
+            }),
+            "the current episode binding must retain the normal one-shot promotion path"
+        );
+        assert!(
+            snapshot
+                .task_run_by_key(&RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: stale_sid.to_owned(),
+                })
+                .is_none(),
+            "episode A must never acquire a durable binding"
+        );
+        drop(snapshot);
+        provider.publish_targets(&harness.shared);
+        assert!(
+            !provider
+                .sessionless_codex_detection_history
+                .contains_key(&episode_b.run_id),
+            "episode history must be released after the run is no longer live provisional"
+        );
+
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn g7_round3_queued_binding_drops_after_snapshot_absence() {
+        let run = g7_provisional("snapshot-absence", 1, G7_DETECTION_MS - 10_000);
+        let mut harness = LaneModelHarness::with_model(g7_model(std::slice::from_ref(&run)));
+        let (provider_sender, mut provider, provider_thread) = g7_provider_integration();
+        let stale_sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+        provider.observe_sessionless_codex_terminals(
+            &harness.shared,
+            &HashSet::from([run.3.terminal_id.clone()]),
+        );
+        provider.publish_targets(&harness.shared);
+        let target = provider
+            .published_targets
+            .codex_panes()
+            .next()
+            .expect("snapshot-present Codex pane must publish a target");
+        let queued = CodexPaneBinding {
+            run_id: target.run_id,
+            sid: stale_sid.to_owned(),
+            observed_at_ms: target.detected_at_ms,
+        };
+
+        provider.observe_sessionless_codex_terminals(&harness.shared, &HashSet::new());
+        provider.publish_targets(&harness.shared);
+        assert_eq!(
+            provider.published_targets.codex_panes().count(),
+            0,
+            "snapshot absence must remove active detection eligibility"
+        );
+        g7_service_binding(&mut harness, &mut provider, queued).await;
+
+        let snapshot = harness.shared.borrow();
+        assert_eq!(
+            snapshot.task_run(&target.run_id).map(|run| &run.key),
+            Some(&run.1),
+            "a binding queued before snapshot absence must not promote the provisional run"
+        );
+        assert!(
+            snapshot
+                .task_run_by_key(&RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: stale_sid.to_owned(),
+                })
+                .is_none(),
+            "the stale snapshot-era SID must not gain a durable owner"
+        );
+        drop(snapshot);
+
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn g7_round2_queued_binding_drops_after_terminal_event() {
+        let mut harness = LaneModelHarness::new();
+        let (provider_sender, mut provider, provider_thread) = g7_provider_integration();
+        let mut owner = OwnerTracker::from_environment();
+        let mut pending_closures = PendingTopologyClosures::default();
+        let stale_sid = "99999999-9999-4999-8999-999999999999";
+
+        g7_prepare_pane_topology(
+            &mut harness,
+            &mut provider,
+            &mut owner,
+            &mut pending_closures,
+        )
+        .await;
+
+        g7_apply_received_event(
+            &mut harness,
+            &mut provider,
+            &mut owner,
+            &mut pending_closures,
+            g7_pane_event("pane_created", "codex", None),
+        )
+        .await;
+        let target = provider
+            .published_targets
+            .codex_panes()
+            .next()
+            .expect("sessionless Codex pane must publish a target");
+        let provisional_key = harness
+            .shared
+            .borrow()
+            .task_run(&target.run_id)
+            .expect("published pane target must own a task run")
+            .key
+            .clone();
+        let queued = CodexPaneBinding {
+            run_id: target.run_id,
+            sid: stale_sid.to_owned(),
+            observed_at_ms: target.detected_at_ms,
+        };
+
+        g7_apply_received_event(
+            &mut harness,
+            &mut provider,
+            &mut owner,
+            &mut pending_closures,
+            g7_pane_exited_event(),
+        )
+        .await;
+        assert_eq!(provider.published_targets.codex_panes().count(), 0);
+        assert!(
+            harness
+                .shared
+                .borrow()
+                .executions()
+                .filter(|execution| execution.task_run_id == target.run_id)
+                .all(|execution| execution.state.is_terminal())
+        );
+        g7_service_binding(&mut harness, &mut provider, queued).await;
+
+        let snapshot = harness.shared.borrow();
+        assert_eq!(
+            snapshot.task_run(&target.run_id).map(|run| &run.key),
+            Some(&provisional_key),
+            "a queued binding must not promote a terminal pane run"
+        );
+        assert!(
+            snapshot
+                .task_run_by_key(&RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: stale_sid.to_owned(),
+                })
+                .is_none()
+        );
+        drop(snapshot);
+
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reused_provisional_anchors_rollout_window_at_actual_codex_detection() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        let provisional_start_ms = G7_DETECTION_MS;
+        let detected_at_ms = G7_DETECTION_MS + 10_000;
+        let _ = g7_rollout(&root, provisional_start_ms + 500, "before-detection");
+        let run = g7_provisional("reused-provisional", 1, provisional_start_ms);
+        let (_model_sender, shared) =
+            watch::channel(Arc::new(g7_model(std::slice::from_ref(&run))));
+        let (provider_sender, mut provider, provider_thread) = g7_provider_integration();
+
+        provider.observe_sessionless_codex_events(
+            &[g7_execution_observation(
+                &run,
+                Provider::Codex,
+                None,
+                detected_at_ms,
+            )],
+            true,
+        );
+        provider.publish_targets(&shared);
+        let targets = provider.published_targets.clone();
+        let (mut worker, mut pending) = g7_worker(&root);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        assert!(
+            g7_bindings(&drain_pending(&mut pending)).is_empty(),
+            "a rollout created after provisional start but before actual Codex detection must not bind"
+        );
+
+        let (_, same_second_sid) = g7_rollout(&root, detected_at_ms - 500, "same-detection-second");
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        assert_eq!(
+            g7_bindings(&drain_pending(&mut pending)),
+            vec![(run.0, same_second_sid)],
+            "a rollout created in the actual detection second must remain eligible"
+        );
+
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeated_sessionless_codex_observations_retain_first_detection_time() {
+        let run = g7_provisional("repeated-detection", 1, G7_DETECTION_MS);
+        let (_model_sender, shared) =
+            watch::channel(Arc::new(g7_model(std::slice::from_ref(&run))));
+        let (provider_sender, mut provider, provider_thread) = g7_provider_integration();
+        let first_detection_ms = G7_DETECTION_MS + 10_000;
+
+        for observed_at_ms in [first_detection_ms, first_detection_ms + 5_000] {
+            provider.observe_sessionless_codex_events(
+                &[g7_execution_observation(
+                    &run,
+                    Provider::Codex,
+                    None,
+                    observed_at_ms,
+                )],
+                true,
+            );
+            provider.publish_targets(&shared);
+        }
+
+        assert_eq!(
+            provider
+                .published_targets
+                .codex_panes()
+                .map(|target| target.detected_at_ms)
+                .collect::<Vec<_>>(),
+            vec![first_detection_ms],
+            "an unchanged live sessionless Codex pane must retain its first actual detection"
+        );
+
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn identity_and_provider_transitions_clear_sessionless_codex_detection() {
+        for (label, transition_provider, transition_sid) in [
+            ("explicit-identity", Provider::Codex, Some("explicit-sid")),
+            ("provider-transition", Provider::Claude, None),
+        ] {
+            let run = g7_provisional(label, 1, G7_DETECTION_MS);
+            let (_model_sender, shared) =
+                watch::channel(Arc::new(g7_model(std::slice::from_ref(&run))));
+            let (provider_sender, mut provider, provider_thread) = g7_provider_integration();
+            let first_detection_ms = G7_DETECTION_MS + 10_000;
+            let redetection_ms = first_detection_ms + 10_000;
+
+            provider.observe_sessionless_codex_events(
+                &[g7_execution_observation(
+                    &run,
+                    Provider::Codex,
+                    None,
+                    first_detection_ms,
+                )],
+                true,
+            );
+            provider.observe_sessionless_codex_events(
+                &[g7_execution_observation(
+                    &run,
+                    transition_provider,
+                    transition_sid,
+                    first_detection_ms + 5_000,
+                )],
+                false,
+            );
+            provider.publish_targets(&shared);
+            assert_eq!(
+                provider.published_targets.codex_panes().count(),
+                0,
+                "{label} must clear stale sessionless Codex detection state"
+            );
+
+            provider.observe_sessionless_codex_events(
+                &[g7_execution_observation(
+                    &run,
+                    Provider::Codex,
+                    None,
+                    redetection_ms,
+                )],
+                true,
+            );
+            provider.publish_targets(&shared);
+            assert_eq!(
+                provider
+                    .published_targets
+                    .codex_panes()
+                    .map(|target| target.detected_at_ms)
+                    .collect::<Vec<_>>(),
+                vec![redetection_ms],
+                "{label} must not reuse the pre-transition detection timestamp"
+            );
+
+            drop(provider_sender);
+            provider_thread.stop().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_sessionless_codex_detection_uses_current_observation_time() {
+        let before_observation_ms = unix_now_ms();
+        let run = g7_provisional(
+            "snapshot-detection",
+            1,
+            before_observation_ms.saturating_sub(60_000),
+        );
+        let (_model_sender, shared) =
+            watch::channel(Arc::new(g7_model(std::slice::from_ref(&run))));
+        let (provider_sender, mut provider, provider_thread) = g7_provider_integration();
+
+        provider.observe_sessionless_codex_terminals(
+            &shared,
+            &[run.3.terminal_id.clone()].into_iter().collect(),
+        );
+        let after_observation_ms = unix_now_ms();
+        provider.publish_targets(&shared);
+
+        let detected_at_ms = provider
+            .published_targets
+            .codex_panes()
+            .next()
+            .expect("snapshot-observed sessionless Codex pane must publish")
+            .detected_at_ms;
+        assert!(
+            (before_observation_ms..=after_observation_ms).contains(&detected_at_ms),
+            "snapshot detection must use a conservative current observation time, got {detected_at_ms} outside {before_observation_ms}..={after_observation_ms}"
+        );
+
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sessionless_codex_pane_binds_in_one_cycle_and_receives_pending_telemetry() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        let (path, rollout_id) = g7_rollout(&root, G7_DETECTION_MS + 500, "fresh");
+        let run = g7_provisional("fresh", 1, G7_DETECTION_MS);
+        let run_id = run.0;
+        let provisional_key = run.1.clone();
+        let model = g7_model(std::slice::from_ref(&run));
+        let targets = g7_targets(&model, &[run_id]);
+        let (mut worker, mut pending) = g7_worker(&root);
+        let mut harness = LaneModelHarness::with_model(model);
+        let native_key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: rollout_id.clone(),
+        };
+        harness.reducer.apply_telemetry(
+            &native_key,
+            G7_DETECTION_MS + 750,
+            37,
+            Some("gpt-5.6-sol".to_owned()),
+            Some("xhigh".to_owned()),
+            Some("workspace-write".to_owned()),
+        );
+        assert!(
+            harness.shared.borrow().telemetry(&run_id).is_none(),
+            "native-key telemetry must remain pending before heuristic promotion"
+        );
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let events = drain_pending(&mut pending);
+        let (provider_sender, mut provider, provider_thread) = g7_provider_integration();
+        provider
+            .sessionless_codex_detections
+            .insert(run_id, G7_DETECTION_MS);
+        let (performance, _sampler) = performance_tracker(Arc::new(SystemPerformanceClock::new()));
+        for event in events {
+            let admission = event.requires_admission().then(|| performance.admit());
+            service_provider_event(
+                Some(ProviderIngressEvent { event, admission }),
+                &mut provider,
+                "session",
+                &mut harness.reducer,
+                &harness.shared,
+                &mut harness.persistence,
+            )
+            .await
+            .unwrap();
+        }
+
+        let snapshot = harness.shared.borrow();
+        assert_eq!(
+            snapshot.task_run(&run_id).map(|run| &run.key),
+            Some(&native_key),
+            "fresh sessionless pane did not promote in the rollout's first rescan cycle"
+        );
+        assert_eq!(
+            snapshot
+                .task_run_by_key(&provisional_key)
+                .map(|run| run.run_id),
+            Some(run_id),
+            "promotion must retain the provisional alias"
+        );
+        let telemetry = snapshot
+            .telemetry(&run_id)
+            .expect("native-key pending telemetry must resolve through heuristic promotion");
+        assert_eq!(telemetry.output_tokens, 37);
+        assert_eq!(telemetry.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(telemetry.effort.as_deref(), Some("xhigh"));
+        assert!(snapshot.agent_nodes().any(|node| {
+            node.task_run_id == run_id && node.session_file.as_deref() == path.to_str()
+        }));
+        drop(snapshot);
+        assert_eq!(
+            derive_provider_targets_with_codex_panes(
+                &harness.shared.borrow(),
+                &[(run_id, G7_DETECTION_MS)].into_iter().collect(),
+            )
+            .codex_panes()
+            .count(),
+            0,
+            "a promoted run must never be reconsidered by the heuristic"
+        );
+        assert_eq!(tail_count_for_absolute(&worker, &path), 1);
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+        harness.shutdown().await;
+    }
+
+    #[test]
+    fn sessionless_codex_same_second_rollout_binds() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        let (_, rollout_id) = g7_rollout(&root, G7_DETECTION_MS - 500, "same-second");
+        let run = g7_provisional("same-second", 1, G7_DETECTION_MS);
+        let model = g7_model(std::slice::from_ref(&run));
+        let targets = g7_targets(&model, &[run.0]);
+        let (mut worker, mut pending) = g7_worker(&root);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+
+        assert_eq!(
+            g7_bindings(&drain_pending(&mut pending)),
+            vec![(run.0, rollout_id)],
+            "filename time in the detection second must qualify after truncation"
+        );
+    }
+
+    #[test]
+    fn two_sessionless_panes_and_two_rollouts_remain_ambiguous() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        let (first_path, first_sid) = g7_rollout(&root, G7_DETECTION_MS + 500, "two-by-two-first");
+        let (second_path, _) = g7_rollout(&root, G7_DETECTION_MS + 1_500, "two-by-two-second");
+        let first = g7_provisional("two-by-two-first", 1, G7_DETECTION_MS);
+        let second = g7_provisional("two-by-two-second", 2, G7_DETECTION_MS);
+        let model = g7_model(&[first.clone(), second.clone()]);
+        let (mut worker, mut pending) = g7_worker(&root);
+
+        process_adapter_worker(
+            &mut worker,
+            &g7_targets(&model, &[first.0, second.0]),
+            &mut pending,
+        );
+        assert!(
+            g7_bindings(&drain_pending(&mut pending)).is_empty(),
+            "two panes that each see two rollouts must both remain provisional"
+        );
+
+        std::fs::remove_file(second_path).unwrap();
+        process_adapter_worker(&mut worker, &g7_targets(&model, &[first.0]), &mut pending);
+        assert_eq!(
+            g7_bindings(&drain_pending(&mut pending)),
+            vec![(first.0, first_sid)],
+            "the surviving pane must retry after ambiguity clears"
+        );
+        assert!(first_path.exists());
+    }
+
+    #[test]
+    fn one_rollout_claimed_by_two_sessionless_panes_binds_neither() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        let (_, rollout_id) = g7_rollout(&root, G7_DETECTION_MS + 500, "shared");
+        let first = g7_provisional("shared-first", 1, G7_DETECTION_MS);
+        let second = g7_provisional("shared-second", 2, G7_DETECTION_MS);
+        let model = g7_model(&[first.clone(), second.clone()]);
+        let (mut worker, mut pending) = g7_worker(&root);
+
+        process_adapter_worker(
+            &mut worker,
+            &g7_targets(&model, &[first.0, second.0]),
+            &mut pending,
+        );
+        assert!(
+            g7_bindings(&drain_pending(&mut pending)).is_empty(),
+            "one rollout with two claimants must bind neither pane"
+        );
+
+        process_adapter_worker(&mut worker, &g7_targets(&model, &[first.0]), &mut pending);
+        assert_eq!(
+            g7_bindings(&drain_pending(&mut pending)),
+            vec![(first.0, rollout_id)],
+            "the remaining claimant must retry after the other pane disappears"
+        );
+    }
+
+    #[test]
+    fn two_same_second_rollouts_for_one_pane_do_not_bind() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        let (_, first_sid) = g7_rollout(&root, G7_DETECTION_MS - 500, "tie-first");
+        let (second_path, _) = g7_rollout(&root, G7_DETECTION_MS - 500, "tie-second");
+        let run = g7_provisional("tie", 1, G7_DETECTION_MS);
+        let model = g7_model(std::slice::from_ref(&run));
+        let targets = g7_targets(&model, &[run.0]);
+        let (mut worker, mut pending) = g7_worker(&root);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        assert!(
+            g7_bindings(&drain_pending(&mut pending)).is_empty(),
+            "candidate degree two must remain provisional even when timestamps tie"
+        );
+
+        std::fs::remove_file(second_path).unwrap();
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        assert_eq!(
+            g7_bindings(&drain_pending(&mut pending)),
+            vec![(run.0, first_sid)],
+            "the pane must retry after one tied candidate disappears"
+        );
+    }
+
+    #[test]
+    fn owned_rollout_exclusion_reduces_two_candidates_to_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        let (_, owned_sid) = g7_rollout(&root, G7_DETECTION_MS + 500, "owned-candidate");
+        let (_, unowned_sid) = g7_rollout(&root, G7_DETECTION_MS + 1_500, "unowned-candidate");
+        let run = g7_provisional("ownership-exclusion", 2, G7_DETECTION_MS);
+        let mut model = g7_model(std::slice::from_ref(&run));
+        model.insert_task_run(TaskRun {
+            run_id: RunId::new(),
+            key: RunKey::Native {
+                provider: Provider::Codex,
+                sid: owned_sid,
+            },
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Queued,
+            has_controller_task_state_event: false,
+            created_at_ms: Some(G7_DETECTION_MS),
+            updated_at_ms: Some(G7_DETECTION_MS),
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        let targets = g7_targets(&model, &[run.0]);
+        let (mut worker, mut pending) = g7_worker(&root);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+
+        assert_eq!(
+            g7_bindings(&drain_pending(&mut pending)),
+            vec![(run.0, unowned_sid)],
+            "excluding the owned rollout must leave one unambiguous candidate"
+        );
+    }
+
+    #[test]
+    fn sessionless_codex_pane_without_candidate_retries_later() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        let _ = g7_rollout(&root, G7_DETECTION_MS - 1_500, "too-old");
+        let run = g7_provisional("no-candidate", 1, G7_DETECTION_MS);
+        let model = g7_model(std::slice::from_ref(&run));
+        let targets = g7_targets(&model, &[run.0]);
+        let (mut worker, mut pending) = g7_worker(&root);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        assert!(
+            g7_bindings(&drain_pending(&mut pending)).is_empty(),
+            "a rollout before the normalized detection window is not a candidate"
+        );
+
+        let (_, later_sid) = g7_rollout(&root, G7_DETECTION_MS + 500, "later");
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        assert_eq!(
+            g7_bindings(&drain_pending(&mut pending)),
+            vec![(run.0, later_sid)],
+            "a pane with no candidate must retry on the next rescan"
+        );
+    }
+
+    #[test]
+    fn explicit_agent_session_suppresses_heuristic_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        let (_, explicit_sid) = g7_rollout(&root, G7_DETECTION_MS + 1_500, "explicit");
+        let explicit_id = RunId::new();
+        let explicit_run = TaskRun {
+            run_id: explicit_id,
+            key: RunKey::Native {
+                provider: Provider::Codex,
+                sid: explicit_sid,
+            },
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Running,
+            has_controller_task_state_event: false,
+            created_at_ms: Some(G7_DETECTION_MS),
+            updated_at_ms: Some(G7_DETECTION_MS),
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        };
+        let explicit_execution = Execution {
+            execution_id: "g7-explicit-execution".to_owned(),
+            pane_id: "g7-explicit-pane".to_owned(),
+            terminal_id: "g7-explicit-terminal".to_owned(),
+            task_run_id: explicit_id,
+            state: ExecState::Working,
+        };
+        let sessionless = g7_provisional("explicit-control", 2, G7_DETECTION_MS);
+        let mut model = g7_model(std::slice::from_ref(&sessionless));
+        model.insert_task_run(explicit_run);
+        model.insert_execution(explicit_execution);
+        let targets = g7_targets(&model, &[sessionless.0]);
+        let (mut worker, mut pending) = g7_worker(&root);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+
+        assert!(
+            g7_bindings(&drain_pending(&mut pending)).is_empty(),
+            "an already-owned native identity must not be a heuristic candidate"
+        );
+    }
+
+    #[test]
+    fn node_only_owned_codex_session_suppresses_heuristic_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        let (_, owned_sid) = g7_rollout(&root, G7_DETECTION_MS + 1_500, "node-owned");
+        let sessionless = g7_provisional("node-owned-control", 2, G7_DETECTION_MS);
+        let mut model = g7_model(std::slice::from_ref(&sessionless));
+        let owner_id = RunId::new();
+        model.insert_task_run(TaskRun {
+            run_id: owner_id,
+            key: RunKey::Controller("node-owned-controller".to_owned()),
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Running,
+            has_controller_task_state_event: false,
+            created_at_ms: Some(G7_DETECTION_MS),
+            updated_at_ms: Some(G7_DETECTION_MS),
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "agent:codex:node-owned".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some(owned_sid.clone()),
+            task_run_id: owner_id,
+            display_ordinal: DisplayOrdinal::new(1),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Working),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
+        });
+        assert!(
+            model
+                .task_run_by_key(&RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: owned_sid,
+                })
+                .is_none(),
+            "the ownership fixture must not gain a native key or alias"
+        );
+        let targets = g7_targets(&model, &[sessionless.0]);
+        let (mut worker, mut pending) = g7_worker(&root);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+
+        assert!(
+            g7_bindings(&drain_pending(&mut pending)).is_empty(),
+            "a node-only owned native identity must not be a heuristic candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_time_heuristic_binding_drops_sid_newly_owned_by_key() {
+        let sessionless = g7_provisional("key-owned-apply", 2, G7_DETECTION_MS);
+        let run_id = sessionless.0;
+        let provisional_key = sessionless.1.clone();
+        let sid = "44444444-4444-4444-8444-444444444444";
+        let binding = CodexPaneBinding {
+            run_id,
+            sid: sid.to_owned(),
+            observed_at_ms: G7_DETECTION_MS + 1_000,
+        };
+        let mut model = g7_model(std::slice::from_ref(&sessionless));
+        let owner = RunId::new();
+        model.insert_task_run(TaskRun {
+            run_id: owner,
+            key: RunKey::Native {
+                provider: Provider::Codex,
+                sid: sid.to_owned(),
+            },
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Queued,
+            has_controller_task_state_event: false,
+            created_at_ms: Some(G7_DETECTION_MS),
+            updated_at_ms: Some(G7_DETECTION_MS),
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        let mut harness = LaneModelHarness::with_model(model);
+        let coverage = SourceCoverageRegistry::new(SourceAvailability::Available);
+        let detections = [(run_id, binding.observed_at_ms)].into_iter().collect();
+
+        apply_heuristic_bindings(
+            vec![binding],
+            &detections,
+            &mut harness.reducer,
+            &harness.shared,
+            &mut harness.persistence,
+            &coverage,
+        )
+        .await
+        .unwrap();
+
+        let snapshot = harness.shared.borrow();
+        assert_eq!(
+            snapshot.task_run(&run_id).map(|run| &run.key),
+            Some(&provisional_key),
+            "a published heuristic binding must go stale when its sid gains a key owner"
+        );
+        assert_eq!(
+            snapshot
+                .task_run_by_key(&RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: sid.to_owned(),
+                })
+                .map(|run| run.run_id),
+            Some(owner)
+        );
+        assert_eq!(snapshot.controller_diagnostics().binding_conflicts(), 0);
+        drop(snapshot);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn apply_time_heuristic_binding_drops_sid_newly_owned_by_node() {
+        let sessionless = g7_provisional("node-owned-apply", 2, G7_DETECTION_MS);
+        let run_id = sessionless.0;
+        let provisional_key = sessionless.1.clone();
+        let sid = "55555555-5555-4555-8555-555555555555";
+        let binding = CodexPaneBinding {
+            run_id,
+            sid: sid.to_owned(),
+            observed_at_ms: G7_DETECTION_MS + 1_000,
+        };
+        let mut model = g7_model(std::slice::from_ref(&sessionless));
+        let owner = RunId::new();
+        model.insert_task_run(TaskRun {
+            run_id: owner,
+            key: RunKey::Controller("node-owned-apply-controller".to_owned()),
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Queued,
+            has_controller_task_state_event: false,
+            created_at_ms: Some(G7_DETECTION_MS),
+            updated_at_ms: Some(G7_DETECTION_MS),
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "agent:codex:node-owned-apply".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some(sid.to_owned()),
+            task_run_id: owner,
+            display_ordinal: DisplayOrdinal::new(1),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Working),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
+        });
+        let mut harness = LaneModelHarness::with_model(model);
+        let coverage = SourceCoverageRegistry::new(SourceAvailability::Available);
+        let detections = [(run_id, binding.observed_at_ms)].into_iter().collect();
+
+        apply_heuristic_bindings(
+            vec![binding],
+            &detections,
+            &mut harness.reducer,
+            &harness.shared,
+            &mut harness.persistence,
+            &coverage,
+        )
+        .await
+        .unwrap();
+
+        let snapshot = harness.shared.borrow();
+        assert_eq!(
+            snapshot.task_run(&run_id).map(|run| &run.key),
+            Some(&provisional_key),
+            "a published heuristic binding must go stale when its sid gains a node owner"
+        );
+        assert!(
+            snapshot
+                .task_run_by_key(&RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: sid.to_owned(),
+                })
+                .is_none()
+        );
+        assert_eq!(snapshot.controller_diagnostics().binding_conflicts(), 0);
+        drop(snapshot);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stale_heuristic_binding_yields_to_explicit_pane_identity() {
+        let sessionless = g7_provisional("stale-binding", 1, G7_DETECTION_MS);
+        let run_id = sessionless.0;
+        let execution = sessionless.3.clone();
+        let mut harness =
+            LaneModelHarness::with_model(g7_model(std::slice::from_ref(&sessionless)));
+        let explicit_sid = "11111111-1111-4111-8111-111111111111";
+        let heuristic_sid = "22222222-2222-4222-8222-222222222222";
+        let mut observed_metadata = metadata("session", "pane_updated_identity_observed");
+        observed_metadata.provider = Some(Provider::Codex);
+        observed_metadata.task_run_id = Some(run_id);
+        harness
+            .reducer
+            .apply(NormalizedEvent::AgentNodeUpsert {
+                metadata: observed_metadata,
+                node: AgentNodeObservation {
+                    agent_node_id: "agent:codex:explicit-pane".to_owned(),
+                    provider: Provider::Codex,
+                    native_session_id: Some(explicit_sid.to_owned()),
+                    task_run_id: run_id,
+                    parent_agent_node_id: None,
+                    state: Some(ExecState::Working),
+                    model_id: None,
+                    session_file: None,
+                },
+            })
+            .unwrap();
+
+        harness
+            .apply([ProviderEvent::SourceState {
+                provider: Provider::Codex,
+                state: ProviderSourceState::AvailableWithBindings {
+                    bindings: vec![CodexPaneBinding {
+                        run_id,
+                        sid: heuristic_sid.to_owned(),
+                        observed_at_ms: G7_DETECTION_MS + 1_000,
+                    }],
+                },
+            }])
+            .await;
+
+        let mut explicit_metadata = metadata("session", "pane_updated");
+        explicit_metadata.provider = Some(Provider::Codex);
+        explicit_metadata.native_session_id = Some(explicit_sid.to_owned());
+        explicit_metadata.terminal_id = Some(execution.terminal_id.clone());
+        harness
+            .reducer
+            .apply(NormalizedEvent::ExecutionBegin {
+                metadata: explicit_metadata,
+                execution,
+            })
+            .unwrap();
+
+        assert_eq!(
+            harness
+                .shared
+                .borrow()
+                .task_run(&run_id)
+                .map(|run| &run.key),
+            Some(&RunKey::Native {
+                provider: Provider::Codex,
+                sid: explicit_sid.to_owned(),
+            }),
+            "the explicit pane identity must win over a stale heuristic result"
+        );
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sessionless_codex_event_publishes_target_until_promotion() {
+        let mut harness = LaneModelHarness::new();
+        let provider_diagnostics = crate::provider::ProviderDiagnostics::default();
+        let (ignored_events, _ignored_receiver) = mpsc::channel(1);
+        let provider_thread = spawn_provider_thread_with_diagnostics(
+            AdapterProviderWorker::new(Vec::new(), provider_diagnostics.clone()),
+            ignored_events,
+            None,
+            provider_diagnostics,
+        )
+        .unwrap();
+        let (_provider_sender, provider_events) = mpsc::channel(1);
+        let initial_coverage = SourceCoverageRegistry::new(SourceAvailability::Available);
+        let (coverage_sender, _source_coverage) = watch::channel(initial_coverage);
+        let (source_quality_sender, _source_quality) =
+            watch::channel(ObservationQuality::Reconciling);
+        let coverage = CoverageTracker::new(
+            SourceAvailability::Available,
+            coverage_sender,
+            source_quality_sender,
+        );
+        let mut provider = ProviderIntegration::new(
+            provider_events,
+            provider_thread.target_publisher(),
+            TargetSet::default(),
+            coverage,
+        );
+        let (performance, _sampler) = performance_tracker(Arc::new(SystemPerformanceClock::new()));
+        let received = ReceivedEvent {
+            event: "pane_created".to_owned(),
+            data: json!({
+                "pane": {
+                    "agent": "codex",
+                    "agent_status": "working",
+                    "pane_id": "g7-event-pane",
+                    "tab_id": "g7-event-tab",
+                    "terminal_id": "g7-event-terminal",
+                    "workspace_id": "g7-event-workspace"
+                }
+            }),
+            primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
+        };
+        let mut owner = OwnerTracker::from_environment();
+        let mut pending_closures = PendingTopologyClosures::default();
+
+        apply_received_event(
+            &mut harness.reducer,
+            &harness.shared,
+            &mut harness.persistence,
+            &mut owner,
+            "session",
+            received,
+            performance.admit(),
+            &mut pending_closures,
+            &mut provider,
+        )
+        .await
+        .unwrap();
+
+        let published = provider.published_targets.codex_panes().collect::<Vec<_>>();
+        let [target] = published.as_slice() else {
+            panic!(
+                "sessionless Codex pane event did not publish exactly one target: {published:?}"
+            );
+        };
+        service_provider_event(
+            Some(ProviderIngressEvent {
+                event: ProviderEvent::SourceState {
+                    provider: Provider::Codex,
+                    state: ProviderSourceState::AvailableWithBindings {
+                        bindings: vec![CodexPaneBinding {
+                            run_id: target.run_id,
+                            sid: "33333333-3333-4333-8333-333333333333".to_owned(),
+                            observed_at_ms: target.detected_at_ms,
+                        }],
+                    },
+                },
+                admission: None,
+            }),
+            &mut provider,
+            "session",
+            &mut harness.reducer,
+            &harness.shared,
+            &mut harness.persistence,
+        )
+        .await
+        .unwrap();
+        provider.publish_targets(&harness.shared);
+
+        assert_eq!(
+            provider.published_targets.codex_panes().count(),
+            0,
+            "promoted pane must disappear from published sessionless targets"
+        );
+        provider_thread.stop().await.unwrap();
+        harness.shutdown().await;
     }
 
     fn tail_read_calls(
@@ -17611,6 +19878,23 @@ mod provider_integration_tests {
             &SourceAvailability::Unavailable {
                 detail: "bind_failure".to_owned(),
             }
+        );
+    }
+
+    #[test]
+    fn provider_metadata_keeps_persisted_source_names_byte_stable() {
+        let mut registry = SourceCoverageRegistry::new(SourceAvailability::Available);
+        registry.set(CoverageSource::Claude, SourceAvailability::Available);
+        registry.set(
+            CoverageSource::Codex,
+            SourceAvailability::Unavailable {
+                detail: "read_failed".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            serde_json::to_vec(&registry.provider_metadata()).unwrap(),
+            br#"[{"source":"herdr","available":true,"detail":null},{"source":"controller","available":true,"detail":null},{"source":"claude","available":true,"detail":null},{"source":"codex","available":false,"detail":"read_failed"}]"#
         );
     }
 

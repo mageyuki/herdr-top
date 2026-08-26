@@ -95,6 +95,13 @@ impl ActivitySelection {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SubagentEnd {
+    failed: bool,
+    ordinal: u64,
+    at_ms: i64,
+}
+
 /// Stateful fact consumer that emits deterministic provider-lane events.
 #[derive(Clone, Debug)]
 pub struct Synthesis {
@@ -107,7 +114,7 @@ pub struct Synthesis {
     published_subjects: HashMap<String, String>,
     started: HashMap<ScopeKey, i64>,
     usage_samples: HashSet<(ScopeKey, String)>,
-    subagent_ends: HashMap<(String, String), bool>,
+    subagent_ends: HashMap<(String, String), SubagentEnd>,
     lineage: HashSet<(ScopeKey, ScopeKey)>,
     last_append_ms: HashMap<ScopeKey, i64>,
     /// Grace-held outcomes flush on graceful shutdown. After a crash, `EndedUnknown` is the
@@ -179,16 +186,16 @@ impl Synthesis {
                     && !self.pending_completes.contains_key(scope)
                     && !self.completed.contains(scope)
                     && now_ms.saturating_sub(anchor_ms) >= self.headless_inactivity_ms)
-                    .then(|| scope.clone())
+                    .then(|| (scope.clone(), anchor_ms))
             })
             .collect::<Vec<_>>();
         inactive.sort();
-        for scope in inactive {
+        for (scope, anchor_ms) in inactive {
             self.inactivity_closed.insert(scope.clone());
             self.started.remove(&scope);
             events.push(ProviderEvent::LaneClose {
                 key: run_key_for_scope_key(&scope),
-                at_ms: now_ms,
+                at_ms: anchor_ms,
             });
         }
         events
@@ -279,7 +286,7 @@ impl Synthesis {
         discovered: &AdmissionIndex,
     ) -> Vec<ProviderEvent> {
         let mut ordinary = Vec::new();
-        let mut ended: HashMap<(String, String), (u64, bool)> = HashMap::new();
+        let mut ended: HashMap<(String, String), (u64, bool, i64)> = HashMap::new();
         let mut ordinal_sequences = HashMap::<u64, usize>::new();
         for (order, (ordinal, fact)) in facts.into_iter().enumerate() {
             let sequence = ordinal_sequences.entry(ordinal).or_default();
@@ -289,11 +296,15 @@ impl Synthesis {
                 parent,
                 agent_id,
                 failed,
+                at_ms,
             } = fact
             {
-                let terminal = ended.entry((parent, agent_id)).or_insert((ordinal, false));
+                let terminal = ended
+                    .entry((parent, agent_id))
+                    .or_insert((ordinal, false, at_ms));
                 terminal.0 = terminal.0.min(ordinal);
                 terminal.1 |= failed;
+                terminal.2 = terminal.2.min(at_ms);
             } else {
                 ordinary.push((ordinal, order, record_sequence, fact));
             }
@@ -301,7 +312,7 @@ impl Synthesis {
         ordinary.extend(
             ended
                 .into_iter()
-                .map(|((parent, agent_id), (ordinal, failed))| {
+                .map(|((parent, agent_id), (ordinal, failed, at_ms))| {
                     (
                         ordinal,
                         usize::MAX,
@@ -310,6 +321,7 @@ impl Synthesis {
                             parent,
                             agent_id,
                             failed,
+                            at_ms,
                         },
                     )
                 }),
@@ -417,12 +429,12 @@ impl Synthesis {
                 let scope = SessionScope::Codex {
                     rollout_id: rollout_id.clone(),
                 };
+                let scope_key = ScopeKey::from(&scope);
                 let at_ms = self
                     .last_append_ms
-                    .get(&ScopeKey::from(&scope))
+                    .get(&scope_key)
                     .copied()
-                    .unwrap_or_default();
-                let scope_key = ScopeKey::from(&scope);
+                    .unwrap_or(self.latest_lifecycle_ms);
                 let _ = self.prepare_resume(&scope_key, at_ms, events);
                 self.start_scope(scope_key, at_ms);
                 events.push(ProviderEvent::Synthesized(controller_event(
@@ -512,14 +524,10 @@ impl Synthesis {
                 agent_id,
                 agent_type,
                 description,
+                at_ms,
             } => {
                 let parent_scope = SessionScope::ClaudeRoot(parent.clone());
                 let child_scope = SessionScope::ClaudeSubagent { parent, agent_id };
-                let at_ms = self
-                    .last_append_ms
-                    .get(&ScopeKey::from(&parent_scope))
-                    .copied()
-                    .unwrap_or_default();
                 let child_key = ScopeKey::from(&child_scope);
                 let _ = self.prepare_resume(&child_key, at_ms, events);
                 let provider_metadata = MinimalProviderMetadata {
@@ -552,26 +560,36 @@ impl Synthesis {
                 parent,
                 agent_id,
                 failed,
+                at_ms,
             } => {
                 let terminal_key = (parent.clone(), agent_id.clone());
-                if let Some(previous) = self.subagent_ends.get(&terminal_key)
-                    && (*previous || !failed)
+                let previous = self.subagent_ends.get(&terminal_key).copied();
+                let terminal = *self
+                    .subagent_ends
+                    .entry(terminal_key)
+                    .and_modify(|current| {
+                        current.failed |= failed;
+                        current.ordinal = current.ordinal.min(ordinal);
+                        current.at_ms = current.at_ms.min(at_ms);
+                    })
+                    .or_insert(SubagentEnd {
+                        failed,
+                        ordinal,
+                        at_ms,
+                    });
+                let scope = SessionScope::ClaudeSubagent { parent, agent_id };
+                let scope_key = ScopeKey::from(&scope);
+                // Durable terminals cannot be rewritten; only a grace-held Complete is mutable.
+                if previous.is_some_and(|previous| previous.failed)
+                    || self.completed.contains(&scope_key)
                 {
                     return;
                 }
-                self.subagent_ends
-                    .entry(terminal_key)
-                    .and_modify(|current| *current |= failed)
-                    .or_insert(failed);
-                let parent_scope = SessionScope::ClaudeRoot(parent.clone());
-                let scope = SessionScope::ClaudeSubagent { parent, agent_id };
-                let at_ms = self
-                    .last_append_ms
-                    .get(&ScopeKey::from(&parent_scope))
-                    .copied()
-                    .filter(|at_ms| *at_ms != 0)
-                    .unwrap_or(self.latest_lifecycle_ms);
-                let scope_key = ScopeKey::from(&scope);
+                let SubagentEnd {
+                    failed,
+                    ordinal,
+                    at_ms,
+                } = terminal;
                 self.flush_due_completes(at_ms, events);
                 let event = controller_event(
                     artifact,
@@ -592,7 +610,8 @@ impl Synthesis {
                     self.started.remove(&scope_key);
                     events.push(ProviderEvent::Synthesized(event));
                 } else {
-                    self.hold_complete(scope_key, event);
+                    // Refresh the held event from the accumulated ordinal and timestamp.
+                    self.pending_completes.insert(scope_key, event);
                 }
             }
             LogFact::Activity {
@@ -635,7 +654,7 @@ impl Synthesis {
                     });
                 }
             }
-            LogFact::EvidenceId { parent, id } => {
+            LogFact::EvidenceId { parent, id, at_ms } => {
                 let Some(child) = admission.on_evidence(&parent, &id, discovered) else {
                     return;
                 };
@@ -646,11 +665,6 @@ impl Synthesis {
                 if !self.lineage.insert(edge) {
                     return;
                 }
-                let at_ms = self
-                    .last_append_ms
-                    .get(&ScopeKey::from(&parent))
-                    .copied()
-                    .unwrap_or_default();
                 events.push(ProviderEvent::Synthesized(controller_event(
                     artifact,
                     ordinal,
@@ -779,15 +793,15 @@ fn fact_lifecycle_time(fact: &LogFact) -> Option<i64> {
         | LogFact::CodexTurnComplete { at_ms, .. }
         | LogFact::CodexTurnAborted { at_ms, .. }
         | LogFact::Activity { at_ms, .. }
-        | LogFact::Usage { at_ms, .. } => Some(*at_ms),
+        | LogFact::Usage { at_ms, .. }
+        | LogFact::SubagentAppeared { at_ms, .. }
+        | LogFact::SubagentEnded { at_ms, .. }
+        | LogFact::EvidenceId { at_ms, .. } => Some(*at_ms),
         LogFact::AiTitle { .. }
         | LogFact::ClaudeCwd { .. }
         | LogFact::CodexMeta { .. }
         | LogFact::CodexTurn { .. }
-        | LogFact::CodexPid { .. }
-        | LogFact::SubagentAppeared { .. }
-        | LogFact::SubagentEnded { .. }
-        | LogFact::EvidenceId { .. } => None,
+        | LogFact::CodexPid { .. } => None,
     }
 }
 
@@ -982,6 +996,8 @@ pub struct DiscoveredArtifact {
     pub path: PathBuf,
     /// Filesystem modification time observed during discovery, in Unix milliseconds.
     pub modified_ms: i64,
+    /// Filename-derived creation time, when the provider artifact names it unambiguously.
+    pub creation_ms: Option<i64>,
     /// Provider-specific artifact identity and kind.
     pub kind: DiscoveredArtifactKind,
 }
@@ -1008,6 +1024,7 @@ impl AdmissionIndex {
                 provider: Provider::Claude,
                 path,
                 modified_ms,
+                creation_ms: None,
                 kind: DiscoveredArtifactKind::ClaudeSession {
                     session_id: session_id.to_owned(),
                 },
@@ -1029,6 +1046,7 @@ impl AdmissionIndex {
                 provider: Provider::Claude,
                 path,
                 modified_ms,
+                creation_ms: None,
                 kind: DiscoveredArtifactKind::ClaudeSubagent {
                     parent: parent.to_owned(),
                     agent_id: agent_id.to_owned(),
@@ -1039,12 +1057,17 @@ impl AdmissionIndex {
 
     /// Records one discovered Codex rollout transcript.
     pub fn insert_codex_rollout(&mut self, rollout_id: &str, path: PathBuf, modified_ms: i64) {
+        let creation_ms = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(rollout_filename_timestamp_ms);
         self.insert(
             rollout_id,
             DiscoveredArtifact {
                 provider: Provider::Codex,
                 path,
                 modified_ms,
+                creation_ms,
                 kind: DiscoveredArtifactKind::CodexRollout {
                     rollout_id: rollout_id.to_owned(),
                 },
@@ -1068,7 +1091,7 @@ impl AdmissionIndex {
         }
     }
 
-    /// Indexes rollout filenames only in UTC date shards on or after `anchor_ms`.
+    /// Indexes rollout filenames only in local-time date shards on or after `anchor_ms`.
     ///
     /// Within the anchor day, parseable filename timestamps before the anchor are skipped.
     /// Individual nested-entry errors are recorded and do not discard healthy siblings.
@@ -1086,9 +1109,6 @@ impl AdmissionIndex {
     }
 
     fn discover_codex_date_shards_inner(root: &Path, anchor_ms: i64) -> io::Result<Self> {
-        const MILLIS_PER_DAY: i64 = 86_400_000;
-
-        let anchor_day = anchor_ms.div_euclid(MILLIS_PER_DAY);
         let mut index = Self::new();
         for year in sorted_directory_entries(root, true, &mut index.had_errors)? {
             let Some(year_value) = fixed_decimal(&year.file_name(), 4) else {
@@ -1138,12 +1158,32 @@ impl AdmissionIndex {
                     if !day_kind.is_dir() {
                         continue;
                     }
-                    let Some(shard_day) = civil_day(year_value, month_value, day_value) else {
+                    let Some(shard_start_ms) =
+                        local_datetime_epoch_ms(year_value, month_value, day_value, 0, 0, 0)
+                    else {
                         continue;
                     };
-                    if shard_day < anchor_day {
+                    let (next_year, next_month, next_day) =
+                        if day_value < days_in_month(year_value, month_value) {
+                            (year_value, month_value, day_value + 1)
+                        } else if month_value < 12 {
+                            (year_value, month_value + 1, 1)
+                        } else {
+                            (year_value.saturating_add(1), 1, 1)
+                        };
+                    let shard_end_ms = if next_year > 9_999 {
+                        i64::MAX
+                    } else if let Some(shard_end_ms) =
+                        local_datetime_epoch_ms(next_year, next_month, next_day, 0, 0, 0)
+                    {
+                        shard_end_ms
+                    } else {
+                        continue;
+                    };
+                    if shard_end_ms <= anchor_ms {
                         continue;
                     }
+                    let anchor_shard = shard_start_ms <= anchor_ms;
                     record_codex_shard_scan(&day_path);
                     for artifact in
                         sorted_directory_entries(&day_path, false, &mut index.had_errors)?
@@ -1168,7 +1208,7 @@ impl AdmissionIndex {
                         if !file_name.starts_with("rollout-") || !file_name.ends_with(".jsonl") {
                             continue;
                         }
-                        if shard_day == anchor_day
+                        if anchor_shard
                             && rollout_filename_timestamp_ms(file_name)
                                 .is_some_and(|timestamp_ms| timestamp_ms < anchor_ms)
                         {
@@ -1222,6 +1262,22 @@ impl AdmissionIndex {
     #[must_use]
     pub fn artifacts_for_uuid(&self, uuid: &str) -> &[DiscoveredArtifact] {
         self.by_identity.get(uuid).map_or(&[], Vec::as_slice)
+    }
+
+    /// Returns every filename-timestamped Codex rollout in stable identity/path order.
+    pub fn codex_rollouts(&self) -> Vec<(&str, &DiscoveredArtifact)> {
+        let mut rollouts = self
+            .by_identity
+            .iter()
+            .flat_map(|(identity, artifacts)| {
+                artifacts.iter().filter_map(move |artifact| {
+                    matches!(artifact.kind, DiscoveredArtifactKind::CodexRollout { .. })
+                        .then_some((identity.as_str(), artifact))
+                })
+            })
+            .collect::<Vec<_>>();
+        rollouts.sort_by(|left, right| (left.0, &left.1.path).cmp(&(right.0, &right.1.path)));
+        rollouts
     }
 
     /// Indexes an artifact by provider-native identity using path topology and discovery mtime.
@@ -1731,9 +1787,79 @@ fn civil_day(year: u32, month: u32, day: u32) -> Option<i64> {
     Some(era * 146_097 + day_of_era - 719_468)
 }
 
-fn rollout_filename_timestamp_ms(file_name: &str) -> Option<i64> {
-    const MILLIS_PER_DAY: i64 = 86_400_000;
+fn local_datetime_epoch_ms(
+    year: u32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<i64> {
+    civil_day(year, month, day)?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    // Rollout names carry no UTC offset, so a local wall-clock time repeated during a
+    // DST fall-back cannot be mapped to a unique epoch.
+    let requested_year = i32::try_from(year).ok()?.checked_sub(1900)?;
+    let requested_month = i32::try_from(month).ok()?.checked_sub(1)?;
+    let requested_day = i32::try_from(day).ok()?;
+    let requested_hour = i32::try_from(hour).ok()?;
+    let requested_minute = i32::try_from(minute).ok()?;
+    let requested_second = i32::try_from(second).ok()?;
+    let matches_requested = |local: &libc::tm| {
+        local.tm_year == requested_year
+            && local.tm_mon == requested_month
+            && local.tm_mday == requested_day
+            && local.tm_hour == requested_hour
+            && local.tm_min == requested_minute
+            && local.tm_sec == requested_second
+    };
+    // SAFETY: all-zero is a valid baseline for C's integer/pointer `tm` fields;
+    // the fields consumed by `mktime` are initialized below before the call.
+    let mut local = unsafe { std::mem::zeroed::<libc::tm>() };
+    local.tm_year = requested_year;
+    local.tm_mon = requested_month;
+    local.tm_mday = requested_day;
+    local.tm_hour = requested_hour;
+    local.tm_min = requested_minute;
+    local.tm_sec = requested_second;
+    local.tm_isdst = -1;
+    local.tm_wday = -1;
+    // SAFETY: `local` is a live, writable `tm`; `mktime` retains no pointer and
+    // resolves the local timezone and DST status because `tm_isdst` is `-1`.
+    let epoch_seconds = unsafe { libc::mktime(&raw mut local) };
+    if local.tm_wday == -1 || local.tm_isdst < 0 || !matches_requested(&local) {
+        return None;
+    }
 
+    // Retry the untouched civil fields with the opposite resolved DST state, as in the
+    // installed mktime(3) ambiguity wrapper. `tm_wday` distinguishes failure from the
+    // valid epoch value `-1` because successful `mktime` calls replace the sentinel.
+    // SAFETY: the same all-zero baseline and field initialization rules apply here.
+    let mut alternative = unsafe { std::mem::zeroed::<libc::tm>() };
+    alternative.tm_year = requested_year;
+    alternative.tm_mon = requested_month;
+    alternative.tm_mday = requested_day;
+    alternative.tm_hour = requested_hour;
+    alternative.tm_min = requested_minute;
+    alternative.tm_sec = requested_second;
+    alternative.tm_isdst = i32::from(local.tm_isdst == 0);
+    alternative.tm_wday = -1;
+    // SAFETY: `alternative` is live and writable, and `mktime` retains no pointer.
+    let alternative_epoch_seconds = unsafe { libc::mktime(&raw mut alternative) };
+    if alternative.tm_wday != -1
+        && alternative.tm_isdst >= 0
+        && matches_requested(&alternative)
+        && (alternative.tm_isdst > 0) != (local.tm_isdst > 0)
+        && alternative_epoch_seconds != epoch_seconds
+    {
+        return None;
+    }
+    epoch_seconds.checked_mul(1_000)
+}
+
+pub(crate) fn rollout_filename_timestamp_ms(file_name: &str) -> Option<i64> {
     let value = file_name.strip_prefix("rollout-")?;
     let timestamp = value.get(..19)?;
     if value.as_bytes().get(19) != Some(&b'-')
@@ -1751,12 +1877,39 @@ fn rollout_filename_timestamp_ms(file_name: &str) -> Option<i64> {
     let hour = timestamp.get(11..13)?.parse::<u32>().ok()?;
     let minute = timestamp.get(14..16)?.parse::<u32>().ok()?;
     let second = timestamp.get(17..19)?.parse::<u32>().ok()?;
-    if hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-    civil_day(year, month, day)?
-        .checked_mul(MILLIS_PER_DAY)?
-        .checked_add(i64::from(hour * 3_600 + minute * 60 + second) * 1_000)
+    local_datetime_epoch_ms(year, month, day, hour, minute, second)
+}
+
+#[cfg(test)]
+pub(crate) fn local_rollout_fixture_parts(epoch_ms: i64) -> (String, String) {
+    let epoch_seconds = libc::time_t::try_from(epoch_ms.div_euclid(1_000)).unwrap();
+    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // SAFETY: `local` points to writable storage for one `tm`, and `epoch_seconds`
+    // remains live for the duration of this non-retaining libc call.
+    let result = unsafe { libc::localtime_r(&epoch_seconds, local.as_mut_ptr()) };
+    assert!(
+        !result.is_null(),
+        "localtime_r rejected fixture epoch {epoch_ms}"
+    );
+    // SAFETY: non-null `localtime_r` initialized the output `tm`.
+    let local = unsafe { local.assume_init() };
+    (
+        format!(
+            "{:04}/{:02}/{:02}",
+            local.tm_year + 1900,
+            local.tm_mon + 1,
+            local.tm_mday,
+        ),
+        format!(
+            "{:04}-{:02}-{:02}T{:02}-{:02}-{:02}",
+            local.tm_year + 1900,
+            local.tm_mon + 1,
+            local.tm_mday,
+            local.tm_hour,
+            local.tm_min,
+            local.tm_sec,
+        ),
+    )
 }
 
 const fn days_in_month(year: u32, month: u32) -> u32 {
@@ -1861,10 +2014,12 @@ fn subagent_artifact_id(file_name: &OsStr) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::env;
     use std::ffi::OsStr;
     use std::fs::{self, FileTimes, OpenOptions};
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -1874,7 +2029,7 @@ mod tests {
         MinimalProviderMetadata, NormalizedEvent, Provider, RunKey, SourceCoverage, TaskState,
     };
     use crate::provider::claude::{ClaudePathTopology, path_topology};
-    use crate::provider::claude_facts::extract_claude_line;
+    use crate::provider::claude_facts::{extract_claude_line, extract_claude_line_at};
     use crate::provider::facts::{ActivitySource, EvidenceId, LogFact, SessionScope};
     use crate::provider::tail::{MAX_TAIL_RECORD_BYTES, RECORD_TOO_LONG_ERROR};
     use crate::provider::{
@@ -1897,9 +2052,10 @@ mod tests {
         modified_ms: i64,
         anchor_ms: i64,
     ) -> (AdmissionIndex, PathBuf) {
-        let shard = root.join("2026/08/23");
+        let (shard, timestamp) = local_rollout_fixture_parts(anchor_ms.saturating_add(3_600_000));
+        let shard = root.join(shard);
         fs::create_dir_all(&shard).unwrap();
-        let path = shard.join(format!("rollout-2026-08-23T13-00-00-{rollout_id}.jsonl"));
+        let path = shard.join(format!("rollout-{timestamp}-{rollout_id}.jsonl"));
         fs::write(&path, b"{}\n").unwrap();
         OpenOptions::new()
             .write(true)
@@ -1934,6 +2090,7 @@ mod tests {
         agent_id: &str,
         source_at_ms: Option<i64>,
     ) -> (SessionScope, Vec<ProviderEvent>) {
+        let artifact_at_ms = source_at_ms.unwrap_or(synthesis.latest_lifecycle_ms.max(1));
         if let Some(source_at_ms) = source_at_ms {
             synthesis
                 .last_append_ms
@@ -1953,10 +2110,193 @@ mod tests {
                     agent_id: agent_id.to_owned(),
                     agent_type: "reviewer".to_owned(),
                     description: format!("Review {agent_id} lifecycle"),
+                    at_ms: artifact_at_ms,
                 },
             )],
         );
         (scope, events)
+    }
+
+    #[test]
+    fn subagent_metadata_before_parent_append_uses_artifact_time() {
+        let events = synthesize(
+            &mut Synthesis::default(),
+            "agent-before-append.meta.json",
+            [(
+                0,
+                LogFact::SubagentAppeared {
+                    parent: PARENT.to_owned(),
+                    agent_id: "before-append".to_owned(),
+                    agent_type: "reviewer".to_owned(),
+                    description: "Review metadata ordering".to_owned(),
+                    at_ms: 7_654,
+                },
+            )],
+        );
+
+        assert!(
+            synthesized_events(&events)
+                .iter()
+                .all(|event| event.metadata.timestamp_ms == 7_654)
+        );
+    }
+
+    #[test]
+    fn subagent_end_coalescing_keeps_earliest_ordinal_and_timestamp_across_batches() {
+        let mut synthesis = Synthesis::with_lifecycle_timing(30, 600);
+        let _ = synthesize_subagent_start(&mut synthesis, "coalesced", Some(50));
+
+        let mut events = synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                9,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "coalesced".to_owned(),
+                    failed: false,
+                    at_ms: 200,
+                },
+            )],
+        );
+        events.extend(synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                3,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "coalesced".to_owned(),
+                    failed: false,
+                    at_ms: 100,
+                },
+            )],
+        ));
+        events.extend(synthesis.advance_lifecycle(129));
+        events.extend(synthesis.advance_lifecycle(130));
+        events.extend(synthesis.advance_lifecycle(300));
+
+        assert!(matches!(
+            synthesized_events(&events).as_slice(),
+            [event]
+                if event.metadata.event_id == "log:queue.jsonl:3:complete:coalesced"
+                    && event.metadata.timestamp_ms == 100
+                    && matches!(event.event, ControllerEventKind::Complete)
+        ));
+    }
+
+    #[test]
+    fn earlier_failed_subagent_end_supersedes_cross_batch_complete() {
+        let mut synthesis = Synthesis::with_lifecycle_timing(30, 600);
+        let _ = synthesize_subagent_start(&mut synthesis, "failed-coalesced", Some(50));
+
+        let mut events = synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                3,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "failed-coalesced".to_owned(),
+                    failed: false,
+                    at_ms: 200,
+                },
+            )],
+        );
+        events.extend(synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                9,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "failed-coalesced".to_owned(),
+                    failed: true,
+                    at_ms: 100,
+                },
+            )],
+        ));
+        events.extend(synthesis.advance_lifecycle(300));
+
+        assert!(matches!(
+            synthesized_events(&events).as_slice(),
+            [event]
+                if event.metadata.event_id == "log:queue.jsonl:3:failed:failed-coalesced"
+                    && event.metadata.timestamp_ms == 100
+                    && matches!(event.event, ControllerEventKind::Failed)
+        ));
+    }
+
+    #[test]
+    fn published_subagent_complete_ignores_retroactive_duplicate() {
+        let mut synthesis = Synthesis::with_lifecycle_timing(30, 600);
+        let _ = synthesize_subagent_start(&mut synthesis, "published", Some(50));
+
+        let mut events = synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                9,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "published".to_owned(),
+                    failed: false,
+                    at_ms: 200,
+                },
+            )],
+        );
+        events.extend(synthesis.advance_lifecycle(230));
+        events.extend(synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                3,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "published".to_owned(),
+                    failed: false,
+                    at_ms: 100,
+                },
+            )],
+        ));
+        events.extend(synthesis.advance_lifecycle(300));
+
+        assert!(matches!(
+            synthesized_events(&events).as_slice(),
+            [event]
+                if event.metadata.event_id == "log:queue.jsonl:9:complete:published"
+                    && event.metadata.timestamp_ms == 200
+                    && matches!(event.event, ControllerEventKind::Complete)
+        ));
+    }
+
+    #[test]
+    fn lineage_fact_times_participate_in_lifecycle_time() {
+        let facts = [
+            LogFact::SubagentAppeared {
+                parent: PARENT.to_owned(),
+                agent_id: "appeared".to_owned(),
+                agent_type: "reviewer".to_owned(),
+                description: "Review appearance".to_owned(),
+                at_ms: 10,
+            },
+            LogFact::SubagentEnded {
+                parent: PARENT.to_owned(),
+                agent_id: "ended".to_owned(),
+                failed: false,
+                at_ms: 20,
+            },
+            LogFact::EvidenceId {
+                parent: SessionScope::ClaudeRoot(PARENT.to_owned()),
+                id: EvidenceId::Uuid("77777777-7777-4777-8777-777777777777".to_owned()),
+                at_ms: 30,
+            },
+        ];
+
+        assert_eq!(
+            facts.iter().map(fact_lifecycle_time).collect::<Vec<_>>(),
+            [Some(10), Some(20), Some(30),]
+        );
     }
 
     fn synthesized_events(events: &[ProviderEvent]) -> Vec<&ControllerEvent> {
@@ -2087,22 +2427,32 @@ mod tests {
                     agent_id: AGENT.to_owned(),
                     agent_type: "reviewer".to_owned(),
                     description: "Review the projected rows".to_owned(),
+                    at_ms: 1,
                 },
             )],
         );
         events.extend(synthesize(
             &mut synthesis,
             "rollout.jsonl",
-            [(
-                0,
-                LogFact::CodexMeta {
-                    rollout_id: ROLLOUT.to_owned(),
-                    cwd: "/tmp/project".to_owned(),
-                    originator: "codex_cli_rs".to_owned(),
-                    internal: None,
-                    cli_version: "0.1.0".to_owned(),
-                },
-            )],
+            [
+                (
+                    0,
+                    LogFact::Append {
+                        scope: codex_scope.clone(),
+                        at_ms: 1,
+                    },
+                ),
+                (
+                    0,
+                    LogFact::CodexMeta {
+                        rollout_id: ROLLOUT.to_owned(),
+                        cwd: "/tmp/project".to_owned(),
+                        originator: "codex_cli_rs".to_owned(),
+                        internal: None,
+                        cli_version: "0.1.0".to_owned(),
+                    },
+                ),
+            ],
         ));
         let model = apply_once_per_event_id(&events);
         let claude_run = model
@@ -2112,8 +2462,8 @@ mod tests {
             .task_run_by_key(&run_key_for_scope(&codex_scope))
             .expect("the lane must create the Codex session run");
         let claude_run_id = claude_run.run_id;
-        let claude_label = task_run_label(&model, claude_run, false, 0, false);
-        let codex_label = task_run_label(&model, codex_run, false, 0, false);
+        let claude_label = task_run_label(&model, claude_run, false, 0, false, true);
+        let codex_label = task_run_label(&model, codex_run, false, 0, false, true);
         assert!(
             claude_label.starts_with("● reviewer "),
             "Claude row must render agentType: {claude_label}"
@@ -2210,6 +2560,7 @@ mod tests {
             false,
             1,
             false,
+            true,
         );
         assert!(
             stable_label.starts_with("● reviewer "),
@@ -2311,7 +2662,7 @@ mod tests {
     #[test]
     fn lane_terminal_task_notifications_for_unannounced_children_do_not_create_runs() {
         let record = r#"{"type":"queue-operation","content":"<task-notification><task-id>1111111111111111</task-id><status>completed</status></task-notification><task-notification><task-id>2222222222222222</task-id><status>failed</status></task-notification>"}"#;
-        let facts = extract_claude_line(&SessionScope::ClaudeRoot(PARENT.to_owned()), record)
+        let facts = extract_claude_line_at(&SessionScope::ClaudeRoot(PARENT.to_owned()), record, 1)
             .into_iter()
             .map(|fact| (7, fact));
         let mut synthesis = Synthesis::default();
@@ -2373,6 +2724,7 @@ mod tests {
                         parent: PARENT.to_owned(),
                         agent_id: "child".to_owned(),
                         failed: false,
+                        at_ms: 100,
                     },
                 ),
             ],
@@ -2428,6 +2780,7 @@ mod tests {
                     agent_id: AGENT.to_owned(),
                     agent_type: "reviewer".to_owned(),
                     description: "Review the reducer gate".to_owned(),
+                    at_ms: 1,
                 },
             )],
         );
@@ -2479,9 +2832,13 @@ mod tests {
         let held = synthesize(
             &mut synthesis,
             "parent.jsonl",
-            extract_claude_line(&SessionScope::ClaudeRoot(PARENT.to_owned()), &notification)
-                .into_iter()
-                .map(|fact| (7, fact)),
+            extract_claude_line_at(
+                &SessionScope::ClaudeRoot(PARENT.to_owned()),
+                &notification,
+                1,
+            )
+            .into_iter()
+            .map(|fact| (7, fact)),
         );
         assert!(
             synthesized_events(&held).is_empty(),
@@ -2519,11 +2876,13 @@ mod tests {
                 parent: PARENT.to_owned(),
                 agent_id: "first".to_owned(),
                 failed: false,
+                at_ms: 1,
             },
             LogFact::SubagentEnded {
                 parent: PARENT.to_owned(),
                 agent_id: "second".to_owned(),
                 failed: true,
+                at_ms: 1,
             },
         ];
         let ids = |facts: Vec<LogFact>| {
@@ -2549,6 +2908,7 @@ mod tests {
             parent: PARENT.to_owned(),
             agent_id: "child".to_owned(),
             failed: false,
+            at_ms: 1,
         };
         let mut synthesis = Synthesis::default();
         let mut events = synthesize(
@@ -2578,6 +2938,7 @@ mod tests {
                     agent_id: "child".to_owned(),
                     agent_type: "reviewer".to_owned(),
                     description: "Review the lane".to_owned(),
+                    at_ms: 1,
                 },
             )],
         );
@@ -2601,6 +2962,7 @@ mod tests {
                     agent_id: "child".to_owned(),
                     agent_type: "reviewer".to_owned(),
                     description: "Review deterministic synthesis".to_owned(),
+                    at_ms: 1,
                 },
             )],
         );
@@ -2655,6 +3017,41 @@ mod tests {
     }
 
     #[test]
+    fn codex_meta_without_append_uses_non_epoch_lifecycle_time() {
+        let mut synthesis = Synthesis::with_lifecycle_timing_at(30, 600, 4_321);
+        let events = synthesize(
+            &mut synthesis,
+            "rollout.jsonl",
+            [(
+                0,
+                LogFact::CodexMeta {
+                    rollout_id: ROLLOUT.to_owned(),
+                    cwd: "/workspace".to_owned(),
+                    originator: "codex".to_owned(),
+                    internal: None,
+                    cli_version: "0.149.0".to_owned(),
+                },
+            )],
+        );
+
+        assert!(matches!(
+            synthesized_events(&events).as_slice(),
+            [event]
+                if matches!(event.event, ControllerEventKind::TaskStarted)
+                    && event.metadata.timestamp_ms == 4_321
+        ));
+        let model = apply_once_per_event_id(&events);
+        let run = model
+            .task_run_by_key(&RunKey::Native {
+                provider: Provider::Codex,
+                sid: ROLLOUT.to_owned(),
+            })
+            .expect("timestamp-less session_meta must still mint the Codex root run");
+        assert_eq!(run.created_at_ms, Some(4_321));
+        assert_eq!(run.updated_at_ms, Some(4_321));
+    }
+
+    #[test]
     fn failed_notification_yields_failed_state() {
         let events = synthesize(
             &mut Synthesis::default(),
@@ -2665,6 +3062,7 @@ mod tests {
                     parent: PARENT.to_owned(),
                     agent_id: "child".to_owned(),
                     failed: true,
+                    at_ms: 1,
                 },
             )],
         );
@@ -2738,6 +3136,7 @@ mod tests {
                     agent_id: AGENT.to_owned(),
                     agent_type: "reviewer".to_owned(),
                     description: "Review identity convergence".to_owned(),
+                    at_ms: 100,
                 },
             )],
         );
@@ -3008,6 +3407,7 @@ mod tests {
                             parent: PARENT.to_owned(),
                             agent_id: "child".to_owned(),
                             failed,
+                            at_ms: ordinal as i64 + 1,
                         },
                     )
                 }),
@@ -3033,6 +3433,7 @@ mod tests {
                     parent: PARENT.to_owned(),
                     agent_id: "child".to_owned(),
                     failed: true,
+                    at_ms: 100,
                 },
             )],
         );
@@ -3045,6 +3446,7 @@ mod tests {
                     parent: PARENT.to_owned(),
                     agent_id: "child".to_owned(),
                     failed: false,
+                    at_ms: 110,
                 },
             )],
         );
@@ -3111,6 +3513,7 @@ mod tests {
                     parent: PARENT.to_owned(),
                     agent_id: "child".to_owned(),
                     failed: false,
+                    at_ms: 100,
                 },
             )],
         );
@@ -3151,6 +3554,7 @@ mod tests {
                     parent: PARENT.to_owned(),
                     agent_id: "shutdown-child".to_owned(),
                     failed: false,
+                    at_ms: 100,
                 },
             )],
         );
@@ -3254,6 +3658,7 @@ mod tests {
                     agent_id: "child".to_owned(),
                     agent_type: "reviewer".to_owned(),
                     description: "Review lifecycle".to_owned(),
+                    at_ms: 100,
                 },
             )],
         );
@@ -3274,6 +3679,7 @@ mod tests {
                         parent: PARENT.to_owned(),
                         agent_id: "child".to_owned(),
                         failed: false,
+                        at_ms: 100,
                     },
                 ),
             ],
@@ -3300,6 +3706,7 @@ mod tests {
                         parent: PARENT.to_owned(),
                         agent_id: "child".to_owned(),
                         failed: true,
+                        at_ms: 120,
                     },
                 ),
             ],
@@ -3347,7 +3754,7 @@ mod tests {
         assert!(matches!(
             synthesis.advance_lifecycle(150).as_slice(),
             [ProviderEvent::LaneClose { key, at_ms }]
-                if key == &run_key_for_scope(&scope) && *at_ms == 150
+                if key == &run_key_for_scope(&scope) && *at_ms == 100
         ));
         assert!(synthesis.advance_lifecycle(200).is_empty());
     }
@@ -3378,7 +3785,7 @@ mod tests {
             synthesis.advance_lifecycle(150),
             vec![ProviderEvent::LaneClose {
                 key: run_key_for_scope(&scope),
-                at_ms: 150,
+                at_ms: 100,
             }],
             "an append-less started scope must close at its start-time threshold"
         );
@@ -3402,7 +3809,7 @@ mod tests {
             synthesis.advance_lifecycle(150),
             vec![ProviderEvent::LaneClose {
                 key: run_key_for_scope(&scope),
-                at_ms: 150,
+                at_ms: 100,
             }]
         );
     }
@@ -3431,7 +3838,7 @@ mod tests {
             synthesis.advance_lifecycle(190),
             vec![ProviderEvent::LaneClose {
                 key: run_key_for_scope(&scope),
-                at_ms: 190,
+                at_ms: 140,
             }]
         );
     }
@@ -3449,6 +3856,7 @@ mod tests {
                     parent: PARENT.to_owned(),
                     agent_id: "completing-child".to_owned(),
                     failed: false,
+                    at_ms: 100,
                 },
             )],
         );
@@ -3563,6 +3971,7 @@ mod tests {
                     LogFact::EvidenceId {
                         parent: SessionScope::ClaudeRoot(PARENT.to_owned()),
                         id: EvidenceId::Uuid(id.to_owned()),
+                        at_ms: 7,
                     },
                 )
             }),
@@ -3617,6 +4026,7 @@ mod tests {
                     LogFact::EvidenceId {
                         parent: SessionScope::ClaudeRoot(PARENT.to_owned()),
                         id: EvidenceId::Uuid(id.to_owned()),
+                        at_ms: 7,
                     },
                 )
             }),
@@ -3664,6 +4074,7 @@ mod tests {
                 LogFact::EvidenceId {
                     parent: SessionScope::ClaudeRoot(PARENT.to_owned()),
                     id: EvidenceId::Uuid(STRANGER.to_owned()),
+                    at_ms: 1,
                 },
             )],
             &mut admission,
@@ -3676,6 +4087,7 @@ mod tests {
                 LogFact::EvidenceId {
                     parent: SessionScope::ClaudeRoot(PARENT.to_owned()),
                     id: EvidenceId::Uuid(ROLLOUT.to_owned()),
+                    at_ms: 2,
                 },
             )],
             &mut admission,
@@ -4303,6 +4715,74 @@ mod tests {
     }
 
     #[test]
+    fn rollout_filename_timestamp_round_trips_local_epoch_seconds() {
+        for epoch_ms in [
+            -1_000,
+            0,
+            946_684_800_000,
+            1_609_459_200_000,
+            1_787_745_600_000,
+            2_145_916_799_000,
+        ] {
+            let (_, timestamp) = local_rollout_fixture_parts(epoch_ms);
+            let file_name =
+                format!("rollout-{timestamp}-22222222-2222-4222-8222-222222222222.jsonl",);
+
+            assert_eq!(
+                rollout_filename_timestamp_ms(&file_name),
+                Some(epoch_ms),
+                "local rollout time did not round-trip for {file_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn rollout_filename_rejects_ambiguous_and_nonexistent_local_times() {
+        const CHILD_SENTINEL: &str = "HERDR_TOP_TEST_ROLLOUT_DST_CHILD";
+        if env::var_os(CHILD_SENTINEL).is_none() {
+            let status = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "provider::lane::tests::rollout_filename_rejects_ambiguous_and_nonexistent_local_times",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_SENTINEL, "1")
+                .env("TZ", "EST5EDT,M3.2.0/2,M11.1.0/2")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated DST regression failed: {status}");
+            return;
+        }
+
+        let file_name = |timestamp: &str| {
+            format!("rollout-{timestamp}-22222222-2222-4222-8222-222222222222.jsonl")
+        };
+        assert_eq!(
+            rollout_filename_timestamp_ms(&file_name("2026-11-01T00-30-00")),
+            Some(1_793_507_400_000)
+        );
+        assert_eq!(
+            rollout_filename_timestamp_ms(&file_name("2026-11-01T02-30-00")),
+            Some(1_793_518_200_000)
+        );
+
+        let ambiguous = file_name("2026-11-01T01-30-00");
+        let nonexistent = file_name("2026-03-08T02-30-00");
+        let mut index = AdmissionIndex::new();
+        index.insert_codex_rollout(ROLLOUT, PathBuf::from(&ambiguous), 0);
+        assert_eq!(index.artifacts_for_uuid(ROLLOUT).len(), 1);
+        assert_eq!(
+            (
+                rollout_filename_timestamp_ms(&ambiguous),
+                rollout_filename_timestamp_ms(&nonexistent),
+                index.artifacts_for_uuid(ROLLOUT)[0].creation_ms,
+            ),
+            (None, None, None)
+        );
+    }
+
+    #[test]
     fn per_file_anchor_only_exempts_pane_roots() {
         let mut admission = Admission::new(1_000);
         admission.admit_pane_session(Provider::Claude, PARENT);
@@ -4347,12 +4827,16 @@ mod tests {
 
     #[test]
     fn date_shard_scan_bounded_by_anchor() {
+        const ANCHOR_MS: i64 = 1_787_486_400_000;
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("sessions");
+        let (previous_shard, _) = local_rollout_fixture_parts(ANCHOR_MS - 86_400_000);
+        let (anchor_shard, _) = local_rollout_fixture_parts(ANCHOR_MS);
+        let (next_shard, _) = local_rollout_fixture_parts(ANCHOR_MS + 86_400_000);
         let shards = [
-            ("2026/08/22", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
-            ("2026/08/23", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
-            ("2026/08/24", "cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+            (&previous_shard, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            (&anchor_shard, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            (&next_shard, "cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
         ];
         for (shard, id) in shards {
             let path = root.join(shard);
@@ -4363,27 +4847,30 @@ mod tests {
         let observed = Arc::clone(&scanned);
         set_codex_shard_scan_hook(move |path| observed.lock().unwrap().push(path.to_path_buf()));
 
-        let index = AdmissionIndex::discover_codex_date_shards(
-            &root,
-            1_787_486_400_000, // 2026-08-23T12:00:00Z
-        )
-        .unwrap();
+        let index = AdmissionIndex::discover_codex_date_shards(&root, ANCHOR_MS).unwrap();
 
         assert!(!index.contains_uuid("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"));
         assert!(index.contains_uuid("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"));
         assert!(index.contains_uuid("cccccccc-cccc-4ccc-8ccc-cccccccccccc"));
         assert_eq!(
             *scanned.lock().unwrap(),
-            [root.join("2026/08/23"), root.join("2026/08/24")]
+            [root.join(anchor_shard), root.join(next_shard)]
         );
     }
 
     #[test]
     fn anchor_day_rollouts_are_bounded_by_filename_timestamp() {
+        const ANCHOR_MS: i64 = 1_787_486_400_000;
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("sessions");
-        let anchor_day = root.join("2026/08/23");
-        let later_day = root.join("2026/08/24");
+        let (before_shard, before_timestamp) = local_rollout_fixture_parts(ANCHOR_MS - 1_000);
+        let (anchor_shard, equal_timestamp) = local_rollout_fixture_parts(ANCHOR_MS);
+        let (_, after_timestamp) = local_rollout_fixture_parts(ANCHOR_MS + 1_000);
+        let (later_shard, later_timestamp) = local_rollout_fixture_parts(ANCHOR_MS + 86_400_000);
+        let before_day = root.join(before_shard);
+        let anchor_day = root.join(anchor_shard);
+        let later_day = root.join(later_shard);
+        fs::create_dir_all(&before_day).unwrap();
         fs::create_dir_all(&anchor_day).unwrap();
         fs::create_dir_all(&later_day).unwrap();
         let before = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
@@ -4391,25 +4878,25 @@ mod tests {
         let after = "ffffffff-ffff-4fff-8fff-ffffffffffff";
         let malformed = "99999999-9999-4999-8999-999999999999";
         let later = "77777777-7777-4777-8777-777777777777";
+        fs::write(
+            before_day.join(format!("rollout-{before_timestamp}-{before}.jsonl")),
+            b"{}\n",
+        )
+        .unwrap();
         for (name, id) in [
-            ("rollout-2026-08-23T11-59-59", before),
-            ("rollout-2026-08-23T12-00-00", equal),
-            ("rollout-2026-08-23T12-00-01", after),
-            ("rollout-not-a-time", malformed),
+            (format!("rollout-{equal_timestamp}"), equal),
+            (format!("rollout-{after_timestamp}"), after),
+            ("rollout-not-a-time".to_owned(), malformed),
         ] {
             fs::write(anchor_day.join(format!("{name}-{id}.jsonl")), b"{}\n").unwrap();
         }
         fs::write(
-            later_day.join(format!("rollout-2026-08-24T00-00-00-{later}.jsonl")),
+            later_day.join(format!("rollout-{later_timestamp}-{later}.jsonl")),
             b"{}\n",
         )
         .unwrap();
 
-        let index = AdmissionIndex::discover_codex_date_shards(
-            &root,
-            1_787_486_400_000, // 2026-08-23T12:00:00Z
-        )
-        .unwrap();
+        let index = AdmissionIndex::discover_codex_date_shards(&root, ANCHOR_MS).unwrap();
 
         assert!(!index.contains_uuid(before));
         assert!(index.contains_uuid(equal));

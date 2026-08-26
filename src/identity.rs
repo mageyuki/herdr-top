@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 
-use crate::model::{DependencyEdge, DomainModel, ExecutionEdge, Provider, RunId, RunKey};
+use crate::model::{DependencyEdge, DomainModel, ExecutionEdge, Provider, RunId, RunKey, TaskRun};
 use crate::store::{NativeSessionBinding, PersistBatch, PersistOp, PersistTaskRun};
 
 /// Explicit evidence that can bind or merge a task-run identity.
@@ -18,6 +18,13 @@ pub enum BindingEvidence {
         /// The provider that owns the session namespace.
         provider: Provider,
         /// The provider-native session ID.
+        sid: String,
+    },
+    /// A globally unambiguous sessionless Codex pane was matched to one rollout.
+    HeuristicNativeSession {
+        /// The still-provisional pane run receiving the one-shot binding.
+        run: RunId,
+        /// Provider-native Codex rollout ID selected by discovery.
         sid: String,
     },
     /// A provider adapter resolved a path-keyed run to its native session ID.
@@ -189,6 +196,9 @@ pub fn plan_binding(model: &DomainModel, ev: &BindingEvidence) -> BindingPlan {
         BindingEvidence::NativeSession { run, provider, sid } => {
             plan_native_session(model, *run, *provider, sid)
         }
+        BindingEvidence::HeuristicNativeSession { run, sid } => {
+            plan_heuristic_native_session(model, *run, sid)
+        }
         BindingEvidence::NativePathResolved { run, provider, sid } => {
             plan_native_path_resolution(model, *run, *provider, sid)
         }
@@ -201,6 +211,36 @@ pub fn plan_binding(model: &DomainModel, ev: &BindingEvidence) -> BindingPlan {
             controller_run,
             terminal_id,
         } => plan_controller_terminal(model, *controller_run, terminal_id),
+    }
+}
+
+fn plan_heuristic_native_session(model: &DomainModel, run: RunId, sid: &str) -> BindingPlan {
+    let Some(observed) = model.task_run(&run) else {
+        return BindingPlan::Conflict(MergeConflict::MissingRun { run });
+    };
+    match &observed.key {
+        RunKey::Provisional { .. } => {
+            let key = RunKey::Native {
+                provider: Provider::Codex,
+                sid: sid.to_owned(),
+            };
+            match model.task_run_by_key(&key) {
+                Some(owner) => BindingPlan::Conflict(MergeConflict::NativeSessionAlreadyBound {
+                    provider: Provider::Codex,
+                    sid: sid.to_owned(),
+                    owner: owner.run_id,
+                    claimant: run,
+                }),
+                None => plan_native_session(model, run, Provider::Codex, sid),
+            }
+        }
+        RunKey::Native {
+            provider,
+            sid: bound,
+        } if *provider == Provider::Codex && bound == sid => BindingPlan::NoChange,
+        RunKey::Controller(_) | RunKey::Native { .. } | RunKey::NativePath { .. } => {
+            BindingPlan::Conflict(MergeConflict::EvidenceMismatch { run })
+        }
     }
 }
 
@@ -240,24 +280,24 @@ pub fn apply_binding_plan(
     apply_binding_plan_at(model, plan, unix_now_ms())
 }
 
-/// Applies a binding plan using the collector-captured receipt time for persistence.
+/// Applies a binding plan using the selected bookkeeping time for persistence.
 pub fn apply_binding_plan_at(
     model: &mut DomainModel,
     plan: BindingPlan,
-    receipt_time_ms: i64,
+    bookkeeping_time_ms: i64,
 ) -> Result<PersistBatch, MergeConflict> {
     match plan {
         BindingPlan::NoChange => Ok(Vec::new()),
         BindingPlan::Conflict(conflict) => Err(conflict),
-        BindingPlan::Bind { run, key } => apply_bind(model, run, key, receipt_time_ms),
+        BindingPlan::Bind { run, key } => apply_bind(model, run, key, bookkeeping_time_ms),
         BindingPlan::Merge { survivor, absorbed } => {
             let contracted = preflight_merge(model, survivor, absorbed)?;
-            merge_in_memory(model, survivor, absorbed, contracted, receipt_time_ms);
+            merge_in_memory(model, survivor, absorbed, contracted, bookkeeping_time_ms);
             let mut task_run = model
                 .task_run(&survivor)
                 .cloned()
                 .ok_or(MergeConflict::MissingRun { run: survivor })?;
-            task_run.touch(receipt_time_ms);
+            touch_task_run(&mut task_run, bookkeeping_time_ms);
             model.insert_task_run(task_run.clone());
             let native_session =
                 single_native_binding(model, survivor)?.map(|(provider, native_session_id)| {
@@ -266,8 +306,8 @@ pub fn apply_binding_plan_at(
                         native_session_id,
                     }
                 });
-            let created_at_ms = task_run.created_at_ms.unwrap_or(receipt_time_ms);
-            let updated_at_ms = task_run.updated_at_ms.unwrap_or(receipt_time_ms);
+            let created_at_ms = task_run.created_at_ms.unwrap_or(bookkeeping_time_ms);
+            let updated_at_ms = task_run.updated_at_ms.unwrap_or(bookkeeping_time_ms);
             let finished_at_ms = task_run.finished_at_ms;
             Ok(vec![
                 PersistOp::MergeTaskRuns { survivor, absorbed },
@@ -488,7 +528,7 @@ fn apply_bind(
     model: &mut DomainModel,
     run: RunId,
     key: RunKey,
-    receipt_time_ms: i64,
+    bookkeeping_time_ms: i64,
 ) -> Result<PersistBatch, MergeConflict> {
     let (provider, sid) = match &key {
         RunKey::Native { provider, sid } => (*provider, sid.clone()),
@@ -534,13 +574,17 @@ fn apply_bind(
             promoted
         }
     };
-    persisted_task_run.touch(receipt_time_ms);
+    touch_task_run(&mut persisted_task_run, bookkeeping_time_ms);
     model.insert_task_run(persisted_task_run.clone());
     if let Some(old_key) = promoted_from.as_ref() {
         model.insert_task_run_alias(old_key.clone(), run);
     }
-    let created_at_ms = persisted_task_run.created_at_ms.unwrap_or(receipt_time_ms);
-    let updated_at_ms = persisted_task_run.updated_at_ms.unwrap_or(receipt_time_ms);
+    let created_at_ms = persisted_task_run
+        .created_at_ms
+        .unwrap_or(bookkeeping_time_ms);
+    let updated_at_ms = persisted_task_run
+        .updated_at_ms
+        .unwrap_or(bookkeeping_time_ms);
     let finished_at_ms = persisted_task_run.finished_at_ms;
     let persisted = PersistTaskRun {
         task_run: persisted_task_run,
@@ -612,7 +656,6 @@ fn preflight_merge(
             claimant: absorbed,
         });
     }
-
     let execution_edges = contract_execution_edges(model, survivor, absorbed)?;
     let dependency_edges = contract_dependency_edges(model, survivor, absorbed)?;
     Ok(ContractedGraphs {
@@ -769,7 +812,7 @@ fn merge_in_memory(
     survivor: RunId,
     absorbed: RunId,
     contracted: ContractedGraphs,
-    receipt_time_ms: i64,
+    bookkeeping_time_ms: i64,
 ) {
     let absorbed_has_controller_evidence = model
         .task_run(&absorbed)
@@ -778,7 +821,7 @@ fn merge_in_memory(
         && let Some(mut task_run) = model.task_run(&survivor).cloned()
     {
         task_run.has_controller_task_state_event = true;
-        task_run.touch(receipt_time_ms);
+        touch_task_run(&mut task_run, bookkeeping_time_ms);
         model.insert_task_run(task_run);
     }
     let mut aliases: Vec<_> = model
@@ -812,6 +855,15 @@ fn merge_in_memory(
     for alias in aliases {
         model.insert_task_run_alias(alias, survivor);
     }
+}
+
+fn touch_task_run(task_run: &mut TaskRun, bookkeeping_time_ms: i64) {
+    task_run.touch(
+        task_run
+            .updated_at_ms
+            .unwrap_or(bookkeeping_time_ms)
+            .max(bookkeeping_time_ms),
+    );
 }
 
 #[cfg(test)]
@@ -902,6 +954,35 @@ mod tests {
         assert_eq!(persisted.created_at_ms, 100);
         assert_eq!(persisted.updated_at_ms, 2_000);
         assert_eq!(persisted.finished_at_ms, None);
+    }
+
+    #[test]
+    fn older_binding_time_does_not_move_merge_survivor_bookkeeping_backward() {
+        let mut model = DomainModel::default();
+        let survivor = insert_run(
+            &mut model,
+            RunKey::Controller("controller-survivor".to_owned()),
+            1,
+        );
+        let absorbed = insert_run(&mut model, native(Provider::Codex, "absorbed-sid"), 2);
+        let mut survivor_run = model.task_run(&survivor).cloned().unwrap();
+        survivor_run.created_at_ms = Some(100);
+        survivor_run.updated_at_ms = Some(2_500);
+        model.insert_task_run(survivor_run);
+        let mut absorbed_run = model.task_run(&absorbed).cloned().unwrap();
+        absorbed_run.has_controller_task_state_event = true;
+        model.insert_task_run(absorbed_run);
+
+        let batch =
+            apply_binding_plan_at(&mut model, BindingPlan::Merge { survivor, absorbed }, 2_000)
+                .unwrap();
+
+        let survivor_run = model.task_run(&survivor).unwrap();
+        assert_eq!(survivor_run.updated_at_ms, Some(2_500));
+        let PersistOp::UpsertTaskRun(persisted) = &batch[1] else {
+            panic!("expected survivor task-run persistence after merge");
+        };
+        assert_eq!(persisted.updated_at_ms, 2_500);
     }
 
     #[test]
@@ -1119,6 +1200,7 @@ mod tests {
         fn assert_exhaustive(evidence: BindingEvidence) {
             match evidence {
                 BindingEvidence::NativeSession { .. }
+                | BindingEvidence::HeuristicNativeSession { .. }
                 | BindingEvidence::NativePathResolved { .. }
                 | BindingEvidence::ControllerNativeSession { .. }
                 | BindingEvidence::ControllerTerminal { .. } => {}
@@ -1352,6 +1434,108 @@ mod tests {
         );
         apply_binding_plan(&mut model, second_plan).unwrap();
         assert_eq!(model.task_runs().count(), 1);
+    }
+
+    #[test]
+    fn heuristic_native_session_conflicts_with_existing_owner_without_merging() {
+        let mut model = DomainModel::default();
+        let owner = insert_run(&mut model, native(Provider::Codex, "owned-sid"), 1);
+        let claimant = insert_run(&mut model, provisional("claimant-terminal", 2), 2);
+
+        assert_eq!(
+            plan_binding(
+                &model,
+                &BindingEvidence::HeuristicNativeSession {
+                    run: claimant,
+                    sid: "owned-sid".to_owned(),
+                },
+            ),
+            BindingPlan::Conflict(MergeConflict::NativeSessionAlreadyBound {
+                provider: Provider::Codex,
+                sid: "owned-sid".to_owned(),
+                owner,
+                claimant,
+            })
+        );
+        assert_eq!(model.task_runs().count(), 2);
+    }
+
+    #[test]
+    fn explicit_native_session_merge_allows_live_executions_on_different_terminals() {
+        let mut model = DomainModel::default();
+        let first = insert_run(&mut model, provisional("terminal-1", 1), 1);
+        let second = insert_run(&mut model, provisional("terminal-2", 2), 2);
+        model.insert_execution(Execution {
+            execution_id: "first-execution".to_owned(),
+            pane_id: "first-pane".to_owned(),
+            terminal_id: "terminal-1".to_owned(),
+            task_run_id: first,
+            state: ExecState::Working,
+        });
+        model.insert_execution(Execution {
+            execution_id: "second-execution".to_owned(),
+            pane_id: "second-pane".to_owned(),
+            terminal_id: "terminal-2".to_owned(),
+            task_run_id: second,
+            state: ExecState::Working,
+        });
+
+        let first_plan = plan_binding(&model, &native_evidence(first, "shared-sid"));
+        apply_binding_plan(&mut model, first_plan).unwrap();
+        let second_plan = plan_binding(&model, &native_evidence(second, "shared-sid"));
+        assert_eq!(
+            second_plan,
+            BindingPlan::Merge {
+                survivor: first,
+                absorbed: second,
+            }
+        );
+
+        apply_binding_plan(&mut model, second_plan).unwrap();
+
+        assert_eq!(model.task_runs().count(), 1);
+        assert!(
+            model
+                .executions()
+                .all(|execution| execution.task_run_id == first)
+        );
+    }
+
+    #[test]
+    fn merge_allows_executed_provisional_to_join_executionless_native_run() {
+        let (mut model, survivor, absorbed) = merge_fixture();
+        model.insert_execution(Execution {
+            execution_id: "provisional-execution".to_owned(),
+            pane_id: "provisional-pane".to_owned(),
+            terminal_id: "provisional-terminal".to_owned(),
+            task_run_id: absorbed,
+            state: ExecState::Working,
+        });
+
+        let batch =
+            apply_binding_plan_at(&mut model, BindingPlan::Merge { survivor, absorbed }, 2_000)
+                .unwrap();
+
+        assert!(matches!(
+            batch.as_slice(),
+            [
+                PersistOp::MergeTaskRuns {
+                    survivor: actual_survivor,
+                    absorbed: actual_absorbed,
+                },
+                PersistOp::UpsertTaskRun(persisted),
+            ] if *actual_survivor == survivor
+                && *actual_absorbed == absorbed
+                && persisted.task_run.run_id == survivor
+        ));
+        assert!(model.task_run(&absorbed).is_none());
+        assert_eq!(
+            model
+                .execution("provisional-execution")
+                .unwrap()
+                .task_run_id,
+            survivor
+        );
     }
 
     #[test]

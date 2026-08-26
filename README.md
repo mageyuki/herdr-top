@@ -50,23 +50,23 @@ scope, and the footer keeps the primary controls visible.
 
 ```text
 ┌ Herdr Top ─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│host:devbox | session:default | up:00:17:42 | workspaces:2 | LIVE | lag:12ms | sources:herdr=available;controller=avail…│
+│host:devbox | session:default | up:00:17:42 | workspaces:2 | LIVE | lag:12ms | sources:herdr=available;ctl=avail…       │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Execution tree ────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │  Session: default                                                                                                      │
 │  ├── Workspace: api                                                                                                    │
 │  │   └── Tab: implementation                                                                                           │
 │  │       ├── Pane: w1:p1 (controller)                                                                                  │
-│  │       │   └── ● Claude controller — tool_use: Agent · 17m03s                        fable-5  high  8400 8.2/s 17m03s│
-│  │       │       └── ● Codex — running command · 03m14s                            gpt-5.6-sol xhigh  2140  11/s 03m14s│
+│  │       │   └── ● Claude controller — tool_use: Agent                                 fable-5  high  8400 8.2/s 17m03s│
+│  │       │       └── ● Codex — running command                                     gpt-5.6-sol xhigh  2140  11/s 03m14s│
 │  │       ├── Pane: w1:p2 (review)                                                                                      │
-│  │       │   └── ⚠ Claude Review failures — tool_use: Bash · 08m01s                 sonnet-4-5  high   920 1.9/s 08m01s│
+│  │       │   └── ⚠ Claude Review failures — tool_use: Bash                          sonnet-4-5  high   920 1.9/s 08m01s│
 │  │       └── Pane: w1:p3 (tests)                                                                                       │
-│  │           └── ✓ Codex Run unit tests · 02m48s                                   gpt-5.6-sol xhigh  1975  12/s 02m48s│
+│  │           └── ✓ Codex Run unit tests                                            gpt-5.6-sol xhigh  1975  12/s 02m48s│
 │  ├── Workspace: docs                                                                                                   │
 │  │   └── Tab: review                                                                                                   │
 │  │       └── Pane: w2:p1                                                                                               │
-│  │           └── ◌ Claude Draft guide outline · 00m42s                               haiku-4-5   low   310 7.4/s 00m42s│
+│  │           └── ◌ Claude Draft guide outline                                        haiku-4-5   low   310 7.4/s 00m42s│
 │  └── Unattached Task Runs                                                                                              │
 │      └── ◌ Codex orphan-session [unlinked]                                         gpt-5.6-sol  high     —     —      —│
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -85,16 +85,14 @@ and time. The TUI paints no column-header row. As the tree pane narrows, it
 drops model, effort, token rate, token total, and time in that order after
 truncating labels and compressing deep indentation.
 
-Claude Agent-tool children carry full lineage through their `.meta.json`
-sidecars. Inner Codex lineage is shown only when the child's session ID appears
-in the parent's admitted artifacts, such as a spawn command, resume invocation,
-or quoted report. With that evidence, herdr-top admits the child and attaches it
-in the tree. Without it, the rollout is not admitted and is not displayed
-anywhere, including under `Unattached`; herdr-top never guesses from timing,
-neighboring panes, or shared paths. As an optional convention, make the
-dispatching agent echo the child session ID into its own transcript. For
-headless Claude children, use `claude -p --output-format json ...` and retain
-the returned `session_id` in the parent transcript.
+Lineage evidence has three positions: Claude Agent-tool `.meta.json` sidecars;
+real Bash-command invocations of `codex exec resume <uuid>` or
+`claude --resume <uuid>` plus leading `CLAUDE_CONFIG_DIR=` assignments; and
+Codex's typed `sub_agent_activity.agent_thread_id` child references. UUIDs must
+exactly match discovered artifacts. Quoted reports, printed lookalikes, bare
+spawns, spawn output, tool-result bodies, and UUID-shaped text elsewhere are not
+evidence. Without one of those positions, a child is not admitted or displayed;
+herdr-top never guesses from timing, neighboring panes, or shared paths.
 
 See the [TUI guide](docs/tui.md) for the complete key map, row grammar, views,
 overlays, and visibility rules.

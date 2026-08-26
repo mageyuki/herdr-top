@@ -112,6 +112,8 @@ pub enum LogFact {
         agent_type: String,
         /// Allowlisted short subagent description.
         description: String,
+        /// Artifact modification time in Unix epoch milliseconds.
+        at_ms: i64,
     },
     /// Evidence that a Claude subagent ended.
     ///
@@ -123,6 +125,8 @@ pub enum LogFact {
         agent_id: String,
         /// Whether the reported status was not completed.
         failed: bool,
+        /// Provider record time in Unix epoch milliseconds.
+        at_ms: i64,
     },
     /// Sanitized short activity evidenced by a provider event.
     Activity {
@@ -155,15 +159,17 @@ pub enum LogFact {
         /// Allowlisted provider effort setting, when present.
         effort: Option<String>,
     },
-    /// Identifier found by the bounded raw-line evidence scan.
+    /// Identifier produced by one position in the closed lineage-evidence grammar.
     ///
-    /// The raw scanner intentionally over-emits UUIDs. `lane::Admission::on_evidence`
-    /// exact-matches them against `AdmissionIndex`; synthesis discards unmatched IDs.
+    /// `lane::Admission::on_evidence` exact-matches UUIDs against `AdmissionIndex`;
+    /// synthesis discards UUIDs that do not name a discovered artifact.
     EvidenceId {
-        /// Session whose raw line contained the identifier.
+        /// Session whose typed evidence position contained the identifier.
         parent: SessionScope,
         /// Extracted identifier token.
         id: EvidenceId,
+        /// Provider record time in Unix epoch milliseconds.
+        at_ms: i64,
     },
 }
 
@@ -200,7 +206,7 @@ pub enum CodexInternal {
     },
 }
 
-/// Narrow identifier evidence that may be scanned from a raw log line.
+/// Narrow identifier evidence produced by the closed lineage grammar.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum EvidenceId {
     /// Lowercase hexadecimal UUID-shaped token.
@@ -327,6 +333,10 @@ fn uuid_at(bytes: &[u8], start: usize) -> bool {
                 byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)
             }
         })
+}
+
+pub(crate) fn is_uuid_token(value: &str) -> bool {
+    value.len() == 36 && uuid_at(value.as_bytes(), 0)
 }
 
 fn push_unique(found: &mut Vec<EvidenceId>, seen: &mut HashSet<EvidenceId>, id: EvidenceId) {

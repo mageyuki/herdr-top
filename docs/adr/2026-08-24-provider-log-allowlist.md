@@ -46,6 +46,9 @@ The ordinary typed reader may read:
 - assistant `message.id`, `message.model`, top-level `effort`, and numeric
   `message.usage` fields;
 - `tool_use.name`, plus `input.description` for Bash and Agent tool uses;
+- Bash tool-use `input.command`, parsed only by the transient lineage-command
+  grammar below; only an extracted resume UUID or configuration-directory value
+  may leave the parser, never the command body;
 - `input.file_path` for path-bearing tool uses, used only to render a repository-relative display path;
 - `toolUseResult.agentId` for an Agent tool result; and
 - all four subagent metadata fields: `agentType`, `description`, `toolUseId`,
@@ -64,6 +67,8 @@ The ordinary typed reader may read:
   context-window breakdown;
 - lifecycle event type, turn identity, and timestamps for `task_started`,
   `task_complete`, and `turn_aborted`;
+- typed `sub_agent_activity.agent_thread_id` child references, used only as
+  lineage evidence;
 - `item_completed` item type and event timestamps, plus string `process_id`;
   and
 - the typed CommandExecution command argv and cwd needed to produce a
@@ -76,12 +81,17 @@ The ordinary typed reader may read:
 Exactly three text scans are permitted. They do not create a general license to
 retain or parse message bodies.
 
-1. **ID EXTRACTION:** Raw transcript lines may be pattern-scanned for
-   UUID-shaped tokens and `CLAUDE_CONFIG_DIR=` assignments. A UUID-shaped token
-   is emitted only when it exactly matches an already discovered rollout or
-   transcript id; unmatched tokens are discarded. For a configuration
-   assignment, only the assignment value is emitted. Nothing else leaves the
-   scan.
+1. **LINEAGE COMMAND GRAMMAR:** Only a Bash tool use's `input.command` may be
+   parsed transiently for lineage. The parser accepts
+   `codex exec resume <uuid>`, `claude --resume <uuid>`, and leading
+   `CLAUDE_CONFIG_DIR=` assignments, including supported leading environment
+   assignments and `env` wrappers. The resume form must be the shell command
+   being invoked, not text passed to another command; quoted or printed
+   lookalikes, bare `codex exec` or `claude -p` spawns, all tool-result text, and
+   all other UUID occurrences produce no evidence. A resume UUID is emitted only
+   when it exactly matches an already discovered rollout or transcript id;
+   unmatched UUIDs are discarded by admission. For a configuration assignment,
+   only the assignment value is emitted. Nothing else leaves the parse.
 2. **COMPLETION STATUS:** `queue-operation.content` may be scanned only for
    `<task-notification>` blocks. Within a matching block, the scanner extracts
    exactly the `task-id` and `status` tags. Ordinary prompt text and every other
@@ -124,8 +134,10 @@ fields.
 ### Never-read fields and files
 
 The reader never materializes Claude user prompts, assistant text or thinking,
-Agent prompts, Bash command bodies, ordinary queue-operation text, tool-result
-bodies, or any other conversation body. It never materializes Codex user
+Agent prompts, Bash command content outside the bounded transient lineage-command
+carve-in above, ordinary queue-operation text, tool-result bodies, or any other
+conversation body. In particular, tool-result bodies have no lineage carve-in.
+It never materializes Codex user
 messages, reasoning summaries or raw reasoning, base instructions,
 non-qualifying AgentMessage text, CommandExecution `stdout`, `stderr`,
 `aggregated_output`, or formatted output, MCP arguments or results, file-change

@@ -1,11 +1,14 @@
 //! Typed allowlist extraction for Claude transcript records.
 
-use serde::Deserialize;
+use std::fmt;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Deserializer};
 
 use crate::model::{TokenBreakdown, sanitize_controller_text};
 
 use super::facts::{
-    ActivitySource, LogFact, SessionScope, repo_relative, scan_raw_ids, truncate_60,
+    ActivitySource, EvidenceId, LogFact, SessionScope, is_uuid_token, repo_relative, truncate_60,
 };
 
 #[derive(Deserialize)]
@@ -25,7 +28,6 @@ struct AiTitleRecord {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AssistantRecord {
-    timestamp: Option<String>,
     cwd: Option<String>,
     effort: Option<String>,
     message: Option<AssistantMessage>,
@@ -59,6 +61,27 @@ struct ContentBlock {
 struct ToolInput {
     description: Option<String>,
     file_path: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_private_command")]
+    command: Option<PrivateCommand>,
+}
+
+#[derive(Deserialize)]
+struct PrivateCommand(String);
+
+fn deserialize_private_command<'de, D>(deserializer: D) -> Result<Option<PrivateCommand>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(command) => Some(PrivateCommand(command)),
+        _ => None,
+    })
+}
+
+impl fmt::Debug for PrivateCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PrivateCommand(<redacted>)")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,32 +117,49 @@ struct MetaRecord {
 /// Extracts allowlisted facts from one Claude JSONL transcript line.
 #[must_use]
 pub fn extract_claude_line(scope: &SessionScope, line: &str) -> Vec<LogFact> {
-    let mut facts = scan_raw_ids(line)
-        .into_iter()
-        .map(|id| LogFact::EvidenceId {
-            parent: scope.clone(),
-            id,
-        })
-        .collect::<Vec<_>>();
+    extract_claude_line_inner(scope, line, None)
+}
+
+/// Extracts allowlisted facts with the artifact modification time as the fallback fact clock.
+#[must_use]
+pub fn extract_claude_line_at(scope: &SessionScope, line: &str, modified_ms: i64) -> Vec<LogFact> {
+    extract_claude_line_inner(scope, line, (modified_ms > 0).then_some(modified_ms))
+}
+
+fn extract_claude_line_inner(
+    scope: &SessionScope,
+    line: &str,
+    modified_ms: Option<i64>,
+) -> Vec<LogFact> {
+    let mut facts = Vec::new();
 
     let Ok(record_type) = serde_json::from_str::<RecordType>(line) else {
         return facts;
     };
-    if let Some(at_ms) = record_type
+    let record_at_ms = record_type
         .timestamp
         .as_deref()
-        .and_then(parse_timestamp_ms)
-    {
+        .and_then(parse_timestamp_ms);
+    if let Some(at_ms) = record_at_ms {
         facts.push(LogFact::Append {
             scope: scope.clone(),
             at_ms,
         });
     }
+    let fact_at_ms = match record_type.timestamp.as_deref() {
+        Some(_) => record_at_ms,
+        None => modified_ms,
+    };
     match record_type.record_type.as_deref() {
         Some("ai-title") => extract_ai_title(line, &mut facts),
-        Some("assistant") => extract_assistant(scope, line, &mut facts),
-        Some("user") => extract_user(scope, line, &mut facts),
-        Some("queue-operation") => extract_queue_operation(scope, line, &mut facts),
+        Some("assistant") if record_type.timestamp.is_none() => {
+            if let Some(at_ms) = fact_at_ms {
+                extract_assistant_command_evidence(scope, line, at_ms, &mut facts);
+            }
+        }
+        Some("assistant") => extract_assistant(scope, line, fact_at_ms, &mut facts),
+        Some("user") => extract_user(scope, line, fact_at_ms, &mut facts),
+        Some("queue-operation") => extract_queue_operation(scope, line, fact_at_ms, &mut facts),
         _ => {}
     }
     facts
@@ -127,13 +167,20 @@ pub fn extract_claude_line(scope: &SessionScope, line: &str) -> Vec<LogFact> {
 
 /// Extracts an allowlisted subagent-appearance fact from Claude `meta.json` bytes.
 #[must_use]
-pub fn extract_meta_json(parent: &str, agent_id: &str, bytes: &[u8]) -> Option<LogFact> {
+pub fn extract_meta_json(
+    parent: &str,
+    agent_id: &str,
+    modified_ms: i64,
+    bytes: &[u8],
+) -> Option<LogFact> {
+    let at_ms = (modified_ms > 0).then_some(modified_ms)?;
     let record = serde_json::from_slice::<MetaRecord>(bytes).ok()?;
     Some(LogFact::SubagentAppeared {
         parent: parent.to_owned(),
         agent_id: agent_id.to_owned(),
         agent_type: record.agent_type?,
         description: record.description?,
+        at_ms,
     })
 }
 
@@ -146,11 +193,16 @@ fn extract_ai_title(line: &str, facts: &mut Vec<LogFact>) {
     }
 }
 
-fn extract_assistant(scope: &SessionScope, line: &str, facts: &mut Vec<LogFact>) {
+fn extract_assistant(
+    scope: &SessionScope,
+    line: &str,
+    at_ms: Option<i64>,
+    facts: &mut Vec<LogFact>,
+) {
     let Ok(record) = serde_json::from_str::<AssistantRecord>(line) else {
         return;
     };
-    let Some(at_ms) = record.timestamp.as_deref().and_then(parse_timestamp_ms) else {
+    let Some(at_ms) = at_ms else {
         return;
     };
 
@@ -186,6 +238,7 @@ fn extract_assistant(scope: &SessionScope, line: &str, facts: &mut Vec<LogFact>)
     }
 
     for block in message.content.unwrap_or_default() {
+        facts.extend(command_evidence(scope, &block, at_ms));
         if let Some(line) = activity_line(block, record.cwd.as_deref().unwrap_or_default()) {
             facts.push(LogFact::Activity {
                 scope: scope.clone(),
@@ -197,27 +250,248 @@ fn extract_assistant(scope: &SessionScope, line: &str, facts: &mut Vec<LogFact>)
     }
 }
 
-fn extract_user(scope: &SessionScope, line: &str, facts: &mut Vec<LogFact>) {
+fn extract_assistant_command_evidence(
+    scope: &SessionScope,
+    line: &str,
+    at_ms: i64,
+    facts: &mut Vec<LogFact>,
+) {
+    let Ok(record) = serde_json::from_str::<AssistantRecord>(line) else {
+        return;
+    };
+    let Some(message) = record.message else {
+        return;
+    };
+    for block in message.content.unwrap_or_default() {
+        facts.extend(command_evidence(scope, &block, at_ms));
+    }
+}
+
+fn command_evidence(scope: &SessionScope, block: &ContentBlock, at_ms: i64) -> Vec<LogFact> {
+    if block.block_type.as_deref() != Some("tool_use") || block.name.as_deref() != Some("Bash") {
+        return Vec::new();
+    }
+    let Some(command) = block
+        .input
+        .as_ref()
+        .and_then(|input| input.command.as_ref())
+    else {
+        return Vec::new();
+    };
+
+    shell_simple_commands(&command.0)
+        .into_iter()
+        .flat_map(simple_command_evidence)
+        .map(|id| LogFact::EvidenceId {
+            parent: scope.clone(),
+            id,
+            at_ms,
+        })
+        .collect()
+}
+
+fn simple_command_evidence(words: Vec<String>) -> Vec<EvidenceId> {
+    let mut evidence = Vec::new();
+    let mut index = 0;
+    loop {
+        while let Some((name, value)) = words.get(index).and_then(|word| shell_assignment(word)) {
+            if name == "CLAUDE_CONFIG_DIR" && !value.is_empty() {
+                push_evidence(&mut evidence, EvidenceId::ConfigDir(PathBuf::from(value)));
+            }
+            index += 1;
+        }
+
+        if words.get(index).map(String::as_str) != Some("env") {
+            break;
+        }
+        index += 1;
+        loop {
+            match words.get(index).map(String::as_str) {
+                Some("-" | "-i" | "--ignore-environment") => index += 1,
+                Some("-u" | "--unset") => {
+                    if words.get(index + 1).is_none() {
+                        return evidence;
+                    }
+                    index += 2;
+                }
+                Some(option) if option.starts_with("--unset=") && option.len() > 8 => index += 1,
+                Some("--") => {
+                    index += 1;
+                    break;
+                }
+                Some(option) if option.starts_with('-') => return evidence,
+                Some(_) | None => break,
+            }
+        }
+    }
+
+    let child_id = match words.get(index..).unwrap_or_default() {
+        [command, exec, resume, child_id, ..]
+            if command == "codex" && exec == "exec" && resume == "resume" =>
+        {
+            Some(child_id)
+        }
+        [command, resume, child_id, ..] if command == "claude" && resume == "--resume" => {
+            Some(child_id)
+        }
+        _ => None,
+    };
+    if let Some(child_id) = child_id.filter(|child_id| is_uuid_token(child_id)) {
+        push_evidence(&mut evidence, EvidenceId::Uuid(child_id.clone()));
+    }
+    evidence
+}
+
+fn shell_assignment(word: &str) -> Option<(&str, &str)> {
+    let (name, value) = word.split_once('=')?;
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    (matches!(first, 'A'..='Z' | 'a'..='z' | '_')
+        && chars.all(|ch| matches!(ch, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_')))
+    .then_some((name, value))
+}
+
+fn push_evidence(evidence: &mut Vec<EvidenceId>, id: EvidenceId) {
+    if !evidence.contains(&id) {
+        evidence.push(id);
+    }
+}
+
+fn shell_simple_commands(script: &str) -> Vec<Vec<String>> {
+    let mut commands = Vec::new();
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut backtick = false;
+    let mut substitution_depth = 0_u32;
+    let mut supported = true;
+    let mut chars = script.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            } else if ch == '\\' && active_quote == '"' {
+                if let Some(escaped) = chars.next() {
+                    word.push(escaped);
+                }
+            } else {
+                word.push(ch);
+            }
+            continue;
+        }
+        if backtick {
+            if ch == '`' {
+                backtick = false;
+            } else {
+                word.push(ch);
+            }
+            continue;
+        }
+        if substitution_depth > 0 {
+            match ch {
+                '\'' | '"' => quote = Some(ch),
+                '`' => backtick = true,
+                '(' => substitution_depth += 1,
+                ')' => substitution_depth -= 1,
+                _ => word.push(ch),
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '\\' => {
+                if let Some(escaped) = chars.next() {
+                    word.push(escaped);
+                }
+            }
+            '`' => {
+                supported = false;
+                backtick = true;
+            }
+            '$' if chars.peek() == Some(&'(') => {
+                supported = false;
+                substitution_depth = 1;
+                let _ = chars.next();
+            }
+            '\n' => finish_simple_command(&mut commands, &mut words, &mut word, &mut supported),
+            ';' | '&' | '|' | '(' | ')' | '{' | '}' => {
+                finish_simple_command(&mut commands, &mut words, &mut word, &mut supported);
+                if matches!(ch, '&' | '|') && chars.peek() == Some(&ch) {
+                    let _ = chars.next();
+                }
+            }
+            '#' if word.is_empty() => {
+                for comment in chars.by_ref() {
+                    if comment == '\n' {
+                        break;
+                    }
+                }
+                finish_simple_command(&mut commands, &mut words, &mut word, &mut supported);
+            }
+            ch if ch.is_whitespace() => finish_shell_word(&mut words, &mut word),
+            _ => word.push(ch),
+        }
+    }
+
+    if quote.is_none() && !backtick && substitution_depth == 0 {
+        finish_simple_command(&mut commands, &mut words, &mut word, &mut supported);
+    }
+    commands
+}
+
+fn finish_shell_word(words: &mut Vec<String>, word: &mut String) {
+    if !word.is_empty() {
+        words.push(std::mem::take(word));
+    }
+}
+
+fn finish_simple_command(
+    commands: &mut Vec<Vec<String>>,
+    words: &mut Vec<String>,
+    word: &mut String,
+    supported: &mut bool,
+) {
+    finish_shell_word(words, word);
+    if *supported && !words.is_empty() {
+        commands.push(std::mem::take(words));
+    } else {
+        words.clear();
+    }
+    *supported = true;
+}
+
+fn extract_user(scope: &SessionScope, line: &str, at_ms: Option<i64>, facts: &mut Vec<LogFact>) {
     let Ok(record) = serde_json::from_str::<UserRecord>(line) else {
         return;
     };
     let Some(result) = record.tool_use_result else {
         return;
     };
-    if let Some(agent_id) = result.agent_id {
+    if let (Some(agent_id), Some(at_ms)) = (result.agent_id, at_ms) {
         facts.push(LogFact::SubagentEnded {
             parent: parent_id(scope).to_owned(),
             agent_id,
             failed: false,
+            at_ms,
         });
     }
 }
 
-fn extract_queue_operation(scope: &SessionScope, line: &str, facts: &mut Vec<LogFact>) {
+fn extract_queue_operation(
+    scope: &SessionScope,
+    line: &str,
+    at_ms: Option<i64>,
+    facts: &mut Vec<LogFact>,
+) {
     let Ok(record) = serde_json::from_str::<QueueOperationRecord>(line) else {
         return;
     };
     let Some(content) = record.content else {
+        return;
+    };
+    let Some(at_ms) = at_ms else {
         return;
     };
     facts.extend(
@@ -225,6 +499,7 @@ fn extract_queue_operation(scope: &SessionScope, line: &str, facts: &mut Vec<Log
             parent: parent_id(scope).to_owned(),
             agent_id,
             failed,
+            at_ms,
         }),
     );
 }
@@ -427,6 +702,13 @@ mod tests {
         fs::read_to_string(path).expect("fixture must be readable")
     }
 
+    fn provider_fixture(name: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/provider")
+            .join(name);
+        fs::read_to_string(path).expect("provider fixture must be readable")
+    }
+
     fn root_scope() -> SessionScope {
         SessionScope::ClaudeRoot(PARENT.to_owned())
     }
@@ -436,19 +718,55 @@ mod tests {
         let bytes = fixture("claude-subagent-meta.json");
 
         assert_eq!(
-            extract_meta_json(PARENT, "a7189abbf3c5741ac", bytes.as_bytes()),
+            extract_meta_json(PARENT, "a7189abbf3c5741ac", 1_234, bytes.as_bytes()),
             Some(LogFact::SubagentAppeared {
                 parent: PARENT.to_owned(),
                 agent_id: "a7189abbf3c5741ac".to_owned(),
                 agent_type: "reviewer".to_owned(),
                 description: "Check deterministic cache report boundaries".to_owned(),
+                at_ms: 1_234,
             })
         );
         assert_eq!(
-            extract_meta_json(PARENT, "child", br#"{"agentType":"reviewer"}"#),
+            extract_meta_json(PARENT, "child", 1_234, br#"{"agentType":"reviewer"}"#),
             None
         );
-        assert_eq!(extract_meta_json(PARENT, "child", b"not json"), None);
+        assert_eq!(extract_meta_json(PARENT, "child", 1_234, b"not json"), None);
+    }
+
+    #[test]
+    fn meta_json_at_epoch_does_not_emit_appearance() {
+        let bytes = fixture("claude-subagent-meta.json");
+
+        assert_eq!(
+            extract_meta_json(PARENT, "a7189abbf3c5741ac", 0, bytes.as_bytes()),
+            None
+        );
+    }
+
+    #[test]
+    fn record_timestamp_precedes_artifact_time_for_terminal_and_evidence() {
+        let at_ms = 1_787_533_212_000;
+        let terminal = r#"{"type":"user","timestamp":"2026-08-24T01:00:12.000Z","toolUseResult":{"agentId":"a7189abbf3c5741ac"}}"#;
+        let evidence = r#"{"type":"assistant","timestamp":"2026-08-24T01:00:12.000Z","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"claude --resume 77777777-7777-4777-8777-777777777777"}}]}}"#;
+
+        assert!(
+            extract_claude_line_at(&root_scope(), terminal, 9_999).contains(
+                &LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "a7189abbf3c5741ac".to_owned(),
+                    failed: false,
+                    at_ms,
+                }
+            )
+        );
+        assert!(
+            extract_claude_line_at(&root_scope(), evidence, 9_999).contains(&LogFact::EvidenceId {
+                parent: root_scope(),
+                id: EvidenceId::Uuid("77777777-7777-4777-8777-777777777777".to_owned()),
+                at_ms,
+            })
+        );
     }
 
     #[test]
@@ -627,6 +945,28 @@ mod tests {
     }
 
     #[test]
+    fn non_string_bash_command_preserves_usage_without_evidence() {
+        let line = r#"{"type":"assistant","timestamp":"2026-08-24T01:00:03.000Z","message":{"id":"msg_non_string_command","usage":{"output_tokens":42},"content":[{"type":"tool_use","name":"Bash","input":{"command":["ls","-la"]}}]}}"#;
+        let facts = extract_claude_line(&root_scope(), line);
+
+        assert!(facts.iter().any(|fact| {
+            matches!(
+                fact,
+                LogFact::Usage {
+                    sample_id,
+                    output_tokens: 42,
+                    ..
+                } if sample_id == "msg_non_string_command"
+            )
+        }));
+        assert!(
+            facts
+                .iter()
+                .all(|fact| !matches!(fact, LogFact::EvidenceId { .. }))
+        );
+    }
+
+    #[test]
     fn effort_extracted_from_assistant_records() {
         let usage = fixture("claude-session.jsonl")
             .lines()
@@ -658,11 +998,13 @@ mod tests {
                     parent: PARENT.to_owned(),
                     agent_id: "a7189abbf3c5741ac".to_owned(),
                     failed: false,
+                    at_ms: 1_787_533_265_000,
                 },
                 LogFact::SubagentEnded {
                     parent: PARENT.to_owned(),
                     agent_id: "aa78091e473624d60".to_owned(),
                     failed: true,
+                    at_ms: 1_787_533_268_000,
                 },
             ]
         );
@@ -815,15 +1157,12 @@ mod tests {
                 .is_empty()
         );
         assert!(extract_claude_line(&root_scope(), "not json at all").is_empty());
-        assert_eq!(
+        assert!(
             extract_claude_line(
                 &root_scope(),
                 "garbage 6f9bdfa0-1502-4a37-97aa-c45591141130"
-            ),
-            vec![LogFact::EvidenceId {
-                parent: root_scope(),
-                id: EvidenceId::Uuid("6f9bdfa0-1502-4a37-97aa-c45591141130".to_owned()),
-            }]
+            )
+            .is_empty()
         );
     }
 
@@ -869,6 +1208,7 @@ mod tests {
                 parent: PARENT.to_owned(),
                 agent_id: "a7189abbf3c5741ac".to_owned(),
                 failed: false,
+                at_ms: 1_787_533_212_000,
             }]
         );
     }
@@ -882,6 +1222,7 @@ mod tests {
                 parent: PARENT.to_owned(),
                 agent_id: "a7189abbf3c5741ac".to_owned(),
                 failed: false,
+                at_ms: 1_787_533_212_000,
             })
         );
     }
@@ -889,7 +1230,7 @@ mod tests {
     #[test]
     fn multiple_task_notifications_are_extracted_in_order() {
         let line = r#"{"type":"queue-operation","content":"<task-notification><task-id>abcdef12</task-id><status>completed</status></task-notification><task-notification><task-id>0123456789ab</task-id><status>failed</status></task-notification>"}"#;
-        let ended = extract_claude_line(&root_scope(), line)
+        let ended = extract_claude_line_at(&root_scope(), line, 55)
             .into_iter()
             .filter(|fact| matches!(fact, LogFact::SubagentEnded { .. }))
             .collect::<Vec<_>>();
@@ -901,11 +1242,13 @@ mod tests {
                     parent: PARENT.to_owned(),
                     agent_id: "abcdef12".to_owned(),
                     failed: false,
+                    at_ms: 55,
                 },
                 LogFact::SubagentEnded {
                     parent: PARENT.to_owned(),
                     agent_id: "0123456789ab".to_owned(),
                     failed: true,
+                    at_ms: 55,
                 },
             ]
         );
@@ -915,7 +1258,21 @@ mod tests {
     fn unparseable_timestamp_suppresses_timestamped_facts() {
         let line = r#"{"type":"assistant","timestamp":"not-a-time","message":{"id":"msg_bad_time","usage":{"output_tokens":42},"content":[{"type":"tool_use","name":"Bash","input":{"description":"must not appear"}}]}}"#;
 
-        assert!(extract_claude_line(&root_scope(), line).is_empty());
+        assert!(extract_claude_line_at(&root_scope(), line, 4_321).is_empty());
+    }
+
+    #[test]
+    fn resume_command_evidence_missing_timestamp_uses_artifact_time() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"claude --resume 77777777-7777-4777-8777-777777777777"}}]}}"#;
+
+        assert_eq!(
+            extract_claude_line_at(&root_scope(), line, 4_321),
+            vec![LogFact::EvidenceId {
+                parent: root_scope(),
+                id: EvidenceId::Uuid("77777777-7777-4777-8777-777777777777".to_owned()),
+                at_ms: 4_321,
+            }]
+        );
     }
 
     #[test]
@@ -935,6 +1292,7 @@ mod tests {
             parent: PARENT.to_owned(),
             agent_id: "fedcba98".to_owned(),
             failed: false,
+            at_ms: 1_787_533_203_000,
         }));
     }
 
@@ -955,8 +1313,59 @@ mod tests {
     }
 
     #[test]
-    fn config_dir_evidence_is_preserved_from_bash_raw_line() {
-        let facts = fixture("claude-session.jsonl")
+    fn pasted_tool_result_uuid_is_not_lineage_evidence() {
+        let input = provider_fixture("claude-lineage-evidence-synthetic.jsonl");
+        let line = input.lines().next().expect("fixture has pasted listing");
+
+        assert!(
+            extract_claude_line(&root_scope(), line)
+                .into_iter()
+                .all(|fact| !matches!(fact, LogFact::EvidenceId { .. }))
+        );
+    }
+
+    #[test]
+    fn quoted_resume_lookalike_is_not_lineage_evidence() {
+        let input = provider_fixture("claude-lineage-evidence-synthetic.jsonl");
+        let line = input.lines().nth(1).expect("fixture has quoted lookalike");
+
+        assert!(
+            extract_claude_line(&root_scope(), line)
+                .into_iter()
+                .all(|fact| !matches!(fact, LogFact::EvidenceId { .. }))
+        );
+    }
+
+    #[test]
+    fn resume_invocations_emit_only_the_typed_child_ids() {
+        let evidence = provider_fixture("claude-lineage-evidence-synthetic.jsonl")
+            .lines()
+            .flat_map(|line| extract_claude_line(&root_scope(), line))
+            .filter_map(|fact| match fact {
+                LogFact::EvidenceId { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(evidence.contains(&EvidenceId::Uuid(
+            "33333333-3333-4333-8333-333333333333".to_owned()
+        )));
+        assert!(evidence.contains(&EvidenceId::Uuid(
+            "44444444-4444-4444-8444-444444444444".to_owned()
+        )));
+        for rejected in [
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+            "55555555-5555-4555-8555-555555555555",
+            "66666666-6666-4666-8666-666666666666",
+        ] {
+            assert!(!evidence.contains(&EvidenceId::Uuid(rejected.to_owned())));
+        }
+    }
+
+    #[test]
+    fn config_dir_evidence_is_preserved_from_bash_command_assignment() {
+        let facts = provider_fixture("claude-lineage-evidence-synthetic.jsonl")
             .lines()
             .flat_map(|line| extract_claude_line(&root_scope(), line))
             .collect::<Vec<_>>();
@@ -964,6 +1373,14 @@ mod tests {
         assert!(facts.contains(&LogFact::EvidenceId {
             parent: root_scope(),
             id: EvidenceId::ConfigDir(PathBuf::from("/home/user/.claude-secondary")),
+            at_ms: 1_787_554_802_000,
         }));
+        assert!(!facts.iter().any(|fact| matches!(
+            fact,
+            LogFact::EvidenceId {
+                id: EvidenceId::ConfigDir(path),
+                ..
+            } if path == &PathBuf::from("/home/user/.claude-printed")
+        )));
     }
 }

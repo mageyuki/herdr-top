@@ -2,11 +2,13 @@ mod common;
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use herdr_top::model::{ExecState, Provider};
 use herdr_top::provider::codex::{CodexAdapter, CodexBootstrapParser};
-use herdr_top::provider::lane::{Admission, AdmissionIndex};
+use herdr_top::provider::codex_facts::extract_codex_line;
+use herdr_top::provider::facts::{EvidenceId, LogFact, SessionScope};
+use herdr_top::provider::lane::{Admission, AdmissionIndex, Synthesis};
 use herdr_top::provider::{
     BootstrapParser, DiscoveryIndex, DiscoveryRoot, MergeOutcome, PathInterner, PendingEvents,
     ProviderDiagnostics, ProviderEvent, SourcePosition, TailRecord,
@@ -146,6 +148,53 @@ fn event_id(event: &ProviderEvent) -> Option<&str> {
         | ProviderEvent::SourceState { .. }
         | ProviderEvent::Malformed { .. } => None,
     }
+}
+
+#[test]
+fn structural_child_reference_yields_exact_rollout_admission() {
+    const STRUCTURAL_CHILD: &str = "d9999999-9999-4999-8999-999999999999";
+    let child_path = PathBuf::from(format!(
+        "/sessions/rollout-2026-08-24T08-00-00-{STRUCTURAL_CHILD}.jsonl"
+    ));
+    let line = format!(
+        r#"{{"timestamp":"2026-08-24T08:00:00.000Z","type":"event_msg","payload":{{"type":"sub_agent_activity","event_id":"call_structural_child","occurred_at_ms":1787558400000,"agent_thread_id":"{STRUCTURAL_CHILD}","agent_path":"/root/child","kind":"started"}}}}"#
+    );
+    let facts = extract_codex_line(ROOT_ID, 0, &line);
+    assert!(facts.contains(&LogFact::EvidenceId {
+        parent: SessionScope::Codex {
+            rollout_id: ROOT_ID.to_owned(),
+        },
+        id: EvidenceId::Uuid(STRUCTURAL_CHILD.to_owned()),
+        at_ms: 1_787_558_400_000,
+    }));
+
+    let mut admission = Admission::new(0);
+    admission.admit_pane_session(Provider::Codex, ROOT_ID);
+    let mut discovered = AdmissionIndex::new();
+    discovered.insert_codex_rollout(STRUCTURAL_CHILD, child_path.clone(), 0);
+    let facts = facts
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, fact)| (ordinal as u64, fact));
+    let _events = Synthesis::default().synthesize_batch(
+        Path::new("parent-rollout.jsonl"),
+        facts,
+        &mut admission,
+        &discovered,
+    );
+
+    assert!(admission.is_admitted_path(&child_path));
+}
+
+#[test]
+fn codex_free_text_uuid_is_not_lineage_evidence() {
+    let line = r#"{"timestamp":"2026-08-24T08:01:00.000Z","type":"response_item","payload":{"type":"message","content":"pasted d9999999-9999-4999-8999-999999999999"}}"#;
+
+    assert!(
+        extract_codex_line(ROOT_ID, 0, line)
+            .into_iter()
+            .all(|fact| !matches!(fact, LogFact::EvidenceId { .. }))
+    );
 }
 
 fn parse_inline(

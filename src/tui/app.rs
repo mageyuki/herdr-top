@@ -3383,6 +3383,60 @@ mod tests {
     }
 
     #[test]
+    fn duration_suffix_tracks_painted_time_band_and_dag_mode() {
+        let live = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let prerequisite = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let mut model = model_with_runs(&[
+            (live, "live", 1, TaskState::Running),
+            (prerequisite, "prerequisite", 2, TaskState::Completed),
+        ]);
+        let mut timed = model.task_run(&live).unwrap().clone();
+        timed.created_at_ms = Some(0);
+        timed.updated_at_ms = Some(0);
+        timed.subject = Some("Timed work".to_owned());
+        model.insert_task_run(timed);
+        model.insert_dependency_edge(DependencyEdge {
+            prerequisite_run_id: prerequisite,
+            dependent_run_id: live,
+        });
+        let (mut app, _senders) = app_with_runtime(
+            model,
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            TestClock::at(7_000),
+        );
+
+        let inner_61 = render_lines(&app, 63, 18)
+            .into_iter()
+            .find(|line| line.contains("Timed work"))
+            .unwrap();
+        assert!(inner_61.contains(" · 07s"), "{inner_61}");
+        assert_eq!(inner_61.matches("07s").count(), 1, "{inner_61}");
+
+        let inner_62 = render_lines(&app, 64, 18)
+            .into_iter()
+            .find(|line| line.contains("Timed work"))
+            .unwrap();
+        assert!(!inner_62.contains(" · 07s"), "{inner_62}");
+        assert_eq!(inner_62.matches("07s").count(), 1, "{inner_62}");
+
+        app.toggle_view();
+        let dag_lines = render_lines(&app, 100, 18);
+        let activity_start = dag_lines
+            .iter()
+            .position(|line| line.contains("Activity for selected item"))
+            .unwrap();
+        let dag_body = dag_lines[..activity_start].join("\n");
+        assert!(dag_body.contains("Task Run"), "{dag_body}");
+        let dag = dag_body
+            .lines()
+            .find(|line| line.contains("Timed work"))
+            .unwrap();
+        assert!(dag.contains(" · 07s"), "{dag}");
+        assert_eq!(dag.matches("07s").count(), 1, "{dag}");
+    }
+
+    #[test]
     fn expanding_collapsed_live_run_rearms_duration_without_watch_traffic() {
         let live = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let mut model = model_with_runs(&[(live, "live", 1, TaskState::Running)]);
@@ -4071,6 +4125,46 @@ mod tests {
 
         assert!(render_at_width(&app, 220).contains("codex=unavailable(read_failed)"));
         drop(model_sender);
+    }
+
+    #[test]
+    fn sources_header_renames_control_socket_and_preserves_provider_states() {
+        let (_model_sender, model_receiver) = watch::channel(Arc::new(DomainModel::default()));
+        let mut coverage = SourceCoverageRegistry::new(SourceAvailability::Available);
+        coverage.set(CoverageSource::Claude, SourceAvailability::Available);
+        coverage.set(CoverageSource::Codex, SourceAvailability::Available);
+        let (coverage_sender, coverage_receiver) = watch::channel(coverage);
+        let mut app = App::new(
+            model_receiver,
+            HeaderInputs {
+                source_coverage: coverage_receiver,
+                ..HeaderInputs::default()
+            },
+        );
+
+        let available = render_at_width(&app, 220);
+        assert!(
+            available.contains("sources:herdr=available;ctl=available;claude=0;codex=0"),
+            "{available}"
+        );
+
+        let mut mixed = coverage_sender.borrow().clone();
+        mixed.set(CoverageSource::Claude, SourceAvailability::NotApplicable);
+        mixed.set(
+            CoverageSource::Codex,
+            SourceAvailability::Unavailable {
+                detail: "read_failed".to_owned(),
+            },
+        );
+        coverage_sender.send(mixed).unwrap();
+        app.refresh_if_changed().unwrap();
+        let mixed = render_at_width(&app, 220);
+        assert!(
+            mixed.contains(
+                "sources:herdr=available;ctl=available;claude=n/a;codex=unavailable(read_failed)"
+            ),
+            "{mixed}"
+        );
     }
 
     #[test]

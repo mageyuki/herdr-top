@@ -1981,6 +1981,7 @@ mod tests {
             key,
             depth,
             label: label.to_owned(),
+            label_without_duration_suffix: None,
             prerequisites: Vec::new(),
             dependents: Vec::new(),
         }
@@ -2533,7 +2534,7 @@ mod tests {
             model.insert_agent_node(agent);
         }
 
-        let label = crate::tui::view::task_run_label(&model, &selected, false, 9_000, false);
+        let label = crate::tui::view::task_run_label(&model, &selected, false, 9_000, false, true);
         assert!(!label.contains(full_key));
         let selected_row = row(
             NodeKey::Run {
@@ -2893,7 +2894,7 @@ mod tests {
             dependent_run_id: child.run_id,
         });
 
-        let tree_label = crate::tui::view::task_run_label(&model, &child, false, 0, false);
+        let tree_label = crate::tui::view::task_run_label(&model, &child, false, 0, false, true);
         let mut dag_order = crate::tui::dag::DagOrder::default();
         dag_order.recompute(&model);
         let dag_text = crate::tui::dag::build_rows(&model, &dag_order, 0)
@@ -2917,7 +2918,7 @@ mod tests {
                 pane_id: Some("pane".to_owned()),
             },
             0,
-            &crate::tui::view::task_run_label(&model, &child, false, 0, false),
+            &crate::tui::view::task_run_label(&model, &child, false, 0, false, true),
         );
         let tied = operator(
             vec![

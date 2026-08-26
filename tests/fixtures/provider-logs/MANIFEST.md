@@ -26,12 +26,14 @@ Mirrors a main-session transcript. It contains `ai-title`, `user`, and
 - `aiTitle`;
 - assistant `message.id`, `message.model`, top-level `effort`, and numeric
   `message.usage` fields;
-- `tool_use` name plus Bash and Agent `description` values; and
+- `tool_use` name plus Bash and Agent `description` values;
+- Bash `input.command`, parsed transiently only for resume invocations and
+  leading `CLAUDE_CONFIG_DIR=` assignments; and
 - an Agent `tool_result` whose top-level `toolUseResult.agentId` identifies the
   child.
 
 The assistant message id `msg_02SyntheticStreamChunk` occurs twice with the
-same usage sample so token deduplication is testable. The Bash spawn command
+same usage sample so token deduplication is testable. The Bash resume command
 contains `CLAUDE_CONFIG_DIR=/home/user/.claude-secondary` and quotes Codex
 rollout id `6f9bdfa0-1502-4a37-97aa-c45591141130`; that id is the identity in
 `codex-exec.jsonl`.
@@ -131,15 +133,17 @@ rollout identity.
 
 The typed read fields above are the only fields intended for ordinary parsing.
 The fixtures also contain fields that must never be materialized: Claude user,
-assistant, thinking, prompt, command, and tool-result bodies; Codex user,
+assistant, thinking, prompt, command content outside the bounded transient
+lineage grammar, and tool-result bodies; Codex user,
 non-commentary AgentMessage, and reasoning bodies; `response_item` reasoning,
 custom-tool-output, and message bodies; `world_state`; the token-count
 `rate_limits` subtree; Codex command scripts; and CommandExecution `stdout`,
 `stderr`, `aggregated_output`, and formatted output. Files under `tool-results/`
 are outside this fixture set because those directories must never be opened.
 
-Three narrowly bounded pattern-only cases are present: discovered-id and
-`CLAUDE_CONFIG_DIR=` extraction from raw Claude lines, `task-id` and `status`
-extraction from task-notification blocks, and one-line Codex commentary text of
-at most 60 characters. Input text for those scans is never retained,
-displayed, or logged.
+Three narrowly bounded pattern-only cases are present: resume UUID and
+`CLAUDE_CONFIG_DIR=` extraction from the Claude Bash-command grammar, `task-id`
+and `status` extraction from task-notification blocks, and one-line Codex
+commentary text of at most 60 characters. Input text for those scans is never
+retained, displayed, or logged. Codex `sub_agent_activity.agent_thread_id` is a
+typed field, not a text scan.
