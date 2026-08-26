@@ -19,17 +19,21 @@ directory) and (ii) a headless-Claude pair (a `claude -p` wrapper, e.g.
 claude-git-operator, + the child transcript). Answer for each: (a) identity
 carried by the child artifact; (b) does the parent transcript reference it
 in a G2-grammar position (spawn/resume command in tool-use `command`,
-config-dir marker, typed tool-result `session_id` — pin the actual wire
-spelling, `sessionId` vs `session_id`) or only in prose? (c) a proposed
+config-dir marker, spawn-correlated result content — pin the actual wire
+spelling and location of the child id) or only in prose? (c) a proposed
 third-tier design sketch — for the inner-codex pair only. Finding (b)
-GATES G2: if lineage
-for either family exists only in prose, STOP and re-plan G2 with the
-Controller.
+GATES G2. STATUS: COMPLETED (commit 7d24295) — the gate FIRED against the
+original typed-field position 4 (both families carry the id only in spawn
+stdout; zero typed session fields across 16,158 real tool-result
+records), and G2 was re-planned to spawn-correlated result parsing.
+Claude wire spelling: snake_case `session_id` inside the spawn result's
+JSON output text.
 
 ## Task 1 — G2: typed lineage evidence grammar
 
 Expected files: `src/provider/claude_facts.rs` (transient command-grammar
-parsing with the privacy carve-in; `ToolUseResult` gains `session_id`;
+parsing with the privacy carve-in; spawn-correlated result parsing —
+tool-use/tool-result pairing plus per-CLI output-grammar extraction;
 extractor stops raw-line scanning), `src/provider/codex_facts.rs` (same
 restriction on its raw scan; structural `sub_agent_activity.agent_thread_id`
 retained), `src/provider/facts.rs` (unconditionally: the `LogFact::EvidenceId`
@@ -43,10 +47,12 @@ section amended with the bounded carve-in — spec G2b'), `README.md` (the
 "quoted report" lineage sentence), `tests/fixtures/provider-logs/MANIFEST.md`
 (read-list mirror), `tests/provider_claude.rs`, `tests/provider_codex.rs`,
 new fixtures under `tests/fixtures/provider-logs/` /
-`tests/fixtures/provider/` — including a position-4 fixture whose record
-carries a typed tool-result `session_id` AND unrelated UUIDs in its free
-text, so one record pins both the positive (typed field admits) and the
-negative (free text does not).
+`tests/fixtures/provider/` — including position-4 fixtures built from the
+REAL shapes Task 0 recorded: a spawn tool use (`claude -p
+--output-format json`) with its paired result whose stdout JSON carries
+`session_id` (admits), and a NON-spawn tool use whose result stdout
+contains unrelated UUIDs (does not admit), so the pair pins both sides
+of the correlation rule.
 
 1. VERIFY: enumerate the raw-scan call sites (`claude_facts.rs` pre-parse
    scan; `codex_facts.rs` scan) and the FIVE filename-parsing production
@@ -57,14 +63,20 @@ negative (free text does not).
    line shapes.
 2. Implement the closed grammar (spec G2a positions 1-4): meta.json
    (unchanged); command grammar parsed TRANSIENTLY from the tool-use
-   `command` (codex exec / codex exec resume <uuid> / claude --resume
-   <uuid>, optional `CLAUDE_CONFIG_DIR=` prefix — NOT bare `claude -p`,
-   which cannot carry the child id) under the privacy carve-in (spec G2b':
-   only the extracted UUID/config-dir is retained; the privacy test is
-   preserved, via a non-Debug-exposed transient parse or a redacted Debug —
-   `sanitize_command_script` is the precedent); typed tool-result
-   `session_id` (position 4); codex structural child refs. Free-text
-   scanning of record bodies is removed from evidence production.
+   `command` (codex exec resume <uuid> / claude --resume <uuid>, optional
+   `CLAUDE_CONFIG_DIR=` prefix) under the privacy carve-in (spec G2b');
+   position 4 SPAWN-CORRELATED RESULT PARSING: when the command matches
+   the spawn grammar (`codex exec` without resume; `claude -p`), the
+   structurally paired tool result's output is parsed with that CLI's
+   known output grammar — `claude -p --output-format json` → JSON-parse,
+   take top-level snake_case `session_id` (wire spelling pinned by
+   Task 0); `codex exec` → pin the exact id-carrying output pattern at
+   VERIFY from real transcripts (Task 0 confirmed presence in stdout);
+   unrecognized shape → no evidence. Pairing uses the transcript's
+   tool-use linkage (VERIFY how tool results reference their tool use in
+   the real schema — tool_use_id or positional — and pin it). Codex
+   structural child refs unchanged. General free-text scanning of record
+   bodies is removed from evidence production.
 3. Retarget `config_dir_evidence_is_preserved_from_bash_raw_line` to the
    command grammar; update both docs in the same commit.
 4. Tests (red first): pasted-UUID fixture (directory-listing text inside a
