@@ -697,6 +697,8 @@ impl Reducer {
             return true;
         }
         debug_assert_eq!(self.pending_telemetry_count, 0);
+        // Self-heal the counter after exhausting the authoritative eviction order.
+        self.pending_telemetry_count = 0;
         false
     }
 
@@ -4364,6 +4366,8 @@ mod tests {
         let newest = snapshot
             .telemetry(&newest_id)
             .expect("the newest pending sample must survive FIFO eviction");
+        // Hard-coded on purpose as the exact-capacity pin; deriving this from
+        // PENDING_CAP would defeat the pin.
         assert_eq!(newest.output_tokens, 4_097);
     }
 
@@ -4410,7 +4414,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_telemetry_resolves_through_promotion_alias() {
+    fn pending_telemetry_resolves_through_promotion_rekey() {
         let native_key = RunKey::Native {
             provider: Provider::Codex,
             sid: "pending-promotion".to_owned(),
