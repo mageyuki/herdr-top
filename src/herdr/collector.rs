@@ -5615,7 +5615,20 @@ async fn apply_heuristic_bindings(
                         .native_session_id
                         .as_ref()
                         .is_some_and(|sid| !sid.is_empty())
-            })
+            }) || (!binding.sid.is_empty()
+                && (model
+                    .task_run_by_key(&RunKey::Native {
+                        provider: Provider::Codex,
+                        sid: binding.sid.clone(),
+                    })
+                    .is_some()
+                    || model.agent_nodes().any(|node| {
+                        node.provider == Provider::Codex
+                            && node
+                                .native_session_id
+                                .as_ref()
+                                .is_some_and(|sid| !sid.is_empty() && sid == &binding.sid)
+                    })))
         };
         if stale {
             continue;
@@ -15967,6 +15980,41 @@ mod provider_integration_tests {
     }
 
     #[test]
+    fn owned_rollout_exclusion_reduces_two_candidates_to_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        let (_, owned_sid) = g7_rollout(&root, G7_DETECTION_MS + 500, "owned-candidate");
+        let (_, unowned_sid) = g7_rollout(&root, G7_DETECTION_MS + 1_500, "unowned-candidate");
+        let run = g7_provisional("ownership-exclusion", 2, G7_DETECTION_MS);
+        let mut model = g7_model(std::slice::from_ref(&run));
+        model.insert_task_run(TaskRun {
+            run_id: RunId::new(),
+            key: RunKey::Native {
+                provider: Provider::Codex,
+                sid: owned_sid,
+            },
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Queued,
+            has_controller_task_state_event: false,
+            created_at_ms: Some(G7_DETECTION_MS),
+            updated_at_ms: Some(G7_DETECTION_MS),
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        let targets = g7_targets(&model, &[run.0]);
+        let (mut worker, mut pending) = g7_worker(&root);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+
+        assert_eq!(
+            g7_bindings(&drain_pending(&mut pending)),
+            vec![(run.0, unowned_sid)],
+            "excluding the owned rollout must leave one unambiguous candidate"
+        );
+    }
+
+    #[test]
     fn sessionless_codex_pane_without_candidate_retries_later() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("home/.codex/sessions");
@@ -16088,6 +16136,140 @@ mod provider_integration_tests {
             g7_bindings(&drain_pending(&mut pending)).is_empty(),
             "a node-only owned native identity must not be a heuristic candidate"
         );
+    }
+
+    #[tokio::test]
+    async fn apply_time_heuristic_binding_drops_sid_newly_owned_by_key() {
+        let sessionless = g7_provisional("key-owned-apply", 2, G7_DETECTION_MS);
+        let run_id = sessionless.0;
+        let provisional_key = sessionless.1.clone();
+        let sid = "44444444-4444-4444-8444-444444444444";
+        let binding = CodexPaneBinding {
+            run_id,
+            sid: sid.to_owned(),
+            observed_at_ms: G7_DETECTION_MS + 1_000,
+        };
+        let mut model = g7_model(std::slice::from_ref(&sessionless));
+        let owner = RunId::new();
+        model.insert_task_run(TaskRun {
+            run_id: owner,
+            key: RunKey::Native {
+                provider: Provider::Codex,
+                sid: sid.to_owned(),
+            },
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Queued,
+            has_controller_task_state_event: false,
+            created_at_ms: Some(G7_DETECTION_MS),
+            updated_at_ms: Some(G7_DETECTION_MS),
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        let mut harness = LaneModelHarness::with_model(model);
+        let coverage = SourceCoverageRegistry::new(SourceAvailability::Available);
+
+        apply_heuristic_bindings(
+            vec![binding],
+            &mut harness.reducer,
+            &harness.shared,
+            &mut harness.persistence,
+            &coverage,
+        )
+        .await
+        .unwrap();
+
+        let snapshot = harness.shared.borrow();
+        assert_eq!(
+            snapshot.task_run(&run_id).map(|run| &run.key),
+            Some(&provisional_key),
+            "a published heuristic binding must go stale when its sid gains a key owner"
+        );
+        assert_eq!(
+            snapshot
+                .task_run_by_key(&RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: sid.to_owned(),
+                })
+                .map(|run| run.run_id),
+            Some(owner)
+        );
+        assert_eq!(snapshot.controller_diagnostics().binding_conflicts(), 0);
+        drop(snapshot);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn apply_time_heuristic_binding_drops_sid_newly_owned_by_node() {
+        let sessionless = g7_provisional("node-owned-apply", 2, G7_DETECTION_MS);
+        let run_id = sessionless.0;
+        let provisional_key = sessionless.1.clone();
+        let sid = "55555555-5555-4555-8555-555555555555";
+        let binding = CodexPaneBinding {
+            run_id,
+            sid: sid.to_owned(),
+            observed_at_ms: G7_DETECTION_MS + 1_000,
+        };
+        let mut model = g7_model(std::slice::from_ref(&sessionless));
+        let owner = RunId::new();
+        model.insert_task_run(TaskRun {
+            run_id: owner,
+            key: RunKey::Controller("node-owned-apply-controller".to_owned()),
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Queued,
+            has_controller_task_state_event: false,
+            created_at_ms: Some(G7_DETECTION_MS),
+            updated_at_ms: Some(G7_DETECTION_MS),
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "agent:codex:node-owned-apply".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some(sid.to_owned()),
+            task_run_id: owner,
+            display_ordinal: DisplayOrdinal::new(1),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Working),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
+        });
+        let mut harness = LaneModelHarness::with_model(model);
+        let coverage = SourceCoverageRegistry::new(SourceAvailability::Available);
+
+        apply_heuristic_bindings(
+            vec![binding],
+            &mut harness.reducer,
+            &harness.shared,
+            &mut harness.persistence,
+            &coverage,
+        )
+        .await
+        .unwrap();
+
+        let snapshot = harness.shared.borrow();
+        assert_eq!(
+            snapshot.task_run(&run_id).map(|run| &run.key),
+            Some(&provisional_key),
+            "a published heuristic binding must go stale when its sid gains a node owner"
+        );
+        assert!(
+            snapshot
+                .task_run_by_key(&RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: sid.to_owned(),
+                })
+                .is_none()
+        );
+        assert_eq!(snapshot.controller_diagnostics().binding_conflicts(), 0);
+        drop(snapshot);
+        harness.shutdown().await;
     }
 
     #[tokio::test]

@@ -138,14 +138,6 @@ pub enum MergeConflict {
         /// The proposed absorbed run.
         absorbed: RunId,
     },
-    /// Both merge parties have live executions on different terminals.
-    #[error("task runs {survivor} and {absorbed} have live executions on different terminals")]
-    DisjointLiveExecutionTerminals {
-        /// The proposed survivor.
-        survivor: RunId,
-        /// The proposed absorbed run.
-        absorbed: RunId,
-    },
     /// One run has accumulated multiple native identities in memory.
     #[error("task run {run} has multiple native-session bindings")]
     MultipleNativeSessions { run: RunId },
@@ -227,7 +219,21 @@ fn plan_heuristic_native_session(model: &DomainModel, run: RunId, sid: &str) -> 
         return BindingPlan::Conflict(MergeConflict::MissingRun { run });
     };
     match &observed.key {
-        RunKey::Provisional { .. } => plan_native_session(model, run, Provider::Codex, sid),
+        RunKey::Provisional { .. } => {
+            let key = RunKey::Native {
+                provider: Provider::Codex,
+                sid: sid.to_owned(),
+            };
+            match model.task_run_by_key(&key) {
+                Some(owner) => BindingPlan::Conflict(MergeConflict::NativeSessionAlreadyBound {
+                    provider: Provider::Codex,
+                    sid: sid.to_owned(),
+                    owner: owner.run_id,
+                    claimant: run,
+                }),
+                None => plan_native_session(model, run, Provider::Codex, sid),
+            }
+        }
         RunKey::Native {
             provider,
             sid: bound,
@@ -650,19 +656,6 @@ fn preflight_merge(
             claimant: absorbed,
         });
     }
-    let live_executions_are_terminal_disjoint = model.executions().any(|survivor_execution| {
-        survivor_execution.task_run_id == survivor
-            && !survivor_execution.state.is_terminal()
-            && model.executions().any(|absorbed_execution| {
-                absorbed_execution.task_run_id == absorbed
-                    && !absorbed_execution.state.is_terminal()
-                    && survivor_execution.terminal_id != absorbed_execution.terminal_id
-            })
-    });
-    if live_executions_are_terminal_disjoint {
-        return Err(MergeConflict::DisjointLiveExecutionTerminals { survivor, absorbed });
-    }
-
     let execution_edges = contract_execution_edges(model, survivor, absorbed)?;
     let dependency_edges = contract_dependency_edges(model, survivor, absorbed)?;
     Ok(ContractedGraphs {
@@ -1444,32 +1437,68 @@ mod tests {
     }
 
     #[test]
-    fn merge_refuses_live_executions_on_different_terminals_without_mutation() {
-        let (mut model, survivor, absorbed) = merge_fixture();
-        model.insert_execution(Execution {
-            execution_id: "native-owner-execution".to_owned(),
-            pane_id: "native-owner-pane".to_owned(),
-            terminal_id: "native-owner-terminal".to_owned(),
-            task_run_id: survivor,
-            state: ExecState::Working,
-        });
-        model.insert_execution(Execution {
-            execution_id: "provisional-execution".to_owned(),
-            pane_id: "provisional-pane".to_owned(),
-            terminal_id: "provisional-terminal".to_owned(),
-            task_run_id: absorbed,
-            state: ExecState::Working,
-        });
-        let before = model_fingerprint(&model);
-
-        let result =
-            apply_binding_plan_at(&mut model, BindingPlan::Merge { survivor, absorbed }, 2_000);
+    fn heuristic_native_session_conflicts_with_existing_owner_without_merging() {
+        let mut model = DomainModel::default();
+        let owner = insert_run(&mut model, native(Provider::Codex, "owned-sid"), 1);
+        let claimant = insert_run(&mut model, provisional("claimant-terminal", 2), 2);
 
         assert_eq!(
-            result,
-            Err(MergeConflict::DisjointLiveExecutionTerminals { survivor, absorbed })
+            plan_binding(
+                &model,
+                &BindingEvidence::HeuristicNativeSession {
+                    run: claimant,
+                    sid: "owned-sid".to_owned(),
+                },
+            ),
+            BindingPlan::Conflict(MergeConflict::NativeSessionAlreadyBound {
+                provider: Provider::Codex,
+                sid: "owned-sid".to_owned(),
+                owner,
+                claimant,
+            })
         );
-        assert_eq!(model_fingerprint(&model), before);
+        assert_eq!(model.task_runs().count(), 2);
+    }
+
+    #[test]
+    fn explicit_native_session_merge_allows_live_executions_on_different_terminals() {
+        let mut model = DomainModel::default();
+        let first = insert_run(&mut model, provisional("terminal-1", 1), 1);
+        let second = insert_run(&mut model, provisional("terminal-2", 2), 2);
+        model.insert_execution(Execution {
+            execution_id: "first-execution".to_owned(),
+            pane_id: "first-pane".to_owned(),
+            terminal_id: "terminal-1".to_owned(),
+            task_run_id: first,
+            state: ExecState::Working,
+        });
+        model.insert_execution(Execution {
+            execution_id: "second-execution".to_owned(),
+            pane_id: "second-pane".to_owned(),
+            terminal_id: "terminal-2".to_owned(),
+            task_run_id: second,
+            state: ExecState::Working,
+        });
+
+        let first_plan = plan_binding(&model, &native_evidence(first, "shared-sid"));
+        apply_binding_plan(&mut model, first_plan).unwrap();
+        let second_plan = plan_binding(&model, &native_evidence(second, "shared-sid"));
+        assert_eq!(
+            second_plan,
+            BindingPlan::Merge {
+                survivor: first,
+                absorbed: second,
+            }
+        );
+
+        apply_binding_plan(&mut model, second_plan).unwrap();
+
+        assert_eq!(model.task_runs().count(), 1);
+        assert!(
+            model
+                .executions()
+                .all(|execution| execution.task_run_id == first)
+        );
     }
 
     #[test]
