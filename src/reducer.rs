@@ -2470,6 +2470,12 @@ impl Reducer {
     }
 
     fn close_inactive_fact_timed_runs(&mut self, now_ms: i64) -> PersistBatch {
+        let runs_with_live_executions: HashSet<_> = self
+            .model
+            .executions()
+            .filter(|execution| !execution.state.is_terminal())
+            .map(|execution| execution.task_run_id)
+            .collect();
         let mut candidates: Vec<_> = self
             .model
             .task_runs()
@@ -2482,11 +2488,7 @@ impl Reducer {
             })
             .filter(|run| run.dismissed_at_ms.is_none())
             .filter(|run| !self.non_lane_task_state_runs.contains(&run.run_id))
-            .filter(|run| {
-                !self.model.executions().any(|execution| {
-                    execution.task_run_id == run.run_id && !execution.state.is_terminal()
-                })
-            })
+            .filter(|run| !runs_with_live_executions.contains(&run.run_id))
             .filter_map(|run| {
                 let anchor_ms = run.updated_at_ms.or(run.created_at_ms)?;
                 (now_ms.saturating_sub(anchor_ms) >= activity::headless_inactivity_ms())
@@ -7324,6 +7326,85 @@ mod tests {
         assert_eq!(
             shared.borrow().task_run(&run_id).unwrap().state,
             TaskState::EndedUnknown
+        );
+    }
+
+    #[test]
+    fn fact_timed_sweep_uses_post_expiry_live_execution_set() {
+        let anchor_ms = 200;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let working = RunId::new();
+        let terminal = RunId::new();
+        let expiring = RunId::new();
+        let mut model = DomainModel::default();
+        for (run_id, key, ordinal) in [
+            (working, RunKey::Controller("fact-working".to_owned()), 1),
+            (
+                terminal,
+                RunKey::Provisional {
+                    terminal_id: "fact-terminal".to_owned(),
+                    start_ms: anchor_ms,
+                    seq: 2,
+                },
+                2,
+            ),
+            (expiring, RunKey::Controller("fact-expiring".to_owned()), 3),
+        ] {
+            let mut task_run =
+                run_with_controller_evidence(run_id, key, ordinal, TaskState::Running);
+            task_run.created_at_ms = Some(anchor_ms);
+            task_run.updated_at_ms = Some(anchor_ms);
+            model.insert_task_run(task_run);
+        }
+        model.insert_execution(execution(working, "fact-working", ExecState::Working));
+        model.insert_execution(execution(terminal, "fact-terminal", ExecState::Ended));
+        model.insert_execution(execution(
+            expiring,
+            "fact-expiring",
+            ExecState::Stale {
+                since_ms: now_ms - super::STALE_GRACE_MS,
+            },
+        ));
+        let (mut reducer, shared) = Reducer::new(restored(model, 4));
+
+        let publish_count = reducer.publish_count.get();
+        let persist = reducer.sweep_stale(now_ms);
+
+        assert_eq!(reducer.publish_count.get(), publish_count + 1);
+        let snapshot = shared.borrow();
+        assert_eq!(
+            snapshot.task_run(&working).unwrap().state,
+            TaskState::Running
+        );
+        for run_id in [terminal, expiring] {
+            let task_run = snapshot.task_run(&run_id).unwrap();
+            assert_eq!(task_run.state, TaskState::EndedUnknown);
+            assert_eq!(task_run.updated_at_ms, Some(anchor_ms));
+            assert_eq!(task_run.finished_at_ms, Some(anchor_ms));
+        }
+        assert_eq!(
+            snapshot.execution("fact-expiring").unwrap().state,
+            ExecState::Ended
+        );
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertExecution(value)
+                if value.execution.execution_id == "fact-expiring"
+                    && value.execution.state == ExecState::Ended
+                    && value.ended_at_ms == Some(now_ms)
+        )));
+        assert_eq!(
+            persist
+                .iter()
+                .filter(|operation| matches!(
+                    operation,
+                    PersistOp::UpsertTaskRun(value)
+                        if [terminal, expiring].contains(&value.task_run.run_id)
+                            && value.task_run.state == TaskState::EndedUnknown
+                            && value.updated_at_ms == anchor_ms
+                ))
+                .count(),
+            2
         );
     }
 

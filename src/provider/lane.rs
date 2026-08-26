@@ -1801,20 +1801,59 @@ fn local_datetime_epoch_ms(
     }
     // Rollout names carry no UTC offset, so a local wall-clock time repeated during a
     // DST fall-back cannot be mapped to a unique epoch.
+    let requested_year = i32::try_from(year).ok()?.checked_sub(1900)?;
+    let requested_month = i32::try_from(month).ok()?.checked_sub(1)?;
+    let requested_day = i32::try_from(day).ok()?;
+    let requested_hour = i32::try_from(hour).ok()?;
+    let requested_minute = i32::try_from(minute).ok()?;
+    let requested_second = i32::try_from(second).ok()?;
+    let matches_requested = |local: &libc::tm| {
+        local.tm_year == requested_year
+            && local.tm_mon == requested_month
+            && local.tm_mday == requested_day
+            && local.tm_hour == requested_hour
+            && local.tm_min == requested_minute
+            && local.tm_sec == requested_second
+    };
     // SAFETY: all-zero is a valid baseline for C's integer/pointer `tm` fields;
     // the fields consumed by `mktime` are initialized below before the call.
     let mut local = unsafe { std::mem::zeroed::<libc::tm>() };
-    local.tm_year = i32::try_from(year).ok()?.checked_sub(1900)?;
-    local.tm_mon = i32::try_from(month).ok()?.checked_sub(1)?;
-    local.tm_mday = i32::try_from(day).ok()?;
-    local.tm_hour = i32::try_from(hour).ok()?;
-    local.tm_min = i32::try_from(minute).ok()?;
-    local.tm_sec = i32::try_from(second).ok()?;
+    local.tm_year = requested_year;
+    local.tm_mon = requested_month;
+    local.tm_mday = requested_day;
+    local.tm_hour = requested_hour;
+    local.tm_min = requested_minute;
+    local.tm_sec = requested_second;
     local.tm_isdst = -1;
+    local.tm_wday = -1;
     // SAFETY: `local` is a live, writable `tm`; `mktime` retains no pointer and
     // resolves the local timezone and DST status because `tm_isdst` is `-1`.
     let epoch_seconds = unsafe { libc::mktime(&raw mut local) };
-    if epoch_seconds == -1 {
+    if local.tm_wday == -1 || local.tm_isdst < 0 || !matches_requested(&local) {
+        return None;
+    }
+
+    // Retry the untouched civil fields with the opposite resolved DST state, as in the
+    // installed mktime(3) ambiguity wrapper. `tm_wday` distinguishes failure from the
+    // valid epoch value `-1` because successful `mktime` calls replace the sentinel.
+    // SAFETY: the same all-zero baseline and field initialization rules apply here.
+    let mut alternative = unsafe { std::mem::zeroed::<libc::tm>() };
+    alternative.tm_year = requested_year;
+    alternative.tm_mon = requested_month;
+    alternative.tm_mday = requested_day;
+    alternative.tm_hour = requested_hour;
+    alternative.tm_min = requested_minute;
+    alternative.tm_sec = requested_second;
+    alternative.tm_isdst = i32::from(local.tm_isdst == 0);
+    alternative.tm_wday = -1;
+    // SAFETY: `alternative` is live and writable, and `mktime` retains no pointer.
+    let alternative_epoch_seconds = unsafe { libc::mktime(&raw mut alternative) };
+    if alternative.tm_wday != -1
+        && alternative.tm_isdst >= 0
+        && matches_requested(&alternative)
+        && (alternative.tm_isdst > 0) != (local.tm_isdst > 0)
+        && alternative_epoch_seconds != epoch_seconds
+    {
         return None;
     }
     epoch_seconds.checked_mul(1_000)
@@ -1975,10 +2014,12 @@ fn subagent_artifact_id(file_name: &OsStr) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::env;
     use std::ffi::OsStr;
     use std::fs::{self, FileTimes, OpenOptions};
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -4676,6 +4717,7 @@ mod tests {
     #[test]
     fn rollout_filename_timestamp_round_trips_local_epoch_seconds() {
         for epoch_ms in [
+            -1_000,
             0,
             946_684_800_000,
             1_609_459_200_000,
@@ -4692,6 +4734,52 @@ mod tests {
                 "local rollout time did not round-trip for {file_name}"
             );
         }
+    }
+
+    #[test]
+    fn rollout_filename_rejects_ambiguous_and_nonexistent_local_times() {
+        const CHILD_SENTINEL: &str = "HERDR_TOP_TEST_ROLLOUT_DST_CHILD";
+        if env::var_os(CHILD_SENTINEL).is_none() {
+            let status = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "provider::lane::tests::rollout_filename_rejects_ambiguous_and_nonexistent_local_times",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_SENTINEL, "1")
+                .env("TZ", "EST5EDT,M3.2.0/2,M11.1.0/2")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated DST regression failed: {status}");
+            return;
+        }
+
+        let file_name = |timestamp: &str| {
+            format!("rollout-{timestamp}-22222222-2222-4222-8222-222222222222.jsonl")
+        };
+        assert_eq!(
+            rollout_filename_timestamp_ms(&file_name("2026-11-01T00-30-00")),
+            Some(1_793_507_400_000)
+        );
+        assert_eq!(
+            rollout_filename_timestamp_ms(&file_name("2026-11-01T02-30-00")),
+            Some(1_793_518_200_000)
+        );
+
+        let ambiguous = file_name("2026-11-01T01-30-00");
+        let nonexistent = file_name("2026-03-08T02-30-00");
+        let mut index = AdmissionIndex::new();
+        index.insert_codex_rollout(ROLLOUT, PathBuf::from(&ambiguous), 0);
+        assert_eq!(index.artifacts_for_uuid(ROLLOUT).len(), 1);
+        assert_eq!(
+            (
+                rollout_filename_timestamp_ms(&ambiguous),
+                rollout_filename_timestamp_ms(&nonexistent),
+                index.artifacts_for_uuid(ROLLOUT)[0].creation_ms,
+            ),
+            (None, None, None)
+        );
     }
 
     #[test]
