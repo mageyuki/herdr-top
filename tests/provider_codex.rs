@@ -165,6 +165,7 @@ fn structural_child_reference_yields_exact_rollout_admission() {
             rollout_id: ROOT_ID.to_owned(),
         },
         id: EvidenceId::Uuid(STRUCTURAL_CHILD.to_owned()),
+        at_ms: 1_787_558_400_000,
     }));
 
     let mut admission = Admission::new(0);

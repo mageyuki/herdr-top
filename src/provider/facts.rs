@@ -112,6 +112,8 @@ pub enum LogFact {
         agent_type: String,
         /// Allowlisted short subagent description.
         description: String,
+        /// Artifact modification time in Unix epoch milliseconds.
+        at_ms: i64,
     },
     /// Evidence that a Claude subagent ended.
     ///
@@ -123,6 +125,8 @@ pub enum LogFact {
         agent_id: String,
         /// Whether the reported status was not completed.
         failed: bool,
+        /// Provider record time in Unix epoch milliseconds.
+        at_ms: i64,
     },
     /// Sanitized short activity evidenced by a provider event.
     Activity {
@@ -164,6 +168,8 @@ pub enum LogFact {
         parent: SessionScope,
         /// Extracted identifier token.
         id: EvidenceId,
+        /// Provider record time in Unix epoch milliseconds.
+        at_ms: i64,
     },
 }
 

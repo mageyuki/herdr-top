@@ -666,6 +666,8 @@ impl Reducer {
             || event.metadata.source.is_empty()
             || event.task_run_id.is_empty()
             || event.metadata.native_session_id.is_some() && event.metadata.provider.is_none()
+            || event.metadata.source == crate::provider::lane::SOURCE_LOG_LANE
+                && event.metadata.timestamp_ms <= 0
             || event
                 .metadata
                 .progress
@@ -817,7 +819,7 @@ impl Reducer {
                     .ensure_controller_placeholder(
                         edge.parent_run_id,
                         Some(parent_task_run_id),
-                        metadata.receipt_time_ms,
+                        Self::run_bookkeeping_time_ms(&metadata),
                         &mut persist,
                     )
                     .map_err(|_| RejectReason::Conflict)?;
@@ -827,7 +829,7 @@ impl Reducer {
                     .ensure_controller_placeholder(
                         edge.prerequisite_run_id,
                         Some(depends_on_id),
-                        metadata.receipt_time_ms,
+                        Self::run_bookkeeping_time_ms(&metadata),
                         &mut persist,
                     )
                     .map_err(|_| RejectReason::Conflict)?;
@@ -1176,13 +1178,13 @@ impl Reducer {
             self.ensure_controller_placeholder(
                 edge.parent_run_id,
                 None,
-                metadata.receipt_time_ms,
+                Self::run_bookkeeping_time_ms(metadata),
                 persist,
             )?;
             self.ensure_controller_placeholder(
                 edge.child_run_id,
                 None,
-                metadata.receipt_time_ms,
+                Self::run_bookkeeping_time_ms(metadata),
                 persist,
             )?;
         }
@@ -1190,13 +1192,13 @@ impl Reducer {
             self.ensure_controller_placeholder(
                 edge.prerequisite_run_id,
                 None,
-                metadata.receipt_time_ms,
+                Self::run_bookkeeping_time_ms(metadata),
                 persist,
             )?;
             self.ensure_controller_placeholder(
                 edge.dependent_run_id,
                 None,
-                metadata.receipt_time_ms,
+                Self::run_bookkeeping_time_ms(metadata),
                 persist,
             )?;
         }
@@ -1212,6 +1214,7 @@ impl Reducer {
         if self.model.task_run(&execution.task_run_id).is_some() {
             return Ok(());
         }
+        let timestamp_ms = Self::run_bookkeeping_time_ms(metadata);
         let ordinal = self.allocate_ordinal()?;
         let native_key = metadata
             .provider
@@ -1223,7 +1226,7 @@ impl Reducer {
             });
         let key = match native_key {
             Some(key) if self.model.task_run_by_key(&key).is_none() => key,
-            _ => provisional_key(&execution.terminal_id, metadata.receipt_time_ms, ordinal),
+            _ => provisional_key(&execution.terminal_id, timestamp_ms, ordinal),
         };
         let mut task_run = TaskRun {
             run_id: execution.task_run_id,
@@ -1237,9 +1240,9 @@ impl Reducer {
             subject: None,
             dismissed_at_ms: None,
         };
-        Self::stamp_new_task_run(&mut task_run, metadata.receipt_time_ms);
+        Self::stamp_new_task_run(&mut task_run, timestamp_ms);
         self.model.insert_task_run(task_run.clone());
-        persist.push(self.persist_task_run(task_run, metadata.receipt_time_ms));
+        persist.push(self.persist_task_run(task_run, timestamp_ms));
         Ok(())
     }
 
@@ -1255,6 +1258,7 @@ impl Reducer {
         if self.model.task_run(&run_id).is_some() {
             return Ok(());
         }
+        let timestamp_ms = Self::run_bookkeeping_time_ms(metadata);
         let ordinal = self.allocate_ordinal()?;
         let native_key = metadata
             .provider
@@ -1274,7 +1278,7 @@ impl Reducer {
                         .terminal_id
                         .as_deref()
                         .map_or("unknown-terminal", |terminal_id| terminal_id),
-                    metadata.receipt_time_ms,
+                    timestamp_ms,
                     ordinal,
                 ),
             }
@@ -1291,9 +1295,9 @@ impl Reducer {
             subject: None,
             dismissed_at_ms: None,
         };
-        Self::stamp_new_task_run(&mut task_run, metadata.receipt_time_ms);
+        Self::stamp_new_task_run(&mut task_run, timestamp_ms);
         self.model.insert_task_run(task_run.clone());
-        persist.push(self.persist_task_run(task_run, metadata.receipt_time_ms));
+        persist.push(self.persist_task_run(task_run, timestamp_ms));
         Ok(())
     }
 
@@ -1334,6 +1338,7 @@ impl Reducer {
         allow_lane_reopen: bool,
         persist: &mut PersistBatch,
     ) {
+        let timestamp_ms = Self::run_bookkeeping_time_ms(metadata);
         if let (Some(run_id), Some(target)) = (metadata.task_run_id, metadata.task_state)
             && let Some(mut task_run) = self.model.task_run(&run_id).cloned()
         {
@@ -1357,9 +1362,9 @@ impl Reducer {
             {
                 task_run.subject = Some(label.clone());
             }
-            Self::touch_task_run(&mut task_run, metadata.receipt_time_ms);
+            Self::touch_task_run(&mut task_run, timestamp_ms);
             self.model.insert_task_run(task_run.clone());
-            persist.push(self.persist_task_run(task_run, metadata.receipt_time_ms));
+            persist.push(self.persist_task_run(task_run, timestamp_ms));
         }
 
         if let Some(edge) = &metadata.execution_parent
@@ -1387,8 +1392,8 @@ impl Reducer {
         source: &str,
         source_timestamp_ms: i64,
     ) -> bool {
-        // Source time is otherwise display-only. Replay receipt time is "now", so this narrow
-        // comparison is the only way to distinguish a genuine resume from replayed history.
+        // A strictly newer source fact is the only way to distinguish a genuine resume from
+        // replayed history after a lane-authored terminal.
         let start_follows_completion = self.model.task_run(&run_id).is_some_and(|run| {
             run.state == TaskState::Completed
                 && run
@@ -1824,6 +1829,7 @@ impl Reducer {
         metadata: &EventMetadata,
         persist: &mut PersistBatch,
     ) -> Result<(), ReducerError> {
+        let timestamp_ms = Self::run_bookkeeping_time_ms(metadata);
         let event_run = match event {
             NormalizedEvent::ControllerEvent { .. } => None,
             NormalizedEvent::ExecutionBegin { execution, .. } => Some(execution.task_run_id),
@@ -1873,7 +1879,7 @@ impl Reducer {
                     sid: sid.to_owned(),
                 }
             };
-            self.apply_binding(evidence, metadata.receipt_time_ms, persist)?;
+            self.apply_binding(evidence, timestamp_ms, persist)?;
         }
 
         if matches!(
@@ -1887,7 +1893,7 @@ impl Reducer {
                     controller_run: run_id,
                     terminal_id: terminal_id.to_owned(),
                 },
-                metadata.receipt_time_ms,
+                timestamp_ms,
                 persist,
             )?;
         }
@@ -1896,11 +1902,7 @@ impl Reducer {
             && let Some(current) = self.model.execution(&execution.execution_id)
             && !current.state.is_terminal()
         {
-            self.activate_for_live_execution(
-                current.task_run_id,
-                metadata.receipt_time_ms,
-                persist,
-            );
+            self.activate_for_live_execution(current.task_run_id, timestamp_ms, persist);
         }
         Ok(())
     }
@@ -2219,7 +2221,20 @@ impl Reducer {
     }
 
     fn touch_task_run(task_run: &mut TaskRun, timestamp_ms: i64) {
-        task_run.touch(timestamp_ms);
+        task_run.touch(
+            task_run
+                .updated_at_ms
+                .unwrap_or(timestamp_ms)
+                .max(timestamp_ms),
+        );
+    }
+
+    fn run_bookkeeping_time_ms(metadata: &EventMetadata) -> i64 {
+        if metadata.source == crate::provider::lane::SOURCE_LOG_LANE {
+            metadata.timestamp_ms
+        } else {
+            metadata.receipt_time_ms
+        }
     }
 
     fn allocate_ordinal(&mut self) -> Result<DisplayOrdinal, ReducerError> {
@@ -2282,6 +2297,7 @@ impl Reducer {
         }
         // Dispatch-only closure must run even when no execution reaches its stale deadline.
         persist.extend(self.close_inactive_dispatch_only_runs(now_ms));
+        persist.extend(self.close_inactive_fact_timed_runs(now_ms));
         if persist.is_empty() {
             return persist;
         }
@@ -2322,6 +2338,47 @@ impl Reducer {
             Self::touch_task_run(&mut task_run, now_ms);
             self.model.insert_task_run(task_run.clone());
             persist.push(self.persist_task_run(task_run, now_ms));
+        }
+        persist
+    }
+
+    fn close_inactive_fact_timed_runs(&mut self, now_ms: i64) -> PersistBatch {
+        let mut candidates: Vec<_> = self
+            .model
+            .task_runs()
+            .filter(|run| {
+                matches!(
+                    (&run.key, run.state),
+                    (RunKey::Controller(_), TaskState::Running)
+                        | (RunKey::Provisional { .. }, TaskState::Running)
+                )
+            })
+            .filter(|run| run.dismissed_at_ms.is_none())
+            .filter(|run| !self.non_lane_task_state_runs.contains(&run.run_id))
+            .filter(|run| {
+                !self.model.executions().any(|execution| {
+                    execution.task_run_id == run.run_id && !execution.state.is_terminal()
+                })
+            })
+            .filter_map(|run| {
+                let anchor_ms = run.updated_at_ms.or(run.created_at_ms)?;
+                (now_ms.saturating_sub(anchor_ms) >= activity::headless_inactivity_ms())
+                    .then_some((run.run_id, anchor_ms))
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|(run_id, _)| *run_id);
+
+        let mut persist = Vec::with_capacity(candidates.len());
+        for (run_id, anchor_ms) in candidates {
+            let mut task_run = self
+                .model
+                .task_run(&run_id)
+                .cloned()
+                .expect("collected task run must remain present");
+            task_run.state = TaskState::EndedUnknown;
+            Self::touch_task_run(&mut task_run, anchor_ms);
+            self.model.insert_task_run(task_run.clone());
+            persist.push(self.persist_task_run(task_run, anchor_ms));
         }
         persist
     }
@@ -3019,6 +3076,20 @@ mod tests {
         }
     }
 
+    fn provider_lane_event(
+        event_id: &str,
+        raw_run_id: &str,
+        event: ControllerEventKind,
+        timestamp_ms: i64,
+        receipt_time_ms: i64,
+    ) -> ControllerEvent {
+        let mut event = controller_event(event_id, raw_run_id, event);
+        event.metadata.source = SOURCE_LOG_LANE.to_owned();
+        event.metadata.timestamp_ms = timestamp_ms;
+        event.metadata.receipt_time_ms = receipt_time_ms;
+        event
+    }
+
     #[test]
     fn provider_diagnostics_handle_lands_counters_in_shared_model() {
         let (reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
@@ -3086,6 +3157,103 @@ mod tests {
             reducer.validate_controller_event(&event),
             Err(RejectReason::Invalid)
         ));
+    }
+
+    #[test]
+    fn provider_lane_run_uses_fact_time_while_event_keeps_receipt_time() {
+        let fact_time_ms = 100;
+        let receipt_time_ms = 10_000;
+        let reducer = Reducer::new(restored(DomainModel::default(), 1)).0;
+        let delta = reducer
+            .validate_controller_event(&provider_lane_event(
+                "fact-time-started",
+                "fact-time-run",
+                ControllerEventKind::TaskStarted,
+                fact_time_ms,
+                receipt_time_ms,
+            ))
+            .unwrap();
+
+        let run = delta
+            .post_model
+            .task_run_by_key(&RunKey::Controller("fact-time-run".to_owned()))
+            .unwrap();
+        assert_eq!(run.created_at_ms, Some(fact_time_ms));
+        assert_eq!(run.updated_at_ms, Some(fact_time_ms));
+        assert!(delta.batch.iter().any(|operation| matches!(
+            operation,
+            PersistOp::RecordEvent { seen_at_ms, event }
+                if *seen_at_ms == receipt_time_ms
+                    && super::event_metadata(event).receipt_time_ms == receipt_time_ms
+                    && super::event_metadata(event).timestamp_ms == fact_time_ms
+        )));
+    }
+
+    #[test]
+    fn provider_lane_zero_fact_time_is_rejected_before_run_minting() {
+        let reducer = Reducer::new(restored(DomainModel::default(), 1)).0;
+
+        assert!(matches!(
+            reducer.validate_controller_event(&provider_lane_event(
+                "zero-fact-time",
+                "zero-fact-time-run",
+                ControllerEventKind::TaskStarted,
+                0,
+                10_000,
+            )),
+            Err(RejectReason::Invalid)
+        ));
+        assert!(
+            reducer
+                .model
+                .task_run_by_key(&RunKey::Controller("zero-fact-time-run".to_owned()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn older_provider_fact_does_not_regress_run_timestamp() {
+        let reducer = Reducer::new(restored(DomainModel::default(), 1)).0;
+        let started = reducer
+            .validate_controller_event(&provider_lane_event(
+                "monotonic-started",
+                "monotonic-run",
+                ControllerEventKind::TaskStarted,
+                200,
+                1_000,
+            ))
+            .unwrap();
+        let run_id = started
+            .post_model
+            .task_run_by_key(&RunKey::Controller("monotonic-run".to_owned()))
+            .unwrap()
+            .run_id;
+        let reducer = Reducer::new(RestoredState {
+            model: started.post_model,
+            next_ordinal: started.post_next_ordinal,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        })
+        .0;
+
+        let progressed = reducer
+            .validate_controller_event(&provider_lane_event(
+                "monotonic-older-progress",
+                "monotonic-run",
+                ControllerEventKind::Progress,
+                100,
+                2_000,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            progressed
+                .post_model
+                .task_run(&run_id)
+                .unwrap()
+                .updated_at_ms,
+            Some(200)
+        );
     }
 
     fn controller_model(raw_run_id: &str, state: TaskState) -> (DomainModel, RunId) {
@@ -6469,6 +6637,235 @@ mod tests {
     }
 
     #[test]
+    fn hours_old_replayed_running_run_closes_with_only_terminal_execution() {
+        let anchor_ms = 100;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let reducer = Reducer::new(restored(DomainModel::default(), 1)).0;
+        let started = reducer
+            .validate_controller_event(&provider_lane_event(
+                "aged-replay-started",
+                "aged-replay",
+                ControllerEventKind::TaskStarted,
+                anchor_ms,
+                now_ms,
+            ))
+            .unwrap();
+        let run_id = started
+            .post_model
+            .task_run_by_key(&RunKey::Controller("aged-replay".to_owned()))
+            .unwrap()
+            .run_id;
+        let mut model = started.post_model;
+        model.insert_execution(execution(run_id, "aged-terminal", ExecState::Ended));
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model,
+            next_ordinal: started.post_next_ordinal,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+
+        reducer.sweep_stale(now_ms);
+
+        assert_eq!(
+            shared.borrow().task_run(&run_id).unwrap().state,
+            TaskState::EndedUnknown
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_hook_ownership_protects_only_owned_stale_running_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let anchor_ms = 200;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let (mut reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let mut started = controller_event(
+            "restored-owned-hook-started",
+            "restored-owned-hook",
+            ControllerEventKind::TaskStarted,
+        );
+        started.metadata.source = "hook".to_owned();
+        started.metadata.timestamp_ms = unix_now_ms();
+        started.metadata.receipt_time_ms = started.metadata.timestamp_ms;
+        commit_controller(&mut reducer, &mut writer, started).await;
+        lifecycle.shutdown().await.unwrap();
+
+        let store = open_reader(&root).unwrap();
+        let ownership = store.non_lane_task_state_runs().unwrap();
+        let mut restored = store.load_restored_state().unwrap();
+        let owned = restored
+            .model
+            .task_run_by_key(&RunKey::Controller("restored-owned-hook".to_owned()))
+            .unwrap()
+            .run_id;
+        assert!(
+            ownership.contains(&owned),
+            "restored ownership: {ownership:?}"
+        );
+        let mut owned_run = restored.model.task_run(&owned).unwrap().clone();
+        owned_run.created_at_ms = Some(anchor_ms);
+        owned_run.updated_at_ms = Some(anchor_ms);
+        restored.model.insert_task_run(owned_run);
+        let unowned = RunId::new();
+        let mut unowned_run = run_with_controller_evidence(
+            unowned,
+            RunKey::Controller("restored-unowned-lane".to_owned()),
+            restored.next_ordinal,
+            TaskState::Running,
+        );
+        unowned_run.created_at_ms = Some(anchor_ms);
+        unowned_run.updated_at_ms = Some(anchor_ms);
+        restored.model.insert_task_run(unowned_run);
+        restored.next_ordinal += 1;
+        let (mut reducer, shared) = Reducer::new(restored);
+        reducer.restore_non_lane_task_state_runs(ownership);
+
+        reducer.sweep_stale(now_ms);
+
+        let snapshot = shared.borrow();
+        assert_eq!(snapshot.task_run(&owned).unwrap().state, TaskState::Running);
+        assert_eq!(
+            snapshot.task_run(&unowned).unwrap().state,
+            TaskState::EndedUnknown
+        );
+    }
+
+    #[test]
+    fn stale_provisional_run_closes_and_dismisses_while_unanchored_stays_open() {
+        let anchor_ms = 300;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let anchored = RunId::new();
+        let unanchored = RunId::new();
+        let mut anchored_run = run(
+            anchored,
+            RunKey::Provisional {
+                terminal_id: "anchored-terminal".to_owned(),
+                start_ms: anchor_ms,
+                seq: 1,
+            },
+            1,
+            TaskState::Running,
+        );
+        anchored_run.created_at_ms = Some(anchor_ms);
+        anchored_run.updated_at_ms = Some(anchor_ms);
+        let unanchored_run = run(
+            unanchored,
+            RunKey::Provisional {
+                terminal_id: "unanchored-terminal".to_owned(),
+                start_ms: anchor_ms,
+                seq: 2,
+            },
+            2,
+            TaskState::Running,
+        );
+        let mut model = DomainModel::default();
+        model.insert_task_run(anchored_run);
+        model.insert_task_run(unanchored_run);
+        model.insert_execution(execution(anchored, "anchored-ended", ExecState::Ended));
+        model.insert_execution(execution(unanchored, "unanchored-ended", ExecState::Ended));
+        let (mut reducer, shared) = Reducer::new(restored(model, 3));
+
+        reducer.sweep_stale(now_ms);
+        assert_eq!(
+            shared.borrow().task_run(&anchored).unwrap().state,
+            TaskState::EndedUnknown
+        );
+        assert_eq!(
+            shared.borrow().task_run(&unanchored).unwrap().state,
+            TaskState::Running
+        );
+
+        reducer.apply_operator_command(OperatorCommand::DismissClearable, now_ms + 1);
+        let snapshot = shared.borrow();
+        assert_eq!(
+            snapshot.task_run(&anchored).unwrap().dismissed_at_ms,
+            Some(now_ms + 1)
+        );
+        assert_eq!(
+            snapshot.task_run(&unanchored).unwrap().dismissed_at_ms,
+            None
+        );
+    }
+
+    #[test]
+    fn fact_timed_closure_uses_last_fact_while_queued_closure_uses_sweep_time() {
+        let anchor_ms = 400;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let queued = RunId::new();
+        let running = RunId::new();
+        let mut queued_run = run_with_controller_evidence(
+            queued,
+            RunKey::Controller("queued-anchor".to_owned()),
+            1,
+            TaskState::Queued,
+        );
+        queued_run.created_at_ms = Some(anchor_ms);
+        queued_run.updated_at_ms = Some(anchor_ms);
+        let mut running_run = run_with_controller_evidence(
+            running,
+            RunKey::Controller("running-anchor".to_owned()),
+            2,
+            TaskState::Running,
+        );
+        running_run.created_at_ms = Some(anchor_ms);
+        running_run.updated_at_ms = Some(anchor_ms);
+        let mut model = DomainModel::default();
+        model.insert_task_run(queued_run);
+        model.insert_task_run(running_run);
+        let (mut reducer, shared) = Reducer::new(restored(model, 3));
+
+        reducer.sweep_stale(now_ms);
+
+        let snapshot = shared.borrow();
+        let queued = snapshot.task_run(&queued).unwrap();
+        let running = snapshot.task_run(&running).unwrap();
+        assert_eq!(queued.state, TaskState::EndedUnknown);
+        assert_eq!(queued.finished_at_ms, Some(now_ms));
+        assert_eq!(running.state, TaskState::EndedUnknown);
+        assert_eq!(running.finished_at_ms, Some(anchor_ms));
+    }
+
+    #[test]
+    fn fact_timed_running_closure_reopens_on_newer_task_started() {
+        let anchor_ms = 500;
+        let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
+        let run_id = RunId::new();
+        let mut task_run = run_with_controller_evidence(
+            run_id,
+            RunKey::Controller("fact-reopen".to_owned()),
+            1,
+            TaskState::Running,
+        );
+        task_run.created_at_ms = Some(anchor_ms);
+        task_run.updated_at_ms = Some(anchor_ms);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        reducer.sweep_stale(now_ms);
+        assert_eq!(
+            shared.borrow().task_run(&run_id).unwrap().state,
+            TaskState::EndedUnknown
+        );
+
+        let reopened = reducer
+            .validate_controller_event(&provider_lane_event(
+                "fact-reopen-started",
+                "fact-reopen",
+                ControllerEventKind::TaskStarted,
+                now_ms + 1,
+                now_ms + 100,
+            ))
+            .unwrap();
+        let run = reopened.post_model.task_run(&run_id).unwrap();
+        assert_eq!(run.state, TaskState::Running);
+        assert_eq!(run.finished_at_ms, None);
+        assert_eq!(run.updated_at_ms, Some(now_ms + 1));
+    }
+
+    #[test]
     fn stale_sweep_closes_dispatch_only_run_at_updated_inactivity_boundary() {
         let anchor_ms = 100;
         let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
@@ -6612,7 +7009,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_sweep_only_closes_controller_queued_runs() {
+    fn stale_sweep_closes_controller_queued_and_unowned_running_runs() {
         let anchor_ms = 700;
         let now_ms = anchor_ms + crate::activity::headless_inactivity_ms();
         let queued = RunId::new();
@@ -6659,7 +7056,7 @@ mod tests {
         );
         assert_eq!(
             snapshot.task_run(&running).unwrap().state,
-            TaskState::Running
+            TaskState::EndedUnknown
         );
         assert_eq!(
             snapshot.task_run(&blocked).unwrap().state,

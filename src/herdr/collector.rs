@@ -4057,7 +4057,11 @@ impl AdapterProviderWorker {
                     },
                     _ => return events,
                 };
-                crate::provider::claude_facts::extract_claude_line(&scope, line)
+                crate::provider::claude_facts::extract_claude_line_at(
+                    &scope,
+                    line,
+                    item.file.modified_ms,
+                )
             }
             Provider::Codex => {
                 let Some(rollout_id) = codex_rollout_id(&item.file.relative_path) else {
@@ -4372,6 +4376,7 @@ impl ProviderWorker for AdapterProviderWorker {
                                 Ok(_) => crate::provider::claude_facts::extract_meta_json(
                                     &parent_session,
                                     &agent_id,
+                                    file.modified_ms,
                                     &bytes,
                                 ),
                                 Err(_) => {
@@ -14282,6 +14287,7 @@ mod provider_integration_tests {
         let meta_fact = extract_meta_json(
             META_PARENT,
             META_AGENT,
+            unix_now_ms(),
             br#"{"agentType":"reviewer","description":"Review the meta-derived subject","toolUseId":"tool-meta","spawnDepth":1}"#,
         )
         .expect("meta fixture yields an allowlisted appearance fact");
@@ -14385,16 +14391,27 @@ mod provider_integration_tests {
             .synthesis
             .synthesize_batch(
                 Path::new("rollout.jsonl"),
-                [(
-                    0,
-                    crate::provider::facts::LogFact::CodexMeta {
-                        rollout_id: ROLLOUT_ID.to_owned(),
-                        cwd: "/workspace".to_owned(),
-                        originator: "codex".to_owned(),
-                        internal: None,
-                        cli_version: "0.1.0".to_owned(),
-                    },
-                )],
+                [
+                    (
+                        0,
+                        crate::provider::facts::LogFact::Append {
+                            scope: crate::provider::facts::SessionScope::Codex {
+                                rollout_id: ROLLOUT_ID.to_owned(),
+                            },
+                            at_ms: now_ms,
+                        },
+                    ),
+                    (
+                        0,
+                        crate::provider::facts::LogFact::CodexMeta {
+                            rollout_id: ROLLOUT_ID.to_owned(),
+                            cwd: "/workspace".to_owned(),
+                            originator: "codex".to_owned(),
+                            internal: None,
+                            cli_version: "0.1.0".to_owned(),
+                        },
+                    ),
+                ],
                 &mut worker.log_admission,
                 &worker.admission_index,
             )

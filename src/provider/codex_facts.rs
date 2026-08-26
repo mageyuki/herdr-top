@@ -105,6 +105,7 @@ struct EventTypePayload {
     #[serde(rename = "type")]
     event_type: Option<String>,
     agent_thread_id: Option<String>,
+    occurred_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -381,10 +382,14 @@ fn extract_event(
         "token_count" => extract_token_count(scope, line, at_ms, record_ordinal, facts),
         "item_completed" => extract_item_completed(rollout_id, scope, line, at_ms, facts),
         "sub_agent_activity" => {
-            if let Some(agent_thread_id) = payload.agent_thread_id.filter(|id| is_uuid_token(id)) {
+            if let (Some(agent_thread_id), Some(at_ms)) = (
+                payload.agent_thread_id.filter(|id| is_uuid_token(id)),
+                payload.occurred_at_ms.filter(|at_ms| *at_ms > 0),
+            ) {
                 facts.push(LogFact::EvidenceId {
                     parent: scope.clone(),
                     id: EvidenceId::Uuid(agent_thread_id),
+                    at_ms,
                 });
             }
         }

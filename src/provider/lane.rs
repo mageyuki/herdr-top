@@ -107,7 +107,7 @@ pub struct Synthesis {
     published_subjects: HashMap<String, String>,
     started: HashMap<ScopeKey, i64>,
     usage_samples: HashSet<(ScopeKey, String)>,
-    subagent_ends: HashMap<(String, String), bool>,
+    subagent_ends: HashMap<(String, String), (bool, i64)>,
     lineage: HashSet<(ScopeKey, ScopeKey)>,
     last_append_ms: HashMap<ScopeKey, i64>,
     /// Grace-held outcomes flush on graceful shutdown. After a crash, `EndedUnknown` is the
@@ -279,7 +279,7 @@ impl Synthesis {
         discovered: &AdmissionIndex,
     ) -> Vec<ProviderEvent> {
         let mut ordinary = Vec::new();
-        let mut ended: HashMap<(String, String), (u64, bool)> = HashMap::new();
+        let mut ended: HashMap<(String, String), (u64, bool, i64)> = HashMap::new();
         let mut ordinal_sequences = HashMap::<u64, usize>::new();
         for (order, (ordinal, fact)) in facts.into_iter().enumerate() {
             let sequence = ordinal_sequences.entry(ordinal).or_default();
@@ -289,11 +289,15 @@ impl Synthesis {
                 parent,
                 agent_id,
                 failed,
+                at_ms,
             } = fact
             {
-                let terminal = ended.entry((parent, agent_id)).or_insert((ordinal, false));
+                let terminal = ended
+                    .entry((parent, agent_id))
+                    .or_insert((ordinal, false, at_ms));
                 terminal.0 = terminal.0.min(ordinal);
                 terminal.1 |= failed;
+                terminal.2 = terminal.2.min(at_ms);
             } else {
                 ordinary.push((ordinal, order, record_sequence, fact));
             }
@@ -301,7 +305,7 @@ impl Synthesis {
         ordinary.extend(
             ended
                 .into_iter()
-                .map(|((parent, agent_id), (ordinal, failed))| {
+                .map(|((parent, agent_id), (ordinal, failed, at_ms))| {
                     (
                         ordinal,
                         usize::MAX,
@@ -310,6 +314,7 @@ impl Synthesis {
                             parent,
                             agent_id,
                             failed,
+                            at_ms,
                         },
                     )
                 }),
@@ -512,14 +517,10 @@ impl Synthesis {
                 agent_id,
                 agent_type,
                 description,
+                at_ms,
             } => {
                 let parent_scope = SessionScope::ClaudeRoot(parent.clone());
                 let child_scope = SessionScope::ClaudeSubagent { parent, agent_id };
-                let at_ms = self
-                    .last_append_ms
-                    .get(&ScopeKey::from(&parent_scope))
-                    .copied()
-                    .unwrap_or_default();
                 let child_key = ScopeKey::from(&child_scope);
                 let _ = self.prepare_resume(&child_key, at_ms, events);
                 let provider_metadata = MinimalProviderMetadata {
@@ -552,25 +553,26 @@ impl Synthesis {
                 parent,
                 agent_id,
                 failed,
+                at_ms,
             } => {
                 let terminal_key = (parent.clone(), agent_id.clone());
                 if let Some(previous) = self.subagent_ends.get(&terminal_key)
-                    && (*previous || !failed)
+                    && (previous.0 || !failed)
                 {
                     return;
                 }
                 self.subagent_ends
                     .entry(terminal_key)
-                    .and_modify(|current| *current |= failed)
-                    .or_insert(failed);
-                let parent_scope = SessionScope::ClaudeRoot(parent.clone());
-                let scope = SessionScope::ClaudeSubagent { parent, agent_id };
+                    .and_modify(|current| {
+                        current.0 |= failed;
+                        current.1 = current.1.min(at_ms);
+                    })
+                    .or_insert((failed, at_ms));
                 let at_ms = self
-                    .last_append_ms
-                    .get(&ScopeKey::from(&parent_scope))
-                    .copied()
-                    .filter(|at_ms| *at_ms != 0)
-                    .unwrap_or(self.latest_lifecycle_ms);
+                    .subagent_ends
+                    .get(&(parent.clone(), agent_id.clone()))
+                    .map_or(at_ms, |(_, earliest_at_ms)| *earliest_at_ms);
+                let scope = SessionScope::ClaudeSubagent { parent, agent_id };
                 let scope_key = ScopeKey::from(&scope);
                 self.flush_due_completes(at_ms, events);
                 let event = controller_event(
@@ -635,7 +637,7 @@ impl Synthesis {
                     });
                 }
             }
-            LogFact::EvidenceId { parent, id } => {
+            LogFact::EvidenceId { parent, id, at_ms } => {
                 let Some(child) = admission.on_evidence(&parent, &id, discovered) else {
                     return;
                 };
@@ -646,11 +648,6 @@ impl Synthesis {
                 if !self.lineage.insert(edge) {
                     return;
                 }
-                let at_ms = self
-                    .last_append_ms
-                    .get(&ScopeKey::from(&parent))
-                    .copied()
-                    .unwrap_or_default();
                 events.push(ProviderEvent::Synthesized(controller_event(
                     artifact,
                     ordinal,
@@ -779,15 +776,15 @@ fn fact_lifecycle_time(fact: &LogFact) -> Option<i64> {
         | LogFact::CodexTurnComplete { at_ms, .. }
         | LogFact::CodexTurnAborted { at_ms, .. }
         | LogFact::Activity { at_ms, .. }
-        | LogFact::Usage { at_ms, .. } => Some(*at_ms),
+        | LogFact::Usage { at_ms, .. }
+        | LogFact::SubagentAppeared { at_ms, .. }
+        | LogFact::SubagentEnded { at_ms, .. }
+        | LogFact::EvidenceId { at_ms, .. } => Some(*at_ms),
         LogFact::AiTitle { .. }
         | LogFact::ClaudeCwd { .. }
         | LogFact::CodexMeta { .. }
         | LogFact::CodexTurn { .. }
-        | LogFact::CodexPid { .. }
-        | LogFact::SubagentAppeared { .. }
-        | LogFact::SubagentEnded { .. }
-        | LogFact::EvidenceId { .. } => None,
+        | LogFact::CodexPid { .. } => None,
     }
 }
 
@@ -1874,7 +1871,7 @@ mod tests {
         MinimalProviderMetadata, NormalizedEvent, Provider, RunKey, SourceCoverage, TaskState,
     };
     use crate::provider::claude::{ClaudePathTopology, path_topology};
-    use crate::provider::claude_facts::extract_claude_line;
+    use crate::provider::claude_facts::{extract_claude_line, extract_claude_line_at};
     use crate::provider::facts::{ActivitySource, EvidenceId, LogFact, SessionScope};
     use crate::provider::tail::{MAX_TAIL_RECORD_BYTES, RECORD_TOO_LONG_ERROR};
     use crate::provider::{
@@ -1934,6 +1931,7 @@ mod tests {
         agent_id: &str,
         source_at_ms: Option<i64>,
     ) -> (SessionScope, Vec<ProviderEvent>) {
+        let artifact_at_ms = source_at_ms.unwrap_or(synthesis.latest_lifecycle_ms.max(1));
         if let Some(source_at_ms) = source_at_ms {
             synthesis
                 .last_append_ms
@@ -1953,10 +1951,103 @@ mod tests {
                     agent_id: agent_id.to_owned(),
                     agent_type: "reviewer".to_owned(),
                     description: format!("Review {agent_id} lifecycle"),
+                    at_ms: artifact_at_ms,
                 },
             )],
         );
         (scope, events)
+    }
+
+    #[test]
+    fn subagent_metadata_before_parent_append_uses_artifact_time() {
+        let events = synthesize(
+            &mut Synthesis::default(),
+            "agent-before-append.meta.json",
+            [(
+                0,
+                LogFact::SubagentAppeared {
+                    parent: PARENT.to_owned(),
+                    agent_id: "before-append".to_owned(),
+                    agent_type: "reviewer".to_owned(),
+                    description: "Review metadata ordering".to_owned(),
+                    at_ms: 7_654,
+                },
+            )],
+        );
+
+        assert!(
+            synthesized_events(&events)
+                .iter()
+                .all(|event| event.metadata.timestamp_ms == 7_654)
+        );
+    }
+
+    #[test]
+    fn subagent_end_coalescing_keeps_earliest_ordinal_and_timestamp() {
+        let mut synthesis = Synthesis::default();
+        let _ = synthesize_subagent_start(&mut synthesis, "coalesced", Some(50));
+
+        let events = synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [
+                (
+                    9,
+                    LogFact::SubagentEnded {
+                        parent: PARENT.to_owned(),
+                        agent_id: "coalesced".to_owned(),
+                        failed: false,
+                        at_ms: 200,
+                    },
+                ),
+                (
+                    3,
+                    LogFact::SubagentEnded {
+                        parent: PARENT.to_owned(),
+                        agent_id: "coalesced".to_owned(),
+                        failed: true,
+                        at_ms: 100,
+                    },
+                ),
+            ],
+        );
+
+        assert!(matches!(
+            synthesized_events(&events).as_slice(),
+            [event]
+                if event.metadata.event_id == "log:queue.jsonl:3:failed:coalesced"
+                    && event.metadata.timestamp_ms == 100
+                    && matches!(event.event, ControllerEventKind::Failed)
+        ));
+    }
+
+    #[test]
+    fn lineage_fact_times_participate_in_lifecycle_time() {
+        let facts = [
+            LogFact::SubagentAppeared {
+                parent: PARENT.to_owned(),
+                agent_id: "appeared".to_owned(),
+                agent_type: "reviewer".to_owned(),
+                description: "Review appearance".to_owned(),
+                at_ms: 10,
+            },
+            LogFact::SubagentEnded {
+                parent: PARENT.to_owned(),
+                agent_id: "ended".to_owned(),
+                failed: false,
+                at_ms: 20,
+            },
+            LogFact::EvidenceId {
+                parent: SessionScope::ClaudeRoot(PARENT.to_owned()),
+                id: EvidenceId::Uuid("77777777-7777-4777-8777-777777777777".to_owned()),
+                at_ms: 30,
+            },
+        ];
+
+        assert_eq!(
+            facts.iter().map(fact_lifecycle_time).collect::<Vec<_>>(),
+            [Some(10), Some(20), Some(30),]
+        );
     }
 
     fn synthesized_events(events: &[ProviderEvent]) -> Vec<&ControllerEvent> {
@@ -2087,22 +2178,32 @@ mod tests {
                     agent_id: AGENT.to_owned(),
                     agent_type: "reviewer".to_owned(),
                     description: "Review the projected rows".to_owned(),
+                    at_ms: 1,
                 },
             )],
         );
         events.extend(synthesize(
             &mut synthesis,
             "rollout.jsonl",
-            [(
-                0,
-                LogFact::CodexMeta {
-                    rollout_id: ROLLOUT.to_owned(),
-                    cwd: "/tmp/project".to_owned(),
-                    originator: "codex_cli_rs".to_owned(),
-                    internal: None,
-                    cli_version: "0.1.0".to_owned(),
-                },
-            )],
+            [
+                (
+                    0,
+                    LogFact::Append {
+                        scope: codex_scope.clone(),
+                        at_ms: 1,
+                    },
+                ),
+                (
+                    0,
+                    LogFact::CodexMeta {
+                        rollout_id: ROLLOUT.to_owned(),
+                        cwd: "/tmp/project".to_owned(),
+                        originator: "codex_cli_rs".to_owned(),
+                        internal: None,
+                        cli_version: "0.1.0".to_owned(),
+                    },
+                ),
+            ],
         ));
         let model = apply_once_per_event_id(&events);
         let claude_run = model
@@ -2311,7 +2412,7 @@ mod tests {
     #[test]
     fn lane_terminal_task_notifications_for_unannounced_children_do_not_create_runs() {
         let record = r#"{"type":"queue-operation","content":"<task-notification><task-id>1111111111111111</task-id><status>completed</status></task-notification><task-notification><task-id>2222222222222222</task-id><status>failed</status></task-notification>"}"#;
-        let facts = extract_claude_line(&SessionScope::ClaudeRoot(PARENT.to_owned()), record)
+        let facts = extract_claude_line_at(&SessionScope::ClaudeRoot(PARENT.to_owned()), record, 1)
             .into_iter()
             .map(|fact| (7, fact));
         let mut synthesis = Synthesis::default();
@@ -2373,6 +2474,7 @@ mod tests {
                         parent: PARENT.to_owned(),
                         agent_id: "child".to_owned(),
                         failed: false,
+                        at_ms: 100,
                     },
                 ),
             ],
@@ -2428,6 +2530,7 @@ mod tests {
                     agent_id: AGENT.to_owned(),
                     agent_type: "reviewer".to_owned(),
                     description: "Review the reducer gate".to_owned(),
+                    at_ms: 1,
                 },
             )],
         );
@@ -2479,9 +2582,13 @@ mod tests {
         let held = synthesize(
             &mut synthesis,
             "parent.jsonl",
-            extract_claude_line(&SessionScope::ClaudeRoot(PARENT.to_owned()), &notification)
-                .into_iter()
-                .map(|fact| (7, fact)),
+            extract_claude_line_at(
+                &SessionScope::ClaudeRoot(PARENT.to_owned()),
+                &notification,
+                1,
+            )
+            .into_iter()
+            .map(|fact| (7, fact)),
         );
         assert!(
             synthesized_events(&held).is_empty(),
@@ -2519,11 +2626,13 @@ mod tests {
                 parent: PARENT.to_owned(),
                 agent_id: "first".to_owned(),
                 failed: false,
+                at_ms: 1,
             },
             LogFact::SubagentEnded {
                 parent: PARENT.to_owned(),
                 agent_id: "second".to_owned(),
                 failed: true,
+                at_ms: 1,
             },
         ];
         let ids = |facts: Vec<LogFact>| {
@@ -2549,6 +2658,7 @@ mod tests {
             parent: PARENT.to_owned(),
             agent_id: "child".to_owned(),
             failed: false,
+            at_ms: 1,
         };
         let mut synthesis = Synthesis::default();
         let mut events = synthesize(
@@ -2578,6 +2688,7 @@ mod tests {
                     agent_id: "child".to_owned(),
                     agent_type: "reviewer".to_owned(),
                     description: "Review the lane".to_owned(),
+                    at_ms: 1,
                 },
             )],
         );
@@ -2601,6 +2712,7 @@ mod tests {
                     agent_id: "child".to_owned(),
                     agent_type: "reviewer".to_owned(),
                     description: "Review deterministic synthesis".to_owned(),
+                    at_ms: 1,
                 },
             )],
         );
@@ -2665,6 +2777,7 @@ mod tests {
                     parent: PARENT.to_owned(),
                     agent_id: "child".to_owned(),
                     failed: true,
+                    at_ms: 1,
                 },
             )],
         );
@@ -2738,6 +2851,7 @@ mod tests {
                     agent_id: AGENT.to_owned(),
                     agent_type: "reviewer".to_owned(),
                     description: "Review identity convergence".to_owned(),
+                    at_ms: 100,
                 },
             )],
         );
@@ -3008,6 +3122,7 @@ mod tests {
                             parent: PARENT.to_owned(),
                             agent_id: "child".to_owned(),
                             failed,
+                            at_ms: ordinal as i64 + 1,
                         },
                     )
                 }),
@@ -3033,6 +3148,7 @@ mod tests {
                     parent: PARENT.to_owned(),
                     agent_id: "child".to_owned(),
                     failed: true,
+                    at_ms: 100,
                 },
             )],
         );
@@ -3045,6 +3161,7 @@ mod tests {
                     parent: PARENT.to_owned(),
                     agent_id: "child".to_owned(),
                     failed: false,
+                    at_ms: 110,
                 },
             )],
         );
@@ -3111,6 +3228,7 @@ mod tests {
                     parent: PARENT.to_owned(),
                     agent_id: "child".to_owned(),
                     failed: false,
+                    at_ms: 100,
                 },
             )],
         );
@@ -3151,6 +3269,7 @@ mod tests {
                     parent: PARENT.to_owned(),
                     agent_id: "shutdown-child".to_owned(),
                     failed: false,
+                    at_ms: 100,
                 },
             )],
         );
@@ -3185,16 +3304,27 @@ mod tests {
         let mut events = synthesize(
             &mut synthesis,
             "rollout.jsonl",
-            [(
-                1,
-                LogFact::CodexMeta {
-                    rollout_id: ROLLOUT.to_owned(),
-                    cwd: "/workspace".to_owned(),
-                    originator: "codex".to_owned(),
-                    internal: None,
-                    cli_version: "0.149.0".to_owned(),
-                },
-            )],
+            [
+                (
+                    1,
+                    LogFact::Append {
+                        scope: SessionScope::Codex {
+                            rollout_id: ROLLOUT.to_owned(),
+                        },
+                        at_ms: 100,
+                    },
+                ),
+                (
+                    1,
+                    LogFact::CodexMeta {
+                        rollout_id: ROLLOUT.to_owned(),
+                        cwd: "/workspace".to_owned(),
+                        originator: "codex".to_owned(),
+                        internal: None,
+                        cli_version: "0.149.0".to_owned(),
+                    },
+                ),
+            ],
         );
         events.extend(synthesize(
             &mut synthesis,
@@ -3254,6 +3384,7 @@ mod tests {
                     agent_id: "child".to_owned(),
                     agent_type: "reviewer".to_owned(),
                     description: "Review lifecycle".to_owned(),
+                    at_ms: 100,
                 },
             )],
         );
@@ -3274,6 +3405,7 @@ mod tests {
                         parent: PARENT.to_owned(),
                         agent_id: "child".to_owned(),
                         failed: false,
+                        at_ms: 100,
                     },
                 ),
             ],
@@ -3300,6 +3432,7 @@ mod tests {
                         parent: PARENT.to_owned(),
                         agent_id: "child".to_owned(),
                         failed: true,
+                        at_ms: 120,
                     },
                 ),
             ],
@@ -3449,6 +3582,7 @@ mod tests {
                     parent: PARENT.to_owned(),
                     agent_id: "completing-child".to_owned(),
                     failed: false,
+                    at_ms: 100,
                 },
             )],
         );
@@ -3563,6 +3697,7 @@ mod tests {
                     LogFact::EvidenceId {
                         parent: SessionScope::ClaudeRoot(PARENT.to_owned()),
                         id: EvidenceId::Uuid(id.to_owned()),
+                        at_ms: 7,
                     },
                 )
             }),
@@ -3617,6 +3752,7 @@ mod tests {
                     LogFact::EvidenceId {
                         parent: SessionScope::ClaudeRoot(PARENT.to_owned()),
                         id: EvidenceId::Uuid(id.to_owned()),
+                        at_ms: 7,
                     },
                 )
             }),
@@ -3664,6 +3800,7 @@ mod tests {
                 LogFact::EvidenceId {
                     parent: SessionScope::ClaudeRoot(PARENT.to_owned()),
                     id: EvidenceId::Uuid(STRANGER.to_owned()),
+                    at_ms: 1,
                 },
             )],
             &mut admission,
@@ -3676,6 +3813,7 @@ mod tests {
                 LogFact::EvidenceId {
                     parent: SessionScope::ClaudeRoot(PARENT.to_owned()),
                     id: EvidenceId::Uuid(ROLLOUT.to_owned()),
+                    at_ms: 2,
                 },
             )],
             &mut admission,

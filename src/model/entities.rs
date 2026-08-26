@@ -69,7 +69,7 @@ pub struct TaskRun {
 }
 
 impl TaskRun {
-    /// Advances bookkeeping for a mutation observed at `timestamp_ms` receipt time.
+    /// Advances bookkeeping for a mutation at its selected fact or receipt timestamp.
     pub fn touch(&mut self, timestamp_ms: i64) {
         self.updated_at_ms = Some(timestamp_ms);
         if self.state.is_terminal() {
@@ -1076,7 +1076,7 @@ pub struct MinimalProviderMetadata {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EventMetadata {
     pub event_id: String,
-    /// Source-emitted time. This is display metadata, never an ordering or retention key.
+    /// Source-emitted time, also used for provider-log run and activity bookkeeping.
     pub timestamp_ms: i64,
     /// Collector-local receipt time used for persistence and retention.
     pub receipt_time_ms: i64,
