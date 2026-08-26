@@ -2536,19 +2536,72 @@ mod tests {
 
     #[test]
     fn runtime_parser_accepts_legacy_and_current_persistence_shapes() {
-        let mut legacy = serde_json::to_value(runtime(PersistenceStatus::Degraded {
-            failure: test_persistence_failure(),
-        }))
+        let legacy: Value = serde_json::from_slice(
+            br#"{
+            "persistence": {
+                "status": "degraded",
+                "failure": {
+                    "operation": "apply",
+                    "phase": "command_execution",
+                    "code": "sqlite",
+                    "durability": "not_committed"
+                }
+            },
+            "controller_input": {"status": "available"},
+            "owner": "current",
+            "persistence_counters": {
+                "not_committed_batches": 0,
+                "durability_unknown_batches": 0,
+                "committed_but_degraded_batches": 0,
+                "skipped_batches": 0,
+                "skipped_owner_updates": 0
+            },
+            "controller_counters": {
+                "binding_conflicts": 0,
+                "terminal_blocked_progress_noops": 0,
+                "terminal_forward_reference_creations": 0,
+                "unknown_lane_terminal_drops": 0,
+                "dangling_announcement_components": 0,
+                "ingest_sequence_exhaustions": 0,
+                "provider_parent_conflicts": 0,
+                "provider_identity_disagreements": 0,
+                "socket_saturations": 0,
+                "accept_failures": 0
+            },
+            "enrichment_counters": {
+                "channel_full_drops": 0,
+                "episode_discards": 0
+            },
+            "provider_counters": {
+                "invalid_targets": 0,
+                "duplicate_events": 0,
+                "malformed_records": 0,
+                "duplicate_path_targets": 0,
+                "baseline_approximations": 0,
+                "provider_cycles": 0,
+                "provider_io_errors": 0,
+                "watch_cap_fallbacks": 0,
+                "notify_creation_failures": 0,
+                "dropped_hints": 0,
+                "coalesced_updates": 0,
+                "egress_saturations": 0,
+                "egress_closed": 0,
+                "pane_sessions_total": 0,
+                "pane_sessions_with_artifacts": 0,
+                "last_watcher_observation_ms": null
+            },
+            "source_coverage": [
+                {"source": "herdr", "availability": "unavailable"},
+                {"source": "controller", "availability": "available"},
+                {"source": "claude", "availability": "unavailable"},
+                {"source": "codex", "availability": "unavailable"}
+            ],
+            "dangling_announcement_components": 0,
+            "first_failure_log": "not_attempted"
+        }"#,
+        )
         .unwrap();
-        let legacy = legacy.as_object_mut().unwrap();
-        legacy.remove("persistence_detail");
-        legacy
-            .get_mut("persistence_counters")
-            .unwrap()
-            .as_object_mut()
-            .unwrap()
-            .remove("skipped_enqueues");
-        let legacy = parse_runtime_snapshot(&Value::Object(legacy.clone()))
+        let legacy = parse_runtime_snapshot(&legacy)
             .expect("legacy runtime diagnostics must remain readable");
         assert_eq!(legacy.persistence_detail, None);
         assert_eq!(legacy.persistence_counters.skipped_enqueues, 0);

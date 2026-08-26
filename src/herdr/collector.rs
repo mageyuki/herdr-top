@@ -501,7 +501,6 @@ impl PersistenceOccurrenceSink for UnavailableOccurrenceSink {
 struct PersistenceRecovery {
     retry_interval: Duration,
     next_probe_at: Option<Instant>,
-    probe_due: bool,
     acceptor_stop_pending: bool,
     marker_pending: bool,
 }
@@ -511,7 +510,6 @@ impl PersistenceRecovery {
         Self {
             retry_interval,
             next_probe_at: None,
-            probe_due: false,
             acceptor_stop_pending: false,
             marker_pending: false,
         }
@@ -647,7 +645,6 @@ impl RuntimePersistence {
     pub(crate) fn reserve_enqueue(&mut self) -> Option<crate::store::EnqueuePermit<'_>> {
         self.observe_writer_health();
         if self.snapshot.persistence != PersistenceStatus::Healthy {
-            self.recovery.probe_due = true;
             self.snapshot.persistence_counters.skipped_enqueues = self
                 .snapshot
                 .persistence_counters
@@ -689,9 +686,6 @@ impl RuntimePersistence {
                 .persistence_counters
                 .skipped_enqueues
                 .saturating_add(1);
-            if !matches!(health.status, PersistenceStatus::Healthy) {
-                recovery.probe_due = true;
-            }
             Self::publish_facade(
                 snapshot,
                 publisher,
@@ -792,7 +786,6 @@ impl RuntimePersistence {
         if Instant::now() < next_probe_at {
             return;
         }
-        self.recovery.probe_due = false;
         let failed = self.writer.probe().await.is_err();
         self.observe_writer_health();
         if failed && !matches!(self.snapshot.persistence, PersistenceStatus::Healthy) {
@@ -922,7 +915,6 @@ impl RuntimePersistence {
                     set_controller_coverage_unavailable(&mut snapshot.source_coverage);
                 }
                 recovery.acceptor_stop_pending = false;
-                recovery.probe_due = false;
                 recovery.next_probe_at = None;
                 recovery.marker_pending = true;
                 tracing::warn!(
@@ -999,9 +991,19 @@ impl RuntimePersistence {
             ?failure,
             "Persistence degraded; writes will be skipped until recovery"
         );
-        snapshot.controller_input = ControllerInputStatus::Unavailable {
-            reason: ControllerInputUnavailableReason::PersistenceUnavailable,
-        };
+        if matches!(
+            snapshot.controller_input,
+            ControllerInputStatus::Unavailable {
+                reason: ControllerInputUnavailableReason::AcceptorStopped,
+            }
+        ) {
+            // The one-shot acceptor cannot recover with persistence, so its stop must survive.
+            recovery.acceptor_stop_pending = true;
+        } else {
+            snapshot.controller_input = ControllerInputStatus::Unavailable {
+                reason: ControllerInputUnavailableReason::PersistenceUnavailable,
+            };
+        }
         set_controller_coverage_unavailable(&mut snapshot.source_coverage);
         match class {
             RuntimeCommandClass::OwnerLocation => {
@@ -8931,7 +8933,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserve_enqueue_arms_probe_and_counts_refusal_while_cadence_gates_attempts() {
+    async fn acceptor_stop_before_outage_takes_precedence_at_recovery() {
+        let (_directory, root, lifecycle, mut runtime, diagnostics) =
+            recoverable_runtime(Duration::from_secs(30));
+        runtime.mark_acceptor_stopped();
+        assert_eq!(
+            diagnostics.borrow().controller_input,
+            ControllerInputStatus::Unavailable {
+                reason: ControllerInputUnavailableReason::AcceptorStopped,
+            }
+        );
+        assert!(matches!(
+            runtime
+                .update_owner_location("terminal-2", "pane-2")
+                .await
+                .unwrap(),
+            RuntimeWriteOutcome::NotCommitted(_)
+        ));
+        replace_runtime_owner_trigger(&root, None);
+        runtime.recovery.next_probe_at = Some(Instant::now());
+
+        assert_eq!(
+            runtime.cleanup(0).await.unwrap(),
+            RuntimeWriteOutcome::Skipped
+        );
+        let snapshot = diagnostics.borrow().clone();
+        assert_eq!(snapshot.persistence, PersistenceStatus::Healthy);
+        assert_eq!(
+            snapshot.controller_input,
+            ControllerInputStatus::Unavailable {
+                reason: ControllerInputUnavailableReason::AcceptorStopped,
+            }
+        );
+
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn reserve_enqueue_counts_refusal_while_cadence_gates_attempts() {
         let retry_interval = Duration::from_millis(500);
         let (_directory, root, lifecycle, mut runtime, diagnostics) =
             recoverable_runtime(retry_interval);
@@ -8945,7 +8984,6 @@ mod tests {
         replace_runtime_owner_trigger(&root, Some("first probe detail"));
 
         assert!(runtime.reserve_enqueue().is_none());
-        assert!(runtime.recovery.probe_due);
         assert_eq!(
             diagnostics.borrow().persistence_counters.skipped_enqueues,
             1
@@ -8966,7 +9004,6 @@ mod tests {
             runtime.apply(Vec::new()).await.unwrap(),
             RuntimeWriteOutcome::Skipped
         );
-        assert!(!runtime.recovery.probe_due);
         assert!(
             diagnostics
                 .borrow()

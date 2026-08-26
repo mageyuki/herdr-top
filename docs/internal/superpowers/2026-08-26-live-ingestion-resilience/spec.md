@@ -86,7 +86,8 @@ the code with line-level evidence.
   pending" flag; the collector loop consumes the flag and enqueues a
   `RecordCollectorGap { kind: PersistenceOutage }` through the normal
   `persist_submission` path (where a `Reducer` is in scope). Owner freshness
-  stays `Stale` until the next successful owner update (existing flow).
+  is not restored on recovery; that pre-existing gap is outside this increment
+  and remains recorded in the backlog.
 - D4. Probe cadence and gating: at most one probe per
   `PERSISTENCE_RETRY_INTERVAL` (default 30 s, injectable for tests). The
   async gated entry points (`apply`, `cleanup`) may drive a probe directly;
