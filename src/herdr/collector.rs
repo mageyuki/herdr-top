@@ -4912,10 +4912,25 @@ fn derive_provider_targets(model: &DomainModel) -> TargetSet {
         let run = model.task_run(&execution.task_run_id)?;
         match &run.key {
             RunKey::Native { provider, sid } if !sid.is_empty() => Some((*provider, sid.clone())),
-            RunKey::Controller(_)
-            | RunKey::Native { .. }
-            | RunKey::NativePath { .. }
-            | RunKey::Provisional { .. } => None,
+            RunKey::Native { .. } => None,
+            RunKey::Controller(_) | RunKey::NativePath { .. } | RunKey::Provisional { .. } => model
+                .task_run_bindings()
+                .filter_map(|(key, owner)| {
+                    if *owner != execution.task_run_id {
+                        return None;
+                    }
+                    match key {
+                        RunKey::Native { provider, sid } if !sid.is_empty() => {
+                            Some((provider_name(*provider), sid.clone(), *provider))
+                        }
+                        RunKey::Controller(_)
+                        | RunKey::Native { .. }
+                        | RunKey::NativePath { .. }
+                        | RunKey::Provisional { .. } => None,
+                    }
+                })
+                .min_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)))
+                .map(|(_, sid, provider)| (provider, sid)),
         }
     });
     TargetSet::new_with_sessions(run_targets.chain(node_targets), session_targets)
@@ -7310,6 +7325,223 @@ mod tests {
         PersistencePhase,
     };
     use crate::store::{LedgerEntry, PersistExecution, PersistTaskRun, open_writer, spawn_writer};
+
+    fn provider_target_task_run(run_id: RunId, key: RunKey, ordinal: i64) -> TaskRun {
+        TaskRun {
+            run_id,
+            key,
+            display_ordinal: DisplayOrdinal::new(ordinal),
+            state: TaskState::Running,
+            has_controller_task_state_event: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        }
+    }
+
+    fn provider_target_execution(task_run_id: RunId) -> Execution {
+        Execution {
+            execution_id: "provider-target-execution".to_owned(),
+            pane_id: "provider-target-pane".to_owned(),
+            terminal_id: "provider-target-terminal".to_owned(),
+            task_run_id,
+            state: ExecState::Working,
+        }
+    }
+
+    fn has_provider_session_target(model: &DomainModel, provider: Provider, sid: &str) -> bool {
+        derive_provider_targets(model)
+            .sessions()
+            .any(|target| target == (provider, sid))
+    }
+
+    #[test]
+    fn provider_targets_include_native_run_session() {
+        let mut model = DomainModel::default();
+        let run_id = RunId::new();
+        model.insert_task_run(provider_target_task_run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "native-target".to_owned(),
+            },
+            1,
+        ));
+        model.insert_execution(provider_target_execution(run_id));
+
+        assert!(has_provider_session_target(
+            &model,
+            Provider::Codex,
+            "native-target"
+        ));
+    }
+
+    #[test]
+    fn provider_targets_keep_native_session_after_controller_merge() {
+        let mut model = DomainModel::default();
+        let controller_run = RunId::new();
+        let native_run = RunId::new();
+        let native_key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "merged-native-target".to_owned(),
+        };
+        model.insert_task_run(provider_target_task_run(
+            controller_run,
+            RunKey::Controller("controller-target".to_owned()),
+            1,
+        ));
+        model.insert_task_run(provider_target_task_run(native_run, native_key.clone(), 2));
+        model.insert_execution(provider_target_execution(native_run));
+
+        let plan = crate::identity::plan_binding(
+            &model,
+            &crate::identity::BindingEvidence::ControllerNativeSession {
+                controller_run,
+                provider: Provider::Codex,
+                sid: "merged-native-target".to_owned(),
+            },
+        );
+        assert_eq!(
+            plan,
+            crate::identity::BindingPlan::Merge {
+                survivor: controller_run,
+                absorbed: native_run,
+            }
+        );
+        crate::identity::apply_binding_plan_at(&mut model, plan, 1_000).unwrap();
+
+        assert_eq!(
+            model.task_run_by_key(&native_key).unwrap().run_id,
+            controller_run
+        );
+        assert_eq!(
+            model.executions().next().unwrap().task_run_id,
+            controller_run
+        );
+        assert!(has_provider_session_target(
+            &model,
+            Provider::Codex,
+            "merged-native-target"
+        ));
+    }
+
+    #[test]
+    fn restored_provider_targets_keep_native_session_after_controller_merge() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let mut model = DomainModel::default();
+        let controller_run = RunId::new();
+        let native_run = RunId::new();
+        let native_key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "restored-native-target".to_owned(),
+        };
+        let controller_task_run = provider_target_task_run(
+            controller_run,
+            RunKey::Controller("restored-controller-target".to_owned()),
+            1,
+        );
+        let native_task_run = provider_target_task_run(native_run, native_key.clone(), 2);
+        let execution = provider_target_execution(native_run);
+        model.insert_task_run(controller_task_run.clone());
+        model.insert_task_run(native_task_run.clone());
+        model.insert_execution(execution.clone());
+        store
+            .apply_batch(vec![
+                PersistOp::UpsertTaskRun(PersistTaskRun {
+                    task_run: controller_task_run,
+                    native_session: None,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                    finished_at_ms: None,
+                }),
+                PersistOp::UpsertTaskRun(PersistTaskRun {
+                    task_run: native_task_run,
+                    native_session: Some(crate::store::NativeSessionBinding {
+                        provider: Provider::Codex,
+                        native_session_id: "restored-native-target".to_owned(),
+                    }),
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                    finished_at_ms: None,
+                }),
+                PersistOp::UpsertExecution(PersistExecution {
+                    execution,
+                    started_at_ms: 1,
+                    updated_at_ms: 1,
+                    ended_at_ms: None,
+                }),
+            ])
+            .unwrap();
+
+        let plan = crate::identity::plan_binding(
+            &model,
+            &crate::identity::BindingEvidence::ControllerNativeSession {
+                controller_run,
+                provider: Provider::Codex,
+                sid: "restored-native-target".to_owned(),
+            },
+        );
+        assert_eq!(
+            plan,
+            crate::identity::BindingPlan::Merge {
+                survivor: controller_run,
+                absorbed: native_run,
+            }
+        );
+        let persist = crate::identity::apply_binding_plan_at(&mut model, plan, 1_000).unwrap();
+        store.apply_batch(persist).unwrap();
+
+        let restored = store.load_restored_state().unwrap();
+        assert_eq!(
+            restored.model.task_run_by_key(&native_key).unwrap().run_id,
+            controller_run
+        );
+        assert_eq!(
+            restored.model.executions().next().unwrap().task_run_id,
+            controller_run
+        );
+        assert!(has_provider_session_target(
+            &restored.model,
+            Provider::Codex,
+            "restored-native-target"
+        ));
+    }
+
+    #[test]
+    fn provider_targets_choose_native_alias_deterministically() {
+        let mut model = DomainModel::default();
+        let controller_run = RunId::new();
+        model.insert_task_run(provider_target_task_run(
+            controller_run,
+            RunKey::Controller("multi-alias-controller".to_owned()),
+            1,
+        ));
+        model.insert_execution(provider_target_execution(controller_run));
+        model.insert_task_run_alias(
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "aaa-codex".to_owned(),
+            },
+            controller_run,
+        );
+        model.insert_task_run_alias(
+            RunKey::Native {
+                provider: Provider::Claude,
+                sid: "zzz-claude".to_owned(),
+            },
+            controller_run,
+        );
+
+        let sessions = derive_provider_targets(&model)
+            .sessions()
+            .map(|(provider, sid)| (provider, sid.to_owned()))
+            .collect::<Vec<_>>();
+        assert_eq!(sessions, vec![(Provider::Claude, "zzz-claude".to_owned())]);
+    }
 
     #[test]
     fn backfill_anchor_uses_earliest_restored_event() {
