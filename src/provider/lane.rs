@@ -2314,8 +2314,8 @@ mod tests {
             .task_run_by_key(&run_key_for_scope(&codex_scope))
             .expect("the lane must create the Codex session run");
         let claude_run_id = claude_run.run_id;
-        let claude_label = task_run_label(&model, claude_run, false, 0, false);
-        let codex_label = task_run_label(&model, codex_run, false, 0, false);
+        let claude_label = task_run_label(&model, claude_run, false, 0, false, true);
+        let codex_label = task_run_label(&model, codex_run, false, 0, false, true);
         assert!(
             claude_label.starts_with("● reviewer "),
             "Claude row must render agentType: {claude_label}"
@@ -2412,6 +2412,7 @@ mod tests {
             false,
             1,
             false,
+            true,
         );
         assert!(
             stable_label.starts_with("● reviewer "),

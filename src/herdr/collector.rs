@@ -383,6 +383,8 @@ pub struct SourceCoverageRegistry {
     controller: SourceAvailability,
     claude: SourceAvailability,
     codex: SourceAvailability,
+    claude_targeted_sessions: usize,
+    codex_targeted_sessions: usize,
 }
 
 impl SourceCoverageRegistry {
@@ -394,6 +396,8 @@ impl SourceCoverageRegistry {
             controller,
             claude: SourceAvailability::NotApplicable,
             codex: SourceAvailability::NotApplicable,
+            claude_targeted_sessions: 0,
+            codex_targeted_sessions: 0,
         }
     }
 
@@ -418,18 +422,37 @@ impl SourceCoverageRegistry {
         } = state;
     }
 
+    fn set_targeted_session_counts(&mut self, targets: &TargetSet) -> bool {
+        let claude = targets
+            .sessions()
+            .filter(|(provider, _)| *provider == Provider::Claude)
+            .count();
+        let codex = targets
+            .sessions()
+            .filter(|(provider, _)| *provider == Provider::Codex)
+            .count();
+        let changed =
+            self.claude_targeted_sessions != claude || self.codex_targeted_sessions != codex;
+        self.claude_targeted_sessions = claude;
+        self.codex_targeted_sessions = codex;
+        changed
+    }
+
     /// Stable header summary without operational paths.
     #[must_use]
     pub fn summary(&self) -> String {
         [
-            ("herdr", &self.herdr),
-            ("controller", &self.controller),
-            ("claude", &self.claude),
-            ("codex", &self.codex),
+            ("herdr", &self.herdr, None),
+            ("ctl", &self.controller, None),
+            ("claude", &self.claude, Some(self.claude_targeted_sessions)),
+            ("codex", &self.codex, Some(self.codex_targeted_sessions)),
         ]
         .into_iter()
-        .map(|(name, state)| match state {
-            SourceAvailability::Available => format!("{name}=available"),
+        .map(|(name, state, targeted_sessions)| match state {
+            SourceAvailability::Available => targeted_sessions.map_or_else(
+                || format!("{name}=available"),
+                |count| format!("{name}={count}"),
+            ),
             SourceAvailability::Unavailable { detail } => {
                 format!("{name}=unavailable({detail})")
             }
@@ -1512,8 +1535,9 @@ pub async fn spawn_workload_collector(
     let provider_publisher = provider_thread.target_publisher();
     let restored_targets = derive_provider_targets(&model.borrow());
     provider_publisher.update_targets(restored_targets.clone());
-    let coverage =
+    let mut coverage =
         CoverageTracker::new(controller_coverage, coverage_sender, source_quality_sender);
+    coverage.update_targeted_session_counts(&restored_targets);
     let (provider_events_drained_sender, provider_events_drained) = oneshot::channel();
     let provider_integration = ProviderIntegration::new_with_drain_acknowledgement(
         provider_events,
@@ -1918,8 +1942,9 @@ async fn spawn_configured_inner(
     let provider_publisher = provider_thread.target_publisher();
     let restored_targets = derive_provider_targets(&model.borrow());
     provider_publisher.update_targets(restored_targets.clone());
-    let coverage =
+    let mut coverage =
         CoverageTracker::new(controller_coverage, coverage_sender, source_quality_sender);
+    coverage.update_targeted_session_counts(&restored_targets);
     let (provider_events_drained_sender, provider_events_drained) = oneshot::channel();
     let provider_integration = ProviderIntegration::new_with_drain_acknowledgement(
         provider_events,
@@ -4982,6 +5007,12 @@ impl CoverageTracker {
         self.publish();
     }
 
+    fn update_targeted_session_counts(&mut self, targets: &TargetSet) {
+        if self.registry.set_targeted_session_counts(targets) {
+            self.publish();
+        }
+    }
+
     fn publish(&self) {
         self.coverage_sender.send_replace(self.registry.clone());
         self.source_quality_sender
@@ -5060,6 +5091,7 @@ impl ProviderIntegration {
             &shared.borrow(),
             &self.sessionless_codex_runs,
         );
+        self.coverage.update_targeted_session_counts(&targets);
         if targets != self.published_targets {
             self.target_publisher.update_targets(targets.clone());
             self.published_targets = targets;
@@ -13729,6 +13761,57 @@ mod tests {
         (provider_sender, provider, provider_thread)
     }
 
+    #[tokio::test]
+    async fn targeted_pane_session_counts_publish_from_derived_targets() {
+        let (provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+        let mut model = DomainModel::default();
+        for (provider_kind, sid, ordinal) in [
+            (Provider::Claude, "claude-one", 1),
+            (Provider::Claude, "claude-two", 2),
+            (Provider::Codex, "codex-one", 3),
+        ] {
+            let run_id = RunId::new();
+            model.insert_task_run(TaskRun {
+                run_id,
+                key: RunKey::Native {
+                    provider: provider_kind,
+                    sid: sid.to_owned(),
+                },
+                display_ordinal: DisplayOrdinal::new(ordinal),
+                state: TaskState::Running,
+                has_controller_task_state_event: false,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
+            });
+            model.insert_execution(Execution {
+                execution_id: format!("execution-{sid}"),
+                pane_id: format!("pane-{sid}"),
+                terminal_id: format!("terminal-{sid}"),
+                task_run_id: run_id,
+                state: ExecState::Working,
+            });
+        }
+        let (_model_sender, shared) = watch::channel(Arc::new(model));
+
+        provider.publish_targets(&shared);
+        provider
+            .coverage
+            .update_provider_state(Provider::Claude, ProviderSourceState::Available);
+        provider
+            .coverage
+            .update_provider_state(Provider::Codex, ProviderSourceState::Available);
+
+        assert_eq!(
+            provider.coverage.registry.summary(),
+            "herdr=available;ctl=n/a;claude=2;codex=1"
+        );
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+    }
+
     #[test]
     fn live_status_expands_per_differing_execution_with_distinct_receipt_identity() {
         let shared = status_model(&[
@@ -18716,6 +18799,23 @@ mod provider_integration_tests {
             &SourceAvailability::Unavailable {
                 detail: "bind_failure".to_owned(),
             }
+        );
+    }
+
+    #[test]
+    fn provider_metadata_keeps_persisted_source_names_byte_stable() {
+        let mut registry = SourceCoverageRegistry::new(SourceAvailability::Available);
+        registry.set(CoverageSource::Claude, SourceAvailability::Available);
+        registry.set(
+            CoverageSource::Codex,
+            SourceAvailability::Unavailable {
+                detail: "read_failed".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            serde_json::to_vec(&registry.provider_metadata()).unwrap(),
+            br#"[{"source":"herdr","available":true,"detail":null},{"source":"controller","available":true,"detail":null},{"source":"claude","available":true,"detail":null},{"source":"codex","available":false,"detail":"read_failed"}]"#
         );
     }
 

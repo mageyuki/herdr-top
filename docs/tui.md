@@ -144,7 +144,7 @@ the following ASCII forms; every other value leaves Unicode connectors enabled.
 A Task Run follows this grammar:
 
 ```text
-<glyph> <worker-kind>[ <subject>][ — <live line>][ · <duration>][ annotations]
+<glyph> <worker-kind>[ <subject>][ — <live line>][ · <duration when TIME is hidden>][ annotations]
 ```
 
 - **Glyph** carries the lifecycle state, with the stall override described
@@ -159,9 +159,10 @@ A Task Run follows this grammar:
 - **Live line** appears only on a non-terminal run. It comes from the log-lane
   live-line read model, or, for a Claude-flavoured run, from the newest Agent
   Node's last event kind with a `: <tool>` suffix when a tool name is present.
-- **Duration** appears when the start and live or finished endpoint form a
-  non-negative interval. Live durations use the current time; terminal runs use
-  their recorded finish time.
+- **Duration** appears in the label when the start and live or finished endpoint
+  form a non-negative interval and the row has no visible `TIME` metric column.
+  DAG rows have no metric band, so they retain the label suffix. Live durations
+  use the current time; terminal runs use their recorded finish time.
 
 The glyph vocabulary is:
 
@@ -204,6 +205,11 @@ row.
 | `TOK` | 5 | Accumulated output tokens only, or an em-dash placeholder. |
 | `TOK-S` | 5 | Output tokens divided by elapsed seconds, or an em-dash placeholder. |
 | `TIME` | 6 | Run duration. |
+
+When a selected execution-tree band includes `TIME`, the row suppresses the
+label's `· <duration>` suffix so the duration is painted exactly once. Below
+inner width 62 the metric band has no `TIME`, so the suffix remains; dependency
+DAG rows also retain it because that view does not paint metric columns.
 
 For `TOK-S`, elapsed time starts at the run's log-time anchor. It ends at the
 current time for a live run and at `finished_at_ms` for a terminal run, so the

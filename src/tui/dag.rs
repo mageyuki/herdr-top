@@ -190,7 +190,9 @@ pub(crate) fn build_rows(model: &DomainModel, order: &DagOrder, now_ms: i64) -> 
                 false,
                 now_ms,
                 stalled_runs.contains(&run.run_id),
+                true,
             ),
+            label_without_duration_suffix: None,
             prerequisites: neighbor_names(prerequisites.get(&run.run_id)),
             dependents: neighbor_names(dependents.get(&run.run_id)),
         })
