@@ -4123,6 +4123,13 @@ struct CodexRolloutCandidate {
     creation_ms: i64,
 }
 
+fn codex_detection_second_ms(detected_at_ms: i64) -> i64 {
+    detected_at_ms
+        .max(0)
+        .div_euclid(1_000)
+        .saturating_mul(1_000)
+}
+
 fn unambiguous_codex_bindings(
     panes: &[CodexPaneTarget],
     rollouts: &[CodexRolloutCandidate],
@@ -4130,7 +4137,7 @@ fn unambiguous_codex_bindings(
     let pane_candidates = panes
         .iter()
         .map(|pane| {
-            let detection_second_ms = pane.detected_at_ms.div_euclid(1_000) * 1_000;
+            let detection_second_ms = codex_detection_second_ms(pane.detected_at_ms);
             rollouts
                 .iter()
                 .enumerate()
@@ -4164,10 +4171,11 @@ fn unambiguous_codex_bindings(
 fn discover_codex_bindings(
     roots: &[DiscoveryRoot],
     panes: &[CodexPaneTarget],
+    owned_codex_sessions: &HashSet<String>,
 ) -> Vec<(RunId, String)> {
     let Some(anchor_ms) = panes
         .iter()
-        .map(|pane| pane.detected_at_ms.div_euclid(1_000) * 1_000)
+        .map(|pane| codex_detection_second_ms(pane.detected_at_ms))
         .min()
     else {
         return Vec::new();
@@ -4187,6 +4195,9 @@ fn discover_codex_bindings(
                 .codex_rollouts()
                 .into_iter()
                 .filter_map(|(sid, artifact)| {
+                    if owned_codex_sessions.contains(sid) {
+                        return None;
+                    }
                     artifact
                         .creation_ms
                         .map(|creation_ms| CodexRolloutCandidate {
@@ -4212,7 +4223,13 @@ impl ProviderWorker for AdapterProviderWorker {
         self.log_admission.begin_pane_cycle();
         let mut codex_panes = cycle.targets.codex_panes().collect::<Vec<_>>();
         codex_panes.sort_by_key(|pane| pane.run_id);
-        let codex_bindings = discover_codex_bindings(&self.standard_roots, &codex_panes);
+        let owned_codex_sessions = cycle
+            .targets
+            .owned_codex_sessions()
+            .map(str::to_owned)
+            .collect();
+        let codex_bindings =
+            discover_codex_bindings(&self.standard_roots, &codex_panes, &owned_codex_sessions);
         for (_, sid) in &codex_bindings {
             self.log_admission.admit_pane_session(Provider::Codex, sid);
             providers_with_session_admissions.insert(Provider::Codex);
@@ -5151,10 +5168,21 @@ fn derive_provider_targets_with_codex_panes(
             detected_at_ms: start_ms,
         })
     });
+    let owned_codex_sessions = model.task_run_bindings().filter_map(|(key, _)| match key {
+        RunKey::Native {
+            provider: Provider::Codex,
+            sid,
+        } if !sid.is_empty() => Some(sid.clone()),
+        RunKey::Controller(_)
+        | RunKey::Native { .. }
+        | RunKey::NativePath { .. }
+        | RunKey::Provisional { .. } => None,
+    });
     TargetSet::new_with_sessions_and_codex_panes(
         run_targets.chain(node_targets),
         session_targets,
         codex_panes,
+        owned_codex_sessions,
     )
 }
 
@@ -5399,16 +5427,42 @@ async fn apply_provider_event(
     persistence: &mut RuntimePersistence,
     coverage: &SourceCoverageRegistry,
 ) -> Result<(), CollectorError> {
-    apply_provider_event_with_admission(
-        event,
+    let provider_diagnostics = crate::provider::ProviderDiagnostics::default();
+    let (ignored_events, _ignored_receiver) = mpsc::channel(1);
+    let provider_thread = spawn_provider_thread_with_diagnostics(
+        AdapterProviderWorker::new(Vec::new(), provider_diagnostics.clone()),
+        ignored_events,
         None,
+        provider_diagnostics,
+    )?;
+    let (_provider_sender, provider_events) = mpsc::channel(1);
+    let (coverage_sender, _source_coverage) = watch::channel(coverage.clone());
+    let (source_quality_sender, _source_quality) = watch::channel(ObservationQuality::Reconciling);
+    let tracker = CoverageTracker {
+        registry: coverage.clone(),
+        herdr_quality: ObservationQuality::Reconciling,
+        coverage_sender,
+        source_quality_sender,
+    };
+    let mut provider = ProviderIntegration::new(
+        provider_events,
+        provider_thread.target_publisher(),
+        TargetSet::default(),
+        tracker,
+    );
+    let (performance, _sampler) = performance_tracker(Arc::new(SystemPerformanceClock::new()));
+    let admission = event.requires_admission().then(|| performance.admit());
+    let result = service_provider_event(
+        Some(ProviderIngressEvent { event, admission }),
+        &mut provider,
         session,
         reducer,
         shared,
         persistence,
-        coverage,
     )
-    .await
+    .await;
+    provider_thread.stop().await?;
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5422,13 +5476,6 @@ async fn apply_provider_event_with_admission(
     coverage: &SourceCoverageRegistry,
 ) -> Result<(), CollectorError> {
     match event {
-        ProviderEvent::SourceState {
-            state: ProviderSourceState::AvailableWithBindings { bindings },
-            ..
-        } => {
-            debug_assert!(admission.is_none());
-            apply_heuristic_bindings(bindings, reducer, shared, persistence, coverage).await
-        }
         ProviderEvent::Synthesized(mut event) => {
             event.metadata.herdr_session = session.to_owned();
             event.metadata.receipt_time_ms = unix_now_ms();
@@ -5548,6 +5595,23 @@ async fn apply_heuristic_bindings(
     coverage: &SourceCoverageRegistry,
 ) -> Result<(), CollectorError> {
     for binding in bindings {
+        let stale = {
+            let model = shared.borrow();
+            !matches!(
+                model.task_run(&binding.run_id).map(|run| &run.key),
+                Some(RunKey::Provisional { .. })
+            ) || model.agent_nodes().any(|node| {
+                node.task_run_id == binding.run_id
+                    && node.provider == Provider::Codex
+                    && node
+                        .native_session_id
+                        .as_ref()
+                        .is_some_and(|sid| !sid.is_empty())
+            })
+        };
+        if stale {
+            continue;
+        }
         let outcome =
             reducer.apply_heuristic_binding(binding.run_id, binding.sid, binding.observed_at_ms);
         if let Some(persist) = collector_apply_outcome(reducer, outcome)
@@ -15688,8 +15752,9 @@ mod provider_integration_tests {
         )
     }
 
-    fn g7_rollout(root: &Path, timestamp: &str, label: &str) -> (PathBuf, String) {
-        let day = root.join("2026/08/26");
+    fn g7_rollout(root: &Path, creation_ms: i64, label: &str) -> (PathBuf, String) {
+        let (day, timestamp) = crate::provider::lane::local_rollout_fixture_parts(creation_ms);
+        let day = root.join(day);
         std::fs::create_dir_all(&day).unwrap();
         let path = codex_artifact(&day, &format!("{timestamp}-{label}"));
         let rollout_id = codex_rollout_id(&path).expect("fixture filename carries a rollout UUID");
@@ -15723,7 +15788,7 @@ mod provider_integration_tests {
     async fn sessionless_codex_pane_binds_in_one_cycle_and_receives_pending_telemetry() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("home/.codex/sessions");
-        let (path, rollout_id) = g7_rollout(&root, "2026-08-26T12-00-01", "fresh");
+        let (path, rollout_id) = g7_rollout(&root, G7_DETECTION_MS + 500, "fresh");
         let run = g7_provisional("fresh", 1, G7_DETECTION_MS);
         let run_id = run.0;
         let provisional_key = run.1.clone();
@@ -15735,18 +15800,17 @@ mod provider_integration_tests {
             provider: Provider::Codex,
             sid: rollout_id.clone(),
         };
+        harness.reducer.apply_telemetry(
+            &native_key,
+            G7_DETECTION_MS + 750,
+            37,
+            Some("gpt-5.6-sol".to_owned()),
+            Some("xhigh".to_owned()),
+            Some("workspace-write".to_owned()),
+        );
         assert!(
-            harness
-                .reducer
-                .apply_telemetry(
-                    &native_key,
-                    G7_DETECTION_MS + 750,
-                    37,
-                    Some("gpt-5.6-sol".to_owned()),
-                    Some("xhigh".to_owned()),
-                    Some("workspace-write".to_owned()),
-                )
-                .is_empty()
+            harness.shared.borrow().telemetry(&run_id).is_none(),
+            "native-key telemetry must remain pending before heuristic promotion"
         );
 
         process_adapter_worker(&mut worker, &targets, &mut pending);
@@ -15794,7 +15858,7 @@ mod provider_integration_tests {
     fn sessionless_codex_same_second_rollout_binds() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("home/.codex/sessions");
-        let (_, rollout_id) = g7_rollout(&root, "2026-08-26T12-00-00", "same-second");
+        let (_, rollout_id) = g7_rollout(&root, G7_DETECTION_MS - 500, "same-second");
         let run = g7_provisional("same-second", 1, G7_DETECTION_MS);
         let model = g7_model(std::slice::from_ref(&run));
         let targets = g7_targets(&model, &[run.0]);
@@ -15813,8 +15877,8 @@ mod provider_integration_tests {
     fn two_sessionless_panes_and_two_rollouts_remain_ambiguous() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("home/.codex/sessions");
-        let (first_path, first_sid) = g7_rollout(&root, "2026-08-26T12-00-01", "two-by-two-first");
-        let (second_path, _) = g7_rollout(&root, "2026-08-26T12-00-02", "two-by-two-second");
+        let (first_path, first_sid) = g7_rollout(&root, G7_DETECTION_MS + 500, "two-by-two-first");
+        let (second_path, _) = g7_rollout(&root, G7_DETECTION_MS + 1_500, "two-by-two-second");
         let first = g7_provisional("two-by-two-first", 1, G7_DETECTION_MS);
         let second = g7_provisional("two-by-two-second", 2, G7_DETECTION_MS);
         let model = g7_model(&[first.clone(), second.clone()]);
@@ -15844,7 +15908,7 @@ mod provider_integration_tests {
     fn one_rollout_claimed_by_two_sessionless_panes_binds_neither() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("home/.codex/sessions");
-        let (_, rollout_id) = g7_rollout(&root, "2026-08-26T12-00-01", "shared");
+        let (_, rollout_id) = g7_rollout(&root, G7_DETECTION_MS + 500, "shared");
         let first = g7_provisional("shared-first", 1, G7_DETECTION_MS);
         let second = g7_provisional("shared-second", 2, G7_DETECTION_MS);
         let model = g7_model(&[first.clone(), second.clone()]);
@@ -15872,8 +15936,8 @@ mod provider_integration_tests {
     fn two_same_second_rollouts_for_one_pane_do_not_bind() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("home/.codex/sessions");
-        let (_, first_sid) = g7_rollout(&root, "2026-08-26T12-00-00", "tie-first");
-        let (second_path, _) = g7_rollout(&root, "2026-08-26T12-00-00", "tie-second");
+        let (_, first_sid) = g7_rollout(&root, G7_DETECTION_MS - 500, "tie-first");
+        let (second_path, _) = g7_rollout(&root, G7_DETECTION_MS - 500, "tie-second");
         let run = g7_provisional("tie", 1, G7_DETECTION_MS);
         let model = g7_model(std::slice::from_ref(&run));
         let targets = g7_targets(&model, &[run.0]);
@@ -15898,7 +15962,7 @@ mod provider_integration_tests {
     fn sessionless_codex_pane_without_candidate_retries_later() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("home/.codex/sessions");
-        let _ = g7_rollout(&root, "2026-08-26T11-59-59", "too-old");
+        let _ = g7_rollout(&root, G7_DETECTION_MS - 1_500, "too-old");
         let run = g7_provisional("no-candidate", 1, G7_DETECTION_MS);
         let model = g7_model(std::slice::from_ref(&run));
         let targets = g7_targets(&model, &[run.0]);
@@ -15910,7 +15974,7 @@ mod provider_integration_tests {
             "a rollout before the normalized detection window is not a candidate"
         );
 
-        let (_, later_sid) = g7_rollout(&root, "2026-08-26T12-00-01", "later");
+        let (_, later_sid) = g7_rollout(&root, G7_DETECTION_MS + 500, "later");
         process_adapter_worker(&mut worker, &targets, &mut pending);
         assert_eq!(
             g7_bindings(&drain_pending(&mut pending)),
@@ -15923,8 +15987,7 @@ mod provider_integration_tests {
     fn explicit_agent_session_suppresses_heuristic_binding() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("home/.codex/sessions");
-        let (_, explicit_sid) = g7_rollout(&root, "2026-08-26T12-00-00", "explicit");
-        let (_, heuristic_sid) = g7_rollout(&root, "2026-08-26T12-00-01", "heuristic");
+        let (_, explicit_sid) = g7_rollout(&root, G7_DETECTION_MS + 1_500, "explicit");
         let explicit_id = RunId::new();
         let explicit_run = TaskRun {
             run_id: explicit_id,
@@ -15948,20 +16011,187 @@ mod provider_integration_tests {
             task_run_id: explicit_id,
             state: ExecState::Working,
         };
-        let sessionless = g7_provisional("explicit-control", 2, G7_DETECTION_MS + 1_000);
+        let sessionless = g7_provisional("explicit-control", 2, G7_DETECTION_MS);
         let mut model = g7_model(std::slice::from_ref(&sessionless));
         model.insert_task_run(explicit_run);
         model.insert_execution(explicit_execution);
-        let targets = g7_targets(&model, &[explicit_id, sessionless.0]);
+        let targets = g7_targets(&model, &[sessionless.0]);
         let (mut worker, mut pending) = g7_worker(&root);
 
         process_adapter_worker(&mut worker, &targets, &mut pending);
 
-        assert_eq!(
-            g7_bindings(&drain_pending(&mut pending)),
-            vec![(sessionless.0, heuristic_sid)],
-            "explicit native identity must be excluded from heuristic claimants"
+        assert!(
+            g7_bindings(&drain_pending(&mut pending)).is_empty(),
+            "an already-owned native identity must not be a heuristic candidate"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_heuristic_binding_yields_to_explicit_pane_identity() {
+        let sessionless = g7_provisional("stale-binding", 1, G7_DETECTION_MS);
+        let run_id = sessionless.0;
+        let execution = sessionless.3.clone();
+        let mut harness =
+            LaneModelHarness::with_model(g7_model(std::slice::from_ref(&sessionless)));
+        let explicit_sid = "11111111-1111-4111-8111-111111111111";
+        let heuristic_sid = "22222222-2222-4222-8222-222222222222";
+        let mut observed_metadata = metadata("session", "pane_updated_identity_observed");
+        observed_metadata.provider = Some(Provider::Codex);
+        observed_metadata.task_run_id = Some(run_id);
+        harness
+            .reducer
+            .apply(NormalizedEvent::AgentNodeUpsert {
+                metadata: observed_metadata,
+                node: AgentNodeObservation {
+                    agent_node_id: "agent:codex:explicit-pane".to_owned(),
+                    provider: Provider::Codex,
+                    native_session_id: Some(explicit_sid.to_owned()),
+                    task_run_id: run_id,
+                    parent_agent_node_id: None,
+                    state: Some(ExecState::Working),
+                    model_id: None,
+                    session_file: None,
+                },
+            })
+            .unwrap();
+
+        harness
+            .apply([ProviderEvent::SourceState {
+                provider: Provider::Codex,
+                state: ProviderSourceState::AvailableWithBindings {
+                    bindings: vec![CodexPaneBinding {
+                        run_id,
+                        sid: heuristic_sid.to_owned(),
+                        observed_at_ms: G7_DETECTION_MS + 1_000,
+                    }],
+                },
+            }])
+            .await;
+
+        let mut explicit_metadata = metadata("session", "pane_updated");
+        explicit_metadata.provider = Some(Provider::Codex);
+        explicit_metadata.native_session_id = Some(explicit_sid.to_owned());
+        explicit_metadata.terminal_id = Some(execution.terminal_id.clone());
+        harness
+            .reducer
+            .apply(NormalizedEvent::ExecutionBegin {
+                metadata: explicit_metadata,
+                execution,
+            })
+            .unwrap();
+
+        assert_eq!(
+            harness
+                .shared
+                .borrow()
+                .task_run(&run_id)
+                .map(|run| &run.key),
+            Some(&RunKey::Native {
+                provider: Provider::Codex,
+                sid: explicit_sid.to_owned(),
+            }),
+            "the explicit pane identity must win over a stale heuristic result"
+        );
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sessionless_codex_event_publishes_target_until_promotion() {
+        let mut harness = LaneModelHarness::new();
+        let provider_diagnostics = crate::provider::ProviderDiagnostics::default();
+        let (ignored_events, _ignored_receiver) = mpsc::channel(1);
+        let provider_thread = spawn_provider_thread_with_diagnostics(
+            AdapterProviderWorker::new(Vec::new(), provider_diagnostics.clone()),
+            ignored_events,
+            None,
+            provider_diagnostics,
+        )
+        .unwrap();
+        let (_provider_sender, provider_events) = mpsc::channel(1);
+        let initial_coverage = SourceCoverageRegistry::new(SourceAvailability::Available);
+        let (coverage_sender, _source_coverage) = watch::channel(initial_coverage);
+        let (source_quality_sender, _source_quality) =
+            watch::channel(ObservationQuality::Reconciling);
+        let coverage = CoverageTracker::new(
+            SourceAvailability::Available,
+            coverage_sender,
+            source_quality_sender,
+        );
+        let mut provider = ProviderIntegration::new(
+            provider_events,
+            provider_thread.target_publisher(),
+            TargetSet::default(),
+            coverage,
+        );
+        let (performance, _sampler) = performance_tracker(Arc::new(SystemPerformanceClock::new()));
+        let received = ReceivedEvent {
+            event: "pane_created".to_owned(),
+            data: json!({
+                "pane": {
+                    "agent": "codex",
+                    "agent_status": "working",
+                    "pane_id": "g7-event-pane",
+                    "tab_id": "g7-event-tab",
+                    "terminal_id": "g7-event-terminal",
+                    "workspace_id": "g7-event-workspace"
+                }
+            }),
+            primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
+        };
+        let mut owner = OwnerTracker::from_environment();
+        let mut pending_closures = PendingTopologyClosures::default();
+
+        apply_received_event(
+            &mut harness.reducer,
+            &harness.shared,
+            &mut harness.persistence,
+            &mut owner,
+            "session",
+            received,
+            performance.admit(),
+            &mut pending_closures,
+            &mut provider,
+        )
+        .await
+        .unwrap();
+
+        let published = provider.published_targets.codex_panes().collect::<Vec<_>>();
+        let [target] = published.as_slice() else {
+            panic!(
+                "sessionless Codex pane event did not publish exactly one target: {published:?}"
+            );
+        };
+        service_provider_event(
+            Some(ProviderIngressEvent {
+                event: ProviderEvent::SourceState {
+                    provider: Provider::Codex,
+                    state: ProviderSourceState::AvailableWithBindings {
+                        bindings: vec![CodexPaneBinding {
+                            run_id: target.run_id,
+                            sid: "33333333-3333-4333-8333-333333333333".to_owned(),
+                            observed_at_ms: G7_DETECTION_MS,
+                        }],
+                    },
+                },
+                admission: None,
+            }),
+            &mut provider,
+            "session",
+            &mut harness.reducer,
+            &harness.shared,
+            &mut harness.persistence,
+        )
+        .await
+        .unwrap();
+        provider.publish_targets(&harness.shared);
+
+        assert_eq!(
+            provider.published_targets.codex_panes().count(),
+            0,
+            "promoted pane must disappear from published sessionless targets"
+        );
+        provider_thread.stop().await.unwrap();
+        harness.shutdown().await;
     }
 
     fn tail_read_calls(

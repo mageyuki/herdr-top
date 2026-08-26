@@ -1074,7 +1074,7 @@ impl AdmissionIndex {
         }
     }
 
-    /// Indexes rollout filenames only in UTC date shards on or after `anchor_ms`.
+    /// Indexes rollout filenames only in local-time date shards on or after `anchor_ms`.
     ///
     /// Within the anchor day, parseable filename timestamps before the anchor are skipped.
     /// Individual nested-entry errors are recorded and do not discard healthy siblings.
@@ -1092,9 +1092,6 @@ impl AdmissionIndex {
     }
 
     fn discover_codex_date_shards_inner(root: &Path, anchor_ms: i64) -> io::Result<Self> {
-        const MILLIS_PER_DAY: i64 = 86_400_000;
-
-        let anchor_day = anchor_ms.div_euclid(MILLIS_PER_DAY);
         let mut index = Self::new();
         for year in sorted_directory_entries(root, true, &mut index.had_errors)? {
             let Some(year_value) = fixed_decimal(&year.file_name(), 4) else {
@@ -1144,12 +1141,32 @@ impl AdmissionIndex {
                     if !day_kind.is_dir() {
                         continue;
                     }
-                    let Some(shard_day) = civil_day(year_value, month_value, day_value) else {
+                    let Some(shard_start_ms) =
+                        local_datetime_epoch_ms(year_value, month_value, day_value, 0, 0, 0)
+                    else {
                         continue;
                     };
-                    if shard_day < anchor_day {
+                    let (next_year, next_month, next_day) =
+                        if day_value < days_in_month(year_value, month_value) {
+                            (year_value, month_value, day_value + 1)
+                        } else if month_value < 12 {
+                            (year_value, month_value + 1, 1)
+                        } else {
+                            (year_value.saturating_add(1), 1, 1)
+                        };
+                    let shard_end_ms = if next_year > 9_999 {
+                        i64::MAX
+                    } else if let Some(shard_end_ms) =
+                        local_datetime_epoch_ms(next_year, next_month, next_day, 0, 0, 0)
+                    {
+                        shard_end_ms
+                    } else {
+                        continue;
+                    };
+                    if shard_end_ms <= anchor_ms {
                         continue;
                     }
+                    let anchor_shard = shard_start_ms <= anchor_ms;
                     record_codex_shard_scan(&day_path);
                     for artifact in
                         sorted_directory_entries(&day_path, false, &mut index.had_errors)?
@@ -1174,7 +1191,7 @@ impl AdmissionIndex {
                         if !file_name.starts_with("rollout-") || !file_name.ends_with(".jsonl") {
                             continue;
                         }
-                        if shard_day == anchor_day
+                        if anchor_shard
                             && rollout_filename_timestamp_ms(file_name)
                                 .is_some_and(|timestamp_ms| timestamp_ms < anchor_ms)
                         {
@@ -1753,9 +1770,38 @@ fn civil_day(year: u32, month: u32, day: u32) -> Option<i64> {
     Some(era * 146_097 + day_of_era - 719_468)
 }
 
-pub(crate) fn rollout_filename_timestamp_ms(file_name: &str) -> Option<i64> {
-    const MILLIS_PER_DAY: i64 = 86_400_000;
+fn local_datetime_epoch_ms(
+    year: u32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<i64> {
+    civil_day(year, month, day)?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    // SAFETY: all-zero is a valid baseline for C's integer/pointer `tm` fields;
+    // the fields consumed by `mktime` are initialized below before the call.
+    let mut local = unsafe { std::mem::zeroed::<libc::tm>() };
+    local.tm_year = i32::try_from(year).ok()?.checked_sub(1900)?;
+    local.tm_mon = i32::try_from(month).ok()?.checked_sub(1)?;
+    local.tm_mday = i32::try_from(day).ok()?;
+    local.tm_hour = i32::try_from(hour).ok()?;
+    local.tm_min = i32::try_from(minute).ok()?;
+    local.tm_sec = i32::try_from(second).ok()?;
+    local.tm_isdst = -1;
+    // SAFETY: `local` is a live, writable `tm`; `mktime` retains no pointer and
+    // resolves the local timezone and DST status because `tm_isdst` is `-1`.
+    let epoch_seconds = unsafe { libc::mktime(&raw mut local) };
+    if epoch_seconds == -1 {
+        return None;
+    }
+    epoch_seconds.checked_mul(1_000)
+}
 
+pub(crate) fn rollout_filename_timestamp_ms(file_name: &str) -> Option<i64> {
     let value = file_name.strip_prefix("rollout-")?;
     let timestamp = value.get(..19)?;
     if value.as_bytes().get(19) != Some(&b'-')
@@ -1773,12 +1819,39 @@ pub(crate) fn rollout_filename_timestamp_ms(file_name: &str) -> Option<i64> {
     let hour = timestamp.get(11..13)?.parse::<u32>().ok()?;
     let minute = timestamp.get(14..16)?.parse::<u32>().ok()?;
     let second = timestamp.get(17..19)?.parse::<u32>().ok()?;
-    if hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-    civil_day(year, month, day)?
-        .checked_mul(MILLIS_PER_DAY)?
-        .checked_add(i64::from(hour * 3_600 + minute * 60 + second) * 1_000)
+    local_datetime_epoch_ms(year, month, day, hour, minute, second)
+}
+
+#[cfg(test)]
+pub(crate) fn local_rollout_fixture_parts(epoch_ms: i64) -> (String, String) {
+    let epoch_seconds = libc::time_t::try_from(epoch_ms.div_euclid(1_000)).unwrap();
+    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // SAFETY: `local` points to writable storage for one `tm`, and `epoch_seconds`
+    // remains live for the duration of this non-retaining libc call.
+    let result = unsafe { libc::localtime_r(&epoch_seconds, local.as_mut_ptr()) };
+    assert!(
+        !result.is_null(),
+        "localtime_r rejected fixture epoch {epoch_ms}"
+    );
+    // SAFETY: non-null `localtime_r` initialized the output `tm`.
+    let local = unsafe { local.assume_init() };
+    (
+        format!(
+            "{:04}/{:02}/{:02}",
+            local.tm_year + 1900,
+            local.tm_mon + 1,
+            local.tm_mday,
+        ),
+        format!(
+            "{:04}-{:02}-{:02}T{:02}-{:02}-{:02}",
+            local.tm_year + 1900,
+            local.tm_mon + 1,
+            local.tm_mday,
+            local.tm_hour,
+            local.tm_min,
+            local.tm_sec,
+        ),
+    )
 }
 
 const fn days_in_month(year: u32, month: u32) -> u32 {
@@ -1919,9 +1992,10 @@ mod tests {
         modified_ms: i64,
         anchor_ms: i64,
     ) -> (AdmissionIndex, PathBuf) {
-        let shard = root.join("2026/08/23");
+        let (shard, timestamp) = local_rollout_fixture_parts(anchor_ms.saturating_add(3_600_000));
+        let shard = root.join(shard);
         fs::create_dir_all(&shard).unwrap();
-        let path = shard.join(format!("rollout-2026-08-23T13-00-00-{rollout_id}.jsonl"));
+        let path = shard.join(format!("rollout-{timestamp}-{rollout_id}.jsonl"));
         fs::write(&path, b"{}\n").unwrap();
         OpenOptions::new()
             .write(true)
@@ -4490,6 +4564,27 @@ mod tests {
     }
 
     #[test]
+    fn rollout_filename_timestamp_round_trips_local_epoch_seconds() {
+        for epoch_ms in [
+            0,
+            946_684_800_000,
+            1_609_459_200_000,
+            1_787_745_600_000,
+            2_145_916_799_000,
+        ] {
+            let (_, timestamp) = local_rollout_fixture_parts(epoch_ms);
+            let file_name =
+                format!("rollout-{timestamp}-22222222-2222-4222-8222-222222222222.jsonl",);
+
+            assert_eq!(
+                rollout_filename_timestamp_ms(&file_name),
+                Some(epoch_ms),
+                "local rollout time did not round-trip for {file_name}"
+            );
+        }
+    }
+
+    #[test]
     fn per_file_anchor_only_exempts_pane_roots() {
         let mut admission = Admission::new(1_000);
         admission.admit_pane_session(Provider::Claude, PARENT);
@@ -4534,12 +4629,16 @@ mod tests {
 
     #[test]
     fn date_shard_scan_bounded_by_anchor() {
+        const ANCHOR_MS: i64 = 1_787_486_400_000;
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("sessions");
+        let (previous_shard, _) = local_rollout_fixture_parts(ANCHOR_MS - 86_400_000);
+        let (anchor_shard, _) = local_rollout_fixture_parts(ANCHOR_MS);
+        let (next_shard, _) = local_rollout_fixture_parts(ANCHOR_MS + 86_400_000);
         let shards = [
-            ("2026/08/22", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
-            ("2026/08/23", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
-            ("2026/08/24", "cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+            (&previous_shard, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            (&anchor_shard, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            (&next_shard, "cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
         ];
         for (shard, id) in shards {
             let path = root.join(shard);
@@ -4550,27 +4649,28 @@ mod tests {
         let observed = Arc::clone(&scanned);
         set_codex_shard_scan_hook(move |path| observed.lock().unwrap().push(path.to_path_buf()));
 
-        let index = AdmissionIndex::discover_codex_date_shards(
-            &root,
-            1_787_486_400_000, // 2026-08-23T12:00:00Z
-        )
-        .unwrap();
+        let index = AdmissionIndex::discover_codex_date_shards(&root, ANCHOR_MS).unwrap();
 
         assert!(!index.contains_uuid("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"));
         assert!(index.contains_uuid("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"));
         assert!(index.contains_uuid("cccccccc-cccc-4ccc-8ccc-cccccccccccc"));
         assert_eq!(
             *scanned.lock().unwrap(),
-            [root.join("2026/08/23"), root.join("2026/08/24")]
+            [root.join(anchor_shard), root.join(next_shard)]
         );
     }
 
     #[test]
     fn anchor_day_rollouts_are_bounded_by_filename_timestamp() {
+        const ANCHOR_MS: i64 = 1_787_486_400_000;
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("sessions");
-        let anchor_day = root.join("2026/08/23");
-        let later_day = root.join("2026/08/24");
+        let (anchor_shard, before_timestamp) = local_rollout_fixture_parts(ANCHOR_MS - 1_000);
+        let (_, equal_timestamp) = local_rollout_fixture_parts(ANCHOR_MS);
+        let (_, after_timestamp) = local_rollout_fixture_parts(ANCHOR_MS + 1_000);
+        let (later_shard, later_timestamp) = local_rollout_fixture_parts(ANCHOR_MS + 86_400_000);
+        let anchor_day = root.join(anchor_shard);
+        let later_day = root.join(later_shard);
         fs::create_dir_all(&anchor_day).unwrap();
         fs::create_dir_all(&later_day).unwrap();
         let before = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
@@ -4579,24 +4679,20 @@ mod tests {
         let malformed = "99999999-9999-4999-8999-999999999999";
         let later = "77777777-7777-4777-8777-777777777777";
         for (name, id) in [
-            ("rollout-2026-08-23T11-59-59", before),
-            ("rollout-2026-08-23T12-00-00", equal),
-            ("rollout-2026-08-23T12-00-01", after),
-            ("rollout-not-a-time", malformed),
+            (format!("rollout-{before_timestamp}"), before),
+            (format!("rollout-{equal_timestamp}"), equal),
+            (format!("rollout-{after_timestamp}"), after),
+            ("rollout-not-a-time".to_owned(), malformed),
         ] {
             fs::write(anchor_day.join(format!("{name}-{id}.jsonl")), b"{}\n").unwrap();
         }
         fs::write(
-            later_day.join(format!("rollout-2026-08-24T00-00-00-{later}.jsonl")),
+            later_day.join(format!("rollout-{later_timestamp}-{later}.jsonl")),
             b"{}\n",
         )
         .unwrap();
 
-        let index = AdmissionIndex::discover_codex_date_shards(
-            &root,
-            1_787_486_400_000, // 2026-08-23T12:00:00Z
-        )
-        .unwrap();
+        let index = AdmissionIndex::discover_codex_date_shards(&root, ANCHOR_MS).unwrap();
 
         assert!(!index.contains_uuid(before));
         assert!(index.contains_uuid(equal));

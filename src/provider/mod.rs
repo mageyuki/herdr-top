@@ -1511,6 +1511,7 @@ pub struct TargetSet {
     targets: HashSet<ProviderTarget>,
     sessions: HashSet<(Provider, String)>,
     codex_panes: HashSet<CodexPaneTarget>,
+    owned_codex_sessions: HashSet<String>,
 }
 
 impl TargetSet {
@@ -1520,6 +1521,7 @@ impl TargetSet {
             targets: targets.into_iter().collect(),
             sessions: HashSet::new(),
             codex_panes: HashSet::new(),
+            owned_codex_sessions: HashSet::new(),
         }
     }
 
@@ -1532,6 +1534,7 @@ impl TargetSet {
             targets: targets.into_iter().collect(),
             sessions: sessions.into_iter().collect(),
             codex_panes: HashSet::new(),
+            owned_codex_sessions: HashSet::new(),
         }
     }
 
@@ -1540,11 +1543,13 @@ impl TargetSet {
         targets: impl IntoIterator<Item = ProviderTarget>,
         sessions: impl IntoIterator<Item = (Provider, String)>,
         codex_panes: impl IntoIterator<Item = CodexPaneTarget>,
+        owned_codex_sessions: impl IntoIterator<Item = String>,
     ) -> Self {
         Self {
             targets: targets.into_iter().collect(),
             sessions: sessions.into_iter().collect(),
             codex_panes: codex_panes.into_iter().collect(),
+            owned_codex_sessions: owned_codex_sessions.into_iter().collect(),
         }
     }
 
@@ -1563,6 +1568,11 @@ impl TargetSet {
     /// Returns live sessionless Codex panes awaiting native identity.
     pub(crate) fn codex_panes(&self) -> impl Iterator<Item = CodexPaneTarget> + '_ {
         self.codex_panes.iter().copied()
+    }
+
+    /// Returns Codex native sessions that already have authoritative run owners.
+    pub(crate) fn owned_codex_sessions(&self) -> impl Iterator<Item = &str> {
+        self.owned_codex_sessions.iter().map(String::as_str)
     }
 }
 

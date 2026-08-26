@@ -172,7 +172,8 @@ Expected files: `src/herdr/collector.rs` (sessionless codex pane flow,
 provisional target derivation), `src/provider/lane.rs` (expose rollout
 creation time from the existing private filename parser; discovery
 surface), `src/provider/mod.rs` (TargetSet if a new target form is needed),
-`src/identity.rs` (binding plan for the promotion), in-file tests. Store
+`src/identity.rs` (binding plan for the promotion), `src/reducer.rs`
+(heuristic binding application), in-file tests. Store
 schema NOT expected; if the promotion cannot reuse the existing
 provisional→native identity path without schema changes, STOP and report.
 
