@@ -76,11 +76,14 @@ Order of work inside the task (writer-first; each numbered step TDD):
    - Amend the `ingest_writer_status` guard (the early return at
      `collector.rs:738-741` that today prevents observing a `Healthy` watch
      value while the facade snapshot is `Degraded`) so recovery can be seen.
-   - Probe driving: the async gated paths (`apply`, `cleanup`) drive a probe
-     when the cooldown elapsed. The synchronous `reserve_enqueue` only ARMS a
-     "probe due" flag; the async staging caller consumes it (same
-     flag-consumed-by-async-caller shape as the gap marker). `reserve_enqueue`
-     increments `skipped_enqueues` on refusal.
+   - Probe driving: the `next_probe_at` cooldown deadline is armed on the
+     `Healthy -> Degraded` edge. The async gated paths (`apply`, `cleanup`)
+     drive at most one probe per `PERSISTENCE_RETRY_INTERVAL` when the cooldown
+     has elapsed; `cleanup` runs on every sweep tick (about every 5 s), which
+     bounds recovery latency. A failed probe re-arms the cooldown and refreshes
+     the retained detail. The synchronous `reserve_enqueue` cannot await, so it
+     does not drive or arm a probe; it only increments `skipped_enqueues` on
+     refusal.
    - On observed recovery: snapshot `Healthy`; `controller_input` restored to
      `Available` iff currently `Unavailable { PersistenceUnavailable }` AND no
      acceptor stop was recorded during the outage — `mark_acceptor_stopped`

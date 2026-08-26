@@ -89,17 +89,18 @@ the code with line-level evidence.
   is not restored on recovery; that pre-existing gap is outside this increment
   and remains recorded in the backlog.
 - D4. Probe cadence and gating: at most one probe per
-  `PERSISTENCE_RETRY_INTERVAL` (default 30 s, injectable for tests). The
-  async gated entry points (`apply`, `cleanup`) may drive a probe directly;
-  the synchronous `reserve_enqueue` CANNOT await — it only ARMS a "probe due"
-  flag, which the next async caller (the staging path caller is async)
-  drives. A failed probe re-arms the cooldown and refreshes the retained
-  detail. Batches and staged events dropped while degraded stay dropped (no
-  buffering). The currently uncounted `reserve_enqueue` refusal gains a
-  `skipped_enqueues` counter; because the counters object is itself a closed
-  schema (deny-unknown-fields raw reader, exact-arity doctor check, and
-  multiple goldens), this counter addition is part of the same single
-  versioning decision as D2.
+  `PERSISTENCE_RETRY_INTERVAL` (default 30 s, injectable for tests). Probing
+  is driven by the `next_probe_at` cooldown deadline, armed on the
+  `Healthy -> Degraded` edge. A failed probe re-arms the cooldown and refreshes
+  the retained detail. The async gated entry points (`apply`, `cleanup`) drive
+  a probe when the cooldown has elapsed; `cleanup` runs on every sweep tick
+  (about every 5 s), which bounds recovery latency. The synchronous
+  `reserve_enqueue` CANNOT await, so it does not drive or arm a probe; it only
+  counts the refusal via `skipped_enqueues`. Batches and staged events dropped
+  while degraded stay dropped (no buffering). Because the counters object is
+  itself a closed schema (deny-unknown-fields raw reader, exact-arity doctor
+  check, and multiple goldens), this counter addition is part of the same
+  single versioning decision as D2.
 
 ### F-C: a flood of no-op events must not disable convergence or the watchdog
 

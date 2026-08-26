@@ -999,7 +999,9 @@ impl RuntimePersistence {
         ) {
             // The one-shot acceptor cannot recover with persistence, so its stop must survive.
             recovery.acceptor_stop_pending = true;
-        } else {
+        } else if snapshot.controller_input == ControllerInputStatus::Available {
+            // Only pre-outage availability may become persistence-unavailable, so recovery can
+            // safely restore availability from this reason.
             snapshot.controller_input = ControllerInputStatus::Unavailable {
                 reason: ControllerInputUnavailableReason::PersistenceUnavailable,
             };
@@ -8895,6 +8897,40 @@ mod tests {
         assert_eq!(
             runtime.apply(Vec::new()).await.unwrap(),
             RuntimeWriteOutcome::Durable
+        );
+
+        shutdown_writer(lifecycle).await;
+    }
+
+    #[tokio::test]
+    async fn persistence_recovery_preserves_preexisting_runtime_unsafe_input() {
+        let (_directory, root, lifecycle, mut runtime, diagnostics) =
+            recoverable_runtime(Duration::from_secs(30));
+        runtime.snapshot.controller_input = ControllerInputStatus::Unavailable {
+            reason: ControllerInputUnavailableReason::RuntimeUnsafe,
+        };
+
+        assert!(matches!(
+            runtime
+                .update_owner_location("terminal-2", "pane-2")
+                .await
+                .unwrap(),
+            RuntimeWriteOutcome::NotCommitted(_)
+        ));
+        replace_runtime_owner_trigger(&root, None);
+        runtime.recovery.next_probe_at = Some(Instant::now());
+
+        assert_eq!(
+            runtime.cleanup(0).await.unwrap(),
+            RuntimeWriteOutcome::Skipped
+        );
+        let snapshot = diagnostics.borrow().clone();
+        assert_eq!(snapshot.persistence, PersistenceStatus::Healthy);
+        assert_eq!(
+            snapshot.controller_input,
+            ControllerInputStatus::Unavailable {
+                reason: ControllerInputUnavailableReason::RuntimeUnsafe,
+            }
         );
 
         shutdown_writer(lifecycle).await;
