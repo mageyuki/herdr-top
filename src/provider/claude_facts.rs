@@ -1,11 +1,14 @@
 //! Typed allowlist extraction for Claude transcript records.
 
+use std::fmt;
+use std::path::PathBuf;
+
 use serde::Deserialize;
 
 use crate::model::{TokenBreakdown, sanitize_controller_text};
 
 use super::facts::{
-    ActivitySource, LogFact, SessionScope, repo_relative, scan_raw_ids, truncate_60,
+    ActivitySource, EvidenceId, LogFact, SessionScope, is_uuid_token, repo_relative, truncate_60,
 };
 
 #[derive(Deserialize)]
@@ -59,6 +62,16 @@ struct ContentBlock {
 struct ToolInput {
     description: Option<String>,
     file_path: Option<String>,
+    command: Option<PrivateCommand>,
+}
+
+#[derive(Deserialize)]
+struct PrivateCommand(String);
+
+impl fmt::Debug for PrivateCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PrivateCommand(<redacted>)")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,13 +107,7 @@ struct MetaRecord {
 /// Extracts allowlisted facts from one Claude JSONL transcript line.
 #[must_use]
 pub fn extract_claude_line(scope: &SessionScope, line: &str) -> Vec<LogFact> {
-    let mut facts = scan_raw_ids(line)
-        .into_iter()
-        .map(|id| LogFact::EvidenceId {
-            parent: scope.clone(),
-            id,
-        })
-        .collect::<Vec<_>>();
+    let mut facts = Vec::new();
 
     let Ok(record_type) = serde_json::from_str::<RecordType>(line) else {
         return facts;
@@ -186,6 +193,7 @@ fn extract_assistant(scope: &SessionScope, line: &str, facts: &mut Vec<LogFact>)
     }
 
     for block in message.content.unwrap_or_default() {
+        facts.extend(command_evidence(scope, &block));
         if let Some(line) = activity_line(block, record.cwd.as_deref().unwrap_or_default()) {
             facts.push(LogFact::Activity {
                 scope: scope.clone(),
@@ -195,6 +203,200 @@ fn extract_assistant(scope: &SessionScope, line: &str, facts: &mut Vec<LogFact>)
             });
         }
     }
+}
+
+fn command_evidence(scope: &SessionScope, block: &ContentBlock) -> Vec<LogFact> {
+    if block.block_type.as_deref() != Some("tool_use") || block.name.as_deref() != Some("Bash") {
+        return Vec::new();
+    }
+    let Some(command) = block
+        .input
+        .as_ref()
+        .and_then(|input| input.command.as_ref())
+    else {
+        return Vec::new();
+    };
+
+    shell_simple_commands(&command.0)
+        .into_iter()
+        .flat_map(simple_command_evidence)
+        .map(|id| LogFact::EvidenceId {
+            parent: scope.clone(),
+            id,
+        })
+        .collect()
+}
+
+fn simple_command_evidence(words: Vec<String>) -> Vec<EvidenceId> {
+    let mut evidence = Vec::new();
+    let mut index = 0;
+    loop {
+        while let Some((name, value)) = words.get(index).and_then(|word| shell_assignment(word)) {
+            if name == "CLAUDE_CONFIG_DIR" && !value.is_empty() {
+                push_evidence(&mut evidence, EvidenceId::ConfigDir(PathBuf::from(value)));
+            }
+            index += 1;
+        }
+
+        if words.get(index).map(String::as_str) != Some("env") {
+            break;
+        }
+        index += 1;
+        loop {
+            match words.get(index).map(String::as_str) {
+                Some("-" | "-i" | "--ignore-environment") => index += 1,
+                Some("-u" | "--unset") => {
+                    if words.get(index + 1).is_none() {
+                        return evidence;
+                    }
+                    index += 2;
+                }
+                Some(option) if option.starts_with("--unset=") && option.len() > 8 => index += 1,
+                Some("--") => {
+                    index += 1;
+                    break;
+                }
+                Some(option) if option.starts_with('-') => return evidence,
+                Some(_) | None => break,
+            }
+        }
+    }
+
+    let child_id = match words.get(index..).unwrap_or_default() {
+        [command, exec, resume, child_id, ..]
+            if command == "codex" && exec == "exec" && resume == "resume" =>
+        {
+            Some(child_id)
+        }
+        [command, resume, child_id, ..] if command == "claude" && resume == "--resume" => {
+            Some(child_id)
+        }
+        _ => None,
+    };
+    if let Some(child_id) = child_id.filter(|child_id| is_uuid_token(child_id)) {
+        push_evidence(&mut evidence, EvidenceId::Uuid(child_id.clone()));
+    }
+    evidence
+}
+
+fn shell_assignment(word: &str) -> Option<(&str, &str)> {
+    let (name, value) = word.split_once('=')?;
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    (matches!(first, 'A'..='Z' | 'a'..='z' | '_')
+        && chars.all(|ch| matches!(ch, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_')))
+    .then_some((name, value))
+}
+
+fn push_evidence(evidence: &mut Vec<EvidenceId>, id: EvidenceId) {
+    if !evidence.contains(&id) {
+        evidence.push(id);
+    }
+}
+
+fn shell_simple_commands(script: &str) -> Vec<Vec<String>> {
+    let mut commands = Vec::new();
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut backtick = false;
+    let mut substitution_depth = 0_u32;
+    let mut supported = true;
+    let mut chars = script.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            } else if ch == '\\' && active_quote == '"' {
+                if let Some(escaped) = chars.next() {
+                    word.push(escaped);
+                }
+            } else {
+                word.push(ch);
+            }
+            continue;
+        }
+        if backtick {
+            if ch == '`' {
+                backtick = false;
+            } else {
+                word.push(ch);
+            }
+            continue;
+        }
+        if substitution_depth > 0 {
+            match ch {
+                '\'' | '"' => quote = Some(ch),
+                '`' => backtick = true,
+                '(' => substitution_depth += 1,
+                ')' => substitution_depth -= 1,
+                _ => word.push(ch),
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '\\' => {
+                if let Some(escaped) = chars.next() {
+                    word.push(escaped);
+                }
+            }
+            '`' => {
+                supported = false;
+                backtick = true;
+            }
+            '$' if chars.peek() == Some(&'(') => {
+                supported = false;
+                substitution_depth = 1;
+                let _ = chars.next();
+            }
+            '\n' => finish_simple_command(&mut commands, &mut words, &mut word, &mut supported),
+            ';' | '&' | '|' | '(' | ')' | '{' | '}' => {
+                finish_simple_command(&mut commands, &mut words, &mut word, &mut supported);
+                if matches!(ch, '&' | '|') && chars.peek() == Some(&ch) {
+                    let _ = chars.next();
+                }
+            }
+            '#' if word.is_empty() => {
+                for comment in chars.by_ref() {
+                    if comment == '\n' {
+                        break;
+                    }
+                }
+                finish_simple_command(&mut commands, &mut words, &mut word, &mut supported);
+            }
+            ch if ch.is_whitespace() => finish_shell_word(&mut words, &mut word),
+            _ => word.push(ch),
+        }
+    }
+
+    if quote.is_none() && !backtick && substitution_depth == 0 {
+        finish_simple_command(&mut commands, &mut words, &mut word, &mut supported);
+    }
+    commands
+}
+
+fn finish_shell_word(words: &mut Vec<String>, word: &mut String) {
+    if !word.is_empty() {
+        words.push(std::mem::take(word));
+    }
+}
+
+fn finish_simple_command(
+    commands: &mut Vec<Vec<String>>,
+    words: &mut Vec<String>,
+    word: &mut String,
+    supported: &mut bool,
+) {
+    finish_shell_word(words, word);
+    if *supported && !words.is_empty() {
+        commands.push(std::mem::take(words));
+    } else {
+        words.clear();
+    }
+    *supported = true;
 }
 
 fn extract_user(scope: &SessionScope, line: &str, facts: &mut Vec<LogFact>) {
@@ -425,6 +627,13 @@ mod tests {
             .join("tests/fixtures/provider-logs")
             .join(name);
         fs::read_to_string(path).expect("fixture must be readable")
+    }
+
+    fn provider_fixture(name: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/provider")
+            .join(name);
+        fs::read_to_string(path).expect("provider fixture must be readable")
     }
 
     fn root_scope() -> SessionScope {
@@ -815,15 +1024,12 @@ mod tests {
                 .is_empty()
         );
         assert!(extract_claude_line(&root_scope(), "not json at all").is_empty());
-        assert_eq!(
+        assert!(
             extract_claude_line(
                 &root_scope(),
                 "garbage 6f9bdfa0-1502-4a37-97aa-c45591141130"
-            ),
-            vec![LogFact::EvidenceId {
-                parent: root_scope(),
-                id: EvidenceId::Uuid("6f9bdfa0-1502-4a37-97aa-c45591141130".to_owned()),
-            }]
+            )
+            .is_empty()
         );
     }
 
@@ -955,8 +1161,59 @@ mod tests {
     }
 
     #[test]
-    fn config_dir_evidence_is_preserved_from_bash_raw_line() {
-        let facts = fixture("claude-session.jsonl")
+    fn pasted_tool_result_uuid_is_not_lineage_evidence() {
+        let input = provider_fixture("claude-lineage-evidence.jsonl");
+        let line = input.lines().next().expect("fixture has pasted listing");
+
+        assert!(
+            extract_claude_line(&root_scope(), line)
+                .into_iter()
+                .all(|fact| !matches!(fact, LogFact::EvidenceId { .. }))
+        );
+    }
+
+    #[test]
+    fn quoted_resume_lookalike_is_not_lineage_evidence() {
+        let input = provider_fixture("claude-lineage-evidence.jsonl");
+        let line = input.lines().nth(1).expect("fixture has quoted lookalike");
+
+        assert!(
+            extract_claude_line(&root_scope(), line)
+                .into_iter()
+                .all(|fact| !matches!(fact, LogFact::EvidenceId { .. }))
+        );
+    }
+
+    #[test]
+    fn resume_invocations_emit_only_the_typed_child_ids() {
+        let evidence = provider_fixture("claude-lineage-evidence.jsonl")
+            .lines()
+            .flat_map(|line| extract_claude_line(&root_scope(), line))
+            .filter_map(|fact| match fact {
+                LogFact::EvidenceId { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(evidence.contains(&EvidenceId::Uuid(
+            "33333333-3333-4333-8333-333333333333".to_owned()
+        )));
+        assert!(evidence.contains(&EvidenceId::Uuid(
+            "44444444-4444-4444-8444-444444444444".to_owned()
+        )));
+        for rejected in [
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+            "55555555-5555-4555-8555-555555555555",
+            "66666666-6666-4666-8666-666666666666",
+        ] {
+            assert!(!evidence.contains(&EvidenceId::Uuid(rejected.to_owned())));
+        }
+    }
+
+    #[test]
+    fn config_dir_evidence_is_preserved_from_bash_command_assignment() {
+        let facts = provider_fixture("claude-lineage-evidence.jsonl")
             .lines()
             .flat_map(|line| extract_claude_line(&root_scope(), line))
             .collect::<Vec<_>>();
@@ -964,6 +1221,10 @@ mod tests {
         assert!(facts.contains(&LogFact::EvidenceId {
             parent: root_scope(),
             id: EvidenceId::ConfigDir(PathBuf::from("/home/user/.claude-secondary")),
+        }));
+        assert!(!facts.contains(&LogFact::EvidenceId {
+            parent: root_scope(),
+            id: EvidenceId::ConfigDir(PathBuf::from("/home/user/.claude-printed")),
         }));
     }
 }

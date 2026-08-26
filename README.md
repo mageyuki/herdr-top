@@ -85,16 +85,14 @@ and time. The TUI paints no column-header row. As the tree pane narrows, it
 drops model, effort, token rate, token total, and time in that order after
 truncating labels and compressing deep indentation.
 
-Claude Agent-tool children carry full lineage through their `.meta.json`
-sidecars. Inner Codex lineage is shown only when the child's session ID appears
-in the parent's admitted artifacts, such as a spawn command, resume invocation,
-or quoted report. With that evidence, herdr-top admits the child and attaches it
-in the tree. Without it, the rollout is not admitted and is not displayed
-anywhere, including under `Unattached`; herdr-top never guesses from timing,
-neighboring panes, or shared paths. As an optional convention, make the
-dispatching agent echo the child session ID into its own transcript. For
-headless Claude children, use `claude -p --output-format json ...` and retain
-the returned `session_id` in the parent transcript.
+Lineage evidence has three positions: Claude Agent-tool `.meta.json` sidecars;
+real Bash-command invocations of `codex exec resume <uuid>` or
+`claude --resume <uuid>` plus leading `CLAUDE_CONFIG_DIR=` assignments; and
+Codex's typed `sub_agent_activity.agent_thread_id` child references. UUIDs must
+exactly match discovered artifacts. Quoted reports, printed lookalikes, bare
+spawns, spawn output, tool-result bodies, and UUID-shaped text elsewhere are not
+evidence. Without one of those positions, a child is not admitted or displayed;
+herdr-top never guesses from timing, neighboring panes, or shared paths.
 
 See the [TUI guide](docs/tui.md) for the complete key map, row grammar, views,
 overlays, and visibility rules.

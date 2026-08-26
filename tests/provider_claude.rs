@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 
 use herdr_top::model::Provider;
 use herdr_top::provider::claude::{ClaudeAdapter, ClaudeBootstrapParser};
+use herdr_top::provider::claude_facts::extract_claude_line;
 use herdr_top::provider::facts::{EvidenceId, SessionScope};
-use herdr_top::provider::lane::{Admission, AdmissionIndex};
+use herdr_top::provider::lane::{Admission, AdmissionIndex, Synthesis};
 use herdr_top::provider::{
     DiscoveryIndex, DiscoveryRoot, PathInterner, ProviderDiagnostics, ProviderEvent,
     SourcePosition, TailRecord,
@@ -235,6 +236,71 @@ fn parse_inline(
             )
         })
         .collect()
+}
+
+#[test]
+fn resume_command_admits_child_from_only_the_pane_root() {
+    const RESUMED: &str = "d7777777-7777-4777-8777-777777777777";
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join(PROJECT);
+    fs::create_dir_all(&project).unwrap();
+    let parent_path = project.join(format!("{ROOT_ID}.jsonl"));
+    let child_path = project.join(format!("{RESUMED}.jsonl"));
+    let parent_line = format!(
+        r#"{{"type":"assistant","uuid":"77777777-7777-4777-8777-777777777777","timestamp":"2026-08-24T07:30:00.000Z","sessionId":"{ROOT_ID}","isSidechain":false,"message":{{"content":[{{"type":"tool_use","name":"Bash","input":{{"command":"claude --resume {RESUMED}"}}}}]}}}}"#
+    );
+    let child_line = format!(
+        r#"{{"type":"user","uuid":"88888888-8888-4888-8888-888888888888","timestamp":"2026-08-24T07:31:00.000Z","sessionId":"{RESUMED}","isSidechain":false}}"#
+    );
+    fs::write(&parent_path, format!("{parent_line}\n")).unwrap();
+    fs::write(&child_path, format!("{child_line}\n")).unwrap();
+
+    let mut index = DiscoveryIndex::new(vec![DiscoveryRoot {
+        provider: Provider::Claude,
+        path: directory.path().to_path_buf(),
+    }])
+    .unwrap();
+    let mut admission = Admission::new(0);
+    admission.admit_pane_session(Provider::Claude, ROOT_ID);
+    let mut evidence = AdmissionIndex::new();
+    let mut parser = ClaudeBootstrapParser;
+    let mut interner = PathInterner::default();
+    index
+        .scan_admitted(
+            &mut parser,
+            &mut interner,
+            &admission,
+            &mut evidence,
+            &ProviderDiagnostics::default(),
+        )
+        .unwrap();
+    assert_eq!(index.files().len(), 1);
+    assert!(!admission.is_admitted_path(&child_path));
+
+    let facts = extract_claude_line(&SessionScope::ClaudeRoot(ROOT_ID.to_owned()), &parent_line)
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, fact)| (ordinal as u64, fact));
+    let _events =
+        Synthesis::default().synthesize_batch(&parent_path, facts, &mut admission, &evidence);
+    assert!(admission.is_admitted_path(&child_path));
+
+    index
+        .scan_admitted(
+            &mut parser,
+            &mut interner,
+            &admission,
+            &mut evidence,
+            &ProviderDiagnostics::default(),
+        )
+        .unwrap();
+    assert!(index.files().iter().any(|file| {
+        file.root.join(&file.relative_path) == child_path
+            && file
+                .bootstrap
+                .as_ref()
+                .is_some_and(|identity| identity.thread_id == RESUMED)
+    }));
 }
 
 #[test]

@@ -15,20 +15,19 @@ The hook integration does not produce dependency edges. Neither provider's hook
 surface can derive semantic dependencies between runs. Add those relationships
 explicitly as described in [Add dependency edges manually](#add-dependency-edges-manually).
 
-Claude Agent-tool children always carry full lineage because their
-`.meta.json` sidecars name the parent and agent type. Inner Codex lineage is
-available only when the child's session ID occurs in the parent's admitted
-artifacts, such as a spawn command, resume invocation, or quoted report. When
-the ID is present, herdr-top admits the child and attaches it in the tree. When
-the ID is absent, the rollout is not admitted and therefore is not displayed
-anywhere, including under `Unattached`; herdr-top never guesses from timing,
-neighboring panes, or shared paths. Measurements on the reference development
-machine found the ID in only a small minority of bare spawn command lines,
-while quoted reports and resumes carried it reliably. An optional convention
-closes this gap: have the dispatching agent echo the child session ID into its
-own transcript. For a headless Claude child, run
-`claude -p --output-format json ...` and retain the returned `session_id` in the
-parent transcript.
+Claude Agent-tool children carry lineage through `.meta.json` sidecars that
+name the parent and agent type. The other admitted positions are actual Bash
+tool-use commands `codex exec resume <uuid>` and `claude --resume <uuid>`,
+leading `CLAUDE_CONFIG_DIR=` assignments, and Codex's typed
+`sub_agent_activity.agent_thread_id` child reference. Resume UUIDs must exactly
+match discovered artifacts. Quoted reports, printed command lookalikes,
+tool-result bodies, bare `codex exec` or `claude -p` spawns, and spawn output are
+not evidence. Measurements on the reference development machine found the
+child ID in only a small minority of bare spawn command lines; because a fresh
+child normally assigns its ID after launch, those spawns are intentionally not
+used for lineage. Linking wrapper children whose IDs surface only in spawn
+output is deferred; herdr-top does not guess from timing, neighboring panes, or
+shared paths.
 
 ## Install the standalone CLI
 

@@ -14,8 +14,8 @@ use crate::model::{TokenBreakdown, sanitize_controller_text};
 
 use super::claude_facts::{parse_decimal, parse_timestamp_ms};
 use super::facts::{
-    ActivitySource, CodexInternal, LogFact, SessionScope, repo_relative, sanitize_command_script,
-    scan_raw_ids, truncate_60,
+    ActivitySource, CodexInternal, EvidenceId, LogFact, SessionScope, is_uuid_token, repo_relative,
+    sanitize_command_script, truncate_60,
 };
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +104,7 @@ struct EventTypeEnvelope {
 struct EventTypePayload {
     #[serde(rename = "type")]
     event_type: Option<String>,
+    agent_thread_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -285,13 +286,7 @@ pub fn extract_codex_line(rollout_id: &str, record_ordinal: u64, line: &str) -> 
     let scope = SessionScope::Codex {
         rollout_id: rollout_id.to_owned(),
     };
-    let mut facts = scan_raw_ids(line)
-        .into_iter()
-        .map(|id| LogFact::EvidenceId {
-            parent: scope.clone(),
-            id,
-        })
-        .collect::<Vec<_>>();
+    let mut facts = Vec::new();
 
     let Ok(record) = serde_json::from_str::<RecordEnvelope>(line) else {
         return facts;
@@ -372,7 +367,10 @@ fn extract_event(
     let Ok(envelope) = serde_json::from_str::<EventTypeEnvelope>(line) else {
         return;
     };
-    let Some(event_type) = envelope.payload.and_then(|payload| payload.event_type) else {
+    let Some(payload) = envelope.payload else {
+        return;
+    };
+    let Some(event_type) = payload.event_type else {
         return;
     };
 
@@ -382,6 +380,14 @@ fn extract_event(
         "turn_aborted" => push_lifecycle(rollout_id, at_ms, facts, Lifecycle::Aborted),
         "token_count" => extract_token_count(scope, line, at_ms, record_ordinal, facts),
         "item_completed" => extract_item_completed(rollout_id, scope, line, at_ms, facts),
+        "sub_agent_activity" => {
+            if let Some(agent_thread_id) = payload.agent_thread_id.filter(|id| is_uuid_token(id)) {
+                facts.push(LogFact::EvidenceId {
+                    parent: scope.clone(),
+                    id: EvidenceId::Uuid(agent_thread_id),
+                });
+            }
+        }
         _ => {}
     }
 }
