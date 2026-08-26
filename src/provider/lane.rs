@@ -979,6 +979,8 @@ pub struct DiscoveredArtifact {
     pub path: PathBuf,
     /// Filesystem modification time observed during discovery, in Unix milliseconds.
     pub modified_ms: i64,
+    /// Filename-derived creation time, when the provider artifact names it unambiguously.
+    pub creation_ms: Option<i64>,
     /// Provider-specific artifact identity and kind.
     pub kind: DiscoveredArtifactKind,
 }
@@ -1005,6 +1007,7 @@ impl AdmissionIndex {
                 provider: Provider::Claude,
                 path,
                 modified_ms,
+                creation_ms: None,
                 kind: DiscoveredArtifactKind::ClaudeSession {
                     session_id: session_id.to_owned(),
                 },
@@ -1026,6 +1029,7 @@ impl AdmissionIndex {
                 provider: Provider::Claude,
                 path,
                 modified_ms,
+                creation_ms: None,
                 kind: DiscoveredArtifactKind::ClaudeSubagent {
                     parent: parent.to_owned(),
                     agent_id: agent_id.to_owned(),
@@ -1036,12 +1040,17 @@ impl AdmissionIndex {
 
     /// Records one discovered Codex rollout transcript.
     pub fn insert_codex_rollout(&mut self, rollout_id: &str, path: PathBuf, modified_ms: i64) {
+        let creation_ms = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(rollout_filename_timestamp_ms);
         self.insert(
             rollout_id,
             DiscoveredArtifact {
                 provider: Provider::Codex,
                 path,
                 modified_ms,
+                creation_ms,
                 kind: DiscoveredArtifactKind::CodexRollout {
                     rollout_id: rollout_id.to_owned(),
                 },
@@ -1219,6 +1228,22 @@ impl AdmissionIndex {
     #[must_use]
     pub fn artifacts_for_uuid(&self, uuid: &str) -> &[DiscoveredArtifact] {
         self.by_identity.get(uuid).map_or(&[], Vec::as_slice)
+    }
+
+    /// Returns every filename-timestamped Codex rollout in stable identity/path order.
+    pub fn codex_rollouts(&self) -> Vec<(&str, &DiscoveredArtifact)> {
+        let mut rollouts = self
+            .by_identity
+            .iter()
+            .flat_map(|(identity, artifacts)| {
+                artifacts.iter().filter_map(move |artifact| {
+                    matches!(artifact.kind, DiscoveredArtifactKind::CodexRollout { .. })
+                        .then_some((identity.as_str(), artifact))
+                })
+            })
+            .collect::<Vec<_>>();
+        rollouts.sort_by(|left, right| (left.0, &left.1.path).cmp(&(right.0, &right.1.path)));
+        rollouts
     }
 
     /// Indexes an artifact by provider-native identity using path topology and discovery mtime.
@@ -1728,7 +1753,7 @@ fn civil_day(year: u32, month: u32, day: u32) -> Option<i64> {
     Some(era * 146_097 + day_of_era - 719_468)
 }
 
-fn rollout_filename_timestamp_ms(file_name: &str) -> Option<i64> {
+pub(crate) fn rollout_filename_timestamp_ms(file_name: &str) -> Option<i64> {
     const MILLIS_PER_DAY: i64 = 86_400_000;
 
     let value = file_name.strip_prefix("rollout-")?;

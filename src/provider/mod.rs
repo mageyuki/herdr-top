@@ -21,7 +21,7 @@ use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
 use crate::model::{
     ControllerEvent, ExecState, MinimalProviderMetadata, Provider, ProviderDiagnosticsHandle,
-    RunKey, TokenBreakdown,
+    RunId, RunKey, TokenBreakdown,
 };
 
 pub mod claude;
@@ -66,8 +66,17 @@ pub struct SourcePosition {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderSourceState {
     Available,
+    AvailableWithBindings { bindings: Vec<CodexPaneBinding> },
     Unavailable { detail: String },
     NotApplicable,
+}
+
+/// One globally unambiguous sessionless Codex pane-to-rollout match.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexPaneBinding {
+    pub run_id: RunId,
+    pub sid: String,
+    pub observed_at_ms: i64,
 }
 
 /// Allowlisted event emitted by a provider adapter.
@@ -1489,11 +1498,19 @@ pub struct ProviderTarget {
     pub path: PathBuf,
 }
 
+/// One live sessionless Codex pane awaiting a one-shot native rollout binding.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct CodexPaneTarget {
+    pub run_id: RunId,
+    pub detected_at_ms: i64,
+}
+
 /// Latest provider-attributed collector target set.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TargetSet {
     targets: HashSet<ProviderTarget>,
     sessions: HashSet<(Provider, String)>,
+    codex_panes: HashSet<CodexPaneTarget>,
 }
 
 impl TargetSet {
@@ -1502,6 +1519,7 @@ impl TargetSet {
         Self {
             targets: targets.into_iter().collect(),
             sessions: HashSet::new(),
+            codex_panes: HashSet::new(),
         }
     }
 
@@ -1513,6 +1531,20 @@ impl TargetSet {
         Self {
             targets: targets.into_iter().collect(),
             sessions: sessions.into_iter().collect(),
+            codex_panes: HashSet::new(),
+        }
+    }
+
+    /// Creates a target set including live sessionless Codex pane identities.
+    pub(crate) fn new_with_sessions_and_codex_panes(
+        targets: impl IntoIterator<Item = ProviderTarget>,
+        sessions: impl IntoIterator<Item = (Provider, String)>,
+        codex_panes: impl IntoIterator<Item = CodexPaneTarget>,
+    ) -> Self {
+        Self {
+            targets: targets.into_iter().collect(),
+            sessions: sessions.into_iter().collect(),
+            codex_panes: codex_panes.into_iter().collect(),
         }
     }
 
@@ -1526,6 +1558,11 @@ impl TargetSet {
         self.sessions
             .iter()
             .map(|(provider, session_id)| (*provider, session_id.as_str()))
+    }
+
+    /// Returns live sessionless Codex panes awaiting native identity.
+    pub(crate) fn codex_panes(&self) -> impl Iterator<Item = CodexPaneTarget> + '_ {
+        self.codex_panes.iter().copied()
     }
 }
 

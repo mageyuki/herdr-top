@@ -20,6 +20,13 @@ pub enum BindingEvidence {
         /// The provider-native session ID.
         sid: String,
     },
+    /// A globally unambiguous sessionless Codex pane was matched to one rollout.
+    HeuristicNativeSession {
+        /// The still-provisional pane run receiving the one-shot binding.
+        run: RunId,
+        /// Provider-native Codex rollout ID selected by discovery.
+        sid: String,
+    },
     /// A provider adapter resolved a path-keyed run to its native session ID.
     NativePathResolved {
         /// The path-keyed run whose provider file supplied the evidence.
@@ -189,6 +196,9 @@ pub fn plan_binding(model: &DomainModel, ev: &BindingEvidence) -> BindingPlan {
         BindingEvidence::NativeSession { run, provider, sid } => {
             plan_native_session(model, *run, *provider, sid)
         }
+        BindingEvidence::HeuristicNativeSession { run, sid } => {
+            plan_heuristic_native_session(model, *run, sid)
+        }
         BindingEvidence::NativePathResolved { run, provider, sid } => {
             plan_native_path_resolution(model, *run, *provider, sid)
         }
@@ -201,6 +211,22 @@ pub fn plan_binding(model: &DomainModel, ev: &BindingEvidence) -> BindingPlan {
             controller_run,
             terminal_id,
         } => plan_controller_terminal(model, *controller_run, terminal_id),
+    }
+}
+
+fn plan_heuristic_native_session(model: &DomainModel, run: RunId, sid: &str) -> BindingPlan {
+    let Some(observed) = model.task_run(&run) else {
+        return BindingPlan::Conflict(MergeConflict::MissingRun { run });
+    };
+    match &observed.key {
+        RunKey::Provisional { .. } => plan_native_session(model, run, Provider::Codex, sid),
+        RunKey::Native {
+            provider,
+            sid: bound,
+        } if *provider == Provider::Codex && bound == sid => BindingPlan::NoChange,
+        RunKey::Controller(_) | RunKey::Native { .. } | RunKey::NativePath { .. } => {
+            BindingPlan::Conflict(MergeConflict::EvidenceMismatch { run })
+        }
     }
 }
 
@@ -1161,6 +1187,7 @@ mod tests {
         fn assert_exhaustive(evidence: BindingEvidence) {
             match evidence {
                 BindingEvidence::NativeSession { .. }
+                | BindingEvidence::HeuristicNativeSession { .. }
                 | BindingEvidence::NativePathResolved { .. }
                 | BindingEvidence::ControllerNativeSession { .. }
                 | BindingEvidence::ControllerTerminal { .. } => {}

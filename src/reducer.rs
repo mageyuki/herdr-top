@@ -415,6 +415,28 @@ impl Reducer {
         self.apply_observation(vec![event])
     }
 
+    /// Applies one globally unambiguous sessionless Codex pane binding.
+    pub(crate) fn apply_heuristic_binding(
+        &mut self,
+        run: RunId,
+        sid: String,
+        bookkeeping_time_ms: i64,
+    ) -> ApplyOutcome {
+        let plan = plan_binding(
+            &self.model,
+            &BindingEvidence::HeuristicNativeSession { run, sid },
+        );
+        let mut persist = match apply_binding_plan_at(&mut self.model, plan, bookkeeping_time_ms) {
+            Ok(persist) => persist,
+            Err(conflict) => return ApplyOutcome::DroppedBindingConflict(conflict),
+        };
+        self.recompute_dangling_announcement_components();
+        normalize_persist_batch_lineage(&mut persist);
+        self.operator.apply_submission(&persist);
+        self.publish();
+        ApplyOutcome::Applied(persist)
+    }
+
     /// Applies one source observation and publishes exactly one resulting snapshot.
     pub fn apply_observation(
         &mut self,
