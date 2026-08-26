@@ -90,7 +90,8 @@ Order of work inside the task (writer-first; each numbered step TDD):
      "recovered, marker pending" flag which the collector loop consumes to
      enqueue `RecordCollectorGap { kind: PersistenceOutage }` via
      `persist_submission` (Reducer in scope there).
-   - Owner freshness stays `Stale` until the next successful owner update.
+   - Owner freshness is not restored on recovery; that pre-existing gap is
+     outside this increment and remains recorded in the backlog.
 4. **Transition warn (D1).** Warn on `Healthy -> Degraded` in the facade
    (`record_facade_failure`) — once per transition, not per skip.
 
