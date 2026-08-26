@@ -1463,6 +1463,9 @@ impl Reducer {
                     });
                 }
                 TopologyEntity::Tab(tab) => {
+                    if self.model.workspace(&tab.workspace_id).is_none() {
+                        return Ok(());
+                    }
                     let mut tab = tab.clone();
                     if tab.label.is_none() && metadata.source_event_type != TAB_RENAMED_EVENT {
                         tab.label = self
@@ -1483,6 +1486,9 @@ impl Reducer {
                     }
                 }
                 TopologyEntity::Pane(pane) => {
+                    if self.model.tab(&pane.tab_id).is_none() {
+                        return Ok(());
+                    }
                     let mut pane = pane.clone();
                     if pane.display_name.is_none() {
                         pane.display_name = self
@@ -5090,6 +5096,242 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn topology_upsert_drops_pane_after_parent_tab_closes_and_snapshot_restores() {
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        for (event_id, entity) in [
+            (
+                "workspace-created",
+                TopologyEntity::Workspace(Workspace {
+                    workspace_id: "workspace".to_owned(),
+                }),
+            ),
+            (
+                "tab-created",
+                TopologyEntity::Tab(Tab {
+                    tab_id: "tab".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    label: None,
+                }),
+            ),
+        ] {
+            reducer
+                .apply(topology_entity_event(event_id, entity))
+                .unwrap();
+        }
+        reducer
+            .apply(NormalizedEvent::TopologyClosure {
+                metadata: metadata("tab-closed", 1_001),
+                entity: TopologyEntityId::Tab {
+                    tab_id: "tab".to_owned(),
+                },
+            })
+            .unwrap();
+
+        let ApplyOutcome::Applied(orphan_batch) = reducer
+            .apply(topology_entity_event(
+                "pane-created-after-tab-closed",
+                TopologyEntity::Pane(Pane {
+                    pane_id: "pane".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    tab_id: "tab".to_owned(),
+                    terminal_id: "terminal".to_owned(),
+                    display_name: None,
+                }),
+            ))
+            .unwrap()
+        else {
+            panic!("orphan pane observation should still be recorded");
+        };
+        assert!(
+            !orphan_batch.iter().any(|operation| matches!(
+                operation,
+                PersistOp::UpsertPane { pane, .. } if pane.pane_id == "pane"
+            )),
+            "orphan pane must not emit UpsertPane"
+        );
+        assert!(
+            shared.borrow().pane("pane").is_none(),
+            "orphan pane must not enter the model"
+        );
+
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: topology_snapshot(
+                    &["workspace"],
+                    &[("tab", "workspace")],
+                    &[("pane", "workspace", "tab")],
+                ),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let model = shared.borrow();
+        assert!(model.tab("tab").is_some());
+        assert!(model.pane("pane").is_some());
+    }
+
+    #[test]
+    fn topology_upsert_existing_tab_pane_uses_ordinal_not_consumed_by_orphan() {
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 10));
+        for (event_id, entity) in [
+            (
+                "workspace-created",
+                TopologyEntity::Workspace(Workspace {
+                    workspace_id: "workspace".to_owned(),
+                }),
+            ),
+            (
+                "tab-created",
+                TopologyEntity::Tab(Tab {
+                    tab_id: "tab".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    label: None,
+                }),
+            ),
+            (
+                "orphan-pane-created",
+                TopologyEntity::Pane(Pane {
+                    pane_id: "orphan-pane".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    tab_id: "missing-tab".to_owned(),
+                    terminal_id: "orphan-terminal".to_owned(),
+                    display_name: None,
+                }),
+            ),
+        ] {
+            reducer
+                .apply(topology_entity_event(event_id, entity))
+                .unwrap();
+        }
+
+        let ApplyOutcome::Applied(valid_batch) = reducer
+            .apply(topology_entity_event(
+                "valid-pane-created",
+                TopologyEntity::Pane(Pane {
+                    pane_id: "valid-pane".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    tab_id: "tab".to_owned(),
+                    terminal_id: "valid-terminal".to_owned(),
+                    display_name: None,
+                }),
+            ))
+            .unwrap()
+        else {
+            panic!("valid pane should apply");
+        };
+        assert!(
+            valid_batch.iter().any(|operation| matches!(
+                operation,
+                PersistOp::UpsertPane {
+                    pane,
+                    display_ordinal,
+                } if pane.pane_id == "valid-pane"
+                    && *display_ordinal == DisplayOrdinal::new(12)
+            )),
+            "valid pane must use the first ordinal after its existing parents"
+        );
+        assert!(shared.borrow().pane("valid-pane").is_some());
+    }
+
+    #[test]
+    fn topology_upsert_drops_orphan_tab_without_blocking_valid_tab_or_ordinal() {
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 20));
+        let ApplyOutcome::Applied(orphan_batch) = reducer
+            .apply(topology_entity_event(
+                "orphan-tab-created",
+                TopologyEntity::Tab(Tab {
+                    tab_id: "orphan-tab".to_owned(),
+                    workspace_id: "missing-workspace".to_owned(),
+                    label: Some("orphan".to_owned()),
+                }),
+            ))
+            .unwrap()
+        else {
+            panic!("orphan tab observation should still be recorded");
+        };
+        assert!(
+            !orphan_batch.iter().any(|operation| matches!(
+                operation,
+                PersistOp::UpsertTab { tab, .. } if tab.tab_id == "orphan-tab"
+            )),
+            "orphan tab must not emit UpsertTab"
+        );
+        assert!(
+            !orphan_batch.iter().any(|operation| matches!(
+                operation,
+                PersistOp::ClearTabLabel { tab_id } if tab_id == "orphan-tab"
+            )),
+            "orphan tab must not emit ClearTabLabel"
+        );
+        assert!(
+            shared.borrow().tab("orphan-tab").is_none(),
+            "orphan tab must not enter the model"
+        );
+
+        reducer
+            .apply(topology_entity_event(
+                "workspace-created",
+                TopologyEntity::Workspace(Workspace {
+                    workspace_id: "workspace".to_owned(),
+                }),
+            ))
+            .unwrap();
+        let ApplyOutcome::Applied(valid_batch) = reducer
+            .apply(topology_entity_event(
+                "valid-tab-created",
+                TopologyEntity::Tab(Tab {
+                    tab_id: "valid-tab".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    label: None,
+                }),
+            ))
+            .unwrap()
+        else {
+            panic!("valid tab should apply");
+        };
+        assert!(valid_batch.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertTab {
+                tab,
+                display_ordinal,
+            } if tab.tab_id == "valid-tab" && *display_ordinal == DisplayOrdinal::new(21)
+        )));
+        assert!(shared.borrow().tab("valid-tab").is_some());
+    }
+
+    #[test]
+    fn topology_upsert_drops_orphan_tab_rename_without_clearing_label() {
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let mut event_metadata = metadata("orphan-tab-renamed", 1_000);
+        event_metadata.source_event_type = "tab_renamed".to_owned();
+        let ApplyOutcome::Applied(batch) = reducer
+            .apply(NormalizedEvent::TopologyUpsert {
+                metadata: event_metadata,
+                entity: TopologyEntity::Tab(Tab {
+                    tab_id: "orphan-tab".to_owned(),
+                    workspace_id: "missing-workspace".to_owned(),
+                    label: None,
+                }),
+            })
+            .unwrap()
+        else {
+            panic!("orphan tab rename observation should still be recorded");
+        };
+
+        assert!(
+            !batch.iter().any(|operation| matches!(
+                operation,
+                PersistOp::ClearTabLabel { tab_id } if tab_id == "orphan-tab"
+            )),
+            "orphan tab rename must not emit ClearTabLabel"
+        );
+        assert!(!batch.iter().any(|operation| matches!(
+            operation,
+            PersistOp::UpsertTab { tab, .. } if tab.tab_id == "orphan-tab"
+        )));
+        assert!(shared.borrow().tab("orphan-tab").is_none());
     }
 
     #[test]
