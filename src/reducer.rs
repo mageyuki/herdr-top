@@ -1,6 +1,6 @@
 //! T7 reducer state machines, ordinal allocator, and gap reconciliation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -264,6 +264,20 @@ pub enum CommitStagedError {
     IngestSequenceExhausted,
 }
 
+/// Maximum unattributed provider-usage samples retained across all run scopes.
+///
+/// The reducer evicts the globally oldest sample first. Since each retained sample has exactly
+/// one [`RunKey`], this also bounds the number of pending scopes.
+const PENDING_TELEMETRY_SAMPLE_CAPACITY: usize = 4_096;
+
+#[derive(Clone, Debug)]
+struct PendingTelemetry {
+    at_ms: i64,
+    output_tokens: u64,
+    token_breakdown: crate::model::TokenBreakdown,
+    attribution: crate::model::TurnAttr,
+}
+
 /// Serialized owner of domain transitions and display-ordinal allocation.
 pub struct Reducer {
     model: DomainModel,
@@ -271,6 +285,9 @@ pub struct Reducer {
     next_ingest_seq: Option<i64>,
     terminal_event_sources: HashMap<RunId, String>,
     non_lane_task_state_runs: HashSet<RunId>,
+    pending_telemetry: HashMap<RunKey, VecDeque<PendingTelemetry>>,
+    pending_telemetry_order: VecDeque<RunKey>,
+    pending_telemetry_count: usize,
     publisher: watch::Sender<Arc<DomainModel>>,
     operator: OperatorProjection,
     #[cfg(test)]
@@ -334,6 +351,9 @@ impl Reducer {
                 next_ingest_seq: restored.next_ingest_seq,
                 terminal_event_sources: HashMap::new(),
                 non_lane_task_state_runs: HashSet::new(),
+                pending_telemetry: HashMap::new(),
+                pending_telemetry_order: VecDeque::new(),
+                pending_telemetry_count: 0,
                 publisher,
                 operator,
                 #[cfg(test)]
@@ -593,6 +613,10 @@ impl Reducer {
     }
 
     /// Accumulates one lane-deduplicated token sample in transient model state.
+    ///
+    /// Samples observed before their run exists remain transiently queued until any subsequent
+    /// model publication exposes that run. The pending queue is globally FIFO-bounded by
+    /// [`PENDING_TELEMETRY_SAMPLE_CAPACITY`].
     pub fn apply_telemetry_with_breakdown(
         &mut self,
         key: &RunKey,
@@ -601,10 +625,30 @@ impl Reducer {
         token_breakdown: crate::model::TokenBreakdown,
         attribution: crate::model::TurnAttr,
     ) -> Vec<PersistOp> {
-        let Some(task_run) = self.model.task_run_by_key(key) else {
-            return Vec::new();
+        let sample = PendingTelemetry {
+            at_ms,
+            output_tokens,
+            token_breakdown,
+            attribution,
         };
-        let run_id = task_run.run_id;
+        if self.model.task_run_by_key(key).is_some() {
+            let applied = self.accumulate_telemetry(key, sample);
+            debug_assert!(applied, "an existing telemetry run must remain resolvable");
+            self.publish();
+        } else {
+            self.enqueue_pending_telemetry(key.clone(), sample);
+        }
+        Vec::new()
+    }
+
+    fn accumulate_telemetry(&mut self, key: &RunKey, sample: PendingTelemetry) -> bool {
+        let Some(run_id) = self
+            .model
+            .task_run_by_key(key)
+            .map(|task_run| task_run.run_id)
+        else {
+            return false;
+        };
         let retain_turn = matches!(
             key,
             RunKey::Native {
@@ -612,17 +656,72 @@ impl Reducer {
                 ..
             }
         );
-        let telemetry = self.model.telemetry_entry(run_id, at_ms);
-        telemetry.token_breakdown.accumulate(token_breakdown);
+        let telemetry = self.model.telemetry_entry(run_id, sample.at_ms);
+        telemetry.token_breakdown.accumulate(sample.token_breakdown);
         telemetry.accumulate(
-            output_tokens,
-            attribution.model,
-            attribution.effort,
-            attribution.sandbox,
+            sample.output_tokens,
+            sample.attribution.model,
+            sample.attribution.effort,
+            sample.attribution.sandbox,
             retain_turn,
         );
-        self.publish();
-        Vec::new()
+        true
+    }
+
+    fn enqueue_pending_telemetry(&mut self, key: RunKey, sample: PendingTelemetry) {
+        while self.pending_telemetry_count >= PENDING_TELEMETRY_SAMPLE_CAPACITY {
+            self.evict_oldest_pending_telemetry();
+        }
+        self.pending_telemetry
+            .entry(key.clone())
+            .or_default()
+            .push_back(sample);
+        self.pending_telemetry_order.push_back(key);
+        self.pending_telemetry_count += 1;
+    }
+
+    fn evict_oldest_pending_telemetry(&mut self) {
+        while let Some(key) = self.pending_telemetry_order.pop_front() {
+            let Some(samples) = self.pending_telemetry.get_mut(&key) else {
+                continue;
+            };
+            if samples.pop_front().is_none() {
+                continue;
+            }
+            self.pending_telemetry_count -= 1;
+            if samples.is_empty() {
+                self.pending_telemetry.remove(&key);
+            }
+            return;
+        }
+        debug_assert_eq!(self.pending_telemetry_count, 0);
+    }
+
+    fn apply_pending_telemetry_for_known_runs(&mut self) {
+        let mut seen = HashSet::new();
+        let ready = self
+            .pending_telemetry_order
+            .iter()
+            .filter(|key| seen.insert((*key).clone()))
+            .filter(|key| self.model.task_run_by_key(key).is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in ready {
+            let Some(samples) = self.pending_telemetry.remove(&key) else {
+                continue;
+            };
+            self.pending_telemetry_count =
+                self.pending_telemetry_count.saturating_sub(samples.len());
+            self.pending_telemetry_order
+                .retain(|pending_key| pending_key != &key);
+            for sample in samples {
+                let applied = self.accumulate_telemetry(&key, sample);
+                debug_assert!(
+                    applied,
+                    "a ready pending-telemetry run must remain resolvable"
+                );
+            }
+        }
     }
 
     /// Closes one active provider-log run after append inactivity.
@@ -2437,7 +2536,8 @@ impl Reducer {
             .set_dangling_announcement_components(count);
     }
 
-    fn publish(&self) {
+    fn publish(&mut self) {
+        self.apply_pending_telemetry_for_known_runs();
         #[cfg(test)]
         self.publish_count.set(self.publish_count.get() + 1);
         // increment5-workload-harness: begin reducer clone publication timing start
@@ -2844,8 +2944,11 @@ mod tests {
         TopologyEntityId, TopologySnapshot, TurnAttr, Workspace,
     };
     use crate::provider::ProviderEvent;
-    use crate::provider::facts::{LogFact, SessionScope};
-    use crate::provider::lane::{Admission, AdmissionIndex, SOURCE_LOG_LANE, Synthesis};
+    use crate::provider::claude_facts::{extract_claude_line, extract_meta_json};
+    use crate::provider::facts::{EvidenceId, LogFact, SessionScope};
+    use crate::provider::lane::{
+        Admission, AdmissionIndex, SOURCE_LOG_LANE, Synthesis, run_key_for_scope,
+    };
     use crate::store::{
         NativeSessionBinding, PersistOp, PersistTaskRun, RestoredState, WriterClient,
         database_path, open_reader, open_writer, spawn_writer,
@@ -3871,6 +3974,381 @@ mod tests {
             assert_eq!(second, &first);
         }
         lifecycle.shutdown().await.unwrap();
+    }
+
+    const WORKER_PARENT: &str = "13f03635-c1f6-46e2-8e52-83d217b6f01c";
+    const WORKER_AGENT: &str = "a7189abbf3c5741ac";
+    const WORKER_MODEL: &str = "claude-sonnet-5";
+    const WORKER_EFFORT: &str = "high";
+    const WORKER_OUTPUT_TOKENS: u64 = 843;
+
+    fn worker_scope(agent_id: &str) -> SessionScope {
+        SessionScope::ClaudeSubagent {
+            parent: WORKER_PARENT.to_owned(),
+            agent_id: agent_id.to_owned(),
+        }
+    }
+
+    fn worker_transcript_events(
+        synthesis: &mut Synthesis,
+        scope: &SessionScope,
+        artifact: &Path,
+        admission: &mut Admission,
+        discovered: &AdmissionIndex,
+    ) -> Vec<ProviderEvent> {
+        let facts = include_str!("../tests/fixtures/provider-logs/claude-subagent.jsonl")
+            .lines()
+            .enumerate()
+            .flat_map(|(ordinal, line)| {
+                extract_claude_line(scope, line)
+                    .into_iter()
+                    .map(move |fact| (u64::try_from(ordinal).unwrap(), fact))
+            })
+            .collect::<Vec<_>>();
+        synthesis.synthesize_batch(artifact, facts, admission, discovered)
+    }
+
+    fn worker_meta_events(
+        synthesis: &mut Synthesis,
+        agent_id: &str,
+        artifact: &Path,
+        modified_ms: i64,
+        admission: &mut Admission,
+        discovered: &AdmissionIndex,
+    ) -> Vec<ProviderEvent> {
+        let fact = extract_meta_json(
+            WORKER_PARENT,
+            agent_id,
+            modified_ms,
+            include_bytes!("../tests/fixtures/provider-logs/claude-subagent-meta.json"),
+        )
+        .expect("the real-shape worker metadata fixture must parse");
+        synthesis.synthesize_batch(artifact, [(0, fact)], admission, discovered)
+    }
+
+    fn assert_worker_telemetry(telemetry: &crate::model::RunTelemetry) {
+        assert_eq!(telemetry.model.as_deref(), Some(WORKER_MODEL));
+        assert_eq!(telemetry.effort.as_deref(), Some(WORKER_EFFORT));
+        assert_eq!(telemetry.output_tokens, WORKER_OUTPUT_TOKENS);
+        assert_eq!(telemetry.token_breakdown.input_tokens, Some(663));
+        assert_eq!(telemetry.token_breakdown.cached_input_tokens, Some(224));
+        assert_eq!(telemetry.token_breakdown.cache_write_input_tokens, Some(96));
+    }
+
+    async fn apply_worker_transcript_then_meta(
+        reducer: &mut Reducer,
+        writer: &mut WriterClient,
+        synthesis: &mut Synthesis,
+        scope: &SessionScope,
+        admission: &mut Admission,
+        discovered: &AdmissionIndex,
+    ) {
+        let SessionScope::ClaudeSubagent { agent_id, .. } = scope else {
+            panic!("worker fixture scope must be a Claude lineage child");
+        };
+        let transcript = std::path::PathBuf::from(format!("agent-{agent_id}.jsonl"));
+        let transcript_events =
+            worker_transcript_events(synthesis, scope, &transcript, admission, discovered);
+        apply_telemetry_fixture_events(reducer, writer, transcript_events).await;
+        let meta = std::path::PathBuf::from(format!("agent-{agent_id}.meta.json"));
+        let meta_events = worker_meta_events(
+            synthesis,
+            agent_id,
+            &meta,
+            1_800_000_000_000,
+            admission,
+            discovered,
+        );
+        apply_telemetry_fixture_events(reducer, writer, meta_events).await;
+    }
+
+    #[tokio::test]
+    async fn real_shape_worker_usage_preceding_meta_is_attributed() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let scope = worker_scope(WORKER_AGENT);
+        let mut synthesis = Synthesis::default();
+        let mut admission = Admission::new(0);
+        let discovered = AdmissionIndex::new();
+
+        apply_worker_transcript_then_meta(
+            &mut reducer,
+            &mut writer,
+            &mut synthesis,
+            &scope,
+            &mut admission,
+            &discovered,
+        )
+        .await;
+
+        let snapshot = shared.borrow();
+        let run = snapshot
+            .task_run_by_key(&run_key_for_scope(&scope))
+            .expect("worker metadata must mint the lineage-child run");
+        let telemetry = snapshot
+            .telemetry(&run.run_id)
+            .expect("usage preceding worker metadata must be attributed");
+        assert_worker_telemetry(telemetry);
+        drop(snapshot);
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn real_shape_worker_restart_rebackfill_is_identical() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let scope = worker_scope(WORKER_AGENT);
+        let key = run_key_for_scope(&scope);
+
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let mut synthesis = Synthesis::default();
+        let mut admission = Admission::new(0);
+        apply_worker_transcript_then_meta(
+            &mut reducer,
+            &mut writer,
+            &mut synthesis,
+            &scope,
+            &mut admission,
+            &AdmissionIndex::new(),
+        )
+        .await;
+        let run_id = shared.borrow().task_run_by_key(&key).unwrap().run_id;
+        let first = shared.borrow().telemetry(&run_id).cloned();
+        lifecycle.shutdown().await.unwrap();
+
+        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+        assert!(restored.model.telemetry(&run_id).is_none());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored);
+        let mut synthesis = Synthesis::default();
+        let mut admission = Admission::new(0);
+        apply_worker_transcript_then_meta(
+            &mut reducer,
+            &mut writer,
+            &mut synthesis,
+            &scope,
+            &mut admission,
+            &AdmissionIndex::new(),
+        )
+        .await;
+        let second = shared.borrow().telemetry(&run_id).cloned();
+
+        assert_eq!(second, first, "restart replay must reproduce exact totals");
+        assert_worker_telemetry(first.as_ref().expect("first pass telemetry must exist"));
+        assert_worker_telemetry(second.as_ref().expect("restart telemetry must exist"));
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_worker_meta_cycle_applies_retained_usage() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let scope = worker_scope(WORKER_AGENT);
+        let key = run_key_for_scope(&scope);
+        let mut synthesis = Synthesis::default();
+        let mut admission = Admission::new(0);
+        let discovered = AdmissionIndex::new();
+
+        let transcript_events = worker_transcript_events(
+            &mut synthesis,
+            &scope,
+            Path::new("agent-a7189abbf3c5741ac.jsonl"),
+            &mut admission,
+            &discovered,
+        );
+        apply_telemetry_fixture_events(&mut reducer, &mut writer, transcript_events).await;
+        assert!(
+            shared.borrow().task_run_by_key(&key).is_none(),
+            "the transcript-only cycle must precede run-minting metadata"
+        );
+
+        let meta_events = worker_meta_events(
+            &mut synthesis,
+            WORKER_AGENT,
+            Path::new("agent-a7189abbf3c5741ac.meta.json"),
+            1_800_000_000_000,
+            &mut admission,
+            &discovered,
+        );
+        apply_telemetry_fixture_events(&mut reducer, &mut writer, meta_events).await;
+
+        let snapshot = shared.borrow();
+        let run_id = snapshot.task_run_by_key(&key).unwrap().run_id;
+        assert_worker_telemetry(
+            snapshot
+                .telemetry(&run_id)
+                .expect("a later metadata cycle must apply retained usage"),
+        );
+        drop(snapshot);
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn out_of_window_lineage_child_stays_unattributed() {
+        const ANCHOR_MS: i64 = 1_800_000_000_000;
+        const FRESH_AGENT: &str = "feedfacefeedface";
+        const STALE_AGENT: &str = "deadbeefdeadbeef";
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&state_root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let artifact_root = directory.path().join(WORKER_PARENT).join("subagents");
+        let fresh_transcript = artifact_root.join(format!("agent-{FRESH_AGENT}.jsonl"));
+        let fresh_meta = artifact_root.join(format!("agent-{FRESH_AGENT}.meta.json"));
+        let stale_transcript = artifact_root.join(format!("agent-{STALE_AGENT}.jsonl"));
+        let stale_meta = artifact_root.join(format!("agent-{STALE_AGENT}.meta.json"));
+        let mut discovered = AdmissionIndex::new();
+        discovered.insert_claude_subagent(
+            WORKER_PARENT,
+            FRESH_AGENT,
+            fresh_transcript.clone(),
+            ANCHOR_MS,
+        );
+        discovered.insert_claude_subagent(
+            WORKER_PARENT,
+            FRESH_AGENT,
+            fresh_meta.clone(),
+            ANCHOR_MS,
+        );
+        discovered.insert_claude_subagent(
+            WORKER_PARENT,
+            STALE_AGENT,
+            stale_transcript.clone(),
+            ANCHOR_MS - 1,
+        );
+        discovered.insert_claude_subagent(
+            WORKER_PARENT,
+            STALE_AGENT,
+            stale_meta.clone(),
+            ANCHOR_MS,
+        );
+        let parent = SessionScope::ClaudeRoot(WORKER_PARENT.to_owned());
+        let mut admission = Admission::new(ANCHOR_MS);
+        admission.admit_pane_session(Provider::Claude, WORKER_PARENT);
+        assert!(
+            admission
+                .on_evidence(
+                    &parent,
+                    &EvidenceId::Uuid(FRESH_AGENT.to_owned()),
+                    &discovered,
+                )
+                .is_some()
+        );
+        assert!(
+            admission
+                .on_evidence(
+                    &parent,
+                    &EvidenceId::Uuid(STALE_AGENT.to_owned()),
+                    &discovered,
+                )
+                .is_some()
+        );
+        assert!(admission.is_admitted_file(&fresh_transcript, ANCHOR_MS));
+        assert!(
+            !admission.is_admitted_file(&stale_transcript, ANCHOR_MS - 1),
+            "the out-of-window artifact must be a lineage child, not an anchor-exempt pane root"
+        );
+
+        let mut synthesis = Synthesis::default();
+        let fresh_scope = worker_scope(FRESH_AGENT);
+        let fresh_events = worker_transcript_events(
+            &mut synthesis,
+            &fresh_scope,
+            &fresh_transcript,
+            &mut admission,
+            &discovered,
+        );
+        apply_telemetry_fixture_events(&mut reducer, &mut writer, fresh_events).await;
+        for (agent_id, meta) in [(FRESH_AGENT, &fresh_meta), (STALE_AGENT, &stale_meta)] {
+            let events = worker_meta_events(
+                &mut synthesis,
+                agent_id,
+                meta,
+                ANCHOR_MS,
+                &mut admission,
+                &discovered,
+            );
+            apply_telemetry_fixture_events(&mut reducer, &mut writer, events).await;
+        }
+
+        let snapshot = shared.borrow();
+        let fresh_run = snapshot
+            .task_run_by_key(&run_key_for_scope(&fresh_scope))
+            .unwrap();
+        assert_worker_telemetry(
+            snapshot
+                .telemetry(&fresh_run.run_id)
+                .expect("the in-window lineage child is the positive control"),
+        );
+        let stale_scope = worker_scope(STALE_AGENT);
+        let stale_run = snapshot
+            .task_run_by_key(&run_key_for_scope(&stale_scope))
+            .unwrap();
+        assert!(
+            snapshot.telemetry(&stale_run.run_id).is_none(),
+            "the out-of-window lineage child must keep the metrics placeholder"
+        );
+        drop(snapshot);
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn pending_telemetry_fifo_evicts_oldest_sample_at_cap() {
+        const PENDING_CAP: usize = 4_096;
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        for index in 0..=PENDING_CAP {
+            let key = RunKey::Controller(format!("pending-{index}"));
+            assert!(
+                reducer
+                    .apply_telemetry(
+                        &key,
+                        i64::try_from(index).unwrap(),
+                        u64::try_from(index + 1).unwrap(),
+                        Some(WORKER_MODEL.to_owned()),
+                        Some(WORKER_EFFORT.to_owned()),
+                        None,
+                    )
+                    .is_empty()
+            );
+        }
+
+        let oldest_key = RunKey::Controller("pending-0".to_owned());
+        let newest_key = RunKey::Controller(format!("pending-{PENDING_CAP}"));
+        let oldest_id = RunId::new();
+        let newest_id = RunId::new();
+        reducer.model.insert_task_run(run_with_controller_evidence(
+            oldest_id,
+            oldest_key,
+            1,
+            TaskState::Running,
+        ));
+        reducer.model.insert_task_run(run_with_controller_evidence(
+            newest_id,
+            newest_key,
+            2,
+            TaskState::Running,
+        ));
+        reducer.publish();
+
+        let snapshot = shared.borrow();
+        assert!(
+            snapshot.telemetry(&oldest_id).is_none(),
+            "the global FIFO cap must evict the oldest pending sample"
+        );
+        let newest = snapshot
+            .telemetry(&newest_id)
+            .expect("the newest pending sample must survive FIFO eviction");
+        assert_eq!(newest.output_tokens, 4_097);
     }
 
     #[test]
