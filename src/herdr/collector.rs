@@ -5168,16 +5168,24 @@ fn derive_provider_targets_with_codex_panes(
             detected_at_ms: start_ms,
         })
     });
-    let owned_codex_sessions = model.task_run_bindings().filter_map(|(key, _)| match key {
-        RunKey::Native {
-            provider: Provider::Codex,
-            sid,
-        } if !sid.is_empty() => Some(sid.clone()),
-        RunKey::Controller(_)
-        | RunKey::Native { .. }
-        | RunKey::NativePath { .. }
-        | RunKey::Provisional { .. } => None,
-    });
+    let owned_codex_sessions = model
+        .task_run_bindings()
+        .filter_map(|(key, _)| match key {
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid,
+            } if !sid.is_empty() => Some(sid.clone()),
+            RunKey::Controller(_)
+            | RunKey::Native { .. }
+            | RunKey::NativePath { .. }
+            | RunKey::Provisional { .. } => None,
+        })
+        .chain(model.agent_nodes().filter_map(|node| {
+            (node.provider == Provider::Codex)
+                .then_some(node.native_session_id.as_ref())?
+                .filter(|sid| !sid.is_empty())
+                .cloned()
+        }));
     TargetSet::new_with_sessions_and_codex_panes(
         run_targets.chain(node_targets),
         session_targets,
@@ -16023,6 +16031,62 @@ mod provider_integration_tests {
         assert!(
             g7_bindings(&drain_pending(&mut pending)).is_empty(),
             "an already-owned native identity must not be a heuristic candidate"
+        );
+    }
+
+    #[test]
+    fn node_only_owned_codex_session_suppresses_heuristic_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        let (_, owned_sid) = g7_rollout(&root, G7_DETECTION_MS + 1_500, "node-owned");
+        let sessionless = g7_provisional("node-owned-control", 2, G7_DETECTION_MS);
+        let mut model = g7_model(std::slice::from_ref(&sessionless));
+        let owner_id = RunId::new();
+        model.insert_task_run(TaskRun {
+            run_id: owner_id,
+            key: RunKey::Controller("node-owned-controller".to_owned()),
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Running,
+            has_controller_task_state_event: false,
+            created_at_ms: Some(G7_DETECTION_MS),
+            updated_at_ms: Some(G7_DETECTION_MS),
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "agent:codex:node-owned".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some(owned_sid.clone()),
+            task_run_id: owner_id,
+            display_ordinal: DisplayOrdinal::new(1),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Working),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
+        });
+        assert!(
+            model
+                .task_run_by_key(&RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: owned_sid,
+                })
+                .is_none(),
+            "the ownership fixture must not gain a native key or alias"
+        );
+        let targets = g7_targets(&model, &[sessionless.0]);
+        let (mut worker, mut pending) = g7_worker(&root);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+
+        assert!(
+            g7_bindings(&drain_pending(&mut pending)).is_empty(),
+            "a node-only owned native identity must not be a heuristic candidate"
         );
     }
 

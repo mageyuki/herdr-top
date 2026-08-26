@@ -1782,6 +1782,8 @@ fn local_datetime_epoch_ms(
     if hour > 23 || minute > 59 || second > 59 {
         return None;
     }
+    // Rollout names carry no UTC offset, so a local wall-clock time repeated during a
+    // DST fall-back cannot be mapped to a unique epoch.
     // SAFETY: all-zero is a valid baseline for C's integer/pointer `tm` fields;
     // the fields consumed by `mktime` are initialized below before the call.
     let mut local = unsafe { std::mem::zeroed::<libc::tm>() };
@@ -4665,12 +4667,14 @@ mod tests {
         const ANCHOR_MS: i64 = 1_787_486_400_000;
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("sessions");
-        let (anchor_shard, before_timestamp) = local_rollout_fixture_parts(ANCHOR_MS - 1_000);
-        let (_, equal_timestamp) = local_rollout_fixture_parts(ANCHOR_MS);
+        let (before_shard, before_timestamp) = local_rollout_fixture_parts(ANCHOR_MS - 1_000);
+        let (anchor_shard, equal_timestamp) = local_rollout_fixture_parts(ANCHOR_MS);
         let (_, after_timestamp) = local_rollout_fixture_parts(ANCHOR_MS + 1_000);
         let (later_shard, later_timestamp) = local_rollout_fixture_parts(ANCHOR_MS + 86_400_000);
+        let before_day = root.join(before_shard);
         let anchor_day = root.join(anchor_shard);
         let later_day = root.join(later_shard);
+        fs::create_dir_all(&before_day).unwrap();
         fs::create_dir_all(&anchor_day).unwrap();
         fs::create_dir_all(&later_day).unwrap();
         let before = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
@@ -4678,8 +4682,12 @@ mod tests {
         let after = "ffffffff-ffff-4fff-8fff-ffffffffffff";
         let malformed = "99999999-9999-4999-8999-999999999999";
         let later = "77777777-7777-4777-8777-777777777777";
+        fs::write(
+            before_day.join(format!("rollout-{before_timestamp}-{before}.jsonl")),
+            b"{}\n",
+        )
+        .unwrap();
         for (name, id) in [
-            (format!("rollout-{before_timestamp}"), before),
             (format!("rollout-{equal_timestamp}"), equal),
             (format!("rollout-{after_timestamp}"), after),
             ("rollout-not-a-time".to_owned(), malformed),

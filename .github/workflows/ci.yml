@@ -36,6 +36,8 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      TZ: Asia/Tokyo
     strategy:
       fail-fast: false
       matrix:

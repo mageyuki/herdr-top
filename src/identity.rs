@@ -138,6 +138,14 @@ pub enum MergeConflict {
         /// The proposed absorbed run.
         absorbed: RunId,
     },
+    /// Both merge parties have live executions on different terminals.
+    #[error("task runs {survivor} and {absorbed} have live executions on different terminals")]
+    DisjointLiveExecutionTerminals {
+        /// The proposed survivor.
+        survivor: RunId,
+        /// The proposed absorbed run.
+        absorbed: RunId,
+    },
     /// One run has accumulated multiple native identities in memory.
     #[error("task run {run} has multiple native-session bindings")]
     MultipleNativeSessions { run: RunId },
@@ -641,6 +649,18 @@ fn preflight_merge(
             owner: survivor,
             claimant: absorbed,
         });
+    }
+    let live_executions_are_terminal_disjoint = model.executions().any(|survivor_execution| {
+        survivor_execution.task_run_id == survivor
+            && !survivor_execution.state.is_terminal()
+            && model.executions().any(|absorbed_execution| {
+                absorbed_execution.task_run_id == absorbed
+                    && !absorbed_execution.state.is_terminal()
+                    && survivor_execution.terminal_id != absorbed_execution.terminal_id
+            })
+    });
+    if live_executions_are_terminal_disjoint {
+        return Err(MergeConflict::DisjointLiveExecutionTerminals { survivor, absorbed });
     }
 
     let execution_edges = contract_execution_edges(model, survivor, absorbed)?;
@@ -1421,6 +1441,72 @@ mod tests {
         );
         apply_binding_plan(&mut model, second_plan).unwrap();
         assert_eq!(model.task_runs().count(), 1);
+    }
+
+    #[test]
+    fn merge_refuses_live_executions_on_different_terminals_without_mutation() {
+        let (mut model, survivor, absorbed) = merge_fixture();
+        model.insert_execution(Execution {
+            execution_id: "native-owner-execution".to_owned(),
+            pane_id: "native-owner-pane".to_owned(),
+            terminal_id: "native-owner-terminal".to_owned(),
+            task_run_id: survivor,
+            state: ExecState::Working,
+        });
+        model.insert_execution(Execution {
+            execution_id: "provisional-execution".to_owned(),
+            pane_id: "provisional-pane".to_owned(),
+            terminal_id: "provisional-terminal".to_owned(),
+            task_run_id: absorbed,
+            state: ExecState::Working,
+        });
+        let before = model_fingerprint(&model);
+
+        let result =
+            apply_binding_plan_at(&mut model, BindingPlan::Merge { survivor, absorbed }, 2_000);
+
+        assert_eq!(
+            result,
+            Err(MergeConflict::DisjointLiveExecutionTerminals { survivor, absorbed })
+        );
+        assert_eq!(model_fingerprint(&model), before);
+    }
+
+    #[test]
+    fn merge_allows_executed_provisional_to_join_executionless_native_run() {
+        let (mut model, survivor, absorbed) = merge_fixture();
+        model.insert_execution(Execution {
+            execution_id: "provisional-execution".to_owned(),
+            pane_id: "provisional-pane".to_owned(),
+            terminal_id: "provisional-terminal".to_owned(),
+            task_run_id: absorbed,
+            state: ExecState::Working,
+        });
+
+        let batch =
+            apply_binding_plan_at(&mut model, BindingPlan::Merge { survivor, absorbed }, 2_000)
+                .unwrap();
+
+        assert!(matches!(
+            batch.as_slice(),
+            [
+                PersistOp::MergeTaskRuns {
+                    survivor: actual_survivor,
+                    absorbed: actual_absorbed,
+                },
+                PersistOp::UpsertTaskRun(persisted),
+            ] if *actual_survivor == survivor
+                && *actual_absorbed == absorbed
+                && persisted.task_run.run_id == survivor
+        ));
+        assert!(model.task_run(&absorbed).is_none());
+        assert_eq!(
+            model
+                .execution("provisional-execution")
+                .unwrap()
+                .task_run_id,
+            survivor
+        );
     }
 
     #[test]
