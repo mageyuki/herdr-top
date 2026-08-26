@@ -1910,14 +1910,14 @@ impl Reducer {
     fn apply_binding(
         &mut self,
         evidence: BindingEvidence,
-        receipt_time_ms: i64,
+        bookkeeping_time_ms: i64,
         persist: &mut PersistBatch,
     ) -> Result<(), ReducerError> {
         let plan = plan_binding(&self.model, &evidence);
         persist.extend(apply_binding_plan_at(
             &mut self.model,
             plan,
-            receipt_time_ms,
+            bookkeeping_time_ms,
         )?);
         Ok(())
     }

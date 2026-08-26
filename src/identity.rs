@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 
-use crate::model::{DependencyEdge, DomainModel, ExecutionEdge, Provider, RunId, RunKey};
+use crate::model::{DependencyEdge, DomainModel, ExecutionEdge, Provider, RunId, RunKey, TaskRun};
 use crate::store::{NativeSessionBinding, PersistBatch, PersistOp, PersistTaskRun};
 
 /// Explicit evidence that can bind or merge a task-run identity.
@@ -240,24 +240,24 @@ pub fn apply_binding_plan(
     apply_binding_plan_at(model, plan, unix_now_ms())
 }
 
-/// Applies a binding plan using the collector-captured receipt time for persistence.
+/// Applies a binding plan using the selected bookkeeping time for persistence.
 pub fn apply_binding_plan_at(
     model: &mut DomainModel,
     plan: BindingPlan,
-    receipt_time_ms: i64,
+    bookkeeping_time_ms: i64,
 ) -> Result<PersistBatch, MergeConflict> {
     match plan {
         BindingPlan::NoChange => Ok(Vec::new()),
         BindingPlan::Conflict(conflict) => Err(conflict),
-        BindingPlan::Bind { run, key } => apply_bind(model, run, key, receipt_time_ms),
+        BindingPlan::Bind { run, key } => apply_bind(model, run, key, bookkeeping_time_ms),
         BindingPlan::Merge { survivor, absorbed } => {
             let contracted = preflight_merge(model, survivor, absorbed)?;
-            merge_in_memory(model, survivor, absorbed, contracted, receipt_time_ms);
+            merge_in_memory(model, survivor, absorbed, contracted, bookkeeping_time_ms);
             let mut task_run = model
                 .task_run(&survivor)
                 .cloned()
                 .ok_or(MergeConflict::MissingRun { run: survivor })?;
-            task_run.touch(receipt_time_ms);
+            touch_task_run(&mut task_run, bookkeeping_time_ms);
             model.insert_task_run(task_run.clone());
             let native_session =
                 single_native_binding(model, survivor)?.map(|(provider, native_session_id)| {
@@ -266,8 +266,8 @@ pub fn apply_binding_plan_at(
                         native_session_id,
                     }
                 });
-            let created_at_ms = task_run.created_at_ms.unwrap_or(receipt_time_ms);
-            let updated_at_ms = task_run.updated_at_ms.unwrap_or(receipt_time_ms);
+            let created_at_ms = task_run.created_at_ms.unwrap_or(bookkeeping_time_ms);
+            let updated_at_ms = task_run.updated_at_ms.unwrap_or(bookkeeping_time_ms);
             let finished_at_ms = task_run.finished_at_ms;
             Ok(vec![
                 PersistOp::MergeTaskRuns { survivor, absorbed },
@@ -488,7 +488,7 @@ fn apply_bind(
     model: &mut DomainModel,
     run: RunId,
     key: RunKey,
-    receipt_time_ms: i64,
+    bookkeeping_time_ms: i64,
 ) -> Result<PersistBatch, MergeConflict> {
     let (provider, sid) = match &key {
         RunKey::Native { provider, sid } => (*provider, sid.clone()),
@@ -534,13 +534,17 @@ fn apply_bind(
             promoted
         }
     };
-    persisted_task_run.touch(receipt_time_ms);
+    touch_task_run(&mut persisted_task_run, bookkeeping_time_ms);
     model.insert_task_run(persisted_task_run.clone());
     if let Some(old_key) = promoted_from.as_ref() {
         model.insert_task_run_alias(old_key.clone(), run);
     }
-    let created_at_ms = persisted_task_run.created_at_ms.unwrap_or(receipt_time_ms);
-    let updated_at_ms = persisted_task_run.updated_at_ms.unwrap_or(receipt_time_ms);
+    let created_at_ms = persisted_task_run
+        .created_at_ms
+        .unwrap_or(bookkeeping_time_ms);
+    let updated_at_ms = persisted_task_run
+        .updated_at_ms
+        .unwrap_or(bookkeeping_time_ms);
     let finished_at_ms = persisted_task_run.finished_at_ms;
     let persisted = PersistTaskRun {
         task_run: persisted_task_run,
@@ -769,7 +773,7 @@ fn merge_in_memory(
     survivor: RunId,
     absorbed: RunId,
     contracted: ContractedGraphs,
-    receipt_time_ms: i64,
+    bookkeeping_time_ms: i64,
 ) {
     let absorbed_has_controller_evidence = model
         .task_run(&absorbed)
@@ -778,7 +782,7 @@ fn merge_in_memory(
         && let Some(mut task_run) = model.task_run(&survivor).cloned()
     {
         task_run.has_controller_task_state_event = true;
-        task_run.touch(receipt_time_ms);
+        touch_task_run(&mut task_run, bookkeeping_time_ms);
         model.insert_task_run(task_run);
     }
     let mut aliases: Vec<_> = model
@@ -812,6 +816,15 @@ fn merge_in_memory(
     for alias in aliases {
         model.insert_task_run_alias(alias, survivor);
     }
+}
+
+fn touch_task_run(task_run: &mut TaskRun, bookkeeping_time_ms: i64) {
+    task_run.touch(
+        task_run
+            .updated_at_ms
+            .unwrap_or(bookkeeping_time_ms)
+            .max(bookkeeping_time_ms),
+    );
 }
 
 #[cfg(test)]
@@ -902,6 +915,35 @@ mod tests {
         assert_eq!(persisted.created_at_ms, 100);
         assert_eq!(persisted.updated_at_ms, 2_000);
         assert_eq!(persisted.finished_at_ms, None);
+    }
+
+    #[test]
+    fn older_binding_time_does_not_move_merge_survivor_bookkeeping_backward() {
+        let mut model = DomainModel::default();
+        let survivor = insert_run(
+            &mut model,
+            RunKey::Controller("controller-survivor".to_owned()),
+            1,
+        );
+        let absorbed = insert_run(&mut model, native(Provider::Codex, "absorbed-sid"), 2);
+        let mut survivor_run = model.task_run(&survivor).cloned().unwrap();
+        survivor_run.created_at_ms = Some(100);
+        survivor_run.updated_at_ms = Some(2_500);
+        model.insert_task_run(survivor_run);
+        let mut absorbed_run = model.task_run(&absorbed).cloned().unwrap();
+        absorbed_run.has_controller_task_state_event = true;
+        model.insert_task_run(absorbed_run);
+
+        let batch =
+            apply_binding_plan_at(&mut model, BindingPlan::Merge { survivor, absorbed }, 2_000)
+                .unwrap();
+
+        let survivor_run = model.task_run(&survivor).unwrap();
+        assert_eq!(survivor_run.updated_at_ms, Some(2_500));
+        let PersistOp::UpsertTaskRun(persisted) = &batch[1] else {
+            panic!("expected survivor task-run persistence after merge");
+        };
+        assert_eq!(persisted.updated_at_ms, 2_500);
     }
 
     #[test]

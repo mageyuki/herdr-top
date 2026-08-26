@@ -179,16 +179,16 @@ impl Synthesis {
                     && !self.pending_completes.contains_key(scope)
                     && !self.completed.contains(scope)
                     && now_ms.saturating_sub(anchor_ms) >= self.headless_inactivity_ms)
-                    .then(|| scope.clone())
+                    .then(|| (scope.clone(), anchor_ms))
             })
             .collect::<Vec<_>>();
         inactive.sort();
-        for scope in inactive {
+        for (scope, anchor_ms) in inactive {
             self.inactivity_closed.insert(scope.clone());
             self.started.remove(&scope);
             events.push(ProviderEvent::LaneClose {
                 key: run_key_for_scope_key(&scope),
-                at_ms: now_ms,
+                at_ms: anchor_ms,
             });
         }
         events
@@ -422,12 +422,12 @@ impl Synthesis {
                 let scope = SessionScope::Codex {
                     rollout_id: rollout_id.clone(),
                 };
+                let scope_key = ScopeKey::from(&scope);
                 let at_ms = self
                     .last_append_ms
-                    .get(&ScopeKey::from(&scope))
+                    .get(&scope_key)
                     .copied()
-                    .unwrap_or_default();
-                let scope_key = ScopeKey::from(&scope);
+                    .unwrap_or(self.latest_lifecycle_ms);
                 let _ = self.prepare_resume(&scope_key, at_ms, events);
                 self.start_scope(scope_key, at_ms);
                 events.push(ProviderEvent::Synthesized(controller_event(
@@ -2767,6 +2767,41 @@ mod tests {
     }
 
     #[test]
+    fn codex_meta_without_append_uses_non_epoch_lifecycle_time() {
+        let mut synthesis = Synthesis::with_lifecycle_timing_at(30, 600, 4_321);
+        let events = synthesize(
+            &mut synthesis,
+            "rollout.jsonl",
+            [(
+                0,
+                LogFact::CodexMeta {
+                    rollout_id: ROLLOUT.to_owned(),
+                    cwd: "/workspace".to_owned(),
+                    originator: "codex".to_owned(),
+                    internal: None,
+                    cli_version: "0.149.0".to_owned(),
+                },
+            )],
+        );
+
+        assert!(matches!(
+            synthesized_events(&events).as_slice(),
+            [event]
+                if matches!(event.event, ControllerEventKind::TaskStarted)
+                    && event.metadata.timestamp_ms == 4_321
+        ));
+        let model = apply_once_per_event_id(&events);
+        let run = model
+            .task_run_by_key(&RunKey::Native {
+                provider: Provider::Codex,
+                sid: ROLLOUT.to_owned(),
+            })
+            .expect("timestamp-less session_meta must still mint the Codex root run");
+        assert_eq!(run.created_at_ms, Some(4_321));
+        assert_eq!(run.updated_at_ms, Some(4_321));
+    }
+
+    #[test]
     fn failed_notification_yields_failed_state() {
         let events = synthesize(
             &mut Synthesis::default(),
@@ -3304,27 +3339,16 @@ mod tests {
         let mut events = synthesize(
             &mut synthesis,
             "rollout.jsonl",
-            [
-                (
-                    1,
-                    LogFact::Append {
-                        scope: SessionScope::Codex {
-                            rollout_id: ROLLOUT.to_owned(),
-                        },
-                        at_ms: 100,
-                    },
-                ),
-                (
-                    1,
-                    LogFact::CodexMeta {
-                        rollout_id: ROLLOUT.to_owned(),
-                        cwd: "/workspace".to_owned(),
-                        originator: "codex".to_owned(),
-                        internal: None,
-                        cli_version: "0.149.0".to_owned(),
-                    },
-                ),
-            ],
+            [(
+                1,
+                LogFact::CodexMeta {
+                    rollout_id: ROLLOUT.to_owned(),
+                    cwd: "/workspace".to_owned(),
+                    originator: "codex".to_owned(),
+                    internal: None,
+                    cli_version: "0.149.0".to_owned(),
+                },
+            )],
         );
         events.extend(synthesize(
             &mut synthesis,
@@ -3480,7 +3504,7 @@ mod tests {
         assert!(matches!(
             synthesis.advance_lifecycle(150).as_slice(),
             [ProviderEvent::LaneClose { key, at_ms }]
-                if key == &run_key_for_scope(&scope) && *at_ms == 150
+                if key == &run_key_for_scope(&scope) && *at_ms == 100
         ));
         assert!(synthesis.advance_lifecycle(200).is_empty());
     }
@@ -3511,7 +3535,7 @@ mod tests {
             synthesis.advance_lifecycle(150),
             vec![ProviderEvent::LaneClose {
                 key: run_key_for_scope(&scope),
-                at_ms: 150,
+                at_ms: 100,
             }],
             "an append-less started scope must close at its start-time threshold"
         );
@@ -3535,7 +3559,7 @@ mod tests {
             synthesis.advance_lifecycle(150),
             vec![ProviderEvent::LaneClose {
                 key: run_key_for_scope(&scope),
-                at_ms: 150,
+                at_ms: 100,
             }]
         );
     }
@@ -3564,7 +3588,7 @@ mod tests {
             synthesis.advance_lifecycle(190),
             vec![ProviderEvent::LaneClose {
                 key: run_key_for_scope(&scope),
-                at_ms: 190,
+                at_ms: 140,
             }]
         );
     }

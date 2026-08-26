@@ -14391,27 +14391,16 @@ mod provider_integration_tests {
             .synthesis
             .synthesize_batch(
                 Path::new("rollout.jsonl"),
-                [
-                    (
-                        0,
-                        crate::provider::facts::LogFact::Append {
-                            scope: crate::provider::facts::SessionScope::Codex {
-                                rollout_id: ROLLOUT_ID.to_owned(),
-                            },
-                            at_ms: now_ms,
-                        },
-                    ),
-                    (
-                        0,
-                        crate::provider::facts::LogFact::CodexMeta {
-                            rollout_id: ROLLOUT_ID.to_owned(),
-                            cwd: "/workspace".to_owned(),
-                            originator: "codex".to_owned(),
-                            internal: None,
-                            cli_version: "0.1.0".to_owned(),
-                        },
-                    ),
-                ],
+                [(
+                    0,
+                    crate::provider::facts::LogFact::CodexMeta {
+                        rollout_id: ROLLOUT_ID.to_owned(),
+                        cwd: "/workspace".to_owned(),
+                        originator: "codex".to_owned(),
+                        internal: None,
+                        cli_version: "0.1.0".to_owned(),
+                    },
+                )],
                 &mut worker.log_admission,
                 &worker.admission_index,
             )

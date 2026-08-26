@@ -152,6 +152,11 @@ fn extract_claude_line_inner(
     };
     match record_type.record_type.as_deref() {
         Some("ai-title") => extract_ai_title(line, &mut facts),
+        Some("assistant") if record_type.timestamp.is_none() => {
+            if let Some(at_ms) = fact_at_ms {
+                extract_assistant_command_evidence(scope, line, at_ms, &mut facts);
+            }
+        }
         Some("assistant") => extract_assistant(scope, line, fact_at_ms, &mut facts),
         Some("user") => extract_user(scope, line, fact_at_ms, &mut facts),
         Some("queue-operation") => extract_queue_operation(scope, line, fact_at_ms, &mut facts),
@@ -242,6 +247,23 @@ fn extract_assistant(
                 line,
             });
         }
+    }
+}
+
+fn extract_assistant_command_evidence(
+    scope: &SessionScope,
+    line: &str,
+    at_ms: i64,
+    facts: &mut Vec<LogFact>,
+) {
+    let Ok(record) = serde_json::from_str::<AssistantRecord>(line) else {
+        return;
+    };
+    let Some(message) = record.message else {
+        return;
+    };
+    for block in message.content.unwrap_or_default() {
+        facts.extend(command_evidence(scope, &block, at_ms));
     }
 }
 
@@ -710,6 +732,16 @@ mod tests {
             None
         );
         assert_eq!(extract_meta_json(PARENT, "child", 1_234, b"not json"), None);
+    }
+
+    #[test]
+    fn meta_json_at_epoch_does_not_emit_appearance() {
+        let bytes = fixture("claude-subagent-meta.json");
+
+        assert_eq!(
+            extract_meta_json(PARENT, "a7189abbf3c5741ac", 0, bytes.as_bytes()),
+            None
+        );
     }
 
     #[test]
@@ -1230,16 +1262,17 @@ mod tests {
     }
 
     #[test]
-    fn resume_command_evidence_without_timestamp_uses_artifact_time() {
+    fn resume_command_evidence_missing_timestamp_uses_artifact_time() {
         let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"claude --resume 77777777-7777-4777-8777-777777777777"}}]}}"#;
 
-        assert!(extract_claude_line_at(&root_scope(), line, 4_321).contains(
-            &LogFact::EvidenceId {
+        assert_eq!(
+            extract_claude_line_at(&root_scope(), line, 4_321),
+            vec![LogFact::EvidenceId {
                 parent: root_scope(),
                 id: EvidenceId::Uuid("77777777-7777-4777-8777-777777777777".to_owned()),
                 at_ms: 4_321,
-            }
-        ));
+            }]
+        );
     }
 
     #[test]
