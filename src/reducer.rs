@@ -544,9 +544,30 @@ impl Reducer {
     /// Resolves a raw Controller key through canonical and durable alias bindings.
     #[must_use]
     pub fn resolve_controller_run(&self, raw: &str) -> Option<RunId> {
-        self.model
+        let exact = self
+            .model
             .task_run_by_key(&RunKey::Controller(raw.to_owned()))
-            .map(|run| run.run_id)
+            .map(|run| run.run_id);
+        if exact.is_some() {
+            return exact;
+        }
+
+        // Shipped lane-created Codex runs used the bare SID as their Controller primary key.
+        // Bridge only a root hook key to that restored owner; suffixed subagent/task keys and
+        // unrelated Controller claimants must continue through normal K1 collision handling.
+        let sid = raw.strip_prefix("hook:codex:")?;
+        if sid.is_empty() || sid.contains(':') {
+            return None;
+        }
+        self.model
+            .task_run_by_key(&RunKey::Native {
+                provider: Provider::Codex,
+                sid: sid.to_owned(),
+            })
+            .filter(
+                |owner| matches!(&owner.key, RunKey::Controller(legacy_sid) if legacy_sid == sid),
+            )
+            .map(|owner| owner.run_id)
     }
 
     /// Rebuilds transient reducer state from a durable-ledger duplicate during log replay.
@@ -9899,6 +9920,179 @@ mod tests {
                 .run_id,
             original
         );
+    }
+
+    #[tokio::test]
+    async fn restored_legacy_codex_controller_accepts_canonical_hook_key() {
+        const SID: &str = "22222222-2222-4222-8222-222222222222";
+        const CANONICAL: &str = "hook:codex:22222222-2222-4222-8222-222222222222";
+        const OTHER_CANONICAL: &str = "hook:codex:33333333-3333-4333-8333-333333333333";
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let mut legacy = controller_event(
+            "legacy-codex-started",
+            SID,
+            ControllerEventKind::TaskStarted,
+        );
+        legacy.metadata.provider = Some(Provider::Codex);
+        legacy.metadata.native_session_id = Some(SID.to_owned());
+        commit_controller(&mut reducer, &mut writer, legacy).await;
+        let original = reducer.resolve_controller_run(SID).unwrap();
+        lifecycle.shutdown().await.unwrap();
+
+        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+        assert_eq!(
+            restored
+                .model
+                .task_run_by_key(&RunKey::Controller(SID.to_owned()))
+                .unwrap()
+                .run_id,
+            original
+        );
+        assert_eq!(
+            restored
+                .model
+                .task_run_by_key(&RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: SID.to_owned(),
+                })
+                .unwrap()
+                .run_id,
+            original
+        );
+
+        let (reducer, _shared) = Reducer::new(restored);
+        let mut arbitrary = controller_event(
+            "arbitrary-codex-started",
+            "different-controller-key",
+            ControllerEventKind::TaskStarted,
+        );
+        arbitrary.metadata.provider = Some(Provider::Codex);
+        arbitrary.metadata.native_session_id = Some(SID.to_owned());
+        assert!(matches!(
+            reducer.validate_controller_event(&arbitrary),
+            Err(RejectReason::Conflict)
+        ));
+        assert_eq!(reducer.resolve_controller_run(OTHER_CANONICAL), None);
+        assert_eq!(
+            reducer.resolve_controller_run(&format!("{CANONICAL}:agent:child")),
+            None
+        );
+
+        let mut canonical = controller_event(
+            "canonical-codex-started",
+            CANONICAL,
+            ControllerEventKind::TaskStarted,
+        );
+        canonical.metadata.provider = Some(Provider::Codex);
+        canonical.metadata.native_session_id = Some(SID.to_owned());
+        let delta = match reducer.validate_controller_event(&canonical) {
+            Ok(delta) => delta,
+            Err(reason) => panic!("canonical restored Codex start was rejected: {reason:?}"),
+        };
+
+        assert_eq!(delta.post_model.task_runs().count(), 1);
+        assert_eq!(
+            delta
+                .post_model
+                .task_run_by_key(&RunKey::Controller(SID.to_owned()))
+                .unwrap()
+                .run_id,
+            original
+        );
+        assert_eq!(
+            delta
+                .post_model
+                .task_run_by_key(&RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: SID.to_owned(),
+                })
+                .unwrap()
+                .run_id,
+            original
+        );
+        assert!(delta.batch.iter().any(|operation| matches!(
+            operation,
+            PersistOp::RecordEvent { event, .. }
+                if super::event_metadata(event).task_run_id == Some(original)
+        )));
+        assert_eq!(
+            delta
+                .post_model
+                .controller_diagnostics()
+                .binding_conflicts(),
+            0
+        );
+    }
+
+    #[test]
+    fn controller_resolution_prioritizes_exact_key_over_legacy_codex_fallback() {
+        const SID: &str = "44444444-4444-4444-8444-444444444444";
+        let canonical = format!("hook:codex:{SID}");
+        let legacy = RunId::new();
+        let exact = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            legacy,
+            RunKey::Controller(SID.to_owned()),
+            1,
+            TaskState::Queued,
+        ));
+        model.insert_task_run_alias(
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: SID.to_owned(),
+            },
+            legacy,
+        );
+        model.insert_task_run(run(
+            exact,
+            RunKey::Controller(canonical.clone()),
+            2,
+            TaskState::Queued,
+        ));
+        let (reducer, _shared) = Reducer::new(restored(model, 3));
+
+        assert_eq!(reducer.resolve_controller_run(&canonical), Some(exact));
+    }
+
+    #[test]
+    fn codex_compatibility_fallback_requires_bare_sid_controller_primary() {
+        const SID: &str = "55555555-5555-4555-8555-555555555555";
+        let owner = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            owner,
+            RunKey::Controller("different-controller-primary".to_owned()),
+            1,
+            TaskState::Queued,
+        ));
+        model.insert_task_run_alias(
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: SID.to_owned(),
+            },
+            owner,
+        );
+        let (reducer, _shared) = Reducer::new(restored(model, 2));
+        let canonical = format!("hook:codex:{SID}");
+
+        assert_eq!(reducer.resolve_controller_run(&canonical), None);
+        let mut claimant = controller_event(
+            "non-legacy-primary-claim",
+            &canonical,
+            ControllerEventKind::TaskStarted,
+        );
+        claimant.metadata.provider = Some(Provider::Codex);
+        claimant.metadata.native_session_id = Some(SID.to_owned());
+        assert!(matches!(
+            reducer.validate_controller_event(&claimant),
+            Err(RejectReason::Conflict)
+        ));
     }
 
     #[test]
