@@ -19,9 +19,9 @@ use crate::model::{
     AgentNode, AgentNodeObservation, AgentSessionReferenceKind, ControllerDiagnosticsHandle,
     ControllerEvent, ControllerEventKind, DependencyEdge, DisplayOrdinal, DomainModel,
     EventMetadata, ExecState, Execution, ExecutionEdge, MinimalProviderMetadata, NormalizedEvent,
-    OperatorCommand, Pane, Provider, ProviderDiagnosticsHandle, ReconcileBatch, RunId, RunKey,
-    SharedModel, TaskRun, TaskState, TopologyAuthority, TopologyEntity, TopologyEntityId,
-    TopologySnapshot, sanitize_controller_text,
+    OperatorCommand, Pane, PaneAgentStatusObservation, Provider, ProviderDiagnosticsHandle,
+    ReconcileBatch, RunId, RunKey, SharedModel, TaskRun, TaskState, TopologyAuthority,
+    TopologyEntity, TopologyEntityId, TopologySnapshot, sanitize_controller_text,
 };
 use crate::operator::OperatorProjection;
 use crate::store::{
@@ -448,7 +448,29 @@ impl Reducer {
         &mut self,
         events: Vec<NormalizedEvent>,
     ) -> Result<ApplyOutcome, ReducerError> {
-        if events.is_empty() {
+        self.apply_observation_inner(events, None)
+    }
+
+    pub(crate) fn apply_pane_agent_observation(
+        &mut self,
+        events: Vec<NormalizedEvent>,
+        observation: PaneAgentStatusObservation,
+    ) -> Result<ApplyOutcome, ReducerError> {
+        self.apply_observation_inner(events, Some(observation))
+    }
+
+    fn apply_observation_inner(
+        &mut self,
+        events: Vec<NormalizedEvent>,
+        pane_agent_observation: Option<PaneAgentStatusObservation>,
+    ) -> Result<ApplyOutcome, ReducerError> {
+        let pane_agent_status_changed =
+            pane_agent_observation.as_ref().is_some_and(|observation| {
+                self.model.pane(&observation.pane_id).is_some()
+                    && self.model.pane_agent_status(&observation.pane_id)
+                        != Some(observation.status)
+            });
+        if events.is_empty() && !pane_agent_status_changed {
             return Ok(ApplyOutcome::Applied(Vec::new()));
         }
         // increment5-workload-harness: begin observed apply scope start
@@ -477,6 +499,12 @@ impl Reducer {
         let original_next_ordinal = self.next_ordinal;
         let original_terminal_event_sources = self.terminal_event_sources.clone();
         let original_non_lane_task_state_runs = self.non_lane_task_state_runs.clone();
+        if pane_agent_status_changed {
+            let observation = pane_agent_observation
+                .expect("a changed pane-agent status must have an observation");
+            self.model
+                .set_pane_agent_status(observation.pane_id, observation.status);
+        }
         let mut persist = Vec::new();
         for event in events {
             match self.apply_inner(event) {
@@ -1188,6 +1216,18 @@ impl Reducer {
 
         self.replace_topology(&topology, &mut persist)?;
 
+        let pane_agent_statuses = topology
+            .panes
+            .iter()
+            .filter(|pane| self.model.pane(&pane.pane_id).is_some())
+            .filter_map(|pane| {
+                pane.agent
+                    .as_ref()
+                    .map(|agent| (pane.pane_id.clone(), agent.status))
+            })
+            .collect();
+        self.model.replace_pane_agent_statuses(pane_agent_statuses);
+
         for pane in topology.panes {
             let Some(agent) = pane.agent else {
                 continue;
@@ -1246,7 +1286,7 @@ impl Reducer {
                 pane_id: pane.pane_id,
                 terminal_id: pane.terminal_id,
                 task_run_id: run_id,
-                state: agent.state,
+                state: agent.status.execution_state(),
             };
             self.model.insert_execution(execution.clone());
             persist.push(persist_execution(execution.clone(), now_ms));
@@ -3032,9 +3072,10 @@ mod tests {
         AgentNode, AgentNodeObservation, AgentSessionReference, AgentSessionReferenceKind,
         ControllerEvent, ControllerEventKind, DependencyEdge, DisplayOrdinal, DomainModel,
         EventMetadata, ExecState, Execution, ExecutionEdge, GapKind, MinimalProviderMetadata,
-        NormalizedEvent, OperatorCommand, Pane, PaneSnapshot, Provider, ReconcileBatch, RunId,
-        RunKey, SharedModel, SnapshotAgent, Tab, TaskRun, TaskState, TopologyAuthority,
-        TopologyEntity, TopologyEntityId, TopologySnapshot, TurnAttr, Workspace,
+        NormalizedEvent, OperatorCommand, Pane, PaneAgentStatus, PaneAgentStatusObservation,
+        PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SharedModel, SnapshotAgent, Tab,
+        TaskRun, TaskState, TopologyAuthority, TopologyEntity, TopologyEntityId, TopologySnapshot,
+        TurnAttr, Workspace,
     };
     use crate::provider::ProviderEvent;
     use crate::provider::claude_facts::{extract_claude_line, extract_meta_json};
@@ -6598,7 +6639,7 @@ mod tests {
         );
         late.panes[0].agent = Some(SnapshotAgent {
             agent_name: "codex".to_owned(),
-            state: ExecState::Working,
+            status: PaneAgentStatus::Working,
         });
         let result = reducer.reconcile_snapshot(late);
 
@@ -6630,7 +6671,7 @@ mod tests {
             .unwrap()
             .agent = Some(SnapshotAgent {
             agent_name: "codex".to_owned(),
-            state: ExecState::Working,
+            status: PaneAgentStatus::Working,
         });
         let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
         reducer
@@ -7446,7 +7487,7 @@ mod tests {
                 display_name: None,
                 agent: Some(SnapshotAgent {
                     agent_name: "codex".to_owned(),
-                    state: ExecState::Working,
+                    status: PaneAgentStatus::Working,
                 }),
                 agent_session: Some(AgentSessionReference {
                     source: "herdr".to_owned(),
@@ -9183,6 +9224,213 @@ mod tests {
         let result = reducer.apply_observation(vec![topology_event(value, "ws-err")]);
         assert_eq!(result, Err(ReducerError::OrdinalExhausted));
         assert_eq!(reducer.publish_count.get(), before_err);
+    }
+
+    #[test]
+    fn pane_status_only_observation_publishes_once_without_persistence() {
+        let mut model = DomainModel::default();
+        model.insert_pane(Pane {
+            pane_id: "pane-1".to_owned(),
+            workspace_id: "workspace-1".to_owned(),
+            tab_id: "tab-1".to_owned(),
+            terminal_id: "terminal-1".to_owned(),
+            display_name: None,
+        });
+        let (mut reducer, shared) = Reducer::new(restored(model, 1));
+        let before = reducer.publish_count.get();
+
+        let ApplyOutcome::Applied(batch) = reducer
+            .apply_pane_agent_observation(
+                Vec::new(),
+                PaneAgentStatusObservation {
+                    pane_id: "pane-1".to_owned(),
+                    status: PaneAgentStatus::Working,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("status-only observation should apply");
+        };
+
+        assert!(batch.is_empty());
+        assert!(
+            !batch
+                .iter()
+                .any(|operation| matches!(operation, PersistOp::RecordEvent { .. }))
+        );
+        assert_eq!(reducer.publish_count.get() - before, 1);
+        assert_eq!(
+            shared.borrow().pane_agent_status("pane-1"),
+            Some(PaneAgentStatus::Working)
+        );
+
+        let before_duplicate = reducer.publish_count.get();
+        let duplicate = reducer
+            .apply_pane_agent_observation(
+                Vec::new(),
+                PaneAgentStatusObservation {
+                    pane_id: "pane-1".to_owned(),
+                    status: PaneAgentStatus::Working,
+                },
+            )
+            .unwrap();
+        assert_eq!(duplicate, ApplyOutcome::Applied(Vec::new()));
+        assert_eq!(reducer.publish_count.get(), before_duplicate);
+    }
+
+    #[test]
+    fn idle_to_done_updates_transient_status_without_execution_change() {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_pane(Pane {
+            pane_id: "pane-1".to_owned(),
+            workspace_id: "workspace-1".to_owned(),
+            tab_id: "tab-1".to_owned(),
+            terminal_id: "terminal-1".to_owned(),
+            display_name: None,
+        });
+        model.insert_execution(execution(run_id, "execution-1", ExecState::Idle));
+        model.set_pane_agent_status("pane-1".to_owned(), PaneAgentStatus::Idle);
+        let (mut reducer, shared) = Reducer::new(restored(model, 1));
+
+        let outcome = reducer
+            .apply_pane_agent_observation(
+                Vec::new(),
+                PaneAgentStatusObservation {
+                    pane_id: "pane-1".to_owned(),
+                    status: PaneAgentStatus::Done,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome, ApplyOutcome::Applied(Vec::new()));
+        assert_eq!(
+            shared.borrow().pane_agent_status("pane-1"),
+            Some(PaneAgentStatus::Done)
+        );
+        assert_eq!(
+            shared.borrow().execution("execution-1").unwrap().state,
+            ExecState::Idle
+        );
+    }
+
+    #[test]
+    fn pane_status_observation_rolls_back_with_failed_event_batch() {
+        let mut model = DomainModel::default();
+        model.insert_pane(Pane {
+            pane_id: "pane-1".to_owned(),
+            workspace_id: "workspace-1".to_owned(),
+            tab_id: "tab-1".to_owned(),
+            terminal_id: "terminal-1".to_owned(),
+            display_name: None,
+        });
+        model.set_pane_agent_status("pane-1".to_owned(), PaneAgentStatus::Idle);
+        let (mut reducer, shared) = Reducer::new(restored(model, i64::MAX));
+        let mut failing_metadata = metadata("status-batch-failure", 1_000);
+        failing_metadata.task_run_id = Some(RunId::new());
+        let before = reducer.publish_count.get();
+
+        let result = reducer.apply_pane_agent_observation(
+            vec![topology_event(failing_metadata, "must-not-exist")],
+            PaneAgentStatusObservation {
+                pane_id: "pane-1".to_owned(),
+                status: PaneAgentStatus::Working,
+            },
+        );
+
+        assert_eq!(result, Err(ReducerError::OrdinalExhausted));
+        assert_eq!(reducer.publish_count.get(), before);
+        assert_eq!(
+            shared.borrow().pane_agent_status("pane-1"),
+            Some(PaneAgentStatus::Idle)
+        );
+        assert!(shared.borrow().workspace("must-not-exist").is_none());
+    }
+
+    #[test]
+    fn snapshot_reconciliation_replaces_transient_pane_statuses() {
+        let mut model = DomainModel::default();
+        model.set_pane_agent_status("obsolete".to_owned(), PaneAgentStatus::Blocked);
+        let (mut reducer, shared) = Reducer::new(restored(model, 1));
+        let mut snapshot = topology_snapshot(
+            &["workspace"],
+            &[("tab", "workspace")],
+            &[
+                ("idle-pane", "workspace", "tab"),
+                ("done-pane", "workspace", "tab"),
+                ("agentless-pane", "workspace", "tab"),
+            ],
+        );
+        snapshot.panes[0].agent = Some(SnapshotAgent {
+            agent_name: "codex".to_owned(),
+            status: PaneAgentStatus::Idle,
+        });
+        snapshot.panes[1].agent = Some(SnapshotAgent {
+            agent_name: "codex".to_owned(),
+            status: PaneAgentStatus::Done,
+        });
+
+        reducer.reconcile_snapshot(snapshot).unwrap();
+
+        let installed = shared.borrow();
+        assert_eq!(
+            installed.pane_agent_status("idle-pane"),
+            Some(PaneAgentStatus::Idle)
+        );
+        assert_eq!(
+            installed.pane_agent_status("done-pane"),
+            Some(PaneAgentStatus::Done)
+        );
+        assert_eq!(installed.pane_agent_status("agentless-pane"), None);
+        assert_eq!(installed.pane_agent_status("obsolete"), None);
+        assert!(
+            installed
+                .executions()
+                .filter(|execution| execution.pane_id == "idle-pane"
+                    || execution.pane_id == "done-pane")
+                .all(|execution| execution.state == ExecState::Idle)
+        );
+    }
+
+    #[test]
+    fn snapshot_reconciliation_clears_orphan_transient_pane_statuses() {
+        let mut model = DomainModel::default();
+        model.replace_pane_agent_statuses(HashMap::from([(
+            "orphan-pane".to_owned(),
+            PaneAgentStatus::Working,
+        )]));
+        let (mut reducer, shared) = Reducer::new(restored(model, 1));
+
+        reducer
+            .reconcile_snapshot(TopologySnapshot::default())
+            .unwrap();
+
+        assert_eq!(shared.borrow().pane_agent_status("orphan-pane"), None);
+    }
+
+    #[test]
+    fn pane_closure_removes_transient_status() {
+        let mut model = DomainModel::default();
+        model.insert_pane(Pane {
+            pane_id: "pane-1".to_owned(),
+            workspace_id: "workspace-1".to_owned(),
+            tab_id: "tab-1".to_owned(),
+            terminal_id: "terminal-1".to_owned(),
+            display_name: None,
+        });
+        model.set_pane_agent_status("pane-1".to_owned(), PaneAgentStatus::Blocked);
+        let (mut reducer, shared) = Reducer::new(restored(model, 1));
+
+        reducer
+            .apply(NormalizedEvent::TopologyClosure {
+                metadata: metadata("pane-closed", 1_000),
+                entity: TopologyEntityId::Pane {
+                    pane_id: "pane-1".to_owned(),
+                },
+            })
+            .unwrap();
+
+        assert_eq!(shared.borrow().pane_agent_status("pane-1"), None);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use super::ids::{DisplayOrdinal, Provider, RunId, RunKey};
-use super::state::{ExecState, TaskState};
+use super::state::{ExecState, PaneAgentStatus, TaskState};
 
 /// Operator intent delivered to the collector-owned reducer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +47,12 @@ pub struct Execution {
     pub terminal_id: String,
     pub task_run_id: RunId,
     pub state: ExecState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaneAgentStatusObservation {
+    pub pane_id: String,
+    pub status: PaneAgentStatus,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -689,6 +695,7 @@ pub struct DomainModel {
     workspaces: HashMap<String, Workspace>,
     tabs: HashMap<String, Tab>,
     panes: HashMap<String, Pane>,
+    pane_agent_statuses: HashMap<String, PaneAgentStatus>,
     topology_ordinals: HashMap<(TopologyKind, String), DisplayOrdinal>,
     task_runs: HashMap<RunId, TaskRun>,
     run_ids_by_key: HashMap<RunKey, RunId>,
@@ -805,6 +812,31 @@ impl DomainModel {
 
     pub fn panes(&self) -> impl Iterator<Item = &Pane> {
         self.panes.values()
+    }
+
+    /// Returns the exact transient Herdr agent status for one pane.
+    #[must_use]
+    pub fn pane_agent_status(&self, pane_id: &str) -> Option<PaneAgentStatus> {
+        self.pane_agent_statuses.get(pane_id).copied()
+    }
+
+    pub(crate) fn set_pane_agent_status(
+        &mut self,
+        pane_id: String,
+        status: PaneAgentStatus,
+    ) -> Option<PaneAgentStatus> {
+        self.pane_agent_statuses.insert(pane_id, status)
+    }
+
+    pub(crate) fn replace_pane_agent_statuses(
+        &mut self,
+        statuses: HashMap<String, PaneAgentStatus>,
+    ) {
+        self.pane_agent_statuses = statuses;
+    }
+
+    pub(crate) fn remove_pane_agent_status(&mut self, pane_id: &str) -> Option<PaneAgentStatus> {
+        self.pane_agent_statuses.remove(pane_id)
     }
 
     /// Returns a pane's persisted display ordinal.
@@ -1049,6 +1081,7 @@ impl DomainModel {
 
     /// Removes one pane from the current physical topology.
     pub fn remove_pane(&mut self, pane_id: &str) -> Option<Pane> {
+        self.remove_pane_agent_status(pane_id);
         self.panes.remove(pane_id)
     }
 }
@@ -1264,7 +1297,7 @@ pub struct PaneSnapshot {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SnapshotAgent {
     pub agent_name: String,
-    pub state: ExecState,
+    pub status: PaneAgentStatus,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1285,7 +1318,7 @@ pub enum AgentSessionReferenceKind {
 mod tests {
     use super::*;
     use crate::model::ids::{DisplayOrdinal, Provider, RunId, RunKey};
-    use crate::model::state::{ExecState, TaskState};
+    use crate::model::state::{ExecState, PaneAgentStatus, TaskState};
 
     #[test]
     fn domain_model_construction() {
@@ -1396,6 +1429,27 @@ mod tests {
     }
 
     #[test]
+    fn pane_agent_status_is_transient_and_removed_with_pane() {
+        let mut model = DomainModel::default();
+        model.insert_pane(Pane {
+            pane_id: "pane-1".to_owned(),
+            workspace_id: "workspace-1".to_owned(),
+            tab_id: "tab-1".to_owned(),
+            terminal_id: "terminal-1".to_owned(),
+            display_name: None,
+        });
+
+        model.set_pane_agent_status("pane-1".to_owned(), PaneAgentStatus::Done);
+
+        assert_eq!(
+            model.pane_agent_status("pane-1"),
+            Some(PaneAgentStatus::Done)
+        );
+        model.remove_pane("pane-1");
+        assert_eq!(model.pane_agent_status("pane-1"), None);
+    }
+
+    #[test]
     fn controller_diagnostics_saturation_handle_is_shared() {
         let model = DomainModel::default();
         let cloned = model.clone();
@@ -1437,7 +1491,7 @@ mod tests {
                 display_name: Some("Build".to_owned()),
                 agent: Some(SnapshotAgent {
                     agent_name: "codex".to_owned(),
-                    state: ExecState::Working,
+                    status: PaneAgentStatus::Working,
                 }),
                 agent_session: Some(AgentSessionReference {
                     source: "herdr".to_owned(),
