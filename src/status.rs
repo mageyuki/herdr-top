@@ -242,7 +242,6 @@ impl StatusReadModel {
 
         if let Some(evidence) = self.root_agents.get(&run.run_id)
             && let Some(state) = evidence.state.as_ref()
-            && !matches!(state, ExecState::Unknown)
         {
             return execution_display_status(state, false)
                 .with_source(StatusSource::AgentNodeState)
@@ -355,7 +354,50 @@ pub(crate) fn agent_node_is_display_stale(agent: &AgentNode, now_ms: i64) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DisplayOrdinal, Execution};
+    use crate::model::{AgentNode, DisplayOrdinal, Execution};
+
+    #[test]
+    fn recent_matching_root_agent_unknown_precedes_running_fallback() {
+        let run = TaskRun {
+            run_id: RunId::new(),
+            key: RunKey::Native {
+                provider: Provider::Codex,
+                sid: "session-42".to_owned(),
+            },
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+            created_at_ms: Some(100),
+            updated_at_ms: Some(100),
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        };
+        let mut model = DomainModel::default();
+        model.insert_task_run(run.clone());
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "root-agent".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some("session-42".to_owned()),
+            task_run_id: run.run_id,
+            display_ordinal: DisplayOrdinal::new(2),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Unknown),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: Some(100),
+            session_file: None,
+        });
+        let statuses = StatusReadModel::from_model(&model, 100);
+
+        assert_eq!(
+            statuses.task_display_status(&model, &run, None, false),
+            DisplayStatus::new(TaskDisplayStatus::Unknown, StatusSource::AgentNodeState)
+        );
+    }
 
     #[test]
     fn run_rate_activity_uses_authoritative_exact_pane_status_with_or_semantics() {

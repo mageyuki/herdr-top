@@ -575,11 +575,8 @@ pub(crate) fn project_rows_with_visible(
                 let last_observed_ms = run.updated_at_ms.or(run.created_at_ms).unwrap_or(*start_ms);
                 let expiry = last_observed_ms.saturating_add(ghost_visibility_ms());
                 next_expiry_ms = Some(next_expiry_ms.map_or(expiry, |current| current.min(expiry)));
-            } else if let Some(first_terminal_ms) = model
-                .task_run_v6_state(&run_id)
-                .and_then(|state| state.native_session_end.as_ref())
-                .map(|end| end.at_ms)
-                .or_else(|| operator.terminal_times.get(&run_id).copied())
+            } else if let Some(first_terminal_ms) =
+                authoritative_terminal_visibility_start_ms(model, operator, run)
                 && crate::activity::is_default_visible_task_run_in_model(
                     model,
                     run,
@@ -615,6 +612,21 @@ pub(crate) fn project_rows_with_visible(
     RowProjection {
         rows,
         next_expiry_ms,
+    }
+}
+
+fn authoritative_terminal_visibility_start_ms(
+    model: &DomainModel,
+    operator: &OperatorSnapshot,
+    run: &TaskRun,
+) -> Option<i64> {
+    if run.state.is_terminal() {
+        operator.terminal_times.get(&run.run_id).copied()
+    } else {
+        model
+            .task_run_v6_state(&run.run_id)
+            .and_then(|state| state.native_session_end.as_ref())
+            .map(|end| end.at_ms)
     }
 }
 
@@ -2915,6 +2927,102 @@ mod tests {
             now + 1,
         );
         assert_eq!(restored.rows[0].key.run_id(), Some(live.run_id));
+    }
+
+    #[test]
+    fn semantic_terminal_projection_deadline_uses_semantic_terminal_time() {
+        let now_ms = 7_200_000;
+        let semantic_terminal_at_ms = now_ms - DEFAULT_TERMINAL_VISIBILITY_MS + 1;
+        let mut terminal = run("semantic-terminal", 1, TaskState::Completed);
+        terminal.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "session-42".to_owned(),
+        };
+        let mut model = DomainModel::default();
+        model.insert_task_run(terminal.clone());
+        model.set_task_run_v6_state(
+            terminal.run_id,
+            TaskRunV6State {
+                native_session_end: Some(NativeSessionEnd {
+                    status: NativeSessionEndStatus::Done,
+                    at_ms: now_ms - DEFAULT_TERMINAL_VISIBILITY_MS - 1,
+                }),
+                ..TaskRunV6State::default()
+            },
+        );
+        let rows = vec![row(
+            NodeKey::Run {
+                run_id: terminal.run_id,
+                pane_id: None,
+            },
+            0,
+            "semantic terminal",
+        )];
+
+        let projection = project_rows(
+            &model,
+            &rows,
+            &operator(
+                Vec::new(),
+                HashMap::from([(terminal.run_id, semantic_terminal_at_ms)]),
+            ),
+            "",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            now_ms,
+        );
+
+        assert_eq!(projection.rows.len(), 1);
+        assert_eq!(
+            projection.next_expiry_ms,
+            Some(semantic_terminal_at_ms + DEFAULT_TERMINAL_VISIBILITY_MS)
+        );
+    }
+
+    #[test]
+    fn running_native_lifecycle_projection_deadline_uses_native_end_time() {
+        let native_end_at_ms = 1_000;
+        let mut ended = run("native-ended", 1, TaskState::Running);
+        ended.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "session-42".to_owned(),
+        };
+        let mut model = DomainModel::default();
+        model.insert_task_run(ended.clone());
+        model.set_task_run_v6_state(
+            ended.run_id,
+            TaskRunV6State {
+                native_session_end: Some(NativeSessionEnd {
+                    status: NativeSessionEndStatus::Done,
+                    at_ms: native_end_at_ms,
+                }),
+                ..TaskRunV6State::default()
+            },
+        );
+        let rows = vec![row(
+            NodeKey::Run {
+                run_id: ended.run_id,
+                pane_id: None,
+            },
+            0,
+            "native ended",
+        )];
+
+        let projection = project_rows(
+            &model,
+            &rows,
+            &operator(Vec::new(), HashMap::new()),
+            "",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            native_end_at_ms,
+        );
+
+        assert_eq!(projection.rows.len(), 1);
+        assert_eq!(
+            projection.next_expiry_ms,
+            Some(native_end_at_ms + DEFAULT_TERMINAL_VISIBILITY_MS)
+        );
     }
 
     #[test]

@@ -870,7 +870,10 @@ impl Reducer {
                 NativeLifecycleWatermark {
                     source_at_ms: at_ms,
                     observed_at_ms,
-                    source_order: format!("provider-liveness:{key:?}"),
+                    source_order: format!(
+                        "provider-liveness:{}",
+                        stable_provider_lifecycle_run_key_identity(key)
+                    ),
                 },
                 &mut persist,
             );
@@ -898,7 +901,10 @@ impl Reducer {
             NativeLifecycleWatermark {
                 source_at_ms: at_ms,
                 observed_at_ms,
-                source_order: format!("provider-liveness:{key:?}"),
+                source_order: format!(
+                    "provider-liveness:{}",
+                    stable_provider_lifecycle_run_key_identity(key)
+                ),
             },
             &mut persist,
         );
@@ -1087,7 +1093,10 @@ impl Reducer {
                 NativeLifecycleWatermark {
                     source_at_ms: at_ms,
                     observed_at_ms,
-                    source_order: format!("provider-lane-close:{key:?}"),
+                    source_order: format!(
+                        "provider-lane-close:{}",
+                        stable_provider_lifecycle_run_key_identity(key)
+                    ),
                 },
                 &mut persist,
             );
@@ -3600,6 +3609,39 @@ fn snapshot_provider(agent_name: &str, session_agent: Option<&str>) -> Option<Pr
         .or_else(|| provider_from_name(agent_name))
 }
 
+fn stable_provider_lifecycle_run_key_identity(key: &RunKey) -> String {
+    match key {
+        RunKey::Controller(controller_id) => {
+            format!("v1:controller:{}:{controller_id}", controller_id.len())
+        }
+        RunKey::Native { provider, sid } => format!(
+            "v1:native:{}:{}:{sid}",
+            stable_provider_token(*provider),
+            sid.len()
+        ),
+        RunKey::NativePath { provider, path } => format!(
+            "v1:native-path:{}:{}:{path}",
+            stable_provider_token(*provider),
+            path.len()
+        ),
+        RunKey::Provisional {
+            terminal_id,
+            start_ms,
+            seq,
+        } => format!(
+            "v1:provisional:{}:{terminal_id}:{start_ms}:{seq}",
+            terminal_id.len()
+        ),
+    }
+}
+
+const fn stable_provider_token(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude => "claude",
+        Provider::Codex => "codex",
+    }
+}
+
 fn provider_from_name(name: &str) -> Option<Provider> {
     let normalized = name.to_ascii_lowercase();
     if normalized.contains("codex") {
@@ -4187,6 +4229,64 @@ mod tests {
         assert_eq!(
             state.lifecycle_watermark.as_ref().unwrap().source_order,
             "c-reopen"
+        );
+    }
+
+    #[test]
+    fn provider_liveness_watermark_uses_stable_versioned_native_identity() {
+        let run_id = RunId::new();
+        let key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "session-42".to_owned(),
+        };
+        let mut model = DomainModel::default();
+        model.insert_task_run(run_with_controller_evidence(
+            run_id,
+            key.clone(),
+            1,
+            TaskState::Running,
+        ));
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        assert!(
+            !reducer
+                .touch_run_liveness_observed(&key, 500, 600)
+                .is_empty()
+        );
+        assert_eq!(
+            shared
+                .borrow()
+                .task_run_v6_state(&run_id)
+                .and_then(|state| state.lifecycle_watermark.as_ref())
+                .map(|watermark| watermark.source_order.as_str()),
+            Some("provider-liveness:v1:native:codex:10:session-42")
+        );
+    }
+
+    #[test]
+    fn provider_lane_close_watermark_uses_stable_versioned_native_identity() {
+        let run_id = RunId::new();
+        let key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "session-42".to_owned(),
+        };
+        let mut model = DomainModel::default();
+        model.insert_task_run(run_with_controller_evidence(
+            run_id,
+            key.clone(),
+            1,
+            TaskState::Running,
+        ));
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+
+        assert!(!reducer.apply_lane_close_observed(&key, 300, 400).is_empty());
+        assert_eq!(
+            shared
+                .borrow()
+                .task_run_v6_state(&run_id)
+                .and_then(|state| state.lifecycle_watermark.as_ref())
+                .map(|watermark| watermark.source_order.as_str()),
+            Some("provider-lane-close:v1:native:codex:10:session-42")
         );
     }
 
