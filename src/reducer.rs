@@ -18,7 +18,8 @@ use crate::model::{
     ControllerEvent, ControllerEventKind, DependencyEdge, DisplayOrdinal, DomainModel,
     EventMetadata, ExecState, Execution, ExecutionEdge, MinimalProviderMetadata, NormalizedEvent,
     OperatorCommand, Pane, Provider, ProviderDiagnosticsHandle, ReconcileBatch, RunId, RunKey,
-    SharedModel, TaskRun, TaskState, TopologyEntity, TopologyEntityId, sanitize_controller_text,
+    SharedModel, TaskRun, TaskState, TopologyAuthority, TopologyEntity, TopologyEntityId,
+    sanitize_controller_text,
 };
 use crate::operator::OperatorProjection;
 use crate::store::{
@@ -206,7 +207,6 @@ struct WorkloadObservationTiming {
 // increment5-workload-harness: end reducer timing callback ABI
 
 const STALE_GRACE_MS: i64 = 30_000;
-const TAB_RENAMED_EVENT: &str = "tab_renamed";
 
 /// Errors that reject a reducer transition before any model or persistence mutation escapes.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -1584,7 +1584,9 @@ impl Reducer {
                     self.model.set_run_kind(run_id, kind.clone());
                 }
             }
-            NormalizedEvent::TopologyUpsert { entity, .. } => match entity {
+            NormalizedEvent::TopologyUpsert {
+                authority, entity, ..
+            } => match entity {
                 TopologyEntity::Workspace(workspace) => {
                     let display_ordinal =
                         self.workspace_ordinal_or_allocate(&workspace.workspace_id)?;
@@ -1599,19 +1601,29 @@ impl Reducer {
                         return Ok(());
                     }
                     let mut tab = tab.clone();
-                    if tab.label.is_none() && metadata.source_event_type != TAB_RENAMED_EVENT {
-                        tab.label = self
-                            .model
-                            .tab(&tab.tab_id)
-                            .and_then(|current| current.label.clone());
-                    }
+                    tab.label = match authority {
+                        TopologyAuthority::Partial => tab
+                            .label
+                            .as_deref()
+                            .map(sanitize_controller_text)
+                            .or_else(|| {
+                                self.model
+                                    .tab(&tab.tab_id)
+                                    .and_then(|current| current.label.clone())
+                            }),
+                        TopologyAuthority::Authoritative => tab
+                            .label
+                            .as_deref()
+                            .map(sanitize_controller_text)
+                            .filter(|label| !label.is_empty()),
+                    };
                     let display_ordinal = self.tab_ordinal_or_allocate(&tab.tab_id)?;
                     self.model.insert_tab(tab.clone());
                     persist.push(PersistOp::UpsertTab {
                         tab: tab.clone(),
                         display_ordinal,
                     });
-                    if tab.label.is_none() && metadata.source_event_type == TAB_RENAMED_EVENT {
+                    if *authority == TopologyAuthority::Authoritative && tab.label.is_none() {
                         persist.push(PersistOp::ClearTabLabel {
                             tab_id: tab.tab_id.clone(),
                         });
@@ -1622,18 +1634,34 @@ impl Reducer {
                         return Ok(());
                     }
                     let mut pane = pane.clone();
-                    if pane.display_name.is_none() {
-                        pane.display_name = self
-                            .model
-                            .pane(&pane.pane_id)
-                            .and_then(|current| current.display_name.clone());
-                    }
+                    pane.display_name = match authority {
+                        TopologyAuthority::Partial => pane
+                            .display_name
+                            .as_deref()
+                            .map(sanitize_controller_text)
+                            .or_else(|| {
+                                self.model
+                                    .pane(&pane.pane_id)
+                                    .and_then(|current| current.display_name.clone())
+                            }),
+                        TopologyAuthority::Authoritative => pane
+                            .display_name
+                            .as_deref()
+                            .map(sanitize_controller_text)
+                            .filter(|display_name| !display_name.is_empty()),
+                    };
                     let display_ordinal = self.pane_ordinal_or_allocate(&pane.pane_id)?;
                     self.model.insert_pane(pane.clone());
                     persist.push(PersistOp::UpsertPane {
-                        pane,
+                        pane: pane.clone(),
                         display_ordinal,
                     });
+                    if *authority == TopologyAuthority::Authoritative && pane.display_name.is_none()
+                    {
+                        persist.push(PersistOp::ClearPaneDisplayName {
+                            pane_id: pane.pane_id.clone(),
+                        });
+                    }
                 }
             },
             NormalizedEvent::TopologyClosure { entity, .. } => {
@@ -2159,24 +2187,6 @@ impl Reducer {
                     .map(|ordinal| (pane.pane_id.clone(), ordinal))
             })
             .collect::<Vec<_>>();
-        let retained_tab_labels = topology
-            .tabs
-            .iter()
-            .filter_map(|tab| {
-                self.model
-                    .tab(&tab.tab_id)
-                    .map(|current| (tab.tab_id.clone(), current.label.clone()))
-            })
-            .collect::<HashMap<_, _>>();
-        let retained_pane_display_names = topology
-            .panes
-            .iter()
-            .filter_map(|pane| {
-                self.model
-                    .pane(&pane.pane_id)
-                    .map(|current| (pane.pane_id.clone(), current.display_name.clone()))
-            })
-            .collect::<HashMap<_, _>>();
         let workspace_ids: Vec<_> = self
             .model
             .workspaces()
@@ -2224,15 +2234,22 @@ impl Reducer {
         }
         for tab in &topology.tabs {
             let mut tab = tab.clone();
-            if tab.label.is_none() {
-                tab.label = retained_tab_labels.get(&tab.tab_id).cloned().flatten();
-            }
+            tab.label = tab
+                .label
+                .as_deref()
+                .map(sanitize_controller_text)
+                .filter(|label| !label.is_empty());
             let display_ordinal = self.tab_ordinal_or_allocate(&tab.tab_id)?;
             self.model.insert_tab(tab.clone());
             persist.push(PersistOp::UpsertTab {
-                tab,
+                tab: tab.clone(),
                 display_ordinal,
             });
+            if tab.label.is_none() {
+                persist.push(PersistOp::ClearTabLabel {
+                    tab_id: tab.tab_id.clone(),
+                });
+            }
         }
         for pane in &topology.panes {
             let pane = Pane {
@@ -2240,19 +2257,23 @@ impl Reducer {
                 workspace_id: pane.workspace_id.clone(),
                 tab_id: pane.tab_id.clone(),
                 terminal_id: pane.terminal_id.clone(),
-                display_name: pane.display_name.clone().or_else(|| {
-                    retained_pane_display_names
-                        .get(&pane.pane_id)
-                        .cloned()
-                        .flatten()
-                }),
+                display_name: pane
+                    .display_name
+                    .as_deref()
+                    .map(sanitize_controller_text)
+                    .filter(|display_name| !display_name.is_empty()),
             };
             let display_ordinal = self.pane_ordinal_or_allocate(&pane.pane_id)?;
             self.model.insert_pane(pane.clone());
             persist.push(PersistOp::UpsertPane {
-                pane,
+                pane: pane.clone(),
                 display_ordinal,
             });
+            if pane.display_name.is_none() {
+                persist.push(PersistOp::ClearPaneDisplayName {
+                    pane_id: pane.pane_id.clone(),
+                });
+            }
         }
         Ok(())
     }
@@ -2970,8 +2991,8 @@ mod tests {
         ControllerEvent, ControllerEventKind, DependencyEdge, DisplayOrdinal, DomainModel,
         EventMetadata, ExecState, Execution, ExecutionEdge, GapKind, MinimalProviderMetadata,
         NormalizedEvent, OperatorCommand, Pane, PaneSnapshot, Provider, ReconcileBatch, RunId,
-        RunKey, SharedModel, SnapshotAgent, Tab, TaskRun, TaskState, TopologyEntity,
-        TopologyEntityId, TopologySnapshot, TurnAttr, Workspace,
+        RunKey, SharedModel, SnapshotAgent, Tab, TaskRun, TaskState, TopologyAuthority,
+        TopologyEntity, TopologyEntityId, TopologySnapshot, TurnAttr, Workspace,
     };
     use crate::provider::ProviderEvent;
     use crate::provider::claude_facts::{extract_claude_line, extract_meta_json};
@@ -3055,6 +3076,7 @@ mod tests {
         let outcome = reducer
             .apply(NormalizedEvent::TopologyUpsert {
                 metadata: event_metadata,
+                authority: TopologyAuthority::Partial,
                 entity: TopologyEntity::Workspace(Workspace {
                     workspace_id: "merge-trigger-workspace".to_owned(),
                 }),
@@ -3092,6 +3114,7 @@ mod tests {
                     metadata.task_run_id = Some(task_run_id);
                     metadata
                 },
+                authority: TopologyAuthority::Partial,
                 entity: TopologyEntity::Workspace(Workspace {
                     workspace_id: format!("workspace-{event_id}"),
                 }),
@@ -5875,6 +5898,7 @@ mod tests {
     fn topology_event(metadata: EventMetadata, workspace_id: &str) -> NormalizedEvent {
         NormalizedEvent::TopologyUpsert {
             metadata,
+            authority: TopologyAuthority::Partial,
             entity: TopologyEntity::Workspace(Workspace {
                 workspace_id: workspace_id.to_owned(),
             }),
@@ -5884,8 +5908,24 @@ mod tests {
     fn topology_entity_event(event_id: &str, entity: TopologyEntity) -> NormalizedEvent {
         NormalizedEvent::TopologyUpsert {
             metadata: metadata(event_id, 1_000),
+            authority: TopologyAuthority::Partial,
             entity,
         }
+    }
+
+    fn topology_entity_event_with_authority(
+        event_id: &str,
+        entity: TopologyEntity,
+        authority: &str,
+    ) -> NormalizedEvent {
+        serde_json::from_value(serde_json::json!({
+            "TopologyUpsert": {
+                "metadata": metadata(event_id, 1_000),
+                "entity": entity,
+                "authority": authority,
+            },
+        }))
+        .unwrap()
     }
 
     fn topology_snapshot(
@@ -5920,6 +5960,352 @@ mod tests {
                     agent_session: None,
                 })
                 .collect(),
+        }
+    }
+
+    fn reducer_with_named_topology() -> (Reducer, SharedModel) {
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        for (event_id, entity) in [
+            (
+                "named-workspace",
+                TopologyEntity::Workspace(Workspace {
+                    workspace_id: "workspace".to_owned(),
+                }),
+            ),
+            (
+                "named-tab",
+                TopologyEntity::Tab(Tab {
+                    tab_id: "tab".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    label: Some("old tab".to_owned()),
+                }),
+            ),
+            (
+                "named-pane",
+                TopologyEntity::Pane(Pane {
+                    pane_id: "pane".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    tab_id: "tab".to_owned(),
+                    terminal_id: "terminal".to_owned(),
+                    display_name: Some("old pane".to_owned()),
+                }),
+            ),
+        ] {
+            reducer
+                .apply(topology_entity_event(event_id, entity))
+                .unwrap();
+        }
+        (reducer, shared)
+    }
+
+    fn names_cleared_by_isolated_operation(operation: &PersistOp) -> (bool, bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        store
+            .apply_batch(vec![
+                PersistOp::UpsertWorkspace {
+                    workspace: Workspace {
+                        workspace_id: "workspace".to_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(1),
+                },
+                PersistOp::UpsertTab {
+                    tab: Tab {
+                        tab_id: "tab".to_owned(),
+                        workspace_id: "workspace".to_owned(),
+                        label: Some("old tab".to_owned()),
+                    },
+                    display_ordinal: DisplayOrdinal::new(2),
+                },
+                PersistOp::UpsertPane {
+                    pane: Pane {
+                        pane_id: "pane".to_owned(),
+                        workspace_id: "workspace".to_owned(),
+                        tab_id: "tab".to_owned(),
+                        terminal_id: "terminal".to_owned(),
+                        display_name: Some("old pane".to_owned()),
+                    },
+                    display_ordinal: DisplayOrdinal::new(3),
+                },
+            ])
+            .unwrap();
+        store.apply_batch(vec![operation.clone()]).unwrap();
+        let restored = store.load_restored_state().unwrap();
+        (
+            restored
+                .model
+                .tab("tab")
+                .is_some_and(|tab| tab.label.is_none()),
+            restored
+                .model
+                .pane("pane")
+                .is_some_and(|pane| pane.display_name.is_none()),
+        )
+    }
+
+    #[test]
+    fn partial_topology_upsert_preserves_names() {
+        let (mut reducer, shared) = reducer_with_named_topology();
+        let mut tab_event = topology_entity_event_with_authority(
+            "partial-tab",
+            TopologyEntity::Tab(Tab {
+                tab_id: "tab".to_owned(),
+                workspace_id: "workspace".to_owned(),
+                label: None,
+            }),
+            "Partial",
+        );
+        let NormalizedEvent::TopologyUpsert { metadata, .. } = &mut tab_event else {
+            unreachable!();
+        };
+        metadata.source_event_type = "tab_renamed".to_owned();
+
+        let ApplyOutcome::Applied(tab_batch) = reducer.apply(tab_event).unwrap() else {
+            panic!("partial tab observation should apply");
+        };
+        let ApplyOutcome::Applied(pane_batch) = reducer
+            .apply(topology_entity_event_with_authority(
+                "partial-pane",
+                TopologyEntity::Pane(Pane {
+                    pane_id: "pane".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    tab_id: "tab".to_owned(),
+                    terminal_id: "terminal".to_owned(),
+                    display_name: None,
+                }),
+                "Partial",
+            ))
+            .unwrap()
+        else {
+            panic!("partial pane observation should apply");
+        };
+
+        assert_eq!(
+            shared.borrow().tab("tab").unwrap().label.as_deref(),
+            Some("old tab")
+        );
+        assert_eq!(
+            shared
+                .borrow()
+                .pane("pane")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("old pane")
+        );
+        assert_eq!(
+            tab_batch.len(),
+            2,
+            "partial tab upsert must not append a clear"
+        );
+        assert_eq!(
+            pane_batch.len(),
+            2,
+            "partial pane upsert must not append a clear"
+        );
+    }
+
+    #[test]
+    fn authoritative_topology_upsert_sets_and_clears_names() {
+        let (mut reducer, shared) = reducer_with_named_topology();
+        for (event_id, entity) in [
+            (
+                "set-tab",
+                TopologyEntity::Tab(Tab {
+                    tab_id: "tab".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    label: Some("new\ntab".to_owned()),
+                }),
+            ),
+            (
+                "set-pane",
+                TopologyEntity::Pane(Pane {
+                    pane_id: "pane".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    tab_id: "tab".to_owned(),
+                    terminal_id: "terminal".to_owned(),
+                    display_name: Some("new\npane".to_owned()),
+                }),
+            ),
+        ] {
+            reducer
+                .apply(topology_entity_event_with_authority(
+                    event_id,
+                    entity,
+                    "Authoritative",
+                ))
+                .unwrap();
+        }
+        assert_eq!(
+            shared.borrow().tab("tab").unwrap().label.as_deref(),
+            Some("new\\ntab")
+        );
+        assert_eq!(
+            shared
+                .borrow()
+                .pane("pane")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("new\\npane")
+        );
+
+        let ApplyOutcome::Applied(tab_batch) = reducer
+            .apply(topology_entity_event_with_authority(
+                "clear-tab",
+                TopologyEntity::Tab(Tab {
+                    tab_id: "tab".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    label: None,
+                }),
+                "Authoritative",
+            ))
+            .unwrap()
+        else {
+            panic!("authoritative tab clear should apply");
+        };
+        let ApplyOutcome::Applied(pane_batch) = reducer
+            .apply(topology_entity_event_with_authority(
+                "clear-pane",
+                TopologyEntity::Pane(Pane {
+                    pane_id: "pane".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    tab_id: "tab".to_owned(),
+                    terminal_id: "terminal".to_owned(),
+                    display_name: Some(String::new()),
+                }),
+                "Authoritative",
+            ))
+            .unwrap()
+        else {
+            panic!("authoritative pane clear should apply");
+        };
+
+        assert_eq!(shared.borrow().tab("tab").unwrap().label, None);
+        assert_eq!(shared.borrow().pane("pane").unwrap().display_name, None);
+        assert_eq!(
+            tab_batch.len(),
+            3,
+            "authoritative tab clear must be explicit"
+        );
+        assert_eq!(
+            pane_batch.len(),
+            3,
+            "authoritative pane clear must be explicit"
+        );
+    }
+
+    #[test]
+    fn authoritative_snapshot_clear_orders_upsert_before_clear() {
+        let (mut reducer, _shared) = reducer_with_named_topology();
+        let batch = reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: topology_snapshot(
+                    &["workspace"],
+                    &[("tab", "workspace")],
+                    &[("pane", "workspace", "tab")],
+                ),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let upsert_tab = batch
+            .iter()
+            .position(|operation| matches!(operation, PersistOp::UpsertTab { tab, .. } if tab.tab_id == "tab"))
+            .unwrap();
+        let upsert_pane = batch
+            .iter()
+            .position(|operation| matches!(operation, PersistOp::UpsertPane { pane, .. } if pane.pane_id == "pane"))
+            .unwrap();
+        let cleared_names = batch
+            .iter()
+            .enumerate()
+            .map(|(index, operation)| (index, names_cleared_by_isolated_operation(operation)))
+            .collect::<Vec<_>>();
+        let clear_tab = cleared_names
+            .iter()
+            .find_map(|(index, (tab, _))| tab.then_some(*index))
+            .expect("snapshot batch must explicitly clear the tab label");
+        let clear_pane = cleared_names
+            .iter()
+            .find_map(|(index, (_, pane))| pane.then_some(*index))
+            .expect("snapshot batch must explicitly clear the pane display name");
+
+        assert!(upsert_tab < clear_tab);
+        assert!(upsert_pane < clear_pane);
+    }
+
+    #[test]
+    fn authoritative_orphans_emit_no_upsert_or_clear() {
+        let (mut reducer, _shared) = reducer_with_named_topology();
+        for (event_id, entity) in [
+            (
+                "orphan-tab",
+                TopologyEntity::Tab(Tab {
+                    tab_id: "orphan-tab".to_owned(),
+                    workspace_id: "missing-workspace".to_owned(),
+                    label: None,
+                }),
+            ),
+            (
+                "orphan-pane",
+                TopologyEntity::Pane(Pane {
+                    pane_id: "orphan-pane".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    tab_id: "missing-tab".to_owned(),
+                    terminal_id: "orphan-terminal".to_owned(),
+                    display_name: None,
+                }),
+            ),
+        ] {
+            let ApplyOutcome::Applied(batch) = reducer
+                .apply(topology_entity_event_with_authority(
+                    event_id,
+                    entity,
+                    "Authoritative",
+                ))
+                .unwrap()
+            else {
+                panic!("orphan observation should still be recorded");
+            };
+            assert_eq!(batch.len(), 1, "orphan must emit only its event record");
+        }
+
+        for (event_id, entity) in [
+            (
+                "known-tab-clear-control",
+                TopologyEntity::Tab(Tab {
+                    tab_id: "tab".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    label: None,
+                }),
+            ),
+            (
+                "known-pane-clear-control",
+                TopologyEntity::Pane(Pane {
+                    pane_id: "pane".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    tab_id: "tab".to_owned(),
+                    terminal_id: "terminal".to_owned(),
+                    display_name: None,
+                }),
+            ),
+        ] {
+            let ApplyOutcome::Applied(batch) = reducer
+                .apply(topology_entity_event_with_authority(
+                    event_id,
+                    entity,
+                    "Authoritative",
+                ))
+                .unwrap()
+            else {
+                panic!("known authoritative clear should apply");
+            };
+            assert_eq!(
+                batch.len(),
+                3,
+                "positive control must emit upsert, clear, and record"
+            );
         }
     }
 
@@ -6134,6 +6520,7 @@ mod tests {
         let ApplyOutcome::Applied(batch) = reducer
             .apply(NormalizedEvent::TopologyUpsert {
                 metadata: event_metadata,
+                authority: TopologyAuthority::Partial,
                 entity: TopologyEntity::Tab(Tab {
                     tab_id: "orphan-tab".to_owned(),
                     workspace_id: "missing-workspace".to_owned(),
@@ -6488,7 +6875,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_gap_retains_or_overwrites_topology_names_end_to_end() {
+    fn reconcile_gap_clears_names_durably() {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let mut store = open_writer(&root).unwrap();
@@ -6560,10 +6947,7 @@ mod tests {
             .unwrap();
         assert!(delete_tab < upsert_tab);
         assert!(delete_pane < upsert_pane);
-        assert_eq!(
-            shared.borrow().tab("tab").unwrap().label.as_deref(),
-            Some("stored tab")
-        );
+        assert_eq!(shared.borrow().tab("tab").unwrap().label.as_deref(), None);
         assert_eq!(
             shared
                 .borrow()
@@ -6571,17 +6955,14 @@ mod tests {
                 .unwrap()
                 .display_name
                 .as_deref(),
-            Some("stored pane")
+            None
         );
         store.apply_batch(batch).unwrap();
         let restored = store.load_restored_state().unwrap();
-        assert_eq!(
-            restored.model.tab("tab").unwrap().label.as_deref(),
-            Some("stored tab")
-        );
+        assert_eq!(restored.model.tab("tab").unwrap().label.as_deref(), None);
         assert_eq!(
             restored.model.pane("pane").unwrap().display_name.as_deref(),
-            Some("stored pane")
+            None
         );
 
         let mut named_topology = topology_snapshot(

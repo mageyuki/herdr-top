@@ -95,6 +95,7 @@ impl OperatorProjection {
                 | PersistOp::DeleteWorkspace { .. }
                 | PersistOp::DeleteTab { .. }
                 | PersistOp::ClearTabLabel { .. }
+                | PersistOp::ClearPaneDisplayName { .. }
                 | PersistOp::DeletePane { .. }
                 | PersistOp::UpsertExecution(_)
                 | PersistOp::UpsertAgentNode(_)
@@ -289,7 +290,7 @@ mod tests {
     use crate::lockfile::StateRoot;
     use crate::model::{
         DisplayOrdinal, EventMetadata, NormalizedEvent, RunId, RunKey, TaskRun, TaskState,
-        TopologyEntity, Workspace,
+        TopologyAuthority, TopologyEntity, Workspace,
     };
     use crate::store::writer::{
         DurabilityDisposition, PersistenceFailure, PersistenceFailureCode, PersistenceOperation,
@@ -376,6 +377,7 @@ mod tests {
                     progress: None,
                     ingest_seq,
                 },
+                authority: TopologyAuthority::Partial,
                 entity: TopologyEntity::Workspace(Workspace {
                     workspace_id: "workspace".to_owned(),
                 }),

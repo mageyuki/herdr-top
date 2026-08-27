@@ -34,8 +34,8 @@ use crate::model::{
     ControllerDiagnosticsHandle, DomainModel, EnrichmentDiagnosticsHandle, EventMetadata,
     ExecState, Execution, GapKind, MinimalProviderMetadata, NormalizedEvent, OperatorCommand, Pane,
     PaneSnapshot, Provider, ProviderDiagnosticsHandle, ReconcileBatch, RunId, RunKey, SharedModel,
-    SnapshotAgent, SourceCoverage, Tab, TopologyEntity, TopologyEntityId, TopologySnapshot,
-    Workspace, sanitize_controller_text,
+    SnapshotAgent, SourceCoverage, Tab, TopologyAuthority, TopologyEntity, TopologyEntityId,
+    TopologySnapshot, Workspace, sanitize_controller_text,
 };
 use crate::performance::{
     Admission, Admitted, PerformanceClock, PerformanceIngress, PerformanceSampler,
@@ -6607,6 +6607,7 @@ fn enrichment_subscriptions(pane_ids: &BTreeSet<String>) -> Vec<Subscription> {
 fn topology_upsert(session: &str, kind: &str, entity: TopologyEntity) -> NormalizedEvent {
     NormalizedEvent::TopologyUpsert {
         metadata: metadata(session, kind),
+        authority: TopologyAuthority::Partial,
         entity,
     }
 }

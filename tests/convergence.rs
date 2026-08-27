@@ -16,7 +16,8 @@ use herdr_top::lockfile::{StateRoot, state_root_in};
 use herdr_top::model::{
     AgentSessionReference, AgentSessionReferenceKind, DisplayOrdinal, DomainModel, EventMetadata,
     ExecState, Execution, GapKind, NormalizedEvent, Pane, PaneSnapshot, Provider, ReconcileBatch,
-    RunId, RunKey, SnapshotAgent, Tab, TaskRun, TaskState, TopologySnapshot, Workspace,
+    RunId, RunKey, SnapshotAgent, Tab, TaskRun, TaskState, TopologyAuthority, TopologySnapshot,
+    Workspace,
 };
 use herdr_top::reducer::{ApplyOutcome, Reducer};
 use herdr_top::session_key;
@@ -2314,6 +2315,7 @@ fn binding_conflict_returns_typed_dropped_result() {
     let outcome = reducer
         .apply(NormalizedEvent::TopologyUpsert {
             metadata: event_metadata,
+            authority: TopologyAuthority::Partial,
             entity: herdr_top::model::TopologyEntity::Workspace(Workspace {
                 workspace_id: "must-roll-back".to_owned(),
             }),
@@ -2340,6 +2342,7 @@ fn binding_conflict_returns_typed_dropped_result() {
     reducer
         .apply(NormalizedEvent::TopologyUpsert {
             metadata: next_metadata,
+            authority: TopologyAuthority::Partial,
             entity: herdr_top::model::TopologyEntity::Workspace(Workspace {
                 workspace_id: "after-rollback".to_owned(),
             }),
