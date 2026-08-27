@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use super::ids::{DisplayOrdinal, Provider, RunId, RunKey};
-use super::state::{ExecState, PaneAgentStatus, TaskState};
+use super::state::{ExecState, PaneAgentStatus, RunRateTotals, TaskRunV6State, TaskState};
 
 /// Operator intent delivered to the collector-owned reducer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -243,6 +243,7 @@ pub struct ControllerDiagnostics {
     ingest_sequence_exhaustions: u64,
     provider_parent_conflicts: u64,
     provider_identity_disagreements: u64,
+    rate_total_saturations: u64,
     acceptor: ControllerDiagnosticsHandle,
 }
 
@@ -293,6 +294,12 @@ impl ControllerDiagnostics {
     #[must_use]
     pub const fn provider_identity_disagreements(&self) -> u64 {
         self.provider_identity_disagreements
+    }
+
+    /// Rate-ledger updates clamped to SQLite's non-negative signed domain.
+    #[must_use]
+    pub const fn rate_total_saturations(&self) -> u64 {
+        self.rate_total_saturations
     }
 
     /// Controller socket admissions rejected because the acceptor was saturated.
@@ -347,6 +354,10 @@ impl ControllerDiagnostics {
     pub(crate) fn record_provider_identity_disagreement(&mut self) {
         self.provider_identity_disagreements =
             self.provider_identity_disagreements.saturating_add(1);
+    }
+
+    pub(crate) fn record_rate_total_saturation(&mut self) {
+        self.rate_total_saturations = self.rate_total_saturations.saturating_add(1);
     }
 }
 
@@ -699,6 +710,8 @@ pub struct DomainModel {
     topology_ordinals: HashMap<(TopologyKind, String), DisplayOrdinal>,
     task_runs: HashMap<RunId, TaskRun>,
     run_ids_by_key: HashMap<RunKey, RunId>,
+    task_run_v6_state: HashMap<RunId, TaskRunV6State>,
+    run_rate_totals: HashMap<RunId, RunRateTotals>,
     /// Recomputed from provider logs at startup; no serialized or database projection owns it.
     telemetry: RunTelemetryMap,
     /// First provider kind per run; recomputed at startup and never persisted.
@@ -878,6 +891,7 @@ impl DomainModel {
         let run_id = task_run.run_id;
         let key = task_run.key.clone();
         let replaced = self.task_runs.insert(run_id, task_run);
+        self.task_run_v6_state.entry(run_id).or_default();
         if let Some(previous) = &replaced
             && self.run_ids_by_key.get(&previous.key) == Some(&run_id)
         {
@@ -901,6 +915,78 @@ impl DomainModel {
 
     pub fn task_runs(&self) -> impl Iterator<Item = &TaskRun> {
         self.task_runs.values()
+    }
+
+    /// Returns persisted lifecycle and historical-readiness state for one run.
+    #[must_use]
+    pub fn task_run_v6_state(&self, run_id: &RunId) -> Option<&TaskRunV6State> {
+        self.task_run_v6_state.get(run_id)
+    }
+
+    /// Replaces persisted lifecycle and historical-readiness state for one run.
+    pub fn set_task_run_v6_state(
+        &mut self,
+        run_id: RunId,
+        state: TaskRunV6State,
+    ) -> Option<TaskRunV6State> {
+        self.task_run_v6_state.insert(run_id, state)
+    }
+
+    /// Returns closed active-time rate totals for one run.
+    #[must_use]
+    pub fn run_rate_totals(&self, run_id: &RunId) -> Option<&RunRateTotals> {
+        self.run_rate_totals.get(run_id)
+    }
+
+    /// Sets closed totals after clamping them to SQLite's persisted domain.
+    pub fn set_run_rate_totals(
+        &mut self,
+        run_id: RunId,
+        totals: RunRateTotals,
+    ) -> Option<RunRateTotals> {
+        let (totals, saturated) = totals.clamped();
+        if saturated {
+            self.controller_diagnostics.record_rate_total_saturation();
+        }
+        self.run_rate_totals.insert(run_id, totals)
+    }
+
+    /// Adds closed totals once and reports whether the persisted domain saturated.
+    pub fn accumulate_run_rate_totals(&mut self, run_id: RunId, delta: RunRateTotals) -> bool {
+        let saturated = self
+            .run_rate_totals
+            .entry(run_id)
+            .or_default()
+            .saturating_add(delta);
+        if saturated {
+            self.controller_diagnostics.record_rate_total_saturation();
+        }
+        saturated
+    }
+
+    pub(crate) fn fold_task_run_v6_state(&mut self, survivor: RunId, absorbed: RunId) {
+        let absorbed_state = self.task_run_v6_state.remove(&absorbed).unwrap_or_default();
+        let survivor_state = self.task_run_v6_state.entry(survivor).or_default();
+        survivor_state.history_ready |= absorbed_state.history_ready;
+        survivor_state.latest_provider_at_ms = match (
+            survivor_state.latest_provider_at_ms,
+            absorbed_state.latest_provider_at_ms,
+        ) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (left @ Some(_), None) => left,
+            (None, right) => right,
+        };
+        if absorbed_state.lifecycle_watermark > survivor_state.lifecycle_watermark {
+            survivor_state.lifecycle_watermark = absorbed_state.lifecycle_watermark;
+            survivor_state.native_session_end = absorbed_state.native_session_end;
+        }
+    }
+
+    pub(crate) fn fold_run_rate_totals(&mut self, survivor: RunId, absorbed: RunId) {
+        let Some(absorbed_totals) = self.run_rate_totals.remove(&absorbed) else {
+            return;
+        };
+        self.accumulate_run_rate_totals(survivor, absorbed_totals);
     }
 
     /// Returns transient output-token telemetry for one run.
@@ -1042,10 +1128,13 @@ impl DomainModel {
 
     /// Restores a historical run without making its collector-scoped key addressable.
     pub fn insert_historical_task_run(&mut self, task_run: TaskRun) -> Option<TaskRun> {
+        self.task_run_v6_state.entry(task_run.run_id).or_default();
         self.task_runs.insert(task_run.run_id, task_run)
     }
 
     pub(crate) fn remove_task_run_record(&mut self, run_id: &RunId) -> Option<TaskRun> {
+        self.task_run_v6_state.remove(run_id);
+        self.run_rate_totals.remove(run_id);
         self.task_runs.remove(run_id)
     }
 

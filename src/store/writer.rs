@@ -9,8 +9,12 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::lockfile::OwnerRecord;
+use crate::model::HistoryDrainId;
 
-use super::{CleanupStats, LedgerEntry, PersistBatch, PersistOp, Store, StoreError};
+use super::{
+    CleanupStats, HistoryDrainFinalization, LedgerEntry, PersistBatch, PersistOp, PersistV6Batch,
+    Store, StoreError,
+};
 
 const WRITER_QUEUE_CAPACITY: usize = 256;
 /// Maximum UTF-8 byte length retained for a persistence error detail.
@@ -749,6 +753,28 @@ impl EnqueuePermit<'_> {
         waiter.arm();
         PendingEnqueue { waiter }
     }
+
+    /// Consumes the permit and enqueues one schema-v6 batch without another channel operation.
+    #[must_use]
+    pub fn enqueue_v6(self, batch: PersistV6Batch) -> PendingEnqueue {
+        for entry in ledger_entries(&batch.operations) {
+            let _ = self.ledger.reserve(entry.event_id, entry.seen_at_ms);
+        }
+        let (acknowledgement, response) = oneshot::channel();
+        let mut waiter = AcknowledgementWaiter::new(
+            response,
+            self.health,
+            PersistenceOperation::Apply,
+            #[cfg(test)]
+            self.acknowledgement_test_control,
+        );
+        self.permit.send(WriterCommand::ApplyV6 {
+            batch,
+            acknowledgement,
+        });
+        waiter.arm();
+        PendingEnqueue { waiter }
+    }
 }
 
 impl WriterClient {
@@ -786,6 +812,32 @@ impl WriterClient {
         if self
             .sender
             .send(WriterCommand::Apply {
+                batch,
+                acknowledgement,
+            })
+            .await
+            .is_err()
+        {
+            return Err(self.health.runtime_error(queue_failure(operation)));
+        }
+        waiter.arm();
+        let delta = waiter.wait().await?;
+        self.ledger
+            .apply_cleanup(&delta.cleanup.deleted_ledger_entries);
+        Ok(())
+    }
+
+    /// Atomically commits one core-plus-v6 reducer persistence batch.
+    pub async fn apply_v6(&mut self, batch: PersistV6Batch) -> Result<(), WriterError> {
+        let operation = PersistenceOperation::Apply;
+        for entry in ledger_entries(&batch.operations) {
+            let _ = self.ledger.reserve(entry.event_id, entry.seen_at_ms);
+        }
+        let (acknowledgement, response) = oneshot::channel();
+        let mut waiter = self.waiter(response, operation);
+        if self
+            .sender
+            .send(WriterCommand::ApplyV6 {
                 batch,
                 acknowledgement,
             })
@@ -907,6 +959,53 @@ impl WriterClient {
             }
         })
         .await
+    }
+
+    /// Atomically finalizes one history drain on the dedicated writer thread.
+    pub async fn finalize_history_drain(
+        &mut self,
+        drain_id: HistoryDrainId,
+        observed_at_ms: i64,
+    ) -> Result<HistoryDrainFinalization, WriterError> {
+        let operation = PersistenceOperation::Apply;
+        let (acknowledgement, response) = oneshot::channel();
+        let mut waiter = self.waiter(response, operation);
+        if self
+            .sender
+            .send(WriterCommand::FinalizeHistoryDrain {
+                drain_id,
+                observed_at_ms,
+                acknowledgement,
+            })
+            .await
+            .is_err()
+        {
+            return Err(self.health.runtime_error(queue_failure(operation)));
+        }
+        waiter.arm();
+        waiter.wait().await
+    }
+
+    /// Reads completion identity directly, including while persistence health is degraded.
+    pub async fn history_drain_finalized(
+        &self,
+        drain_id: &HistoryDrainId,
+    ) -> Result<bool, WriterError> {
+        let operation = PersistenceOperation::Barrier;
+        let (acknowledgement, response) = oneshot::channel();
+        let waiter = self.waiter(response, operation);
+        if self
+            .sender
+            .send(WriterCommand::HistoryDrainFinalized {
+                drain_id: drain_id.clone(),
+                acknowledgement,
+            })
+            .await
+            .is_err()
+        {
+            return Err(self.health.runtime_error(queue_failure(operation)));
+        }
+        waiter.wait_response_only().await
     }
 
     /// Acknowledges after every command queued before this call has completed.
@@ -1096,6 +1195,20 @@ fn spawn_writer_with_test_control(
     Ok((lifecycle, writer, handle, injector))
 }
 
+#[cfg(test)]
+pub(super) fn spawn_writer_with_dropped_apply_ack(
+    store: Store,
+) -> Result<(WriterLifecycle, WriterClient), WriterError> {
+    let (lifecycle, writer, handle, _injector) = spawn_writer_with_test_control(
+        store,
+        super::unix_now_ms,
+        PersistenceOperation::Apply,
+        AcknowledgementTestMode::DropAcknowledgement,
+    )?;
+    handle.release();
+    Ok((lifecycle, writer))
+}
+
 fn spawn_writer_inner(
     store: Store,
     clock: fn() -> Result<i64, StoreError>,
@@ -1141,6 +1254,10 @@ enum WriterCommand {
         batch: PersistBatch,
         acknowledgement: oneshot::Sender<Result<WriterDelta, PersistenceFailure>>,
     },
+    ApplyV6 {
+        batch: PersistV6Batch,
+        acknowledgement: oneshot::Sender<Result<WriterDelta, PersistenceFailure>>,
+    },
     Cleanup {
         now_ms: i64,
         acknowledgement: oneshot::Sender<Result<WriterDelta, PersistenceFailure>>,
@@ -1153,6 +1270,15 @@ enum WriterCommand {
     ReplaceOwner {
         record: OwnerRecord,
         acknowledgement: oneshot::Sender<Result<(), PersistenceFailure>>,
+    },
+    FinalizeHistoryDrain {
+        drain_id: HistoryDrainId,
+        observed_at_ms: i64,
+        acknowledgement: oneshot::Sender<Result<HistoryDrainFinalization, PersistenceFailure>>,
+    },
+    HistoryDrainFinalized {
+        drain_id: HistoryDrainId,
+        acknowledgement: oneshot::Sender<Result<bool, PersistenceFailure>>,
     },
     Barrier {
         acknowledgement: oneshot::Sender<Result<(), PersistenceFailure>>,
@@ -1186,6 +1312,53 @@ fn writer_main(
                     WriterOperationGuard::new(health.clone(), PersistenceOperation::Apply);
                 operation_guard.arm();
                 let result = match store.apply_batch(batch) {
+                    Ok(()) => clock()
+                        .and_then(|now_ms| store.cleanup_retention(now_ms))
+                        .map(|cleanup| WriterDelta { cleanup })
+                        .map_err(|error| {
+                            store_failure(
+                                PersistenceOperation::Cleanup,
+                                PersistencePhase::PostApplyCommit,
+                                DurabilityDisposition::Committed,
+                                &error,
+                            )
+                        }),
+                    Err(error) => Err(store_failure(
+                        PersistenceOperation::Apply,
+                        PersistencePhase::CommandExecution,
+                        DurabilityDisposition::NotCommitted,
+                        &error,
+                    )),
+                };
+                let result = publish_store_result(result, &health);
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control
+                    && control.before_acknowledgement(PersistenceOperation::Apply, result.is_err())
+                {
+                    drop(acknowledgement);
+                    control.acknowledgement_dropped(PersistenceOperation::Apply);
+                    operation_guard.disarm();
+                    continue;
+                }
+                let _ = acknowledgement.send(result);
+                operation_guard.disarm();
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control {
+                    control.acknowledgement_attempted(PersistenceOperation::Apply);
+                }
+            }
+            WriterCommand::ApplyV6 {
+                batch,
+                acknowledgement,
+            } => {
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control {
+                    control.command_admitted(PersistenceOperation::Apply);
+                }
+                let mut operation_guard =
+                    WriterOperationGuard::new(health.clone(), PersistenceOperation::Apply);
+                operation_guard.arm();
+                let result = match store.apply_v6_batch(batch) {
                     Ok(()) => clock()
                         .and_then(|now_ms| store.cleanup_retention(now_ms))
                         .map(|cleanup| WriterDelta { cleanup })
@@ -1341,6 +1514,59 @@ fn writer_main(
                 if let Some(control) = &acknowledgement_test_control {
                     control.acknowledgement_attempted(PersistenceOperation::ReplaceOwner);
                 }
+            }
+            WriterCommand::FinalizeHistoryDrain {
+                drain_id,
+                observed_at_ms,
+                acknowledgement,
+            } => {
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control {
+                    control.command_admitted(PersistenceOperation::Apply);
+                }
+                let mut operation_guard =
+                    WriterOperationGuard::new(health.clone(), PersistenceOperation::Apply);
+                operation_guard.arm();
+                let result = store
+                    .finalize_history_drain(&drain_id, observed_at_ms)
+                    .map_err(|error| {
+                        store_failure(
+                            PersistenceOperation::Apply,
+                            PersistencePhase::CommandExecution,
+                            DurabilityDisposition::NotCommitted,
+                            &error,
+                        )
+                    });
+                let result = publish_store_result(result, &health);
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control
+                    && control.before_acknowledgement(PersistenceOperation::Apply, result.is_err())
+                {
+                    drop(acknowledgement);
+                    control.acknowledgement_dropped(PersistenceOperation::Apply);
+                    operation_guard.disarm();
+                    continue;
+                }
+                let _ = acknowledgement.send(result);
+                operation_guard.disarm();
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control {
+                    control.acknowledgement_attempted(PersistenceOperation::Apply);
+                }
+            }
+            WriterCommand::HistoryDrainFinalized {
+                drain_id,
+                acknowledgement,
+            } => {
+                let result = store.history_drain_finalized(&drain_id).map_err(|error| {
+                    store_failure(
+                        PersistenceOperation::Barrier,
+                        PersistencePhase::CommandExecution,
+                        DurabilityDisposition::NotApplicable,
+                        &error,
+                    )
+                });
+                let _ = acknowledgement.send(result.map_err(|failure| failure.failure));
             }
             WriterCommand::Barrier { acknowledgement } => {
                 #[cfg(test)]
