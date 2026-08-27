@@ -205,9 +205,10 @@ Acceptance includes mixed-source coverage proving that hook `task_started` or
 metadata followed by provider-log activity, cancellation, and a later valid
 log start neither duplicates the run nor regresses its state.
 
-Enabling and validating the optional hook registrations is the first
-post-fix operational task. It must not be used to mask or waive a failure in
-the zero-configuration path.
+Enabling and validating the optional hook registrations is the final
+operational task in this increment. It runs only after the fixed binary passes
+the zero-configuration live acceptance, so hook evidence cannot mask or waive
+a failure in the baseline path.
 
 ### T5: persistence converges forward without destructive cleanup
 
@@ -230,6 +231,8 @@ subsystems are:
 - `src/reducer.rs` and, only if an explicit mutation type is shared,
   `src/model/entities.rs`: authoritative name clear semantics and the guarded
   cancelled-run reopen;
+- `src/store/mod.rs` and `src/operator.rs` if the existing coalescing name
+  upserts require an explicit pane-name clear persistence operation;
 - TUI projection/view tests only if the existing row helper does not already
   satisfy the null grammar;
 - `tests/convergence.rs` plus focused collector/reducer/controller tests and
@@ -315,9 +318,13 @@ while the default disposition completes successfully.
 5. Rename a pane and tab and observe event-triggered convergence; clear the
    pane label and verify parentheses disappear. Restore any temporary test
    label before completion.
-6. If optional `emit` hooks are enabled for the live check, verify they improve
-   subject/lifecycle detail without creating duplicate rows. Their absence is
-   not a waiver for steps 2-5.
+6. After steps 2-5 pass without hooks, back up and append the documented
+   `emit` commands to the existing Claude Code and Codex hook arrays, preserving
+   every pre-existing handler and accepting Codex hook trust. Verify the files
+   still parse and satisfy the guide's append-only checks.
+7. Start fresh provider sessions and verify the hooks improve
+   subject/lifecycle/dispatch detail without creating duplicate rows. A hook
+   delivery failure does not retroactively waive steps 2-5.
 
 ## Non-goals
 
@@ -335,15 +342,15 @@ while the default disposition completes successfully.
 
 ## Follow-up sequence
 
-1. Complete and live-verify this P0 truth/convergence increment.
-2. As a separate operational change, enable/verify the documented Claude Code
-   and Codex `emit` hook registrations and measure the additional lifecycle,
-   subject, and dispatch-edge precision. Zero-configuration behavior remains
-   the comparison baseline.
-3. Enter release preparation. Run the required repository-wide security audit
+1. Complete and live-verify the P0 truth/convergence implementation without
+   hooks, then enable/verify the documented Claude Code and Codex `emit` hook
+   registrations as the increment's final operational task. Measure the
+   additional lifecycle, subject, and dispatch-edge precision against the
+   zero-configuration baseline.
+2. Enter release preparation. Run the required repository-wide security audit
    with an intentionally sufficient budget, triage its completed findings,
    then perform the first-release flow. The security audit is a release
-   trigger, not a per-change gate for steps 1-2.
-4. Design and implement the already-deferred wrapper-child linking increment
+   trigger, not a per-change gate for step 1.
+3. Design and implement the already-deferred wrapper-child linking increment
    from the committed inner-worker investigation evidence; do not reintroduce
    free-text UUID inference.
