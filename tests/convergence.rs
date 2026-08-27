@@ -16,9 +16,9 @@ use herdr_top::lockfile::{StateRoot, state_root_in};
 use herdr_top::model::{
     AgentSessionReference, AgentSessionReferenceKind, ControllerEventKind, DependencyEdge,
     DisplayOrdinal, DomainModel, EventMetadata, ExecState, Execution, ExecutionEdge, GapKind,
-    NativeLifecycleWatermark, NormalizedEvent, Pane, PaneAgentStatus, PaneSnapshot, Provider,
-    ReconcileBatch, RunId, RunKey, SnapshotAgent, Tab, TaskRun, TaskRunV6State, TaskState,
-    TopologyAuthority, TopologySnapshot, Workspace,
+    NativeLifecycleWatermark, NativeSessionEndStatus, NormalizedEvent, Pane, PaneAgentStatus,
+    PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SnapshotAgent, Tab, TaskRun,
+    TaskRunV6State, TaskState, TopologyAuthority, TopologySnapshot, Workspace,
 };
 use herdr_top::reducer::{ApplyOutcome, Reducer};
 use herdr_top::session_key;
@@ -2807,7 +2807,7 @@ fn binding_conflict_returns_typed_dropped_result() {
 }
 
 #[test]
-fn hook_metadata_and_later_log_start_converge_one_run() {
+fn hook_metadata_and_later_log_lifecycle_converge_one_run() {
     const ROLLOUT: &str = "77777777-7777-4777-8777-777777777777";
     let parent_run_id = RunId::new();
     let prerequisite_run_id = RunId::new();
@@ -2943,8 +2943,15 @@ fn hook_metadata_and_later_log_start_converge_one_run() {
     {
         let snapshot = shared.borrow();
         let run = snapshot.task_run(&child_run_id).unwrap();
-        assert_eq!(run.state, TaskState::Cancelled);
-        assert_eq!(run.finished_at_ms, Some(30));
+        assert_eq!(run.state, TaskState::Running);
+        assert_eq!(run.finished_at_ms, None);
+        assert_eq!(
+            snapshot
+                .task_run_v6_state(&child_run_id)
+                .and_then(|state| state.native_session_end.as_ref())
+                .map(|end| (end.status, end.at_ms)),
+            Some((NativeSessionEndStatus::Cancelled, 30))
+        );
     }
 
     let before_valid_start = {
@@ -2987,6 +2994,12 @@ fn hook_metadata_and_later_log_start_converge_one_run() {
     let run = snapshot.task_run(&child_run_id).unwrap();
     assert_eq!(run.state, TaskState::Running);
     assert_eq!(run.finished_at_ms, None);
+    assert!(
+        snapshot
+            .task_run_v6_state(&child_run_id)
+            .and_then(|state| state.native_session_end.as_ref())
+            .is_none()
+    );
     assert_eq!(run.subject.as_deref(), Some("preserved hook subject"));
     assert_eq!(
         snapshot

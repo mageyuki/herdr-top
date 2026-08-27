@@ -16,5 +16,6 @@ pub mod provider;
 pub mod reducer;
 pub mod rendezvous;
 pub mod session_key;
+pub(crate) mod status;
 pub mod store;
 pub mod tui;

@@ -18,8 +18,8 @@ use herdr_top::herdr::controller::{
 use herdr_top::lockfile::{OwnerLock, StateRoot, state_root_in, try_acquire};
 use herdr_top::model::{
     ControllerDiagnosticsHandle, ControllerEventKind, DisplayOrdinal, EventMetadata,
-    MinimalProviderMetadata, NormalizedEvent, Provider, RunId, RunKey, SourceCoverage, TaskRun,
-    TaskState,
+    MinimalProviderMetadata, NativeSessionEndStatus, NormalizedEvent, Provider, RunId, RunKey,
+    SourceCoverage, TaskRun, TaskState,
 };
 use herdr_top::performance::{PerformanceIngress, SystemPerformanceClock, performance_tracker};
 use herdr_top::rendezvous::{
@@ -817,6 +817,150 @@ async fn duplicate_event_id_is_duplicate() {
     let event = envelope("same-event", "task_started", "run");
     assert_eq!(running.send(&event).await, ControllerResponse::Accepted);
     assert_eq!(running.send(&event).await, ControllerResponse::Duplicate);
+    running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_end_is_durable_and_same_session_start_reopens_without_reordering() {
+    let running = RunningController::start().await;
+    let mut start = envelope("native-start", "task_started", "native-root");
+    start["provider"] = json!("codex");
+    start["native_session_id"] = json!("session-1");
+    start["emitted_at_ms"] = json!(100);
+    assert_eq!(running.send(&start).await, ControllerResponse::Accepted);
+
+    let before = running
+        .collector
+        .model
+        .borrow()
+        .task_run_by_key(&RunKey::Native {
+            provider: Provider::Codex,
+            sid: "session-1".to_owned(),
+        })
+        .unwrap()
+        .clone();
+    let mut end = envelope("native-end", "session_ended", "native-root");
+    end["provider"] = json!("codex");
+    end["native_session_id"] = json!("session-1");
+    end["emitted_at_ms"] = json!(200);
+    assert_eq!(running.send(&end).await, ControllerResponse::Accepted);
+    let ended = running.collector.model.borrow();
+    assert_eq!(
+        ended.task_run(&before.run_id).unwrap().state,
+        TaskState::Running
+    );
+    assert_eq!(
+        ended
+            .task_run_v6_state(&before.run_id)
+            .unwrap()
+            .native_session_end
+            .as_ref()
+            .unwrap()
+            .status,
+        NativeSessionEndStatus::Done
+    );
+    drop(ended);
+
+    let mut resumed = start.clone();
+    resumed["event_id"] = json!("native-resume");
+    resumed["emitted_at_ms"] = json!(300);
+    assert_eq!(running.send(&resumed).await, ControllerResponse::Accepted);
+    let resumed_model = running.collector.model.borrow();
+    assert!(
+        resumed_model
+            .task_run_v6_state(&before.run_id)
+            .unwrap()
+            .native_session_end
+            .is_none()
+    );
+    assert_eq!(
+        resumed_model
+            .task_run(&before.run_id)
+            .unwrap()
+            .display_ordinal,
+        before.display_ordinal
+    );
+    drop(resumed_model);
+
+    let mut delayed_end = end.clone();
+    delayed_end["event_id"] = json!("native-delayed-end");
+    delayed_end["emitted_at_ms"] = json!(250);
+    assert_eq!(
+        running.send(&delayed_end).await,
+        ControllerResponse::Accepted
+    );
+    assert!(
+        running
+            .collector
+            .model
+            .borrow()
+            .task_run_v6_state(&before.run_id)
+            .unwrap()
+            .native_session_end
+            .is_none()
+    );
+
+    let mut final_end = end;
+    final_end["event_id"] = json!("native-final-end");
+    final_end["emitted_at_ms"] = json!(400);
+    assert_eq!(running.send(&final_end).await, ControllerResponse::Accepted);
+
+    let (_state, reopened) = running.stop_and_reopen().await;
+    let restored = reopened.load_restored_state().unwrap();
+    assert_eq!(
+        restored
+            .model
+            .task_run_v6_state(&before.run_id)
+            .unwrap()
+            .native_session_end
+            .as_ref()
+            .unwrap()
+            .status,
+        NativeSessionEndStatus::Done
+    );
+    assert_eq!(
+        restored
+            .model
+            .task_run(&before.run_id)
+            .unwrap()
+            .display_ordinal,
+        before.display_ordinal
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_and_unbound_session_end_are_accepted_without_forward_references() {
+    let running = RunningController::start().await;
+    let unknown = envelope("unknown-end", "session_ended", "missing");
+    assert_eq!(running.send(&unknown).await, ControllerResponse::Accepted);
+    assert!(
+        running
+            .collector
+            .model
+            .borrow()
+            .task_runs()
+            .next()
+            .is_none()
+    );
+
+    assert_eq!(
+        running
+            .send(&envelope("plain-start", "task_started", "plain"))
+            .await,
+        ControllerResponse::Accepted
+    );
+    let unbound = envelope("plain-end", "session_ended", "plain");
+    assert_eq!(running.send(&unbound).await, ControllerResponse::Accepted);
+    let model = running.collector.model.borrow();
+    let run = model
+        .task_run_by_key(&RunKey::Controller("plain".to_owned()))
+        .unwrap();
+    assert!(
+        model
+            .task_run_v6_state(&run.run_id)
+            .is_none_or(|state| state.native_session_end.is_none())
+    );
+    drop(model);
     running.stop().await;
 }
 

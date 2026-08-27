@@ -149,11 +149,23 @@ pub(crate) fn build_rows(model: &DomainModel, order: &DagOrder, now_ms: i64) -> 
     build_rows_with_statuses(model, order, now_ms, &statuses)
 }
 
+#[cfg(test)]
 pub(crate) fn build_rows_with_statuses(
     model: &DomainModel,
     order: &DagOrder,
     now_ms: i64,
     statuses: &StatusReadModel,
+) -> Vec<TreeRow> {
+    let visible = order.run_ids().iter().copied().collect::<HashSet<_>>();
+    build_rows_with_statuses_visible(model, order, now_ms, statuses, &visible)
+}
+
+pub(crate) fn build_rows_with_statuses_visible(
+    model: &DomainModel,
+    order: &DagOrder,
+    now_ms: i64,
+    statuses: &StatusReadModel,
+    visible_runs: &HashSet<RunId>,
 ) -> Vec<TreeRow> {
     let stalled_runs =
         super::projection::stalled_run_ids(model, now_ms, crate::activity::stall_warn_ms());
@@ -189,6 +201,7 @@ pub(crate) fn build_rows_with_statuses(
     order
         .run_ids()
         .iter()
+        .filter(|run_id| visible_runs.contains(run_id))
         .filter_map(|run_id| model.task_run(run_id))
         .map(|run| {
             let display_status =

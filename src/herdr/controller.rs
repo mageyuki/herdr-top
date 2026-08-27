@@ -971,6 +971,9 @@ fn decode_object(
         "cancelled" if parent_task_run_id.is_none() && depends_on_id.is_none() => {
             ControllerEventKind::Cancelled
         }
+        "session_ended" if parent_task_run_id.is_none() && depends_on_id.is_none() => {
+            ControllerEventKind::SessionEnded
+        }
         "dismiss" if parent_task_run_id.is_none() && depends_on_id.is_none() => {
             ControllerEventKind::Dismiss
         }

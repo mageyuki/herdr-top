@@ -1541,7 +1541,12 @@ pub(crate) fn build_tree_rows(
     newest_agents: &NewestAgentNodes<'_>,
 ) -> Vec<TreeRow> {
     let statuses = StatusReadModel::from_model(model, state.now_ms());
-    build_tree_rows_with_statuses(model, state, newest_agents, &statuses)
+    let visible = crate::activity::default_visible_task_run_ids(
+        model,
+        &state.operator_snapshot(),
+        state.now_ms(),
+    );
+    build_tree_rows_with_statuses(model, state, newest_agents, &statuses, &visible)
 }
 
 fn build_tree_rows_with_statuses(
@@ -1549,6 +1554,7 @@ fn build_tree_rows_with_statuses(
     state: &AppState,
     newest_agents: &NewestAgentNodes<'_>,
     statuses: &StatusReadModel,
+    visible_runs: &HashSet<RunId>,
 ) -> Vec<TreeRow> {
     let mut rows = vec![TreeRow {
         key: NodeKey::Session,
@@ -1559,7 +1565,14 @@ fn build_tree_rows_with_statuses(
         prerequisites: Vec::new(),
         dependents: Vec::new(),
     }];
-    append_execution_tree_rows(&mut rows, model, state, newest_agents, statuses);
+    append_execution_tree_rows(
+        &mut rows,
+        model,
+        state,
+        newest_agents,
+        statuses,
+        visible_runs,
+    );
     rows
 }
 
@@ -1570,11 +1583,15 @@ pub(crate) fn build_rows(model: &DomainModel, state: &AppState) -> Vec<TreeRow> 
 pub(crate) fn build_projection(model: &DomainModel, state: &AppState) -> RowProjection {
     #[cfg(test)]
     state.record_projection_build();
-    let full_rows = build_full_rows(model, state);
-    projection::project_rows(
+    let operator = state.operator_snapshot();
+    let visible_runs =
+        crate::activity::default_visible_task_run_ids(model, &operator, state.now_ms());
+    let full_rows = build_full_rows(model, state, &visible_runs);
+    projection::project_rows_with_visible(
         model,
         &full_rows,
-        &state.operator_snapshot(),
+        &operator,
+        &visible_runs,
         state.filter_query(),
         state.collapsed(),
         state.view_mode(),
@@ -1585,11 +1602,15 @@ pub(crate) fn build_projection(model: &DomainModel, state: &AppState) -> RowProj
 pub(crate) fn build_uncollapsed_rows(model: &DomainModel, state: &AppState) -> Vec<TreeRow> {
     #[cfg(test)]
     state.record_projection_build();
-    let full_rows = build_full_rows(model, state);
-    projection::project_rows(
+    let operator = state.operator_snapshot();
+    let visible_runs =
+        crate::activity::default_visible_task_run_ids(model, &operator, state.now_ms());
+    let full_rows = build_full_rows(model, state, &visible_runs);
+    projection::project_rows_with_visible(
         model,
         &full_rows,
-        &state.operator_snapshot(),
+        &operator,
+        &visible_runs,
         state.filter_query(),
         &HashSet::new(),
         state.view_mode(),
@@ -1598,16 +1619,24 @@ pub(crate) fn build_uncollapsed_rows(model: &DomainModel, state: &AppState) -> V
     .rows
 }
 
-fn build_full_rows(model: &DomainModel, state: &AppState) -> Vec<TreeRow> {
+fn build_full_rows(
+    model: &DomainModel,
+    state: &AppState,
+    visible_runs: &HashSet<RunId>,
+) -> Vec<TreeRow> {
     let statuses = StatusReadModel::from_model(model, state.now_ms());
     match state.view_mode() {
         ViewMode::ExecutionTree => {
             let newest_agents = newest_agent_nodes(model, state.now_ms());
-            build_tree_rows_with_statuses(model, state, &newest_agents, &statuses)
+            build_tree_rows_with_statuses(model, state, &newest_agents, &statuses, visible_runs)
         }
-        ViewMode::DependencyDag => {
-            dag::build_rows_with_statuses(model, state.dag_order(), state.now_ms(), &statuses)
-        }
+        ViewMode::DependencyDag => dag::build_rows_with_statuses_visible(
+            model,
+            state.dag_order(),
+            state.now_ms(),
+            &statuses,
+            visible_runs,
+        ),
     }
 }
 
@@ -1617,8 +1646,9 @@ fn append_execution_tree_rows<'model>(
     state: &AppState,
     newest_agents: &NewestAgentNodes<'model>,
     statuses: &StatusReadModel,
+    visible_runs: &HashSet<RunId>,
 ) {
-    let (mut pane_runs, unattached, nested_runs) = place_runs(model, state);
+    let (mut pane_runs, unattached, nested_runs) = place_runs(model, state, visible_runs);
     let live_lines = LiveLineReadModel::from_model(model);
     let stalled_runs =
         projection::stalled_run_ids(model, state.now_ms(), crate::activity::stall_warn_ms());
@@ -1733,29 +1763,21 @@ fn append_execution_tree_rows<'model>(
     }
 }
 
-fn place_runs(model: &DomainModel, state: &AppState) -> (PaneRuns, Vec<RunId>, NestedRuns) {
+fn place_runs(
+    model: &DomainModel,
+    state: &AppState,
+    default_visible_runs: &HashSet<RunId>,
+) -> (PaneRuns, Vec<RunId>, NestedRuns) {
     let mut pane_runs = PaneRuns::new();
     let mut unattached = Vec::new();
     let mut unplaced = Vec::new();
     let mut candidate_parents = HashMap::new();
-    let mut runs = model.task_runs().collect::<Vec<_>>();
+    let mut runs = model
+        .task_runs()
+        .filter(|run| default_visible_runs.contains(&run.run_id))
+        .collect::<Vec<_>>();
     // Keep discovery deterministic; each output collection owns its display ordering below.
     runs.sort_by_key(|run| run.run_id);
-    let execution_run_ids = crate::activity::runs_with_executions(model);
-    let operator = state.operator_snapshot();
-    let default_visible_runs = runs
-        .iter()
-        .filter(|run| {
-            crate::activity::is_default_visible_task_run(
-                run,
-                &operator,
-                &execution_run_ids,
-                state.now_ms(),
-            )
-        })
-        .map(|run| run.run_id)
-        .collect::<HashSet<_>>();
-
     for run in runs {
         let all_executions = model
             .executions()
@@ -2218,7 +2240,11 @@ fn run_row_label_with_agent(
                 line
             })
     });
+    let has_native_session_end = model
+        .task_run_v6_state(&run.run_id)
+        .is_some_and(|state| state.native_session_end.is_some());
     if !run.state.is_terminal()
+        && !has_native_session_end
         && let Some(live_line) = live_line
     {
         label.push_str(" — ");
@@ -2424,8 +2450,8 @@ mod tests {
     };
     use crate::model::{
         AgentNode, DependencyEdge, DisplayOrdinal, DomainModel, ExecState, Execution,
-        ExecutionEdge, Pane, PaneAgentStatus, Provider, RunId, RunKey, Tab, TaskRun, TaskState,
-        Workspace,
+        ExecutionEdge, NativeSessionEnd, NativeSessionEndStatus, Pane, PaneAgentStatus, Provider,
+        RunId, RunKey, Tab, TaskRun, TaskRunV6State, TaskState, Workspace,
     };
     use crate::performance::{PerformanceDegradationReason, PerformanceSnapshot};
     use crate::store::writer::PersistenceStatus;
@@ -3029,6 +3055,75 @@ mod tests {
                 format!("{glyph} {} claude-code subject", status.label())
             );
         }
+    }
+
+    #[test]
+    fn native_session_end_suppresses_live_line_but_runtime_status_does_not() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let run = label_run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "native-end".to_owned(),
+            },
+            TaskState::Running,
+            None,
+            None,
+            Some("subject"),
+        );
+        let mut model = DomainModel::default();
+        model.insert_task_run(run.clone());
+        model.insert_agent_node(label_agent(
+            "live-line",
+            run_id,
+            Some(2),
+            Some(crate::provider::lane::LIVE_LINE_EVENT_KIND),
+            Some("must stay while resumable"),
+            None,
+        ));
+        let live_lines = LiveLineReadModel::from_model(&model);
+
+        for status in [
+            projection::TaskDisplayStatus::Idle,
+            projection::TaskDisplayStatus::Blocked,
+            projection::TaskDisplayStatus::Unknown,
+        ] {
+            let label = run_row_label_with_agent(
+                &model,
+                &run,
+                None,
+                3,
+                &live_lines,
+                projection::DisplayStatus::new(status, projection::StatusSource::AgentNodeState),
+                true,
+            );
+            assert!(label.contains(" — must stay while resumable"), "{label}");
+        }
+
+        model.set_task_run_v6_state(
+            run_id,
+            TaskRunV6State {
+                native_session_end: Some(NativeSessionEnd {
+                    status: NativeSessionEndStatus::Cancelled,
+                    at_ms: 3,
+                }),
+                ..TaskRunV6State::default()
+            },
+        );
+        let terminal_label = run_row_label_with_agent(
+            &model,
+            &run,
+            None,
+            3,
+            &live_lines,
+            projection::DisplayStatus::new(
+                projection::TaskDisplayStatus::Cancelled,
+                projection::StatusSource::NativeSessionLifecycle,
+            ),
+            true,
+        );
+
+        assert_eq!(terminal_label, "⊘ cancelled Codex subject");
     }
 
     #[test]
@@ -5473,7 +5568,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_parent_children_fall_to_unattached() {
+    fn hidden_parent_remains_structural_for_visible_grandchild() {
         let root = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let hidden_middle = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
         let visible_grandchild = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
@@ -5509,12 +5604,10 @@ mod tests {
         }
 
         let rows = build_uncollapsed_rows(&model, &AppState::default());
-        assert!(
-            rows.iter()
-                .all(|row| row.key.run_id() != Some(hidden_middle))
-        );
+        let middle_row = only_run_row(&rows, hidden_middle);
         let grandchild_row = only_run_row(&rows, visible_grandchild);
-        assert_eq!(grandchild_row.depth, 2);
+        assert_eq!(middle_row.depth, 5);
+        assert_eq!(grandchild_row.depth, 6);
         assert_eq!(
             grandchild_row.key,
             NodeKey::Run {
@@ -5523,12 +5616,9 @@ mod tests {
             }
         );
         assert!(!grandchild_row.label.contains("[dispatched by:"));
-        let unattached_index = rows
-            .iter()
-            .position(|row| row.key == NodeKey::UnattachedGroup)
-            .unwrap();
+        let middle_index = rows.iter().position(|row| row == middle_row).unwrap();
         let grandchild_index = rows.iter().position(|row| row == grandchild_row).unwrap();
-        assert!(unattached_index < grandchild_index);
+        assert!(middle_index < grandchild_index);
     }
 
     #[test]

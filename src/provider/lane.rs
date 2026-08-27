@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use crate::activity::{DEFAULT_GHOST_VISIBILITY_MS, DEFAULT_STALL_WARN_MS};
 use crate::hook_adapter::{HookPayload, HookProvider, map_hook_payload};
 use crate::model::{
-    ControllerEvent, ControllerEventKind, EventMetadata, MinimalProviderMetadata,
+    ControllerEvent, ControllerEventKind, EventMetadata, ExecState, MinimalProviderMetadata,
     ObservationOrigin, Provider, RunKey, sanitize_controller_text,
 };
 
@@ -288,18 +288,6 @@ impl Synthesis {
                 .remove(&(parent.clone(), agent_id.clone()));
         }
         was_completed || was_inactive
-    }
-
-    fn hold_complete(
-        &mut self,
-        scope: ScopeKey,
-        event: ControllerEvent,
-        origin: &ObservationOrigin,
-    ) {
-        if let Entry::Vacant(entry) = self.pending_completes.entry(scope.clone()) {
-            entry.insert(event);
-            self.pending_complete_origins.insert(scope, origin.clone());
-        }
     }
 
     fn start_scope(
@@ -600,21 +588,26 @@ impl Synthesis {
                         None,
                     )));
                 }
+                events.push(root_runtime_state_event(
+                    artifact,
+                    ordinal,
+                    sequence,
+                    &scope,
+                    at_ms,
+                    ExecState::Working,
+                ));
             }
             LogFact::CodexTurnComplete { rollout_id, at_ms } => {
                 let scope = SessionScope::Codex { rollout_id };
                 self.flush_due_completes(at_ms, events);
-                let scope_key = ScopeKey::from(&scope);
-                let event = controller_event(
+                events.push(root_runtime_state_event(
                     artifact,
                     ordinal,
+                    sequence,
                     &scope,
-                    ControllerEventKind::Complete,
                     at_ms,
-                    None,
-                    None,
-                );
-                self.hold_complete(scope_key, event, origin);
+                    ExecState::Idle,
+                ));
             }
             LogFact::CodexTurnAborted { rollout_id, at_ms } => {
                 let scope = SessionScope::Codex { rollout_id };
@@ -964,6 +957,46 @@ fn live_line_event(
     }
 }
 
+fn root_runtime_state_event(
+    artifact: &Path,
+    ordinal: u64,
+    sequence: usize,
+    scope: &SessionScope,
+    at_ms: i64,
+    state: ExecState,
+) -> ProviderEvent {
+    let SessionScope::Codex { rollout_id } = scope else {
+        unreachable!("runtime root state currently belongs to Codex turns")
+    };
+    let basename = artifact
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("artifact"))
+        .to_string_lossy();
+    ProviderEvent::AgentUpsert {
+        provider: Provider::Codex,
+        agent_thread_id: rollout_id.clone(),
+        owner_session_id: Some(rollout_id.clone()),
+        parent_thread_id: None,
+        state: Some(state.clone()),
+        model_id: None,
+        depth: Some(0),
+        event_id: format!(
+            "prov:codex:runtime:{basename}:{ordinal}:{sequence}:{}",
+            match state {
+                ExecState::Working => "working",
+                ExecState::Idle => "idle",
+                _ => unreachable!("only live Codex runtime states are emitted"),
+            }
+        ),
+        observed_at_ms: at_ms,
+        position: SourcePosition {
+            path_id: u32::MAX,
+            generation: 0,
+            offset: ordinal,
+        },
+    }
+}
+
 fn controller_event(
     artifact: &Path,
     ordinal: u64,
@@ -982,6 +1015,7 @@ fn controller_event(
         ControllerEventKind::Complete => "complete",
         ControllerEventKind::Failed => "failed",
         ControllerEventKind::Cancelled => "cancelled",
+        ControllerEventKind::SessionEnded => "session_ended",
         ControllerEventKind::Dismiss => "dismiss",
     };
     let (provider, native_session_id) = match scope {
@@ -1031,6 +1065,7 @@ fn controller_event_kind_slug(event: &ControllerEventKind) -> &'static str {
         ControllerEventKind::Complete => "complete",
         ControllerEventKind::Failed => "failed",
         ControllerEventKind::Cancelled => "cancelled",
+        ControllerEventKind::SessionEnded => "session-ended",
         ControllerEventKind::Dismiss => "dismiss",
     }
 }
@@ -3660,7 +3695,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_lands_after_grace_only() {
+    fn codex_turn_complete_is_runtime_idle_only() {
         let mut synthesis = Synthesis::with_lifecycle_timing(30, 600);
         let held = synthesize(
             &mut synthesis,
@@ -3675,11 +3710,14 @@ mod tests {
         );
 
         assert!(synthesized_events(&held).is_empty());
-        assert!(synthesis.advance_lifecycle(129).is_empty());
-        assert!(matches!(
-            synthesized_events(&synthesis.advance_lifecycle(130)).as_slice(),
-            [event] if matches!(event.event, ControllerEventKind::Complete)
-        ));
+        assert!(held.iter().any(|event| matches!(
+            event,
+            ProviderEvent::AgentUpsert {
+                state: Some(crate::model::ExecState::Idle),
+                ..
+            }
+        )));
+        assert!(synthesis.advance_lifecycle(130).is_empty());
         let reopened = synthesize(
             &mut synthesis,
             "rollout.jsonl",
@@ -3694,9 +3732,9 @@ mod tests {
             )],
         );
         assert!(
-            synthesized_events(&reopened)
+            reopened
                 .iter()
-                .any(|event| matches!(event.event, ControllerEventKind::TaskStarted))
+                .any(|event| matches!(event, ProviderEvent::RunLiveness { .. }))
         );
     }
 

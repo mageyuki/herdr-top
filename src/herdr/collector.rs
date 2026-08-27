@@ -32,17 +32,17 @@ use crate::diagnostics::{
     encode_persistence_occurrence,
 };
 use crate::lockfile::OwnerRecord;
-#[cfg(test)]
-use crate::model::ReconcileBatch;
 use crate::model::{
     AgentNodeObservation, AgentSessionReference, AgentSessionReferenceKind,
     ControllerDiagnosticsHandle, DomainModel, EnrichmentDiagnosticsHandle, EventMetadata,
-    ExecState, Execution, GapKind, HistoryDrainId, MinimalProviderMetadata, NormalizedEvent,
-    OperatorCommand, Pane, PaneAgentStatus, PaneAgentStatusObservation, PaneSnapshot, Provider,
-    ProviderDiagnosticsHandle, RunId, RunKey, SharedModel, SnapshotAgent, SourceCoverage, Tab,
-    TopologyAuthority, TopologyEntity, TopologyEntityId, TopologySnapshot, Workspace,
-    sanitize_controller_text,
+    ExecState, Execution, GapKind, HistoryDrainId, MinimalProviderMetadata,
+    NativeLifecycleWatermark, NormalizedEvent, OperatorCommand, Pane, PaneAgentStatus,
+    PaneAgentStatusObservation, PaneSnapshot, Provider, ProviderDiagnosticsHandle, RunId, RunKey,
+    SharedModel, SnapshotAgent, SourceCoverage, Tab, TopologyAuthority, TopologyEntity,
+    TopologyEntityId, TopologySnapshot, Workspace, sanitize_controller_text,
 };
+#[cfg(test)]
+use crate::model::{NativeSessionEndStatus, ReconcileBatch};
 use crate::performance::{
     Admission, Admitted, PerformanceClock, PerformanceIngress, PerformanceSampler,
     PerformanceSnapshot, SystemPerformanceClock, admitted_channel, performance_tracker,
@@ -1357,7 +1357,9 @@ async fn persist_submission(
     reducer: &mut Reducer,
     batch: PersistBatch,
 ) -> Result<RuntimeWriteOutcome, WriterError> {
-    let outcome = persistence.apply(batch).await?;
+    let outcome = persistence
+        .apply_v6(reducer.decorate_v6_batch(batch))
+        .await?;
     reducer.complete_operator_submission(outcome);
     persist_recovery_marker_if_pending(persistence, reducer).await?;
     Ok(outcome)
@@ -3970,7 +3972,7 @@ fn enrichment_payload(event: &str, data: &Value) -> Option<EnrichmentPayload> {
 }
 
 fn pane_agent_status_observation(event: &str, data: &Value) -> Option<PaneAgentStatusObservation> {
-    if event != "pane_agent_status_changed" {
+    if !is_pane_agent_status_event(event) {
         return None;
     }
     let pane_id =
@@ -3982,6 +3984,13 @@ fn pane_agent_status_observation(event: &str, data: &Value) -> Option<PaneAgentS
             .and_then(Value::as_str),
     );
     Some(PaneAgentStatusObservation { pane_id, status })
+}
+
+fn is_pane_agent_status_event(event: &str) -> bool {
+    matches!(
+        event,
+        "pane.agent_status_changed" | "pane_agent_status_changed"
+    )
 }
 
 fn spawn_event_reader(
@@ -6137,9 +6146,7 @@ fn classify_primary_event(event: &str) -> PrimaryEventClass {
         | "pane.moved"
         | "pane.exited"
         | "pane.agent_detected" => PrimaryEventClass::TopologyHint,
-        "pane_agent_status_changed" | "pane.agent_status_changed" => {
-            PrimaryEventClass::EnrichmentGauge
-        }
+        event if is_pane_agent_status_event(event) => PrimaryEventClass::EnrichmentGauge,
         _ => PrimaryEventClass::NoOp,
     }
 }
@@ -6399,6 +6406,31 @@ async fn apply_provider_event(
     persistence: &mut RuntimePersistence,
     coverage: &SourceCoverageRegistry,
 ) -> Result<(), CollectorError> {
+    apply_provider_event_originated(
+        event,
+        crate::model::ObservationOrigin::Live,
+        None,
+        session,
+        reducer,
+        shared,
+        persistence,
+        coverage,
+    )
+    .await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn apply_provider_event_originated(
+    event: ProviderEvent,
+    origin: crate::model::ObservationOrigin,
+    history_manifest: Option<Arc<crate::store::PersistHistoryDrain>>,
+    session: &str,
+    reducer: &mut Reducer,
+    shared: &SharedModel,
+    persistence: &mut RuntimePersistence,
+    coverage: &SourceCoverageRegistry,
+) -> Result<(), CollectorError> {
     let provider_diagnostics = crate::provider::ProviderDiagnostics::default();
     let (ignored_events, _ignored_receiver) = mpsc::channel(1);
     let provider_thread = spawn_provider_thread_with_diagnostics(
@@ -6428,8 +6460,8 @@ async fn apply_provider_event(
         Some(ProviderIngressEvent {
             event,
             admission,
-            origin: crate::model::ObservationOrigin::Live,
-            history_manifest: None,
+            origin,
+            history_manifest,
         }),
         &mut provider,
         session,
@@ -6511,11 +6543,13 @@ async fn apply_provider_event_with_admission(
     pending_history_mutation: &mut Option<PendingHistoryMutation>,
 ) -> Result<(), CollectorError> {
     let provider_at_ms = provider_event_timestamp_ms(&event);
-    let prior = reducer.begin_provider_observation(&origin);
+    let mut prior = reducer.begin_provider_observation(&origin);
     match event {
         ProviderEvent::Synthesized(mut event) => {
             event.metadata.herdr_session = session.to_owned();
-            event.metadata.receipt_time_ms = unix_now_ms();
+            if matches!(&origin, crate::model::ObservationOrigin::Live) {
+                event.metadata.receipt_time_ms = unix_now_ms();
+            }
             event.metadata.source_coverage = coverage.provider_metadata();
             if persistence.is_duplicate(&event.metadata.event_id) {
                 reducer.cancel_provider_observation();
@@ -6524,6 +6558,50 @@ async fn apply_provider_event_with_admission(
                     admission.complete();
                 }
                 return Ok(());
+            }
+            if matches!(&origin, crate::model::ObservationOrigin::Historical { .. })
+                && matches!(event.event, crate::model::ControllerEventKind::TaskStarted)
+                && let Some((run_id, stored_watermark)) = event
+                    .metadata
+                    .provider
+                    .zip(event.metadata.native_session_id.as_deref())
+                    .and_then(|(provider, sid)| {
+                        let model = shared.borrow();
+                        let run_id = model
+                            .task_run_by_key(&RunKey::Native {
+                                provider,
+                                sid: sid.to_owned(),
+                            })?
+                            .run_id;
+                        model
+                            .task_run_v6_state(&run_id)
+                            .and_then(|state| state.lifecycle_watermark.as_ref())
+                            .cloned()
+                            .map(|watermark| (run_id, watermark))
+                    })
+            {
+                let candidate = NativeLifecycleWatermark {
+                    source_at_ms: event.metadata.timestamp_ms,
+                    observed_at_ms: event.metadata.receipt_time_ms,
+                    source_order: event.metadata.event_id.clone(),
+                };
+                if stored_watermark >= candidate {
+                    reducer.cancel_provider_observation();
+                    if let Some(admission) = admission.take() {
+                        admission.complete();
+                    }
+                    return Ok(());
+                }
+                // Historical reconciliation freezes ready rows at `prior`; advance that
+                // baseline after the complete watermark admits a later native resume.
+                if let Some(prior) = prior.as_mut()
+                    && let Some(mut state) = prior.task_run_v6_state(&run_id).cloned()
+                    && state.history_ready
+                {
+                    state.native_session_end = None;
+                    state.lifecycle_watermark = Some(candidate);
+                    prior.set_task_run_v6_state(run_id, state);
+                }
             }
             let delta = match reducer.validate_controller_event(&event) {
                 Ok(delta) => delta,
@@ -6611,7 +6689,11 @@ async fn apply_provider_event_with_admission(
             Ok(())
         }
         ProviderEvent::RunLiveness { key, at_ms } => {
-            let persist = reducer.touch_run_liveness(&key, at_ms);
+            let observed_at_ms = match &origin {
+                crate::model::ObservationOrigin::Historical { .. } => at_ms,
+                crate::model::ObservationOrigin::Live => unix_now_ms(),
+            };
+            let persist = reducer.touch_run_liveness_observed(&key, at_ms, observed_at_ms);
             let persist = reducer.finish_provider_observation(
                 prior,
                 persist,
@@ -6636,7 +6718,11 @@ async fn apply_provider_event_with_admission(
             Ok(())
         }
         ProviderEvent::LaneClose { key, at_ms } => {
-            let persist = reducer.apply_lane_close(&key, at_ms);
+            let observed_at_ms = match &origin {
+                crate::model::ObservationOrigin::Historical { .. } => at_ms,
+                crate::model::ObservationOrigin::Live => unix_now_ms(),
+            };
+            let persist = reducer.apply_lane_close_observed(&key, at_ms, observed_at_ms);
             let persist = reducer.finish_provider_observation(
                 prior,
                 persist,
@@ -7025,7 +7111,7 @@ fn normalize_event(
                 ));
             }
         }
-        "pane_agent_status_changed" => {
+        event if is_pane_agent_status_event(event) => {
             let terminal_id = string_field(&received.data, "terminal_id")
                 .or_else(|| nested_string(&received.data, "pane", "terminal_id"));
             if let Some(observation) =
@@ -7976,6 +8062,11 @@ fn created_entities(received: &ReceivedEvent) -> Vec<EntityKey> {
 }
 
 fn updated_entity(received: &ReceivedEvent) -> Option<EntityKey> {
+    if is_pane_agent_status_event(&received.event) {
+        return string_field(&received.data, "pane_id")
+            .or_else(|| nested_string(&received.data, "pane", "pane_id"))
+            .map(EntityKey::Pane);
+    }
     match received.event.as_str() {
         "workspace_renamed" => nested_string(&received.data, "workspace", "workspace_id")
             .or_else(|| string_field(&received.data, "workspace_id"))
@@ -7988,7 +8079,7 @@ fn updated_entity(received: &ReceivedEvent) -> Option<EntityKey> {
         "pane_updated" | "pane_agent_detected" => nested_string(&received.data, "pane", "pane_id")
             .or_else(|| string_field(&received.data, "pane_id"))
             .map(EntityKey::Pane),
-        "pane_focused" | "pane_agent_status_changed" => string_field(&received.data, "pane_id")
+        "pane_focused" => string_field(&received.data, "pane_id")
             .or_else(|| nested_string(&received.data, "pane", "pane_id"))
             .map(EntityKey::Pane),
         _ => None,
@@ -17815,9 +17906,9 @@ mod tests {
         }
     }
 
-    fn status_received(status: &str) -> ReceivedEvent {
+    fn status_event_received(event: &str, status: &str) -> ReceivedEvent {
         ReceivedEvent {
-            event: "pane_agent_status_changed".to_owned(),
+            event: event.to_owned(),
             data: json!({
                 "pane_id": "w1:p1",
                 "terminal_id": "terminal-1",
@@ -17825,6 +17916,10 @@ mod tests {
             }),
             primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
         }
+    }
+
+    fn status_received(status: &str) -> ReceivedEvent {
+        status_event_received("pane_agent_status_changed", status)
     }
 
     fn pane_status_test_model(
@@ -17876,8 +17971,9 @@ mod tests {
         model
     }
 
-    async fn apply_primary_pane_status_for_test(
+    async fn apply_primary_pane_status_event_for_test(
         model: DomainModel,
+        event: &str,
         status: &str,
     ) -> (Arc<DomainModel>, i64, bool) {
         let directory = tempfile::tempdir().unwrap();
@@ -17908,7 +18004,7 @@ mod tests {
             &mut persistence,
             &mut owner,
             "status-session",
-            status_received(status),
+            status_event_received(event, status),
             performance.admit(),
             &mut PendingTopologyClosures::default(),
             &mut provider,
@@ -17928,6 +18024,13 @@ mod tests {
             })
             .unwrap();
         (snapshot, ledger_count, produced)
+    }
+
+    async fn apply_primary_pane_status_for_test(
+        model: DomainModel,
+        status: &str,
+    ) -> (Arc<DomainModel>, i64, bool) {
+        apply_primary_pane_status_event_for_test(model, "pane_agent_status_changed", status).await
     }
 
     async fn apply_enrichment_pane_status_for_test(
@@ -18009,6 +18112,33 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn pane_status_aliases_are_identical_and_other_dotted_events_are_ignored() {
+        let payload = json!({"pane_id": "w1:p1", "agent_status": "working"});
+        let underscore = pane_agent_status_observation("pane_agent_status_changed", &payload);
+        let dotted = pane_agent_status_observation("pane.agent_status_changed", &payload);
+
+        assert_eq!(dotted, underscore);
+        assert!(dotted.is_some());
+        assert!(pane_agent_status_observation("pane.status_changed", &payload).is_none());
+    }
+
+    #[tokio::test]
+    async fn installed_dotted_pane_status_updates_complete_snapshot_idle_to_working() {
+        let model = pane_status_test_model(true, ExecState::Idle, Some(PaneAgentStatus::Idle));
+
+        let (snapshot, ledger_count, produced) =
+            apply_primary_pane_status_event_for_test(model, "pane.agent_status_changed", "working")
+                .await;
+
+        assert!(produced);
+        assert_eq!(
+            snapshot.pane_agent_status("w1:p1"),
+            Some(PaneAgentStatus::Working)
+        );
+        assert_eq!(ledger_count, 0);
     }
 
     #[tokio::test]
@@ -18935,8 +19065,15 @@ mod tests {
             let run = snapshot
                 .task_run_by_key(&native_key)
                 .expect("initial backfill must retain the native run");
-            assert_eq!(run.state, TaskState::Cancelled);
-            assert_eq!(run.finished_at_ms, Some(times.cancelled_at_ms));
+            assert_eq!(run.state, TaskState::Running);
+            assert_eq!(run.finished_at_ms, None);
+            assert_eq!(
+                snapshot
+                    .task_run_v6_state(&run.run_id)
+                    .and_then(|state| state.native_session_end.as_ref())
+                    .map(|end| (end.status, end.at_ms)),
+                Some((NativeSessionEndStatus::Cancelled, times.cancelled_at_ms))
+            );
             assert_eq!(snapshot.task_runs().count(), 1);
             assert_eq!(snapshot.executions().count(), 1);
             assert_eq!(
@@ -18952,13 +19089,21 @@ mod tests {
         let terminal_sources = reader.terminal_event_sources().unwrap();
         assert_eq!(
             terminal_sources.get(&run_id).map(String::as_str),
-            Some(crate::provider::lane::SOURCE_LOG_LANE),
-            "restart fixture must restore lane-authored terminal provenance"
+            None,
+            "resumable native lifecycle ends must not become semantic terminal provenance"
         );
         let restored = reader.load_restored_state().unwrap();
         assert_eq!(
             restored.model.task_run(&run_id).unwrap().state,
-            TaskState::Cancelled
+            TaskState::Running
+        );
+        assert_eq!(
+            restored
+                .model
+                .task_run_v6_state(&run_id)
+                .and_then(|state| state.native_session_end.as_ref())
+                .map(|end| end.status),
+            Some(NativeSessionEndStatus::Cancelled)
         );
         assert_eq!(restored.model.executions().count(), 1);
         Task4PersistedCancelled {
@@ -19029,8 +19174,15 @@ mod tests {
         let (run_id, display_ordinal) = {
             let snapshot = shared.borrow();
             let run = snapshot.task_run_by_key(&native_key).unwrap();
-            assert_eq!(run.state, TaskState::Cancelled);
-            assert_eq!(run.finished_at_ms, Some(20));
+            assert_eq!(run.state, TaskState::Running);
+            assert_eq!(run.finished_at_ms, None);
+            assert_eq!(
+                snapshot
+                    .task_run_v6_state(&run.run_id)
+                    .and_then(|state| state.native_session_end.as_ref())
+                    .map(|end| end.status),
+                Some(NativeSessionEndStatus::Cancelled)
+            );
             (run.run_id, run.display_ordinal)
         };
 
@@ -19052,6 +19204,13 @@ mod tests {
             let run = snapshot.task_run(&run_id).unwrap();
             assert_eq!(run.state, TaskState::Running);
             assert_eq!(run.finished_at_ms, None);
+            assert!(
+                snapshot
+                    .task_run_v6_state(&run_id)
+                    .unwrap()
+                    .native_session_end
+                    .is_none()
+            );
             assert_eq!(run.display_ordinal, display_ordinal);
             assert_eq!(
                 snapshot.task_run_by_key(&native_key).unwrap().run_id,
@@ -19075,8 +19234,15 @@ mod tests {
         task4_apply_provider_events(terminal, &mut reducer, &shared, &mut persistence).await;
         let snapshot = shared.borrow();
         let run = snapshot.task_run(&run_id).unwrap();
-        assert_eq!(run.state, TaskState::Cancelled);
-        assert_eq!(run.finished_at_ms, Some(40));
+        assert_eq!(run.state, TaskState::Running);
+        assert_eq!(run.finished_at_ms, None);
+        assert_eq!(
+            snapshot
+                .task_run_v6_state(&run_id)
+                .and_then(|state| state.native_session_end.as_ref())
+                .map(|end| (end.status, end.at_ms)),
+            Some((NativeSessionEndStatus::Cancelled, 40))
+        );
         assert_eq!(snapshot.task_runs().count(), 1);
         drop(snapshot);
         drop(persistence);
@@ -19129,6 +19295,13 @@ mod tests {
                 let run = snapshot.task_run(&fixture.run_id).unwrap();
                 assert_eq!(run.state, TaskState::Running);
                 assert_eq!(run.finished_at_ms, None);
+                assert!(
+                    snapshot
+                        .task_run_v6_state(&fixture.run_id)
+                        .unwrap()
+                        .native_session_end
+                        .is_none()
+                );
                 assert_eq!(run.dismissed_at_ms, None);
                 assert_eq!(run.display_ordinal, fixture.display_ordinal);
                 assert_eq!(snapshot.task_runs().count(), 1);
@@ -19147,8 +19320,15 @@ mod tests {
         {
             let snapshot = shared.borrow();
             let run = snapshot.task_run(&fixture.run_id).unwrap();
-            assert_eq!(run.state, TaskState::Completed);
-            assert_eq!(run.finished_at_ms, Some(fixture.times.complete_at_ms));
+            assert_eq!(run.state, TaskState::Running);
+            assert_eq!(run.finished_at_ms, None);
+            assert!(
+                snapshot
+                    .task_run_v6_state(&fixture.run_id)
+                    .unwrap()
+                    .native_session_end
+                    .is_none()
+            );
             assert_eq!(snapshot.task_runs().count(), 1);
             assert_eq!(snapshot.executions().count(), 1);
         }
@@ -19174,7 +19354,7 @@ mod tests {
                 .unwrap()
                 .get(&fixture.run_id)
                 .map(String::as_str),
-            Some(crate::provider::lane::SOURCE_LOG_LANE)
+            None
         );
         let connection =
             rusqlite::Connection::open(crate::store::database_path(&fixture.state_root)).unwrap();
@@ -19189,7 +19369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_backfill_rejects_start_not_newer_than_cancel() {
+    async fn restart_backfill_equal_source_time_uses_later_observation_to_reopen() {
         let fixture = task4_persist_cancelled_backfill().await;
         let initial_ledger_len = fixture.restored.event_ledger.len();
         task4_append_record(
@@ -19207,8 +19387,15 @@ mod tests {
         {
             let snapshot = shared.borrow();
             let run = snapshot.task_run(&fixture.run_id).unwrap();
-            assert_eq!(run.state, TaskState::Cancelled);
-            assert_eq!(run.finished_at_ms, Some(fixture.times.cancelled_at_ms));
+            assert_eq!(run.state, TaskState::Running);
+            assert_eq!(run.finished_at_ms, None);
+            assert!(
+                snapshot
+                    .task_run_v6_state(&fixture.run_id)
+                    .unwrap()
+                    .native_session_end
+                    .is_none()
+            );
             assert_eq!(run.display_ordinal, fixture.display_ordinal);
             assert_eq!(snapshot.task_runs().count(), 1);
             assert_eq!(snapshot.executions().count(), 1);
@@ -19219,10 +19406,18 @@ mod tests {
             .unwrap()
             .load_restored_state()
             .unwrap();
-        assert_eq!(restored.event_ledger.len(), initial_ledger_len);
+        assert_eq!(restored.event_ledger.len(), initial_ledger_len + 2);
         assert_eq!(
             restored.model.task_run(&fixture.run_id).unwrap().state,
-            TaskState::Cancelled
+            TaskState::Running
+        );
+        assert!(
+            restored
+                .model
+                .task_run_v6_state(&fixture.run_id)
+                .unwrap()
+                .native_session_end
+                .is_none()
         );
 
         let positive = task4_persist_cancelled_backfill().await;
@@ -19241,7 +19436,7 @@ mod tests {
         assert_eq!(
             shared.borrow().task_run(&positive.run_id).unwrap().state,
             TaskState::Running,
-            "strict rejection must not exclude a genuinely later restart fact"
+            "a genuinely later restart fact must remain live"
         );
         drop(persistence);
         lifecycle.shutdown().await.unwrap();
@@ -20112,7 +20307,7 @@ mod provider_integration_tests {
     }
 
     #[tokio::test]
-    async fn graceful_provider_stop_emits_complete_held_in_grace() {
+    async fn graceful_provider_stop_preserves_turn_complete_as_idle_only() {
         const ROLLOUT_ID: &str = "22222222-2222-4222-8222-222222222222";
         let now_ms = unix_now_ms();
         let diagnostics = crate::provider::ProviderDiagnostics::default();
@@ -20166,6 +20361,20 @@ mod provider_integration_tests {
             ProviderEvent::Synthesized(controller)
                 if matches!(controller.event, ControllerEventKind::Complete)
         )));
+        let has_eligible_idle_root_agent = held.iter().any(|event| {
+            matches!(
+                event,
+                ProviderEvent::AgentUpsert {
+                    provider: Provider::Codex,
+                    agent_thread_id,
+                    owner_session_id: Some(owner_session_id),
+                    parent_thread_id: None,
+                    state: Some(ExecState::Idle),
+                    depth: Some(0),
+                    ..
+                } if agent_thread_id == ROLLOUT_ID && owner_session_id == ROLLOUT_ID
+            )
+        });
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let store = open_writer(&root).unwrap();
@@ -20255,20 +20464,28 @@ mod provider_integration_tests {
             provider_events_drained: Some(events_drained),
         };
 
+        let stopped_model = handle.model.clone();
         handle.stop().await.unwrap();
         lifecycle.shutdown().await.unwrap();
 
-        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
-        assert_eq!(
-            restored
-                .model
-                .task_run_by_key(&RunKey::Native {
-                    provider: Provider::Codex,
-                    sid: ROLLOUT_ID.to_owned(),
-                })
-                .unwrap()
-                .state,
-            TaskState::Completed
+        let snapshot = stopped_model.borrow();
+        let run = snapshot
+            .task_run_by_key(&RunKey::Native {
+                provider: Provider::Codex,
+                sid: ROLLOUT_ID.to_owned(),
+            })
+            .expect("graceful stop must retain the Codex root run");
+        assert_eq!(run.state, TaskState::Running);
+        assert_eq!(run.finished_at_ms, None);
+        assert!(
+            snapshot
+                .task_run_v6_state(&run.run_id)
+                .is_none_or(|state| state.native_session_end.is_none()),
+            "turn complete must not create a native lifecycle end"
+        );
+        assert!(
+            has_eligible_idle_root_agent,
+            "turn complete must emit Idle for its own eligible root runtime agent"
         );
     }
 
@@ -20528,6 +20745,10 @@ mod provider_integration_tests {
             "a due close inherited provider-wide frozen-manifest provenance"
         );
         assert!(late_close.2.is_none());
+        let expected_close_at_ms = match &late_close.0 {
+            ProviderEvent::LaneClose { at_ms, .. } => *at_ms,
+            _ => unreachable!("the selected event is a lane close"),
+        };
 
         let mut harness = LaneModelHarness::new();
         let (provider_sender, mut provider, provider_thread) = g7_provider_integration();
@@ -20559,7 +20780,18 @@ mod provider_integration_tests {
             })
             .cloned()
             .expect("the live late run must publish");
-        assert_eq!(late_run.state, TaskState::EndedUnknown);
+        assert_eq!(late_run.state, TaskState::Running);
+        assert_eq!(late_run.finished_at_ms, None);
+        assert!(!late_run.state.is_terminal());
+        assert_eq!(
+            harness
+                .shared
+                .borrow()
+                .task_run_v6_state(&late_run.run_id)
+                .and_then(|state| state.native_session_end.as_ref())
+                .map(|end| (end.status, end.at_ms)),
+            Some((NativeSessionEndStatus::Unknown, expected_close_at_ms))
+        );
 
         drop(provider_sender);
         provider_thread.stop().await.unwrap();
@@ -21220,7 +21452,7 @@ mod provider_integration_tests {
                 "{{\"timestamp\":\"2026-08-24T00:00:01Z\",\"type\":\"turn_context\",\"payload\":{{\"turn_id\":\"turn-1\",\"model\":\"gpt-5.6-sol\",\"effort\":\"xhigh\",\"sandbox_policy\":{{\"type\":\"workspace-write\"}}}}}}\n",
                 "{{\"timestamp\":\"2026-08-24T00:00:02Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\"}}}}\n",
                 "{{\"timestamp\":\"2026-08-24T00:00:03Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":{{\"output_tokens\":42}},\"model_context_window\":114000}}}}}}\n",
-                "{{\"timestamp\":\"2026-08-24T00:00:04Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"turn-1\"}}}}\n"
+                "{{\"timestamp\":\"2026-08-24T00:00:04Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"turn_aborted\"}}}}\n"
             ),
             RESTART_BACKFILL_ROLLOUT
         )
@@ -21343,10 +21575,23 @@ mod provider_integration_tests {
     }
 
     fn replay_restart_backfill(fixture: &PersistedRestartBackfill) -> Vec<ProviderEvent> {
+        replay_restart_backfill_originated(fixture)
+            .into_iter()
+            .map(|(event, _, _)| event)
+            .collect()
+    }
+
+    fn replay_restart_backfill_originated(
+        fixture: &PersistedRestartBackfill,
+    ) -> Vec<(
+        ProviderEvent,
+        crate::model::ObservationOrigin,
+        Option<Arc<crate::store::PersistHistoryDrain>>,
+    )> {
         let mut worker = restart_backfill_worker(&fixture.provider_root);
         let mut pending = PendingEvents::new(crate::provider::ProviderDiagnostics::default());
         process_adapter_worker(&mut worker, &fixture.targets, &mut pending);
-        drain_pending(&mut pending)
+        pending.originated_events_for_test()
     }
 
     #[tokio::test]
@@ -21416,33 +21661,44 @@ mod provider_integration_tests {
     }
 
     #[tokio::test]
-    async fn restart_does_not_flap_restored_terminal_runs() {
+    async fn restart_does_not_flap_restored_native_cancelled_lifecycle() {
         let fixture = persist_restart_backfill().await;
-        let expected_terminal = fixture
+        let expected_run = fixture
             .restored
             .model
             .task_run(&fixture.run_id)
             .unwrap()
             .clone();
+        let expected_lifecycle = fixture
+            .restored
+            .model
+            .task_run_v6_state(&fixture.run_id)
+            .expect("explicit abort must persist native lifecycle state")
+            .clone();
+        assert_eq!(expected_run.state, TaskState::Running);
+        assert_eq!(expected_run.finished_at_ms, None);
         assert_eq!(
-            expected_terminal.state,
-            TaskState::Completed,
-            "zero completion grace must persist the terminal precondition"
+            expected_lifecycle
+                .native_session_end
+                .as_ref()
+                .map(|end| end.status),
+            Some(NativeSessionEndStatus::Cancelled),
+            "explicit abort must persist a resumable native cancellation"
         );
         let ledger_len = fixture.restored.event_ledger.len();
         let next_ingest_seq = fixture.restored.next_ingest_seq;
-        let replay = replay_restart_backfill(&fixture);
+        let replay = replay_restart_backfill_originated(&fixture);
         assert_eq!(
             replay
                 .iter()
-                .filter(|event| matches!(
+                .filter(|(event, _, _)| matches!(
                     event,
                     ProviderEvent::Synthesized(controller)
-                        if matches!(controller.event, ControllerEventKind::Complete)
+                        if matches!(controller.event, ControllerEventKind::Cancelled)
                 ))
                 .count(),
             1,
-            "startup replay must exercise the normal held-then-flushed Complete path"
+            "startup replay must contain the retained Controller Cancelled"
         );
         let store = open_writer(&fixture.state_root).unwrap();
         let (lifecycle, writer) = spawn_writer(store).unwrap();
@@ -21450,9 +21706,11 @@ mod provider_integration_tests {
         let (mut reducer, shared) = Reducer::new(fixture.restored);
         reducer.restore_terminal_event_sources(fixture.terminal_sources);
         let coverage = SourceCoverageRegistry::new(SourceAvailability::Available);
-        for (index, event) in replay.into_iter().enumerate() {
-            apply_provider_event(
+        for (index, (event, origin, history_manifest)) in replay.into_iter().enumerate() {
+            apply_provider_event_originated(
                 event,
+                origin,
+                history_manifest,
                 "restart-backfill",
                 &mut reducer,
                 &shared,
@@ -21461,10 +21719,16 @@ mod provider_integration_tests {
             )
             .await
             .unwrap();
+            let snapshot = shared.borrow();
             assert_eq!(
-                shared.borrow().task_run(&fixture.run_id),
-                Some(&expected_terminal),
-                "replay event {index} changed the restored terminal run"
+                snapshot.task_run(&fixture.run_id),
+                Some(&expected_run),
+                "replay event {index} changed the restored core run"
+            );
+            assert_eq!(
+                snapshot.task_run_v6_state(&fixture.run_id),
+                Some(&expected_lifecycle),
+                "replay event {index} changed the restored native lifecycle"
             );
         }
         drop(persistence);
@@ -21478,18 +21742,126 @@ mod provider_integration_tests {
         assert_eq!(replayed.next_ingest_seq, next_ingest_seq);
         assert_eq!(
             replayed.model.task_run(&fixture.run_id),
-            Some(&expected_terminal),
-            "replay persisted a reopen or duplicate terminal transition"
+            Some(&expected_run),
+            "replay persisted a core-state flap"
+        );
+        assert_eq!(
+            replayed.model.task_run_v6_state(&fixture.run_id),
+            Some(&expected_lifecycle),
+            "replay persisted a native-lifecycle flap"
         );
     }
 
     #[tokio::test]
-    async fn restart_historical_start_missing_from_ledger_does_not_reopen_completed_run() {
+    async fn historical_start_with_later_source_order_clears_native_end() {
         let fixture = persist_restart_backfill().await;
-        let replay = replay_restart_backfill(&fixture);
+        let stored_watermark = fixture
+            .restored
+            .model
+            .task_run_v6_state(&fixture.run_id)
+            .and_then(|state| state.lifecycle_watermark.as_ref())
+            .expect("explicit abort must persist a lifecycle watermark")
+            .clone();
+        assert_eq!(
+            fixture
+                .restored
+                .model
+                .task_run_v6_state(&fixture.run_id)
+                .and_then(|state| state.native_session_end.as_ref())
+                .map(|end| end.status),
+            Some(NativeSessionEndStatus::Cancelled)
+        );
+        let (mut resume, origin, history_manifest) = replay_restart_backfill_originated(&fixture)
+            .into_iter()
+            .find_map(|(event, origin, history_manifest)| match event {
+                ProviderEvent::Synthesized(controller)
+                    if matches!(controller.event, ControllerEventKind::TaskStarted) =>
+                {
+                    Some((controller, origin, history_manifest))
+                }
+                _ => None,
+            })
+            .expect("startup replay must contain the historical TaskStarted");
+        resume.metadata.timestamp_ms = stored_watermark.source_at_ms;
+        resume.metadata.receipt_time_ms = stored_watermark.observed_at_ms;
+        resume.metadata.event_id = format!("{}~resume", stored_watermark.source_order);
+        let candidate = crate::model::NativeLifecycleWatermark {
+            source_at_ms: resume.metadata.timestamp_ms,
+            observed_at_ms: resume.metadata.receipt_time_ms,
+            source_order: resume.metadata.event_id.clone(),
+        };
+        assert!(
+            candidate > stored_watermark,
+            "test precondition requires only the stable source order to advance"
+        );
+
+        let store = open_writer(&fixture.state_root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut persistence = test_runtime(writer);
+        let (mut reducer, shared) = Reducer::new(fixture.restored);
+        apply_provider_event_originated(
+            ProviderEvent::Synthesized(resume),
+            origin,
+            history_manifest,
+            "restart-backfill",
+            &mut reducer,
+            &shared,
+            &mut persistence,
+            &SourceCoverageRegistry::new(SourceAvailability::Available),
+        )
+        .await
+        .unwrap();
+        drop(persistence);
+        lifecycle.shutdown().await.unwrap();
+        let persisted = open_reader(&fixture.state_root)
+            .unwrap()
+            .load_restored_state()
+            .unwrap();
+        assert_eq!(
+            persisted
+                .model
+                .task_run_v6_state(&fixture.run_id)
+                .and_then(|state| state.lifecycle_watermark.as_ref()),
+            Some(&candidate)
+        );
+        assert!(
+            persisted
+                .model
+                .task_run_v6_state(&fixture.run_id)
+                .unwrap()
+                .native_session_end
+                .is_none(),
+            "the strictly later historical start must clear the retained native end"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_historical_start_missing_from_ledger_does_not_reopen_cancelled_lifecycle() {
+        let fixture = persist_restart_backfill().await;
+        let expected_run = fixture
+            .restored
+            .model
+            .task_run(&fixture.run_id)
+            .expect("restart fixture must persist its core run")
+            .clone();
+        let expected_lifecycle = fixture
+            .restored
+            .model
+            .task_run_v6_state(&fixture.run_id)
+            .expect("restart fixture must persist its native lifecycle")
+            .clone();
+        assert_eq!(expected_run.state, TaskState::Running);
+        assert_eq!(
+            expected_lifecycle
+                .native_session_end
+                .as_ref()
+                .map(|end| end.status),
+            Some(NativeSessionEndStatus::Cancelled)
+        );
+        let replay = replay_restart_backfill_originated(&fixture);
         let started_event_id = replay
             .iter()
-            .find_map(|event| match event {
+            .find_map(|(event, _, _)| match event {
                 ProviderEvent::Synthesized(controller)
                     if matches!(controller.event, ControllerEventKind::TaskStarted) =>
                 {
@@ -21498,17 +21870,17 @@ mod provider_integration_tests {
                 _ => None,
             })
             .expect("startup replay must contain the historical TaskStarted");
-        let complete_event_id = replay
+        let cancelled_event_id = replay
             .iter()
-            .find_map(|event| match event {
+            .find_map(|(event, _, _)| match event {
                 ProviderEvent::Synthesized(controller)
-                    if matches!(controller.event, ControllerEventKind::Complete) =>
+                    if matches!(controller.event, ControllerEventKind::Cancelled) =>
                 {
                     Some(controller.metadata.event_id.clone())
                 }
                 _ => None,
             })
-            .expect("startup replay must contain the retained Complete");
+            .expect("startup replay must contain the retained Controller Cancelled");
         let connection =
             rusqlite::Connection::open(crate::store::database_path(&fixture.state_root)).unwrap();
         assert_eq!(
@@ -21525,7 +21897,7 @@ mod provider_integration_tests {
             connection
                 .query_row(
                     "SELECT COUNT(*) FROM events WHERE event_id IN (?1, ?2)",
-                    (&started_event_id, &complete_event_id),
+                    (&started_event_id, &cancelled_event_id),
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
@@ -21536,12 +21908,12 @@ mod provider_integration_tests {
             connection
                 .query_row(
                     "SELECT COUNT(*) FROM event_ledger WHERE event_id = ?1",
-                    [&complete_event_id],
+                    [&cancelled_event_id],
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
             1,
-            "the retained Complete must remain a ledger duplicate"
+            "the retained Cancelled must remain a ledger duplicate"
         );
         drop(connection);
 
@@ -21549,9 +21921,13 @@ mod provider_integration_tests {
         let terminal_sources = reader.terminal_event_sources().unwrap();
         let restored = reader.load_restored_state().unwrap();
         assert_eq!(
-            restored.model.task_run(&fixture.run_id).unwrap().state,
-            TaskState::Completed,
-            "restart seed must restore the persisted terminal run"
+            restored.model.task_run(&fixture.run_id),
+            Some(&expected_run)
+        );
+        assert_eq!(
+            restored.model.task_run_v6_state(&fixture.run_id),
+            Some(&expected_lifecycle),
+            "restart seed must restore the persisted native cancellation"
         );
         assert!(
             !restored
@@ -21566,12 +21942,34 @@ mod provider_integration_tests {
         let mut persistence = test_runtime(writer);
         let (mut reducer, shared) = Reducer::new(restored);
         reducer.restore_terminal_event_sources(terminal_sources);
-        apply_restart_backfill_events(replay, &mut reducer, &shared, &mut persistence).await;
-        let replayed_state = shared
-            .borrow()
-            .task_run(&fixture.run_id)
-            .expect("replayed run must remain visible")
-            .state;
+        let coverage = SourceCoverageRegistry::new(SourceAvailability::Available);
+        for (event, origin, history_manifest) in replay {
+            apply_provider_event_originated(
+                event,
+                origin,
+                history_manifest,
+                "restart-backfill",
+                &mut reducer,
+                &shared,
+                &mut persistence,
+                &coverage,
+            )
+            .await
+            .unwrap();
+        }
+        {
+            let snapshot = shared.borrow();
+            assert_eq!(
+                snapshot.task_run(&fixture.run_id),
+                Some(&expected_run),
+                "historical TaskStarted replay changed the restored core run"
+            );
+            assert_eq!(
+                snapshot.task_run_v6_state(&fixture.run_id),
+                Some(&expected_lifecycle),
+                "the later Cancelled lifecycle watermark did not prevent reopening"
+            );
+        }
         let persistence_status = persistence.snapshot.persistence;
         drop(persistence);
         lifecycle.shutdown().await.unwrap();
@@ -21594,13 +21992,7 @@ mod provider_integration_tests {
             .unwrap();
         drop(connection);
         let reader = open_reader(&fixture.state_root).unwrap();
-        let persisted_state = reader
-            .load_restored_state()
-            .unwrap()
-            .model
-            .task_run(&fixture.run_id)
-            .expect("replayed run must remain persisted")
-            .state;
+        let persisted = reader.load_restored_state().unwrap();
         assert_eq!(
             persisted_start_events, 1,
             "historical TaskStarted replay persisted a duplicate Running event"
@@ -21615,14 +22007,14 @@ mod provider_integration_tests {
             "historical TaskStarted replay attempted a conflicting durable event write"
         );
         assert_eq!(
-            persisted_state,
-            TaskState::Completed,
-            "historical TaskStarted replay persisted a spurious reopen"
+            persisted.model.task_run(&fixture.run_id),
+            Some(&expected_run),
+            "historical TaskStarted replay persisted a core-state flap"
         );
         assert_eq!(
-            replayed_state,
-            TaskState::Completed,
-            "historical TaskStarted replay reopened the restored terminal run"
+            persisted.model.task_run_v6_state(&fixture.run_id),
+            Some(&expected_lifecycle),
+            "historical TaskStarted replay persisted a lifecycle reopen"
         );
     }
 

@@ -18,10 +18,11 @@ use crate::identity::{
 use crate::model::{
     AgentNode, AgentNodeObservation, AgentSessionReferenceKind, ControllerDiagnosticsHandle,
     ControllerEvent, ControllerEventKind, DependencyEdge, DisplayOrdinal, DomainModel,
-    EventMetadata, ExecState, Execution, ExecutionEdge, MinimalProviderMetadata, NormalizedEvent,
+    EventMetadata, ExecState, Execution, ExecutionEdge, MinimalProviderMetadata,
+    NativeLifecycleWatermark, NativeSessionEnd, NativeSessionEndStatus, NormalizedEvent,
     ObservationOrigin, OperatorCommand, Pane, PaneAgentStatusObservation, Provider,
-    ProviderDiagnosticsHandle, ReconcileBatch, RunId, RunKey, SharedModel, TaskRun, TaskState,
-    TopologyAuthority, TopologyEntity, TopologyEntityId, TopologySnapshot,
+    ProviderDiagnosticsHandle, ReconcileBatch, RunId, RunKey, SharedModel, TaskRun, TaskRunV6State,
+    TaskState, TopologyAuthority, TopologyEntity, TopologyEntityId, TopologySnapshot,
     sanitize_controller_text,
 };
 use crate::operator::OperatorProjection;
@@ -846,20 +847,61 @@ impl Reducer {
     ///
     /// Dismissal is checked before [`TaskRun::touch`] because a non-terminal touch clears it.
     pub fn touch_run_liveness(&mut self, key: &RunKey, at_ms: i64) -> Vec<PersistOp> {
+        self.touch_run_liveness_observed(key, at_ms, at_ms)
+    }
+
+    pub(crate) fn touch_run_liveness_observed(
+        &mut self,
+        key: &RunKey,
+        at_ms: i64,
+        observed_at_ms: i64,
+    ) -> Vec<PersistOp> {
         let Some(mut task_run) = self.model.task_run_by_key(key).cloned() else {
             return Vec::new();
         };
-        if task_run.dismissed_at_ms.is_some()
-            || task_run.state.is_terminal()
-            || task_run
-                .updated_at_ms
-                .is_some_and(|updated_at_ms| updated_at_ms >= at_ms)
-        {
+        if task_run.dismissed_at_ms.is_some() {
+            return Vec::new();
+        }
+        if task_run.state.is_terminal() {
+            let mut persist = Vec::new();
+            self.apply_native_lifecycle(
+                task_run.run_id,
+                None,
+                NativeLifecycleWatermark {
+                    source_at_ms: at_ms,
+                    observed_at_ms,
+                    source_order: format!("provider-liveness:{key:?}"),
+                },
+                &mut persist,
+            );
+            if !persist.is_empty() {
+                self.apply_operator_submission(&persist);
+                self.publish();
+            }
+            return persist;
+        }
+        if task_run.updated_at_ms.is_some_and(|updated_at_ms| {
+            updated_at_ms >= at_ms
+                && self
+                    .model
+                    .task_run_v6_state(&task_run.run_id)
+                    .is_none_or(|state| state.native_session_end.is_none())
+        }) {
             return Vec::new();
         }
         Self::touch_task_run(&mut task_run, at_ms);
         self.model.insert_task_run(task_run.clone());
-        let persist = vec![self.persist_task_run(task_run, at_ms)];
+        let mut persist = vec![self.persist_task_run(task_run.clone(), at_ms)];
+        self.apply_native_lifecycle(
+            task_run.run_id,
+            None,
+            NativeLifecycleWatermark {
+                source_at_ms: at_ms,
+                observed_at_ms,
+                source_order: format!("provider-liveness:{key:?}"),
+            },
+            &mut persist,
+        );
         self.apply_operator_submission(&persist);
         self.publish();
         persist
@@ -1015,6 +1057,15 @@ impl Reducer {
     /// This lane-specific path deliberately ignores `has_controller_task_state_event`, which is
     /// set by synthesized events and makes the observation-close path unsuitable here.
     pub fn apply_lane_close(&mut self, key: &RunKey, at_ms: i64) -> Vec<PersistOp> {
+        self.apply_lane_close_observed(key, at_ms, at_ms)
+    }
+
+    pub(crate) fn apply_lane_close_observed(
+        &mut self,
+        key: &RunKey,
+        at_ms: i64,
+        observed_at_ms: i64,
+    ) -> Vec<PersistOp> {
         let Some(mut task_run) = self.model.task_run_by_key(key).cloned() else {
             return Vec::new();
         };
@@ -1028,6 +1079,22 @@ impl Reducer {
         {
             return Vec::new();
         }
+        if native_binding(&self.model, task_run.run_id).is_some() {
+            let mut persist = Vec::new();
+            self.apply_native_lifecycle(
+                task_run.run_id,
+                Some(NativeSessionEndStatus::Unknown),
+                NativeLifecycleWatermark {
+                    source_at_ms: at_ms,
+                    observed_at_ms,
+                    source_order: format!("provider-lane-close:{key:?}"),
+                },
+                &mut persist,
+            );
+            self.apply_operator_submission(&persist);
+            self.publish();
+            return persist;
+        }
         task_run.state = TaskState::EndedUnknown;
         Self::touch_task_run(&mut task_run, at_ms);
         self.model.insert_task_run(task_run.clone());
@@ -1035,6 +1102,41 @@ impl Reducer {
         self.apply_operator_submission(&persist);
         self.publish();
         persist
+    }
+
+    fn apply_native_lifecycle(
+        &mut self,
+        run_id: RunId,
+        end_status: Option<NativeSessionEndStatus>,
+        watermark: NativeLifecycleWatermark,
+        persist: &mut PersistBatch,
+    ) {
+        let mut state = self
+            .model
+            .task_run_v6_state(&run_id)
+            .cloned()
+            .unwrap_or_else(TaskRunV6State::default);
+        if state
+            .lifecycle_watermark
+            .as_ref()
+            .is_some_and(|stored| stored >= &watermark)
+        {
+            return;
+        }
+        state.native_session_end = end_status.map(|status| NativeSessionEnd {
+            status,
+            at_ms: watermark.source_at_ms,
+        });
+        state.lifecycle_watermark = Some(watermark.clone());
+        self.model.set_task_run_v6_state(run_id, state);
+        let already_persisted = persist.iter().any(|operation| match operation {
+            PersistOp::UpsertTaskRun(value) => value.task_run.run_id == run_id,
+            PersistOp::PromoteTaskRunKey { promoted, .. } => promoted.task_run.run_id == run_id,
+            _ => false,
+        });
+        if !already_persisted && let Some(run) = self.model.task_run(&run_id).cloned() {
+            persist.push(self.persist_task_run(run, watermark.observed_at_ms));
+        }
     }
 
     /// Executes the complete Controller mutation sequence on one throwaway clone.
@@ -1074,6 +1176,21 @@ impl Reducer {
         metadata.execution_parent = None;
         metadata.dependency = None;
         metadata.ingest_seq = None;
+        let lane_native_end = metadata.source == crate::provider::lane::SOURCE_LOG_LANE
+            && metadata.provider.is_some()
+            && metadata
+                .native_session_id
+                .as_deref()
+                .is_some_and(|sid| !sid.is_empty())
+            && matches!(
+                event.event,
+                ControllerEventKind::Complete
+                    | ControllerEventKind::Failed
+                    | ControllerEventKind::Cancelled
+            );
+        if lane_native_end {
+            metadata.task_state = None;
+        }
 
         match &event.event {
             ControllerEventKind::Dispatch { parent_task_run_id } => {
@@ -1112,6 +1229,7 @@ impl Reducer {
             | ControllerEventKind::Complete
             | ControllerEventKind::Failed
             | ControllerEventKind::Cancelled
+            | ControllerEventKind::SessionEnded
             | ControllerEventKind::Dismiss => {}
         }
 
@@ -1123,6 +1241,38 @@ impl Reducer {
         });
         scratch.terminal_event_sources = self.terminal_event_sources.clone();
         scratch.non_lane_task_state_runs = self.non_lane_task_state_runs.clone();
+        if matches!(event.event, ControllerEventKind::SessionEnded) {
+            let bound = self
+                .resolve_controller_run(&event.task_run_id)
+                .and_then(|run_id| native_binding(&self.model, run_id))
+                .filter(|binding| {
+                    metadata.provider == Some(binding.provider)
+                        && metadata.native_session_id.as_deref()
+                            == Some(binding.native_session_id.as_str())
+                });
+            if bound.is_none() {
+                metadata.task_run_id = None;
+                let normalized = NormalizedEvent::ControllerEvent {
+                    metadata: metadata.clone(),
+                    event: event.event.clone(),
+                };
+                return Ok(MaterializedDelta {
+                    post_model: scratch.model,
+                    post_next_ordinal: scratch.next_ordinal,
+                    post_terminal_event_sources: scratch.terminal_event_sources,
+                    post_non_lane_task_state_runs: scratch.non_lane_task_state_runs,
+                    diagnostic_deltas: ControllerDiagnosticDeltas {
+                        post_dangling_announcement_components:
+                            crate::model::graph::dangling_announcement_components(&self.model),
+                        ..ControllerDiagnosticDeltas::default()
+                    },
+                    batch: vec![PersistOp::RecordEvent {
+                        event: Box::new(normalized),
+                        seen_at_ms: metadata.receipt_time_ms,
+                    }],
+                });
+            }
+        }
         let drops_unknown_lane_terminal = subject_was_unknown
             && metadata.source == crate::provider::lane::SOURCE_LOG_LANE
             && matches!(
@@ -1226,12 +1376,7 @@ impl Reducer {
             _ => {}
         }
 
-        let allow_lane_reopen = scratch.lane_reopen_allowed(
-            &event.event,
-            subject,
-            &metadata.source,
-            metadata.timestamp_ms,
-        );
+        let allow_lane_reopen = false;
         let mut diagnostic_deltas = validate_controller_transition(
             &scratch.model,
             &event.event,
@@ -1239,7 +1384,7 @@ impl Reducer {
             subject_was_unknown,
             metadata.execution_parent.as_ref(),
             metadata.dependency.as_ref(),
-            allow_lane_reopen,
+            lane_native_end,
         )?;
         scratch.apply_controller_metadata(&metadata, allow_lane_reopen, &mut persist);
         scratch
@@ -1251,8 +1396,49 @@ impl Reducer {
                 ReducerError::BindingConflict(conflict) => reject_merge_conflict(&conflict),
                 ReducerError::OrdinalExhausted => RejectReason::Conflict,
             })?;
+        let lifecycle_run_id = metadata
+            .provider
+            .zip(metadata.native_session_id.as_deref())
+            .and_then(|(provider, sid)| {
+                scratch
+                    .model
+                    .task_run_by_key(&RunKey::Native {
+                        provider,
+                        sid: sid.to_owned(),
+                    })
+                    .map(|run| run.run_id)
+            })
+            .or_else(|| scratch.resolve_controller_run(&event.task_run_id));
+        if let Some(run_id) = lifecycle_run_id {
+            let end_status = if matches!(event.event, ControllerEventKind::SessionEnded) {
+                Some(NativeSessionEndStatus::Done)
+            } else if lane_native_end {
+                match event.event {
+                    ControllerEventKind::Complete => Some(NativeSessionEndStatus::Done),
+                    ControllerEventKind::Failed => Some(NativeSessionEndStatus::Error),
+                    ControllerEventKind::Cancelled => Some(NativeSessionEndStatus::Cancelled),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if end_status.is_some() || matches!(event.event, ControllerEventKind::TaskStarted) {
+                scratch.apply_native_lifecycle(
+                    run_id,
+                    end_status,
+                    NativeLifecycleWatermark {
+                        source_at_ms: metadata.timestamp_ms,
+                        observed_at_ms: metadata.receipt_time_ms,
+                        source_order: metadata.event_id.clone(),
+                    },
+                    &mut persist,
+                );
+            }
+        }
         scratch.persist_event_execution(&normalized, metadata.receipt_time_ms, &mut persist);
-        scratch.update_terminal_event_source(&normalized);
+        if !lane_native_end {
+            scratch.update_terminal_event_source(&normalized);
+        }
         persist.push(PersistOp::RecordEvent {
             event: Box::new(normalized),
             seen_at_ms: metadata.receipt_time_ms,
@@ -1315,7 +1501,7 @@ impl Reducer {
         self.apply_controller_diagnostic_deltas(delta.diagnostic_deltas);
         self.apply_operator_submission(&batch);
         self.publish();
-        Ok(permit.enqueue(batch))
+        Ok(permit.enqueue_v6(self.decorate_v6_batch(batch)))
     }
 
     /// Installs a validated provider delta while returning its transaction for v6 decoration.
@@ -1368,24 +1554,156 @@ impl Reducer {
             .set_dangling_announcement_components(deltas.post_dangling_announcement_components);
     }
 
-    fn apply_inner(&mut self, event: NormalizedEvent) -> Result<PersistBatch, ReducerError> {
+    pub(crate) fn decorate_v6_batch(&self, operations: PersistBatch) -> PersistV6Batch {
+        let touched = operations
+            .iter()
+            .filter_map(|operation| match operation {
+                PersistOp::UpsertTaskRun(value) => Some(value.task_run.run_id),
+                PersistOp::PromoteTaskRunKey { promoted, .. } => Some(promoted.task_run.run_id),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let task_runs = touched
+            .into_iter()
+            .filter_map(|run_id| {
+                let run = self.model.task_run(&run_id)?.clone();
+                let state = self.model.task_run_v6_state(&run_id)?.clone();
+                let PersistOp::UpsertTaskRun(task_run) = self.persist_task_run(
+                    run,
+                    state
+                        .lifecycle_watermark
+                        .as_ref()
+                        .map_or(0, |w| w.observed_at_ms),
+                ) else {
+                    unreachable!("persist_task_run always returns an upsert");
+                };
+                Some(PersistTaskRunV6 { task_run, state })
+            })
+            .collect();
+        PersistV6Batch {
+            operations,
+            task_runs,
+            ..PersistV6Batch::default()
+        }
+    }
+
+    fn apply_inner(&mut self, mut event: NormalizedEvent) -> Result<PersistBatch, ReducerError> {
+        let lane_native_terminal = matches!(
+            &event,
+            NormalizedEvent::ControllerEvent {
+                metadata,
+                event:
+                    ControllerEventKind::Complete
+                    | ControllerEventKind::Failed
+                    | ControllerEventKind::Cancelled,
+            } if metadata.source == crate::provider::lane::SOURCE_LOG_LANE
+                && metadata.provider.is_some()
+                && metadata
+                    .native_session_id
+                    .as_deref()
+                    .is_some_and(|sid| !sid.is_empty())
+        );
+        if lane_native_terminal {
+            event_metadata_mut(&mut event).task_state = None;
+        }
         let metadata = event_metadata(&event).clone();
         let mut persist = Vec::new();
 
         self.ensure_event_runs(&event, &metadata, &mut persist)?;
-        let allow_lane_reopen = match &event {
-            NormalizedEvent::ControllerEvent { event, .. } => {
-                metadata.task_run_id.is_some_and(|run_id| {
-                    self.lane_reopen_allowed(event, run_id, &metadata.source, metadata.timestamp_ms)
-                })
-            }
-            _ => false,
-        };
-        self.apply_controller_metadata(&metadata, allow_lane_reopen, &mut persist);
+        self.apply_controller_metadata(&metadata, false, &mut persist);
         self.apply_event_body(&event, &metadata, &mut persist)?;
         self.apply_identity_metadata(&event, &metadata, &mut persist)?;
+        let lifecycle_end = match &event {
+            NormalizedEvent::ControllerEvent {
+                event: ControllerEventKind::Complete,
+                ..
+            } if lane_native_terminal => Some(NativeSessionEndStatus::Done),
+            NormalizedEvent::ControllerEvent {
+                event: ControllerEventKind::Failed,
+                ..
+            } if lane_native_terminal => Some(NativeSessionEndStatus::Error),
+            NormalizedEvent::ControllerEvent {
+                event: ControllerEventKind::Cancelled,
+                ..
+            } if lane_native_terminal => Some(NativeSessionEndStatus::Cancelled),
+            _ => None,
+        };
+        let lifecycle_reopen = matches!(
+            &event,
+            NormalizedEvent::ControllerEvent {
+                event: ControllerEventKind::TaskStarted,
+                ..
+            }
+        ) && metadata.provider.is_some()
+            && metadata
+                .native_session_id
+                .as_deref()
+                .is_some_and(|sid| !sid.is_empty());
+        if (lifecycle_end.is_some() || lifecycle_reopen)
+            && let Some(run_id) = metadata
+                .provider
+                .zip(metadata.native_session_id.as_deref())
+                .and_then(|(provider, sid)| {
+                    self.model
+                        .task_run_by_key(&RunKey::Native {
+                            provider,
+                            sid: sid.to_owned(),
+                        })
+                        .map(|run| run.run_id)
+                })
+        {
+            self.apply_native_lifecycle(
+                run_id,
+                lifecycle_end,
+                NativeLifecycleWatermark {
+                    source_at_ms: metadata.timestamp_ms,
+                    observed_at_ms: metadata.receipt_time_ms,
+                    source_order: metadata.event_id.clone(),
+                },
+                &mut persist,
+            );
+        }
+        let matching_live = match &event {
+            NormalizedEvent::ExecutionBegin { execution, .. } => !execution.state.is_terminal(),
+            NormalizedEvent::AgentStatusChanged { execution_id, .. } => self
+                .model
+                .execution(execution_id)
+                .is_some_and(|execution| !execution.state.is_terminal()),
+            NormalizedEvent::AgentNodeUpsert { node, .. } => node
+                .state
+                .as_ref()
+                .is_some_and(|state| !state.is_terminal()),
+            NormalizedEvent::AgentActivity { .. } => true,
+            _ => false,
+        };
+        if matching_live
+            && let Some(run_id) = metadata
+                .provider
+                .zip(metadata.native_session_id.as_deref())
+                .and_then(|(provider, sid)| {
+                    self.model
+                        .task_run_by_key(&RunKey::Native {
+                            provider,
+                            sid: sid.to_owned(),
+                        })
+                        .map(|run| run.run_id)
+                })
+        {
+            self.apply_native_lifecycle(
+                run_id,
+                None,
+                NativeLifecycleWatermark {
+                    source_at_ms: metadata.timestamp_ms,
+                    observed_at_ms: metadata.receipt_time_ms,
+                    source_order: metadata.event_id.clone(),
+                },
+                &mut persist,
+            );
+        }
         self.persist_event_execution(&event, metadata.receipt_time_ms, &mut persist);
-        self.update_terminal_event_source(&event);
+        if !lane_native_terminal {
+            self.update_terminal_event_source(&event);
+        }
         persist.push(PersistOp::RecordEvent {
             event: Box::new(event),
             seen_at_ms: metadata.receipt_time_ms,
@@ -1845,32 +2163,6 @@ impl Reducer {
                 created_at_ms: metadata.receipt_time_ms,
             });
         }
-    }
-
-    fn lane_reopen_allowed(
-        &self,
-        event: &ControllerEventKind,
-        run_id: RunId,
-        source: &str,
-        source_timestamp_ms: i64,
-    ) -> bool {
-        // A strictly newer source fact is the only way to distinguish a genuine resume from
-        // replayed history after a lane-authored terminal.
-        let start_follows_terminal = self.model.task_run(&run_id).is_some_and(|run| {
-            matches!(run.state, TaskState::Completed | TaskState::Cancelled)
-                && run
-                    .finished_at_ms
-                    .is_some_and(|finished_at_ms| source_timestamp_ms > finished_at_ms)
-        });
-        matches!(event, ControllerEventKind::TaskStarted)
-            && source == crate::provider::lane::SOURCE_LOG_LANE
-            && start_follows_terminal
-            && self
-                .terminal_event_sources
-                .get(&run_id)
-                .is_some_and(|terminal_source| {
-                    terminal_source == crate::provider::lane::SOURCE_LOG_LANE
-                })
     }
 
     fn update_terminal_event_source(&mut self, event: &NormalizedEvent) {
@@ -2955,7 +3247,7 @@ fn validate_controller_transition(
     subject_was_unknown: bool,
     execution_edge: Option<&ExecutionEdge>,
     dependency_edge: Option<&DependencyEdge>,
-    allow_lane_reopen: bool,
+    native_lifecycle_terminal: bool,
 ) -> Result<ControllerDiagnosticDeltas, RejectReason> {
     let mut deltas = ControllerDiagnosticDeltas::default();
     let state = model
@@ -2981,7 +3273,7 @@ fn validate_controller_transition(
             if matches!(
                 state,
                 TaskState::Completed | TaskState::Failed | TaskState::Cancelled
-            ) && !allow_lane_reopen
+            ) && native_binding(model, subject).is_none()
             {
                 return Err(RejectReason::StaleEvent);
             }
@@ -2995,9 +3287,13 @@ fn validate_controller_transition(
             }
         }
         ControllerEventKind::Dismiss => {}
+        ControllerEventKind::SessionEnded => {}
         ControllerEventKind::Complete
         | ControllerEventKind::Failed
         | ControllerEventKind::Cancelled => {
+            if native_lifecycle_terminal {
+                return Ok(deltas);
+            }
             let target = controller_target_state(event).ok_or(RejectReason::Invalid)?;
             if matches!(
                 state,
@@ -3034,6 +3330,7 @@ fn controller_kind_name(event: &ControllerEventKind) -> &'static str {
         ControllerEventKind::Complete => "complete",
         ControllerEventKind::Failed => "failed",
         ControllerEventKind::Cancelled => "cancelled",
+        ControllerEventKind::SessionEnded => "session_ended",
         ControllerEventKind::Dismiss => "dismiss",
     }
 }
@@ -3042,6 +3339,7 @@ fn controller_target_state(event: &ControllerEventKind) -> Option<TaskState> {
     match event {
         ControllerEventKind::Dispatch { .. }
         | ControllerEventKind::DependsOn { .. }
+        | ControllerEventKind::SessionEnded
         | ControllerEventKind::Dismiss => None,
         ControllerEventKind::TaskStarted => Some(TaskState::Running),
         ControllerEventKind::Blocked => Some(TaskState::Blocked),
@@ -3332,10 +3630,10 @@ mod tests {
         AgentNode, AgentNodeObservation, AgentSessionReference, AgentSessionReferenceKind,
         ControllerEvent, ControllerEventKind, DependencyEdge, DisplayOrdinal, DomainModel,
         EventMetadata, ExecState, Execution, ExecutionEdge, GapKind, MinimalProviderMetadata,
-        NormalizedEvent, OperatorCommand, Pane, PaneAgentStatus, PaneAgentStatusObservation,
-        PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SharedModel, SnapshotAgent, Tab,
-        TaskRun, TaskRunV6State, TaskState, TopologyAuthority, TopologyEntity, TopologyEntityId,
-        TopologySnapshot, TurnAttr, Workspace,
+        NativeLifecycleWatermark, NativeSessionEndStatus, NormalizedEvent, OperatorCommand, Pane,
+        PaneAgentStatus, PaneAgentStatusObservation, PaneSnapshot, Provider, ReconcileBatch, RunId,
+        RunKey, SharedModel, SnapshotAgent, Tab, TaskRun, TaskRunV6State, TaskState,
+        TopologyAuthority, TopologyEntity, TopologyEntityId, TopologySnapshot, TurnAttr, Workspace,
     };
     use crate::provider::claude_facts::{extract_claude_line, extract_meta_json};
     use crate::provider::facts::{EvidenceId, LogFact, SessionScope};
@@ -3822,6 +4120,157 @@ mod tests {
         assert_eq!(landed.malformed_records(), 1);
     }
 
+    #[test]
+    fn native_lifecycle_watermark_orders_end_and_reopen_by_all_three_fields() {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run_with_controller_evidence(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "watermark".to_owned(),
+            },
+            1,
+            TaskState::Running,
+        ));
+        let (mut reducer, _) = Reducer::new(restored(model, 2));
+        let mut persist = Vec::new();
+        reducer.apply_native_lifecycle(
+            run_id,
+            Some(NativeSessionEndStatus::Error),
+            NativeLifecycleWatermark {
+                source_at_ms: 100,
+                observed_at_ms: 200,
+                source_order: "b-end".to_owned(),
+            },
+            &mut persist,
+        );
+        let after_first_end = persist.len();
+        reducer.apply_native_lifecycle(
+            run_id,
+            Some(NativeSessionEndStatus::Error),
+            NativeLifecycleWatermark {
+                source_at_ms: 100,
+                observed_at_ms: 200,
+                source_order: "b-end".to_owned(),
+            },
+            &mut persist,
+        );
+        assert_eq!(
+            persist.len(),
+            after_first_end,
+            "same watermark/status is idempotent"
+        );
+        reducer.apply_native_lifecycle(
+            run_id,
+            None,
+            NativeLifecycleWatermark {
+                source_at_ms: 100,
+                observed_at_ms: 200,
+                source_order: "c-reopen".to_owned(),
+            },
+            &mut persist,
+        );
+        reducer.apply_native_lifecycle(
+            run_id,
+            Some(NativeSessionEndStatus::Done),
+            NativeLifecycleWatermark {
+                source_at_ms: 100,
+                observed_at_ms: 199,
+                source_order: "z-delayed-end".to_owned(),
+            },
+            &mut persist,
+        );
+
+        let state = reducer.model.task_run_v6_state(&run_id).unwrap();
+        assert!(state.native_session_end.is_none());
+        assert_eq!(
+            state.lifecycle_watermark.as_ref().unwrap().source_order,
+            "c-reopen"
+        );
+    }
+
+    #[test]
+    fn native_root_abort_failure_and_lane_close_are_resumable_lifecycle_only() {
+        for (event, expected) in [
+            (
+                ControllerEventKind::Cancelled,
+                NativeSessionEndStatus::Cancelled,
+            ),
+            (ControllerEventKind::Failed, NativeSessionEndStatus::Error),
+        ] {
+            let sid = format!("root-{expected:?}");
+            let run_id = RunId::new();
+            let mut model = DomainModel::default();
+            model.insert_task_run(run_with_controller_evidence(
+                run_id,
+                RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: sid.clone(),
+                },
+                1,
+                TaskState::Running,
+            ));
+            model.insert_task_run_alias(RunKey::Controller(sid.clone()), run_id);
+            let (reducer, _) = Reducer::new(restored(model, 2));
+            let mut terminal = provider_lane_event("root-terminal", &sid, event, 100, 200);
+            terminal.metadata.provider = Some(Provider::Codex);
+            terminal.metadata.native_session_id = Some(sid);
+            let delta = reducer.validate_controller_event(&terminal).unwrap();
+            assert_eq!(
+                delta.post_model.task_run(&run_id).unwrap().state,
+                TaskState::Running
+            );
+            assert_eq!(
+                delta
+                    .post_model
+                    .task_run_v6_state(&run_id)
+                    .and_then(|state| state.native_session_end.as_ref())
+                    .map(|end| end.status),
+                Some(expected)
+            );
+        }
+
+        let run_id = RunId::new();
+        let key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "lane-close".to_owned(),
+        };
+        let mut model = DomainModel::default();
+        model.insert_task_run(run_with_controller_evidence(
+            run_id,
+            key.clone(),
+            1,
+            TaskState::Running,
+        ));
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+        assert!(!reducer.apply_lane_close_observed(&key, 300, 400).is_empty());
+        let model = shared.borrow();
+        assert_eq!(model.task_run(&run_id).unwrap().state, TaskState::Running);
+        assert_eq!(
+            model
+                .task_run_v6_state(&run_id)
+                .and_then(|state| state.native_session_end.as_ref())
+                .map(|end| end.status),
+            Some(NativeSessionEndStatus::Unknown)
+        );
+        drop(model);
+
+        assert!(
+            !reducer
+                .touch_run_liveness_observed(&key, 500, 600)
+                .is_empty()
+        );
+        assert!(
+            shared
+                .borrow()
+                .task_run_v6_state(&run_id)
+                .and_then(|state| state.native_session_end.as_ref())
+                .is_none(),
+            "newer provider liveness must clear only the native lifecycle end"
+        );
+    }
+
     fn controller_event(
         event_id: &str,
         raw_run_id: &str,
@@ -4027,12 +4476,10 @@ mod tests {
         );
         lane_reopen.metadata.source = SOURCE_LOG_LANE.to_owned();
         lane_reopen.metadata.timestamp_ms = 21;
-        let reopened = reducer.validate_controller_event(&lane_reopen).unwrap();
-        let run_id = reducer.resolve_controller_run("lane-terminal").unwrap();
-        assert_eq!(
-            reopened.post_model.task_run(&run_id).unwrap().state,
-            TaskState::Running
-        );
+        assert!(matches!(
+            reducer.validate_controller_event(&lane_reopen),
+            Err(RejectReason::StaleEvent)
+        ));
         lifecycle.shutdown().await.unwrap();
     }
 
@@ -4041,7 +4488,7 @@ mod tests {
         for (case, finished_at_ms, timestamp_ms, expected_state) in [
             ("before", Some(100), 99, None),
             ("equal", Some(100), 100, None),
-            ("after", Some(100), 101, Some(TaskState::Running)),
+            ("after", Some(100), 101, None),
             ("missing-finish", None, 101, None),
         ] {
             let (mut model, run_id) = controller_model(case, TaskState::Completed);
@@ -4086,7 +4533,7 @@ mod tests {
         for (case, timestamp_ms, expected_state) in [
             ("older", 99, None),
             ("equal", 100, None),
-            ("newer", 101, Some(TaskState::Running)),
+            ("newer", 101, None),
         ] {
             let raw_run_id = format!("cancelled-lane-{case}");
             let (mut model, run_id) = controller_model(&raw_run_id, TaskState::Cancelled);
@@ -4198,20 +4645,14 @@ mod tests {
             1_101,
         );
 
-        assert_eq!(
-            reducer
-                .validate_controller_event(&reopen)
-                .expect("the exclusions must not block the eligible cancelled lane case")
-                .post_model
-                .task_run(&run_id)
-                .unwrap()
-                .state,
-            TaskState::Running
-        );
+        assert!(matches!(
+            reducer.validate_controller_event(&reopen),
+            Err(RejectReason::StaleEvent)
+        ));
     }
 
     #[test]
-    fn cancelled_lane_reopen_preserves_identity_and_clears_terminal_state() {
+    fn native_start_preserves_irreversible_semantic_terminal_state_and_identity() {
         let raw_run_id = "cancelled-lane-identity";
         let native_key = RunKey::Native {
             provider: Provider::Codex,
@@ -4293,9 +4734,9 @@ mod tests {
         assert_eq!(reopened_run.display_ordinal, cancelled.display_ordinal);
         assert_eq!(reopened_run.subject, cancelled.subject);
         assert!(reopened_run.has_controller_task_state_event);
-        assert_eq!(reopened_run.state, TaskState::Running);
-        assert_eq!(reopened_run.finished_at_ms, None);
-        assert_eq!(reopened_run.dismissed_at_ms, None);
+        assert_eq!(reopened_run.state, TaskState::Cancelled);
+        assert_eq!(reopened_run.finished_at_ms, Some(100));
+        assert_eq!(reopened_run.dismissed_at_ms, Some(105));
         assert_eq!(reopened.post_model.task_runs().count(), initial_run_count);
         assert_eq!(
             reopened.post_model.executions().count(),
@@ -4338,7 +4779,13 @@ mod tests {
             Some(&preserved_telemetry)
         );
         assert_eq!(reopened.post_model.run_kind(&run_id), Some("codex_cli_rs"));
-        assert!(!reopened.post_terminal_event_sources.contains_key(&run_id));
+        assert_eq!(
+            reopened
+                .post_terminal_event_sources
+                .get(&run_id)
+                .map(String::as_str),
+            Some(SOURCE_LOG_LANE)
+        );
 
         let mut reducer = Reducer::new(RestoredState {
             model: reopened.post_model,
@@ -4348,24 +4795,28 @@ mod tests {
         })
         .0;
         reducer.restore_terminal_event_sources(reopened.post_terminal_event_sources);
+        let mut native_complete = provider_lane_event(
+            "cancelled-lane-identity-complete",
+            raw_run_id,
+            ControllerEventKind::Complete,
+            102,
+            1_102,
+        );
+        native_complete.metadata.provider = Some(Provider::Codex);
+        native_complete.metadata.native_session_id = Some(raw_run_id.to_owned());
         let completed = reducer
-            .validate_controller_event(&provider_lane_event(
-                "cancelled-lane-identity-complete",
-                raw_run_id,
-                ControllerEventKind::Complete,
-                102,
-                1_102,
-            ))
+            .validate_controller_event(&native_complete)
             .expect("a later terminal event must be accepted after reopen");
         let completed_run = completed.post_model.task_run(&run_id).unwrap();
-        assert_eq!(completed_run.state, TaskState::Completed);
-        assert_eq!(completed_run.finished_at_ms, Some(102));
+        assert_eq!(completed_run.state, TaskState::Cancelled);
+        assert_eq!(completed_run.finished_at_ms, Some(100));
         assert_eq!(
             completed
-                .post_terminal_event_sources
-                .get(&run_id)
-                .map(String::as_str),
-            Some(SOURCE_LOG_LANE)
+                .post_model
+                .task_run_v6_state(&run_id)
+                .and_then(|state| state.native_session_end.as_ref())
+                .map(|end| end.status),
+            Some(NativeSessionEndStatus::Done)
         );
     }
 
@@ -4416,16 +4867,12 @@ mod tests {
             );
             resumed_start.metadata.source = SOURCE_LOG_LANE.to_owned();
             resumed_start.metadata.timestamp_ms = 101;
-            assert_eq!(
-                reducer
-                    .validate_controller_event(&resumed_start)
-                    .expect("a new start must use rebuilt lane provenance")
-                    .post_model
-                    .task_run(&run_id)
-                    .unwrap()
-                    .state,
-                TaskState::Running,
-                "replayed {case} did not permit a genuine resume"
+            assert!(
+                matches!(
+                    reducer.validate_controller_event(&resumed_start),
+                    Err(RejectReason::StaleEvent)
+                ),
+                "replayed {case} unexpectedly reopened semantic terminal state"
             );
         }
 
@@ -4512,11 +4959,10 @@ mod tests {
         reopen.metadata.source = SOURCE_LOG_LANE.to_owned();
         reopen.metadata.timestamp_ms = finished_at_ms + 1;
 
-        let reopened = reducer.validate_controller_event(&reopen).unwrap();
-        assert_eq!(
-            reopened.post_model.task_run(&run_id).unwrap().state,
-            TaskState::Running
-        );
+        assert!(matches!(
+            reducer.validate_controller_event(&reopen),
+            Err(RejectReason::StaleEvent)
+        ));
     }
 
     #[tokio::test]

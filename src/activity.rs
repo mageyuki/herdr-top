@@ -135,6 +135,54 @@ pub fn is_default_visible_task_run(
     )
 }
 
+#[must_use]
+pub(crate) fn is_default_visible_task_run_in_model(
+    model: &crate::model::DomainModel,
+    run: &TaskRun,
+    operator: &OperatorSnapshot,
+    runs_with_executions: &HashSet<RunId>,
+    now_ms: i64,
+) -> bool {
+    if !is_default_visible_task_run(run, operator, runs_with_executions, now_ms) {
+        return false;
+    }
+    run.state.is_terminal()
+        || model
+            .task_run_v6_state(&run.run_id)
+            .and_then(|state| state.native_session_end.as_ref())
+            .is_none_or(|end| now_ms < end.at_ms.saturating_add(DEFAULT_TERMINAL_VISIBILITY_MS))
+}
+
+/// Computes the single default-visible run set and closes it over execution ancestors.
+#[must_use]
+pub(crate) fn default_visible_task_run_ids(
+    model: &crate::model::DomainModel,
+    operator: &OperatorSnapshot,
+    now_ms: i64,
+) -> HashSet<RunId> {
+    let execution_run_ids = runs_with_executions(model);
+    let mut visible = model
+        .task_runs()
+        .filter(|run| {
+            is_default_visible_task_run_in_model(model, run, operator, &execution_run_ids, now_ms)
+        })
+        .map(|run| run.run_id)
+        .collect::<HashSet<_>>();
+    loop {
+        let ancestors = model
+            .execution_edges()
+            .filter(|edge| visible.contains(&edge.child_run_id))
+            .map(|edge| edge.parent_run_id)
+            .filter(|run_id| !visible.contains(run_id))
+            .collect::<Vec<_>>();
+        if ancestors.is_empty() {
+            break;
+        }
+        visible.extend(ancestors);
+    }
+    visible
+}
+
 /// Returns default visibility with an explicit provisional-run window.
 ///
 /// `RunKey::Provisional` is minted for terminal occupancy without provider identity, so its
@@ -177,17 +225,16 @@ pub fn default_visible_task_run_count(
     operator: &OperatorSnapshot,
     now_ms: i64,
 ) -> usize {
-    let execution_run_ids = runs_with_executions(model);
-    model
-        .task_runs()
-        .filter(|run| is_default_visible_task_run(run, operator, &execution_run_ids, now_ms))
-        .count()
+    default_visible_task_run_ids(model, operator, now_ms).len()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DisplayOrdinal, DomainModel, ExecState, Execution, RunKey, TaskRun};
+    use crate::model::{
+        DisplayOrdinal, DomainModel, ExecState, Execution, ExecutionEdge, NativeSessionEnd,
+        NativeSessionEndStatus, RunKey, TaskRun, TaskRunV6State,
+    };
 
     fn task_run(key: RunKey, state: TaskState, updated_at_ms: Option<i64>) -> TaskRun {
         TaskRun {
@@ -254,6 +301,128 @@ mod tests {
         let now_ms = 7_200_000;
         let (model, operator) = visibility_fixture(now_ms);
         assert_eq!(default_visible_task_run_count(&model, &operator, now_ms), 3);
+    }
+
+    #[test]
+    fn semantic_terminal_visibility_takes_precedence_over_expired_native_lifecycle() {
+        let now_ms = 7_200_000;
+        let run = task_run(
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "semantic-terminal".to_owned(),
+            },
+            TaskState::Completed,
+            Some(now_ms),
+        );
+        let mut model = DomainModel::default();
+        model.insert_task_run(run.clone());
+        model.set_task_run_v6_state(
+            run.run_id,
+            TaskRunV6State {
+                native_session_end: Some(NativeSessionEnd {
+                    status: NativeSessionEndStatus::Done,
+                    at_ms: now_ms - DEFAULT_TERMINAL_VISIBILITY_MS - 1,
+                }),
+                ..TaskRunV6State::default()
+            },
+        );
+        let operator = OperatorSnapshot {
+            activity: Arc::from(Vec::new()),
+            terminal_times: Arc::new(HashMap::from([(
+                run.run_id,
+                now_ms - DEFAULT_TERMINAL_VISIBILITY_MS + 1,
+            )])),
+        };
+
+        assert!(is_default_visible_task_run_in_model(
+            &model,
+            &run,
+            &operator,
+            &HashSet::new(),
+            now_ms,
+        ));
+    }
+
+    #[test]
+    fn native_lifecycle_end_expires_at_the_exact_one_hour_boundary() {
+        let now_ms = 7_200_000;
+        let mut model = DomainModel::default();
+        for sid in ["root", "child", "grandchild"] {
+            let run = task_run(
+                RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: sid.to_owned(),
+                },
+                TaskState::Running,
+                Some(now_ms - DEFAULT_TERMINAL_VISIBILITY_MS),
+            );
+            model.insert_task_run(run.clone());
+            model.set_task_run_v6_state(
+                run.run_id,
+                TaskRunV6State {
+                    native_session_end: Some(NativeSessionEnd {
+                        status: NativeSessionEndStatus::Done,
+                        at_ms: now_ms - DEFAULT_TERMINAL_VISIBILITY_MS,
+                    }),
+                    ..TaskRunV6State::default()
+                },
+            );
+
+            assert!(
+                !is_default_visible_task_run_in_model(
+                    &model,
+                    &run,
+                    &empty_operator(),
+                    &HashSet::new(),
+                    now_ms,
+                ),
+                "{sid} must expire exactly at the one-hour boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn visible_grandchild_keeps_expired_execution_ancestors_as_structure() {
+        let now_ms = 7_200_000;
+        let mut model = DomainModel::default();
+        let root = task_run(
+            RunKey::Controller("root".to_owned()),
+            TaskState::Completed,
+            None,
+        );
+        let child = task_run(
+            RunKey::Controller("child".to_owned()),
+            TaskState::Completed,
+            None,
+        );
+        let grandchild = task_run(
+            RunKey::Controller("grandchild".to_owned()),
+            TaskState::Running,
+            Some(now_ms),
+        );
+        for run in [&root, &child, &grandchild] {
+            model.insert_task_run(run.clone());
+        }
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: root.run_id,
+            child_run_id: child.run_id,
+        });
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: child.run_id,
+            child_run_id: grandchild.run_id,
+        });
+        let operator = OperatorSnapshot {
+            activity: Arc::from(Vec::new()),
+            terminal_times: Arc::new(HashMap::from([
+                (root.run_id, now_ms - DEFAULT_TERMINAL_VISIBILITY_MS),
+                (child.run_id, now_ms - DEFAULT_TERMINAL_VISIBILITY_MS),
+            ])),
+        };
+
+        assert_eq!(
+            default_visible_task_run_ids(&model, &operator, now_ms),
+            HashSet::from([root.run_id, child.run_id, grandchild.run_id])
+        );
     }
 
     #[test]

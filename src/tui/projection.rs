@@ -7,14 +7,12 @@ use std::path::Path;
 
 use crate::activity::{
     ActivityDurability, ActivityItem, DEFAULT_TERMINAL_VISIBILITY_MS,
-    HOOK_ONLY_STALE_VISIBILITY_MS, OperatorSnapshot, ghost_visibility_ms,
-    is_default_visible_task_run, runs_with_executions,
+    HOOK_ONLY_STALE_VISIBILITY_MS, OperatorSnapshot, ghost_visibility_ms, runs_with_executions,
 };
 use crate::diagnostics::{ControllerInputStatus, RuntimeDiagnosticsSnapshot};
 use crate::herdr::collector::ObservationQuality;
 use crate::model::{
-    AgentNode, DomainModel, ExecState, PaneAgentStatus, Provider, RunId, RunKey, TaskRun,
-    TaskState, TokenBreakdown, TurnAttr,
+    DomainModel, ExecState, Provider, RunId, RunKey, TaskRun, TaskState, TokenBreakdown, TurnAttr,
 };
 use crate::store::writer::PersistenceStatus;
 
@@ -23,267 +21,10 @@ use super::dag;
 use super::view::TreeRow;
 
 pub(crate) const DETAIL_ACTIVITY_LIMIT: usize = 100;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TaskDisplayStatus {
-    Queued,
-    Working,
-    Idle,
-    Blocked,
-    Done,
-    Error,
-    Cancelled,
-    Unknown,
-}
-
-impl TaskDisplayStatus {
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::Queued => "queued",
-            Self::Working => "working",
-            Self::Idle => "idle",
-            Self::Blocked => "blocked",
-            Self::Done => "done",
-            Self::Error => "error",
-            Self::Cancelled => "cancelled",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StatusSource {
-    TaskState,
-    PaneAgentStatus,
-    ExecutionState,
-    AgentNodeState,
-    Fallback,
-}
-
-impl StatusSource {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::TaskState => "task_state",
-            Self::PaneAgentStatus => "pane_agent_status",
-            Self::ExecutionState => "execution_state",
-            Self::AgentNodeState => "agent_node_state",
-            Self::Fallback => "fallback",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DisplayStatus {
-    pub(crate) status: TaskDisplayStatus,
-    pub(crate) source: StatusSource,
-    pub(crate) stalled: bool,
-}
-
-impl DisplayStatus {
-    pub(crate) const fn new(status: TaskDisplayStatus, source: StatusSource) -> Self {
-        Self {
-            status,
-            source,
-            stalled: false,
-        }
-    }
-
-    fn with_stalled(mut self, stalled: bool) -> Self {
-        if !matches!(
-            self.status,
-            TaskDisplayStatus::Done | TaskDisplayStatus::Error | TaskDisplayStatus::Cancelled
-        ) {
-            self.stalled |= stalled;
-        }
-        self
-    }
-
-    pub(crate) const fn glyph(self) -> &'static str {
-        if self.stalled {
-            return "⚠";
-        }
-        match self.status {
-            TaskDisplayStatus::Queued => "◌",
-            TaskDisplayStatus::Working | TaskDisplayStatus::Blocked => "●",
-            TaskDisplayStatus::Idle => "○",
-            TaskDisplayStatus::Done => "✓",
-            TaskDisplayStatus::Error => "✗",
-            TaskDisplayStatus::Cancelled => "⊘",
-            TaskDisplayStatus::Unknown => "?",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct AgentStatusEvidence {
-    state: Option<ExecState>,
-    last_activity_at_ms: Option<i64>,
-    agent_node_id: String,
-}
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct StatusReadModel {
-    pane_executions: HashMap<(RunId, String), ExecState>,
-    root_agents: HashMap<RunId, AgentStatusEvidence>,
-}
-
-impl StatusReadModel {
-    pub(crate) fn from_model(model: &DomainModel, now_ms: i64) -> Self {
-        let mut selected_executions = HashMap::<(RunId, String), (bool, String, ExecState)>::new();
-        for execution in model.executions() {
-            let key = (execution.task_run_id, execution.pane_id.clone());
-            let candidate = (
-                execution.state.is_terminal(),
-                execution.execution_id.clone(),
-                execution.state.clone(),
-            );
-            selected_executions
-                .entry(key)
-                .and_modify(|selected| {
-                    if (candidate.0, candidate.1.as_str()) < (selected.0, selected.1.as_str()) {
-                        selected.clone_from(&candidate);
-                    }
-                })
-                .or_insert(candidate);
-        }
-        let pane_executions = selected_executions
-            .into_iter()
-            .map(|(key, (_, _, state))| (key, state))
-            .collect();
-
-        let mut root_agents = HashMap::<RunId, AgentStatusEvidence>::new();
-        for agent in model.agent_nodes() {
-            if agent.parent_agent_node_id.is_some()
-                || agent.last_event_kind.as_deref()
-                    == Some(crate::provider::lane::LIVE_LINE_EVENT_KIND)
-                || agent_node_is_display_stale(agent, now_ms)
-                || model
-                    .task_run(&agent.task_run_id)
-                    .and_then(task_run_provider)
-                    .is_some_and(|provider| provider != agent.provider)
-            {
-                continue;
-            }
-            let candidate = AgentStatusEvidence {
-                state: agent.state.clone(),
-                last_activity_at_ms: agent.last_activity_at_ms,
-                agent_node_id: agent.agent_node_id.clone(),
-            };
-            root_agents
-                .entry(agent.task_run_id)
-                .and_modify(|selected| {
-                    if (
-                        selected.last_activity_at_ms,
-                        selected.agent_node_id.as_str(),
-                    ) < (
-                        candidate.last_activity_at_ms,
-                        candidate.agent_node_id.as_str(),
-                    ) {
-                        selected.clone_from(&candidate);
-                    }
-                })
-                .or_insert(candidate);
-        }
-
-        Self {
-            pane_executions,
-            root_agents,
-        }
-    }
-
-    pub(crate) fn task_display_status(
-        &self,
-        model: &DomainModel,
-        run: &TaskRun,
-        pane_id: Option<&str>,
-        inactive: bool,
-    ) -> DisplayStatus {
-        let semantic = match run.state {
-            TaskState::Completed => Some(TaskDisplayStatus::Done),
-            TaskState::Failed => Some(TaskDisplayStatus::Error),
-            TaskState::Cancelled => Some(TaskDisplayStatus::Cancelled),
-            TaskState::EndedUnknown => Some(TaskDisplayStatus::Unknown),
-            TaskState::Queued => Some(TaskDisplayStatus::Queued),
-            TaskState::Blocked => Some(TaskDisplayStatus::Blocked),
-            TaskState::Running => None,
-        };
-        if let Some(status) = semantic {
-            return DisplayStatus::new(status, StatusSource::TaskState).with_stalled(inactive);
-        }
-
-        if let Some(pane_id) = pane_id
-            && let Some(execution) = self.pane_executions.get(&(run.run_id, pane_id.to_owned()))
-        {
-            if !execution.is_terminal()
-                && let Some(status) = model.pane_agent_status(pane_id)
-            {
-                return pane_agent_display_status(status).with_stalled(inactive);
-            }
-            return execution_display_status(execution, false).with_stalled(inactive);
-        }
-
-        if let Some(evidence) = self.root_agents.get(&run.run_id)
-            && let Some(state) = evidence.state.as_ref()
-            && !matches!(state, ExecState::Unknown)
-        {
-            return execution_display_status(state, false)
-                .with_source(StatusSource::AgentNodeState)
-                .with_stalled(inactive);
-        }
-
-        DisplayStatus::new(TaskDisplayStatus::Working, StatusSource::TaskState)
-            .with_stalled(inactive)
-    }
-}
-
-impl DisplayStatus {
-    const fn with_source(mut self, source: StatusSource) -> Self {
-        self.source = source;
-        self
-    }
-}
-
-fn task_run_provider(run: &TaskRun) -> Option<Provider> {
-    match &run.key {
-        RunKey::Native { provider, .. } | RunKey::NativePath { provider, .. } => Some(*provider),
-        RunKey::Controller(_) | RunKey::Provisional { .. } => None,
-    }
-}
-
-fn pane_agent_display_status(status: PaneAgentStatus) -> DisplayStatus {
-    let status = match status {
-        PaneAgentStatus::Idle => TaskDisplayStatus::Idle,
-        PaneAgentStatus::Working => TaskDisplayStatus::Working,
-        PaneAgentStatus::Blocked => TaskDisplayStatus::Blocked,
-        PaneAgentStatus::Done => TaskDisplayStatus::Done,
-        PaneAgentStatus::Unknown => TaskDisplayStatus::Unknown,
-    };
-    DisplayStatus::new(status, StatusSource::PaneAgentStatus)
-}
-
-fn execution_display_status(state: &ExecState, ended_is_done: bool) -> DisplayStatus {
-    let (status, stalled) = match state {
-        ExecState::Unknown => (TaskDisplayStatus::Unknown, false),
-        ExecState::Idle => (TaskDisplayStatus::Idle, false),
-        ExecState::Working => (TaskDisplayStatus::Working, false),
-        ExecState::Blocked => (TaskDisplayStatus::Blocked, false),
-        ExecState::Stale { .. } => (TaskDisplayStatus::Unknown, true),
-        ExecState::Ended if ended_is_done => (TaskDisplayStatus::Done, false),
-        ExecState::Ended => (TaskDisplayStatus::Unknown, false),
-    };
-    DisplayStatus {
-        status,
-        source: StatusSource::ExecutionState,
-        stalled,
-    }
-}
-
-pub(crate) fn native_agent_display_status(agent: &AgentNode) -> DisplayStatus {
-    agent.state.as_ref().map_or_else(
-        || DisplayStatus::new(TaskDisplayStatus::Unknown, StatusSource::Fallback),
-        |state| execution_display_status(state, true).with_source(StatusSource::AgentNodeState),
-    )
-}
+pub(crate) use crate::status::{
+    DisplayStatus, StatusReadModel, StatusSource, TaskDisplayStatus, agent_node_is_display_stale,
+    native_agent_display_status,
+};
 
 /// Raw run-scoped inputs gathered during paint so elapsed values follow the paint clock.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -622,17 +363,6 @@ pub(crate) fn stalled_run_ids(
 /// crossed the inactivity interval; this also prevents a just-created node from disappearing
 /// before its first timestamped event. `ExecState::Stale` remains visible because it is a known
 /// state, while the display rule deliberately applies only when state is absent, unknown, or ended.
-pub(crate) fn agent_node_is_display_stale(agent: &AgentNode, now_ms: i64) -> bool {
-    matches!(
-        agent.state.as_ref(),
-        None | Some(ExecState::Unknown) | Some(ExecState::Ended)
-    ) && agent
-        .last_activity_at_ms
-        .is_some_and(|last_activity_at_ms| {
-            now_ms.saturating_sub(last_activity_at_ms) >= crate::activity::headless_inactivity_ms()
-        })
-}
-
 fn next_agent_visibility_expiry_ms(model: &DomainModel, now_ms: i64) -> Option<i64> {
     model
         .agent_nodes()
@@ -672,6 +402,9 @@ fn has_active_descendant(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+// Detail projection materializes one selected entity at a time; keeping the run fields together
+// avoids allocation-only indirection in this private, short-lived read model.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum DetailEntity {
     Session,
     Workspace {
@@ -691,6 +424,9 @@ pub(crate) enum DetailEntity {
         key: String,
         name: String,
         native_session_id: Option<String>,
+        native_lifecycle_end: Option<String>,
+        lifecycle_watermark: Option<String>,
+        history_ready: bool,
         state: TaskState,
         display_status: DisplayStatus,
         dispatch_parent: Option<String>,
@@ -746,10 +482,35 @@ pub(crate) struct RuntimeStrip {
     pub(crate) d4: u64,
 }
 
+#[cfg(test)]
 pub(crate) fn project_rows(
     model: &DomainModel,
     full_rows: &[TreeRow],
     operator: &OperatorSnapshot,
+    query: &str,
+    collapsed: &HashSet<NodeKey>,
+    mode: ViewMode,
+    now_ms: i64,
+) -> RowProjection {
+    let visible_runs = crate::activity::default_visible_task_run_ids(model, operator, now_ms);
+    project_rows_with_visible(
+        model,
+        full_rows,
+        operator,
+        &visible_runs,
+        query,
+        collapsed,
+        mode,
+        now_ms,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn project_rows_with_visible(
+    model: &DomainModel,
+    full_rows: &[TreeRow],
+    operator: &OperatorSnapshot,
+    visible_runs: &HashSet<RunId>,
     query: &str,
     collapsed: &HashSet<NodeKey>,
     mode: ViewMode,
@@ -797,14 +558,9 @@ pub(crate) fn project_rows(
     }
 
     let mut visible = Vec::with_capacity(full_rows.len());
-    let mut hidden_subtree_depth = None;
     let mut next_expiry_ms = agent_expiry_ms;
     let execution_run_ids = runs_with_executions(model);
     for row in full_rows {
-        if hidden_subtree_depth.is_some_and(|depth| row.depth > depth) {
-            continue;
-        }
-        hidden_subtree_depth = None;
         let Some(run_id) = row.key.run_id() else {
             visible.push(row.clone());
             continue;
@@ -812,15 +568,25 @@ pub(crate) fn project_rows(
         let Some(run) = model.task_run(&run_id) else {
             continue;
         };
-        if is_default_visible_task_run(run, operator, &execution_run_ids, now_ms) {
+        if visible_runs.contains(&run_id) {
             if !run.state.is_terminal()
                 && let RunKey::Provisional { start_ms, .. } = &run.key
             {
                 let last_observed_ms = run.updated_at_ms.or(run.created_at_ms).unwrap_or(*start_ms);
                 let expiry = last_observed_ms.saturating_add(ghost_visibility_ms());
                 next_expiry_ms = Some(next_expiry_ms.map_or(expiry, |current| current.min(expiry)));
-            } else if run.state.is_terminal()
-                && let Some(first_terminal_ms) = operator.terminal_times.get(&run_id).copied()
+            } else if let Some(first_terminal_ms) = model
+                .task_run_v6_state(&run_id)
+                .and_then(|state| state.native_session_end.as_ref())
+                .map(|end| end.at_ms)
+                .or_else(|| operator.terminal_times.get(&run_id).copied())
+                && crate::activity::is_default_visible_task_run_in_model(
+                    model,
+                    run,
+                    operator,
+                    &execution_run_ids,
+                    now_ms,
+                )
             {
                 let expiry = first_terminal_ms.saturating_add(DEFAULT_TERMINAL_VISIBILITY_MS);
                 next_expiry_ms = Some(next_expiry_ms.map_or(expiry, |current| current.min(expiry)));
@@ -833,8 +599,6 @@ pub(crate) fn project_rows(
                 next_expiry_ms = Some(next_expiry_ms.map_or(expiry, |current| current.min(expiry)));
             }
             visible.push(row.clone());
-        } else if mode == ViewMode::ExecutionTree {
-            hidden_subtree_depth = Some(row.depth);
         }
     }
 
@@ -1144,11 +908,25 @@ fn detail_entity(
                     .collect::<Vec<_>>();
                 evidence_paths.sort();
                 evidence_paths.dedup();
+                let v6 = model.task_run_v6_state(run_id).cloned().unwrap_or_default();
                 DetailEntity::Run {
                     run_id: *run_id,
                     key: detail_run_key(run_id, &run.key),
                     name: safe_run_name(run_id, &run.key),
                     native_session_id: bound_native_session_id(model, run_id, &run.key),
+                    native_lifecycle_end: v6
+                        .native_session_end
+                        .as_ref()
+                        .map(|end| format!("{:?}@{}", end.status, end.at_ms)),
+                    lifecycle_watermark: v6.lifecycle_watermark.as_ref().map(|watermark| {
+                        format!(
+                            "{}/{}/{}",
+                            watermark.source_at_ms,
+                            watermark.observed_at_ms,
+                            escape_controls(&watermark.source_order)
+                        )
+                    }),
+                    history_ready: v6.history_ready,
                     state: run.state,
                     display_status,
                     dispatch_parent,
@@ -1353,6 +1131,9 @@ fn entity_lines(entity: &DetailEntity) -> Vec<String> {
             key,
             name,
             native_session_id,
+            native_lifecycle_end,
+            lifecycle_watermark,
+            history_ready,
             state,
             display_status,
             dispatch_parent,
@@ -1380,6 +1161,15 @@ fn entity_lines(entity: &DetailEntity) -> Vec<String> {
                     "native_session_id: {}",
                     native_session_id.as_deref().unwrap_or("unknown")
                 ),
+                format!(
+                    "native_lifecycle_end: {}",
+                    native_lifecycle_end.as_deref().unwrap_or("none")
+                ),
+                format!(
+                    "lifecycle_watermark: {}",
+                    lifecycle_watermark.as_deref().unwrap_or("none")
+                ),
+                format!("history_ready: {history_ready}"),
                 format!("state: {}", task_state_name(*state)),
                 format!("effective_status: {}", display_status.status.label()),
                 format!("status_source: {}", display_status.source.label()),
@@ -1691,8 +1481,8 @@ mod tests {
     use crate::lockfile::StateRoot;
     use crate::model::{
         AgentNode, DependencyEdge, DisplayOrdinal, DomainModel, ExecState, Execution,
-        ExecutionEdge, Pane, PaneAgentStatus, Provider, RunId, RunKey, TaskRun, TaskState,
-        Workspace,
+        ExecutionEdge, NativeSessionEnd, NativeSessionEndStatus, Pane, PaneAgentStatus, Provider,
+        RunId, RunKey, TaskRun, TaskRunV6State, TaskState, Workspace,
     };
     use crate::provider::ProviderEvent;
     use crate::provider::claude_facts::extract_claude_line;
@@ -2366,6 +2156,38 @@ mod tests {
         assert_eq!(
             statuses.task_display_status(&model, &task_run, None, false),
             DisplayStatus::new(TaskDisplayStatus::Working, StatusSource::TaskState),
+        );
+    }
+
+    #[test]
+    fn native_lifecycle_end_precedes_runtime_activity_without_overwriting_semantics() {
+        let task_run = run("native-end", 1, TaskState::Running);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run.clone());
+        model.insert_execution(execution(
+            task_run.run_id,
+            "pane",
+            "execution",
+            ExecState::Working,
+        ));
+        model.set_task_run_v6_state(
+            task_run.run_id,
+            TaskRunV6State {
+                native_session_end: Some(NativeSessionEnd {
+                    status: NativeSessionEndStatus::Done,
+                    at_ms: 100,
+                }),
+                ..TaskRunV6State::default()
+            },
+        );
+        let statuses = StatusReadModel::from_model(&model, 200);
+
+        let status = statuses.task_display_status(&model, &task_run, Some("pane"), false);
+        assert_eq!(status.status, TaskDisplayStatus::Done);
+        assert_eq!(status.source.label(), "native_session_lifecycle");
+        assert_eq!(
+            model.task_run(&task_run.run_id).unwrap().state,
+            TaskState::Running
         );
     }
 

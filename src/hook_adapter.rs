@@ -97,7 +97,7 @@ pub fn map_hook_payload(
             "started",
         )],
         "SessionEnd" => vec![make_envelope(
-            "dismiss",
+            "session_ended",
             session_run_id,
             None,
             None,
@@ -491,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn session_end_maps_to_one_dismiss_envelope_for_both_providers() {
+    fn session_end_maps_to_one_resumable_lifecycle_envelope_for_both_providers() {
         for (provider, selector, wire_provider) in [
             (HookProvider::ClaudeCode, "claude-code", "claude"),
             (HookProvider::Codex, "codex", "codex"),
@@ -499,7 +499,7 @@ mod tests {
             let actual = map_hook_payload(provider, &payload("SessionEnd"), EMITTED_AT_MS, NONCE);
 
             assert_eq!(actual.len(), 1);
-            assert_eq!(actual[0].event_type, "dismiss");
+            assert_eq!(actual[0].event_type, "session_ended");
             assert_eq!(
                 actual[0].task_run_id,
                 format!("hook:{selector}:session-123")
