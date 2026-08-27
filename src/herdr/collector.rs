@@ -753,7 +753,6 @@ impl RuntimePersistence {
             enrichment_diagnostics,
             provider_diagnostics,
             recovery,
-            session: _,
             ..
         } = self;
         let permit = writer.reserve_enqueue();
