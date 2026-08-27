@@ -214,7 +214,9 @@ impl StatusReadModel {
         if let Some(pane_id) = pane_id
             && let Some(execution) = self.pane_executions.get(&(run.run_id, pane_id.to_owned()))
         {
-            if let Some(status) = model.pane_agent_status(pane_id) {
+            if !execution.is_terminal()
+                && let Some(status) = model.pane_agent_status(pane_id)
+            {
                 return pane_agent_display_status(status).with_stalled(inactive);
             }
             return execution_display_status(execution, false).with_stalled(inactive);
@@ -753,9 +755,7 @@ pub(crate) fn project_rows(
     mode: ViewMode,
     now_ms: i64,
 ) -> RowProjection {
-    let agent_expiry_ms = (mode == ViewMode::ExecutionTree)
-        .then(|| next_agent_visibility_expiry_ms(model, now_ms))
-        .flatten();
+    let agent_expiry_ms = next_agent_visibility_expiry_ms(model, now_ms);
     if !query.is_empty() {
         let direct = full_rows
             .iter()
@@ -2452,6 +2452,36 @@ mod tests {
         assert_eq!(
             statuses.task_display_status(&model, &task_run, Some("ended-pane"), false),
             DisplayStatus::new(TaskDisplayStatus::Unknown, StatusSource::ExecutionState),
+        );
+    }
+
+    #[test]
+    fn pane_status_does_not_leak_across_sequential_same_pane_executions() {
+        let old_run = run("old", 1, TaskState::Running);
+        let new_run = run("new", 2, TaskState::Running);
+        let mut model = DomainModel::default();
+        model.insert_execution(execution(
+            old_run.run_id,
+            "pane",
+            "old-execution",
+            ExecState::Ended,
+        ));
+        model.insert_execution(execution(
+            new_run.run_id,
+            "pane",
+            "new-execution",
+            ExecState::Working,
+        ));
+        model.set_pane_agent_status("pane".to_owned(), PaneAgentStatus::Working);
+        let statuses = StatusReadModel::from_model(&model, 0);
+
+        assert_eq!(
+            statuses.task_display_status(&model, &old_run, Some("pane"), false),
+            DisplayStatus::new(TaskDisplayStatus::Unknown, StatusSource::ExecutionState),
+        );
+        assert_eq!(
+            statuses.task_display_status(&model, &new_run, Some("pane"), false),
+            DisplayStatus::new(TaskDisplayStatus::Working, StatusSource::PaneAgentStatus),
         );
     }
 
