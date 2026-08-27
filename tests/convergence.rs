@@ -14,10 +14,10 @@ use herdr_top::herdr::collector::{self, CollectorHandle, ObservationQuality};
 use herdr_top::identity::MergeConflict;
 use herdr_top::lockfile::{StateRoot, state_root_in};
 use herdr_top::model::{
-    AgentSessionReference, AgentSessionReferenceKind, DisplayOrdinal, DomainModel, EventMetadata,
-    ExecState, Execution, GapKind, NormalizedEvent, Pane, PaneSnapshot, Provider, ReconcileBatch,
-    RunId, RunKey, SnapshotAgent, Tab, TaskRun, TaskState, TopologyAuthority, TopologySnapshot,
-    Workspace,
+    AgentSessionReference, AgentSessionReferenceKind, ControllerEventKind, DependencyEdge,
+    DisplayOrdinal, DomainModel, EventMetadata, ExecState, Execution, ExecutionEdge, GapKind,
+    NormalizedEvent, Pane, PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SnapshotAgent,
+    Tab, TaskRun, TaskState, TopologyAuthority, TopologySnapshot, Workspace,
 };
 use herdr_top::reducer::{ApplyOutcome, Reducer};
 use herdr_top::session_key;
@@ -2702,6 +2702,233 @@ fn binding_conflict_returns_typed_dropped_result() {
             .expect("the next run should be created")
             .display_ordinal,
         DisplayOrdinal::new(2)
+    );
+}
+
+#[test]
+fn hook_metadata_and_later_log_start_converge_one_run() {
+    const ROLLOUT: &str = "77777777-7777-4777-8777-777777777777";
+    let parent_run_id = RunId::new();
+    let prerequisite_run_id = RunId::new();
+    let child_run_id = RunId::new();
+    let mut model = DomainModel::default();
+    for (run_id, key, ordinal) in [
+        (parent_run_id, "mixed-parent", 1),
+        (prerequisite_run_id, "mixed-prerequisite", 2),
+    ] {
+        model.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::Controller(key.to_owned()),
+            display_ordinal: DisplayOrdinal::new(ordinal),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+            created_at_ms: Some(1),
+            updated_at_ms: Some(1),
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+    }
+    let (mut reducer, shared) = Reducer::new(RestoredState {
+        model,
+        next_ordinal: 3,
+        next_ingest_seq: Some(1),
+        event_ledger: Vec::new(),
+    });
+
+    let mut hook_started = identity_metadata("mixed-hook-started", "task_started");
+    hook_started.timestamp_ms = 10;
+    hook_started.receipt_time_ms = 10;
+    hook_started.source = "hook:codex".to_owned();
+    hook_started.provider = Some(Provider::Codex);
+    hook_started.native_session_id = Some(ROLLOUT.to_owned());
+    hook_started.task_run_id = Some(child_run_id);
+    hook_started.task_state = Some(TaskState::Running);
+    hook_started.label = Some("preserved hook subject".to_owned());
+    assert!(matches!(
+        reducer
+            .apply(NormalizedEvent::ControllerEvent {
+                metadata: hook_started,
+                event: ControllerEventKind::TaskStarted,
+            })
+            .unwrap(),
+        ApplyOutcome::Applied(_)
+    ));
+
+    let execution_edge = ExecutionEdge {
+        parent_run_id,
+        child_run_id,
+    };
+    let mut dispatch = identity_metadata("mixed-controller-dispatch", "dispatch");
+    dispatch.timestamp_ms = 11;
+    dispatch.receipt_time_ms = 11;
+    dispatch.source = "controller".to_owned();
+    dispatch.task_run_id = Some(child_run_id);
+    dispatch.execution_parent = Some(execution_edge.clone());
+    assert!(matches!(
+        reducer
+            .apply(NormalizedEvent::ControllerEvent {
+                metadata: dispatch,
+                event: ControllerEventKind::Dispatch {
+                    parent_task_run_id: "mixed-parent".to_owned(),
+                },
+            })
+            .unwrap(),
+        ApplyOutcome::Applied(_)
+    ));
+
+    let dependency_edge = DependencyEdge {
+        prerequisite_run_id,
+        dependent_run_id: child_run_id,
+    };
+    let mut depends = identity_metadata("mixed-controller-dependency", "depends_on");
+    depends.timestamp_ms = 12;
+    depends.receipt_time_ms = 12;
+    depends.source = "controller".to_owned();
+    depends.task_run_id = Some(child_run_id);
+    depends.dependency = Some(dependency_edge.clone());
+    assert!(matches!(
+        reducer
+            .apply(NormalizedEvent::ControllerEvent {
+                metadata: depends,
+                event: ControllerEventKind::DependsOn {
+                    depends_on_id: "mixed-prerequisite".to_owned(),
+                },
+            })
+            .unwrap(),
+        ApplyOutcome::Applied(_)
+    ));
+
+    let mut execution_metadata = identity_metadata("mixed-execution", "pane_agent_detected");
+    execution_metadata.timestamp_ms = 13;
+    execution_metadata.receipt_time_ms = 13;
+    execution_metadata.provider = Some(Provider::Codex);
+    execution_metadata.native_session_id = Some(ROLLOUT.to_owned());
+    execution_metadata.task_run_id = Some(child_run_id);
+    let execution = Execution {
+        execution_id: "mixed-preserved-execution".to_owned(),
+        pane_id: "w1:p1".to_owned(),
+        terminal_id: "terminal-1".to_owned(),
+        task_run_id: child_run_id,
+        state: ExecState::Working,
+    };
+    assert!(matches!(
+        reducer
+            .apply(NormalizedEvent::ExecutionBegin {
+                metadata: execution_metadata,
+                execution: execution.clone(),
+            })
+            .unwrap(),
+        ApplyOutcome::Applied(_)
+    ));
+
+    let mut cancelled = identity_metadata("mixed-log-cancelled", "cancelled");
+    cancelled.timestamp_ms = 30;
+    cancelled.receipt_time_ms = 300;
+    cancelled.source = herdr_top::provider::lane::SOURCE_LOG_LANE.to_owned();
+    cancelled.provider = Some(Provider::Codex);
+    cancelled.native_session_id = Some(ROLLOUT.to_owned());
+    cancelled.task_run_id = Some(child_run_id);
+    cancelled.task_state = Some(TaskState::Cancelled);
+    assert!(matches!(
+        reducer
+            .apply(NormalizedEvent::ControllerEvent {
+                metadata: cancelled,
+                event: ControllerEventKind::Cancelled,
+            })
+            .unwrap(),
+        ApplyOutcome::Applied(_)
+    ));
+    {
+        let snapshot = shared.borrow();
+        let run = snapshot.task_run(&child_run_id).unwrap();
+        assert_eq!(run.state, TaskState::Cancelled);
+        assert_eq!(run.finished_at_ms, Some(30));
+    }
+
+    let before_valid_start = {
+        let snapshot = shared.borrow();
+        (
+            snapshot.task_runs().count(),
+            snapshot.executions().count(),
+            snapshot.controller_diagnostics().binding_conflicts(),
+            snapshot
+                .controller_diagnostics()
+                .terminal_blocked_progress_noops(),
+            snapshot
+                .controller_diagnostics()
+                .terminal_forward_reference_creations(),
+            snapshot
+                .controller_diagnostics()
+                .unknown_lane_terminal_drops(),
+            snapshot.provider_diagnostics().duplicate_events(),
+        )
+    };
+    let mut later_start = identity_metadata("mixed-log-later-start", "task_started");
+    later_start.timestamp_ms = 40;
+    later_start.receipt_time_ms = 400;
+    later_start.source = herdr_top::provider::lane::SOURCE_LOG_LANE.to_owned();
+    later_start.provider = Some(Provider::Codex);
+    later_start.native_session_id = Some(ROLLOUT.to_owned());
+    later_start.task_run_id = Some(child_run_id);
+    later_start.task_state = Some(TaskState::Running);
+    assert!(matches!(
+        reducer
+            .apply(NormalizedEvent::ControllerEvent {
+                metadata: later_start,
+                event: ControllerEventKind::TaskStarted,
+            })
+            .unwrap(),
+        ApplyOutcome::Applied(_)
+    ));
+
+    let snapshot = shared.borrow();
+    let run = snapshot.task_run(&child_run_id).unwrap();
+    assert_eq!(run.state, TaskState::Running);
+    assert_eq!(run.finished_at_ms, None);
+    assert_eq!(run.subject.as_deref(), Some("preserved hook subject"));
+    assert_eq!(
+        snapshot
+            .task_run_by_key(&RunKey::Native {
+                provider: Provider::Codex,
+                sid: ROLLOUT.to_owned(),
+            })
+            .unwrap()
+            .run_id,
+        child_run_id
+    );
+    assert_eq!(
+        snapshot.execution("mixed-preserved-execution"),
+        Some(&execution)
+    );
+    assert!(
+        snapshot
+            .execution_edges()
+            .any(|edge| edge == &execution_edge)
+    );
+    assert!(
+        snapshot
+            .dependency_edges()
+            .any(|edge| edge == &dependency_edge)
+    );
+    assert_eq!(
+        (
+            snapshot.task_runs().count(),
+            snapshot.executions().count(),
+            snapshot.controller_diagnostics().binding_conflicts(),
+            snapshot
+                .controller_diagnostics()
+                .terminal_blocked_progress_noops(),
+            snapshot
+                .controller_diagnostics()
+                .terminal_forward_reference_creations(),
+            snapshot
+                .controller_diagnostics()
+                .unknown_lane_terminal_drops(),
+            snapshot.provider_diagnostics().duplicate_events(),
+        ),
+        before_valid_start,
+        "valid mixed-source reopen must not add a run, execution, or conflict/duplicate diagnostic"
     );
 }
 

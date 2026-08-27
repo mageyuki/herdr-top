@@ -7846,8 +7846,8 @@ mod tests {
     use crate::activity::OperatorSnapshot;
     use crate::diagnostics::{OccurrenceLogStatus, RuntimeWriteOutcome};
     use crate::model::{
-        AgentNode, DependencyEdge, DisplayOrdinal, ExecutionEdge, OperatorCommand, TaskRun,
-        TaskState, Workspace,
+        AgentNode, ControllerEventKind, DependencyEdge, DisplayOrdinal, ExecutionEdge,
+        OperatorCommand, TaskRun, TaskState, Workspace,
     };
     use crate::performance::{
         PerformanceDegradationReason, PerformanceSampler, PerformanceSnapshot,
@@ -16932,6 +16932,570 @@ mod tests {
             contents.contains("herdr wire I/O failed:"),
             "subscribe WireError display was not logged: {contents}"
         );
+    }
+
+    const TASK4_ROLLOUT: &str = "88888888-8888-4888-8888-888888888888";
+    const TASK4_EXECUTION_ID: &str = "task4-preserved-execution";
+
+    #[derive(Clone, Copy)]
+    struct Task4Times {
+        session_at_ms: i64,
+        started_at_ms: i64,
+        cancelled_at_ms: i64,
+        later_start_at_ms: i64,
+        complete_at_ms: i64,
+    }
+
+    fn task4_times() -> Task4Times {
+        let session_at_ms = unix_now_ms().div_euclid(1_000) * 1_000 - 10_000;
+        Task4Times {
+            session_at_ms,
+            started_at_ms: session_at_ms + 2_000,
+            cancelled_at_ms: session_at_ms + 4_000,
+            later_start_at_ms: session_at_ms + 5_000,
+            complete_at_ms: session_at_ms + 6_000,
+        }
+    }
+
+    fn task4_rfc3339(at_ms: i64) -> String {
+        assert_eq!(at_ms.rem_euclid(1_000), 0);
+        let seconds = at_ms.div_euclid(1_000);
+        let days = seconds.div_euclid(86_400);
+        let seconds_of_day = seconds.rem_euclid(86_400);
+        let shifted_days = days + 719_468;
+        let era = if shifted_days >= 0 {
+            shifted_days
+        } else {
+            shifted_days - 146_096
+        }
+        .div_euclid(146_097);
+        let day_of_era = shifted_days - era * 146_097;
+        let year_of_era =
+            (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+        let mut year = year_of_era + era * 400;
+        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        let shifted_month = (5 * day_of_year + 2) / 153;
+        let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+        let month = shifted_month + if shifted_month < 10 { 3 } else { -9 };
+        year += i64::from(month <= 2);
+        let hour = seconds_of_day / 3_600;
+        let minute = seconds_of_day % 3_600 / 60;
+        let second = seconds_of_day % 60;
+        let rendered = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z");
+        assert_eq!(
+            crate::provider::claude_facts::parse_timestamp_ms(&rendered),
+            Some(at_ms)
+        );
+        rendered
+    }
+
+    fn task4_runtime(writer: WriterClient) -> RuntimePersistence {
+        RuntimePersistence::new_for_test(writer, Arc::new(RecordingOccurrenceSink::default())).0
+    }
+
+    async fn task4_apply_provider_events(
+        events: impl IntoIterator<Item = ProviderEvent>,
+        reducer: &mut Reducer,
+        shared: &SharedModel,
+        persistence: &mut RuntimePersistence,
+    ) {
+        let coverage = SourceCoverageRegistry::new(SourceAvailability::Available);
+        for event in events {
+            apply_provider_event(event, "task4", reducer, shared, persistence, &coverage)
+                .await
+                .unwrap();
+        }
+    }
+
+    fn task4_worker(root: &Path) -> AdapterProviderWorker {
+        AdapterProviderWorker::new_with_log_lane_config(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root.to_path_buf(),
+            }],
+            crate::provider::ProviderDiagnostics::default(),
+            LogLaneConfig {
+                complete_grace_ms: 0,
+                headless_inactivity_ms: i64::MAX / 2,
+                ..LogLaneConfig::default()
+            },
+            None,
+        )
+    }
+
+    fn task4_process_worker(
+        worker: &mut AdapterProviderWorker,
+        targets: &TargetSet,
+        pending: &mut PendingEvents,
+    ) {
+        let mut watch_requests = Vec::new();
+        let mut cycle = crate::provider::test_provider_cycle(targets, pending, &mut watch_requests);
+        worker.process(&mut cycle).unwrap();
+    }
+
+    fn task4_drain_pending(pending: &mut PendingEvents) -> Vec<ProviderEvent> {
+        let (sender, mut receiver) = mpsc::channel(64);
+        pending.flush_to(&sender);
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn task4_initial_log(times: Task4Times) -> String {
+        [
+            serde_json::json!({
+                "timestamp": task4_rfc3339(times.session_at_ms),
+                "type": "session_meta",
+                "payload": {
+                    "id": TASK4_ROLLOUT,
+                    "session_id": TASK4_ROLLOUT,
+                    "cwd": "/repo",
+                    "originator": "codex_cli_rs",
+                    "cli_version": "0.149.0"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": task4_rfc3339(times.started_at_ms),
+                "type": "event_msg",
+                "payload": {"type": "task_started"}
+            }),
+            serde_json::json!({
+                "timestamp": task4_rfc3339(times.cancelled_at_ms),
+                "type": "event_msg",
+                "payload": {"type": "turn_aborted"}
+            }),
+        ]
+        .into_iter()
+        .map(|record| format!("{record}\n"))
+        .collect()
+    }
+
+    fn task4_append_record(artifact: &Path, timestamp: &str, payload: &str) {
+        use std::io::Write as _;
+
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(artifact)
+                .unwrap(),
+            "{{\"timestamp\":\"{timestamp}\",\"type\":\"event_msg\",\"payload\":{payload}}}"
+        )
+        .unwrap();
+    }
+
+    struct Task4PersistedCancelled {
+        _directory: tempfile::TempDir,
+        provider_root: PathBuf,
+        artifact: PathBuf,
+        targets: TargetSet,
+        state_root: crate::lockfile::StateRoot,
+        run_id: RunId,
+        display_ordinal: DisplayOrdinal,
+        times: Task4Times,
+        terminal_sources: HashMap<RunId, String>,
+        restored: RestoredState,
+    }
+
+    async fn task4_persist_cancelled_backfill() -> Task4PersistedCancelled {
+        let times = task4_times();
+        let directory = tempfile::tempdir().unwrap();
+        let provider_root = directory.path().join("home/.codex/sessions");
+        std::fs::create_dir_all(&provider_root).unwrap();
+        let artifact =
+            provider_root.join(format!("rollout-2026-08-27T00-00-00-{TASK4_ROLLOUT}.jsonl"));
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path: artifact.clone(),
+        }]);
+        let mut worker = task4_worker(&provider_root);
+        let mut pending = PendingEvents::new(crate::provider::ProviderDiagnostics::default());
+        task4_process_worker(&mut worker, &TargetSet::default(), &mut pending);
+        let _ = task4_drain_pending(&mut pending);
+        std::fs::write(&artifact, task4_initial_log(times)).unwrap();
+        task4_process_worker(&mut worker, &targets, &mut pending);
+
+        let state_root = crate::lockfile::StateRoot(directory.path().join("state"));
+        std::fs::create_dir_all(&state_root.0).unwrap();
+        let store = open_writer(&state_root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut persistence = task4_runtime(writer);
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let mut installed_execution = false;
+        for event in task4_drain_pending(&mut pending) {
+            let is_start = matches!(
+                &event,
+                ProviderEvent::Synthesized(controller)
+                    if matches!(controller.event, ControllerEventKind::TaskStarted)
+            );
+            task4_apply_provider_events(
+                std::iter::once(event),
+                &mut reducer,
+                &shared,
+                &mut persistence,
+            )
+            .await;
+            if is_start && !installed_execution {
+                let run_id = shared
+                    .borrow()
+                    .task_run_by_key(&RunKey::Native {
+                        provider: Provider::Codex,
+                        sid: TASK4_ROLLOUT.to_owned(),
+                    })
+                    .expect("provider start must create the native run")
+                    .run_id;
+                let mut execution_metadata = metadata("task4", "pane_agent_detected");
+                execution_metadata.timestamp_ms = 1;
+                execution_metadata.receipt_time_ms = 1;
+                execution_metadata.task_run_id = Some(run_id);
+                execution_metadata.provider = Some(Provider::Codex);
+                execution_metadata.native_session_id = Some(TASK4_ROLLOUT.to_owned());
+                let persist = apply_collector_event(
+                    &mut reducer,
+                    NormalizedEvent::ExecutionBegin {
+                        metadata: execution_metadata,
+                        execution: Execution {
+                            execution_id: TASK4_EXECUTION_ID.to_owned(),
+                            pane_id: "task4-pane".to_owned(),
+                            terminal_id: "task4-terminal".to_owned(),
+                            task_run_id: run_id,
+                            state: ExecState::Working,
+                        },
+                    },
+                )
+                .unwrap()
+                .expect("execution insertion must produce a persistence batch");
+                let _ = persist_submission(&mut persistence, &mut reducer, persist)
+                    .await
+                    .unwrap();
+                installed_execution = true;
+            }
+        }
+        let native_key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: TASK4_ROLLOUT.to_owned(),
+        };
+        let (run_id, display_ordinal) = {
+            let snapshot = shared.borrow();
+            let run = snapshot
+                .task_run_by_key(&native_key)
+                .expect("initial backfill must retain the native run");
+            assert_eq!(run.state, TaskState::Cancelled);
+            assert_eq!(run.finished_at_ms, Some(times.cancelled_at_ms));
+            assert_eq!(snapshot.task_runs().count(), 1);
+            assert_eq!(snapshot.executions().count(), 1);
+            assert_eq!(
+                snapshot.execution(TASK4_EXECUTION_ID).unwrap().task_run_id,
+                run.run_id
+            );
+            (run.run_id, run.display_ordinal)
+        };
+        drop(persistence);
+        lifecycle.shutdown().await.unwrap();
+
+        let reader = open_reader(&state_root).unwrap();
+        let terminal_sources = reader.terminal_event_sources().unwrap();
+        assert_eq!(
+            terminal_sources.get(&run_id).map(String::as_str),
+            Some(crate::provider::lane::SOURCE_LOG_LANE),
+            "restart fixture must restore lane-authored terminal provenance"
+        );
+        let restored = reader.load_restored_state().unwrap();
+        assert_eq!(
+            restored.model.task_run(&run_id).unwrap().state,
+            TaskState::Cancelled
+        );
+        assert_eq!(restored.model.executions().count(), 1);
+        Task4PersistedCancelled {
+            _directory: directory,
+            provider_root,
+            artifact,
+            targets,
+            state_root,
+            run_id,
+            display_ordinal,
+            times,
+            terminal_sources,
+            restored,
+        }
+    }
+
+    fn task4_replay_backfill(fixture: &Task4PersistedCancelled) -> Vec<ProviderEvent> {
+        let mut worker = task4_worker(&fixture.provider_root);
+        let mut pending = PendingEvents::new(crate::provider::ProviderDiagnostics::default());
+        task4_process_worker(&mut worker, &fixture.targets, &mut pending);
+        task4_drain_pending(&mut pending)
+    }
+
+    #[tokio::test]
+    async fn codex_live_abort_then_later_start_reuses_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = crate::lockfile::StateRoot(directory.path().join("state"));
+        std::fs::create_dir_all(&state_root.0).unwrap();
+        let store = open_writer(&state_root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut persistence = task4_runtime(writer);
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let mut synthesis = crate::provider::lane::Synthesis::default();
+        let mut admission = crate::provider::lane::Admission::new(0);
+        let discovered = crate::provider::lane::AdmissionIndex::new();
+        let artifact = Path::new("task4-live-rollout.jsonl");
+        let first_turn = synthesis.synthesize_batch(
+            artifact,
+            [
+                (
+                    1,
+                    crate::provider::facts::LogFact::CodexTurnStarted {
+                        rollout_id: TASK4_ROLLOUT.to_owned(),
+                        at_ms: 10,
+                    },
+                ),
+                (
+                    2,
+                    crate::provider::facts::LogFact::CodexTurnAborted {
+                        rollout_id: TASK4_ROLLOUT.to_owned(),
+                        at_ms: 20,
+                    },
+                ),
+            ],
+            &mut admission,
+            &discovered,
+        );
+        task4_apply_provider_events(first_turn, &mut reducer, &shared, &mut persistence).await;
+        let native_key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: TASK4_ROLLOUT.to_owned(),
+        };
+        let (run_id, display_ordinal) = {
+            let snapshot = shared.borrow();
+            let run = snapshot.task_run_by_key(&native_key).unwrap();
+            assert_eq!(run.state, TaskState::Cancelled);
+            assert_eq!(run.finished_at_ms, Some(20));
+            (run.run_id, run.display_ordinal)
+        };
+
+        let later_turn = synthesis.synthesize_batch(
+            artifact,
+            [(
+                3,
+                crate::provider::facts::LogFact::CodexTurnStarted {
+                    rollout_id: TASK4_ROLLOUT.to_owned(),
+                    at_ms: 30,
+                },
+            )],
+            &mut admission,
+            &discovered,
+        );
+        task4_apply_provider_events(later_turn, &mut reducer, &shared, &mut persistence).await;
+        {
+            let snapshot = shared.borrow();
+            let run = snapshot.task_run(&run_id).unwrap();
+            assert_eq!(run.state, TaskState::Running);
+            assert_eq!(run.finished_at_ms, None);
+            assert_eq!(run.display_ordinal, display_ordinal);
+            assert_eq!(
+                snapshot.task_run_by_key(&native_key).unwrap().run_id,
+                run_id
+            );
+            assert_eq!(snapshot.task_runs().count(), 1);
+        }
+
+        let terminal = synthesis.synthesize_batch(
+            artifact,
+            [(
+                4,
+                crate::provider::facts::LogFact::CodexTurnAborted {
+                    rollout_id: TASK4_ROLLOUT.to_owned(),
+                    at_ms: 40,
+                },
+            )],
+            &mut admission,
+            &discovered,
+        );
+        task4_apply_provider_events(terminal, &mut reducer, &shared, &mut persistence).await;
+        let snapshot = shared.borrow();
+        let run = snapshot.task_run(&run_id).unwrap();
+        assert_eq!(run.state, TaskState::Cancelled);
+        assert_eq!(run.finished_at_ms, Some(40));
+        assert_eq!(snapshot.task_runs().count(), 1);
+        drop(snapshot);
+        drop(persistence);
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_backfill_reopens_cancelled_run_without_duplication() {
+        let fixture = task4_persist_cancelled_backfill().await;
+        let initial_ledger_len = fixture.restored.event_ledger.len();
+        task4_append_record(
+            &fixture.artifact,
+            &task4_rfc3339(fixture.times.later_start_at_ms),
+            r#"{"type":"task_started"}"#,
+        );
+        task4_append_record(
+            &fixture.artifact,
+            &task4_rfc3339(fixture.times.complete_at_ms),
+            r#"{"type":"task_complete","turn_id":"turn-2"}"#,
+        );
+        let replay = task4_replay_backfill(&fixture);
+        assert!(replay.iter().any(|event| matches!(
+            event,
+            ProviderEvent::Synthesized(controller)
+                if matches!(controller.event, ControllerEventKind::TaskStarted)
+                    && controller.metadata.timestamp_ms == fixture.times.later_start_at_ms
+        )));
+        let store = open_writer(&fixture.state_root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut persistence = task4_runtime(writer);
+        let (mut reducer, shared) = Reducer::new(fixture.restored);
+        reducer.restore_terminal_event_sources(fixture.terminal_sources);
+        let mut observed_reopen = false;
+        for event in replay {
+            let is_new_start = matches!(
+                &event,
+                ProviderEvent::Synthesized(controller)
+                    if matches!(controller.event, ControllerEventKind::TaskStarted)
+                        && controller.metadata.timestamp_ms == fixture.times.later_start_at_ms
+            );
+            task4_apply_provider_events(
+                std::iter::once(event),
+                &mut reducer,
+                &shared,
+                &mut persistence,
+            )
+            .await;
+            if is_new_start {
+                let snapshot = shared.borrow();
+                let run = snapshot.task_run(&fixture.run_id).unwrap();
+                assert_eq!(run.state, TaskState::Running);
+                assert_eq!(run.finished_at_ms, None);
+                assert_eq!(run.dismissed_at_ms, None);
+                assert_eq!(run.display_ordinal, fixture.display_ordinal);
+                assert_eq!(snapshot.task_runs().count(), 1);
+                assert_eq!(snapshot.executions().count(), 1);
+                assert_eq!(
+                    snapshot.execution(TASK4_EXECUTION_ID).unwrap().task_run_id,
+                    fixture.run_id
+                );
+                observed_reopen = true;
+            }
+        }
+        assert!(
+            observed_reopen,
+            "restart replay never reached the later start"
+        );
+        {
+            let snapshot = shared.borrow();
+            let run = snapshot.task_run(&fixture.run_id).unwrap();
+            assert_eq!(run.state, TaskState::Completed);
+            assert_eq!(run.finished_at_ms, Some(fixture.times.complete_at_ms));
+            assert_eq!(snapshot.task_runs().count(), 1);
+            assert_eq!(snapshot.executions().count(), 1);
+        }
+        drop(persistence);
+        lifecycle.shutdown().await.unwrap();
+
+        let reader = open_reader(&fixture.state_root).unwrap();
+        let restored = reader.load_restored_state().unwrap();
+        assert_eq!(restored.event_ledger.len(), initial_ledger_len + 2);
+        assert_eq!(restored.model.task_runs().count(), 1);
+        assert_eq!(restored.model.executions().count(), 1);
+        assert_eq!(
+            restored
+                .model
+                .execution(TASK4_EXECUTION_ID)
+                .unwrap()
+                .task_run_id,
+            fixture.run_id
+        );
+        assert_eq!(
+            reader
+                .terminal_event_sources()
+                .unwrap()
+                .get(&fixture.run_id)
+                .map(String::as_str),
+            Some(crate::provider::lane::SOURCE_LOG_LANE)
+        );
+        let connection =
+            rusqlite::Connection::open(crate::store::database_path(&fixture.state_root)).unwrap();
+        let (event_count, distinct_event_count): (i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT event_id) FROM events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(event_count, distinct_event_count);
+    }
+
+    #[tokio::test]
+    async fn restart_backfill_rejects_start_not_newer_than_cancel() {
+        let fixture = task4_persist_cancelled_backfill().await;
+        let initial_ledger_len = fixture.restored.event_ledger.len();
+        task4_append_record(
+            &fixture.artifact,
+            &task4_rfc3339(fixture.times.cancelled_at_ms),
+            r#"{"type":"task_started"}"#,
+        );
+        let replay = task4_replay_backfill(&fixture);
+        let store = open_writer(&fixture.state_root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut persistence = task4_runtime(writer);
+        let (mut reducer, shared) = Reducer::new(fixture.restored);
+        reducer.restore_terminal_event_sources(fixture.terminal_sources);
+        task4_apply_provider_events(replay, &mut reducer, &shared, &mut persistence).await;
+        {
+            let snapshot = shared.borrow();
+            let run = snapshot.task_run(&fixture.run_id).unwrap();
+            assert_eq!(run.state, TaskState::Cancelled);
+            assert_eq!(run.finished_at_ms, Some(fixture.times.cancelled_at_ms));
+            assert_eq!(run.display_ordinal, fixture.display_ordinal);
+            assert_eq!(snapshot.task_runs().count(), 1);
+            assert_eq!(snapshot.executions().count(), 1);
+        }
+        drop(persistence);
+        lifecycle.shutdown().await.unwrap();
+        let restored = open_reader(&fixture.state_root)
+            .unwrap()
+            .load_restored_state()
+            .unwrap();
+        assert_eq!(restored.event_ledger.len(), initial_ledger_len);
+        assert_eq!(
+            restored.model.task_run(&fixture.run_id).unwrap().state,
+            TaskState::Cancelled
+        );
+
+        let positive = task4_persist_cancelled_backfill().await;
+        task4_append_record(
+            &positive.artifact,
+            &task4_rfc3339(positive.times.later_start_at_ms),
+            r#"{"type":"task_started"}"#,
+        );
+        let replay = task4_replay_backfill(&positive);
+        let store = open_writer(&positive.state_root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut persistence = task4_runtime(writer);
+        let (mut reducer, shared) = Reducer::new(positive.restored);
+        reducer.restore_terminal_event_sources(positive.terminal_sources);
+        task4_apply_provider_events(replay, &mut reducer, &shared, &mut persistence).await;
+        assert_eq!(
+            shared.borrow().task_run(&positive.run_id).unwrap().state,
+            TaskState::Running,
+            "strict rejection must not exclude a genuinely later restart fact"
+        );
+        drop(persistence);
+        lifecycle.shutdown().await.unwrap();
     }
 }
 

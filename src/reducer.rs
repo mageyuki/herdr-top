@@ -1539,15 +1539,15 @@ impl Reducer {
     ) -> bool {
         // A strictly newer source fact is the only way to distinguish a genuine resume from
         // replayed history after a lane-authored terminal.
-        let start_follows_completion = self.model.task_run(&run_id).is_some_and(|run| {
-            run.state == TaskState::Completed
+        let start_follows_terminal = self.model.task_run(&run_id).is_some_and(|run| {
+            matches!(run.state, TaskState::Completed | TaskState::Cancelled)
                 && run
                     .finished_at_ms
                     .is_some_and(|finished_at_ms| source_timestamp_ms > finished_at_ms)
         });
         matches!(event, ControllerEventKind::TaskStarted)
             && source == crate::provider::lane::SOURCE_LOG_LANE
-            && start_follows_completion
+            && start_follows_terminal
             && self
                 .terminal_event_sources
                 .get(&run_id)
@@ -2811,7 +2811,7 @@ fn controller_task_transition(
     match controller_event_kind(source_event_type) {
         LegacyControllerEventKind::Started => match current {
             TaskState::Queued | TaskState::Blocked | TaskState::EndedUnknown => TaskState::Running,
-            TaskState::Completed if allow_lane_reopen => TaskState::Running,
+            TaskState::Completed | TaskState::Cancelled if allow_lane_reopen => TaskState::Running,
             _ => current,
         },
         LegacyControllerEventKind::Blocked => match current {
@@ -3544,6 +3544,294 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn cancelled_lane_run_reopens_only_for_strictly_newer_lane_start() {
+        for (case, timestamp_ms, expected_state) in [
+            ("older", 99, None),
+            ("equal", 100, None),
+            ("newer", 101, Some(TaskState::Running)),
+        ] {
+            let raw_run_id = format!("cancelled-lane-{case}");
+            let (mut model, run_id) = controller_model(&raw_run_id, TaskState::Cancelled);
+            let mut run = model.task_run(&run_id).unwrap().clone();
+            run.finished_at_ms = Some(100);
+            model.insert_task_run(run);
+            let (mut reducer, _shared) = Reducer::new(restored(model, 2));
+            reducer.restore_terminal_event_sources(HashMap::from([(
+                run_id,
+                SOURCE_LOG_LANE.to_owned(),
+            )]));
+
+            let reopen = provider_lane_event(
+                &format!("cancelled-lane-reopen-{case}"),
+                &raw_run_id,
+                ControllerEventKind::TaskStarted,
+                timestamp_ms,
+                1_000 + timestamp_ms,
+            );
+            let result = reducer.validate_controller_event(&reopen);
+
+            match expected_state {
+                Some(expected_state) => assert_eq!(
+                    result
+                        .expect("a strictly newer lane start must reopen a cancelled lane run")
+                        .post_model
+                        .task_run(&run_id)
+                        .unwrap()
+                        .state,
+                    expected_state,
+                    "case {case}"
+                ),
+                None => assert!(
+                    matches!(result, Err(RejectReason::StaleEvent)),
+                    "case {case} unexpectedly reopened"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn failed_and_non_lane_terminal_runs_do_not_reopen() {
+        for (case, terminal_state, terminal_source, start_source) in [
+            (
+                "failed-lane",
+                TaskState::Failed,
+                SOURCE_LOG_LANE,
+                SOURCE_LOG_LANE,
+            ),
+            (
+                "cancelled-hook-terminal",
+                TaskState::Cancelled,
+                "hook",
+                SOURCE_LOG_LANE,
+            ),
+            (
+                "cancelled-controller-start",
+                TaskState::Cancelled,
+                SOURCE_LOG_LANE,
+                "controller",
+            ),
+            (
+                "cancelled-manual-start",
+                TaskState::Cancelled,
+                SOURCE_LOG_LANE,
+                "manual",
+            ),
+        ] {
+            let (mut model, run_id) = controller_model(case, terminal_state);
+            let mut run = model.task_run(&run_id).unwrap().clone();
+            run.finished_at_ms = Some(100);
+            model.insert_task_run(run);
+            let (mut reducer, _shared) = Reducer::new(restored(model, 2));
+            reducer.restore_terminal_event_sources(HashMap::from([(
+                run_id,
+                terminal_source.to_owned(),
+            )]));
+            let mut reopen = controller_event(
+                &format!("terminal-reopen-{case}"),
+                case,
+                ControllerEventKind::TaskStarted,
+            );
+            reopen.metadata.source = start_source.to_owned();
+            reopen.metadata.timestamp_ms = 101;
+            reopen.metadata.receipt_time_ms = 1_101;
+
+            assert!(
+                matches!(
+                    reducer.validate_controller_event(&reopen),
+                    Err(RejectReason::StaleEvent)
+                ),
+                "case {case} unexpectedly reopened"
+            );
+        }
+
+        let (mut model, run_id) =
+            controller_model("cancelled-lane-positive-control", TaskState::Cancelled);
+        let mut run = model.task_run(&run_id).unwrap().clone();
+        run.finished_at_ms = Some(100);
+        model.insert_task_run(run);
+        let (mut reducer, _shared) = Reducer::new(restored(model, 2));
+        reducer
+            .restore_terminal_event_sources(HashMap::from([(run_id, SOURCE_LOG_LANE.to_owned())]));
+        let reopen = provider_lane_event(
+            "cancelled-lane-positive-control-reopen",
+            "cancelled-lane-positive-control",
+            ControllerEventKind::TaskStarted,
+            101,
+            1_101,
+        );
+
+        assert_eq!(
+            reducer
+                .validate_controller_event(&reopen)
+                .expect("the exclusions must not block the eligible cancelled lane case")
+                .post_model
+                .task_run(&run_id)
+                .unwrap()
+                .state,
+            TaskState::Running
+        );
+    }
+
+    #[test]
+    fn cancelled_lane_reopen_preserves_identity_and_clears_terminal_state() {
+        let raw_run_id = "cancelled-lane-identity";
+        let native_key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: raw_run_id.to_owned(),
+        };
+        let run_id = RunId::new();
+        let parent_run_id = RunId::new();
+        let prerequisite_run_id = RunId::new();
+        let execution_edge = ExecutionEdge {
+            parent_run_id,
+            child_run_id: run_id,
+        };
+        let dependency_edge = DependencyEdge {
+            prerequisite_run_id,
+            dependent_run_id: run_id,
+        };
+        let mut cancelled = run_with_controller_evidence(
+            run_id,
+            RunKey::Controller(raw_run_id.to_owned()),
+            7,
+            TaskState::Cancelled,
+        );
+        cancelled.created_at_ms = Some(10);
+        cancelled.updated_at_ms = Some(100);
+        cancelled.finished_at_ms = Some(100);
+        cancelled.subject = Some("preserved subject".to_owned());
+        cancelled.dismissed_at_ms = Some(105);
+        let preserved_execution = execution(run_id, "preserved-execution", ExecState::Working);
+        let preserved_node = native_agent_node("preserved-node", raw_run_id, run_id, 8);
+        let mut model = DomainModel::default();
+        model.insert_task_run(cancelled.clone());
+        model.insert_task_run(run(
+            parent_run_id,
+            RunKey::Controller("preserved-parent".to_owned()),
+            5,
+            TaskState::Queued,
+        ));
+        model.insert_task_run(run(
+            prerequisite_run_id,
+            RunKey::Controller("preserved-prerequisite".to_owned()),
+            6,
+            TaskState::Queued,
+        ));
+        model.insert_task_run_alias(native_key.clone(), run_id);
+        model.insert_execution(preserved_execution.clone());
+        model.insert_agent_node(preserved_node.clone());
+        model.insert_execution_edge(execution_edge.clone());
+        model.insert_dependency_edge(dependency_edge.clone());
+        model.set_run_kind(run_id, "codex_cli_rs".to_owned());
+        let initial_run_count = model.task_runs().count();
+        let initial_execution_count = model.executions().count();
+        let initial_node_count = model.agent_nodes().count();
+        let (mut reducer, _shared) = Reducer::new(restored(model, 9));
+        reducer
+            .restore_terminal_event_sources(HashMap::from([(run_id, SOURCE_LOG_LANE.to_owned())]));
+        reducer.apply_telemetry(
+            &native_key,
+            50,
+            42,
+            Some("gpt-5.6-sol".to_owned()),
+            Some("xhigh".to_owned()),
+            Some("workspace-write".to_owned()),
+        );
+        let preserved_telemetry = reducer.model.telemetry(&run_id).unwrap().clone();
+        let reopen = provider_lane_event(
+            "cancelled-lane-identity-reopen",
+            raw_run_id,
+            ControllerEventKind::TaskStarted,
+            101,
+            1_101,
+        );
+
+        let reopened = reducer
+            .validate_controller_event(&reopen)
+            .expect("a newer lane start must reopen the cancelled run");
+        let reopened_run = reopened.post_model.task_run(&run_id).unwrap();
+        assert_eq!(reopened_run.run_id, run_id);
+        assert_eq!(reopened_run.key, cancelled.key);
+        assert_eq!(reopened_run.display_ordinal, cancelled.display_ordinal);
+        assert_eq!(reopened_run.subject, cancelled.subject);
+        assert!(reopened_run.has_controller_task_state_event);
+        assert_eq!(reopened_run.state, TaskState::Running);
+        assert_eq!(reopened_run.finished_at_ms, None);
+        assert_eq!(reopened_run.dismissed_at_ms, None);
+        assert_eq!(reopened.post_model.task_runs().count(), initial_run_count);
+        assert_eq!(
+            reopened.post_model.executions().count(),
+            initial_execution_count
+        );
+        assert_eq!(
+            reopened.post_model.agent_nodes().count(),
+            initial_node_count
+        );
+        assert_eq!(
+            reopened
+                .post_model
+                .task_run_by_key(&native_key)
+                .unwrap()
+                .run_id,
+            run_id
+        );
+        assert_eq!(
+            reopened.post_model.execution("preserved-execution"),
+            Some(&preserved_execution)
+        );
+        assert_eq!(
+            reopened.post_model.agent_node("preserved-node"),
+            Some(&preserved_node)
+        );
+        assert!(
+            reopened
+                .post_model
+                .execution_edges()
+                .any(|edge| edge == &execution_edge)
+        );
+        assert!(
+            reopened
+                .post_model
+                .dependency_edges()
+                .any(|edge| edge == &dependency_edge)
+        );
+        assert_eq!(
+            reopened.post_model.telemetry(&run_id),
+            Some(&preserved_telemetry)
+        );
+        assert_eq!(reopened.post_model.run_kind(&run_id), Some("codex_cli_rs"));
+        assert!(!reopened.post_terminal_event_sources.contains_key(&run_id));
+
+        let mut reducer = Reducer::new(RestoredState {
+            model: reopened.post_model,
+            next_ordinal: reopened.post_next_ordinal,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        })
+        .0;
+        reducer.restore_terminal_event_sources(reopened.post_terminal_event_sources);
+        let completed = reducer
+            .validate_controller_event(&provider_lane_event(
+                "cancelled-lane-identity-complete",
+                raw_run_id,
+                ControllerEventKind::Complete,
+                102,
+                1_102,
+            ))
+            .expect("a later terminal event must be accepted after reopen");
+        let completed_run = completed.post_model.task_run(&run_id).unwrap();
+        assert_eq!(completed_run.state, TaskState::Completed);
+        assert_eq!(completed_run.finished_at_ms, Some(102));
+        assert_eq!(
+            completed
+                .post_terminal_event_sources
+                .get(&run_id)
+                .map(String::as_str),
+            Some(SOURCE_LOG_LANE)
+        );
     }
 
     #[test]

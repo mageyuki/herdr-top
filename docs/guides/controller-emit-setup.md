@@ -9,7 +9,9 @@ Controller events are an optional precision layer over that view. Provider
 hooks add explicit lifecycle transitions, Controller-authored subjects, and
 dispatch edges that do not depend on session-ID evidence. Claude Code hooks can
 also report task-run creation and completion. Manual `emit` events can add
-explicit dependencies.
+explicit dependencies. Hooks and manual events are not authoritative for
+physical workspace, tab, pane, or execution topology; complete Herdr snapshots
+remain the authority for those entities.
 
 The hook integration does not produce dependency edges. Neither provider's hook
 surface can derive semantic dependencies between runs. Add those relationships
@@ -276,6 +278,28 @@ its start hook. When the delayed start later delivers `task_started`, the
 controller rejects it with reason `stale_event`. The adapter treats that reason
 as benign: it logs it to standard error, continues delivery, and does not count
 it as a delivery failure or a `--strict` failure.
+
+Codex provider-log cancellation and resume use a narrower rule that hooks and
+manual events cannot invoke. A log-lane `turn_aborted` is a truthful terminal
+observation: the existing Task Run becomes `cancelled`, receives its finish
+timestamp, and renders as cancelled until another turn actually starts. A
+provider-log `task_started` may reopen that same run from `completed` or
+`cancelled` only when the previous terminal observation also came from the log
+lane, identity resolution selects the same native session, the start's provider
+timestamp is strictly greater than the stored terminal timestamp, and the
+normal identity, event-ledger, and binding checks succeed. `failed` never
+reopens; equal or older starts and all hook, Controller, or manual starts remain
+stale.
+
+An accepted log-lane reopen changes the existing run to `running`; it does not
+create another Task Run or physical execution. The run ID, native binding,
+execution lineage, display order, subject, telemetry identity, Controller
+metadata, and relationship edges remain intact, while the obsolete finish time,
+dismissal, and terminal-source marker are cleared. Startup backfill reconstructs
+the lane terminal source before applying this same strict-time rule, so
+historical equal or older starts remain rejected after restart and a genuinely
+later start is accepted. This uses the current event and Task Run data; it needs
+no schema migration or history purge.
 
 `SessionEnd` maps to the non-terminal `dismiss` event. The session run disappears
 from the default view immediately without changing its task state. If the

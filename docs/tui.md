@@ -5,7 +5,9 @@ combines Herdr's physical workspace, tab, and pane topology with Task Runs and
 native Claude Code or Codex agent nodes synthesized directly from provider
 session logs. No hook registration or `emit` wiring is required. Run
 `herdr-top` in a managed Herdr pane, or pass an explicit session and socket as
-described in the [CLI reference](cli.md).
+described in the [CLI reference](cli.md). Optional hooks and manual Controller
+events can add subjects and semantic edges, but they never authorize physical
+workspace, tab, pane, or execution topology.
 
 ## Screen layout
 
@@ -274,6 +276,11 @@ runs that have already reached the 24-hour boundary. It does not delete them,
 and the dismissal survives a restart. A later non-terminal mutation clears the
 dismissal, while a terminal touch retains it.
 
+For Codex, a provider-log `turn_aborted` truthfully changes the Task Run to
+`cancelled`, records its finish time, and temporarily renders the `✗` cancelled
+row. A later turn does not erase that observation retroactively; a qualifying
+provider-log start reactivates the same run when the new turn is observed.
+
 A provider `SessionEnd` hook dismisses its known session run immediately without
 changing the Task Run state or advancing its activity time. The dismissal is
 persisted. If that native session resumes, its `SessionStart` becomes
@@ -297,14 +304,22 @@ subjects, run kind, and per-turn context are transient and are recomputed from
 the artifacts rather than restored from SQLite; token totals therefore return
 after startup backfill instead of being persisted.
 
-One fail-safe limitation remains. If a session completed and then resumed, and
-both halves arrive in one backfill pass, the row remains `completed` until
-genuinely new activity appears. The reopen gate requires the resume's
-source-clock timestamp to be strictly newer than `finished_at_ms`, but replay
-records the historical completion using the current receipt clock. The
-historical resume is therefore older and is denied. Denial avoids a false
-reopen on every restart; a durable correction requires a source-clock
-completion timestamp and a schema change.
+A provider-log `task_started` may reopen the same native Task Run from
+`completed` or `cancelled` only when the stored terminal source is also the log
+lane and the start's provider timestamp is strictly greater than the stored
+terminal timestamp. Normal identity, durable-ledger, and binding checks still
+apply. `failed` never reopens; equal or older starts and hook, Controller, or
+manual starts remain stale. A successful reopen preserves the run ID, native
+binding, execution lineage, display order, subject, telemetry identity,
+Controller metadata, and relationship edges, sets the run to `running`, and
+clears the obsolete finish time, dismissal, and terminal-source marker. It does
+not create a duplicate run or execution, and a later terminal fact is accepted
+normally.
+
+Startup reconstructs terminal provenance before backfill, so historical equal
+or older starts remain rejected after restart while a genuinely later start is
+accepted under the same rule. The durable event ledger keeps replay idempotent.
+No schema migration or history purge is required.
 
 ## Liveness watchdog
 

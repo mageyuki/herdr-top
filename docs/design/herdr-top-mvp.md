@@ -6,7 +6,7 @@ Herdr Top is a Herdr-native terminal UI for observing Claude Code and Codex mult
 
 The tool runs inside a pane managed by the target Herdr session and observes that session's workspaces, tabs, panes, agent sessions, task runs, dependencies, and recent activity. It complements Herdr instead of replacing its session, terminal, workspace, or worktree management.
 
-The orchestration-visibility core is zero-configuration: installing the Herdr plugin and opening its pane exposes the agent tree, including headless workers, by reading provider session artifacts directly. Controller hooks and `emit` are an optional precision layer for explicit lifecycle transitions, Controller-authored subjects, dispatch edges that do not depend on session-ID evidence, and dependencies.
+The orchestration-visibility core is zero-configuration: installing the Herdr plugin and opening its pane exposes the agent tree, including headless workers, by reading provider session artifacts directly. Controller hooks and `emit` are an optional precision layer for explicit lifecycle transitions, Controller-authored subjects, dispatch edges that do not depend on session-ID evidence, and dependencies. They never authorize physical topology; complete Herdr snapshots remain authoritative for workspaces, tabs, panes, and physical executions.
 
 Repository: [mageyuki/herdr-top](https://github.com/mageyuki/herdr-top)
 
@@ -130,6 +130,9 @@ Rules:
 - Provisional identity is scoped to one collector run because `terminal_id` does not survive a cold server restart and physical executions are never continued across an observation gap.
 - A different native session in the same pane creates a new Task Run.
 - Resuming the same native session reactivates the existing Task Run.
+- A Codex log-lane `turn_aborted` truthfully puts the run in `cancelled`, stamps its terminal time, and renders it as cancelled until a later turn is observed.
+- A provider-log `task_started` can reopen an existing `completed` or `cancelled` run only when the prior terminal source is also the provider log lane, the incoming fact resolves to that same native run, its provider timestamp is strictly greater than the stored terminal timestamp, and ordinary identity, event-ledger, and binding-conflict checks succeed. `failed`, equal or older starts, and Controller, hook, or manual starts do not gain this authority.
+- Reopening mutates that run to `running`, clears `finished_at_ms`, `dismissed_at_ms`, and terminal-source bookkeeping, and preserves the run ID, native key, display ordinal, executions, Agent Nodes, subject, telemetry identity, Controller metadata, and execution and dependency edges. It never mints a second run or execution.
 - Moving the same terminal or native session does not create a new Task Run.
 - A provisional Task Run merges into the resolved identity when the native session ID appears.
 - Multiple prompts inside one native session are not automatically split.
@@ -464,7 +467,7 @@ After every successful owner launch:
 
 Provider backfill re-reads every admitted artifact selected by the window from byte zero; no per-file byte offset is persisted. Its hard anchor is `max(earliest database event, now - HERDR_TOP_BACKFILL_WINDOW_MS)`. The anchor bounds file selection, not record selection, so an admitted in-window file is read in full and contributes complete run totals. Pane-root artifacts are exempt from the anchor. Lineage evidence admits only artifacts whose mtime satisfies the anchor; an older identity echo is ignored entirely. Replay converges idempotently through the durable event ledger. Token telemetry, subjects, run kind, and turn context are transient and are recomputed from artifacts rather than restored from SQLite.
 
-A completed-then-resumed session has one fail-safe backfill residual. When both halves arrive in one backfill pass, the row remains `completed` until genuinely new activity appears. The lane reopen gate requires the reopening `TaskStarted` source-clock timestamp to be strictly newer than the run's `finished_at_ms`, but `TaskRun::touch` records `finished_at_ms` from the receipt clock, which is “now” during replay. The historical resume start is therefore older and the gate denies it. Denial avoids an incorrect reopen on every restart; a durable fix requires a source-clock completion timestamp and therefore a schema change.
+Provider-log terminal provenance is reconstructed from the durable event read model before startup backfill is applied. Log-lane lifecycle bookkeeping uses provider source time, so a historical `task_started` at or before a restored `completed` or `cancelled` timestamp remains stale, while a strictly later start reopens the same native Task Run and a later terminal event is accepted normally. Replay remains event-ledger idempotent and does not duplicate the run, its execution lineage, or its events. This convergence uses the existing schema and retained history; no schema migration or history purge is required.
 
 A second invocation does not reconcile because it does not acquire the lock.
 
