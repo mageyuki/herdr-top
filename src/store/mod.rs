@@ -736,6 +736,33 @@ impl Store {
             upsert_history_drain(&transaction, &drain)?;
         }
         for association in batch.history_associations {
+            let association_exists: bool = transaction.query_row(
+                "SELECT EXISTS(\
+                     SELECT 1 FROM history_drain_runs WHERE drain_id = ?1 AND run_id = ?2\
+                 )",
+                params![
+                    association.drain_id.as_str(),
+                    association.run_id.to_string()
+                ],
+                |row| row.get(0),
+            )?;
+            if association_exists {
+                continue;
+            }
+            let finalized_at_ms = transaction
+                .query_row(
+                    "SELECT finalized_at_ms FROM history_drains WHERE drain_id = ?1",
+                    [association.drain_id.as_str()],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .optional()?;
+            if matches!(finalized_at_ms, Some(Some(_))) {
+                return Err(StoreError::invalid(
+                    "history_drain_runs",
+                    format!("{}:{}", association.drain_id.as_str(), association.run_id),
+                    "cannot add an association after the history drain is finalized",
+                ));
+            }
             transaction.execute(
                 "INSERT INTO history_drain_runs(drain_id, run_id) VALUES (?1, ?2) \
                  ON CONFLICT(drain_id, run_id) DO NOTHING",
@@ -2633,6 +2660,7 @@ fn upsert_history_drain(
     drain: &PersistHistoryDrain,
 ) -> Result<(), StoreError> {
     let mut artifact_ids = HashSet::new();
+    let mut incoming_manifest = Vec::with_capacity(drain.artifacts.len());
     for artifact in &drain.artifacts {
         if artifact.artifact_id.is_empty() || artifact.generation.is_empty() {
             return Err(StoreError::invalid(
@@ -2648,8 +2676,19 @@ fn upsert_history_drain(
                 "frozen manifest contains a duplicate artifact identity",
             ));
         }
+        let goalpost = i64::try_from(artifact.goalpost).map_err(|_: TryFromIntError| {
+            StoreError::IntegerOutOfRange {
+                field: "history_drain_artifacts.goalpost",
+            }
+        })?;
+        incoming_manifest.push((
+            artifact.artifact_id.clone(),
+            artifact.generation.clone(),
+            goalpost,
+        ));
     }
-    transaction.execute(
+    incoming_manifest.sort_unstable();
+    let inserted = transaction.execute(
         "INSERT INTO history_drains(drain_id, provider, created_at_ms) VALUES (?1, ?2, ?3) \
          ON CONFLICT(drain_id) DO NOTHING",
         params![
@@ -2657,7 +2696,7 @@ fn upsert_history_drain(
             provider_text(drain.provider),
             drain.created_at_ms
         ],
-    )?;
+    )? != 0;
     let stored: (String, i64) = transaction.query_row(
         "SELECT provider, created_at_ms FROM history_drains WHERE drain_id = ?1",
         [drain.drain_id.as_str()],
@@ -2676,49 +2715,33 @@ fn upsert_history_drain(
         ));
     }
 
-    for artifact in &drain.artifacts {
-        let goalpost = i64::try_from(artifact.goalpost).map_err(|_: TryFromIntError| {
-            StoreError::IntegerOutOfRange {
-                field: "history_drain_artifacts.goalpost",
-            }
-        })?;
+    if !inserted {
+        let mut statement = transaction.prepare(
+            "SELECT artifact_id, generation, goalpost FROM history_drain_artifacts \
+             WHERE drain_id = ?1 ORDER BY artifact_id",
+        )?;
+        let stored_manifest = statement
+            .query_map([drain.drain_id.as_str()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if stored_manifest != incoming_manifest {
+            return Err(StoreError::invalid(
+                "history_drain_artifacts",
+                drain.drain_id.as_str(),
+                "drain identity already has a different frozen artifact set",
+            ));
+        }
+        return Ok(());
+    }
+
+    for (artifact_id, generation, goalpost) in incoming_manifest {
         transaction.execute(
             "INSERT INTO history_drain_artifacts(\
                  drain_id, artifact_id, generation, goalpost\
-             ) VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT(drain_id, artifact_id) DO NOTHING",
-            params![
-                drain.drain_id.as_str(),
-                artifact.artifact_id,
-                artifact.generation,
-                goalpost
-            ],
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![drain.drain_id.as_str(), artifact_id, generation, goalpost],
         )?;
-        let stored: (String, i64) = transaction.query_row(
-            "SELECT generation, goalpost FROM history_drain_artifacts \
-             WHERE drain_id = ?1 AND artifact_id = ?2",
-            params![drain.drain_id.as_str(), artifact.artifact_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if stored != (artifact.generation.clone(), goalpost) {
-            return Err(StoreError::invalid(
-                "history_drain_artifacts",
-                &artifact.artifact_id,
-                "artifact identity already has a different frozen generation or goalpost",
-            ));
-        }
-    }
-    let stored_count: i64 = transaction.query_row(
-        "SELECT COUNT(*) FROM history_drain_artifacts WHERE drain_id = ?1",
-        [drain.drain_id.as_str()],
-        |row| row.get(0),
-    )?;
-    if stored_count != drain.artifacts.len() as i64 {
-        return Err(StoreError::invalid(
-            "history_drain_artifacts",
-            drain.drain_id.as_str(),
-            "drain identity already has a different frozen artifact set",
-        ));
     }
     Ok(())
 }
@@ -3824,6 +3847,290 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn history_drain_manifest_rejects_superset_replay_without_mutation() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let artifact =
+            |artifact_id: &str, generation: &str, goalpost: u64| PersistHistoryDrainArtifact {
+                artifact_id: artifact_id.to_owned(),
+                generation: generation.to_owned(),
+                goalpost,
+            };
+
+        let exact_id = HistoryDrainId::new("codex:manifest-exact").unwrap();
+        let exact_manifest = vec![
+            artifact("a.jsonl", "dev:1", 100),
+            artifact("b.jsonl", "dev:2", 200),
+        ];
+        store
+            .apply_v6_batch(PersistV6Batch {
+                history_drains: vec![PersistHistoryDrain {
+                    drain_id: exact_id.clone(),
+                    provider: Provider::Codex,
+                    created_at_ms: 1_000,
+                    artifacts: exact_manifest.clone(),
+                }],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+        let expected_exact = history_drain_manifest(&store.connection, &exact_id);
+        store
+            .apply_v6_batch(PersistV6Batch {
+                history_drains: vec![PersistHistoryDrain {
+                    drain_id: exact_id.clone(),
+                    provider: Provider::Codex,
+                    created_at_ms: 1_000,
+                    artifacts: exact_manifest.into_iter().rev().collect(),
+                }],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+        assert_eq!(
+            history_drain_manifest(&store.connection, &exact_id),
+            expected_exact
+        );
+
+        let mismatches = [
+            (
+                "empty-to-nonempty",
+                Vec::new(),
+                vec![artifact("a.jsonl", "dev:1", 100)],
+            ),
+            (
+                "subset-to-superset",
+                vec![artifact("a.jsonl", "dev:1", 100)],
+                vec![
+                    artifact("a.jsonl", "dev:1", 100),
+                    artifact("b.jsonl", "dev:2", 200),
+                ],
+            ),
+            (
+                "superset-to-subset",
+                vec![
+                    artifact("a.jsonl", "dev:1", 100),
+                    artifact("b.jsonl", "dev:2", 200),
+                ],
+                vec![artifact("a.jsonl", "dev:1", 100)],
+            ),
+            (
+                "changed-metadata",
+                vec![artifact("a.jsonl", "dev:1", 100)],
+                vec![artifact("a.jsonl", "dev:9", 900)],
+            ),
+            (
+                "same-size-changed-members",
+                vec![
+                    artifact("a.jsonl", "dev:1", 100),
+                    artifact("b.jsonl", "dev:2", 200),
+                ],
+                vec![
+                    artifact("a.jsonl", "dev:1", 100),
+                    artifact("c.jsonl", "dev:3", 300),
+                ],
+            ),
+        ];
+
+        for (case, stored_manifest, replay_manifest) in mismatches {
+            let drain_id = HistoryDrainId::new(format!("codex:manifest-{case}")).unwrap();
+            store
+                .apply_v6_batch(PersistV6Batch {
+                    history_drains: vec![PersistHistoryDrain {
+                        drain_id: drain_id.clone(),
+                        provider: Provider::Codex,
+                        created_at_ms: 2_000,
+                        artifacts: stored_manifest,
+                    }],
+                    ..PersistV6Batch::default()
+                })
+                .unwrap();
+            let expected = history_drain_manifest(&store.connection, &drain_id);
+
+            let result = store.apply_v6_batch(PersistV6Batch {
+                history_drains: vec![PersistHistoryDrain {
+                    drain_id: drain_id.clone(),
+                    provider: Provider::Codex,
+                    created_at_ms: 2_000,
+                    artifacts: replay_manifest,
+                }],
+                ..PersistV6Batch::default()
+            });
+
+            assert!(
+                matches!(result, Err(StoreError::InvalidData { .. })),
+                "{case} replay unexpectedly succeeded: {result:?}"
+            );
+            assert_eq!(
+                history_drain_manifest(&store.connection, &drain_id),
+                expected,
+                "{case} replay mutated the frozen manifest"
+            );
+        }
+    }
+
+    #[test]
+    fn finalized_history_drain_rejects_new_association_but_allows_existing_replay() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let associated_run_id = RunId::new();
+        let unassociated_run_id = RunId::new();
+        let drain_id = HistoryDrainId::new("codex:finalized-associations").unwrap();
+        let rollback_drain_id = HistoryDrainId::new("codex:rollback-sentinel").unwrap();
+
+        store
+            .apply_v6_batch(PersistV6Batch {
+                task_runs: vec![
+                    PersistTaskRunV6 {
+                        task_run: match run_op(
+                            associated_run_id,
+                            1,
+                            TaskState::Running,
+                            3_000,
+                            false,
+                        ) {
+                            PersistOp::UpsertTaskRun(task_run) => task_run,
+                            _ => unreachable!(),
+                        },
+                        state: TaskRunV6State {
+                            history_ready: false,
+                            latest_provider_at_ms: Some(4_000),
+                            ..TaskRunV6State::default()
+                        },
+                    },
+                    PersistTaskRunV6 {
+                        task_run: match run_op(
+                            unassociated_run_id,
+                            2,
+                            TaskState::Running,
+                            3_100,
+                            false,
+                        ) {
+                            PersistOp::UpsertTaskRun(task_run) => task_run,
+                            _ => unreachable!(),
+                        },
+                        state: TaskRunV6State {
+                            history_ready: false,
+                            latest_provider_at_ms: Some(4_100),
+                            ..TaskRunV6State::default()
+                        },
+                    },
+                ],
+                history_drains: vec![PersistHistoryDrain {
+                    drain_id: drain_id.clone(),
+                    provider: Provider::Codex,
+                    created_at_ms: 3_500,
+                    artifacts: Vec::new(),
+                }],
+                history_associations: vec![PersistHistoryDrainRun {
+                    drain_id: drain_id.clone(),
+                    run_id: associated_run_id,
+                }],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+
+        store
+            .apply_v6_batch(PersistV6Batch {
+                history_associations: vec![PersistHistoryDrainRun {
+                    drain_id: drain_id.clone(),
+                    run_id: associated_run_id,
+                }],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+        assert_eq!(count(&store.connection, "history_drain_runs"), 1);
+
+        store.finalize_history_drain(&drain_id, 5_000).unwrap();
+        store
+            .apply_v6_batch(PersistV6Batch {
+                history_associations: vec![PersistHistoryDrainRun {
+                    drain_id: drain_id.clone(),
+                    run_id: associated_run_id,
+                }],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+        assert_eq!(
+            store.history_drain_run_ids(&drain_id).unwrap(),
+            vec![associated_run_id]
+        );
+
+        let result = store.apply_v6_batch(PersistV6Batch {
+            operations: vec![PersistOp::UpsertWorkspace {
+                workspace: Workspace {
+                    workspace_id: "rollback-workspace".to_owned(),
+                },
+                display_ordinal: DisplayOrdinal::new(90),
+            }],
+            task_runs: vec![PersistTaskRunV6 {
+                task_run: match run_op(unassociated_run_id, 2, TaskState::Completed, 6_000, false) {
+                    PersistOp::UpsertTaskRun(task_run) => task_run,
+                    _ => unreachable!(),
+                },
+                state: TaskRunV6State {
+                    history_ready: false,
+                    latest_provider_at_ms: Some(9_000),
+                    ..TaskRunV6State::default()
+                },
+            }],
+            rate_totals: vec![(
+                unassociated_run_id,
+                RunRateTotals {
+                    output_tokens: 99,
+                    working_ms: 1_500,
+                },
+            )],
+            history_drains: vec![PersistHistoryDrain {
+                drain_id: rollback_drain_id.clone(),
+                provider: Provider::Codex,
+                created_at_ms: 5_500,
+                artifacts: vec![PersistHistoryDrainArtifact {
+                    artifact_id: "rollback.jsonl".to_owned(),
+                    generation: "dev:rollback".to_owned(),
+                    goalpost: 512,
+                }],
+            }],
+            history_associations: vec![
+                PersistHistoryDrainRun {
+                    drain_id: drain_id.clone(),
+                    run_id: associated_run_id,
+                },
+                PersistHistoryDrainRun {
+                    drain_id: drain_id.clone(),
+                    run_id: unassociated_run_id,
+                },
+            ],
+        });
+
+        assert!(
+            matches!(result, Err(StoreError::InvalidData { .. })),
+            "new association on finalized drain unexpectedly succeeded: {result:?}"
+        );
+        assert_eq!(count(&store.connection, "workspaces"), 0);
+        assert_eq!(
+            task_state(&store.connection, unassociated_run_id),
+            "running"
+        );
+        let restored = store.load_restored_state().unwrap();
+        assert_eq!(
+            restored.model.task_run_v6_state(&unassociated_run_id),
+            Some(&TaskRunV6State {
+                history_ready: false,
+                latest_provider_at_ms: Some(4_100),
+                ..TaskRunV6State::default()
+            })
+        );
+        assert_eq!(restored.model.run_rate_totals(&unassociated_run_id), None);
+        assert!(matches!(
+            store.history_drain_finalized(&rollback_drain_id),
+            Err(StoreError::InvalidData { .. })
+        ));
+        assert_eq!(
+            store.history_drain_run_ids(&drain_id).unwrap(),
+            vec![associated_run_id]
+        );
     }
 
     #[tokio::test]
@@ -6270,6 +6577,25 @@ mod tests {
                 [],
                 |row| row.get(0),
             )
+            .unwrap()
+    }
+
+    fn history_drain_manifest(
+        connection: &Connection,
+        drain_id: &HistoryDrainId,
+    ) -> Vec<(String, String, i64)> {
+        let mut statement = connection
+            .prepare(
+                "SELECT artifact_id, generation, goalpost FROM history_drain_artifacts \
+                 WHERE drain_id = ?1 ORDER BY artifact_id",
+            )
+            .unwrap();
+        statement
+            .query_map([drain_id.as_str()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
             .unwrap()
     }
 }

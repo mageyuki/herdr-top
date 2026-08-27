@@ -112,6 +112,7 @@ impl RunRateTotals {
         let output_tokens = output_sum.unwrap_or(u64::MAX).min(PERSISTED_RATE_TOTAL_MAX);
         let working_ms = working_sum.unwrap_or(i64::MAX);
         let saturated = preexisting_clamp
+            || delta.working_ms < 0
             || output_sum.is_none_or(|sum| sum > PERSISTED_RATE_TOTAL_MAX)
             || working_sum.is_none();
         *self = Self {
@@ -273,6 +274,43 @@ mod tests {
         for (status, expected) in cases {
             assert_eq!(status.execution_state(), expected);
         }
+    }
+
+    #[test]
+    fn negative_working_delta_records_saturation() {
+        let mut totals = RunRateTotals {
+            output_tokens: 41,
+            working_ms: 500,
+        };
+        assert!(totals.saturating_add(RunRateTotals {
+            output_tokens: 9,
+            working_ms: -250,
+        }));
+        assert_eq!(
+            totals,
+            RunRateTotals {
+                output_tokens: 50,
+                working_ms: 500,
+            }
+        );
+
+        let mut model = crate::model::DomainModel::default();
+        let run_id = crate::model::RunId::new();
+        assert!(model.accumulate_run_rate_totals(
+            run_id,
+            RunRateTotals {
+                output_tokens: 7,
+                working_ms: -1,
+            }
+        ));
+        assert_eq!(model.controller_diagnostics().rate_total_saturations(), 1);
+        assert_eq!(
+            model.run_rate_totals(&run_id),
+            Some(&RunRateTotals {
+                output_tokens: 7,
+                working_ms: 0,
+            })
+        );
     }
 
     #[test]
