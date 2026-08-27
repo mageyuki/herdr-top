@@ -23,7 +23,7 @@ Repository: [mageyuki/herdr-top](https://github.com/mageyuki/herdr-top)
 | Primary view | Fixed-screen, htop-style live TUI |
 | Hierarchy | Herdr physical topology plus Task Run and native sub-agent nesting |
 | Physical pane identity | Herdr `terminal_id` is stable within one server run; public `pane_id` is the current address; no physical identity survives a cold restart |
-| Cross-pane relationship | Linked only by provider-artifact lineage evidence or an explicit Controller relationship event; otherwise independent and `unlinked` |
+| Cross-pane relationship | Linked only by provider-artifact lineage evidence or an explicit Controller relationship event; otherwise independent and `unlinked` in the relationship model, presented in Detail as no recorded task relationships |
 | Dependency representation | A DAG separate from the execution tree |
 | Data acquisition | Herdr snapshot/events plus direct, non-invasive Claude/Codex provider-session artifact observation; Controller events are optional precision |
 | Provider fallback | Two-second rescan when file watching is unavailable; no terminal-output scraping |
@@ -172,23 +172,23 @@ Session
 ├── Workspace: api
 │   ├── Tab: implementation
 │   │   ├── Pane w1:p1
-│   │   │   └── Task Run: controller (Claude)
-│   │   │       └── Claude native sub-agent: investigate
+│   │   │   └── ● working Claude controller
+│   │   │       └── ○ idle Claude native agent: investigate
 │   │   ├── Pane w1:p2
-│   │   │   └── Task Run: implement (Codex)  [dispatched by: controller]
+│   │   │   └── ● blocked Codex implement  [dispatched by: controller]
 │   │   └── Pane w1:p3
-│   │       └── Task Run: tests  [unlinked]
+│   │       └── ? unknown Codex tests
 │   └── Tab: review
 └── Workspace: docs
 ```
 
 The physical hierarchy is rendered with computed Unicode box-drawing connectors: `├── ` for a non-final child, `└── ` for a final child, and `│   ` while an ancestor has later siblings. `HERDR_TOP_ASCII_TREE=1` selects the corresponding `|-- `, `` `-- ``, and `|   ` forms; every other value leaves Unicode enabled. The environment variable is read once while constructing the TUI at startup, never during a frame render.
 
-Each Task Run row has the shipped grammar `<glyph> <worker-kind>[ <subject>][ — <live line>][ · <duration>][ annotations]`; for example, `● Claude Implement wire tolerance — tool_use: Bash · 17m03s`. The glyph is `⚠` for a stalled non-terminal run, `●` for `running` or `blocked`, `✓` for `completed`, `✗` for `failed` or `cancelled`, and `◌` for `queued` or `ended_unknown`; the stall override never replaces a terminal glyph. Worker kind comes from the projected run kind and falls back to the run key. A missing captured subject falls back to the key-derived name rather than leaving an empty segment, except that a native or native-path Codex run below an execution edge renders the kind alone. The live line appears only for a non-terminal run, from the lane live-line read model or, for a Claude-flavoured run, from the newest non-display-stale Agent Node's `last_event_kind` with a `: tool` suffix when `last_tool_name` is present. Duration appears only when the available start and live-or-finished end timestamps produce a non-negative interval. Existing `[shared]`, `[dispatched by: …]`, and `[unlinked]` annotations remain appended in that order when applicable. Model, effort, output tokens, output-token rate, and time render in separate right-aligned metric columns rather than inside the row label, and the lifecycle state is carried by the glyph. A captured subject keeps the UUID and run key out of the row, while the no-subject fallback can still be identity-shaped — a Controller key, native session ID, or UUID for a path-keyed native run; the Detail overlay is the complete identity surface and always shows the full key, `run_id`, bound native session ID, and lifecycle timestamps.
+Each Task Run row has the shipped grammar `<glyph> <status> <worker-kind>[ <subject>][ — <live line>][ · <duration>][ relationship annotations]`; for example, `● working Claude Implement wire tolerance — tool_use: Bash · 17m03s`. The status mapping is `queued ◌`, `working ●`, `idle ○`, `blocked ●`, `done ✓`, `error ✗`, `cancelled ⊘`, and `unknown ?`. A stalled non-terminal row retains that written base status and uses the orthogonal `⚠` glyph; terminal rows are never stalled. Worker kind comes from the projected run kind and falls back to the run key. A missing captured subject falls back to the key-derived name rather than leaving an empty segment, except that a native or native-path Codex run below an execution edge renders the kind alone. The live line appears only for a non-terminal run, from the lane live-line read model or, for a Claude-flavoured run, from the newest non-display-stale Agent Node's `last_event_kind` with a `: tool` suffix when `last_tool_name` is present. Duration appears only when the available start and live-or-finished end timestamps produce a non-negative interval. Existing `[shared]` and `[dispatched by: …]` annotations remain appended in that order when applicable; absence of relationships is reported in Detail as `task_relationships: none`, not appended to a row. Model, effort, output tokens, output-token rate, and time render in separate right-aligned metric columns rather than inside the row label, while the status remains explicit at the left edge. A captured subject keeps the UUID and run key out of the row, while the no-subject fallback can still be identity-shaped — a Controller key, native session ID, or UUID for a path-keyed native run; the Detail overlay is the complete identity surface and always shows the full key, `run_id`, bound native session ID, lifecycle timestamps, and relationship lines.
 
 Tab and pane rows retain their stable IDs and append a display name in parentheses only when a non-empty sanitized Herdr `label` is present. A terminal title is never a pane display name. The exact grammar is `Tab: <tab-id> (<label>)` and `Pane: <pane-id> (<label>)` when present, or `Tab: <tab-id>` and `Pane: <pane-id>` when absent; absence never renders empty parentheses. Labels are escaped and truncated UTF-8-safely at capture to the same 256-byte limit as Controller display text.
 
-Native sub-agent nesting appears only beneath a Task Run of the same provider, because provider metadata is the only source of native parent-child edges and no provider's metadata can establish a cross-provider edge. Run placement is ordered: every pane hosting a live execution; otherwise the pane of the latest ended execution; otherwise, for a run with no execution history, its default-visible dispatch parent; otherwise `Unattached`. A dispatch-nested child shows parentage by position and carries no `[dispatched by: …]` text; that annotation appears only on pane-placed runs. A dismissed or expired parent never hides its children, which fall back to `Unattached` for that frame, and a malformed parent cycle does the same. A run with concurrent live executions appears under each hosting pane with `[shared]`, but its descendants expand only on the first occurrence.
+Native sub-agent nesting appears only beneath a Task Run of the same provider, because provider metadata is the only source of native parent-child edges and no provider's metadata can establish a cross-provider edge. The provider-native root Agent that duplicates its owning Task Run is hidden; visible descendants attach directly beneath the Task Run when that root is hidden, retain model and Detail data, and use `<glyph> <status> <provider> native agent: ...` with their own evidence. Run placement is ordered: every pane hosting a live execution; otherwise the pane of the latest ended execution; otherwise, for a run with no execution history, its default-visible dispatch parent; otherwise `Unattached`. A dispatch-nested child shows parentage by position and carries no `[dispatched by: …]` text; that annotation appears only on pane-placed runs. A dismissed or expired parent never hides its children, which fall back to `Unattached` for that frame, and a malformed parent cycle does the same. A run with concurrent live executions appears under each hosting pane with `[shared]`, but its descendants expand only on the first occurrence.
 
 ### 6.2 Task dependency DAG
 
@@ -203,9 +203,16 @@ Nesting must not be used to represent every dependency. A Task Run can depend on
 
 The dependency DAG uses the same status glyph and label grammar as the execution tree, but omits the live line.
 
-### 6.3 Unlinked rule
+### 6.3 Unlinked relationship-model rule
 
-A task observed in another pane is displayed as an independent Task Run with `unlinked` relationship status unless an explicit event links it or the identity rules in section 5.4 establish it as another execution of an existing Task Run.
+A task observed in another pane remains an independent Task Run whose
+relationship-model state is `unlinked` unless an explicit event links it or the
+identity rules in section 5.4 establish it as another execution of an existing
+Task Run. The execution tree and dependency DAG do not append a row annotation
+for this fact. Detail calls it "no recorded task relationships" through
+`dispatch_parent`, `prerequisites`, `dependents`, and
+`task_relationships: none | present`; the filter retains `unlinked` as a legacy
+synonym.
 
 Herdr Top must not infer a Controller relationship from:
 
@@ -485,7 +492,7 @@ Herdr restores its own topology and supported agent sessions. Herdr Top restores
 
 - Active and non-terminal Task Runs are never auto-pruned. A Controller-keyed run with no execution is hidden from the default view once its last `updated_at_ms` is at least `HOOK_ONLY_STALE_VISIBILITY_MS = 24 * 60 * 60 * 1_000` ms old; native-keyed runs and Controller runs with an execution do not use this expiry.
 - A fresh `running` or `blocked` Task Run without live execution remains visible.
-- An Agent Node whose state is absent, unknown, or ended is hidden from tree and DAG row projections once its recorded last activity is at least `HERDR_TOP_HEADLESS_INACTIVITY_MS` old. Missing activity timestamps and known states, including `stale`, remain visible. A visible child of a hidden Agent Node is re-parented to the owning Task Run for display. The complete Agent Node model remains retained and available to Detail projection.
+- Provider-native root Agent Nodes that duplicate their owning Task Run are hidden from the execution tree regardless of state or age. Visibility aging applies only to child Agent Nodes eligible for execution-tree rows: a child whose state is absent, unknown, or ended is hidden once its recorded last activity is at least `HERDR_TOP_HEADLESS_INACTIVITY_MS` old; missing activity timestamps and known states, including `stale` and `working`, remain visible. A visible child of a hidden Agent Node is re-parented to the owning Task Run for display. The dependency DAG is run-only and has no Agent rows. The complete Agent Node model remains retained and available to Detail projection.
 - Finished Task Runs and unreferenced edges are retained for 30 days.
 - Events form an activity ring bounded to 100,000 per named session and 7 days; under the target sustained load the count bound dominates at roughly 83 minutes, which is intentional — semantic state never depends on event retention. The `event_id` deduplication ledger is stored separately and keeps IDs for the full 7 days regardless of ring eviction.
 - Parents or dependencies referenced by active Task Runs are not pruned.
@@ -519,7 +526,7 @@ Required behavior:
 - manual scroll disables follow; `f` or End resumes it;
 - expand/collapse and filtering that retains matching ancestors — in the dependency view, every prerequisite path to a matching run;
 - execution-tree and dependency-DAG toggle; the dependency view renders the conceptual DAG of section 6.2 as a stable topologically sorted list with prerequisite and dependent columns per run — prerequisites precede dependents, the display ordinal breaks topological ties, state refreshes preserve order, and only dependency-edge changes may reorder, minimally — so 1,000 edges stay scrollable and scannable;
-- distinct `unlinked`, `blocked`, `stale`, `ended`, `ended_unknown`, and other terminal task states;
+- Detail distinguishes no recorded task relationships from operational statuses such as `blocked`, stale evidence, execution `ended`, `ended_unknown`, and other terminal task states;
 - selection moves to a surviving ancestor or neighbor when its node closes, and follows the surviving run through an identity merge, with the reason shown;
 - with no overlay or filter draft active, unmodified `s` opens the Summary overlay and unmodified `c` sends one non-blocking clear command; modifier-bearing `s` and `c` do neither. `Esc` or any `s` key code closes an already-open Summary overlay, because overlay-local closing is deliberately modifier-blind;
 - the Summary overlay prints a `scope:` line, then groups by worker kind and model in two separate tables headed `per worker kind` and `per model`; their exact header lines are `worker kind | runs | live | total | mean | tok | mean tok/s` and `model | runs | live | total | mean | tok | mean tok/s`; `runs` and `live` count all group members, `total` and `mean` use only terminal runs with valid timing, `tok` is accumulated output tokens, and `mean tok/s` is total rated output tokens divided by total rated elapsed seconds rather than an unweighted mean of per-run rates; either token field renders `-` only when the required telemetry is unavailable;
@@ -644,7 +651,7 @@ Provider adapters must not force unstable Claude Code or Codex JSON into an over
 - Best-effort `emit` failure warns but cannot terminate orchestration; `--strict` is opt-in.
 - Migration backs up the database first. Failure stops startup and never resets the database automatically. An older binary refuses to open a database whose schema version is newer than it understands, with a clear upgrade message.
 - Provisional nodes remain until the identity rules resolve, merge, or close them.
-- Missing semantic links remain `unlinked`.
+- Missing semantic links remain `unlinked` in the relationship model; the UI wording is "no recorded task relationships" and no row annotation is added.
 - The header shows hostname so identical remote session names are distinguishable.
 - Panic handling restores the terminal where the platform permits.
 
@@ -744,7 +751,7 @@ Herdr Top's differentiating combination is:
 1. A regular managed pane or tab connects to its Herdr named session.
 2. Live workspaces, tabs, panes, Claude/Codex executions, and available recursively nested native sub-agents are shown.
 3. `terminal_id` preserves identity across pane moves while the server runs; after a cold restart, reconciliation relies on Task Run identity rules alone and never on stale physical identifiers.
-4. Cross-pane runs remain `unlinked` without provider-artifact lineage evidence or an explicit Controller relationship event; execution and dependency edges are the only linking evidence.
+4. Cross-pane runs remain `unlinked` in the relationship model without provider-artifact lineage evidence or an explicit Controller relationship event; execution and dependency edges are the only linking evidence, while the UI calls the condition "no recorded task relationships" rather than adding a row annotation.
 5. `dispatch` and `depends_on` create distinct persisted execution and dependency edges.
 6. Duplicate events are idempotent and cycles are rejected.
 7. Watched changes reach the screen within one second at the 95th percentile under target load; the fallback scan adds at most its two-second interval.

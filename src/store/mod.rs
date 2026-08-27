@@ -2337,7 +2337,10 @@ mod tests {
 
     use super::*;
     use crate::activity::{ActivityDurability, ActivityIdentity, ActivityItem};
-    use crate::model::{TopologyEntity, TopologyEntityId};
+    use crate::model::{
+        PaneAgentStatus, PaneSnapshot, SnapshotAgent, TopologyEntity, TopologyEntityId,
+        TopologySnapshot,
+    };
     use crate::reducer::{ApplyOutcome, Reducer};
 
     const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -3405,6 +3408,58 @@ mod tests {
         );
         assert_eq!(restored.model.execution_edges().count(), 1);
         assert_eq!(restored.model.dependency_edges().count(), 1);
+    }
+
+    #[test]
+    fn restore_does_not_recreate_transient_pane_status() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model: crate::model::DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let persist = reducer
+            .reconcile_snapshot(TopologySnapshot {
+                workspaces: vec![Workspace {
+                    workspace_id: "workspace-transient".to_owned(),
+                }],
+                tabs: vec![Tab {
+                    tab_id: "tab-transient".to_owned(),
+                    workspace_id: "workspace-transient".to_owned(),
+                    label: None,
+                }],
+                panes: vec![PaneSnapshot {
+                    pane_id: "pane-transient".to_owned(),
+                    workspace_id: "workspace-transient".to_owned(),
+                    tab_id: "tab-transient".to_owned(),
+                    terminal_id: "terminal-transient".to_owned(),
+                    display_name: None,
+                    agent: Some(SnapshotAgent {
+                        agent_name: "codex".to_owned(),
+                        status: PaneAgentStatus::Working,
+                    }),
+                    agent_session: None,
+                }],
+            })
+            .unwrap();
+        assert_eq!(
+            shared.borrow().pane_agent_status("pane-transient"),
+            Some(PaneAgentStatus::Working)
+        );
+        store.apply_batch(persist).unwrap();
+
+        let restored = store.load_restored_state().unwrap();
+
+        assert!(restored.model.pane("pane-transient").is_some());
+        assert!(
+            restored
+                .model
+                .executions()
+                .any(|execution| execution.pane_id == "pane-transient")
+        );
+        assert_eq!(restored.model.pane_agent_status("pane-transient"), None);
     }
 
     #[test]

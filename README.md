@@ -57,27 +57,43 @@ scope, and the footer keeps the primary controls visible.
 │  ├── Workspace: api                                                                                                    │
 │  │   └── Tab: implementation                                                                                           │
 │  │       ├── Pane: w1:p1 (controller)                                                                                  │
-│  │       │   └── ● Claude controller — tool_use: Agent                                 fable-5  high  8400 8.2/s 17m03s│
-│  │       │       └── ● Codex — running command                                     gpt-5.6-sol xhigh  2140  11/s 03m14s│
+│  │       │   └── ● working Claude controller — tool_use: Agent                         fable-5  high  8400 8.2/s 17m03s│
+│  │       │       └── ○ idle Codex native agent: tests [model:gpt-5.6-sol] [last:1723456789012ms]                      │
 │  │       ├── Pane: w1:p2 (review)                                                                                      │
-│  │       │   └── ⚠ Claude Review failures — tool_use: Bash                          sonnet-4-5  high   920 1.9/s 08m01s│
+│  │       │   └── ⚠ working Claude Review failures — tool_use: Bash                  sonnet-4-5  high   920 1.9/s 08m01s│
 │  │       └── Pane: w1:p3 (tests)                                                                                       │
-│  │           └── ✓ Codex Run unit tests                                            gpt-5.6-sol xhigh  1975  12/s 02m48s│
+│  │           └── ✓ done Codex Run unit tests                                        gpt-5.6-sol xhigh  1975  12/s 02m48s│
 │  ├── Workspace: docs                                                                                                   │
 │  │   └── Tab: review                                                                                                   │
 │  │       └── Pane: w2:p1                                                                                               │
-│  │           └── ◌ Claude Draft guide outline                                        haiku-4-5   low   310 7.4/s 00m42s│
+│  │           └── ◌ queued Claude Draft guide outline                                 haiku-4-5   low   310 7.4/s 00m42s│
 │  └── Unattached Task Runs                                                                                              │
-│      └── ◌ Codex orphan-session [unlinked]                                         gpt-5.6-sol  high     —     —      —│
+│      └── ? unknown Codex orphan-session                                            gpt-5.6-sol  high     —     —      —│
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Activity for selected item ────────────────────────────────────────────────────────────────────────────────────────────┐
 │p:healthy | ctl:available | D4:0                                                                                        │
-│Selected: ● Codex — running command · 03m14s                                                                            │
+│Selected: ○ idle Codex native agent: tests [model:gpt-5.6-sol] [last:1723456789012ms]                                    │
 │selection: stable                                                                                                       │
 │Newest: at=1723456789012 kind=agent_activity source_type=activity provider=Codex durability=current_only                │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 q: stop Top only; agents continue | detach: Top runs | ↑↓ select | f/End follow | tab view | / filter | s summary | ? help
 ```
+
+Every Task Run and visible native Agent row writes its status explicitly:
+
+| Status | Glyph | Meaning |
+| --- | --- | --- |
+| `queued` | `◌` | announced |
+| `working` | `●` | active |
+| `idle` | `○` | waiting |
+| `blocked` | `●` | needs attention |
+| `done` | `✓` | finished |
+| `error` | `✗` | failed |
+| `cancelled` | `⊘` | stopped |
+| `unknown` | `?` | insufficient evidence |
+
+`⚠` is an orthogonal stalled warning: it replaces the normal glyph on a
+non-terminal row but retains the written base status.
 
 The example uses a 120-column tree inner width, so all five fixed metric
 columns are visible: model, effort, output tokens, output tokens per second,
@@ -94,8 +110,8 @@ spawns, spawn output, tool-result bodies, and UUID-shaped text elsewhere are not
 evidence. Without one of those positions, a child is not admitted or displayed;
 herdr-top never guesses from timing, neighboring panes, or shared paths.
 
-See the [TUI guide](docs/tui.md) for the complete key map, row grammar, views,
-overlays, and visibility rules.
+See the [TUI guide](docs/tui.md) for the complete key map, row grammar, status
+source precedence, relationship detail, views, overlays, and visibility rules.
 
 ## Install
 

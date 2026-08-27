@@ -20,6 +20,39 @@ impl ExecState {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PaneAgentStatus {
+    Idle,
+    Working,
+    Blocked,
+    Done,
+    Unknown,
+}
+
+impl PaneAgentStatus {
+    #[must_use]
+    pub fn from_wire(value: Option<&str>) -> Self {
+        match value {
+            Some("idle") => Self::Idle,
+            Some("working") => Self::Working,
+            Some("blocked") => Self::Blocked,
+            Some("done") => Self::Done,
+            Some("unknown") | None => Self::Unknown,
+            Some(_) => Self::Unknown,
+        }
+    }
+
+    #[must_use]
+    pub const fn execution_state(self) -> ExecState {
+        match self {
+            Self::Idle | Self::Done => ExecState::Idle,
+            Self::Working => ExecState::Working,
+            Self::Blocked => ExecState::Blocked,
+            Self::Unknown => ExecState::Unknown,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TaskState {
     Queued,
     Running,
@@ -87,5 +120,38 @@ mod tests {
                 .unwrap(),
             task_state
         );
+    }
+
+    #[test]
+    fn pane_agent_status_preserves_wire_vocabulary() {
+        let cases = [
+            (Some("idle"), PaneAgentStatus::Idle),
+            (Some("working"), PaneAgentStatus::Working),
+            (Some("blocked"), PaneAgentStatus::Blocked),
+            (Some("done"), PaneAgentStatus::Done),
+            (Some("unknown"), PaneAgentStatus::Unknown),
+            (None, PaneAgentStatus::Unknown),
+            (Some("unrecognized"), PaneAgentStatus::Unknown),
+        ];
+
+        for (wire, expected) in cases {
+            assert_eq!(PaneAgentStatus::from_wire(wire), expected);
+        }
+        assert_ne!(PaneAgentStatus::Done, PaneAgentStatus::Idle);
+    }
+
+    #[test]
+    fn pane_agent_status_maps_to_existing_execution_states() {
+        let cases = [
+            (PaneAgentStatus::Idle, ExecState::Idle),
+            (PaneAgentStatus::Working, ExecState::Working),
+            (PaneAgentStatus::Blocked, ExecState::Blocked),
+            (PaneAgentStatus::Done, ExecState::Idle),
+            (PaneAgentStatus::Unknown, ExecState::Unknown),
+        ];
+
+        for (status, expected) in cases {
+            assert_eq!(status.execution_state(), expected);
+        }
     }
 }

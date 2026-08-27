@@ -35,9 +35,9 @@ use crate::model::{
     AgentNodeObservation, AgentSessionReference, AgentSessionReferenceKind,
     ControllerDiagnosticsHandle, DomainModel, EnrichmentDiagnosticsHandle, EventMetadata,
     ExecState, Execution, GapKind, MinimalProviderMetadata, NormalizedEvent, OperatorCommand, Pane,
-    PaneSnapshot, Provider, ProviderDiagnosticsHandle, RunId, RunKey, SharedModel, SnapshotAgent,
-    SourceCoverage, Tab, TopologyAuthority, TopologyEntity, TopologyEntityId, TopologySnapshot,
-    Workspace, sanitize_controller_text,
+    PaneAgentStatus, PaneAgentStatusObservation, PaneSnapshot, Provider, ProviderDiagnosticsHandle,
+    RunId, RunKey, SharedModel, SnapshotAgent, SourceCoverage, Tab, TopologyAuthority,
+    TopologyEntity, TopologyEntityId, TopologySnapshot, Workspace, sanitize_controller_text,
 };
 use crate::performance::{
     Admission, Admitted, PerformanceClock, PerformanceIngress, PerformanceSampler,
@@ -2876,7 +2876,7 @@ fn canonical_topology(mut topology: TopologySnapshot) -> TopologySnapshot {
         );
         agent.agent_name = provider.map(provider_name).unwrap_or("unknown").to_owned();
         // Agent state is a volatile gauge, not topology; comparing it caused reconnect churn.
-        agent.state = ExecState::Unknown;
+        agent.status = PaneAgentStatus::Unknown;
         pane.agent_session = match (provider, pane.agent_session.take()) {
             (Some(_), Some(mut session)) if !session.value.is_empty() => {
                 session.source.clear();
@@ -2936,7 +2936,9 @@ fn current_model_topology(
                 (
                     Some(SnapshotAgent {
                         agent_name,
-                        state: execution.state.clone(),
+                        status: model
+                            .pane_agent_status(&pane.pane_id)
+                            .unwrap_or(PaneAgentStatus::Unknown),
                     }),
                     agent_session,
                 )
@@ -3465,7 +3467,7 @@ impl EventReaderReport {
 struct EnrichmentPayload {
     pane_id: String,
     terminal_id: Option<String>,
-    state: ExecState,
+    status: PaneAgentStatus,
     timestamp_ms: i64,
     receipt_time_ms: i64,
 }
@@ -3834,26 +3836,32 @@ fn rejected_enrichment_pane(message: &str, targets: &BTreeSet<String>) -> Option
 }
 
 fn enrichment_payload(event: &str, data: &Value) -> Option<EnrichmentPayload> {
+    let observation = pane_agent_status_observation(event, data)?;
+    let terminal_id =
+        string_field(data, "terminal_id").or_else(|| nested_string(data, "pane", "terminal_id"));
+    let receipt_time_ms = unix_now_ms();
+    Some(EnrichmentPayload {
+        pane_id: observation.pane_id,
+        terminal_id,
+        status: observation.status,
+        timestamp_ms: receipt_time_ms,
+        receipt_time_ms,
+    })
+}
+
+fn pane_agent_status_observation(event: &str, data: &Value) -> Option<PaneAgentStatusObservation> {
     if event != "pane_agent_status_changed" {
         return None;
     }
     let pane_id =
         string_field(data, "pane_id").or_else(|| nested_string(data, "pane", "pane_id"))?;
-    let terminal_id =
-        string_field(data, "terminal_id").or_else(|| nested_string(data, "pane", "terminal_id"));
-    let state = status_from_value(
+    let status = PaneAgentStatus::from_wire(
         data.get("agent_status")
             .or_else(|| data.get("status"))
-            .or_else(|| data.get("new_status")),
+            .or_else(|| data.get("new_status"))
+            .and_then(Value::as_str),
     );
-    let receipt_time_ms = unix_now_ms();
-    Some(EnrichmentPayload {
-        pane_id,
-        terminal_id,
-        state,
-        timestamp_ms: receipt_time_ms,
-        receipt_time_ms,
-    })
+    Some(PaneAgentStatusObservation { pane_id, status })
 }
 
 fn spawn_event_reader(
@@ -5783,12 +5791,17 @@ async fn apply_received_event(
             return Err(error);
         }
     };
+    let pane_agent_observation = pane_agent_status_observation(&received.event, &received.data)
+        .filter(|observation| shared.borrow().pane(&observation.pane_id).is_some());
     provider.observe_sessionless_codex_events(
         &normalized,
         received_has_sessionless_codex_pane(&received),
     );
-    let produced_observations = !normalized.is_empty();
-    let outcome = apply_collector_observation(reducer, normalized);
+    let produced_observations = !normalized.is_empty() || pane_agent_observation.is_some();
+    let outcome = match pane_agent_observation {
+        Some(observation) => apply_collector_pane_observation(reducer, normalized, observation),
+        None => apply_collector_observation(reducer, normalized),
+    };
     admission.complete();
     let Some(persist) = outcome? else {
         persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
@@ -5834,21 +5847,33 @@ async fn apply_enrichment_payload(
     if !target_set.contains(&payload.pane_id) {
         return Ok(());
     }
+    if shared.borrow().pane(&payload.pane_id).is_none() {
+        return Ok(());
+    }
 
     let events = agent_status_events(
         shared,
         session,
         &payload.pane_id,
         payload.terminal_id.as_deref(),
-        payload.state,
+        payload.status.execution_state(),
         Some((payload.timestamp_ms, payload.receipt_time_ms)),
     );
-    if events.is_empty() {
+    if events.is_empty()
+        && shared.borrow().pane_agent_status(&payload.pane_id) == Some(payload.status)
+    {
         return Ok(());
     }
 
     let admission = performance.admit();
-    let outcome = apply_collector_observation(reducer, events);
+    let outcome = apply_collector_pane_observation(
+        reducer,
+        events,
+        PaneAgentStatusObservation {
+            pane_id: payload.pane_id,
+            status: payload.status,
+        },
+    );
     admission.complete();
     if let Some(persist) = outcome?
         && !persist.is_empty()
@@ -5873,6 +5898,15 @@ fn apply_collector_observation(
     events: Vec<NormalizedEvent>,
 ) -> Result<Option<PersistBatch>, ReducerError> {
     let outcome = reducer.apply_observation(events)?;
+    Ok(collector_apply_outcome(reducer, outcome))
+}
+
+fn apply_collector_pane_observation(
+    reducer: &mut Reducer,
+    events: Vec<NormalizedEvent>,
+    observation: PaneAgentStatusObservation,
+) -> Result<Option<PersistBatch>, ReducerError> {
+    let outcome = reducer.apply_pane_agent_observation(events, observation)?;
     Ok(collector_apply_outcome(reducer, outcome))
 }
 
@@ -6304,24 +6338,18 @@ fn normalize_event(
             }
         }
         "pane_agent_status_changed" => {
-            let state = status_from_value(
-                received
-                    .data
-                    .get("agent_status")
-                    .or_else(|| received.data.get("status"))
-                    .or_else(|| received.data.get("new_status")),
-            );
-            let pane_id = string_field(&received.data, "pane_id")
-                .or_else(|| nested_string(&received.data, "pane", "pane_id"));
             let terminal_id = string_field(&received.data, "terminal_id")
                 .or_else(|| nested_string(&received.data, "pane", "terminal_id"));
-            if let Some(pane_id) = pane_id {
+            if let Some(observation) =
+                pane_agent_status_observation(&received.event, &received.data)
+                && shared.borrow().pane(&observation.pane_id).is_some()
+            {
                 events.extend(agent_status_events(
                     shared,
                     session,
-                    &pane_id,
+                    &observation.pane_id,
                     terminal_id.as_deref(),
-                    state,
+                    observation.status.execution_state(),
                     None,
                 ));
             }
@@ -6454,7 +6482,8 @@ fn append_pane_upsert(
         if should_reuse && !reused {
             let mut updated = execution;
             updated.pane_id.clone_from(&pane.pane_id);
-            updated.state = status_from_str(pane.agent_status.as_deref());
+            updated.state =
+                PaneAgentStatus::from_wire(pane.agent_status.as_deref()).execution_state();
             events.push(NormalizedEvent::ExecutionBegin {
                 metadata: pane_metadata(session, event_kind, &pane),
                 execution: updated,
@@ -6632,7 +6661,7 @@ fn topology_from_snapshot(snapshot: &Snapshot) -> Result<TopologySnapshot, Colle
                 display_name: pane_display_name(pane),
                 agent: pane.agent.as_ref().map(|agent| SnapshotAgent {
                     agent_name: agent.clone(),
-                    state: status_from_str(pane.agent_status.as_deref()),
+                    status: PaneAgentStatus::from_wire(pane.agent_status.as_deref()),
                 }),
                 agent_session: pane.agent_session.as_ref().map(agent_session_reference),
             })
@@ -6706,7 +6735,7 @@ fn execution_begin(session: &str, kind: &str, pane: &PaneInfo) -> NormalizedEven
             pane_id: pane.pane_id.clone(),
             terminal_id: pane.terminal_id.clone(),
             task_run_id: RunId::new(),
-            state: status_from_str(pane.agent_status.as_deref()),
+            state: PaneAgentStatus::from_wire(pane.agent_status.as_deref()).execution_state(),
         },
     }
 }
@@ -7219,19 +7248,6 @@ fn provider_from_name(name: &str) -> Option<Provider> {
         Some(Provider::Claude)
     } else {
         None
-    }
-}
-
-fn status_from_value(value: Option<&Value>) -> ExecState {
-    status_from_str(value.and_then(Value::as_str))
-}
-
-fn status_from_str(value: Option<&str>) -> ExecState {
-    match value {
-        Some("idle" | "done") => ExecState::Idle,
-        Some("working") => ExecState::Working,
-        Some("blocked") => ExecState::Blocked,
-        _ => ExecState::Unknown,
     }
 }
 
@@ -10489,7 +10505,7 @@ mod tests {
                 display_name: None,
                 agent: agent_name.map(|name| SnapshotAgent {
                     agent_name: name.to_owned(),
-                    state: ExecState::Working,
+                    status: PaneAgentStatus::Working,
                 }),
                 agent_session: session.map(|(kind, source, value)| AgentSessionReference {
                     source: source.to_owned(),
@@ -10573,7 +10589,7 @@ mod tests {
             Some((AgentSessionReferenceKind::Id, "herdr:claude", "sid-1")),
         );
         let mut volatile_state = current.clone();
-        volatile_state.panes[0].agent.as_mut().unwrap().state = ExecState::Idle;
+        volatile_state.panes[0].agent.as_mut().unwrap().status = PaneAgentStatus::Idle;
         assert!(
             probe_topology_matches_model(volatile_state, current.clone()),
             "volatile execution state must not trigger topology divergence"
@@ -10674,12 +10690,12 @@ mod tests {
         let (no_agent_projected, mut agent_appeared) = reconciled_probe_topologies(no_agent);
         agent_appeared.panes[0].agent = Some(SnapshotAgent {
             agent_name: "claude".to_owned(),
-            state: ExecState::Working,
+            status: PaneAgentStatus::Working,
         });
         assert_probe_comparison_diverges(&no_agent_projected, agent_appeared, "agent appearance");
 
         let mut changed = probed.clone();
-        changed.panes[0].agent.as_mut().unwrap().state = ExecState::Idle;
+        changed.panes[0].agent.as_mut().unwrap().status = PaneAgentStatus::Idle;
         // Execution state is a volatile gauge and must not define topology identity.
         assert!(probe_topology_matches_model(changed, projected.clone()));
 
@@ -15469,6 +15485,21 @@ mod tests {
 
     fn status_model(states: &[(&str, ExecState)]) -> SharedModel {
         let mut model = DomainModel::default();
+        model.insert_workspace(Workspace {
+            workspace_id: "w1".to_owned(),
+        });
+        model.insert_tab(Tab {
+            tab_id: "w1:t1".to_owned(),
+            workspace_id: "w1".to_owned(),
+            label: None,
+        });
+        model.insert_pane(Pane {
+            pane_id: "w1:p1".to_owned(),
+            workspace_id: "w1".to_owned(),
+            tab_id: "w1:t1".to_owned(),
+            terminal_id: "terminal-1".to_owned(),
+            display_name: None,
+        });
         for (index, (execution_id, state)) in states.iter().enumerate() {
             let run_id = RunId::new();
             model.insert_task_run(TaskRun {
@@ -16364,6 +16395,293 @@ mod tests {
         }
     }
 
+    fn pane_status_test_model(
+        admitted: bool,
+        execution_state: ExecState,
+        pane_status: Option<PaneAgentStatus>,
+    ) -> DomainModel {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        if admitted {
+            model.insert_workspace(Workspace {
+                workspace_id: "w1".to_owned(),
+            });
+            model.insert_tab(Tab {
+                tab_id: "w1:t1".to_owned(),
+                workspace_id: "w1".to_owned(),
+                label: None,
+            });
+            model.insert_pane(Pane {
+                pane_id: "w1:p1".to_owned(),
+                workspace_id: "w1".to_owned(),
+                tab_id: "w1:t1".to_owned(),
+                terminal_id: "terminal-1".to_owned(),
+                display_name: None,
+            });
+        }
+        model.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::Controller("pane-status-run".to_owned()),
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Running,
+            has_controller_task_state_event: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        model.insert_execution(Execution {
+            execution_id: "execution-1".to_owned(),
+            pane_id: "w1:p1".to_owned(),
+            terminal_id: "terminal-1".to_owned(),
+            task_run_id: run_id,
+            state: execution_state,
+        });
+        if let Some(status) = pane_status {
+            model.set_pane_agent_status("w1:p1".to_owned(), status);
+        }
+        model
+    }
+
+    async fn apply_primary_pane_status_for_test(
+        model: DomainModel,
+        status: &str,
+    ) -> (Arc<DomainModel>, i64, bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut persistence =
+            RuntimePersistence::new_for_test(writer, Arc::new(RecordingOccurrenceSink::default()))
+                .0;
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model,
+            next_ordinal: 2,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let (provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+        let (performance, _sampler) =
+            performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
+        let mut owner = OwnerTracker {
+            terminal_id: None,
+            pane_id: None,
+            started_at_ms: 1,
+        };
+
+        let produced = apply_received_event(
+            &mut reducer,
+            &shared,
+            &mut persistence,
+            &mut owner,
+            "status-session",
+            status_received(status),
+            performance.admit(),
+            &mut PendingTopologyClosures::default(),
+            &mut provider,
+        )
+        .await
+        .unwrap();
+        let snapshot = Arc::clone(&shared.borrow());
+
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+        drop(persistence);
+        shutdown_writer(lifecycle).await;
+        let connection = rusqlite::Connection::open(crate::store::database_path(&root)).unwrap();
+        let ledger_count = connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        (snapshot, ledger_count, produced)
+    }
+
+    async fn apply_enrichment_pane_status_for_test(
+        model: DomainModel,
+        status: PaneAgentStatus,
+    ) -> (Arc<DomainModel>, i64) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut persistence =
+            RuntimePersistence::new_for_test(writer, Arc::new(RecordingOccurrenceSink::default()))
+                .0;
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model,
+            next_ordinal: 2,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let (provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+        let (performance, _sampler) =
+            performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
+
+        apply_enrichment_payload(
+            &mut reducer,
+            &shared,
+            &mut persistence,
+            "status-session",
+            EnrichmentPayload {
+                pane_id: "w1:p1".to_owned(),
+                terminal_id: Some("terminal-1".to_owned()),
+                status,
+                timestamp_ms: 111,
+                receipt_time_ms: 222,
+            },
+            &BTreeSet::from(["w1:p1".to_owned()]),
+            &performance,
+            &mut PendingTopologyClosures::default(),
+            &mut provider,
+        )
+        .await
+        .unwrap();
+        let snapshot = Arc::clone(&shared.borrow());
+
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+        drop(persistence);
+        shutdown_writer(lifecycle).await;
+        let connection = rusqlite::Connection::open(crate::store::database_path(&root)).unwrap();
+        let ledger_count = connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        (snapshot, ledger_count)
+    }
+
+    #[test]
+    fn pane_status_parser_keeps_all_public_values() {
+        for (wire, expected) in [
+            ("idle", PaneAgentStatus::Idle),
+            ("working", PaneAgentStatus::Working),
+            ("blocked", PaneAgentStatus::Blocked),
+            ("done", PaneAgentStatus::Done),
+            ("unknown", PaneAgentStatus::Unknown),
+        ] {
+            let observation = pane_agent_status_observation(
+                "pane_agent_status_changed",
+                &json!({"pane_id": "w1:p1", "agent_status": wire}),
+            )
+            .unwrap();
+            assert_eq!(observation.pane_id, "w1:p1");
+            assert_eq!(observation.status, expected);
+        }
+        assert!(
+            pane_agent_status_observation(
+                "pane_updated",
+                &json!({"pane_id": "w1:p1", "agent_status": "done"}),
+            )
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_idle_to_done_updates_transient_status_without_ledger_event() {
+        let model = pane_status_test_model(true, ExecState::Idle, Some(PaneAgentStatus::Idle));
+
+        let (snapshot, ledger_count, produced) =
+            apply_primary_pane_status_for_test(model, "done").await;
+
+        assert!(produced);
+        assert_eq!(
+            snapshot.pane_agent_status("w1:p1"),
+            Some(PaneAgentStatus::Done)
+        );
+        assert_eq!(
+            snapshot.execution("execution-1").unwrap().state,
+            ExecState::Idle
+        );
+        assert_eq!(ledger_count, 0);
+    }
+
+    #[tokio::test]
+    async fn enrichment_idle_to_done_updates_transient_status_without_ledger_event() {
+        let model = pane_status_test_model(true, ExecState::Idle, Some(PaneAgentStatus::Idle));
+
+        let (snapshot, ledger_count) =
+            apply_enrichment_pane_status_for_test(model, PaneAgentStatus::Done).await;
+
+        assert_eq!(
+            snapshot.pane_agent_status("w1:p1"),
+            Some(PaneAgentStatus::Done)
+        );
+        assert_eq!(
+            snapshot.execution("execution-1").unwrap().state,
+            ExecState::Idle
+        );
+        assert_eq!(ledger_count, 0);
+    }
+
+    #[test]
+    fn snapshot_keeps_done_distinct_from_idle_for_display() {
+        let mut snapshot = snapshot_with_names();
+        snapshot.panes[0].agent = Some("codex".to_owned());
+        snapshot.panes[0].agent_status = Some("idle".to_owned());
+        let mut done = snapshot.panes[0].clone();
+        done.pane_id = "w1:p5".to_owned();
+        done.terminal_id = "terminal-5".to_owned();
+        done.agent_status = Some("done".to_owned());
+        snapshot.panes.push(done);
+
+        let topology = topology_from_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            topology.panes[0].agent.as_ref().unwrap().status,
+            PaneAgentStatus::Idle
+        );
+        assert_eq!(
+            topology.panes[1].agent.as_ref().unwrap().status,
+            PaneAgentStatus::Done
+        );
+        let (mut reducer, shared) = empty_reducer();
+        reducer.reconcile_snapshot(topology).unwrap();
+        assert_eq!(
+            shared.borrow().pane_agent_status("w1:p4"),
+            Some(PaneAgentStatus::Idle)
+        );
+        assert_eq!(
+            shared.borrow().pane_agent_status("w1:p5"),
+            Some(PaneAgentStatus::Done)
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_pane_status_fails_safe_without_execution_guess() {
+        let model = pane_status_test_model(true, ExecState::Idle, Some(PaneAgentStatus::Idle));
+
+        let (snapshot, _ledger_count, produced) =
+            apply_primary_pane_status_for_test(model, "unrecognized").await;
+
+        assert!(produced);
+        assert_eq!(
+            snapshot.pane_agent_status("w1:p1"),
+            Some(PaneAgentStatus::Unknown)
+        );
+        assert_eq!(
+            snapshot.execution("execution-1").unwrap().state,
+            ExecState::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn unadmitted_pane_status_is_not_retained() {
+        let model = pane_status_test_model(false, ExecState::Idle, None);
+
+        let (snapshot, ledger_count, produced) =
+            apply_primary_pane_status_for_test(model, "working").await;
+
+        assert!(!produced);
+        assert_eq!(snapshot.pane_agent_status("w1:p1"), None);
+        assert_eq!(
+            snapshot.execution("execution-1").unwrap().state,
+            ExecState::Idle
+        );
+        assert_eq!(ledger_count, 0);
+    }
+
     fn inactive_provider_integration() -> (
         mpsc::Sender<ProviderIngressEvent>,
         ProviderIntegration,
@@ -16581,7 +16899,7 @@ mod tests {
             EnrichmentPayload {
                 pane_id: "w1:p1".to_owned(),
                 terminal_id: Some("terminal-1".to_owned()),
-                state: ExecState::Working,
+                status: PaneAgentStatus::Working,
                 timestamp_ms: 1_900_000_000_111,
                 receipt_time_ms: 1_900_000_000_222,
             },
@@ -16680,7 +16998,7 @@ mod tests {
             EnrichmentPayload {
                 pane_id: "w1:p1".to_owned(),
                 terminal_id: Some("terminal-1".to_owned()),
-                state: ExecState::Working,
+                status: PaneAgentStatus::Working,
                 timestamp_ms: 111,
                 receipt_time_ms: 222,
             },
@@ -17948,7 +18266,7 @@ mod provider_integration_tests {
         harness.apply(terminal).await;
         let terminal_row = harness.row_label(run_id);
         assert!(
-            terminal_row.starts_with('✗'),
+            terminal_row.starts_with("⊘ cancelled"),
             "unexpected terminal row: {terminal_row}"
         );
         assert!(!terminal_row.contains("must disappear"));
@@ -18076,7 +18394,7 @@ mod provider_integration_tests {
         assert!(
             harness
                 .row_label(meta_id)
-                .contains("● reviewer Review the meta-derived subject"),
+                .contains("● working reviewer Review the meta-derived subject"),
             "meta.json kind and subject were not first after the status glyph; actual row: {:?}",
             harness.row_label(meta_id)
         );
@@ -19234,7 +19552,7 @@ mod provider_integration_tests {
         harness: &mut LaneModelHarness,
         provider: &mut ProviderIntegration,
         agent: &str,
-        state: ExecState,
+        status: PaneAgentStatus,
         agent_session: Option<AgentSessionReference>,
     ) {
         let sessionless_codex_terminals = if agent == "codex" && agent_session.is_none() {
@@ -19261,7 +19579,7 @@ mod provider_integration_tests {
                     display_name: None,
                     agent: Some(SnapshotAgent {
                         agent_name: agent.to_owned(),
-                        state,
+                        status,
                     }),
                     agent_session,
                 }],
@@ -19434,7 +19752,7 @@ mod provider_integration_tests {
             &mut harness,
             &mut provider,
             "codex",
-            ExecState::Working,
+            PaneAgentStatus::Working,
             None,
         )
         .await;
@@ -19461,7 +19779,7 @@ mod provider_integration_tests {
             &mut harness,
             &mut provider,
             "codex",
-            ExecState::Working,
+            PaneAgentStatus::Working,
             Some(AgentSessionReference {
                 source: "herdr".to_owned(),
                 agent: "codex".to_owned(),
@@ -19519,7 +19837,7 @@ mod provider_integration_tests {
             &mut harness,
             &mut provider,
             "codex",
-            ExecState::Working,
+            PaneAgentStatus::Working,
             None,
         )
         .await;
@@ -19545,7 +19863,7 @@ mod provider_integration_tests {
             &mut harness,
             &mut provider,
             "claude",
-            ExecState::Working,
+            PaneAgentStatus::Working,
             None,
         )
         .await;
@@ -19776,7 +20094,7 @@ mod provider_integration_tests {
             &mut harness,
             &mut provider,
             "codex",
-            ExecState::Working,
+            PaneAgentStatus::Working,
             None,
         )
         .await;
@@ -19798,8 +20116,30 @@ mod provider_integration_tests {
             observed_at_ms: target.detected_at_ms,
         };
 
-        g7_install_pane_snapshot(&mut harness, &mut provider, "codex", ExecState::Ended, None)
-            .await;
+        let execution_id = harness
+            .shared
+            .borrow()
+            .executions()
+            .find(|execution| {
+                execution.task_run_id == target.run_id && !execution.state.is_terminal()
+            })
+            .unwrap()
+            .execution_id
+            .clone();
+        let ApplyOutcome::Applied(persist) = harness
+            .reducer
+            .apply(NormalizedEvent::ExecutionEnd {
+                metadata: metadata("session", "pane_exited"),
+                execution_id,
+            })
+            .unwrap()
+        else {
+            panic!("terminal event should apply");
+        };
+        let _ = persist_submission(&mut harness.persistence, &mut harness.reducer, persist)
+            .await
+            .unwrap();
+        provider.publish_targets(&harness.shared);
         assert_eq!(provider.published_targets.codex_panes().count(), 0);
         assert!(
             harness
@@ -20574,7 +20914,7 @@ mod provider_integration_tests {
             &mut harness,
             &mut provider,
             "codex",
-            ExecState::Working,
+            PaneAgentStatus::Working,
             None,
         )
         .await;

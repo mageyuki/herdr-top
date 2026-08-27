@@ -16,9 +16,7 @@ use crate::diagnostics::{
     OccurrenceLogStatus, OwnerFreshness, RuntimeDiagnosticsSnapshot,
 };
 use crate::herdr::collector::{ObservationQuality, PerformancePublication};
-use crate::model::{
-    AgentNode, DisplayOrdinal, DomainModel, ExecState, Provider, RunId, RunKey, TaskRun, TaskState,
-};
+use crate::model::{AgentNode, DisplayOrdinal, DomainModel, Provider, RunId, RunKey, TaskRun};
 use crate::performance::PerformanceDegradationReason;
 use crate::store::writer::{
     DurabilityDisposition, PersistenceFailureCode, PersistenceOperation, PersistencePhase,
@@ -27,7 +25,7 @@ use crate::store::writer::{
 
 use super::app::{AppState, HeaderInputs, NodeKey, Overlay, TuiSetup, ViewMode};
 use super::dag;
-use super::projection::{self, RowProjection};
+use super::projection::{self, DisplayStatus, RowProjection, StatusReadModel};
 
 const MIN_WIDTH: u16 = 48;
 const MIN_HEIGHT: u16 = 14;
@@ -77,7 +75,7 @@ impl LiveLineReadModel {
 #[derive(Clone, Copy)]
 struct RunRowSignals<'a> {
     live_lines: &'a LiveLineReadModel,
-    stalled: bool,
+    display_status: DisplayStatus,
     show_duration_suffix: bool,
 }
 
@@ -87,6 +85,7 @@ struct RunRowContext<'model, 'data> {
     newest_agents: &'data NewestAgentNodes<'model>,
     live_lines: &'data LiveLineReadModel,
     stalled_runs: &'data HashSet<RunId>,
+    statuses: &'data StatusReadModel,
     now_ms: i64,
 }
 
@@ -122,6 +121,7 @@ pub(crate) struct TreeRow {
     pub(crate) depth: usize,
     pub(crate) label: String,
     pub(crate) label_without_duration_suffix: Option<String>,
+    pub(crate) display_status: Option<DisplayStatus>,
     pub(crate) prerequisites: Vec<String>,
     pub(crate) dependents: Vec<String>,
 }
@@ -513,6 +513,63 @@ fn render_header(
     frame.render_widget(Paragraph::new(line).block(block), area);
 }
 
+fn styled_status_line(
+    text: String,
+    status_start: usize,
+    display: Option<DisplayStatus>,
+    selected: bool,
+) -> Line<'static> {
+    let mut base_style = Style::default();
+    if selected {
+        base_style = base_style.add_modifier(Modifier::REVERSED);
+    }
+    let Some(display) = display else {
+        return Line::from(Span::styled(text, base_style));
+    };
+    if status_start >= text.len() || !text.is_char_boundary(status_start) {
+        return Line::from(Span::styled(text, base_style));
+    }
+
+    let token = format!("{} {}", display.glyph(), display.status.label());
+    let mut status_end = status_start.saturating_add(token.len()).min(text.len());
+    while status_end > status_start && !text.is_char_boundary(status_end) {
+        status_end = status_end.saturating_sub(1);
+    }
+    if status_end == status_start {
+        return Line::from(Span::styled(text, base_style));
+    }
+
+    let before = text[..status_start].to_owned();
+    let status = text[status_start..status_end].to_owned();
+    let after = text[status_end..].to_owned();
+    let mut status_style = if display.stalled {
+        Style::default().fg(Color::Yellow)
+    } else {
+        match display.status {
+            projection::TaskDisplayStatus::Working | projection::TaskDisplayStatus::Done => {
+                Style::default().fg(Color::Green)
+            }
+            projection::TaskDisplayStatus::Blocked | projection::TaskDisplayStatus::Error => {
+                Style::default().fg(Color::Red)
+            }
+            projection::TaskDisplayStatus::Cancelled => Style::default().fg(Color::Yellow),
+            projection::TaskDisplayStatus::Queued
+            | projection::TaskDisplayStatus::Idle
+            | projection::TaskDisplayStatus::Unknown => {
+                Style::default().add_modifier(Modifier::DIM)
+            }
+        }
+    };
+    if selected {
+        status_style = status_style.add_modifier(Modifier::REVERSED);
+    }
+    Line::from(vec![
+        Span::styled(before, base_style),
+        Span::styled(status, status_style),
+        Span::styled(after, base_style),
+    ])
+}
+
 fn render_tree(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -574,12 +631,12 @@ fn render_tree(
                     render_metric_block(metrics.as_ref(), columns, now_ms)
                 )
             };
-            let style = if selected {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
-            Line::from(Span::styled(text, style))
+            styled_status_line(
+                text,
+                marker.len().saturating_add(prefix.len()),
+                row.display_status,
+                selected,
+            )
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), inner);
@@ -738,12 +795,7 @@ fn render_dag(frame: &mut Frame<'_>, area: Rect, rows: &[TreeRow], state: &AppSt
             let prerequisites = pad_to_width(&row.prerequisites.join(", "), prerequisite_width);
             let dependents = pad_to_width(&row.dependents.join(", "), dependent_width);
             let text = truncate_to_width(&format!("{run} │ {prerequisites} │ {dependents}"), width);
-            let style = if selected {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
-            Line::from(Span::styled(text, style))
+            styled_status_line(text, marker.len(), row.display_status, selected)
         })
         .collect::<Vec<_>>();
     frame.render_widget(
@@ -1067,6 +1119,14 @@ fn help_lines(diagnostics: &RuntimeDiagnosticsSnapshot, setup: &TuiSetup) -> Vec
         "Recovery: ancestor, stable neighbor, first; reasons are typed".to_owned(),
         "Controller input is optional capability; standalone setup is optional".to_owned(),
     ];
+    lines.extend([
+        "Task status: queued=announced, working=active, idle=waiting, blocked=needs attention"
+            .to_owned(),
+        "Task status: done=finished, error=failed, cancelled=stopped, unknown=insufficient evidence"
+            .to_owned(),
+        "Warning: ⚠ means stalled; it does not replace the status word".to_owned(),
+        "Status source: pane-backed rows use Herdr; headless rows use task/agent evidence".to_owned(),
+    ]);
     lines.push(match diagnostics.persistence {
         PersistenceStatus::Healthy => "persistence: healthy".to_owned(),
         PersistenceStatus::Degraded { failure } => format!(
@@ -1474,20 +1534,32 @@ fn quality_style(quality: ObservationQuality) -> Style {
     Style::default().fg(color).add_modifier(Modifier::BOLD)
 }
 
+#[cfg(test)]
 pub(crate) fn build_tree_rows(
     model: &DomainModel,
     state: &AppState,
     newest_agents: &NewestAgentNodes<'_>,
+) -> Vec<TreeRow> {
+    let statuses = StatusReadModel::from_model(model, state.now_ms());
+    build_tree_rows_with_statuses(model, state, newest_agents, &statuses)
+}
+
+fn build_tree_rows_with_statuses(
+    model: &DomainModel,
+    state: &AppState,
+    newest_agents: &NewestAgentNodes<'_>,
+    statuses: &StatusReadModel,
 ) -> Vec<TreeRow> {
     let mut rows = vec![TreeRow {
         key: NodeKey::Session,
         depth: 0,
         label: format!("Session: {}", state.session_display_name()),
         label_without_duration_suffix: None,
+        display_status: None,
         prerequisites: Vec::new(),
         dependents: Vec::new(),
     }];
-    append_execution_tree_rows(&mut rows, model, state, newest_agents);
+    append_execution_tree_rows(&mut rows, model, state, newest_agents, statuses);
     rows
 }
 
@@ -1527,12 +1599,15 @@ pub(crate) fn build_uncollapsed_rows(model: &DomainModel, state: &AppState) -> V
 }
 
 fn build_full_rows(model: &DomainModel, state: &AppState) -> Vec<TreeRow> {
+    let statuses = StatusReadModel::from_model(model, state.now_ms());
     match state.view_mode() {
         ViewMode::ExecutionTree => {
             let newest_agents = newest_agent_nodes(model, state.now_ms());
-            build_tree_rows(model, state, &newest_agents)
+            build_tree_rows_with_statuses(model, state, &newest_agents, &statuses)
         }
-        ViewMode::DependencyDag => dag::build_rows(model, state.dag_order(), state.now_ms()),
+        ViewMode::DependencyDag => {
+            dag::build_rows_with_statuses(model, state.dag_order(), state.now_ms(), &statuses)
+        }
     }
 }
 
@@ -1541,6 +1616,7 @@ fn append_execution_tree_rows<'model>(
     model: &'model DomainModel,
     state: &AppState,
     newest_agents: &NewestAgentNodes<'model>,
+    statuses: &StatusReadModel,
 ) {
     let (mut pane_runs, unattached, nested_runs) = place_runs(model, state);
     let live_lines = LiveLineReadModel::from_model(model);
@@ -1552,6 +1628,7 @@ fn append_execution_tree_rows<'model>(
         newest_agents,
         live_lines: &live_lines,
         stalled_runs: &stalled_runs,
+        statuses,
         now_ms: state.now_ms(),
     };
     let mut run_render_state = RunRenderState::default();
@@ -1572,6 +1649,7 @@ fn append_execution_tree_rows<'model>(
             depth: 1,
             label: format!("Workspace: {}", safe_text(&workspace.workspace_id)),
             label_without_duration_suffix: None,
+            display_status: None,
             prerequisites: Vec::new(),
             dependents: Vec::new(),
         });
@@ -1594,6 +1672,7 @@ fn append_execution_tree_rows<'model>(
                 depth: 2,
                 label: topology_row_label("Tab", &tab.tab_id, tab.label.as_deref()),
                 label_without_duration_suffix: None,
+                display_status: None,
                 prerequisites: Vec::new(),
                 dependents: Vec::new(),
             });
@@ -1618,6 +1697,7 @@ fn append_execution_tree_rows<'model>(
                     depth: 3,
                     label: topology_row_label("Pane", &pane.pane_id, pane.display_name.as_deref()),
                     label_without_duration_suffix: None,
+                    display_status: None,
                     prerequisites: Vec::new(),
                     dependents: Vec::new(),
                 });
@@ -1641,6 +1721,7 @@ fn append_execution_tree_rows<'model>(
             depth: 1,
             label: "Unattached Task Runs".to_owned(),
             label_without_duration_suffix: None,
+            display_status: None,
             prerequisites: Vec::new(),
             dependents: Vec::new(),
         });
@@ -1830,9 +1911,15 @@ fn append_run_subtree(
         return;
     };
     let newest_agent = context.newest_agents.get(&run_id).copied();
+    let display_status = context.statuses.task_display_status(
+        context.model,
+        run,
+        pane_id,
+        context.stalled_runs.contains(&run_id),
+    );
     let signals = RunRowSignals {
         live_lines: context.live_lines,
-        stalled: context.stalled_runs.contains(&run_id),
+        display_status,
         show_duration_suffix: true,
     };
     rows.push(TreeRow {
@@ -1862,6 +1949,7 @@ fn append_run_subtree(
                 ..signals
             },
         )),
+        display_status: Some(display_status),
         prerequisites: Vec::new(),
         dependents: Vec::new(),
     });
@@ -1869,6 +1957,7 @@ fn append_run_subtree(
         .model
         .agent_nodes()
         .filter(|agent| agent.task_run_id == run_id)
+        .filter(|agent| agent.parent_agent_node_id.is_some())
         .filter(|agent| !is_live_line_agent(agent))
         .filter(|agent| !projection::agent_node_is_display_stale(agent, context.now_ms))
         .filter(|agent| {
@@ -1882,7 +1971,7 @@ fn append_run_subtree(
             append_run_subtree(
                 rows,
                 (*child_run_id, false),
-                pane_id,
+                None,
                 depth.saturating_add(1),
                 false,
                 context,
@@ -1941,14 +2030,16 @@ fn append_agent_subtree(
     if !visited.insert(agent.agent_node_id.clone()) {
         return;
     }
+    let display_status = projection::native_agent_display_status(agent);
     rows.push(TreeRow {
         key: NodeKey::Agent {
             agent_node_id: agent.agent_node_id.clone(),
             pane_id: pane_id.map(str::to_owned),
         },
         depth,
-        label: agent_node_label(agent),
+        label: agent_node_label(agent, display_status),
         label_without_duration_suffix: None,
+        display_status: Some(display_status),
         prerequisites: Vec::new(),
         dependents: Vec::new(),
     });
@@ -1966,40 +2057,36 @@ fn append_agent_subtree(
     }
 }
 
-fn agent_node_label(agent: &AgentNode) -> String {
+fn agent_node_label(agent: &AgentNode, display_status: DisplayStatus) -> String {
     let identity = agent
         .native_session_id
         .as_deref()
         .unwrap_or(&agent.agent_node_id);
-    let state = agent
-        .state
-        .as_ref()
-        .map(exec_state_label)
-        .unwrap_or("unknown");
-    let model = agent
-        .model_id
-        .as_deref()
-        .map(safe_text)
-        .unwrap_or_else(|| "unknown".to_owned());
-    let activity = agent
-        .last_activity_at_ms
-        .map_or_else(|| "unknown".to_owned(), |value| format!("{value}ms"));
-    format!(
-        "{} native agent: {} [state:{state}] [model:{model}] [last:{activity}]",
+    let mut label = format!(
+        "{} {} {} native agent: {}",
+        display_status.glyph(),
+        display_status.status.label(),
         provider_label(agent.provider),
         safe_text(identity),
-    )
+    );
+    if let Some(model) = agent.model_id.as_deref() {
+        label.push_str(&format!(" [model:{}]", safe_text(model)));
+    }
+    if let Some(activity) = agent.last_activity_at_ms {
+        label.push_str(&format!(" [last:{activity}ms]"));
+    }
+    label
 }
 
 pub(crate) fn task_run_label(
     model: &DomainModel,
     run: &TaskRun,
+    display_status: DisplayStatus,
     shared: bool,
     now_ms: i64,
-    stalled: bool,
     show_duration_suffix: bool,
 ) -> String {
-    let mut label = run_row_head(model, run, stalled);
+    let mut label = run_row_head(model, run, display_status);
     if show_duration_suffix {
         append_run_duration(&mut label, run, now_ms);
     }
@@ -2021,7 +2108,7 @@ fn task_run_label_for_placement(
         newest_agent,
         now_ms,
         signals.live_lines,
-        signals.stalled,
+        signals.display_status,
         signals.show_duration_suffix,
     );
     append_task_run_annotations(model, run, label, shared, show_dispatch_parent)
@@ -2039,15 +2126,6 @@ fn append_task_run_annotations(
     }
     if show_dispatch_parent && let Some(parent) = dispatch_parent_run(model, run.run_id) {
         label.push_str(&format!(" [dispatched by: {}]", short_run_name(parent)));
-    }
-    let linked = model
-        .execution_edges()
-        .any(|edge| edge.parent_run_id == run.run_id || edge.child_run_id == run.run_id)
-        || model.dependency_edges().any(|edge| {
-            edge.prerequisite_run_id == run.run_id || edge.dependent_run_id == run.run_id
-        });
-    if !linked {
-        label.push_str(" [unlinked]");
     }
     label
 }
@@ -2099,13 +2177,15 @@ fn run_row_label(model: &DomainModel, run: &TaskRun, now_ms: i64) -> String {
     let newest_agent = newest_agent_node(model, run.run_id, now_ms);
     let stalled = projection::stalled_run_ids(model, now_ms, crate::activity::stall_warn_ms())
         .contains(&run.run_id);
+    let statuses = StatusReadModel::from_model(model, now_ms);
+    let display_status = statuses.task_display_status(model, run, None, stalled);
     run_row_label_with_agent(
         model,
         run,
         newest_agent,
         now_ms,
         &LiveLineReadModel::default(),
-        stalled,
+        display_status,
         true,
     )
 }
@@ -2116,10 +2196,10 @@ fn run_row_label_with_agent(
     newest_agent: Option<&AgentNode>,
     now_ms: i64,
     live_lines: &LiveLineReadModel,
-    stalled: bool,
+    display_status: DisplayStatus,
     show_duration_suffix: bool,
 ) -> String {
-    let mut label = run_row_head(model, run, stalled);
+    let mut label = run_row_head(model, run, display_status);
     let live_line = live_lines.get(&run.run_id).map(str::to_owned).or_else(|| {
         newest_agent
             .filter(|agent| run_uses_claude_tool_line(run, agent))
@@ -2150,9 +2230,12 @@ fn run_row_label_with_agent(
     label
 }
 
-fn run_row_head(model: &DomainModel, run: &TaskRun, stalled: bool) -> String {
-    let mut label = status_glyph(run.state, stalled).to_owned();
-    label.push(' ');
+fn run_row_head(model: &DomainModel, run: &TaskRun, display_status: DisplayStatus) -> String {
+    let mut label = format!(
+        "{} {} ",
+        display_status.glyph(),
+        display_status.status.label()
+    );
     let run_kind = projection::run_kind_label(model, run);
     label.push_str(&run_kind);
     let subject = if is_codex_worker(model, run) {
@@ -2209,18 +2292,6 @@ fn is_codex_worker(model: &DomainModel, run: &TaskRun) -> bool {
     ) && model
         .execution_edges()
         .any(|edge| edge.child_run_id == run.run_id)
-}
-
-fn status_glyph(state: TaskState, stalled: bool) -> &'static str {
-    if stalled && !state.is_terminal() {
-        return "⚠";
-    }
-    match state {
-        TaskState::Running | TaskState::Blocked => "●",
-        TaskState::Completed => "✓",
-        TaskState::Failed | TaskState::Cancelled => "✗",
-        TaskState::Queued | TaskState::EndedUnknown => "◌",
-    }
 }
 
 fn run_subject_fallback(run: &TaskRun) -> String {
@@ -2297,17 +2368,6 @@ fn provider_label(provider: Provider) -> &'static str {
     }
 }
 
-fn exec_state_label(state: &ExecState) -> &'static str {
-    match state {
-        ExecState::Unknown => "unknown",
-        ExecState::Idle => "idle",
-        ExecState::Working => "working",
-        ExecState::Blocked => "blocked",
-        ExecState::Ended => "ended",
-        ExecState::Stale { .. } => "stale",
-    }
-}
-
 fn safe_text(value: &str) -> String {
     projection::escape_controls(value)
 }
@@ -2349,7 +2409,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::buffer::{Buffer, CellWidth};
+    use ratatui::buffer::{Buffer, Cell, CellWidth};
     use ratatui::text::{Line, Span};
     use tokio::sync::watch;
 
@@ -2364,7 +2424,8 @@ mod tests {
     };
     use crate::model::{
         AgentNode, DependencyEdge, DisplayOrdinal, DomainModel, ExecState, Execution,
-        ExecutionEdge, Pane, Provider, RunId, RunKey, Tab, TaskRun, TaskState, Workspace,
+        ExecutionEdge, Pane, PaneAgentStatus, Provider, RunId, RunKey, Tab, TaskRun, TaskState,
+        Workspace,
     };
     use crate::performance::{PerformanceDegradationReason, PerformanceSnapshot};
     use crate::store::writer::PersistenceStatus;
@@ -2420,7 +2481,7 @@ mod tests {
             native_session_id: Some("investigate".to_owned()),
             task_run_id: run,
             display_ordinal: DisplayOrdinal::new(8),
-            parent_agent_node_id: None,
+            parent_agent_node_id: Some("provider-root".to_owned()),
             state: Some(ExecState::Working),
             model_id: Some("gpt-test".to_owned()),
             last_event_kind: Some("assistant".to_owned()),
@@ -2519,19 +2580,426 @@ mod tests {
         })
     }
 
+    fn display(status: projection::TaskDisplayStatus) -> projection::DisplayStatus {
+        projection::DisplayStatus::new(status, projection::StatusSource::TaskState)
+    }
+
+    #[test]
+    fn task_rows_write_glyph_status_and_worker_kind() {
+        for (state, status, run_kind, subject, expected) in [
+            (
+                TaskState::Queued,
+                projection::TaskDisplayStatus::Queued,
+                "Codex",
+                "Prepare worker",
+                "◌ queued Codex Prepare worker",
+            ),
+            (
+                TaskState::Running,
+                projection::TaskDisplayStatus::Working,
+                "Codex",
+                "Run tests",
+                "● working Codex Run tests",
+            ),
+            (
+                TaskState::Running,
+                projection::TaskDisplayStatus::Idle,
+                "Claude",
+                "Wait",
+                "○ idle Claude Wait",
+            ),
+            (
+                TaskState::Blocked,
+                projection::TaskDisplayStatus::Blocked,
+                "Codex",
+                "Approval gate",
+                "● blocked Codex Approval gate",
+            ),
+            (
+                TaskState::Completed,
+                projection::TaskDisplayStatus::Done,
+                "Claude",
+                "Finished",
+                "✓ done Claude Finished",
+            ),
+            (
+                TaskState::Failed,
+                projection::TaskDisplayStatus::Error,
+                "Codex",
+                "Failed",
+                "✗ error Codex Failed",
+            ),
+            (
+                TaskState::Cancelled,
+                projection::TaskDisplayStatus::Cancelled,
+                "Claude",
+                "Stopped",
+                "⊘ cancelled Claude Stopped",
+            ),
+            (
+                TaskState::EndedUnknown,
+                projection::TaskDisplayStatus::Unknown,
+                "provisional",
+                "unknown-run",
+                "? unknown provisional unknown-run",
+            ),
+        ] {
+            let task_run = label_run(
+                RunId::new(),
+                RunKey::Controller("fixture".to_owned()),
+                state,
+                None,
+                None,
+                Some(subject),
+            );
+            let mut model = DomainModel::default();
+            model.set_run_kind(task_run.run_id, run_kind.to_owned());
+
+            assert_eq!(
+                task_run_label(&model, &task_run, display(status), false, 0, false),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn stalled_rows_keep_their_base_status_word() {
+        let task_run = label_run(
+            RunId::new(),
+            RunKey::Controller("fixture".to_owned()),
+            TaskState::Running,
+            None,
+            None,
+            Some("Quiet worker"),
+        );
+        let mut model = DomainModel::default();
+        model.set_run_kind(task_run.run_id, "Codex".to_owned());
+        let stalled = projection::DisplayStatus {
+            status: projection::TaskDisplayStatus::Working,
+            source: projection::StatusSource::TaskState,
+            stalled: true,
+        };
+
+        assert_eq!(
+            task_run_label(&model, &task_run, stalled, false, 0, false),
+            "⚠ working Codex Quiet worker",
+        );
+    }
+
+    #[test]
+    fn tree_shared_run_uses_occurrence_specific_status() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut model = placement_model(&["pane-a", "pane-b"]);
+        insert_placement_run(&mut model, run_id, "shared", 1);
+        for (pane_id, status) in [
+            ("pane-a", PaneAgentStatus::Working),
+            ("pane-b", PaneAgentStatus::Blocked),
+        ] {
+            insert_placement_execution(
+                &mut model,
+                run_id,
+                &format!("execution-{pane_id}"),
+                pane_id,
+                ExecState::Working,
+            );
+            model.set_pane_agent_status(pane_id.to_owned(), status);
+        }
+
+        let rows = build_rows(&model, &AppState::default());
+        let row_for = |pane_id: &str| {
+            rows.iter()
+                .find(|row| {
+                    matches!(
+                        &row.key,
+                        NodeKey::Run {
+                            run_id: candidate,
+                            pane_id: Some(candidate_pane),
+                        } if *candidate == run_id && candidate_pane == pane_id
+                    )
+                })
+                .unwrap()
+        };
+
+        assert_eq!(
+            row_for("pane-a").display_status,
+            Some(projection::DisplayStatus::new(
+                projection::TaskDisplayStatus::Working,
+                projection::StatusSource::PaneAgentStatus,
+            )),
+        );
+        assert!(row_for("pane-a").label.starts_with("● working "));
+        assert_eq!(
+            row_for("pane-b").display_status,
+            Some(projection::DisplayStatus::new(
+                projection::TaskDisplayStatus::Blocked,
+                projection::StatusSource::PaneAgentStatus,
+            )),
+        );
+        assert!(row_for("pane-b").label.starts_with("● blocked "));
+    }
+
+    #[test]
+    fn pane_parent_keeps_headless_child_and_grandchild_statuses_independent() {
+        let parent = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let child = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let grandchild = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        let mut model = placement_model(&["pane-parent"]);
+        for (run_id, label, ordinal) in [
+            (parent, "parent", 1),
+            (child, "child", 2),
+            (grandchild, "grandchild", 3),
+        ] {
+            insert_placement_run(&mut model, run_id, label, ordinal);
+        }
+        insert_placement_execution(
+            &mut model,
+            parent,
+            "parent-execution",
+            "pane-parent",
+            ExecState::Working,
+        );
+        model.set_pane_agent_status("pane-parent".to_owned(), PaneAgentStatus::Working);
+        for (parent_run_id, child_run_id) in [(parent, child), (child, grandchild)] {
+            model.insert_execution_edge(ExecutionEdge {
+                parent_run_id,
+                child_run_id,
+            });
+        }
+        model.insert_agent_node(visibility_agent(
+            "child-root",
+            child,
+            4,
+            Some(ExecState::Idle),
+            Some(10),
+            None,
+        ));
+        model.insert_agent_node(visibility_agent(
+            "grandchild-root",
+            grandchild,
+            5,
+            Some(ExecState::Blocked),
+            Some(20),
+            None,
+        ));
+
+        let rows = build_rows(&model, &AppState::default());
+        for (run_id, expected_status, expected_source) in [
+            (
+                parent,
+                projection::TaskDisplayStatus::Working,
+                projection::StatusSource::PaneAgentStatus,
+            ),
+            (
+                child,
+                projection::TaskDisplayStatus::Idle,
+                projection::StatusSource::AgentNodeState,
+            ),
+            (
+                grandchild,
+                projection::TaskDisplayStatus::Blocked,
+                projection::StatusSource::AgentNodeState,
+            ),
+        ] {
+            let row = only_run_row(&rows, run_id);
+            assert_eq!(
+                row.display_status,
+                Some(projection::DisplayStatus::new(
+                    expected_status,
+                    expected_source
+                )),
+            );
+            if run_id != parent {
+                assert!(matches!(row.key, NodeKey::Run { pane_id: None, .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn root_agent_node_is_hidden_but_parented_descendants_remain() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut model = DomainModel::default();
+        insert_placement_run(&mut model, run_id, "run", 1);
+        for agent in [
+            visibility_agent("root", run_id, 2, Some(ExecState::Working), Some(1), None),
+            visibility_agent(
+                "child",
+                run_id,
+                3,
+                Some(ExecState::Idle),
+                Some(2),
+                Some("root"),
+            ),
+            visibility_agent(
+                "grandchild",
+                run_id,
+                4,
+                Some(ExecState::Blocked),
+                Some(3),
+                Some("child"),
+            ),
+        ] {
+            model.insert_agent_node(agent);
+        }
+
+        let rows = build_rows(&model, &AppState::default());
+        assert!(!has_agent_row(&rows, "root"));
+        let child = rows
+            .iter()
+            .find(|row| matches!(&row.key, NodeKey::Agent { agent_node_id, .. } if agent_node_id == "child"))
+            .unwrap();
+        let grandchild = rows
+            .iter()
+            .find(|row| matches!(&row.key, NodeKey::Agent { agent_node_id, .. } if agent_node_id == "grandchild"))
+            .unwrap();
+        let run = only_run_row(&rows, run_id);
+        assert_eq!(child.depth, run.depth + 1);
+        assert_eq!(grandchild.depth, child.depth + 1);
+    }
+
+    #[test]
+    fn agent_rows_use_shared_status_vocabulary() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut model = DomainModel::default();
+        insert_placement_run(&mut model, run_id, "run", 1);
+        model.insert_agent_node(visibility_agent(
+            "root",
+            run_id,
+            2,
+            Some(ExecState::Working),
+            Some(0),
+            None,
+        ));
+        for (index, (agent_node_id, state, expected)) in [
+            ("idle", Some(ExecState::Idle), "○ idle"),
+            ("working", Some(ExecState::Working), "● working"),
+            ("blocked", Some(ExecState::Blocked), "● blocked"),
+            ("ended", Some(ExecState::Ended), "✓ done"),
+            ("stale", Some(ExecState::Stale { since_ms: 0 }), "⚠ unknown"),
+            ("unknown", Some(ExecState::Unknown), "? unknown"),
+            ("absent", None, "? unknown"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            model.insert_agent_node(AgentNode {
+                model_id: Some("model".to_owned()),
+                ..visibility_agent(
+                    agent_node_id,
+                    run_id,
+                    index as i64 + 3,
+                    state,
+                    Some(index as i64),
+                    Some("root"),
+                )
+            });
+            let _ = expected;
+        }
+
+        let rows = build_rows(&model, &AppState::default());
+        for (agent_node_id, expected) in [
+            ("idle", "○ idle"),
+            ("working", "● working"),
+            ("blocked", "● blocked"),
+            ("ended", "✓ done"),
+            ("stale", "⚠ unknown"),
+            ("unknown", "? unknown"),
+            ("absent", "? unknown"),
+        ] {
+            let row = rows
+                .iter()
+                .find(|row| matches!(&row.key, NodeKey::Agent { agent_node_id: candidate, .. } if candidate == agent_node_id))
+                .unwrap();
+            assert!(
+                row.label
+                    .starts_with(&format!("{expected} Codex native agent:")),
+                "{}",
+                row.label,
+            );
+            assert!(!row.label.contains("[state:"));
+            assert_eq!(
+                row.display_status,
+                Some(projection::native_agent_display_status(
+                    model.agent_node(agent_node_id).unwrap()
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn task_row_labels_never_append_unlinked() {
+        let task_run = label_run(
+            RunId::new(),
+            RunKey::Controller("fixture".to_owned()),
+            TaskState::Running,
+            None,
+            None,
+            Some("subject"),
+        );
+        let label = task_run_label(
+            &DomainModel::default(),
+            &task_run,
+            display(projection::TaskDisplayStatus::Working),
+            false,
+            0,
+            false,
+        );
+
+        assert!(!label.contains("[unlinked]"), "{label}");
+    }
+
     #[test]
     fn glyph_reflects_state_and_stall() {
         let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let live_lines = LiveLineReadModel::default();
-        for (state, stalled, glyph) in [
-            (TaskState::Running, false, "●"),
-            (TaskState::Blocked, false, "●"),
-            (TaskState::Queued, false, "◌"),
-            (TaskState::Completed, false, "✓"),
-            (TaskState::Failed, false, "✗"),
-            (TaskState::Cancelled, false, "✗"),
-            (TaskState::EndedUnknown, false, "◌"),
-            (TaskState::Running, true, "⚠"),
+        for (state, status, stalled, glyph) in [
+            (
+                TaskState::Running,
+                projection::TaskDisplayStatus::Working,
+                false,
+                "●",
+            ),
+            (
+                TaskState::Blocked,
+                projection::TaskDisplayStatus::Blocked,
+                false,
+                "●",
+            ),
+            (
+                TaskState::Queued,
+                projection::TaskDisplayStatus::Queued,
+                false,
+                "◌",
+            ),
+            (
+                TaskState::Completed,
+                projection::TaskDisplayStatus::Done,
+                false,
+                "✓",
+            ),
+            (
+                TaskState::Failed,
+                projection::TaskDisplayStatus::Error,
+                false,
+                "✗",
+            ),
+            (
+                TaskState::Cancelled,
+                projection::TaskDisplayStatus::Cancelled,
+                false,
+                "⊘",
+            ),
+            (
+                TaskState::EndedUnknown,
+                projection::TaskDisplayStatus::Unknown,
+                false,
+                "?",
+            ),
+            (
+                TaskState::Running,
+                projection::TaskDisplayStatus::Working,
+                true,
+                "⚠",
+            ),
         ] {
             let run = label_run(
                 run_id,
@@ -2542,10 +3010,23 @@ mod tests {
                 Some("subject"),
             );
             let model = DomainModel::default();
+            let display_status = projection::DisplayStatus {
+                status,
+                source: projection::StatusSource::TaskState,
+                stalled,
+            };
 
             assert_eq!(
-                run_row_label_with_agent(&model, &run, None, 1_000, &live_lines, stalled, true,),
-                format!("{glyph} claude-code subject")
+                run_row_label_with_agent(
+                    &model,
+                    &run,
+                    None,
+                    1_000,
+                    &live_lines,
+                    display_status,
+                    true,
+                ),
+                format!("{glyph} {} claude-code subject", status.label())
             );
         }
     }
@@ -2623,12 +3104,28 @@ mod tests {
         let live_lines = LiveLineReadModel::default();
 
         assert_eq!(
-            run_row_label_with_agent(&model, &root, None, 0, &live_lines, false, true),
-            "● Codex root subject"
+            run_row_label_with_agent(
+                &model,
+                &root,
+                None,
+                0,
+                &live_lines,
+                display(projection::TaskDisplayStatus::Working),
+                true,
+            ),
+            "● working Codex root subject"
         );
         assert_eq!(
-            run_row_label_with_agent(&model, &worker, None, 0, &live_lines, false, true),
-            "● Codex"
+            run_row_label_with_agent(
+                &model,
+                &worker,
+                None,
+                0,
+                &live_lines,
+                display(projection::TaskDisplayStatus::Working),
+                true,
+            ),
+            "● working Codex"
         );
     }
 
@@ -2816,6 +3313,7 @@ mod tests {
                 depth: 1,
                 label: "preceding-workspace".to_owned(),
                 label_without_duration_suffix: None,
+                display_status: None,
                 prerequisites: Vec::new(),
                 dependents: Vec::new(),
             },
@@ -2824,6 +3322,7 @@ mod tests {
                 depth: 1,
                 label: "Unattached Task Runs".to_owned(),
                 label_without_duration_suffix: None,
+                display_status: None,
                 prerequisites: Vec::new(),
                 dependents: Vec::new(),
             },
@@ -2832,6 +3331,7 @@ mod tests {
                 depth: 2,
                 label: "unattached".to_owned(),
                 label_without_duration_suffix: None,
+                display_status: None,
                 prerequisites: Vec::new(),
                 dependents: Vec::new(),
             },
@@ -2886,7 +3386,7 @@ mod tests {
                     Some("gpt-5.6-sol"),
                 )),
                 1_033_000,
-                "⚠ claude-code Implement I7 Task 2 wire tolerance — tool_use: Bash · 17m03s",
+                "⚠ working claude-code Implement I7 Task 2 wire tolerance — tool_use: Bash · 17m03s",
             ),
             (
                 label_run(
@@ -2899,7 +3399,7 @@ mod tests {
                 ),
                 None,
                 5_000,
-                "◌ claude-code hook:claude-code:S:task:T",
+                "◌ queued claude-code hook:claude-code:S:task:T",
             ),
             (
                 label_run(
@@ -2919,7 +3419,7 @@ mod tests {
                     Some("gpt-terminal"),
                 )),
                 9_000_000,
-                "✓ claude-code Finish work · 1h01m",
+                "✓ done claude-code Finish work · 1h01m",
             ),
             (
                 label_run(
@@ -2939,7 +3439,7 @@ mod tests {
                     None,
                 )),
                 5_000,
-                "● claude-code No timing — message",
+                "● working claude-code No timing — message",
             ),
             (
                 label_run(
@@ -2952,7 +3452,7 @@ mod tests {
                 ),
                 None,
                 5_000,
-                "● claude-code Clock skew",
+                "● working claude-code Clock skew",
             ),
         ];
 
@@ -3016,7 +3516,7 @@ mod tests {
         recency_model.insert_agent_node(newer);
         assert_eq!(
             run_row_label(&recency_model, &run, 1_000),
-            "● claude-code Tie break — newer: Read"
+            "● working claude-code Tie break — newer: Read"
         );
 
         for agents in [
@@ -3031,7 +3531,7 @@ mod tests {
             for _ in 0..8 {
                 assert_eq!(
                     run_row_label(&tie_model, &run, 1_000),
-                    "● claude-code Tie break — tie-high: Bash"
+                    "● working claude-code Tie break — tie-high: Bash"
                 );
             }
         }
@@ -3110,7 +3610,7 @@ mod tests {
 
         let label = run_row_label(&model, &run, now_ms);
 
-        assert_eq!(label, "● claude-code Only stale");
+        assert_eq!(label, "● working claude-code Only stale");
         assert!(
             !label.contains("hidden-only-event: Bash"),
             "display-stale only agent leaked into run row: {label}"
@@ -3143,7 +3643,7 @@ mod tests {
 
         assert_eq!(
             run_row_label(&model, &run, now_ms),
-            "● claude-code Visible fallback — visible-event: Read"
+            "● working claude-code Visible fallback — visible-event: Read"
         );
     }
 
@@ -3224,12 +3724,26 @@ mod tests {
         });
 
         assert_eq!(
-            task_run_label(&model, &child, true, 10, false, true),
-            "● claude-code Shared child [shared] [dispatched by: Parent]"
+            task_run_label(
+                &model,
+                &child,
+                display(projection::TaskDisplayStatus::Working),
+                true,
+                10,
+                true,
+            ),
+            "● working claude-code Shared child [shared] [dispatched by: Parent]"
         );
         assert_eq!(
-            task_run_label(&model, &orphan, false, 10, false, true),
-            "◌ codex Orphan [unlinked]"
+            task_run_label(
+                &model,
+                &orphan,
+                display(projection::TaskDisplayStatus::Queued),
+                false,
+                10,
+                true,
+            ),
+            "◌ queued codex Orphan"
         );
     }
 
@@ -3366,14 +3880,14 @@ mod tests {
                     provider: Provider::Codex,
                     sid: "native-session".to_owned(),
                 },
-                "● Codex native-session",
+                "● working Codex native-session",
             ),
             (
                 RunKey::NativePath {
                     provider: Provider::Codex,
                     path: "/private/session.jsonl".to_owned(),
                 },
-                "● Codex 01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "● working Codex 01ARZ3NDEKTSV4RRFFQ69G5FAV",
             ),
             (
                 RunKey::Provisional {
@@ -3381,11 +3895,11 @@ mod tests {
                     start_ms: 1,
                     seq: 2,
                 },
-                "● provisional terminal:1:2",
+                "● working provisional terminal:1:2",
             ),
             (
                 RunKey::Controller("hook:claude-code:S:task:T".to_owned()),
-                "● claude-code hook:claude-code:S:task:T",
+                "● working claude-code hook:claude-code:S:task:T",
             ),
         ] {
             let run = label_run(run_id, key, TaskState::Running, None, None, None);
@@ -3483,9 +3997,13 @@ mod tests {
             ),
         ] {
             let run = label_run(run_id, key, TaskState::Running, None, None, Some("subject"));
-            let head = run_row_head(&DomainModel::default(), &run, false);
+            let head = run_row_head(
+                &DomainModel::default(),
+                &run,
+                display(projection::TaskDisplayStatus::Working),
+            );
             assert!(
-                head.starts_with(&format!("● {expected_kind}")),
+                head.starts_with(&format!("● working {expected_kind}")),
                 "missing current kind {expected_kind}: {head}"
             );
         }
@@ -3521,6 +4039,22 @@ mod tests {
         )
     }
 
+    fn healthy_runtime_diagnostics() -> RuntimeDiagnosticsSnapshot {
+        RuntimeDiagnosticsSnapshot {
+            persistence: PersistenceStatus::Healthy,
+            persistence_detail: None,
+            controller_input: ControllerInputStatus::Available,
+            owner: OwnerFreshness::Current,
+            persistence_counters: PersistenceCounters::default(),
+            controller_counters: ControllerCounterSnapshot::default(),
+            enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
+            provider_counters: crate::diagnostics::ProviderCounterSnapshot::default(),
+            source_coverage: Vec::new(),
+            dangling_announcement_components: 0,
+            first_failure_log: OccurrenceLogStatus::NotAttempted,
+        }
+    }
+
     fn buffer_rows(buffer: &Buffer) -> Vec<String> {
         let mut rows = Vec::new();
         for y in 0..buffer.area.height {
@@ -3538,6 +4072,157 @@ mod tests {
             rows.push(row);
         }
         rows
+    }
+
+    fn render_status_row(
+        display_status: projection::DisplayStatus,
+        dag: bool,
+        width: u16,
+    ) -> Buffer {
+        let label = format!(
+            "{} {} Codex A deliberately long subject",
+            display_status.glyph(),
+            display_status.status.label(),
+        );
+        let rows = vec![TreeRow {
+            key: NodeKey::Run {
+                run_id: RunId::new(),
+                pane_id: None,
+            },
+            depth: 0,
+            label,
+            label_without_duration_suffix: None,
+            display_status: Some(display_status),
+            prerequisites: if dag {
+                vec!["prerequisite".to_owned()]
+            } else {
+                Vec::new()
+            },
+            dependents: Vec::new(),
+        }];
+        let backend = TestBackend::new(width, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                if dag {
+                    render_dag(
+                        frame,
+                        Rect::new(0, 0, width, 4),
+                        &rows,
+                        &AppState::default(),
+                    );
+                } else {
+                    render_tree(
+                        frame,
+                        Rect::new(0, 0, width, 4),
+                        &DomainModel::default(),
+                        &rows,
+                        &AppState::default(),
+                        false,
+                        0,
+                    );
+                }
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn status_glyph_cell(buffer: &Buffer, glyph: &str) -> Cell {
+        buffer
+            .content
+            .iter()
+            .find(|cell| cell.symbol() == glyph)
+            .cloned()
+            .unwrap_or_else(|| panic!("missing status glyph {glyph:?}: {:?}", buffer_rows(buffer)))
+    }
+
+    #[test]
+    fn status_tokens_use_accessible_colors_in_tree_and_dag() {
+        for (status, expected_color, expected_dim) in [
+            (projection::TaskDisplayStatus::Working, Color::Green, false),
+            (projection::TaskDisplayStatus::Done, Color::Green, false),
+            (projection::TaskDisplayStatus::Blocked, Color::Red, false),
+            (projection::TaskDisplayStatus::Error, Color::Red, false),
+            (
+                projection::TaskDisplayStatus::Cancelled,
+                Color::Yellow,
+                false,
+            ),
+            (projection::TaskDisplayStatus::Queued, Color::Reset, true),
+            (projection::TaskDisplayStatus::Idle, Color::Reset, true),
+            (projection::TaskDisplayStatus::Unknown, Color::Reset, true),
+        ] {
+            let display_status = display(status);
+            for dag in [false, true] {
+                let buffer = render_status_row(display_status, dag, 72);
+                let cell = status_glyph_cell(&buffer, display_status.glyph());
+                assert_eq!(cell.fg, expected_color, "{status:?} dag={dag}");
+                assert_eq!(
+                    cell.modifier.contains(Modifier::DIM),
+                    expected_dim,
+                    "{status:?} dag={dag}: {:?}",
+                    cell.modifier,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_status_is_red_and_distinct_from_green_working() {
+        let working = render_status_row(display(projection::TaskDisplayStatus::Working), false, 64);
+        let blocked = render_status_row(display(projection::TaskDisplayStatus::Blocked), false, 64);
+        let error = render_status_row(display(projection::TaskDisplayStatus::Error), true, 64);
+
+        assert_eq!(status_glyph_cell(&working, "●").fg, Color::Green);
+        assert_eq!(status_glyph_cell(&blocked, "●").fg, Color::Red);
+        assert_eq!(status_glyph_cell(&error, "✗").fg, Color::Red);
+    }
+
+    #[test]
+    fn stalled_status_uses_yellow_warning_style() {
+        let stalled = projection::DisplayStatus {
+            status: projection::TaskDisplayStatus::Working,
+            source: projection::StatusSource::TaskState,
+            stalled: true,
+        };
+        let stalled_buffer = render_status_row(stalled, false, 64);
+        let cancelled_buffer =
+            render_status_row(display(projection::TaskDisplayStatus::Cancelled), true, 64);
+
+        assert_eq!(status_glyph_cell(&stalled_buffer, "⚠").fg, Color::Yellow);
+        assert_eq!(status_glyph_cell(&cancelled_buffer, "⊘").fg, Color::Yellow);
+    }
+
+    #[test]
+    fn selected_status_remains_readable_under_reversal() {
+        let display_status = display(projection::TaskDisplayStatus::Working);
+        let line = styled_status_line(
+            "  ● working Codex subject".to_owned(),
+            2,
+            Some(display_status),
+            true,
+        );
+
+        assert!(
+            line.spans
+                .iter()
+                .all(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+        );
+        let status = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("● working"))
+            .unwrap();
+        assert_eq!(status.style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn narrow_tree_retains_glyph_and_status_before_subject() {
+        let buffer = render_status_row(display(projection::TaskDisplayStatus::Working), false, 16);
+        let rendered = buffer_rows(&buffer).join("\n");
+
+        assert!(rendered.contains("● working"), "{rendered}");
+        assert!(!rendered.contains("deliberately long subject"));
     }
 
     fn render(app: &App, width: u16, height: u16) -> Vec<String> {
@@ -3690,8 +4375,8 @@ mod tests {
         assert_eq!(workspace_x, session_x + 4);
         assert_eq!(tab_x, workspace_x + 4);
         assert_eq!(pane_x, tab_x + 4);
-        assert_eq!(run_x, pane_x + 6);
-        assert_eq!(agent_x, run_x + 2);
+        assert_eq!(run_x, pane_x + 14);
+        assert_eq!(agent_x, run_x + 4);
     }
 
     #[test]
@@ -3759,6 +4444,7 @@ mod tests {
             depth,
             label: label.to_owned(),
             label_without_duration_suffix: None,
+            display_status: None,
             prerequisites: Vec::new(),
             dependents: Vec::new(),
         })
@@ -3838,6 +4524,7 @@ mod tests {
             depth: max_depth,
             label: "deep".to_owned(),
             label_without_duration_suffix: None,
+            display_status: None,
             prerequisites: Vec::new(),
             dependents: Vec::new(),
         }];
@@ -3896,8 +4583,9 @@ mod tests {
                 pane_id: None,
             },
             depth: 12,
-            label: "● Codex deeply nested work".to_owned(),
+            label: "● working Codex deeply nested work".to_owned(),
             label_without_duration_suffix: None,
+            display_status: Some(display(projection::TaskDisplayStatus::Working)),
             prerequisites: Vec::new(),
             dependents: Vec::new(),
         }];
@@ -4166,6 +4854,69 @@ mod tests {
         assert!(!extreme.contains("up:"), "{extreme}");
         assert!(extreme.contains("session:"), "{extreme}");
         assert!(extreme.contains("LIVE"), "{extreme}");
+    }
+
+    #[test]
+    fn help_lists_every_task_status_and_stall_semantics() {
+        let help_lines = help_lines(&healthy_runtime_diagnostics(), &TuiSetup::default());
+        assert!(
+            help_lines.iter().any(|line| line
+                == "Task status: queued=announced, working=active, idle=waiting, blocked=needs attention"),
+            "{help_lines:#?}"
+        );
+        assert!(
+            help_lines.iter().any(|line| line
+                == "Task status: done=finished, error=failed, cancelled=stopped, unknown=insufficient evidence"),
+            "{help_lines:#?}"
+        );
+        let help = help_lines.join("\n");
+
+        assert!(help.contains("blocked=needs attention"), "{help}");
+        assert!(!help.contains("blocked=approval"), "{help}");
+        assert!(!help.contains("approval required"), "{help}");
+        assert!(help.contains("⚠ means stalled"), "{help}");
+        assert!(
+            help.contains("it does not replace the status word"),
+            "{help}"
+        );
+    }
+
+    #[test]
+    fn help_explains_pane_backed_and_headless_sources() {
+        let help = help_lines(&healthy_runtime_diagnostics(), &TuiSetup::default()).join("\n");
+
+        assert!(help.contains("pane-backed rows use Herdr"), "{help}");
+        assert!(
+            help.contains("headless rows use task/agent evidence"),
+            "{help}"
+        );
+    }
+
+    #[test]
+    fn help_status_section_scrolls_in_narrow_height() {
+        let mut app = app(
+            DomainModel::default(),
+            ObservationQuality::Live,
+            "status-help",
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+
+        let mut transcript = String::new();
+        for _ in 0..40 {
+            transcript.push_str(&render(&app, 120, 14).join("\n"));
+            transcript.push('\n');
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+
+        assert!(
+            transcript.contains("Task status: queued=announced"),
+            "{transcript}"
+        );
+        assert!(transcript.contains("persistence: healthy"), "{transcript}");
+        assert!(
+            transcript.contains("standalone probe: not evaluated (non-owner/default)"),
+            "{transcript}"
+        );
     }
 
     #[test]
@@ -4554,7 +5305,7 @@ mod tests {
             child_row.key,
             NodeKey::Run {
                 run_id: child,
-                pane_id: Some("pane-parent".to_owned()),
+                pane_id: None,
             }
         );
         assert!(parent_index < child_index);
@@ -4602,7 +5353,7 @@ mod tests {
             child_rows[0].key,
             NodeKey::Run {
                 run_id: child,
-                pane_id: Some("pane-first".to_owned()),
+                pane_id: None,
             }
         );
     }
@@ -4659,7 +5410,7 @@ mod tests {
             grandchild_row.key,
             NodeKey::Run {
                 run_id: headless_grandchild,
-                pane_id: Some("pane-ended".to_owned()),
+                pane_id: None,
             }
         );
     }
@@ -4707,15 +5458,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(root, 4), (child, 5), (grandchild, 6)]
         );
-        assert!(run_rows.iter().all(|row| {
-            matches!(
-                &row.key,
-                NodeKey::Run {
-                    pane_id: Some(pane_id),
-                    ..
-                } if pane_id == "pane-root"
-            )
-        }));
+        assert!(matches!(
+            &run_rows[0].key,
+            NodeKey::Run {
+                pane_id: Some(pane_id),
+                ..
+            } if pane_id == "pane-root"
+        ));
+        assert!(
+            run_rows[1..]
+                .iter()
+                .all(|row| matches!(row.key, NodeKey::Run { pane_id: None, .. }))
+        );
     }
 
     #[test]
@@ -4897,7 +5651,12 @@ mod tests {
         assert!(agent_rows[0].label.contains("investigate"));
         assert_eq!(agent_rows[0].depth + 1, agent_rows[1].depth);
         assert!(agent_rows[1].label.contains("child"));
-        assert!(agent_rows[1].label.contains("state:working"));
+        assert!(
+            agent_rows[1]
+                .label
+                .starts_with("● working Codex native agent:")
+        );
+        assert!(!agent_rows[1].label.contains("[state:"));
         assert!(agent_rows[1].label.contains("model:gpt-child"));
         assert!(agent_rows[1].label.contains("last:99ms"));
         assert_eq!(agent_rows[0].depth, agent_rows[2].depth);
@@ -4914,7 +5673,7 @@ mod tests {
             9,
             Some(ExecState::Unknown),
             Some(-crate::provider::lane::DEFAULT_HEADLESS_INACTIVITY_MS),
-            None,
+            Some("provider-root"),
         ));
 
         let rows = build_rows(&model, &AppState::default());
@@ -4935,7 +5694,7 @@ mod tests {
             9,
             Some(ExecState::Unknown),
             Some(1_i64.saturating_sub(crate::provider::lane::DEFAULT_HEADLESS_INACTIVITY_MS)),
-            None,
+            Some("provider-root"),
         ));
 
         let rows = build_rows(&model, &AppState::default());
@@ -4953,7 +5712,7 @@ mod tests {
             9,
             Some(ExecState::Working),
             Some(-crate::provider::lane::DEFAULT_HEADLESS_INACTIVITY_MS),
-            None,
+            Some("provider-root"),
         ));
 
         let rows = build_rows(&model, &AppState::default());
@@ -4971,7 +5730,7 @@ mod tests {
             9,
             Some(ExecState::Ended),
             Some(-crate::provider::lane::DEFAULT_HEADLESS_INACTIVITY_MS),
-            None,
+            Some("provider-root"),
         ));
 
         let rows = build_rows(&model, &AppState::default());
@@ -4992,7 +5751,7 @@ mod tests {
             9,
             Some(ExecState::Unknown),
             None,
-            None,
+            Some("provider-root"),
         ));
         model.insert_agent_node(visibility_agent(
             "known-stale",
@@ -5000,7 +5759,7 @@ mod tests {
             10,
             Some(ExecState::Stale { since_ms: 0 }),
             Some(-crate::provider::lane::DEFAULT_HEADLESS_INACTIVITY_MS),
-            None,
+            Some("provider-root"),
         ));
 
         let rows = build_rows(&model, &AppState::default());
@@ -5209,11 +5968,19 @@ mod tests {
         };
         let prerequisite_row = rows
             .iter()
-            .find(|row| row.contains("前提🙂 前提🙂"))
+            .find(|row| {
+                row.split('│')
+                    .nth(1)
+                    .is_some_and(|run| run.contains("● working 前提🙂"))
+            })
             .unwrap();
         let dependent_row = rows
             .iter()
-            .find(|row| row.contains("依存先🙂with-a-long-tail 依存先🙂with-a-long-tail"))
+            .find(|row| {
+                row.split('│')
+                    .nth(1)
+                    .is_some_and(|run| run.contains("● working 依存先🙂"))
+            })
             .unwrap();
         let prerequisite_columns = columns(prerequisite_row);
         let dependent_columns = columns(dependent_row);
@@ -5226,8 +5993,8 @@ mod tests {
         assert!(!dependent_columns[2].contains("前提"));
 
         let initial_activity = rows.iter().find(|row| row.contains("Selected:")).unwrap();
-        assert!(initial_activity.contains("Selected: ● 依存先🙂with-a-long-tail"));
-        assert!(!initial_activity.contains("Selected: ● 前提🙂"));
+        assert!(initial_activity.contains("Selected: ● working 依存先🙂with-a-long-tail"));
+        assert!(!initial_activity.contains("Selected: ● working 前提🙂"));
 
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(
@@ -5242,8 +6009,8 @@ mod tests {
             .iter()
             .find(|row| row.contains("Selected:"))
             .unwrap();
-        assert!(moved_activity.contains("Selected: ● 前提🙂"));
-        assert!(!moved_activity.contains("Selected: ● 依存先"));
+        assert!(moved_activity.contains("Selected: ● working 前提🙂"));
+        assert!(!moved_activity.contains("Selected: ● working 依存先"));
 
         let minimum_rows = render(&app, 48, 18);
         let screen = minimum_rows.join("\n");
@@ -5253,7 +6020,7 @@ mod tests {
         assert!(screen.contains("Prereqs"));
         assert!(screen.contains("Dependents"));
         assert!(screen.contains("前提"));
-        assert!(screen.contains("Selected: ● 前提"));
+        assert!(screen.contains("Selected: ● working 前提"));
         for row in &minimum_rows {
             assert!(
                 Line::raw(row.as_str()).width() <= 48,

@@ -1674,7 +1674,7 @@ mod tests {
         DurabilityDisposition, PersistenceFailure, PersistenceFailureCode, PersistenceOperation,
         PersistencePhase, PersistenceStatus,
     };
-    use crate::tui::projection::SummaryScope;
+    use crate::tui::projection::{DisplayStatus, StatusSource, SummaryScope, TaskDisplayStatus};
 
     fn run_id(value: &str) -> RunId {
         RunId::parse(value).unwrap()
@@ -2298,7 +2298,7 @@ mod tests {
             native_session_id: Some("native  cafe\u{301}".to_owned()),
             task_run_id: searchable,
             display_ordinal: DisplayOrdinal::new(3),
-            parent_agent_node_id: None,
+            parent_agent_node_id: Some("provider-root".to_owned()),
             state: Some(ExecState::Working),
             model_id: Some("GPT-SAFE".to_owned()),
             last_event_kind: None,
@@ -2523,7 +2523,7 @@ mod tests {
             native_session_id: Some("agent-native".to_owned()),
             task_run_id: run,
             display_ordinal: DisplayOrdinal::new(2),
-            parent_agent_node_id: None,
+            parent_agent_node_id: Some("provider-root".to_owned()),
             state: Some(ExecState::Working),
             model_id: None,
             last_event_kind: None,
@@ -2736,7 +2736,7 @@ mod tests {
             native_session_id: Some("filter-me".to_owned()),
             task_run_id: run,
             display_ordinal: DisplayOrdinal::new(2),
-            parent_agent_node_id: None,
+            parent_agent_node_id: Some("provider-root".to_owned()),
             state: Some(ExecState::Working),
             model_id: None,
             last_event_kind: None,
@@ -3291,6 +3291,78 @@ mod tests {
     }
 
     #[test]
+    fn dag_cache_refreshes_when_root_agent_status_evidence_ages_out() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let deadline = crate::activity::headless_inactivity_ms();
+        let mut model = DomainModel::default();
+        model.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::Controller("run".to_owned()),
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        model.insert_agent_node(AgentNode {
+            agent_node_id: "root-agent".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some("root-agent".to_owned()),
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(1),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Ended),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: Some(0),
+            session_file: None,
+        });
+        let clock = TestClock::at(deadline - 1);
+        let (mut app, _senders) = app_with_runtime(
+            model,
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.state().view_mode(), ViewMode::DependencyDag);
+        assert_eq!(
+            app.rows
+                .iter()
+                .find(|row| row.key.run_id() == Some(run_id))
+                .and_then(|row| row.display_status),
+            Some(DisplayStatus::new(
+                TaskDisplayStatus::Unknown,
+                StatusSource::AgentNodeState,
+            )),
+        );
+        assert_eq!(app.next_expiry_ms(), Some(deadline));
+
+        app.reset_projection_build_count();
+        clock.set(deadline);
+        assert!(app.refresh_if_changed().unwrap());
+        assert_eq!(app.projection_build_count(), 1);
+        assert_eq!(
+            app.rows
+                .iter()
+                .find(|row| row.key.run_id() == Some(run_id))
+                .and_then(|row| row.display_status),
+            Some(DisplayStatus::new(
+                TaskDisplayStatus::Working,
+                StatusSource::TaskState,
+            )),
+        );
+        assert_eq!(app.next_expiry_ms(), None);
+    }
+
+    #[test]
     fn idle_without_visible_live_duration_never_rebuilds_or_zero_polls() {
         let live = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let clock = TestClock::at(0);
@@ -3834,7 +3906,7 @@ mod tests {
                 pane_id: None,
             })
         );
-        assert!(render(&app).contains("Selected: ● first first"));
+        assert!(render(&app).contains("Selected: ● working first first"));
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.state().view_mode(), ViewMode::ExecutionTree);
@@ -4084,7 +4156,7 @@ mod tests {
         let following_rows = render_lines(&following, 100, 14);
         let following_view = following_rows[3..9].join("\n");
         assert!(following_view.contains("Dependency DAG"));
-        assert!(!following_view.contains("> ● run-0 run-0"));
+        assert!(!following_view.contains("> ● working run-0 run-0"));
         assert!(following_view.contains("run-7 run-7"));
 
         let (mut manual, _sender) = app_with_model(edgeful_model());
@@ -4096,7 +4168,7 @@ mod tests {
         manual.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let manual_rows = render_lines(&manual, 100, 14);
         let manual_view = manual_rows[3..9].join("\n");
-        assert!(manual_view.contains("> ● run-0 run-0"));
+        assert!(manual_view.contains("> ● working run-0 run-0"));
     }
 
     #[test]

@@ -16,8 +16,8 @@ use herdr_top::lockfile::{StateRoot, state_root_in};
 use herdr_top::model::{
     AgentSessionReference, AgentSessionReferenceKind, ControllerEventKind, DependencyEdge,
     DisplayOrdinal, DomainModel, EventMetadata, ExecState, Execution, ExecutionEdge, GapKind,
-    NormalizedEvent, Pane, PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SnapshotAgent,
-    Tab, TaskRun, TaskState, TopologyAuthority, TopologySnapshot, Workspace,
+    NormalizedEvent, Pane, PaneAgentStatus, PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey,
+    SnapshotAgent, Tab, TaskRun, TaskState, TopologyAuthority, TopologySnapshot, Workspace,
 };
 use herdr_top::reducer::{ApplyOutcome, Reducer};
 use herdr_top::session_key;
@@ -3979,10 +3979,7 @@ fn topology_with_session(
             display_name: None,
             agent: Some(SnapshotAgent {
                 agent_name: "codex".to_owned(),
-                state: match status {
-                    "idle" => ExecState::Idle,
-                    _ => ExecState::Working,
-                },
+                status: PaneAgentStatus::from_wire(Some(status)),
             }),
             agent_session: Some(AgentSessionReference {
                 source: "herdr:codex".to_owned(),

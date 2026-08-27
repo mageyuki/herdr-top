@@ -45,7 +45,8 @@ Four overlays can replace the center of the screen:
   plus up to 100 recent activity items in its scope. Task Run detail includes
   `tokens.output`, `tokens.input`, `tokens.cached_input`,
   `tokens.cache_write_input`, `tokens.reasoning_output`, `tokens.total`, and
-  `tokens.context_window`, followed by
+  `tokens.context_window`, relationship lines named `dispatch_parent`,
+  `prerequisites`, `dependents`, and `task_relationships`, followed by
   `scope: semantic run and agent descendants`. Unreported fields use a
   not-reported-style placeholder rather than zero. Resumed Codex rollouts also
   show per-turn model, effort, and sandbox history.
@@ -153,11 +154,12 @@ the following ASCII forms; every other value leaves Unicode connectors enabled.
 A Task Run follows this grammar:
 
 ```text
-<glyph> <worker-kind>[ <subject>][ — <live line>][ · <duration when TIME is hidden>][ annotations]
+<glyph> <status> <worker-kind>[ <subject>][ — <live line>][ · <duration when TIME is hidden>][ relationship annotations]
 ```
 
-- **Glyph** carries the lifecycle state, with the stall override described
-  below.
+- **Glyph and status** are redundant operational cues. The written status stays
+  at the left edge so narrow-width truncation drops subject and live detail
+  before it drops the operational state.
 - **Worker kind** comes from the projected run kind, falling back to the native
   provider name, the selector from a hook-backed Controller key, another
   Controller key, or `provisional`.
@@ -173,15 +175,78 @@ A Task Run follows this grammar:
   DAG rows have no metric band, so they retain the label suffix. Live durations
   use the current time; terminal runs use their recorded finish time.
 
-The glyph vocabulary is:
+### Task Run status source precedence
 
-| Glyph | Meaning |
+Terminal `TaskState` facts win over every runtime observation:
+
+| Terminal `TaskState` | Status |
 | --- | --- |
-| `⚠` | A non-terminal run whose activity silence has crossed the stall threshold. The override never replaces a terminal glyph. |
-| `●` | `running` or `blocked`. |
-| `✓` | `completed`. |
-| `✗` | `failed` or `cancelled`. |
-| `◌` | `queued` or `ended_unknown`. |
+| `completed` | `done` |
+| `failed` | `error` |
+| `cancelled` | `cancelled` |
+| `ended_unknown` | `unknown` |
+
+Semantic pre-start and block facts are next:
+
+| Semantic `TaskState` | Status |
+| --- | --- |
+| `queued` | `queued` |
+| `blocked` | `blocked` |
+
+For a pane-backed occurrence, the current status for that exact pane is the
+next source. Shared Task Runs can therefore display a different status in each
+pane occurrence. Herdr maps one-to-one:
+
+| Herdr pane status | Status |
+| --- | --- |
+| `working` | `working` |
+| `idle` | `idle` |
+| `blocked` | `blocked` |
+| `done` | `done` |
+| `unknown` | `unknown` |
+
+An explicit Herdr `unknown` is evidence, not absence. Only a missing pane
+status falls back to the execution matching that pane:
+
+| Matching execution state | Status |
+| --- | --- |
+| `working` | `working` |
+| `idle` | `idle` |
+| `blocked` | `blocked` |
+| `unknown` | `unknown` |
+| `stale` | `unknown` plus stalled |
+| `ended` | `unknown`, unless terminal `TaskState` already won |
+
+A headless Task Run consults only its newest non-display-stale,
+provider-matching root Agent Node, never descendants:
+
+| Root Agent Node state | Status |
+| --- | --- |
+| `working` | `working` |
+| `idle` | `idle` |
+| `blocked` | `blocked` |
+| `stale` | `unknown` plus stalled |
+| `ended` | `unknown` |
+| absent or `unknown` | fall through |
+
+After that fallthrough, `TaskState::Running` may finally supply `working`.
+Without applicable evidence, the status is `unknown`.
+
+Stalled is orthogonal to status. A stalled non-terminal row keeps its base
+status word and uses `⚠` in place of the normal glyph; terminal rows are never
+stalled.
+
+| Status | Glyph | Meaning |
+| --- | --- | --- |
+| `queued` | `◌` | announced |
+| `working` | `●` | active |
+| `idle` | `○` | waiting |
+| `blocked` | `●` | needs attention |
+| `done` | `✓` | finished |
+| `error` | `✗` | failed |
+| `cancelled` | `⊘` | stopped |
+| `unknown` | `?` | insufficient evidence |
+| stalled override | `⚠` | orthogonal warning; written base status is retained |
 
 Relationship annotations are appended in this order when applicable:
 
@@ -193,8 +258,12 @@ Relationship annotations are appended in this order when applicable:
   default-visible dispatch parent and carries no textual parent hint. A hidden
   or expired parent never hides a child: the child falls back to `Unattached`
   for that frame. A malformed parent cycle also falls back to `Unattached`.
-- `[unlinked]` means no execution or dependency edge links the Task Run. Herdr
-  Top does not infer a relationship from neighboring panes or shared paths.
+
+Rows do not append a visible annotation for the absence of relationships.
+Selected Task Run Detail reports `dispatch_parent`, `prerequisites`,
+`dependents`, and `task_relationships: none | present`. The filter accepts
+`unlinked` as a legacy synonym for "no recorded task relationships." Herdr Top
+does not infer a relationship from neighboring panes or shared paths.
 
 Placement follows live execution panes first, then the pane of the latest ended
 execution, then a default-visible dispatch parent for a run with no execution
@@ -241,27 +310,36 @@ The resulting drop order is `MODEL`, `EFF`, `TOK-S`, `TOK`, then `TIME` as the
 pane narrows. Label text is truncated and deep indentation is compressed before
 the active band's columns disappear at the next threshold. Columns are joined
 with one space; the all-five band reserves 36 columns for metrics plus one
-separator from the padded label.
+separator from the padded label. Selection reversal preserves readable status
+text and its status color.
 
 Native agent rows use this form:
 
 ```text
-<Claude|Codex> native agent: <native-session-or-node-id> [state:<state>] [model:<model>] [last:<timestamp>ms|unknown]
+<glyph> <status> <Claude|Codex> native agent: <native-session-or-node-id> [model:<model>] [last:<timestamp>ms]
 ```
 
-Agent nodes nest recursively only where provider metadata establishes a parent.
-An Agent Node whose state is absent, unknown, or ended is hidden after its
-recorded last activity has been silent for `HERDR_TOP_HEADLESS_INACTIVITY_MS`.
-A node without an activity timestamp remains visible, as do known states such
-as `stale` and `working`. When a hidden parent has a visible child, the child is
-re-parented directly beneath the owning Task Run for display. This rule removes
-no model or SQLite data, and the Selected detail projection continues to use
-the complete, unfiltered Agent Node model. The Task Run live-line fallback
-likewise ignores display-stale Agent Nodes.
+Visible native child Agent rows use their own evidence: `working`, `idle`, and
+`blocked` map one-to-one; `ended` maps to `done`; `stale` maps to `unknown` plus
+stalled; and absent or `unknown` maps to `unknown`. They never invent `queued`,
+`error`, or `cancelled`.
+
+The provider-native root Agent that duplicates its owning Task Run is hidden
+from the tree. A visible descendant whose root is hidden attaches directly
+beneath the Task Run. Explicit provider parentage otherwise nests visible Agent
+Nodes recursively. Model and Detail data remain retained. An Agent Node whose
+state is absent, unknown, or ended becomes display-stale after its recorded last
+activity has been silent for `HERDR_TOP_HEADLESS_INACTIVITY_MS`; a node without
+an activity timestamp remains visible, as do known states such as `stale` and
+`working`. A visible child of any display-stale parent is re-parented beneath
+the owning Task Run. These display rules remove no model or SQLite data, and
+the Task Run live-line fallback also ignores display-stale Agent Nodes.
+
 The dependency view remains separate: it lists each Task Run with its explicit
 prerequisites and dependents, or displays `no dependency edges recorded` when
-there are none. DAG rows share the status-glyph and label grammar, but omit the
-live line.
+there are none. Tree and DAG rows share the same glyph-and-status prefix. DAG
+rows omit the live line. Across the two views, `[shared]` and
+`[dispatched by: ...]` remain wherever the row placement implements them.
 
 ## Visibility and dismissal
 
@@ -277,7 +355,7 @@ and the dismissal survives a restart. A later non-terminal mutation clears the
 dismissal, while a terminal touch retains it.
 
 For Codex, a provider-log `turn_aborted` truthfully changes the Task Run to
-`cancelled`, records its finish time, and temporarily renders the `✗` cancelled
+`cancelled`, records its finish time, and temporarily renders the `⊘` cancelled
 row. A later turn does not erase that observation retroactively; a qualifying
 provider-log start reactivates the same run when the new turn is observed.
 
