@@ -1181,6 +1181,13 @@ pub enum TopologyEntityId {
     Pane { pane_id: String },
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum TopologyAuthority {
+    #[default]
+    Partial,
+    Authoritative,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum NormalizedEvent {
     ControllerEvent {
@@ -1189,6 +1196,8 @@ pub enum NormalizedEvent {
     },
     TopologyUpsert {
         metadata: EventMetadata,
+        #[serde(default)]
+        authority: TopologyAuthority,
         entity: TopologyEntity,
     },
     TopologyClosure {
@@ -1459,6 +1468,50 @@ mod tests {
         .unwrap();
 
         assert_eq!(pane.display_name, None);
+    }
+
+    #[test]
+    fn topology_authority_defaults_to_partial_when_missing_from_json() {
+        let metadata = EventMetadata {
+            event_id: "legacy-topology-upsert".to_owned(),
+            timestamp_ms: 11,
+            receipt_time_ms: 22,
+            source: "herdr".to_owned(),
+            source_event_type: "workspace_created".to_owned(),
+            herdr_session: "session".to_owned(),
+            workspace_id: Some("workspace".to_owned()),
+            tab_id: None,
+            pane_id: None,
+            terminal_id: None,
+            provider: None,
+            native_session_id: None,
+            task_run_id: None,
+            agent_node_id: None,
+            task_state: None,
+            execution_parent: None,
+            dependency: None,
+            source_coverage: Vec::new(),
+            provider_metadata: None,
+            label: None,
+            reason: None,
+            progress: None,
+            ingest_seq: None,
+        };
+        let event = serde_json::from_value::<NormalizedEvent>(serde_json::json!({
+            "TopologyUpsert": {
+                "metadata": metadata,
+                "entity": TopologyEntity::Workspace(Workspace {
+                    workspace_id: "workspace".to_owned(),
+                }),
+            },
+        }))
+        .unwrap();
+        let encoded = serde_json::to_value(event).unwrap();
+
+        assert_eq!(
+            encoded["TopologyUpsert"]["authority"],
+            serde_json::json!("Partial")
+        );
     }
 
     #[test]

@@ -1786,7 +1786,7 @@ fn pane_is_renderable(model: &DomainModel, pane_id: &str) -> bool {
 
 fn topology_row_label(kind: &str, id: &str, name: Option<&str>) -> String {
     let id = safe_text(id);
-    match name {
+    match name.filter(|name| !name.is_empty()) {
         Some(name) => format!("{kind}: {id} ({})", safe_text(name)),
         None => format!("{kind}: {id}"),
     }
@@ -3729,6 +3729,18 @@ mod tests {
                 .iter()
                 .any(|row| row.label == "Pane: w1:p1 (UI修正\\t)")
         );
+    }
+
+    #[test]
+    fn topology_rows_omit_absent_names() {
+        assert_eq!(topology_row_label("Tab", "w1:t1", None), "Tab: w1:t1");
+        assert_eq!(topology_row_label("Pane", "w1:p1", Some("")), "Pane: w1:p1");
+    }
+
+    #[test]
+    fn topology_rows_omit_empty_names() {
+        assert_eq!(topology_row_label("Tab", "w1:t1", Some("")), "Tab: w1:t1");
+        assert_eq!(topology_row_label("Pane", "w1:p1", None), "Pane: w1:p1");
     }
 
     fn connector_fixture_rows() -> Vec<TreeRow> {

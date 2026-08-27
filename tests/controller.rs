@@ -11,7 +11,7 @@ use herdr_top::diagnostics::{
     OccurrenceLogStatus, OwnerFreshness, PersistenceCounters, RuntimeDiagnosticsSnapshot,
     SourceCoverageSnapshot,
 };
-use herdr_top::herdr::collector::{self, CollectorHandle, SourceAvailability};
+use herdr_top::herdr::collector::{self, CollectorHandle, ObservationQuality, SourceAvailability};
 use herdr_top::herdr::controller::{
     self, ControllerEnvelope, ControllerResponse, RejectResponseReason, RetryableReason,
 };
@@ -2896,7 +2896,7 @@ async fn i4_status_live_diagnostics_track_herdr_d4_and_source_order() {
 }
 
 #[tokio::test]
-async fn i4_status_closed_real_diagnostics_downgrades_controller_only() {
+async fn i4_status_topology_conversion_reconnect_keeps_controller_available() {
     let state = tempfile::tempdir().unwrap();
     let socket_dir = tempfile::tempdir().unwrap();
     let controller_path = socket_dir.path().join("controller.sock");
@@ -2908,7 +2908,7 @@ async fn i4_status_closed_real_diagnostics_downgrades_controller_only() {
     let store = store::open_writer(&root).unwrap();
     let restored = store.load_restored_state().unwrap();
     let (lifecycle, writer) = store::spawn_writer(store).unwrap();
-    let mut collector = collector::spawn_with_controller(
+    let collector = collector::spawn_with_controller(
         herdr_path,
         SESSION.to_owned(),
         restored,
@@ -2917,27 +2917,51 @@ async fn i4_status_closed_real_diagnostics_downgrades_controller_only() {
     )
     .await
     .unwrap();
-    collector.diagnostics.borrow_and_update();
+    let mut diagnostics = collector.diagnostics.clone();
+    let mut quality = collector.quality.clone();
     tokio::time::timeout(Duration::from_secs(3), async {
-        while let Ok(()) = collector.diagnostics.changed().await {
-            collector.diagnostics.borrow_and_update();
+        loop {
+            let herdr_unavailable = diagnostics
+                .borrow()
+                .source_coverage
+                .iter()
+                .find(|source| source.source == DiagnosticSource::Herdr)
+                .is_some_and(|source| source.availability == InputAvailability::Unavailable);
+            let herdr_disconnected = *quality.borrow() == ObservationQuality::Disconnected;
+            if herdr_unavailable && herdr_disconnected {
+                break;
+            }
+            tokio::select! {
+                result = diagnostics.changed() => {
+                    result.expect("diagnostics publisher closed during reconnect");
+                }
+                result = quality.changed() => {
+                    result.expect("quality publisher closed during reconnect");
+                }
+            }
         }
     })
     .await
-    .expect("collector task did not close its diagnostics publisher");
+    .expect("invalid snapshot did not enter a disconnected reconnect state");
+    assert!(
+        diagnostics.has_changed().is_ok(),
+        "diagnostics publisher closed during reconnect"
+    );
 
     assert_eq!(
         serde_json::from_value::<ControllerResponse>(
             send_wire_value(
                 &controller_path,
-                &envelope("closed-diagnostics-event", "task_started", "closed-run"),
+                &envelope(
+                    "topology-conversion-reconnect-event",
+                    "task_started",
+                    "reconnect-run",
+                ),
             )
             .await,
         )
         .unwrap(),
-        ControllerResponse::Retryable {
-            reason: RetryableReason::PersistenceUnavailable,
-        }
+        ControllerResponse::Accepted
     );
     let status = send_wire_value(
         &controller_path,
@@ -2952,14 +2976,21 @@ async fn i4_status_closed_real_diagnostics_downgrades_controller_only() {
     assert_eq!(status["diagnostics"]["owner"], "current");
     assert_eq!(
         status["diagnostics"]["controller_input"],
-        json!({"status": "unavailable", "reason": "runtime_unsafe"})
+        json!({"status": "available"})
+    );
+    assert_eq!(
+        status["diagnostics"]["source_coverage"][0],
+        json!({"source": "herdr", "availability": "unavailable"})
     );
     assert_eq!(
         status["diagnostics"]["source_coverage"][1],
-        json!({"source": "controller", "availability": "unavailable"})
+        json!({"source": "controller", "availability": "available"})
     );
 
-    assert!(collector.stop().await.is_err());
+    tokio::time::timeout(Duration::from_secs(3), collector.stop())
+        .await
+        .expect("collector stop timed out during reconnect")
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(3), lifecycle.shutdown())
         .await
         .expect("writer shutdown timed out")

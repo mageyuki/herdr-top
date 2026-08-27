@@ -2,6 +2,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
@@ -18,7 +20,8 @@ use crate::model::{
     ControllerEvent, ControllerEventKind, DependencyEdge, DisplayOrdinal, DomainModel,
     EventMetadata, ExecState, Execution, ExecutionEdge, MinimalProviderMetadata, NormalizedEvent,
     OperatorCommand, Pane, Provider, ProviderDiagnosticsHandle, ReconcileBatch, RunId, RunKey,
-    SharedModel, TaskRun, TaskState, TopologyEntity, TopologyEntityId, sanitize_controller_text,
+    SharedModel, TaskRun, TaskState, TopologyAuthority, TopologyEntity, TopologyEntityId,
+    TopologySnapshot, sanitize_controller_text,
 };
 use crate::operator::OperatorProjection;
 use crate::store::{
@@ -206,7 +209,6 @@ struct WorkloadObservationTiming {
 // increment5-workload-harness: end reducer timing callback ABI
 
 const STALE_GRACE_MS: i64 = 30_000;
-const TAB_RENAMED_EVENT: &str = "tab_renamed";
 
 /// Errors that reject a reducer transition before any model or persistence mutation escapes.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -292,6 +294,8 @@ pub struct Reducer {
     operator: OperatorProjection,
     #[cfg(test)]
     publish_count: std::cell::Cell<u64>,
+    #[cfg(test)]
+    shared_publish_count: Arc<AtomicU64>,
     // increment5-workload-harness: begin reducer timing configuration field
     #[cfg(feature = "workload-harness")]
     workload_observation_timing: Option<WorkloadObservationTiming>,
@@ -358,6 +362,8 @@ impl Reducer {
                 operator,
                 #[cfg(test)]
                 publish_count: std::cell::Cell::new(0),
+                #[cfg(test)]
+                shared_publish_count: Arc::new(AtomicU64::new(0)),
                 // increment5-workload-harness: begin reducer timing configuration initialization
                 #[cfg(feature = "workload-harness")]
                 workload_observation_timing: None,
@@ -510,6 +516,11 @@ impl Reducer {
         self.model.controller_diagnostics().acceptor_handle()
     }
 
+    #[cfg(test)]
+    pub(crate) fn shared_publish_count(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.shared_publish_count)
+    }
+
     /// Returns the atomic diagnostics handle intended for the provider I/O thread.
     #[must_use]
     pub fn provider_diagnostics_handle(&self) -> ProviderDiagnosticsHandle {
@@ -533,9 +544,30 @@ impl Reducer {
     /// Resolves a raw Controller key through canonical and durable alias bindings.
     #[must_use]
     pub fn resolve_controller_run(&self, raw: &str) -> Option<RunId> {
-        self.model
+        let exact = self
+            .model
             .task_run_by_key(&RunKey::Controller(raw.to_owned()))
-            .map(|run| run.run_id)
+            .map(|run| run.run_id);
+        if exact.is_some() {
+            return exact;
+        }
+
+        // Shipped lane-created Codex runs used the bare SID as their Controller primary key.
+        // Bridge only a root hook key to that restored owner; suffixed subagent/task keys and
+        // unrelated Controller claimants must continue through normal K1 collision handling.
+        let sid = raw.strip_prefix("hook:codex:")?;
+        if sid.is_empty() || sid.contains(':') {
+            return None;
+        }
+        self.model
+            .task_run_by_key(&RunKey::Native {
+                provider: Provider::Codex,
+                sid: sid.to_owned(),
+            })
+            .filter(
+                |owner| matches!(&owner.key, RunKey::Controller(legacy_sid) if legacy_sid == sid),
+            )
+            .map(|owner| owner.run_id)
     }
 
     /// Rebuilds transient reducer state from a durable-ledger duplicate during log replay.
@@ -1099,12 +1131,22 @@ impl Reducer {
 
     /// Replaces physical topology across an observation gap in one coherent batch.
     pub fn reconcile_gap(&mut self, batch: ReconcileBatch) -> Result<PersistBatch, ReducerError> {
+        self.reconcile_snapshot(batch.topology)
+    }
+
+    /// Atomically replaces physical topology from one complete authoritative snapshot.
+    pub fn reconcile_snapshot(
+        &mut self,
+        topology: TopologySnapshot,
+    ) -> Result<PersistBatch, ReducerError> {
         let original_model = self.model.clone();
         let original_next_ordinal = self.next_ordinal;
-        match self.reconcile_gap_inner(batch) {
+        match self.reconcile_snapshot_inner(topology) {
             Ok(mut persist) => {
                 normalize_persist_batch_lineage(&mut persist);
+                self.recompute_dangling_announcement_components();
                 self.operator.apply_submission(&persist);
+                self.publish();
                 Ok(persist)
             }
             Err(error) => {
@@ -1120,11 +1162,10 @@ impl Reducer {
         self.operator.complete_submission(outcome);
     }
 
-    fn reconcile_gap_inner(&mut self, batch: ReconcileBatch) -> Result<PersistBatch, ReducerError> {
-        let ReconcileBatch {
-            topology,
-            gap_kind: _,
-        } = batch;
+    fn reconcile_snapshot_inner(
+        &mut self,
+        topology: TopologySnapshot,
+    ) -> Result<PersistBatch, ReducerError> {
         let now_ms = unix_now_ms();
         let mut persist = Vec::new();
         let mut pre_gap_executions: Vec<_> = self.model.executions().cloned().collect();
@@ -1265,8 +1306,6 @@ impl Reducer {
             self.close_run_without_live_execution(run_id, now_ms, &mut persist);
         }
 
-        self.recompute_dangling_announcement_components();
-        self.publish();
         Ok(persist)
     }
 
@@ -1521,15 +1560,15 @@ impl Reducer {
     ) -> bool {
         // A strictly newer source fact is the only way to distinguish a genuine resume from
         // replayed history after a lane-authored terminal.
-        let start_follows_completion = self.model.task_run(&run_id).is_some_and(|run| {
-            run.state == TaskState::Completed
+        let start_follows_terminal = self.model.task_run(&run_id).is_some_and(|run| {
+            matches!(run.state, TaskState::Completed | TaskState::Cancelled)
                 && run
                     .finished_at_ms
                     .is_some_and(|finished_at_ms| source_timestamp_ms > finished_at_ms)
         });
         matches!(event, ControllerEventKind::TaskStarted)
             && source == crate::provider::lane::SOURCE_LOG_LANE
-            && start_follows_completion
+            && start_follows_terminal
             && self
                 .terminal_event_sources
                 .get(&run_id)
@@ -1584,7 +1623,9 @@ impl Reducer {
                     self.model.set_run_kind(run_id, kind.clone());
                 }
             }
-            NormalizedEvent::TopologyUpsert { entity, .. } => match entity {
+            NormalizedEvent::TopologyUpsert {
+                authority, entity, ..
+            } => match entity {
                 TopologyEntity::Workspace(workspace) => {
                     let display_ordinal =
                         self.workspace_ordinal_or_allocate(&workspace.workspace_id)?;
@@ -1599,19 +1640,29 @@ impl Reducer {
                         return Ok(());
                     }
                     let mut tab = tab.clone();
-                    if tab.label.is_none() && metadata.source_event_type != TAB_RENAMED_EVENT {
-                        tab.label = self
-                            .model
-                            .tab(&tab.tab_id)
-                            .and_then(|current| current.label.clone());
-                    }
+                    tab.label = match authority {
+                        TopologyAuthority::Partial => tab
+                            .label
+                            .as_deref()
+                            .map(sanitize_controller_text)
+                            .or_else(|| {
+                                self.model
+                                    .tab(&tab.tab_id)
+                                    .and_then(|current| current.label.clone())
+                            }),
+                        TopologyAuthority::Authoritative => tab
+                            .label
+                            .as_deref()
+                            .map(sanitize_controller_text)
+                            .filter(|label| !label.is_empty()),
+                    };
                     let display_ordinal = self.tab_ordinal_or_allocate(&tab.tab_id)?;
                     self.model.insert_tab(tab.clone());
                     persist.push(PersistOp::UpsertTab {
                         tab: tab.clone(),
                         display_ordinal,
                     });
-                    if tab.label.is_none() && metadata.source_event_type == TAB_RENAMED_EVENT {
+                    if *authority == TopologyAuthority::Authoritative && tab.label.is_none() {
                         persist.push(PersistOp::ClearTabLabel {
                             tab_id: tab.tab_id.clone(),
                         });
@@ -1622,18 +1673,34 @@ impl Reducer {
                         return Ok(());
                     }
                     let mut pane = pane.clone();
-                    if pane.display_name.is_none() {
-                        pane.display_name = self
-                            .model
-                            .pane(&pane.pane_id)
-                            .and_then(|current| current.display_name.clone());
-                    }
+                    pane.display_name = match authority {
+                        TopologyAuthority::Partial => pane
+                            .display_name
+                            .as_deref()
+                            .map(sanitize_controller_text)
+                            .or_else(|| {
+                                self.model
+                                    .pane(&pane.pane_id)
+                                    .and_then(|current| current.display_name.clone())
+                            }),
+                        TopologyAuthority::Authoritative => pane
+                            .display_name
+                            .as_deref()
+                            .map(sanitize_controller_text)
+                            .filter(|display_name| !display_name.is_empty()),
+                    };
                     let display_ordinal = self.pane_ordinal_or_allocate(&pane.pane_id)?;
                     self.model.insert_pane(pane.clone());
                     persist.push(PersistOp::UpsertPane {
-                        pane,
+                        pane: pane.clone(),
                         display_ordinal,
                     });
+                    if *authority == TopologyAuthority::Authoritative && pane.display_name.is_none()
+                    {
+                        persist.push(PersistOp::ClearPaneDisplayName {
+                            pane_id: pane.pane_id.clone(),
+                        });
+                    }
                 }
             },
             NormalizedEvent::TopologyClosure { entity, .. } => {
@@ -2159,24 +2226,6 @@ impl Reducer {
                     .map(|ordinal| (pane.pane_id.clone(), ordinal))
             })
             .collect::<Vec<_>>();
-        let retained_tab_labels = topology
-            .tabs
-            .iter()
-            .filter_map(|tab| {
-                self.model
-                    .tab(&tab.tab_id)
-                    .map(|current| (tab.tab_id.clone(), current.label.clone()))
-            })
-            .collect::<HashMap<_, _>>();
-        let retained_pane_display_names = topology
-            .panes
-            .iter()
-            .filter_map(|pane| {
-                self.model
-                    .pane(&pane.pane_id)
-                    .map(|current| (pane.pane_id.clone(), current.display_name.clone()))
-            })
-            .collect::<HashMap<_, _>>();
         let workspace_ids: Vec<_> = self
             .model
             .workspaces()
@@ -2224,15 +2273,22 @@ impl Reducer {
         }
         for tab in &topology.tabs {
             let mut tab = tab.clone();
-            if tab.label.is_none() {
-                tab.label = retained_tab_labels.get(&tab.tab_id).cloned().flatten();
-            }
+            tab.label = tab
+                .label
+                .as_deref()
+                .map(sanitize_controller_text)
+                .filter(|label| !label.is_empty());
             let display_ordinal = self.tab_ordinal_or_allocate(&tab.tab_id)?;
             self.model.insert_tab(tab.clone());
             persist.push(PersistOp::UpsertTab {
-                tab,
+                tab: tab.clone(),
                 display_ordinal,
             });
+            if tab.label.is_none() {
+                persist.push(PersistOp::ClearTabLabel {
+                    tab_id: tab.tab_id.clone(),
+                });
+            }
         }
         for pane in &topology.panes {
             let pane = Pane {
@@ -2240,19 +2296,23 @@ impl Reducer {
                 workspace_id: pane.workspace_id.clone(),
                 tab_id: pane.tab_id.clone(),
                 terminal_id: pane.terminal_id.clone(),
-                display_name: pane.display_name.clone().or_else(|| {
-                    retained_pane_display_names
-                        .get(&pane.pane_id)
-                        .cloned()
-                        .flatten()
-                }),
+                display_name: pane
+                    .display_name
+                    .as_deref()
+                    .map(sanitize_controller_text)
+                    .filter(|display_name| !display_name.is_empty()),
             };
             let display_ordinal = self.pane_ordinal_or_allocate(&pane.pane_id)?;
             self.model.insert_pane(pane.clone());
             persist.push(PersistOp::UpsertPane {
-                pane,
+                pane: pane.clone(),
                 display_ordinal,
             });
+            if pane.display_name.is_none() {
+                persist.push(PersistOp::ClearPaneDisplayName {
+                    pane_id: pane.pane_id.clone(),
+                });
+            }
         }
         Ok(())
     }
@@ -2569,7 +2629,10 @@ impl Reducer {
     fn publish(&mut self) {
         self.apply_pending_telemetry_for_known_runs();
         #[cfg(test)]
-        self.publish_count.set(self.publish_count.get() + 1);
+        {
+            self.publish_count.set(self.publish_count.get() + 1);
+            self.shared_publish_count.fetch_add(1, Ordering::Relaxed);
+        }
         // increment5-workload-harness: begin reducer clone publication timing start
         #[cfg(feature = "workload-harness")]
         let workload_publish_started = Instant::now();
@@ -2769,7 +2832,7 @@ fn controller_task_transition(
     match controller_event_kind(source_event_type) {
         LegacyControllerEventKind::Started => match current {
             TaskState::Queued | TaskState::Blocked | TaskState::EndedUnknown => TaskState::Running,
-            TaskState::Completed if allow_lane_reopen => TaskState::Running,
+            TaskState::Completed | TaskState::Cancelled if allow_lane_reopen => TaskState::Running,
             _ => current,
         },
         LegacyControllerEventKind::Blocked => match current {
@@ -2970,8 +3033,8 @@ mod tests {
         ControllerEvent, ControllerEventKind, DependencyEdge, DisplayOrdinal, DomainModel,
         EventMetadata, ExecState, Execution, ExecutionEdge, GapKind, MinimalProviderMetadata,
         NormalizedEvent, OperatorCommand, Pane, PaneSnapshot, Provider, ReconcileBatch, RunId,
-        RunKey, SharedModel, SnapshotAgent, Tab, TaskRun, TaskState, TopologyEntity,
-        TopologyEntityId, TopologySnapshot, TurnAttr, Workspace,
+        RunKey, SharedModel, SnapshotAgent, Tab, TaskRun, TaskState, TopologyAuthority,
+        TopologyEntity, TopologyEntityId, TopologySnapshot, TurnAttr, Workspace,
     };
     use crate::provider::ProviderEvent;
     use crate::provider::claude_facts::{extract_claude_line, extract_meta_json};
@@ -3055,6 +3118,7 @@ mod tests {
         let outcome = reducer
             .apply(NormalizedEvent::TopologyUpsert {
                 metadata: event_metadata,
+                authority: TopologyAuthority::Partial,
                 entity: TopologyEntity::Workspace(Workspace {
                     workspace_id: "merge-trigger-workspace".to_owned(),
                 }),
@@ -3092,6 +3156,7 @@ mod tests {
                     metadata.task_run_id = Some(task_run_id);
                     metadata
                 },
+                authority: TopologyAuthority::Partial,
                 entity: TopologyEntity::Workspace(Workspace {
                     workspace_id: format!("workspace-{event_id}"),
                 }),
@@ -3500,6 +3565,294 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn cancelled_lane_run_reopens_only_for_strictly_newer_lane_start() {
+        for (case, timestamp_ms, expected_state) in [
+            ("older", 99, None),
+            ("equal", 100, None),
+            ("newer", 101, Some(TaskState::Running)),
+        ] {
+            let raw_run_id = format!("cancelled-lane-{case}");
+            let (mut model, run_id) = controller_model(&raw_run_id, TaskState::Cancelled);
+            let mut run = model.task_run(&run_id).unwrap().clone();
+            run.finished_at_ms = Some(100);
+            model.insert_task_run(run);
+            let (mut reducer, _shared) = Reducer::new(restored(model, 2));
+            reducer.restore_terminal_event_sources(HashMap::from([(
+                run_id,
+                SOURCE_LOG_LANE.to_owned(),
+            )]));
+
+            let reopen = provider_lane_event(
+                &format!("cancelled-lane-reopen-{case}"),
+                &raw_run_id,
+                ControllerEventKind::TaskStarted,
+                timestamp_ms,
+                1_000 + timestamp_ms,
+            );
+            let result = reducer.validate_controller_event(&reopen);
+
+            match expected_state {
+                Some(expected_state) => assert_eq!(
+                    result
+                        .expect("a strictly newer lane start must reopen a cancelled lane run")
+                        .post_model
+                        .task_run(&run_id)
+                        .unwrap()
+                        .state,
+                    expected_state,
+                    "case {case}"
+                ),
+                None => assert!(
+                    matches!(result, Err(RejectReason::StaleEvent)),
+                    "case {case} unexpectedly reopened"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn failed_and_non_lane_terminal_runs_do_not_reopen() {
+        for (case, terminal_state, terminal_source, start_source) in [
+            (
+                "failed-lane",
+                TaskState::Failed,
+                SOURCE_LOG_LANE,
+                SOURCE_LOG_LANE,
+            ),
+            (
+                "cancelled-hook-terminal",
+                TaskState::Cancelled,
+                "hook",
+                SOURCE_LOG_LANE,
+            ),
+            (
+                "cancelled-controller-start",
+                TaskState::Cancelled,
+                SOURCE_LOG_LANE,
+                "controller",
+            ),
+            (
+                "cancelled-manual-start",
+                TaskState::Cancelled,
+                SOURCE_LOG_LANE,
+                "manual",
+            ),
+        ] {
+            let (mut model, run_id) = controller_model(case, terminal_state);
+            let mut run = model.task_run(&run_id).unwrap().clone();
+            run.finished_at_ms = Some(100);
+            model.insert_task_run(run);
+            let (mut reducer, _shared) = Reducer::new(restored(model, 2));
+            reducer.restore_terminal_event_sources(HashMap::from([(
+                run_id,
+                terminal_source.to_owned(),
+            )]));
+            let mut reopen = controller_event(
+                &format!("terminal-reopen-{case}"),
+                case,
+                ControllerEventKind::TaskStarted,
+            );
+            reopen.metadata.source = start_source.to_owned();
+            reopen.metadata.timestamp_ms = 101;
+            reopen.metadata.receipt_time_ms = 1_101;
+
+            assert!(
+                matches!(
+                    reducer.validate_controller_event(&reopen),
+                    Err(RejectReason::StaleEvent)
+                ),
+                "case {case} unexpectedly reopened"
+            );
+        }
+
+        let (mut model, run_id) =
+            controller_model("cancelled-lane-positive-control", TaskState::Cancelled);
+        let mut run = model.task_run(&run_id).unwrap().clone();
+        run.finished_at_ms = Some(100);
+        model.insert_task_run(run);
+        let (mut reducer, _shared) = Reducer::new(restored(model, 2));
+        reducer
+            .restore_terminal_event_sources(HashMap::from([(run_id, SOURCE_LOG_LANE.to_owned())]));
+        let reopen = provider_lane_event(
+            "cancelled-lane-positive-control-reopen",
+            "cancelled-lane-positive-control",
+            ControllerEventKind::TaskStarted,
+            101,
+            1_101,
+        );
+
+        assert_eq!(
+            reducer
+                .validate_controller_event(&reopen)
+                .expect("the exclusions must not block the eligible cancelled lane case")
+                .post_model
+                .task_run(&run_id)
+                .unwrap()
+                .state,
+            TaskState::Running
+        );
+    }
+
+    #[test]
+    fn cancelled_lane_reopen_preserves_identity_and_clears_terminal_state() {
+        let raw_run_id = "cancelled-lane-identity";
+        let native_key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: raw_run_id.to_owned(),
+        };
+        let run_id = RunId::new();
+        let parent_run_id = RunId::new();
+        let prerequisite_run_id = RunId::new();
+        let execution_edge = ExecutionEdge {
+            parent_run_id,
+            child_run_id: run_id,
+        };
+        let dependency_edge = DependencyEdge {
+            prerequisite_run_id,
+            dependent_run_id: run_id,
+        };
+        let mut cancelled = run_with_controller_evidence(
+            run_id,
+            RunKey::Controller(raw_run_id.to_owned()),
+            7,
+            TaskState::Cancelled,
+        );
+        cancelled.created_at_ms = Some(10);
+        cancelled.updated_at_ms = Some(100);
+        cancelled.finished_at_ms = Some(100);
+        cancelled.subject = Some("preserved subject".to_owned());
+        cancelled.dismissed_at_ms = Some(105);
+        let preserved_execution = execution(run_id, "preserved-execution", ExecState::Working);
+        let preserved_node = native_agent_node("preserved-node", raw_run_id, run_id, 8);
+        let mut model = DomainModel::default();
+        model.insert_task_run(cancelled.clone());
+        model.insert_task_run(run(
+            parent_run_id,
+            RunKey::Controller("preserved-parent".to_owned()),
+            5,
+            TaskState::Queued,
+        ));
+        model.insert_task_run(run(
+            prerequisite_run_id,
+            RunKey::Controller("preserved-prerequisite".to_owned()),
+            6,
+            TaskState::Queued,
+        ));
+        model.insert_task_run_alias(native_key.clone(), run_id);
+        model.insert_execution(preserved_execution.clone());
+        model.insert_agent_node(preserved_node.clone());
+        model.insert_execution_edge(execution_edge.clone());
+        model.insert_dependency_edge(dependency_edge.clone());
+        model.set_run_kind(run_id, "codex_cli_rs".to_owned());
+        let initial_run_count = model.task_runs().count();
+        let initial_execution_count = model.executions().count();
+        let initial_node_count = model.agent_nodes().count();
+        let (mut reducer, _shared) = Reducer::new(restored(model, 9));
+        reducer
+            .restore_terminal_event_sources(HashMap::from([(run_id, SOURCE_LOG_LANE.to_owned())]));
+        reducer.apply_telemetry(
+            &native_key,
+            50,
+            42,
+            Some("gpt-5.6-sol".to_owned()),
+            Some("xhigh".to_owned()),
+            Some("workspace-write".to_owned()),
+        );
+        let preserved_telemetry = reducer.model.telemetry(&run_id).unwrap().clone();
+        let reopen = provider_lane_event(
+            "cancelled-lane-identity-reopen",
+            raw_run_id,
+            ControllerEventKind::TaskStarted,
+            101,
+            1_101,
+        );
+
+        let reopened = reducer
+            .validate_controller_event(&reopen)
+            .expect("a newer lane start must reopen the cancelled run");
+        let reopened_run = reopened.post_model.task_run(&run_id).unwrap();
+        assert_eq!(reopened_run.run_id, run_id);
+        assert_eq!(reopened_run.key, cancelled.key);
+        assert_eq!(reopened_run.display_ordinal, cancelled.display_ordinal);
+        assert_eq!(reopened_run.subject, cancelled.subject);
+        assert!(reopened_run.has_controller_task_state_event);
+        assert_eq!(reopened_run.state, TaskState::Running);
+        assert_eq!(reopened_run.finished_at_ms, None);
+        assert_eq!(reopened_run.dismissed_at_ms, None);
+        assert_eq!(reopened.post_model.task_runs().count(), initial_run_count);
+        assert_eq!(
+            reopened.post_model.executions().count(),
+            initial_execution_count
+        );
+        assert_eq!(
+            reopened.post_model.agent_nodes().count(),
+            initial_node_count
+        );
+        assert_eq!(
+            reopened
+                .post_model
+                .task_run_by_key(&native_key)
+                .unwrap()
+                .run_id,
+            run_id
+        );
+        assert_eq!(
+            reopened.post_model.execution("preserved-execution"),
+            Some(&preserved_execution)
+        );
+        assert_eq!(
+            reopened.post_model.agent_node("preserved-node"),
+            Some(&preserved_node)
+        );
+        assert!(
+            reopened
+                .post_model
+                .execution_edges()
+                .any(|edge| edge == &execution_edge)
+        );
+        assert!(
+            reopened
+                .post_model
+                .dependency_edges()
+                .any(|edge| edge == &dependency_edge)
+        );
+        assert_eq!(
+            reopened.post_model.telemetry(&run_id),
+            Some(&preserved_telemetry)
+        );
+        assert_eq!(reopened.post_model.run_kind(&run_id), Some("codex_cli_rs"));
+        assert!(!reopened.post_terminal_event_sources.contains_key(&run_id));
+
+        let mut reducer = Reducer::new(RestoredState {
+            model: reopened.post_model,
+            next_ordinal: reopened.post_next_ordinal,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        })
+        .0;
+        reducer.restore_terminal_event_sources(reopened.post_terminal_event_sources);
+        let completed = reducer
+            .validate_controller_event(&provider_lane_event(
+                "cancelled-lane-identity-complete",
+                raw_run_id,
+                ControllerEventKind::Complete,
+                102,
+                1_102,
+            ))
+            .expect("a later terminal event must be accepted after reopen");
+        let completed_run = completed.post_model.task_run(&run_id).unwrap();
+        assert_eq!(completed_run.state, TaskState::Completed);
+        assert_eq!(completed_run.finished_at_ms, Some(102));
+        assert_eq!(
+            completed
+                .post_terminal_event_sources
+                .get(&run_id)
+                .map(String::as_str),
+            Some(SOURCE_LOG_LANE)
+        );
     }
 
     #[test]
@@ -5875,6 +6228,7 @@ mod tests {
     fn topology_event(metadata: EventMetadata, workspace_id: &str) -> NormalizedEvent {
         NormalizedEvent::TopologyUpsert {
             metadata,
+            authority: TopologyAuthority::Partial,
             entity: TopologyEntity::Workspace(Workspace {
                 workspace_id: workspace_id.to_owned(),
             }),
@@ -5884,8 +6238,24 @@ mod tests {
     fn topology_entity_event(event_id: &str, entity: TopologyEntity) -> NormalizedEvent {
         NormalizedEvent::TopologyUpsert {
             metadata: metadata(event_id, 1_000),
+            authority: TopologyAuthority::Partial,
             entity,
         }
+    }
+
+    fn topology_entity_event_with_authority(
+        event_id: &str,
+        entity: TopologyEntity,
+        authority: &str,
+    ) -> NormalizedEvent {
+        serde_json::from_value(serde_json::json!({
+            "TopologyUpsert": {
+                "metadata": metadata(event_id, 1_000),
+                "entity": entity,
+                "authority": authority,
+            },
+        }))
+        .unwrap()
     }
 
     fn topology_snapshot(
@@ -5920,6 +6290,451 @@ mod tests {
                     agent_session: None,
                 })
                 .collect(),
+        }
+    }
+
+    fn reducer_with_named_topology() -> (Reducer, SharedModel) {
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        for (event_id, entity) in [
+            (
+                "named-workspace",
+                TopologyEntity::Workspace(Workspace {
+                    workspace_id: "workspace".to_owned(),
+                }),
+            ),
+            (
+                "named-tab",
+                TopologyEntity::Tab(Tab {
+                    tab_id: "tab".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    label: Some("old tab".to_owned()),
+                }),
+            ),
+            (
+                "named-pane",
+                TopologyEntity::Pane(Pane {
+                    pane_id: "pane".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    tab_id: "tab".to_owned(),
+                    terminal_id: "terminal".to_owned(),
+                    display_name: Some("old pane".to_owned()),
+                }),
+            ),
+        ] {
+            reducer
+                .apply(topology_entity_event(event_id, entity))
+                .unwrap();
+        }
+        (reducer, shared)
+    }
+
+    fn names_cleared_by_isolated_operation(operation: &PersistOp) -> (bool, bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        store
+            .apply_batch(vec![
+                PersistOp::UpsertWorkspace {
+                    workspace: Workspace {
+                        workspace_id: "workspace".to_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(1),
+                },
+                PersistOp::UpsertTab {
+                    tab: Tab {
+                        tab_id: "tab".to_owned(),
+                        workspace_id: "workspace".to_owned(),
+                        label: Some("old tab".to_owned()),
+                    },
+                    display_ordinal: DisplayOrdinal::new(2),
+                },
+                PersistOp::UpsertPane {
+                    pane: Pane {
+                        pane_id: "pane".to_owned(),
+                        workspace_id: "workspace".to_owned(),
+                        tab_id: "tab".to_owned(),
+                        terminal_id: "terminal".to_owned(),
+                        display_name: Some("old pane".to_owned()),
+                    },
+                    display_ordinal: DisplayOrdinal::new(3),
+                },
+            ])
+            .unwrap();
+        store.apply_batch(vec![operation.clone()]).unwrap();
+        let restored = store.load_restored_state().unwrap();
+        (
+            restored
+                .model
+                .tab("tab")
+                .is_some_and(|tab| tab.label.is_none()),
+            restored
+                .model
+                .pane("pane")
+                .is_some_and(|pane| pane.display_name.is_none()),
+        )
+    }
+
+    #[test]
+    fn partial_topology_upsert_preserves_names() {
+        let (mut reducer, shared) = reducer_with_named_topology();
+        let mut tab_event = topology_entity_event_with_authority(
+            "partial-tab",
+            TopologyEntity::Tab(Tab {
+                tab_id: "tab".to_owned(),
+                workspace_id: "workspace".to_owned(),
+                label: None,
+            }),
+            "Partial",
+        );
+        let NormalizedEvent::TopologyUpsert { metadata, .. } = &mut tab_event else {
+            unreachable!();
+        };
+        metadata.source_event_type = "tab_renamed".to_owned();
+
+        let ApplyOutcome::Applied(tab_batch) = reducer.apply(tab_event).unwrap() else {
+            panic!("partial tab observation should apply");
+        };
+        let ApplyOutcome::Applied(pane_batch) = reducer
+            .apply(topology_entity_event_with_authority(
+                "partial-pane",
+                TopologyEntity::Pane(Pane {
+                    pane_id: "pane".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    tab_id: "tab".to_owned(),
+                    terminal_id: "terminal".to_owned(),
+                    display_name: None,
+                }),
+                "Partial",
+            ))
+            .unwrap()
+        else {
+            panic!("partial pane observation should apply");
+        };
+
+        assert_eq!(
+            shared.borrow().tab("tab").unwrap().label.as_deref(),
+            Some("old tab")
+        );
+        assert_eq!(
+            shared
+                .borrow()
+                .pane("pane")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("old pane")
+        );
+        assert_eq!(
+            tab_batch.len(),
+            2,
+            "partial tab upsert must not append a clear"
+        );
+        assert_eq!(
+            pane_batch.len(),
+            2,
+            "partial pane upsert must not append a clear"
+        );
+    }
+
+    #[test]
+    fn authoritative_topology_upsert_sets_and_clears_names() {
+        let (mut reducer, shared) = reducer_with_named_topology();
+        for (event_id, entity) in [
+            (
+                "set-tab",
+                TopologyEntity::Tab(Tab {
+                    tab_id: "tab".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    label: Some("new\ntab".to_owned()),
+                }),
+            ),
+            (
+                "set-pane",
+                TopologyEntity::Pane(Pane {
+                    pane_id: "pane".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    tab_id: "tab".to_owned(),
+                    terminal_id: "terminal".to_owned(),
+                    display_name: Some("new\npane".to_owned()),
+                }),
+            ),
+        ] {
+            reducer
+                .apply(topology_entity_event_with_authority(
+                    event_id,
+                    entity,
+                    "Authoritative",
+                ))
+                .unwrap();
+        }
+        assert_eq!(
+            shared.borrow().tab("tab").unwrap().label.as_deref(),
+            Some("new\\ntab")
+        );
+        assert_eq!(
+            shared
+                .borrow()
+                .pane("pane")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("new\\npane")
+        );
+
+        let ApplyOutcome::Applied(tab_batch) = reducer
+            .apply(topology_entity_event_with_authority(
+                "clear-tab",
+                TopologyEntity::Tab(Tab {
+                    tab_id: "tab".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    label: None,
+                }),
+                "Authoritative",
+            ))
+            .unwrap()
+        else {
+            panic!("authoritative tab clear should apply");
+        };
+        let ApplyOutcome::Applied(pane_batch) = reducer
+            .apply(topology_entity_event_with_authority(
+                "clear-pane",
+                TopologyEntity::Pane(Pane {
+                    pane_id: "pane".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    tab_id: "tab".to_owned(),
+                    terminal_id: "terminal".to_owned(),
+                    display_name: Some(String::new()),
+                }),
+                "Authoritative",
+            ))
+            .unwrap()
+        else {
+            panic!("authoritative pane clear should apply");
+        };
+
+        assert_eq!(shared.borrow().tab("tab").unwrap().label, None);
+        assert_eq!(shared.borrow().pane("pane").unwrap().display_name, None);
+        assert_eq!(
+            tab_batch.len(),
+            3,
+            "authoritative tab clear must be explicit"
+        );
+        assert_eq!(
+            pane_batch.len(),
+            3,
+            "authoritative pane clear must be explicit"
+        );
+    }
+
+    #[test]
+    fn authoritative_snapshot_clear_orders_upsert_before_clear() {
+        let (mut reducer, _shared) = reducer_with_named_topology();
+        let batch = reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: topology_snapshot(
+                    &["workspace"],
+                    &[("tab", "workspace")],
+                    &[("pane", "workspace", "tab")],
+                ),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        let upsert_tab = batch
+            .iter()
+            .position(|operation| matches!(operation, PersistOp::UpsertTab { tab, .. } if tab.tab_id == "tab"))
+            .unwrap();
+        let upsert_pane = batch
+            .iter()
+            .position(|operation| matches!(operation, PersistOp::UpsertPane { pane, .. } if pane.pane_id == "pane"))
+            .unwrap();
+        let cleared_names = batch
+            .iter()
+            .enumerate()
+            .map(|(index, operation)| (index, names_cleared_by_isolated_operation(operation)))
+            .collect::<Vec<_>>();
+        let clear_tab = cleared_names
+            .iter()
+            .find_map(|(index, (tab, _))| tab.then_some(*index))
+            .expect("snapshot batch must explicitly clear the tab label");
+        let clear_pane = cleared_names
+            .iter()
+            .find_map(|(index, (_, pane))| pane.then_some(*index))
+            .expect("snapshot batch must explicitly clear the pane display name");
+
+        assert!(upsert_tab < clear_tab);
+        assert!(upsert_pane < clear_pane);
+    }
+
+    #[test]
+    fn authoritative_snapshot_publishes_once_and_rolls_back_on_late_error() {
+        let (mut reducer, mut shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let before_success = reducer.publish_count.get();
+        let successful = topology_snapshot(
+            &["workspace"],
+            &[("tab", "workspace")],
+            &[("pane", "workspace", "tab")],
+        );
+
+        let batch = reducer
+            .reconcile_snapshot(successful)
+            .expect("an authoritative snapshot should install atomically");
+
+        assert_eq!(reducer.publish_count.get() - before_success, 1);
+        assert!(shared.has_changed().unwrap());
+        let installed = Arc::clone(&shared.borrow_and_update());
+        assert!(installed.workspace("workspace").is_some());
+        assert!(installed.tab("tab").is_some());
+        assert!(installed.pane("pane").is_some());
+        assert!(!batch.is_empty());
+
+        let before_next_ordinal = i64::MAX - 1;
+        reducer.next_ordinal = before_next_ordinal;
+        let before_error = reducer.publish_count.get();
+        let before_model = Arc::clone(&shared.borrow());
+        let mut late = topology_snapshot(
+            &["late-workspace"],
+            &[("late-tab", "late-workspace")],
+            &[("late-pane", "late-workspace", "late-tab")],
+        );
+        late.panes[0].agent = Some(SnapshotAgent {
+            agent_name: "codex".to_owned(),
+            state: ExecState::Working,
+        });
+        let result = reducer.reconcile_snapshot(late);
+
+        assert_eq!(result, Err(ReducerError::OrdinalExhausted));
+        assert_eq!(reducer.publish_count.get(), before_error);
+        assert_eq!(
+            reducer.next_ordinal, before_next_ordinal,
+            "the run ordinal allocated before the later agent-node failure must roll back"
+        );
+        assert!(!shared.has_changed().unwrap());
+        assert!(Arc::ptr_eq(&before_model, &shared.borrow()));
+        assert!(shared.borrow().workspace("late-workspace").is_none());
+    }
+
+    #[test]
+    fn authoritative_snapshot_removes_absent_entities_immediately() {
+        let mut initial = topology_snapshot(
+            &["workspace", "absent-workspace"],
+            &[("tab", "workspace"), ("absent-tab", "absent-workspace")],
+            &[
+                ("pane", "workspace", "tab"),
+                ("absent-pane", "absent-workspace", "absent-tab"),
+            ],
+        );
+        initial
+            .panes
+            .iter_mut()
+            .find(|pane| pane.pane_id == "absent-pane")
+            .unwrap()
+            .agent = Some(SnapshotAgent {
+            agent_name: "codex".to_owned(),
+            state: ExecState::Working,
+        });
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: initial,
+                gap_kind: GapKind::Startup,
+            })
+            .unwrap();
+
+        let batch = reducer
+            .reconcile_snapshot(topology_snapshot(
+                &["workspace"],
+                &[("tab", "workspace")],
+                &[("pane", "workspace", "tab")],
+            ))
+            .unwrap();
+
+        let model = shared.borrow();
+        assert!(model.workspace("absent-workspace").is_none());
+        assert!(model.tab("absent-tab").is_none());
+        assert!(model.pane("absent-pane").is_none());
+        assert!(batch.iter().any(
+            |operation| matches!(operation, PersistOp::DeletePane { pane_id } if pane_id == "absent-pane")
+        ));
+        assert!(batch.iter().any(
+            |operation| matches!(operation, PersistOp::DeleteTab { tab_id } if tab_id == "absent-tab")
+        ));
+        assert!(batch.iter().any(|operation| matches!(
+            operation,
+            PersistOp::DeleteWorkspace { workspace_id } if workspace_id == "absent-workspace"
+        )));
+    }
+
+    #[test]
+    fn authoritative_orphans_emit_no_upsert_or_clear() {
+        let (mut reducer, _shared) = reducer_with_named_topology();
+        for (event_id, entity) in [
+            (
+                "orphan-tab",
+                TopologyEntity::Tab(Tab {
+                    tab_id: "orphan-tab".to_owned(),
+                    workspace_id: "missing-workspace".to_owned(),
+                    label: None,
+                }),
+            ),
+            (
+                "orphan-pane",
+                TopologyEntity::Pane(Pane {
+                    pane_id: "orphan-pane".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    tab_id: "missing-tab".to_owned(),
+                    terminal_id: "orphan-terminal".to_owned(),
+                    display_name: None,
+                }),
+            ),
+        ] {
+            let ApplyOutcome::Applied(batch) = reducer
+                .apply(topology_entity_event_with_authority(
+                    event_id,
+                    entity,
+                    "Authoritative",
+                ))
+                .unwrap()
+            else {
+                panic!("orphan observation should still be recorded");
+            };
+            assert_eq!(batch.len(), 1, "orphan must emit only its event record");
+        }
+
+        for (event_id, entity) in [
+            (
+                "known-tab-clear-control",
+                TopologyEntity::Tab(Tab {
+                    tab_id: "tab".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    label: None,
+                }),
+            ),
+            (
+                "known-pane-clear-control",
+                TopologyEntity::Pane(Pane {
+                    pane_id: "pane".to_owned(),
+                    workspace_id: "workspace".to_owned(),
+                    tab_id: "tab".to_owned(),
+                    terminal_id: "terminal".to_owned(),
+                    display_name: None,
+                }),
+            ),
+        ] {
+            let ApplyOutcome::Applied(batch) = reducer
+                .apply(topology_entity_event_with_authority(
+                    event_id,
+                    entity,
+                    "Authoritative",
+                ))
+                .unwrap()
+            else {
+                panic!("known authoritative clear should apply");
+            };
+            assert_eq!(
+                batch.len(),
+                3,
+                "positive control must emit upsert, clear, and record"
+            );
         }
     }
 
@@ -6134,6 +6949,7 @@ mod tests {
         let ApplyOutcome::Applied(batch) = reducer
             .apply(NormalizedEvent::TopologyUpsert {
                 metadata: event_metadata,
+                authority: TopologyAuthority::Partial,
                 entity: TopologyEntity::Tab(Tab {
                     tab_id: "orphan-tab".to_owned(),
                     workspace_id: "missing-workspace".to_owned(),
@@ -6488,7 +7304,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_gap_retains_or_overwrites_topology_names_end_to_end() {
+    fn reconcile_gap_clears_names_durably() {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let mut store = open_writer(&root).unwrap();
@@ -6560,10 +7376,7 @@ mod tests {
             .unwrap();
         assert!(delete_tab < upsert_tab);
         assert!(delete_pane < upsert_pane);
-        assert_eq!(
-            shared.borrow().tab("tab").unwrap().label.as_deref(),
-            Some("stored tab")
-        );
+        assert_eq!(shared.borrow().tab("tab").unwrap().label.as_deref(), None);
         assert_eq!(
             shared
                 .borrow()
@@ -6571,17 +7384,14 @@ mod tests {
                 .unwrap()
                 .display_name
                 .as_deref(),
-            Some("stored pane")
+            None
         );
         store.apply_batch(batch).unwrap();
         let restored = store.load_restored_state().unwrap();
-        assert_eq!(
-            restored.model.tab("tab").unwrap().label.as_deref(),
-            Some("stored tab")
-        );
+        assert_eq!(restored.model.tab("tab").unwrap().label.as_deref(), None);
         assert_eq!(
             restored.model.pane("pane").unwrap().display_name.as_deref(),
-            Some("stored pane")
+            None
         );
 
         let mut named_topology = topology_snapshot(
@@ -9110,6 +9920,179 @@ mod tests {
                 .run_id,
             original
         );
+    }
+
+    #[tokio::test]
+    async fn restored_legacy_codex_controller_accepts_canonical_hook_key() {
+        const SID: &str = "22222222-2222-4222-8222-222222222222";
+        const CANONICAL: &str = "hook:codex:22222222-2222-4222-8222-222222222222";
+        const OTHER_CANONICAL: &str = "hook:codex:33333333-3333-4333-8333-333333333333";
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let (mut reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let mut legacy = controller_event(
+            "legacy-codex-started",
+            SID,
+            ControllerEventKind::TaskStarted,
+        );
+        legacy.metadata.provider = Some(Provider::Codex);
+        legacy.metadata.native_session_id = Some(SID.to_owned());
+        commit_controller(&mut reducer, &mut writer, legacy).await;
+        let original = reducer.resolve_controller_run(SID).unwrap();
+        lifecycle.shutdown().await.unwrap();
+
+        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+        assert_eq!(
+            restored
+                .model
+                .task_run_by_key(&RunKey::Controller(SID.to_owned()))
+                .unwrap()
+                .run_id,
+            original
+        );
+        assert_eq!(
+            restored
+                .model
+                .task_run_by_key(&RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: SID.to_owned(),
+                })
+                .unwrap()
+                .run_id,
+            original
+        );
+
+        let (reducer, _shared) = Reducer::new(restored);
+        let mut arbitrary = controller_event(
+            "arbitrary-codex-started",
+            "different-controller-key",
+            ControllerEventKind::TaskStarted,
+        );
+        arbitrary.metadata.provider = Some(Provider::Codex);
+        arbitrary.metadata.native_session_id = Some(SID.to_owned());
+        assert!(matches!(
+            reducer.validate_controller_event(&arbitrary),
+            Err(RejectReason::Conflict)
+        ));
+        assert_eq!(reducer.resolve_controller_run(OTHER_CANONICAL), None);
+        assert_eq!(
+            reducer.resolve_controller_run(&format!("{CANONICAL}:agent:child")),
+            None
+        );
+
+        let mut canonical = controller_event(
+            "canonical-codex-started",
+            CANONICAL,
+            ControllerEventKind::TaskStarted,
+        );
+        canonical.metadata.provider = Some(Provider::Codex);
+        canonical.metadata.native_session_id = Some(SID.to_owned());
+        let delta = match reducer.validate_controller_event(&canonical) {
+            Ok(delta) => delta,
+            Err(reason) => panic!("canonical restored Codex start was rejected: {reason:?}"),
+        };
+
+        assert_eq!(delta.post_model.task_runs().count(), 1);
+        assert_eq!(
+            delta
+                .post_model
+                .task_run_by_key(&RunKey::Controller(SID.to_owned()))
+                .unwrap()
+                .run_id,
+            original
+        );
+        assert_eq!(
+            delta
+                .post_model
+                .task_run_by_key(&RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: SID.to_owned(),
+                })
+                .unwrap()
+                .run_id,
+            original
+        );
+        assert!(delta.batch.iter().any(|operation| matches!(
+            operation,
+            PersistOp::RecordEvent { event, .. }
+                if super::event_metadata(event).task_run_id == Some(original)
+        )));
+        assert_eq!(
+            delta
+                .post_model
+                .controller_diagnostics()
+                .binding_conflicts(),
+            0
+        );
+    }
+
+    #[test]
+    fn controller_resolution_prioritizes_exact_key_over_legacy_codex_fallback() {
+        const SID: &str = "44444444-4444-4444-8444-444444444444";
+        let canonical = format!("hook:codex:{SID}");
+        let legacy = RunId::new();
+        let exact = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            legacy,
+            RunKey::Controller(SID.to_owned()),
+            1,
+            TaskState::Queued,
+        ));
+        model.insert_task_run_alias(
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: SID.to_owned(),
+            },
+            legacy,
+        );
+        model.insert_task_run(run(
+            exact,
+            RunKey::Controller(canonical.clone()),
+            2,
+            TaskState::Queued,
+        ));
+        let (reducer, _shared) = Reducer::new(restored(model, 3));
+
+        assert_eq!(reducer.resolve_controller_run(&canonical), Some(exact));
+    }
+
+    #[test]
+    fn codex_compatibility_fallback_requires_bare_sid_controller_primary() {
+        const SID: &str = "55555555-5555-4555-8555-555555555555";
+        let owner = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            owner,
+            RunKey::Controller("different-controller-primary".to_owned()),
+            1,
+            TaskState::Queued,
+        ));
+        model.insert_task_run_alias(
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: SID.to_owned(),
+            },
+            owner,
+        );
+        let (reducer, _shared) = Reducer::new(restored(model, 2));
+        let canonical = format!("hook:codex:{SID}");
+
+        assert_eq!(reducer.resolve_controller_run(&canonical), None);
+        let mut claimant = controller_event(
+            "non-legacy-primary-claim",
+            &canonical,
+            ControllerEventKind::TaskStarted,
+        );
+        claimant.metadata.provider = Some(Provider::Codex);
+        claimant.metadata.native_session_id = Some(SID.to_owned());
+        assert!(matches!(
+            reducer.validate_controller_event(&claimant),
+            Err(RejectReason::Conflict)
+        ));
     }
 
     #[test]

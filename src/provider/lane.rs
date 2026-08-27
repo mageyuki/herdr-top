@@ -738,9 +738,11 @@ pub fn run_key_for_scope(scope: &SessionScope) -> RunKey {
 
 fn run_key_for_scope_key(scope: &ScopeKey) -> RunKey {
     match scope {
-        ScopeKey::ClaudeRoot(session_id) => RunKey::Controller(claude_hook_key(session_id, None)),
+        ScopeKey::ClaudeRoot(session_id) => {
+            RunKey::Controller(hook_key(HookProvider::ClaudeCode, session_id, None))
+        }
         ScopeKey::ClaudeSubagent { parent, agent_id } => {
-            RunKey::Controller(claude_hook_key(parent, Some(agent_id)))
+            RunKey::Controller(hook_key(HookProvider::ClaudeCode, parent, Some(agent_id)))
         }
         ScopeKey::Codex(rollout_id) => RunKey::Native {
             provider: Provider::Codex,
@@ -751,15 +753,17 @@ fn run_key_for_scope_key(scope: &ScopeKey) -> RunKey {
 
 fn controller_key_for_scope(scope: &SessionScope) -> String {
     match scope {
-        SessionScope::ClaudeRoot(session_id) => claude_hook_key(session_id, None),
-        SessionScope::ClaudeSubagent { parent, agent_id } => {
-            claude_hook_key(parent, Some(agent_id))
+        SessionScope::ClaudeRoot(session_id) => {
+            hook_key(HookProvider::ClaudeCode, session_id, None)
         }
-        SessionScope::Codex { rollout_id } => rollout_id.clone(),
+        SessionScope::ClaudeSubagent { parent, agent_id } => {
+            hook_key(HookProvider::ClaudeCode, parent, Some(agent_id))
+        }
+        SessionScope::Codex { rollout_id } => hook_key(HookProvider::Codex, rollout_id, None),
     }
 }
 
-fn claude_hook_key(session_id: &str, agent_id: Option<&str>) -> String {
+fn hook_key(provider: HookProvider, session_id: &str, agent_id: Option<&str>) -> String {
     let payload = HookPayload {
         hook_event_name: if agent_id.is_some() {
             "SubagentStart".to_owned()
@@ -773,7 +777,7 @@ fn claude_hook_key(session_id: &str, agent_id: Option<&str>) -> String {
         task_id: None,
         task_subject: None,
     };
-    map_hook_payload(HookProvider::ClaudeCode, &payload, 0, 0)
+    map_hook_payload(provider, &payload, 0, 0)
         .into_iter()
         .find(|event| {
             if agent_id.is_some() {
@@ -782,7 +786,7 @@ fn claude_hook_key(session_id: &str, agent_id: Option<&str>) -> String {
                 event.event_type == "task_started"
             }
         })
-        .expect("supported Claude hook identity must map")
+        .expect("supported hook identity must map")
         .task_run_id
 }
 
@@ -3115,6 +3119,76 @@ mod tests {
             .validate_controller_event(synthesized_events(&lane)[0])
             .expect("same lane identity remains a no-conflict no-op");
         assert_eq!(delta.post_model.task_runs().count(), 1);
+    }
+
+    #[test]
+    fn codex_hook_and_lane_starts_converge_in_both_arrival_orders() {
+        let hook = map_hook_payload(
+            HookProvider::Codex,
+            &hook_payload("SessionStart", ROLLOUT, None),
+            100,
+            9,
+        );
+        let hook_started = controller_event_from_hook(&hook[0]);
+        let lane = synthesize(
+            &mut Synthesis::default(),
+            "rollout.jsonl",
+            [(
+                0,
+                LogFact::CodexMeta {
+                    rollout_id: ROLLOUT.to_owned(),
+                    cwd: "/workspace".to_owned(),
+                    originator: "codex".to_owned(),
+                    internal: None,
+                    cli_version: "0.149.0".to_owned(),
+                },
+            )],
+        );
+        let lane_started = synthesized_events(&lane)
+            .into_iter()
+            .find(|event| matches!(event.event, ControllerEventKind::TaskStarted))
+            .expect("Codex metadata must synthesize TaskStarted")
+            .clone();
+
+        for (first, second) in [
+            (&hook_started, &lane_started),
+            (&lane_started, &hook_started),
+        ] {
+            let reducer = Reducer::new(RestoredState {
+                model: DomainModel::default(),
+                next_ordinal: 1,
+                next_ingest_seq: Some(1),
+                event_ledger: Vec::new(),
+            })
+            .0;
+            let reducer = advance_reducer(reducer, first);
+            let reducer = advance_reducer(reducer, second);
+            let model = reducer
+                .validate_controller_event(second)
+                .expect("replayed Codex start must not conflict or be rejected")
+                .post_model;
+            let controller_run = model
+                .task_run_by_key(&RunKey::Controller(hook_started.task_run_id.clone()))
+                .expect("the canonical Codex Controller key must resolve");
+            let native_run = model
+                .task_run_by_key(&RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: ROLLOUT.to_owned(),
+                })
+                .expect("the native Codex SID must resolve to the converged run");
+
+            assert_eq!(model.task_runs().count(), 1);
+            assert_eq!(native_run.run_id, controller_run.run_id);
+            assert_eq!(model.controller_diagnostics().binding_conflicts(), 0);
+            assert_eq!(
+                model
+                    .controller_diagnostics()
+                    .provider_identity_disagreements(),
+                0
+            );
+        }
+
+        assert_eq!(hook_started.task_run_id, lane_started.task_run_id);
     }
 
     #[test]

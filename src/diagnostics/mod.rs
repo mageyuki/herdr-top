@@ -2,6 +2,8 @@
 
 use std::fs::File;
 use std::io::{self, Write};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -128,6 +130,8 @@ pub struct ProviderCounterSnapshot {
 pub struct PrimaryStreamCounterSnapshot {
     pub flat_pane_agent_detected: u64,
     pub inconclusive_topology_probes: u64,
+    pub suppressed_topology_frames: u64,
+    pub event_triggered_topology_refreshes: u64,
 }
 
 /// Reader-shareable counters for tolerated primary-stream wire shapes.
@@ -135,6 +139,10 @@ pub struct PrimaryStreamCounterSnapshot {
 pub struct PrimaryStreamDiagnosticsHandle {
     flat_pane_agent_detected: Arc<AtomicU64>,
     inconclusive_topology_probes: Arc<AtomicU64>,
+    suppressed_topology_frames: Arc<AtomicU64>,
+    event_triggered_topology_refreshes: Arc<AtomicU64>,
+    #[cfg(test)]
+    last_gap_committed: Arc<AtomicBool>,
 }
 
 impl PrimaryStreamDiagnosticsHandle {
@@ -156,12 +164,45 @@ impl PrimaryStreamDiagnosticsHandle {
         );
     }
 
+    /// Records one CatchUp-origin topology hint whose raw payload was discarded.
+    pub fn record_suppressed_topology_frame(&self) {
+        let _ = self.suppressed_topology_frames.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |value| Some(value.saturating_add(1)),
+        );
+    }
+
+    /// Records one snapshot request caused by an admitted topology hint.
+    pub fn record_event_triggered_topology_refresh(&self) {
+        let _ = self.event_triggered_topology_refreshes.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |value| Some(value.saturating_add(1)),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_gap_committed(&self, gap_committed: bool) {
+        self.last_gap_committed
+            .store(gap_committed, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gap_committed(&self) -> bool {
+        self.last_gap_committed.load(Ordering::Relaxed)
+    }
+
     /// Returns an immutable copy of the primary-stream counters.
     #[must_use]
     pub fn snapshot(&self) -> PrimaryStreamCounterSnapshot {
         PrimaryStreamCounterSnapshot {
             flat_pane_agent_detected: self.flat_pane_agent_detected.load(Ordering::Relaxed),
             inconclusive_topology_probes: self.inconclusive_topology_probes.load(Ordering::Relaxed),
+            suppressed_topology_frames: self.suppressed_topology_frames.load(Ordering::Relaxed),
+            event_triggered_topology_refreshes: self
+                .event_triggered_topology_refreshes
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -493,5 +534,52 @@ mod tests {
             .expect("tracing writer did not report a bounded result");
         tracing_writer.join().unwrap();
         write_result.unwrap();
+    }
+
+    #[test]
+    fn primary_stream_topology_counters_have_exact_saturating_semantics() {
+        let counters = PrimaryStreamDiagnosticsHandle::default();
+        assert_eq!(counters.snapshot().suppressed_topology_frames, 0);
+        assert_eq!(counters.snapshot().event_triggered_topology_refreshes, 0);
+
+        // A CatchUp replay hint is admitted and dropped before its request is issued.
+        counters.record_suppressed_topology_frame();
+        assert_eq!(counters.snapshot().suppressed_topology_frames, 1);
+        assert_eq!(counters.snapshot().event_triggered_topology_refreshes, 0);
+        counters.record_event_triggered_topology_refresh();
+        assert_eq!(counters.snapshot().suppressed_topology_frames, 1);
+        assert_eq!(counters.snapshot().event_triggered_topology_refreshes, 1);
+
+        // A coalesced CatchUp follow-up contributes one hint and one actually issued request.
+        counters.record_suppressed_topology_frame();
+        assert_eq!(counters.snapshot().suppressed_topology_frames, 2);
+        assert_eq!(counters.snapshot().event_triggered_topology_refreshes, 1);
+        counters.record_event_triggered_topology_refresh();
+        assert_eq!(counters.snapshot().suppressed_topology_frames, 2);
+        assert_eq!(counters.snapshot().event_triggered_topology_refreshes, 2);
+
+        // A LiveRefresh hint and its monitor drops do not call the suppression recorder;
+        // its issued refresh request still uses the event-triggered recorder.
+        counters.record_event_triggered_topology_refresh();
+        assert_eq!(counters.snapshot().suppressed_topology_frames, 2);
+        assert_eq!(counters.snapshot().event_triggered_topology_refreshes, 3);
+
+        // Startup, reconnect, watchdog probe, and recovery snapshot boundaries call neither.
+        assert_eq!(counters.snapshot().suppressed_topology_frames, 2);
+        assert_eq!(counters.snapshot().event_triggered_topology_refreshes, 3);
+
+        counters
+            .suppressed_topology_frames
+            .store(u64::MAX, Ordering::Relaxed);
+        counters
+            .event_triggered_topology_refreshes
+            .store(u64::MAX, Ordering::Relaxed);
+        counters.record_suppressed_topology_frame();
+        counters.record_event_triggered_topology_refresh();
+        assert_eq!(counters.snapshot().suppressed_topology_frames, u64::MAX);
+        assert_eq!(
+            counters.snapshot().event_triggered_topology_refreshes,
+            u64::MAX
+        );
     }
 }

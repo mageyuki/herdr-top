@@ -1562,7 +1562,9 @@ mod tests {
     use serde_json::json;
 
     use crate::lockfile::{OwnerRecord, StateRoot};
-    use crate::model::{EventMetadata, GapKind, NormalizedEvent, TopologyEntity, Workspace};
+    use crate::model::{
+        EventMetadata, GapKind, NormalizedEvent, TopologyAuthority, TopologyEntity, Workspace,
+    };
     use crate::store::{CollectorGap, PersistOp, database_path, open_reader, open_writer};
 
     use super::*;
@@ -1598,6 +1600,7 @@ mod tests {
                     progress: None,
                     ingest_seq: None,
                 },
+                authority: TopologyAuthority::Partial,
                 entity: TopologyEntity::Workspace(Workspace {
                     workspace_id: "workspace".to_owned(),
                 }),

@@ -218,6 +218,11 @@ pub enum PersistOp {
         /// The tab whose label is explicitly removed.
         tab_id: String,
     },
+    /// Clear a pane's captured display name on authoritative observation.
+    ClearPaneDisplayName {
+        /// The pane whose display name is explicitly removed.
+        pane_id: String,
+    },
     /// Delete a physical pane.
     DeletePane {
         /// The pane identity to remove.
@@ -1242,6 +1247,12 @@ fn apply_operation(transaction: &Transaction<'_>, operation: PersistOp) -> Resul
         }
         PersistOp::ClearTabLabel { tab_id } => {
             transaction.execute("UPDATE tabs SET label = NULL WHERE tab_id = ?1", [&tab_id])?;
+        }
+        PersistOp::ClearPaneDisplayName { pane_id } => {
+            transaction.execute(
+                "UPDATE panes SET display_name = NULL WHERE pane_id = ?1",
+                [&pane_id],
+            )?;
         }
         PersistOp::DeletePane { pane_id } => {
             transaction.execute("DELETE FROM panes WHERE pane_id = ?1", [&pane_id])?;
@@ -2326,7 +2337,8 @@ mod tests {
 
     use super::*;
     use crate::activity::{ActivityDurability, ActivityIdentity, ActivityItem};
-    use crate::model::TopologyEntityId;
+    use crate::model::{TopologyEntity, TopologyEntityId};
+    use crate::reducer::{ApplyOutcome, Reducer};
 
     const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
 
@@ -2955,6 +2967,117 @@ mod tests {
                 .display_name
                 .as_deref(),
             Some("other")
+        );
+    }
+
+    #[test]
+    fn authoritative_name_clear_persists_across_restore() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        store
+            .apply_batch(vec![
+                PersistOp::UpsertWorkspace {
+                    workspace: Workspace {
+                        workspace_id: "workspace-authoritative-clear".to_owned(),
+                    },
+                    display_ordinal: DisplayOrdinal::new(1),
+                },
+                PersistOp::UpsertTab {
+                    tab: Tab {
+                        tab_id: "tab-authoritative-clear".to_owned(),
+                        workspace_id: "workspace-authoritative-clear".to_owned(),
+                        label: Some("old tab".to_owned()),
+                    },
+                    display_ordinal: DisplayOrdinal::new(2),
+                },
+                PersistOp::UpsertPane {
+                    pane: Pane {
+                        pane_id: "pane-authoritative-clear".to_owned(),
+                        workspace_id: "workspace-authoritative-clear".to_owned(),
+                        tab_id: "tab-authoritative-clear".to_owned(),
+                        terminal_id: "terminal-authoritative-clear".to_owned(),
+                        display_name: Some("old pane".to_owned()),
+                    },
+                    display_ordinal: DisplayOrdinal::new(3),
+                },
+            ])
+            .unwrap();
+        let (mut reducer, _shared) = Reducer::new(store.load_restored_state().unwrap());
+        let authoritative_event = |event_id: &str, entity: TopologyEntity| {
+            serde_json::from_value::<NormalizedEvent>(serde_json::json!({
+                "TopologyUpsert": {
+                    "metadata": EventMetadata {
+                        event_id: event_id.to_owned(),
+                        timestamp_ms: 1_000,
+                        receipt_time_ms: 1_000,
+                        source: "herdr".to_owned(),
+                        source_event_type: "snapshot".to_owned(),
+                        herdr_session: "session".to_owned(),
+                        workspace_id: None,
+                        tab_id: None,
+                        pane_id: None,
+                        terminal_id: None,
+                        provider: None,
+                        native_session_id: None,
+                        task_run_id: None,
+                        agent_node_id: None,
+                        task_state: None,
+                        execution_parent: None,
+                        dependency: None,
+                        source_coverage: Vec::new(),
+                        provider_metadata: None,
+                        label: None,
+                        reason: None,
+                        progress: None,
+                        ingest_seq: None,
+                    },
+                    "entity": entity,
+                    "authority": "Authoritative",
+                },
+            }))
+            .unwrap()
+        };
+        for (event_id, entity) in [
+            (
+                "authoritative-tab-clear",
+                TopologyEntity::Tab(Tab {
+                    tab_id: "tab-authoritative-clear".to_owned(),
+                    workspace_id: "workspace-authoritative-clear".to_owned(),
+                    label: None,
+                }),
+            ),
+            (
+                "authoritative-pane-clear",
+                TopologyEntity::Pane(Pane {
+                    pane_id: "pane-authoritative-clear".to_owned(),
+                    workspace_id: "workspace-authoritative-clear".to_owned(),
+                    tab_id: "tab-authoritative-clear".to_owned(),
+                    terminal_id: "terminal-authoritative-clear".to_owned(),
+                    display_name: Some(String::new()),
+                }),
+            ),
+        ] {
+            let ApplyOutcome::Applied(batch) = reducer
+                .apply(authoritative_event(event_id, entity))
+                .unwrap()
+            else {
+                panic!("authoritative topology clear should apply");
+            };
+            store.apply_batch(batch).unwrap();
+        }
+
+        let restored = store.load_restored_state().unwrap();
+        assert_eq!(
+            restored.model.tab("tab-authoritative-clear").unwrap().label,
+            None
+        );
+        assert_eq!(
+            restored
+                .model
+                .pane("pane-authoritative-clear")
+                .unwrap()
+                .display_name,
+            None
         );
     }
 

@@ -1868,6 +1868,42 @@ mod tests {
     }
 
     #[test]
+    fn i4_status_closed_diagnostics_downgrades_controller_only() {
+        let (diagnostics_sender, diagnostics) = test_runtime_diagnostics();
+        let before = diagnostics.borrow().clone();
+        drop(diagnostics_sender);
+
+        let response = status_response(
+            br#"{"request":"status","schema_version":1}"#,
+            Some(&diagnostics),
+            &ControllerDiagnosticsHandle::default(),
+        )
+        .unwrap();
+        let ControllerStatusResponse::Ok {
+            schema_version: 1,
+            diagnostics: after,
+        } = response
+        else {
+            panic!("closed diagnostics did not return a version 1 status response");
+        };
+
+        let mut expected = before.clone();
+        expected.controller_input = ControllerInputStatus::Unavailable {
+            reason: ControllerInputUnavailableReason::RuntimeUnsafe,
+        };
+        expected
+            .source_coverage
+            .iter_mut()
+            .find(|source| source.source == DiagnosticSource::Controller)
+            .unwrap()
+            .availability = InputAvailability::Unavailable;
+
+        assert_eq!(after.persistence, before.persistence);
+        assert_eq!(after.owner, before.owner);
+        assert_eq!(after, expected);
+    }
+
+    #[test]
     fn i4_status_request_key_on_existing_event_remains_an_ignored_extension() {
         let (_diagnostics_sender, diagnostics) = test_runtime_diagnostics();
         let acceptor_diagnostics = ControllerDiagnosticsHandle::default();
