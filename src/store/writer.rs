@@ -1008,6 +1008,28 @@ impl WriterClient {
         waiter.wait_response_only().await
     }
 
+    /// Reads the exact durable finalization page even while writer health is degraded.
+    pub async fn history_drain_finalization(
+        &self,
+        drain_id: &HistoryDrainId,
+    ) -> Result<Option<HistoryDrainFinalization>, WriterError> {
+        let operation = PersistenceOperation::Barrier;
+        let (acknowledgement, response) = oneshot::channel();
+        let waiter = self.waiter(response, operation);
+        if self
+            .sender
+            .send(WriterCommand::HistoryDrainFinalization {
+                drain_id: drain_id.clone(),
+                acknowledgement,
+            })
+            .await
+            .is_err()
+        {
+            return Err(self.health.runtime_error(queue_failure(operation)));
+        }
+        waiter.wait_response_only().await
+    }
+
     /// Acknowledges after every command queued before this call has completed.
     pub async fn barrier(&self) -> Result<(), WriterError> {
         self.request(PersistenceOperation::Barrier, |acknowledgement| {
@@ -1279,6 +1301,11 @@ enum WriterCommand {
     HistoryDrainFinalized {
         drain_id: HistoryDrainId,
         acknowledgement: oneshot::Sender<Result<bool, PersistenceFailure>>,
+    },
+    HistoryDrainFinalization {
+        drain_id: HistoryDrainId,
+        acknowledgement:
+            oneshot::Sender<Result<Option<HistoryDrainFinalization>, PersistenceFailure>>,
     },
     Barrier {
         acknowledgement: oneshot::Sender<Result<(), PersistenceFailure>>,
@@ -1566,6 +1593,22 @@ fn writer_main(
                         &error,
                     )
                 });
+                let _ = acknowledgement.send(result.map_err(|failure| failure.failure));
+            }
+            WriterCommand::HistoryDrainFinalization {
+                drain_id,
+                acknowledgement,
+            } => {
+                let result = store
+                    .history_drain_finalization(&drain_id)
+                    .map_err(|error| {
+                        store_failure(
+                            PersistenceOperation::Barrier,
+                            PersistencePhase::CommandExecution,
+                            DurabilityDisposition::NotApplicable,
+                            &error,
+                        )
+                    });
                 let _ = acknowledgement.send(result.map_err(|failure| failure.failure));
             }
             WriterCommand::Barrier { acknowledgement } => {

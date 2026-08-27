@@ -16,15 +16,17 @@ use herdr_top::lockfile::{StateRoot, state_root_in};
 use herdr_top::model::{
     AgentSessionReference, AgentSessionReferenceKind, ControllerEventKind, DependencyEdge,
     DisplayOrdinal, DomainModel, EventMetadata, ExecState, Execution, ExecutionEdge, GapKind,
-    NormalizedEvent, Pane, PaneAgentStatus, PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey,
-    SnapshotAgent, Tab, TaskRun, TaskState, TopologyAuthority, TopologySnapshot, Workspace,
+    NativeLifecycleWatermark, NormalizedEvent, Pane, PaneAgentStatus, PaneSnapshot, Provider,
+    ReconcileBatch, RunId, RunKey, SnapshotAgent, Tab, TaskRun, TaskRunV6State, TaskState,
+    TopologyAuthority, TopologySnapshot, Workspace,
 };
 use herdr_top::reducer::{ApplyOutcome, Reducer};
 use herdr_top::session_key;
 use herdr_top::store::writer::{WriterClient, WriterLifecycle, spawn_writer};
 use herdr_top::store::{
-    CollectorGap, NativeSessionBinding, PersistExecution, PersistOp, PersistTaskRun, RestoredState,
-    database_path, open_reader, open_writer,
+    CollectorGap, NativeSessionBinding, PersistExecution, PersistHistoryDrain,
+    PersistHistoryDrainRun, PersistOp, PersistTaskRun, PersistTaskRunV6, PersistV6Batch,
+    RestoredState, database_path, open_reader, open_writer,
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -35,6 +37,105 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 const WAIT: Duration = Duration::from_secs(3);
+
+#[test]
+fn historical_enrichment_never_regresses_live_state_or_watermark() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = StateRoot(directory.path().to_path_buf());
+    let mut store = open_writer(&root).unwrap();
+    let run_id = RunId::new();
+    let drain_id = herdr_top::model::HistoryDrainId::new("codex:convergence-history").unwrap();
+    let task_run = |state, created_at_ms, updated_at_ms, finished_at_ms, subject: &str| TaskRun {
+        run_id,
+        key: RunKey::Native {
+            provider: Provider::Codex,
+            sid: "convergence-history".to_owned(),
+        },
+        display_ordinal: DisplayOrdinal::new(1),
+        state,
+        has_controller_task_state_event: state == TaskState::Completed,
+        created_at_ms: Some(created_at_ms),
+        updated_at_ms: Some(updated_at_ms),
+        finished_at_ms,
+        subject: Some(subject.to_owned()),
+        dismissed_at_ms: None,
+    };
+    let persisted = |task_run: TaskRun| PersistTaskRun {
+        created_at_ms: task_run.created_at_ms.unwrap(),
+        updated_at_ms: task_run.updated_at_ms.unwrap(),
+        finished_at_ms: task_run.finished_at_ms,
+        native_session: Some(NativeSessionBinding {
+            provider: Provider::Codex,
+            native_session_id: "convergence-history".to_owned(),
+        }),
+        task_run,
+    };
+    let live_watermark = NativeLifecycleWatermark {
+        source_at_ms: 500,
+        observed_at_ms: 600,
+        source_order: "live:controller".to_owned(),
+    };
+    store
+        .apply_v6_batch(PersistV6Batch {
+            task_runs: vec![PersistTaskRunV6 {
+                task_run: persisted(task_run(
+                    TaskState::Completed,
+                    200,
+                    500,
+                    Some(500),
+                    "live subject",
+                )),
+                state: TaskRunV6State {
+                    lifecycle_watermark: Some(live_watermark.clone()),
+                    history_ready: true,
+                    latest_provider_at_ms: Some(500),
+                    ..TaskRunV6State::default()
+                },
+            }],
+            ..PersistV6Batch::default()
+        })
+        .unwrap();
+
+    store
+        .apply_v6_batch(PersistV6Batch {
+            task_runs: vec![PersistTaskRunV6 {
+                task_run: persisted(task_run(
+                    TaskState::Running,
+                    100,
+                    300,
+                    None,
+                    "historical subject",
+                )),
+                state: TaskRunV6State {
+                    history_ready: false,
+                    latest_provider_at_ms: Some(300),
+                    ..TaskRunV6State::default()
+                },
+            }],
+            history_drains: vec![PersistHistoryDrain {
+                drain_id: drain_id.clone(),
+                provider: Provider::Codex,
+                created_at_ms: 700,
+                artifacts: Vec::new(),
+            }],
+            history_associations: vec![PersistHistoryDrainRun { drain_id, run_id }],
+            ..PersistV6Batch::default()
+        })
+        .unwrap();
+
+    let restored = store.load_restored_state().unwrap();
+    let run = restored.model.task_run(&run_id).unwrap();
+    assert_eq!(run.state, TaskState::Completed);
+    assert!(run.has_controller_task_state_event);
+    assert_eq!(run.created_at_ms, Some(100));
+    assert_eq!(run.updated_at_ms, Some(500));
+    assert_eq!(run.finished_at_ms, Some(500));
+    assert_eq!(run.subject.as_deref(), Some("live subject"));
+    let state = restored.model.task_run_v6_state(&run_id).unwrap();
+    assert!(state.history_ready);
+    assert_eq!(state.latest_provider_at_ms, Some(500));
+    assert_eq!(state.lifecycle_watermark, Some(live_watermark));
+}
 
 #[derive(Clone, Debug)]
 struct ScopedHerdrConfig {

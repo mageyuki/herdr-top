@@ -34,6 +34,18 @@ impl HistoryDrainId {
     }
 }
 
+/// Provenance of one reducer-visible observation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ObservationOrigin {
+    /// Evidence observed after the startup/backfill goalpost or from a live control surface.
+    Live,
+    /// Evidence read at or before one member's frozen history goalpost.
+    Historical {
+        drain_id: HistoryDrainId,
+        artifact_id: String,
+    },
+}
+
 /// Persisted native-session lifecycle outcome, independently of semantic task state.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum NativeSessionEndStatus {

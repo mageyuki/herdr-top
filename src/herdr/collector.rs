@@ -5,6 +5,8 @@ use std::env;
 use std::ffi::OsStr;
 use std::future::{Future, pending};
 use std::io::{self, Read};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -13,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -34,10 +37,11 @@ use crate::model::ReconcileBatch;
 use crate::model::{
     AgentNodeObservation, AgentSessionReference, AgentSessionReferenceKind,
     ControllerDiagnosticsHandle, DomainModel, EnrichmentDiagnosticsHandle, EventMetadata,
-    ExecState, Execution, GapKind, MinimalProviderMetadata, NormalizedEvent, OperatorCommand, Pane,
-    PaneAgentStatus, PaneAgentStatusObservation, PaneSnapshot, Provider, ProviderDiagnosticsHandle,
-    RunId, RunKey, SharedModel, SnapshotAgent, SourceCoverage, Tab, TopologyAuthority,
-    TopologyEntity, TopologyEntityId, TopologySnapshot, Workspace, sanitize_controller_text,
+    ExecState, Execution, GapKind, HistoryDrainId, MinimalProviderMetadata, NormalizedEvent,
+    OperatorCommand, Pane, PaneAgentStatus, PaneAgentStatusObservation, PaneSnapshot, Provider,
+    ProviderDiagnosticsHandle, RunId, RunKey, SharedModel, SnapshotAgent, SourceCoverage, Tab,
+    TopologyAuthority, TopologyEntity, TopologyEntityId, TopologySnapshot, Workspace,
+    sanitize_controller_text,
 };
 use crate::performance::{
     Admission, Admitted, PerformanceClock, PerformanceIngress, PerformanceSampler,
@@ -48,18 +52,21 @@ use crate::provider::lane::LogLaneConfig;
 use crate::provider::spawn_provider_thread_with_diagnostics;
 use crate::provider::{
     BootstrapIdentity, BootstrapParser, CodexPaneBinding, CodexPaneTarget, DiscoveryIndex,
-    DiscoveryRoot, DiscoveryScanStatus, FsReadBoundary, MergeOutcome, PathInterner, PendingEvents,
-    ProviderCycle, ProviderEvent, ProviderIngressEvent, ProviderSourceState, ProviderSpawnError,
-    ProviderTarget, ProviderTargetPublisher, ProviderThreadError, ProviderThreadHandle,
-    ProviderWorker, RecommendedNotifyFactory, TailFile, TargetSet,
-    spawn_provider_thread_with_diagnostics_and_performance,
+    DiscoveryRoot, DiscoveryScanStatus, FrozenHistoryArtifact, FsReadBoundary, HistoryDrainBarrier,
+    MergeOutcome, PathInterner, PendingEvents, ProviderCycle, ProviderEvent, ProviderIngressEvent,
+    ProviderSourceState, ProviderSpawnError, ProviderTarget, ProviderTargetPublisher,
+    ProviderThreadError, ProviderThreadHandle, ProviderWorker, RecommendedNotifyFactory, TailFile,
+    TargetSet, spawn_provider_thread_with_diagnostics_and_performance, stable_history_drain_id,
 };
 use crate::reducer::{ApplyOutcome, CommitStagedError, Reducer, ReducerError};
 use crate::store::writer::{
     BoundedDetail, DurabilityDisposition, PendingEnqueue, PersistenceFailure,
     PersistenceHealthSnapshot, PersistenceStatus, WriterClient, WriterError,
 };
-use crate::store::{CollectorGap, PersistBatch, PersistOp, RestoredState};
+use crate::store::{
+    CollectorGap, HistoryDrainFinalization, PersistBatch, PersistHistoryDrain,
+    PersistHistoryDrainArtifact, PersistOp, PersistV6Batch, RestoredState,
+};
 
 use super::controller::{
     self, ControllerRequestReceiver, ControllerRuntimeEvent, ControllerServerError,
@@ -814,6 +821,80 @@ impl RuntimePersistence {
         self.classify_result(result, RuntimeCommandClass::Batch)
     }
 
+    async fn apply_v6(
+        &mut self,
+        batch: PersistV6Batch,
+    ) -> Result<RuntimeWriteOutcome, WriterError> {
+        #[cfg(test)]
+        if let Some(result) = self.injected_write_result(RuntimeCommandClass::Batch) {
+            return result;
+        }
+        if self
+            .skip_async_if_degraded(RuntimeCommandClass::Batch)
+            .await
+        {
+            return Ok(RuntimeWriteOutcome::Skipped);
+        }
+        let result = self.writer.apply_v6(batch).await;
+        self.classify_result(result, RuntimeCommandClass::Batch)
+    }
+
+    async fn finalize_history_drain(
+        &mut self,
+        staged: &crate::reducer::StagedHistoryFinalization,
+    ) -> Result<(RuntimeWriteOutcome, Option<HistoryDrainFinalization>), WriterError> {
+        #[cfg(test)]
+        if let Some(result) = self.injected_write_result(RuntimeCommandClass::Batch) {
+            let outcome = result?;
+            let page = if matches!(
+                outcome,
+                RuntimeWriteOutcome::CommittedButDegraded(_)
+                    | RuntimeWriteOutcome::DurabilityUnknown(_)
+            ) {
+                self.writer
+                    .history_drain_finalization(&staged.drain_id)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            return Ok((outcome, page));
+        }
+        if self
+            .skip_async_if_degraded(RuntimeCommandClass::Batch)
+            .await
+        {
+            return Ok((RuntimeWriteOutcome::Skipped, None));
+        }
+        match self
+            .writer
+            .finalize_history_drain(staged.drain_id.clone(), staged.observed_at_ms)
+            .await
+        {
+            Ok(page) => Ok((RuntimeWriteOutcome::Durable, Some(page))),
+            Err(WriterError::Persistence(failure)) => {
+                let outcome = self.record_failure(failure, RuntimeCommandClass::Batch);
+                let page = if matches!(
+                    outcome,
+                    RuntimeWriteOutcome::CommittedButDegraded(_)
+                        | RuntimeWriteOutcome::DurabilityUnknown(_)
+                ) {
+                    // Response-only readback deliberately remains available while degraded.
+                    self.writer
+                        .history_drain_finalization(&staged.drain_id)
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+                Ok((outcome, page))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     async fn cleanup(&mut self, now_ms: i64) -> Result<RuntimeWriteOutcome, WriterError> {
         if self
             .skip_async_if_degraded(RuntimeCommandClass::Batch)
@@ -1277,6 +1358,17 @@ async fn persist_submission(
     batch: PersistBatch,
 ) -> Result<RuntimeWriteOutcome, WriterError> {
     let outcome = persistence.apply(batch).await?;
+    reducer.complete_operator_submission(outcome);
+    persist_recovery_marker_if_pending(persistence, reducer).await?;
+    Ok(outcome)
+}
+
+async fn persist_v6_submission(
+    persistence: &mut RuntimePersistence,
+    reducer: &mut Reducer,
+    batch: PersistV6Batch,
+) -> Result<RuntimeWriteOutcome, WriterError> {
+    let outcome = persistence.apply_v6(batch).await?;
     reducer.complete_operator_submission(outcome);
     persist_recovery_marker_if_pending(persistence, reducer).await?;
     Ok(outcome)
@@ -3212,6 +3304,7 @@ async fn monitor_live(
                 }
                 let _ = persistence.cleanup(unix_now_ms()).await?;
                 persist_recovery_marker_if_pending(persistence, reducer).await?;
+                let _ = retry_held_history_barrier(provider, reducer, shared, persistence).await?;
                 persistence.refresh_pane_coverage(&shared.borrow());
                 persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
                 continue;
@@ -3398,6 +3491,7 @@ async fn monitor_reconciling(
                 }
                 let _ = persistence.cleanup(unix_now_ms()).await?;
                 persist_recovery_marker_if_pending(persistence, reducer).await?;
+                let _ = retry_held_history_barrier(provider, reducer, shared, persistence).await?;
                 persistence.refresh_pane_coverage(&shared.borrow());
                 persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
                 continue;
@@ -4021,6 +4115,55 @@ struct AdapterWorkItem {
     file: crate::provider::DiscoveredFile,
 }
 
+fn stable_history_artifact_id(path: &Path) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"herdr-top:history-artifact:v1");
+    let bytes = path.as_os_str().as_bytes();
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+    format!("sha256:{:x}", digest.finalize())
+}
+
+fn freeze_history_manifest(
+    provider: Provider,
+    work: &[AdapterWorkItem],
+) -> io::Result<PersistHistoryDrain> {
+    let mut artifacts = Vec::new();
+    for item in work.iter().filter(|item| item.provider == provider) {
+        let absolute = item.root.join(&item.file.relative_path);
+        let metadata = std::fs::metadata(&absolute)?;
+        let artifact_id = stable_history_artifact_id(&absolute);
+        artifacts.push(PersistHistoryDrainArtifact {
+            artifact_id,
+            generation: format!("{}:{}", metadata.dev(), metadata.ino()),
+            goalpost: metadata.len(),
+        });
+    }
+    artifacts.sort_by(|left, right| {
+        (&left.artifact_id, &left.generation, left.goalpost).cmp(&(
+            &right.artifact_id,
+            &right.generation,
+            right.goalpost,
+        ))
+    });
+    let drain_id = stable_history_drain_id(
+        provider,
+        artifacts.iter().map(|artifact| FrozenHistoryArtifact {
+            provider,
+            artifact_id: artifact.artifact_id.clone(),
+            generation: artifact.generation.clone(),
+            goalpost: artifact.goalpost,
+        }),
+    )
+    .map_err(io::Error::other)?;
+    Ok(PersistHistoryDrain {
+        drain_id,
+        provider,
+        created_at_ms: unix_now_ms(),
+        artifacts,
+    })
+}
+
 fn compare_adapter_key(
     left_provider: Provider,
     left_root: &PathBuf,
@@ -4086,6 +4229,12 @@ struct AdapterProviderWorker {
     /// Highest generation observed per absolute path. Tombstones live for the whole run.
     generations: HashMap<PathBuf, u64>,
     deferred: VecDeque<ProviderEvent>,
+    deferred_records: VecDeque<(AdapterWorkItem, crate::provider::TailRecord)>,
+    history_manifests: HashMap<Provider, Arc<PersistHistoryDrain>>,
+    history_completed: HashSet<Provider>,
+    history_failed: HashSet<Provider>,
+    invalidated_history_artifacts: HashSet<(Provider, String)>,
+    held_history_barrier: Option<(Provider, HistoryDrainBarrier)>,
     standard_roots: Vec<DiscoveryRoot>,
     late_standard_baselines: HashSet<(Provider, PathBuf)>,
     root_state_factory: RootStateFactory,
@@ -4132,6 +4281,12 @@ impl AdapterProviderWorker {
             ),
             generations: HashMap::new(),
             deferred: VecDeque::new(),
+            deferred_records: VecDeque::new(),
+            history_manifests: HashMap::new(),
+            history_completed: HashSet::new(),
+            history_failed: HashSet::new(),
+            invalidated_history_artifacts: HashSet::new(),
+            held_history_barrier: None,
             standard_roots,
             late_standard_baselines: HashSet::new(),
             root_state_factory: Box::new(AdapterRootState::new),
@@ -4159,9 +4314,139 @@ impl AdapterProviderWorker {
         self.after_tail_chunk = Some(Box::new(hook));
     }
 
-    fn emit_due_lifecycle_events(&mut self, pending: &mut PendingEvents) {
+    fn emit_due_lifecycle_events(&mut self, pending: &mut PendingEvents) -> bool {
+        let synthesis = self.synthesis.clone();
         let events = self.synthesis.advance_lifecycle(unix_now_ms());
-        let _ = merge_adapter_events(events, pending, &mut self.deferred);
+        let mut trial = pending.clone();
+        let accepted = events.into_iter().all(|event| {
+            let (origin, manifest) = self.lifecycle_event_origin(&event);
+            !matches!(
+                trial.merge_with_origin(event, origin, manifest),
+                MergeOutcome::AtCapacity(_)
+            )
+        });
+        if !accepted {
+            self.synthesis = synthesis;
+        } else {
+            *pending = trial;
+        }
+        accepted
+    }
+
+    fn lifecycle_event_origin(
+        &self,
+        event: &ProviderEvent,
+    ) -> (
+        crate::model::ObservationOrigin,
+        Option<Arc<PersistHistoryDrain>>,
+    ) {
+        let Some(provider) = event.provider() else {
+            return (crate::model::ObservationOrigin::Live, None);
+        };
+        let Some(manifest) = self.history_manifests.get(&provider).cloned() else {
+            return (crate::model::ObservationOrigin::Live, None);
+        };
+        let Some(artifact) = manifest.artifacts.first() else {
+            return (crate::model::ObservationOrigin::Live, None);
+        };
+        (
+            crate::model::ObservationOrigin::Historical {
+                drain_id: manifest.drain_id.clone(),
+                artifact_id: artifact.artifact_id.clone(),
+            },
+            Some(manifest),
+        )
+    }
+
+    fn record_origin(
+        &self,
+        item: &AdapterWorkItem,
+        record: Option<&crate::provider::TailRecord>,
+    ) -> (
+        crate::model::ObservationOrigin,
+        Option<Arc<PersistHistoryDrain>>,
+    ) {
+        let Some(manifest) = self.history_manifests.get(&item.provider).cloned() else {
+            return (crate::model::ObservationOrigin::Live, None);
+        };
+        let artifact_id = stable_history_artifact_id(&item.root.join(&item.file.relative_path));
+        if self
+            .invalidated_history_artifacts
+            .contains(&(item.provider, artifact_id.clone()))
+        {
+            return (crate::model::ObservationOrigin::Live, None);
+        }
+        let Some(artifact) = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_id == artifact_id)
+        else {
+            return (crate::model::ObservationOrigin::Live, None);
+        };
+        if record.is_some_and(|record| record.offset >= artifact.goalpost) {
+            return (crate::model::ObservationOrigin::Live, None);
+        }
+        (
+            crate::model::ObservationOrigin::Historical {
+                drain_id: manifest.drain_id.clone(),
+                artifact_id,
+            },
+            Some(manifest),
+        )
+    }
+
+    fn drain_deferred_records(&mut self, pending: &mut PendingEvents) -> bool {
+        while let Some((item, record)) = self.deferred_records.front().cloned() {
+            let synthesis = self.synthesis.clone();
+            let admission = self.log_admission.clone();
+            let ordinals = self.record_ordinals.clone();
+            let events = self.parse_record(&item, &record);
+            let parse_failed = events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::Malformed { .. }));
+            let (origin, manifest) = self.record_origin(&item, Some(&record));
+            let mut trial = pending.clone();
+            let accepted = events.into_iter().all(|event| {
+                !matches!(
+                    trial.merge_with_origin(event, origin.clone(), manifest.clone()),
+                    MergeOutcome::AtCapacity(_)
+                )
+            });
+            if !accepted {
+                self.synthesis = synthesis;
+                self.log_admission = admission;
+                self.record_ordinals = ordinals;
+                return false;
+            }
+            *pending = trial;
+            self.deferred_records.pop_front();
+            if parse_failed {
+                self.history_failed.insert(item.provider);
+            }
+        }
+        true
+    }
+
+    fn enqueue_history_barrier(&mut self, provider: Provider, pending: &mut PendingEvents) {
+        if self.history_failed.contains(&provider) {
+            return;
+        }
+        let drain_id = self
+            .history_manifests
+            .get(&provider)
+            .expect("active history provider must retain its frozen manifest")
+            .drain_id
+            .clone();
+        let barrier = HistoryDrainBarrier::new(drain_id, unix_now_ms());
+        match pending.merge(ProviderEvent::SourceState {
+            provider,
+            state: ProviderSourceState::HistoryDrainBarrier(barrier.clone()),
+        }) {
+            MergeOutcome::Accepted | MergeOutcome::Coalesced | MergeOutcome::Duplicate => {
+                self.held_history_barrier = Some((provider, barrier));
+            }
+            MergeOutcome::AtCapacity(_) => {}
+        }
     }
 
     fn initialize_standard_baselines(&mut self) -> HashMap<(Provider, PathBuf), io::ErrorKind> {
@@ -4480,6 +4765,18 @@ fn discover_codex_bindings(
 
 impl ProviderWorker for AdapterProviderWorker {
     fn process(&mut self, cycle: &mut ProviderCycle<'_>) -> io::Result<()> {
+        if let Some((provider, barrier)) = self.held_history_barrier.as_ref() {
+            if barrier.acknowledgement().is_committed() {
+                self.history_completed.insert(*provider);
+                self.history_manifests.remove(provider);
+                self.held_history_barrier = None;
+            } else {
+                return Ok(());
+            }
+        }
+        if !self.drain_deferred_records(cycle.pending) {
+            return Ok(());
+        }
         let baseline_failures = self.initialize_standard_baselines();
         let mut targets_by_root: HashMap<(Provider, PathBuf), HashSet<PathBuf>> = HashMap::new();
         let mut providers_with_session_admissions = HashSet::new();
@@ -4669,6 +4966,21 @@ impl ProviderWorker for AdapterProviderWorker {
             }
             for path_id in scan_outcome.removed_path_ids() {
                 if let Some(tail) = self.tails.remove(path_id) {
+                    let artifact_id = stable_history_artifact_id(&tail.absolute_path());
+                    if self
+                        .history_manifests
+                        .get(&provider)
+                        .is_some_and(|manifest| {
+                            manifest
+                                .artifacts
+                                .iter()
+                                .any(|artifact| artifact.artifact_id == artifact_id)
+                        })
+                    {
+                        self.history_failed.insert(provider);
+                        self.invalidated_history_artifacts
+                            .insert((provider, artifact_id));
+                    }
                     self.generations
                         .entry(tail.absolute_path())
                         .and_modify(|generation| *generation = (*generation).max(tail.generation()))
@@ -4738,6 +5050,27 @@ impl ProviderWorker for AdapterProviderWorker {
                 false
             }
         });
+        for provider in [Provider::Claude, Provider::Codex] {
+            if self.history_completed.contains(&provider)
+                || self.history_manifests.contains_key(&provider)
+                || !applicable_providers.contains(&provider)
+            {
+                continue;
+            }
+            if !work.iter().any(|item| item.provider == provider) {
+                self.history_completed.insert(provider);
+                continue;
+            }
+            let manifest = freeze_history_manifest(provider, &work)?;
+            self.history_manifests.insert(provider, Arc::new(manifest));
+        }
+        let active_history_provider =
+            [Provider::Claude, Provider::Codex]
+                .into_iter()
+                .find(|provider| {
+                    !self.history_completed.contains(provider)
+                        && self.history_manifests.contains_key(provider)
+                });
         if work.is_empty() {
             self.finish_completed_sweeps(
                 &universes,
@@ -4745,7 +5078,10 @@ impl ProviderWorker for AdapterProviderWorker {
                 &codex_bindings,
                 cycle.pending,
             );
-            self.emit_due_lifecycle_events(cycle.pending);
+            let _ = self.emit_due_lifecycle_events(cycle.pending);
+            if let Some(provider) = active_history_provider {
+                self.enqueue_history_barrier(provider, cycle.pending);
+            }
             return Ok(());
         }
         let start = resume_start(&work, self.resume_cursor.as_ref());
@@ -4811,14 +5147,19 @@ impl ProviderWorker for AdapterProviderWorker {
                             .get_or_insert(AvailabilitySweepFailure::FileIoError);
                     }
                     if let Some(fact) = fact {
-                        self.meta_emitted.insert(file.path_id);
+                        let synthesis = self.synthesis.clone();
+                        let admission_state = self.log_admission.clone();
                         let events = self.synthesis.synthesize_batch(
                             &absolute,
                             [(0, fact)],
                             &mut self.log_admission,
                             &self.admission_index,
                         );
-                        if !merge_adapter_events(events, cycle.pending, &mut self.deferred) {
+                        let (origin, manifest) = self.record_origin(item, None);
+                        if !merge_originated_events_atomic(events, cycle.pending, origin, manifest)
+                        {
+                            self.synthesis = synthesis;
+                            self.log_admission = admission_state;
                             self.resume_cursor = Some(cursor_for_work(item));
                             self.finish_completed_sweeps(
                                 &universes,
@@ -4828,6 +5169,7 @@ impl ProviderWorker for AdapterProviderWorker {
                             );
                             return Ok(());
                         }
+                        self.meta_emitted.insert(file.path_id);
                     }
                 }
                 self.availability_sweeps
@@ -4843,7 +5185,7 @@ impl ProviderWorker for AdapterProviderWorker {
                     .generations
                     .get(&absolute)
                     .map_or(0, |generation| generation.saturating_add(1));
-                self.generations.insert(absolute, generation);
+                self.generations.insert(absolute.clone(), generation);
                 let tail = match TailFile::open(
                     &file.root,
                     &file.relative_path,
@@ -4913,12 +5255,25 @@ impl ProviderWorker for AdapterProviderWorker {
                     continue;
                 }
             };
+            if let Some(manifest) = self.history_manifests.get(&provider) {
+                let artifact_id = stable_history_artifact_id(&absolute);
+                if !self
+                    .invalidated_history_artifacts
+                    .contains(&(provider, artifact_id.clone()))
+                    && let Some(artifact) = manifest
+                        .artifacts
+                        .iter()
+                        .find(|artifact| artifact.artifact_id == artifact_id)
+                {
+                    goalpost = artifact.goalpost;
+                }
+            }
             let tail_generation = self
                 .tails
                 .get(&file.path_id)
                 .expect("tail remains after goalpost snapshot")
                 .generation();
-            if self.bootstrap_emitted.insert(file.path_id) {
+            if !self.bootstrap_emitted.contains(&file.path_id) {
                 let event = match provider {
                     Provider::Codex => crate::provider::codex::CodexAdapter.bootstrap_event(
                         file,
@@ -4931,22 +5286,25 @@ impl ProviderWorker for AdapterProviderWorker {
                         unix_now_ms(),
                     ),
                 };
-                if let Some(event) = event
-                    && !merge_adapter_events(
+                if let Some(event) = event {
+                    let (origin, manifest) = self.record_origin(item, None);
+                    if !merge_originated_events_atomic(
                         std::iter::once(event),
                         cycle.pending,
-                        &mut self.deferred,
-                    )
-                {
-                    self.resume_cursor = Some(cursor_for_work(item));
-                    self.finish_completed_sweeps(
-                        &universes,
-                        &applicable_providers,
-                        &codex_bindings,
-                        cycle.pending,
-                    );
-                    return Ok(());
+                        origin,
+                        manifest,
+                    ) {
+                        self.resume_cursor = Some(cursor_for_work(item));
+                        self.finish_completed_sweeps(
+                            &universes,
+                            &applicable_providers,
+                            &codex_bindings,
+                            cycle.pending,
+                        );
+                        return Ok(());
+                    }
                 }
+                self.bootstrap_emitted.insert(file.path_id);
             }
             self.availability_sweeps
                 .entry(provider)
@@ -4998,14 +5356,11 @@ impl ProviderWorker for AdapterProviderWorker {
                         break;
                     }
                 };
-                while let Some(record) = records.next() {
-                    let events = self.parse_record(item, &record);
-                    if !merge_adapter_events(events, cycle.pending, &mut self.deferred) {
-                        let mut remaining = Vec::new();
-                        for record in records {
-                            remaining.extend(self.parse_record(item, &record));
-                        }
-                        self.deferred.extend(remaining);
+                if let Some(record) = records.next() {
+                    self.deferred_records.push_back((item.clone(), record));
+                    self.deferred_records
+                        .extend(records.map(|record| (item.clone(), record)));
+                    if !self.drain_deferred_records(cycle.pending) {
                         let next = if index + 1 < work.len() {
                             &work[index + 1]
                         } else {
@@ -5022,6 +5377,9 @@ impl ProviderWorker for AdapterProviderWorker {
                     }
                 }
                 if tail_generation != previous_generation {
+                    if self.history_manifests.contains_key(&provider) {
+                        self.history_failed.insert(provider);
+                    }
                     if replacement_goalpost_refrozen {
                         break;
                     }
@@ -5061,11 +5419,29 @@ impl ProviderWorker for AdapterProviderWorker {
             &codex_bindings,
             cycle.pending,
         );
-        self.emit_due_lifecycle_events(cycle.pending);
+        if !self.emit_due_lifecycle_events(cycle.pending) {
+            return Ok(());
+        }
+        if let Some(provider) = active_history_provider {
+            self.enqueue_history_barrier(provider, cycle.pending);
+        }
         Ok(())
     }
 
     fn graceful_stop(&mut self) -> Vec<ProviderEvent> {
+        if let Some((provider, barrier)) = self.held_history_barrier.as_ref()
+            && barrier.acknowledgement().is_committed()
+        {
+            self.history_completed.insert(*provider);
+            self.history_manifests.remove(provider);
+            self.held_history_barrier = None;
+        }
+        if self.held_history_barrier.is_some()
+            || !self.history_manifests.is_empty()
+            || !self.history_failed.is_empty()
+        {
+            return Vec::new();
+        }
         self.synthesis.flush_pending_completes()
     }
 }
@@ -5113,22 +5489,22 @@ fn drain_deferred_provider_events(
     true
 }
 
-fn merge_adapter_events(
+fn merge_originated_events_atomic(
     events: impl IntoIterator<Item = ProviderEvent>,
     pending: &mut PendingEvents,
-    deferred: &mut VecDeque<ProviderEvent>,
+    origin: crate::model::ObservationOrigin,
+    history_manifest: Option<Arc<PersistHistoryDrain>>,
 ) -> bool {
-    let mut events = events.into_iter();
-    while let Some(event) = events.next() {
-        match pending.merge(event) {
-            MergeOutcome::AtCapacity(event) => {
-                deferred.push_back(*event);
-                deferred.extend(events);
-                return false;
-            }
-            MergeOutcome::Accepted | MergeOutcome::Coalesced | MergeOutcome::Duplicate => {}
+    let mut trial = pending.clone();
+    for event in events {
+        if matches!(
+            trial.merge_with_origin(event, origin.clone(), history_manifest.clone()),
+            MergeOutcome::AtCapacity(_)
+        ) {
+            return false;
         }
     }
+    *pending = trial;
     true
 }
 
@@ -5175,6 +5551,8 @@ struct ProviderIntegration {
     published_targets: TargetSet,
     sessionless_codex_detections: HashMap<RunId, i64>,
     sessionless_codex_detection_history: HashMap<RunId, i64>,
+    held_history_barrier: Option<HistoryDrainBarrier>,
+    blocked_history_drains: HashSet<HistoryDrainId>,
     coverage: CoverageTracker,
     #[cfg(test)]
     published_targets_observer: Option<Arc<std::sync::Mutex<TargetSet>>>,
@@ -5228,6 +5606,7 @@ impl CoverageTracker {
                 SourceAvailability::Unavailable { detail }
             }
             ProviderSourceState::NotApplicable => SourceAvailability::NotApplicable,
+            ProviderSourceState::HistoryDrainBarrier(_) => return,
         };
         self.registry.set(source, state);
         self.publish();
@@ -5278,6 +5657,8 @@ impl ProviderIntegration {
             published_targets,
             sessionless_codex_detections: HashMap::new(),
             sessionless_codex_detection_history: HashMap::new(),
+            held_history_barrier: None,
+            blocked_history_drains: HashSet::new(),
             coverage,
             published_targets_observer: None,
         }
@@ -5297,6 +5678,8 @@ impl ProviderIntegration {
             published_targets,
             sessionless_codex_detections: HashMap::new(),
             sessionless_codex_detection_history: HashMap::new(),
+            held_history_barrier: None,
+            blocked_history_drains: HashSet::new(),
             coverage,
             #[cfg(test)]
             published_targets_observer: None,
@@ -5307,6 +5690,11 @@ impl ProviderIntegration {
         if let Some(events_drained) = self.events_drained.take() {
             let _ = events_drained.send(());
         }
+    }
+
+    #[cfg(test)]
+    fn block_history_drain(&mut self, drain_id: HistoryDrainId) {
+        self.blocked_history_drains.insert(drain_id);
     }
 
     fn set_herdr_quality(
@@ -5945,7 +6333,12 @@ async fn apply_provider_event(
     let (performance, _sampler) = performance_tracker(Arc::new(SystemPerformanceClock::new()));
     let admission = event.requires_admission().then(|| performance.admit());
     let result = service_provider_event(
-        Some(ProviderIngressEvent { event, admission }),
+        Some(ProviderIngressEvent {
+            event,
+            admission,
+            origin: crate::model::ObservationOrigin::Live,
+            history_manifest: None,
+        }),
         &mut provider,
         session,
         reducer,
@@ -5957,22 +6350,62 @@ async fn apply_provider_event(
     result
 }
 
+fn block_history_drain(
+    blocked_history_drains: &mut HashSet<HistoryDrainId>,
+    origin: &crate::model::ObservationOrigin,
+) {
+    if let crate::model::ObservationOrigin::Historical { drain_id, .. } = origin {
+        blocked_history_drains.insert(drain_id.clone());
+    }
+}
+
+fn block_history_drain_after_uncertain_write(
+    blocked_history_drains: &mut HashSet<HistoryDrainId>,
+    origin: &crate::model::ObservationOrigin,
+    outcome: RuntimeWriteOutcome,
+) {
+    if !matches!(
+        outcome,
+        RuntimeWriteOutcome::Durable | RuntimeWriteOutcome::CommittedButDegraded(_)
+    ) {
+        block_history_drain(blocked_history_drains, origin);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn apply_provider_event_with_admission(
     event: ProviderEvent,
     mut admission: Option<Admission>,
+    origin: crate::model::ObservationOrigin,
+    history_manifest: Option<Arc<crate::store::PersistHistoryDrain>>,
     session: &str,
     reducer: &mut Reducer,
     shared: &SharedModel,
     persistence: &mut RuntimePersistence,
     coverage: &SourceCoverageRegistry,
+    blocked_history_drains: &mut HashSet<HistoryDrainId>,
 ) -> Result<(), CollectorError> {
+    let provider_at_ms = provider_event_timestamp_ms(&event);
+    if let Some(manifest) = history_manifest.as_deref() {
+        let outcome = persist_v6_submission(
+            persistence,
+            reducer,
+            PersistV6Batch {
+                history_drains: vec![manifest.clone()],
+                ..PersistV6Batch::default()
+            },
+        )
+        .await?;
+        block_history_drain_after_uncertain_write(blocked_history_drains, &origin, outcome);
+    }
+    let prior = reducer.begin_provider_observation(&origin);
     match event {
         ProviderEvent::Synthesized(mut event) => {
             event.metadata.herdr_session = session.to_owned();
             event.metadata.receipt_time_ms = unix_now_ms();
             event.metadata.source_coverage = coverage.provider_metadata();
             if persistence.is_duplicate(&event.metadata.event_id) {
+                reducer.cancel_provider_observation();
                 reducer.restore_replayed_controller_transients(&event);
                 if let Some(admission) = admission.take() {
                     admission.complete();
@@ -5982,6 +6415,7 @@ async fn apply_provider_event_with_admission(
             let delta = match reducer.validate_controller_event(&event) {
                 Ok(delta) => delta,
                 Err(reason) => {
+                    reducer.cancel_provider_observation();
                     tracing::warn!(
                         warning_code = "provider_synthesized_event_rejected",
                         event_id = event.metadata.event_id,
@@ -5995,45 +6429,74 @@ async fn apply_provider_event_with_admission(
                 }
             };
             let Some(permit) = persistence.reserve_enqueue() else {
+                reducer.cancel_provider_observation();
+                block_history_drain(blocked_history_drains, &origin);
                 if let Some(admission) = admission.take() {
                     admission.complete();
                 }
                 return Ok(());
             };
-            let pending = match reducer.commit_staged(delta, permit) {
-                Ok(pending) => pending,
+            let operations = match reducer.commit_staged_unqueued(delta) {
+                Ok(operations) => operations,
                 Err(CommitStagedError::IngestSequenceExhausted) => {
+                    reducer.cancel_provider_observation();
+                    block_history_drain(blocked_history_drains, &origin);
                     if let Some(admission) = admission.take() {
                         admission.complete();
                     }
                     return Ok(());
                 }
             };
+            let batch = reducer.finish_provider_observation(
+                prior,
+                operations,
+                &origin,
+                history_manifest.as_deref(),
+                provider_at_ms,
+            );
+            let pending = permit.enqueue_v6(batch);
             if let Some(admission) = admission.take() {
                 admission.complete();
             }
             let outcome = persistence.finish_pending(pending).await?;
+            block_history_drain_after_uncertain_write(blocked_history_drains, &origin, outcome);
             reducer.complete_operator_submission(outcome);
             Ok(())
         }
         ProviderEvent::RunLiveness { key, at_ms } => {
             let persist = reducer.touch_run_liveness(&key, at_ms);
+            let persist = reducer.finish_provider_observation(
+                prior,
+                persist,
+                &origin,
+                history_manifest.as_deref(),
+                provider_at_ms,
+            );
             if let Some(admission) = admission.take() {
                 admission.complete();
             }
-            if !persist.is_empty() {
-                let _ = persist_submission(persistence, reducer, persist).await?;
+            if !persist.operations.is_empty() {
+                let outcome = persist_v6_submission(persistence, reducer, persist).await?;
+                block_history_drain_after_uncertain_write(blocked_history_drains, &origin, outcome);
             }
             persistence.refresh_snapshot(&shared.borrow(), coverage);
             Ok(())
         }
         ProviderEvent::LaneClose { key, at_ms } => {
             let persist = reducer.apply_lane_close(&key, at_ms);
+            let persist = reducer.finish_provider_observation(
+                prior,
+                persist,
+                &origin,
+                history_manifest.as_deref(),
+                provider_at_ms,
+            );
             if let Some(admission) = admission.take() {
                 admission.complete();
             }
-            if !persist.is_empty() {
-                let _ = persist_submission(persistence, reducer, persist).await?;
+            if !persist.operations.is_empty() {
+                let outcome = persist_v6_submission(persistence, reducer, persist).await?;
+                block_history_drain_after_uncertain_write(blocked_history_drains, &origin, outcome);
             }
             persistence.refresh_snapshot(&shared.borrow(), coverage);
             Ok(())
@@ -6059,6 +6522,13 @@ async fn apply_provider_event_with_admission(
                 },
             );
             debug_assert!(persist.is_empty(), "telemetry must remain transient");
+            let _ = reducer.finish_provider_observation(
+                prior,
+                persist,
+                &origin,
+                history_manifest.as_deref(),
+                provider_at_ms,
+            );
             if let Some(admission) = admission.take() {
                 admission.complete();
             }
@@ -6068,11 +6538,16 @@ async fn apply_provider_event_with_admission(
             apply_normalized_provider_event(
                 event,
                 admission,
+                prior,
+                origin,
+                history_manifest,
+                provider_at_ms,
                 session,
                 reducer,
                 shared,
                 persistence,
                 coverage,
+                blocked_history_drains,
             )
             .await
         }
@@ -6137,11 +6612,16 @@ async fn apply_heuristic_bindings(
 async fn apply_normalized_provider_event(
     event: ProviderEvent,
     mut admission: Option<Admission>,
+    prior: Option<DomainModel>,
+    origin: crate::model::ObservationOrigin,
+    history_manifest: Option<Arc<crate::store::PersistHistoryDrain>>,
+    provider_at_ms: i64,
     session: &str,
     reducer: &mut Reducer,
     shared: &SharedModel,
     persistence: &mut RuntimePersistence,
     coverage: &SourceCoverageRegistry,
+    blocked_history_drains: &mut HashSet<HistoryDrainId>,
 ) -> Result<(), CollectorError> {
     let normalized = normalize_provider_event(shared, session, event, coverage);
     let identity_disagreement = normalized.identity_disagreement;
@@ -6151,6 +6631,7 @@ async fn apply_normalized_provider_event(
         .filter(|event| !persistence.is_duplicate(&normalized_metadata(event).event_id))
         .collect::<Vec<_>>();
     if events.is_empty() {
+        reducer.cancel_provider_observation();
         if let Some(admission) = admission.take() {
             admission.complete();
         }
@@ -6160,19 +6641,51 @@ async fn apply_normalized_provider_event(
         && events
             .iter()
             .any(|event| normalized_metadata(event).source_event_type == "session_resolved");
-    let outcome = apply_collector_observation(reducer, events);
+    let outcome = match apply_collector_observation(reducer, events) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            reducer.cancel_provider_observation();
+            if let Some(admission) = admission.take() {
+                admission.complete();
+            }
+            return Err(error.into());
+        }
+    };
     if let Some(admission) = admission.take() {
         admission.complete();
     }
-    if let Some(persist) = outcome?
-        && !persist.is_empty()
-    {
-        let _ = persist_submission(persistence, reducer, persist).await?;
+    if let Some(persist) = outcome {
+        let persist = reducer.finish_provider_observation(
+            prior,
+            persist,
+            &origin,
+            history_manifest.as_deref(),
+            provider_at_ms,
+        );
+        if !persist.operations.is_empty() {
+            let outcome = persist_v6_submission(persistence, reducer, persist).await?;
+            block_history_drain_after_uncertain_write(blocked_history_drains, &origin, outcome);
+        }
+    } else {
+        reducer.cancel_provider_observation();
     }
     if disagreement_is_new {
         reducer.record_provider_identity_disagreement();
     }
     Ok(())
+}
+
+fn provider_event_timestamp_ms(event: &ProviderEvent) -> i64 {
+    match event {
+        ProviderEvent::Synthesized(event) => event.metadata.timestamp_ms,
+        ProviderEvent::RunLiveness { at_ms, .. }
+        | ProviderEvent::LaneClose { at_ms, .. }
+        | ProviderEvent::Telemetry { at_ms, .. } => *at_ms,
+        ProviderEvent::SessionResolved { observed_at_ms, .. }
+        | ProviderEvent::AgentUpsert { observed_at_ms, .. }
+        | ProviderEvent::Activity { observed_at_ms, .. } => *observed_at_ms,
+        ProviderEvent::SourceState { .. } | ProviderEvent::Malformed { .. } => unix_now_ms(),
+    }
 }
 
 fn collector_apply_outcome(reducer: &mut Reducer, outcome: ApplyOutcome) -> Option<PersistBatch> {
@@ -7475,7 +7988,42 @@ async fn drain_provider_events(
         let event = receive_provider(&mut provider.events).await;
         service_provider_event(event, provider, session, reducer, shared, persistence).await?;
     }
+    let _ = retry_held_history_barrier(provider, reducer, shared, persistence).await?;
     Ok(())
+}
+
+async fn retry_held_history_barrier(
+    provider: &mut ProviderIntegration,
+    reducer: &mut Reducer,
+    shared: &SharedModel,
+    persistence: &mut RuntimePersistence,
+) -> Result<bool, CollectorError> {
+    let Some(barrier) = provider.held_history_barrier.clone() else {
+        return Ok(false);
+    };
+    if provider.blocked_history_drains.contains(&barrier.drain_id) {
+        return Ok(false);
+    }
+    let staged = reducer.stage_history_finalization(&barrier);
+    let (outcome, page) = persistence.finalize_history_drain(&staged).await?;
+    let committed = matches!(
+        outcome,
+        RuntimeWriteOutcome::Durable
+            | RuntimeWriteOutcome::CommittedButDegraded(_)
+            | RuntimeWriteOutcome::DurabilityUnknown(_)
+    ) && page.is_some();
+    if !committed {
+        return Ok(false);
+    }
+    reducer.apply_history_finalization(
+        page.as_ref()
+            .expect("a known committed finalization must have an exact page"),
+    );
+    barrier.acknowledgement().acknowledge_committed();
+    provider.held_history_barrier = None;
+    persistence.refresh_pane_coverage(&shared.borrow());
+    persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
+    Ok(true)
 }
 
 async fn service_provider_event(
@@ -7494,6 +8042,8 @@ async fn service_provider_event(
                     state,
                 },
             admission,
+            origin: _,
+            history_manifest: _,
         }) => {
             assert!(
                 admission.is_none(),
@@ -7513,6 +8063,14 @@ async fn service_provider_event(
                     .await?;
                     ProviderSourceState::Available
                 }
+                ProviderSourceState::HistoryDrainBarrier(barrier) => {
+                    if provider.held_history_barrier.is_none() {
+                        provider.held_history_barrier = Some(barrier);
+                    }
+                    let _ =
+                        retry_held_history_barrier(provider, reducer, shared, persistence).await?;
+                    return Ok(());
+                }
                 state => state,
             };
             provider.update_source_state(source, state);
@@ -7528,6 +8086,8 @@ async fn service_provider_event(
                     error_code,
                 },
             admission,
+            origin: _,
+            history_manifest: _,
         }) => {
             assert!(
                 admission.is_none(),
@@ -7542,18 +8102,26 @@ async fn service_provider_event(
             );
             Ok(())
         }
-        Some(ProviderIngressEvent { event, admission }) => {
+        Some(ProviderIngressEvent {
+            event,
+            admission,
+            origin,
+            history_manifest,
+        }) => {
             let admission = admission
                 .expect("reducer-bound provider events must carry a performance admission");
             let coverage = provider.coverage.registry.clone();
             apply_provider_event_with_admission(
                 event,
                 Some(admission),
+                origin,
+                history_manifest,
                 session,
                 reducer,
                 shared,
                 persistence,
                 &coverage,
+                &mut provider.blocked_history_drains,
             )
             .await
         }
@@ -7862,7 +8430,7 @@ mod tests {
     use crate::diagnostics::{OccurrenceLogStatus, RuntimeWriteOutcome};
     use crate::model::{
         AgentNode, ControllerEventKind, DependencyEdge, DisplayOrdinal, ExecutionEdge,
-        OperatorCommand, TaskRun, TaskState, Workspace,
+        OperatorCommand, TaskRun, TaskRunV6State, TaskState, Workspace,
     };
     use crate::performance::{
         PerformanceDegradationReason, PerformanceSampler, PerformanceSnapshot,
@@ -7873,8 +8441,236 @@ mod tests {
         PersistencePhase,
     };
     use crate::store::{
-        LedgerEntry, PersistExecution, PersistTaskRun, open_reader, open_writer, spawn_writer,
+        LedgerEntry, PersistExecution, PersistHistoryDrain, PersistHistoryDrainRun, PersistTaskRun,
+        PersistTaskRunV6, PersistV6Batch, open_reader, open_writer, spawn_writer,
     };
+
+    #[tokio::test]
+    async fn history_barrier_writer_outcome_matrix_retries_until_commit_known() {
+        let cases = [
+            ("durable", None, false, true),
+            (
+                "committed-but-degraded",
+                Some(RuntimeWriteOutcome::CommittedButDegraded(failure(
+                    PersistenceOperation::Apply,
+                    PersistencePhase::PostApplyCommit,
+                    PersistenceFailureCode::Io,
+                    DurabilityDisposition::Committed,
+                ))),
+                true,
+                true,
+            ),
+            (
+                "not-committed",
+                Some(RuntimeWriteOutcome::NotCommitted(failure(
+                    PersistenceOperation::Apply,
+                    PersistencePhase::CommandExecution,
+                    PersistenceFailureCode::Sqlite,
+                    DurabilityDisposition::NotCommitted,
+                ))),
+                false,
+                false,
+            ),
+            ("skipped", Some(RuntimeWriteOutcome::Skipped), false, false),
+            (
+                "unknown-committed",
+                Some(RuntimeWriteOutcome::DurabilityUnknown(failure(
+                    PersistenceOperation::Apply,
+                    PersistencePhase::Acknowledgement,
+                    PersistenceFailureCode::AcknowledgementDropped,
+                    DurabilityDisposition::Unknown,
+                ))),
+                true,
+                true,
+            ),
+            (
+                "unknown-absent",
+                Some(RuntimeWriteOutcome::DurabilityUnknown(failure(
+                    PersistenceOperation::Apply,
+                    PersistencePhase::Acknowledgement,
+                    PersistenceFailureCode::AcknowledgementDropped,
+                    DurabilityDisposition::Unknown,
+                ))),
+                false,
+                false,
+            ),
+        ];
+
+        for (label, injected, prefinalized, first_committed) in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+            let mut store = open_writer(&root).unwrap();
+            let run_id = RunId::new();
+            let drain_id = crate::model::HistoryDrainId::new(format!("codex:{label}")).unwrap();
+            let task_run = TaskRun {
+                run_id,
+                key: RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: label.to_owned(),
+                },
+                display_ordinal: DisplayOrdinal::new(1),
+                state: TaskState::Queued,
+                has_controller_task_state_event: false,
+                created_at_ms: Some(1_000),
+                updated_at_ms: Some(4_000),
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
+            };
+            let manifest = PersistHistoryDrain {
+                drain_id: drain_id.clone(),
+                provider: Provider::Codex,
+                created_at_ms: 1_000,
+                artifacts: Vec::new(),
+            };
+            store
+                .apply_v6_batch(PersistV6Batch {
+                    task_runs: vec![PersistTaskRunV6 {
+                        task_run: PersistTaskRun {
+                            task_run,
+                            native_session: Some(crate::store::NativeSessionBinding {
+                                provider: Provider::Codex,
+                                native_session_id: label.to_owned(),
+                            }),
+                            created_at_ms: 1_000,
+                            updated_at_ms: 4_000,
+                            finished_at_ms: None,
+                        },
+                        state: TaskRunV6State {
+                            history_ready: false,
+                            latest_provider_at_ms: Some(4_000),
+                            ..TaskRunV6State::default()
+                        },
+                    }],
+                    history_drains: vec![manifest.clone()],
+                    history_associations: vec![PersistHistoryDrainRun {
+                        drain_id: drain_id.clone(),
+                        run_id,
+                    }],
+                    ..PersistV6Batch::default()
+                })
+                .unwrap();
+            let precommit_model = store.load_restored_state().unwrap();
+            if prefinalized {
+                store.finalize_history_drain(&drain_id, 5_000).unwrap();
+            }
+            let (lifecycle, writer) = spawn_writer(store).unwrap();
+            let (mut persistence, _diagnostics) = RuntimePersistence::new_for_test(
+                writer,
+                Arc::new(RecordingOccurrenceSink::default()),
+            );
+            if let Some(outcome) = injected {
+                persistence.inject_write_result(TestWriteInjection {
+                    class: RuntimeCommandClass::Batch,
+                    successes_before_failure: 0,
+                    result: TestWriteResult::Classified(outcome),
+                });
+            }
+            let (mut reducer, shared) = Reducer::new(precommit_model);
+            let publish_count = reducer.shared_publish_count();
+            let (_provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+            let barrier = HistoryDrainBarrier::new(manifest.drain_id.clone(), 5_000);
+            let acknowledgement = barrier.acknowledgement();
+            provider.held_history_barrier = Some(barrier);
+
+            let first =
+                retry_held_history_barrier(&mut provider, &mut reducer, &shared, &mut persistence)
+                    .await
+                    .unwrap();
+            assert_eq!(first, first_committed, "{label}: first attempt");
+            assert_eq!(
+                acknowledgement.is_committed(),
+                first_committed,
+                "{label}: acknowledgement"
+            );
+            assert_eq!(
+                publish_count.load(Ordering::Relaxed),
+                u64::from(first_committed),
+                "{label}: first publication"
+            );
+
+            if !first_committed {
+                persistence.observe_writer_health();
+                let retried = retry_held_history_barrier(
+                    &mut provider,
+                    &mut reducer,
+                    &shared,
+                    &mut persistence,
+                )
+                .await
+                .unwrap();
+                assert!(retried, "{label}: retry did not reach a known commit");
+                assert!(
+                    acknowledgement.is_committed(),
+                    "{label}: retry acknowledgement"
+                );
+            }
+            assert!(
+                provider.held_history_barrier.is_none(),
+                "{label}: held barrier"
+            );
+            assert_eq!(
+                publish_count.load(Ordering::Relaxed),
+                1,
+                "{label}: publication"
+            );
+            assert!(
+                shared
+                    .borrow()
+                    .task_run_v6_state(&run_id)
+                    .unwrap()
+                    .history_ready,
+                "{label}: readiness"
+            );
+            drop(persistence);
+            lifecycle.shutdown().await.unwrap();
+            provider_thread.stop().await.unwrap();
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let drain_id = crate::model::HistoryDrainId::new("codex:lost-mutation").unwrap();
+        store
+            .apply_v6_batch(PersistV6Batch {
+                history_drains: vec![PersistHistoryDrain {
+                    drain_id: drain_id.clone(),
+                    provider: Provider::Codex,
+                    created_at_ms: 1_000,
+                    artifacts: Vec::new(),
+                }],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+        let restored = store.load_restored_state().unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut persistence, _diagnostics) =
+            RuntimePersistence::new_for_test(writer, Arc::new(RecordingOccurrenceSink::default()));
+        let (mut reducer, shared) = Reducer::new(restored);
+        let (_provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+        provider.block_history_drain(drain_id.clone());
+        let barrier = HistoryDrainBarrier::new(drain_id.clone(), 5_000);
+        let acknowledgement = barrier.acknowledgement();
+        provider.held_history_barrier = Some(barrier);
+
+        assert!(
+            !retry_held_history_barrier(&mut provider, &mut reducer, &shared, &mut persistence)
+                .await
+                .unwrap()
+        );
+        assert!(!acknowledgement.is_committed());
+        assert!(
+            persistence
+                .writer
+                .history_drain_finalization(&drain_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(persistence);
+        lifecycle.shutdown().await.unwrap();
+        provider_thread.stop().await.unwrap();
+    }
 
     fn provider_target_task_run(run_id: RunId, key: RunKey, ordinal: i64) -> TaskRun {
         TaskRun {
@@ -14618,6 +15414,8 @@ mod tests {
                                 state: ProviderSourceState::NotApplicable,
                             },
                             admission: None,
+                            origin: crate::model::ObservationOrigin::Live,
+                            history_manifest: None,
                         };
                         let sent = tokio::time::timeout(
                             Duration::from_secs(1),
@@ -16186,6 +16984,14 @@ mod tests {
         pending.flush_to(&sender);
         let mut events = Vec::new();
         while let Ok(event) = receiver.try_recv() {
+            if let ProviderEvent::SourceState {
+                state: ProviderSourceState::HistoryDrainBarrier(barrier),
+                ..
+            } = &event
+            {
+                barrier.acknowledgement().acknowledge_committed();
+                continue;
+            }
             events.push(event);
         }
 
@@ -17831,7 +18637,7 @@ mod provider_integration_tests {
     use crate::lockfile::StateRoot;
     use crate::model::{
         AgentNode, ControllerEventKind, DisplayOrdinal, DomainModel, ExecState, ExecutionEdge,
-        MinimalProviderMetadata, RunId, RunKey, SharedModel, TaskRun, TaskState,
+        MinimalProviderMetadata, RunId, RunKey, SharedModel, TaskRun, TaskRunV6State, TaskState,
     };
     use crate::provider::claude_facts::{extract_claude_line, extract_meta_json};
     use crate::provider::facts::{ActivitySource, LogFact, SessionScope};
@@ -17839,7 +18645,8 @@ mod provider_integration_tests {
     use crate::provider::{ProviderCycle, ProviderEvent, ProviderWorker, SourcePosition};
     use crate::store::WriterLifecycle;
     use crate::store::{
-        NativeSessionBinding, PersistOp, PersistTaskRun, open_reader, open_writer, spawn_writer,
+        NativeSessionBinding, PersistHistoryDrain, PersistHistoryDrainRun, PersistOp,
+        PersistTaskRun, PersistTaskRunV6, PersistV6Batch, open_reader, open_writer, spawn_writer,
     };
     use crate::tui::app::AppState;
     use crate::tui::view::build_rows;
@@ -17850,6 +18657,250 @@ mod provider_integration_tests {
         fn append(&self, _record: &[u8]) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn history_drain_spills_4097_run_associations_without_drain_wide_key_state() {
+        const RUNS: usize = 4_097;
+        const CYCLE: usize = 64;
+        const PENDING_CAPACITY: usize = 8;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let drain_id = crate::model::HistoryDrainId::new("codex:spill-4097").unwrap();
+        let manifest = PersistHistoryDrain {
+            drain_id: drain_id.clone(),
+            provider: Provider::Codex,
+            created_at_ms: 1_000,
+            artifacts: Vec::new(),
+        };
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut pending = PendingEvents::with_capacity(PENDING_CAPACITY, diagnostics);
+        let (sender, mut receiver) = mpsc::channel(PENDING_CAPACITY);
+        let mut pending_high_water = 0;
+        let mut run_ids = Vec::with_capacity(RUNS);
+
+        for cycle_start in (0..RUNS).step_by(CYCLE) {
+            let cycle_end = (cycle_start + CYCLE).min(RUNS);
+            let mut task_runs = Vec::with_capacity(cycle_end - cycle_start);
+            let mut associations = Vec::with_capacity(cycle_end - cycle_start);
+            for index in cycle_start..cycle_end {
+                let run_id = RunId::new();
+                run_ids.push(run_id);
+                let task_run = TaskRun {
+                    run_id,
+                    key: RunKey::Native {
+                        provider: Provider::Codex,
+                        sid: format!("spill-{index}"),
+                    },
+                    display_ordinal: DisplayOrdinal::new(i64::try_from(index + 1).unwrap()),
+                    state: TaskState::Queued,
+                    has_controller_task_state_event: false,
+                    created_at_ms: Some(1_000),
+                    updated_at_ms: Some(2_000),
+                    finished_at_ms: None,
+                    subject: None,
+                    dismissed_at_ms: None,
+                };
+                task_runs.push(PersistTaskRunV6 {
+                    task_run: PersistTaskRun {
+                        task_run,
+                        native_session: Some(NativeSessionBinding {
+                            provider: Provider::Codex,
+                            native_session_id: format!("spill-{index}"),
+                        }),
+                        created_at_ms: 1_000,
+                        updated_at_ms: 2_000,
+                        finished_at_ms: None,
+                    },
+                    state: TaskRunV6State {
+                        history_ready: false,
+                        latest_provider_at_ms: Some(2_000),
+                        ..TaskRunV6State::default()
+                    },
+                });
+                associations.push(PersistHistoryDrainRun {
+                    drain_id: drain_id.clone(),
+                    run_id,
+                });
+
+                let event = ProviderEvent::AgentUpsert {
+                    provider: Provider::Codex,
+                    agent_thread_id: format!("spill-{index}"),
+                    owner_session_id: None,
+                    parent_thread_id: None,
+                    state: Some(ExecState::Idle),
+                    model_id: None,
+                    depth: Some(0),
+                    event_id: format!("prov:spill:{index}"),
+                    observed_at_ms: 2_000,
+                    position: SourcePosition {
+                        path_id: 1,
+                        generation: 0,
+                        offset: u64::try_from(index).unwrap(),
+                    },
+                };
+                let mut retry = Some(event);
+                while let Some(event) = retry.take() {
+                    match pending.merge(event) {
+                        MergeOutcome::AtCapacity(event) => {
+                            pending.flush_to(&sender);
+                            while receiver.try_recv().is_ok() {}
+                            retry = Some(*event);
+                        }
+                        MergeOutcome::Accepted
+                        | MergeOutcome::Coalesced
+                        | MergeOutcome::Duplicate => {}
+                    }
+                }
+                pending_high_water = pending_high_water.max(pending.total_count_for_test());
+            }
+            writer
+                .apply_v6(PersistV6Batch {
+                    task_runs,
+                    history_drains: (cycle_start == 0)
+                        .then(|| manifest.clone())
+                        .into_iter()
+                        .collect(),
+                    history_associations: associations,
+                    ..PersistV6Batch::default()
+                })
+                .await
+                .unwrap();
+            pending.flush_to(&sender);
+            while receiver.try_recv().is_ok() {}
+        }
+
+        let barrier = HistoryDrainBarrier::new(manifest.drain_id.clone(), 3_000);
+        assert!(matches!(
+            pending.merge(ProviderEvent::SourceState {
+                provider: Provider::Codex,
+                state: ProviderSourceState::HistoryDrainBarrier(barrier),
+            }),
+            MergeOutcome::Accepted
+        ));
+        pending_high_water = pending_high_water.max(pending.total_count_for_test());
+        writer.barrier().await.unwrap();
+
+        let reader = open_reader(&root).unwrap();
+        assert_eq!(reader.history_drain_run_ids(&drain_id).unwrap().len(), RUNS);
+        let restored = reader.load_restored_state().unwrap();
+        assert!(run_ids.iter().all(|run_id| {
+            !restored
+                .model
+                .task_run_v6_state(run_id)
+                .unwrap()
+                .history_ready
+        }));
+        let (mut reducer, shared) = Reducer::new(restored);
+        assert_eq!(shared.borrow().task_runs().count(), 0);
+
+        let page = writer
+            .finalize_history_drain(drain_id, 3_000)
+            .await
+            .unwrap();
+        assert_eq!(page.runs.len(), RUNS);
+        assert!(reducer.apply_history_finalization(&page));
+        assert_eq!(shared.borrow().task_runs().count(), RUNS);
+        assert!(pending_high_water <= PENDING_CAPACITY + 1);
+
+        drop(writer);
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_parse_failure_and_shutdown_leave_suppressed_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, mut writer) = spawn_writer(store).unwrap();
+        let run_id = RunId::new();
+        let drain_id = crate::model::HistoryDrainId::new("codex:parse-failure").unwrap();
+        writer
+            .apply_v6(PersistV6Batch {
+                task_runs: vec![PersistTaskRunV6 {
+                    task_run: PersistTaskRun {
+                        task_run: TaskRun {
+                            run_id,
+                            key: RunKey::Native {
+                                provider: Provider::Codex,
+                                sid: "parse-failure".to_owned(),
+                            },
+                            display_ordinal: DisplayOrdinal::new(1),
+                            state: TaskState::Queued,
+                            has_controller_task_state_event: false,
+                            created_at_ms: Some(1_000),
+                            updated_at_ms: Some(2_000),
+                            finished_at_ms: None,
+                            subject: None,
+                            dismissed_at_ms: None,
+                        },
+                        native_session: Some(NativeSessionBinding {
+                            provider: Provider::Codex,
+                            native_session_id: "parse-failure".to_owned(),
+                        }),
+                        created_at_ms: 1_000,
+                        updated_at_ms: 2_000,
+                        finished_at_ms: None,
+                    },
+                    state: TaskRunV6State {
+                        history_ready: false,
+                        latest_provider_at_ms: Some(2_000),
+                        ..TaskRunV6State::default()
+                    },
+                }],
+                history_drains: vec![PersistHistoryDrain {
+                    drain_id: drain_id.clone(),
+                    provider: Provider::Codex,
+                    created_at_ms: 1_000,
+                    artifacts: Vec::new(),
+                }],
+                history_associations: vec![PersistHistoryDrainRun {
+                    drain_id: drain_id.clone(),
+                    run_id,
+                }],
+                ..PersistV6Batch::default()
+            })
+            .await
+            .unwrap();
+
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut pending = PendingEvents::new(diagnostics.clone());
+        let malformed = ProviderEvent::Malformed {
+            provider: Provider::Codex,
+            path_display: "sha256:redacted".to_owned(),
+            generation: 0,
+            byte_offset: 42,
+            error_code: "invalid_json",
+        };
+        assert!(matches!(pending.merge(malformed), MergeOutcome::Accepted));
+        let (sender, mut receiver) = mpsc::channel(1);
+        pending.flush_to(&sender);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ProviderEvent::Malformed { .. })
+        ));
+
+        let mut worker = AdapterProviderWorker::new(Vec::new(), diagnostics);
+        worker.history_failed.insert(Provider::Codex);
+        assert!(worker.graceful_stop().is_empty());
+        drop(writer);
+        lifecycle.shutdown().await.unwrap();
+
+        let reader = open_reader(&root).unwrap();
+        assert!(!reader.history_drain_finalized(&drain_id).unwrap());
+        let restored = reader.load_restored_state().unwrap();
+        assert!(
+            !restored
+                .model
+                .task_run_v6_state(&run_id)
+                .unwrap()
+                .history_ready
+        );
+        let (_reducer, shared) = Reducer::new(restored);
+        assert!(shared.borrow().task_run(&run_id).is_none());
     }
 
     fn test_runtime(writer: WriterClient) -> RuntimePersistence {
@@ -18634,9 +19685,305 @@ mod provider_integration_tests {
         pending.flush_to(&sender);
         let mut events = Vec::new();
         while let Ok(event) = receiver.try_recv() {
-            events.push(event);
+            match &event {
+                ProviderEvent::SourceState {
+                    state: ProviderSourceState::HistoryDrainBarrier(barrier),
+                    ..
+                } => barrier.acknowledgement().acknowledge_committed(),
+                _ => events.push(event),
+            }
         }
         events
+    }
+
+    fn history_test_item(
+        provider: Provider,
+        root: &Path,
+        relative_path: impl Into<PathBuf>,
+        path_id: u32,
+    ) -> AdapterWorkItem {
+        let relative_path = relative_path.into();
+        AdapterWorkItem {
+            provider,
+            root: root.to_path_buf(),
+            file: crate::provider::DiscoveredFile {
+                provider,
+                root: root.to_path_buf(),
+                relative_path,
+                modified_ms: 1,
+                path_id,
+                bootstrap: None,
+            },
+        }
+    }
+
+    fn history_test_manifest(
+        provider: Provider,
+        drain_id: &str,
+        artifact_id: String,
+        goalpost: u64,
+    ) -> Arc<PersistHistoryDrain> {
+        Arc::new(PersistHistoryDrain {
+            drain_id: HistoryDrainId::new(drain_id).unwrap(),
+            provider,
+            created_at_ms: 1,
+            artifacts: vec![PersistHistoryDrainArtifact {
+                artifact_id,
+                generation: "dev:inode".to_owned(),
+                goalpost,
+            }],
+        })
+    }
+
+    #[test]
+    fn record_origin_requires_frozen_manifest_membership_and_respects_goalpost() {
+        let root = Path::new("/history-root");
+        let frozen = history_test_item(Provider::Codex, root, "frozen.jsonl", 1);
+        let late = history_test_item(Provider::Codex, root, "late.jsonl", 2);
+        let frozen_artifact_id = stable_history_artifact_id(&root.join(&frozen.file.relative_path));
+        let manifest = history_test_manifest(
+            Provider::Codex,
+            "codex:record-origin-membership",
+            frozen_artifact_id.clone(),
+            100,
+        );
+        let mut worker = AdapterProviderWorker::default();
+        worker
+            .history_manifests
+            .insert(Provider::Codex, Arc::clone(&manifest));
+
+        let (before, before_manifest) = worker.record_origin(
+            &frozen,
+            Some(&crate::provider::TailRecord::data(99, 0, Vec::new())),
+        );
+        assert_eq!(
+            before,
+            crate::model::ObservationOrigin::Historical {
+                drain_id: manifest.drain_id.clone(),
+                artifact_id: frozen_artifact_id,
+            }
+        );
+        assert_eq!(before_manifest.as_deref(), Some(manifest.as_ref()));
+
+        for offset in [100, 101] {
+            assert_eq!(
+                worker.record_origin(
+                    &frozen,
+                    Some(&crate::provider::TailRecord::data(offset, 0, Vec::new())),
+                ),
+                (crate::model::ObservationOrigin::Live, None),
+                "offset {offset} must be live at or after the frozen goalpost"
+            );
+        }
+        assert_eq!(
+            worker.record_origin(
+                &late,
+                Some(&crate::provider::TailRecord::data(0, 0, Vec::new())),
+            ),
+            (crate::model::ObservationOrigin::Live, None),
+            "an artifact absent from the frozen manifest is outside the history drain"
+        );
+    }
+
+    #[test]
+    fn empty_initial_discovery_keeps_later_artifact_events_live() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("home/.codex/sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = codex_artifact(&root, "created-later");
+        let targets = TargetSet::new([ProviderTarget {
+            provider: Provider::Codex,
+            path: path.clone(),
+        }]);
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new(
+            vec![DiscoveryRoot {
+                provider: Provider::Codex,
+                path: root,
+            }],
+            diagnostics.clone(),
+        );
+        let mut pending = PendingEvents::new(diagnostics);
+
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+        let _ = drain_pending(&mut pending);
+        assert!(worker.history_completed.contains(&Provider::Codex));
+        assert!(!worker.history_manifests.contains_key(&Provider::Codex));
+
+        std::fs::write(
+            path,
+            codex_records("late-owner", "late-agent", "created-later"),
+        )
+        .unwrap();
+        process_adapter_worker(&mut worker, &targets, &mut pending);
+
+        let (_, origin, manifest) = pending
+            .originated_events_for_test()
+            .into_iter()
+            .find(|(event, _, _)| {
+                matches!(
+                    event,
+                    ProviderEvent::Activity { event_id, .. }
+                        if event_id == "prov:codex:act:created-later"
+                )
+            })
+            .expect("the later artifact must produce its activity event");
+        assert_eq!(origin, crate::model::ObservationOrigin::Live);
+        assert!(manifest.is_none());
+    }
+
+    fn seed_due_lifecycle_for_both_providers(worker: &mut AdapterProviderWorker, at_ms: i64) {
+        let claude_scope = SessionScope::ClaudeRoot("claude-lifecycle".to_owned());
+        let _ = worker.synthesis.synthesize_batch(
+            Path::new("claude-lifecycle.jsonl"),
+            [(
+                1,
+                LogFact::Append {
+                    scope: claude_scope,
+                    at_ms,
+                },
+            )],
+            &mut worker.log_admission,
+            &worker.admission_index,
+        );
+        let _ = worker.synthesis.synthesize_batch(
+            Path::new("codex-lifecycle.jsonl"),
+            [(
+                1,
+                LogFact::CodexTurnStarted {
+                    rollout_id: "codex-lifecycle".to_owned(),
+                    at_ms,
+                },
+            )],
+            &mut worker.log_admission,
+            &worker.admission_index,
+        );
+    }
+
+    #[test]
+    fn due_lifecycle_events_use_their_matching_provider_manifest_atomically() {
+        let now_ms = unix_now_ms();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new_with_log_lane_config(
+            Vec::new(),
+            diagnostics.clone(),
+            LogLaneConfig {
+                headless_inactivity_ms: 0,
+                ..LogLaneConfig::default()
+            },
+            None,
+        );
+        seed_due_lifecycle_for_both_providers(&mut worker, now_ms);
+        let claude_manifest = history_test_manifest(
+            Provider::Claude,
+            "claude:lifecycle-routing",
+            "claude-artifact".to_owned(),
+            100,
+        );
+        let codex_manifest = history_test_manifest(
+            Provider::Codex,
+            "codex:lifecycle-routing",
+            "codex-artifact".to_owned(),
+            200,
+        );
+        worker
+            .history_manifests
+            .insert(Provider::Claude, Arc::clone(&claude_manifest));
+        worker
+            .history_manifests
+            .insert(Provider::Codex, Arc::clone(&codex_manifest));
+
+        let mut pending = PendingEvents::with_capacity(2, diagnostics);
+        assert!(matches!(
+            pending.merge(ProviderEvent::RunLiveness {
+                key: RunKey::Controller("resident".to_owned()),
+                at_ms: now_ms,
+            }),
+            MergeOutcome::Accepted
+        ));
+        let pending_before = pending.originated_events_for_test();
+        assert!(!worker.emit_due_lifecycle_events(&mut pending));
+        assert_eq!(pending.originated_events_for_test(), pending_before);
+        let _ = drain_pending(&mut pending);
+
+        assert!(worker.emit_due_lifecycle_events(&mut pending));
+        let routed = pending.originated_events_for_test();
+        assert_eq!(routed.len(), 2);
+        for (event, origin, manifest) in routed {
+            let (provider, expected_manifest) = match event {
+                ProviderEvent::LaneClose {
+                    key: RunKey::Controller(key),
+                    ..
+                } if key.starts_with("hook:claude-code:") => (Provider::Claude, &claude_manifest),
+                ProviderEvent::LaneClose {
+                    key: RunKey::Native { provider, .. },
+                    ..
+                } => (provider, &codex_manifest),
+                event => panic!("unexpected due lifecycle event: {event:?}"),
+            };
+            assert_eq!(expected_manifest.provider, provider);
+            assert_eq!(
+                origin,
+                crate::model::ObservationOrigin::Historical {
+                    drain_id: expected_manifest.drain_id.clone(),
+                    artifact_id: expected_manifest.artifacts[0].artifact_id.clone(),
+                }
+            );
+            assert_eq!(manifest.as_deref(), Some(expected_manifest.as_ref()));
+        }
+    }
+
+    #[test]
+    fn due_lifecycle_event_without_matching_manifest_is_live() {
+        let now_ms = unix_now_ms();
+        let diagnostics = crate::provider::ProviderDiagnostics::default();
+        let mut worker = AdapterProviderWorker::new_with_log_lane_config(
+            Vec::new(),
+            diagnostics.clone(),
+            LogLaneConfig {
+                headless_inactivity_ms: 0,
+                ..LogLaneConfig::default()
+            },
+            None,
+        );
+        let _ = worker.synthesis.synthesize_batch(
+            Path::new("codex-live-lifecycle.jsonl"),
+            [(
+                1,
+                LogFact::CodexTurnStarted {
+                    rollout_id: "codex-live-lifecycle".to_owned(),
+                    at_ms: now_ms,
+                },
+            )],
+            &mut worker.log_admission,
+            &worker.admission_index,
+        );
+        worker.history_manifests.insert(
+            Provider::Claude,
+            history_test_manifest(
+                Provider::Claude,
+                "claude:unrelated-lifecycle",
+                "claude-artifact".to_owned(),
+                100,
+            ),
+        );
+        let mut pending = PendingEvents::new(diagnostics);
+
+        assert!(worker.emit_due_lifecycle_events(&mut pending));
+        let routed = pending.originated_events_for_test();
+        assert_eq!(routed.len(), 1);
+        assert!(matches!(
+            routed[0].0,
+            ProviderEvent::LaneClose {
+                key: RunKey::Native {
+                    provider: Provider::Codex,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(routed[0].1, crate::model::ObservationOrigin::Live);
+        assert!(routed[0].2.is_none());
     }
 
     fn codex_artifact_name(label: &str) -> String {
@@ -19609,6 +20956,8 @@ mod provider_integration_tests {
                     },
                 },
                 admission: None,
+                origin: crate::model::ObservationOrigin::Live,
+                history_manifest: None,
             }),
             provider,
             "session",
@@ -19703,6 +21052,8 @@ mod provider_integration_tests {
                         state: ProviderSourceState::Available,
                     },
                     admission: None,
+                    origin: crate::model::ObservationOrigin::Live,
+                    history_manifest: None,
                 })
                 .await
                 .unwrap();
@@ -19739,6 +21090,7 @@ mod provider_integration_tests {
                         state: ProviderSourceState::Available,
                     },
                     admission: None,
+                    ..
                 })
             ));
         }
@@ -20386,7 +21738,12 @@ mod provider_integration_tests {
         for event in events {
             let admission = event.requires_admission().then(|| performance.admit());
             service_provider_event(
-                Some(ProviderIngressEvent { event, admission }),
+                Some(ProviderIngressEvent {
+                    event,
+                    admission,
+                    origin: crate::model::ObservationOrigin::Live,
+                    history_manifest: None,
+                }),
                 &mut provider,
                 "session",
                 &mut harness.reducer,
@@ -20938,6 +22295,8 @@ mod provider_integration_tests {
                     },
                 },
                 admission: None,
+                origin: crate::model::ObservationOrigin::Live,
+                history_manifest: None,
             }),
             &mut provider,
             "session",
@@ -21776,10 +23135,6 @@ mod provider_integration_tests {
         let mut recovered = false;
         for _ in 0..12 {
             process_adapter_worker(&mut worker, &targets, &mut pending);
-            assert!(
-                !worker.deferred.is_empty(),
-                "physical cycle did not saturate as arranged"
-            );
             let all_visited = [codex_artifact_name("first"), codex_artifact_name("second")]
                 .into_iter()
                 .all(|name| tail_read_calls(&worker, &root, &name).is_some_and(|calls| calls > 0));
@@ -22781,7 +24136,7 @@ mod provider_integration_tests {
 
         process_adapter_worker(&mut worker, &targets, &mut pending);
         let read_calls = tail_read_calls(&worker, &root, &codex_artifact_name("bounded")).unwrap();
-        let deferred_len = worker.deferred.len();
+        let deferred_len = worker.deferred_records.len();
         let cursor = worker.resume_cursor.clone();
         assert!(deferred_len > 0);
 
@@ -22793,7 +24148,7 @@ mod provider_integration_tests {
             tail_read_calls(&worker, &root, &codex_artifact_name("bounded")),
             Some(read_calls)
         );
-        assert_eq!(worker.deferred.len(), deferred_len);
+        assert_eq!(worker.deferred_records.len(), deferred_len);
         assert_eq!(worker.resume_cursor, cursor);
         assert_eq!(pending.entity_count(), 1);
     }

@@ -11,13 +11,17 @@ use std::time::{Duration, Instant};
 use common::mock::{MockConfig, MockHerdr};
 use herdr_top::herdr::collector::{self, CollectorHandle, ObservationQuality};
 use herdr_top::lockfile::{OwnerRecord, StateRoot, state_root_in, try_acquire};
-use herdr_top::model::{DisplayOrdinal, ExecState, Provider, RunId, RunKey, TaskRun, TaskState};
+use herdr_top::model::{
+    DisplayOrdinal, ExecState, Provider, RunId, RunKey, TaskRun, TaskRunV6State, TaskState,
+};
+use herdr_top::reducer::Reducer;
 use herdr_top::rendezvous::{
     ControllerSocketStatus, open_runtime_dir_at, prepare_controller_socket,
 };
 use herdr_top::session_key;
 use herdr_top::store::{
-    PersistOp, PersistTaskRun, SchemaVerdict, database_path, open_reader, open_writer,
+    NativeSessionBinding, PersistHistoryDrain, PersistHistoryDrainRun, PersistOp, PersistTaskRun,
+    PersistTaskRunV6, PersistV6Batch, SchemaVerdict, database_path, open_reader, open_writer,
     preflight_schema, spawn_writer,
 };
 use rusqlite::Connection;
@@ -26,6 +30,106 @@ use tempfile::TempDir;
 
 const SESSION_NAME: &str = "Task 11 restore session";
 const WAIT: Duration = Duration::from_secs(3);
+
+#[test]
+fn incomplete_history_stays_suppressed_and_completed_drain_restores() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = StateRoot(directory.path().to_path_buf());
+    let mut store = open_writer(&root).unwrap();
+    let incomplete_run = RunId::new();
+    let completed_run = RunId::new();
+    let incomplete_drain =
+        herdr_top::model::HistoryDrainId::new("codex:restore-incomplete").unwrap();
+    let completed_drain =
+        herdr_top::model::HistoryDrainId::new("claude:restore-completed").unwrap();
+    let persisted = |run_id, provider, sid: &str, ordinal| PersistTaskRunV6 {
+        task_run: PersistTaskRun {
+            task_run: TaskRun {
+                run_id,
+                key: RunKey::Native {
+                    provider,
+                    sid: sid.to_owned(),
+                },
+                display_ordinal: DisplayOrdinal::new(ordinal),
+                state: TaskState::Queued,
+                has_controller_task_state_event: false,
+                created_at_ms: Some(1_000),
+                updated_at_ms: Some(2_000),
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
+            },
+            native_session: Some(NativeSessionBinding {
+                provider,
+                native_session_id: sid.to_owned(),
+            }),
+            created_at_ms: 1_000,
+            updated_at_ms: 2_000,
+            finished_at_ms: None,
+        },
+        state: TaskRunV6State {
+            history_ready: false,
+            latest_provider_at_ms: Some(2_000),
+            ..TaskRunV6State::default()
+        },
+    };
+    store
+        .apply_v6_batch(PersistV6Batch {
+            task_runs: vec![
+                persisted(incomplete_run, Provider::Codex, "restore-incomplete", 1),
+                persisted(completed_run, Provider::Claude, "restore-completed", 2),
+            ],
+            history_drains: vec![
+                PersistHistoryDrain {
+                    drain_id: incomplete_drain.clone(),
+                    provider: Provider::Codex,
+                    created_at_ms: 1_000,
+                    artifacts: Vec::new(),
+                },
+                PersistHistoryDrain {
+                    drain_id: completed_drain.clone(),
+                    provider: Provider::Claude,
+                    created_at_ms: 1_000,
+                    artifacts: Vec::new(),
+                },
+            ],
+            history_associations: vec![
+                PersistHistoryDrainRun {
+                    drain_id: incomplete_drain,
+                    run_id: incomplete_run,
+                },
+                PersistHistoryDrainRun {
+                    drain_id: completed_drain.clone(),
+                    run_id: completed_run,
+                },
+            ],
+            ..PersistV6Batch::default()
+        })
+        .unwrap();
+    store
+        .finalize_history_drain(&completed_drain, 3_000)
+        .unwrap();
+    drop(store);
+
+    let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+    assert!(
+        !restored
+            .model
+            .task_run_v6_state(&incomplete_run)
+            .unwrap()
+            .history_ready
+    );
+    assert!(
+        restored
+            .model
+            .task_run_v6_state(&completed_run)
+            .unwrap()
+            .history_ready
+    );
+    let (_reducer, shared) = Reducer::new(restored);
+    assert!(shared.borrow().task_run(&incomplete_run).is_none());
+    assert!(shared.borrow().task_run(&completed_run).is_some());
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn second_launch_reads_owner_resolves_and_focuses() {

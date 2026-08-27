@@ -732,6 +732,54 @@ enum TopologyKind {
 }
 
 impl DomainModel {
+    /// Clones the coherent externally visible model while suppressing incomplete history rows.
+    ///
+    /// The reducer may continue accumulating durable historical rows internally; no task-run
+    /// keyed projection becomes visible until the matching drain finalization flips readiness.
+    pub(crate) fn publication_snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        let suppressed = snapshot
+            .task_run_v6_state
+            .iter()
+            .filter_map(|(run_id, state)| (!state.history_ready).then_some(*run_id))
+            .collect::<HashSet<_>>();
+        if suppressed.is_empty() {
+            return snapshot;
+        }
+        snapshot
+            .task_runs
+            .retain(|run_id, _| !suppressed.contains(run_id));
+        snapshot
+            .run_ids_by_key
+            .retain(|_, run_id| !suppressed.contains(run_id));
+        snapshot
+            .task_run_v6_state
+            .retain(|run_id, _| !suppressed.contains(run_id));
+        snapshot
+            .run_rate_totals
+            .retain(|run_id, _| !suppressed.contains(run_id));
+        snapshot
+            .telemetry
+            .retain(|run_id, _| !suppressed.contains(run_id));
+        snapshot
+            .run_kinds
+            .retain(|run_id, _| !suppressed.contains(run_id));
+        snapshot
+            .executions
+            .retain(|_, execution| !suppressed.contains(&execution.task_run_id));
+        snapshot
+            .agent_nodes
+            .retain(|_, node| !suppressed.contains(&node.task_run_id));
+        snapshot.execution_edges.retain(|edge| {
+            !suppressed.contains(&edge.parent_run_id) && !suppressed.contains(&edge.child_run_id)
+        });
+        snapshot.dependency_edges.retain(|edge| {
+            !suppressed.contains(&edge.prerequisite_run_id)
+                && !suppressed.contains(&edge.dependent_run_id)
+        });
+        snapshot
+    }
+
     /// Returns the reducer-owned Controller diagnostic counters.
     #[must_use]
     pub const fn controller_diagnostics(&self) -> &ControllerDiagnostics {

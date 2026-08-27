@@ -19,14 +19,16 @@ use crate::model::{
     AgentNode, AgentNodeObservation, AgentSessionReferenceKind, ControllerDiagnosticsHandle,
     ControllerEvent, ControllerEventKind, DependencyEdge, DisplayOrdinal, DomainModel,
     EventMetadata, ExecState, Execution, ExecutionEdge, MinimalProviderMetadata, NormalizedEvent,
-    OperatorCommand, Pane, PaneAgentStatusObservation, Provider, ProviderDiagnosticsHandle,
-    ReconcileBatch, RunId, RunKey, SharedModel, TaskRun, TaskState, TopologyAuthority,
-    TopologyEntity, TopologyEntityId, TopologySnapshot, sanitize_controller_text,
+    ObservationOrigin, OperatorCommand, Pane, PaneAgentStatusObservation, Provider,
+    ProviderDiagnosticsHandle, ReconcileBatch, RunId, RunKey, SharedModel, TaskRun, TaskState,
+    TopologyAuthority, TopologyEntity, TopologyEntityId, TopologySnapshot,
+    sanitize_controller_text,
 };
 use crate::operator::OperatorProjection;
 use crate::store::{
-    EnqueuePermit, NativeSessionBinding, PendingEnqueue, PersistBatch, PersistExecution, PersistOp,
-    PersistTaskRun, RestoredState,
+    EnqueuePermit, HistoryDrainFinalization, NativeSessionBinding, PendingEnqueue, PersistBatch,
+    PersistExecution, PersistHistoryDrain, PersistHistoryDrainRun, PersistOp, PersistTaskRun,
+    PersistTaskRunV6, PersistV6Batch, RestoredState,
 };
 // increment5-workload-harness: begin reducer timing callback ABI
 #[cfg(feature = "workload-harness")]
@@ -266,6 +268,13 @@ pub enum CommitStagedError {
     IngestSequenceExhausted,
 }
 
+/// Immutable request staged before the writer decides whether finalization committed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StagedHistoryFinalization {
+    pub drain_id: crate::model::HistoryDrainId,
+    pub observed_at_ms: i64,
+}
+
 /// Maximum unattributed provider-usage samples retained across all run scopes.
 ///
 /// The reducer evicts the globally oldest sample first. Since each retained sample has exactly
@@ -292,6 +301,8 @@ pub struct Reducer {
     pending_telemetry_count: usize,
     publisher: watch::Sender<Arc<DomainModel>>,
     operator: OperatorProjection,
+    defer_provider_publication: bool,
+    published_history_drains: HashSet<crate::model::HistoryDrainId>,
     #[cfg(test)]
     publish_count: std::cell::Cell<u64>,
     #[cfg(test)]
@@ -339,7 +350,7 @@ impl Reducer {
         #[cfg(feature = "workload-harness")]
         let workload_publish_started = Instant::now();
         // increment5-workload-harness: end startup clone publication timing start
-        let (publisher, shared) = watch::channel(Arc::new(model.clone()));
+        let (publisher, shared) = watch::channel(Arc::new(model.publication_snapshot()));
         // increment5-workload-harness: begin startup clone publication timing finish
         #[cfg(feature = "workload-harness")]
         record_workload_timing_segment(
@@ -360,6 +371,8 @@ impl Reducer {
                 pending_telemetry_count: 0,
                 publisher,
                 operator,
+                defer_provider_publication: false,
+                published_history_drains: HashSet::new(),
                 #[cfg(test)]
                 publish_count: std::cell::Cell::new(0),
                 #[cfg(test)]
@@ -449,6 +462,185 @@ impl Reducer {
         events: Vec<NormalizedEvent>,
     ) -> Result<ApplyOutcome, ReducerError> {
         self.apply_observation_inner(events, None)
+    }
+
+    /// Stages one drain finalization request without mutating or publishing the live model.
+    #[must_use]
+    pub(crate) fn stage_history_finalization(
+        &self,
+        barrier: &crate::provider::HistoryDrainBarrier,
+    ) -> StagedHistoryFinalization {
+        StagedHistoryFinalization {
+            drain_id: barrier.drain_id.clone(),
+            observed_at_ms: barrier.observed_at_ms,
+        }
+    }
+
+    /// Applies the exact page returned by durable finalization and publishes at most once.
+    ///
+    /// Replaying the same page is idempotent and deliberately emits no duplicate snapshot.
+    pub(crate) fn apply_history_finalization(
+        &mut self,
+        finalization: &HistoryDrainFinalization,
+    ) -> bool {
+        if !self
+            .published_history_drains
+            .insert(finalization.drain_id.clone())
+        {
+            return false;
+        }
+        for finalized in &finalization.runs {
+            if self.model.task_run(&finalized.run_id).is_none() {
+                continue;
+            }
+            if self.model.task_run_v6_state(&finalized.run_id) != Some(&finalized.state) {
+                self.model
+                    .set_task_run_v6_state(finalized.run_id, finalized.state.clone());
+            }
+        }
+        self.publish();
+        true
+    }
+
+    /// Captures pre-observation state and suppresses the intermediate historical publication.
+    pub(crate) fn begin_provider_observation(
+        &mut self,
+        origin: &ObservationOrigin,
+    ) -> Option<DomainModel> {
+        if matches!(origin, ObservationOrigin::Historical { .. }) {
+            self.defer_provider_publication = true;
+            Some(self.model.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Attaches readiness and a drain association to the same transaction as core mutations.
+    pub(crate) fn finish_provider_observation(
+        &mut self,
+        prior: Option<DomainModel>,
+        mut operations: PersistBatch,
+        origin: &ObservationOrigin,
+        history_manifest: Option<&PersistHistoryDrain>,
+        provider_at_ms: i64,
+    ) -> PersistV6Batch {
+        let historical = matches!(origin, ObservationOrigin::Historical { .. });
+        let mut touched = operations
+            .iter()
+            .filter_map(|operation| match operation {
+                PersistOp::UpsertTaskRun(task_run) => Some(task_run.task_run.run_id),
+                PersistOp::PromoteTaskRunKey { promoted, .. } => Some(promoted.task_run.run_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        touched.sort_unstable();
+        touched.dedup();
+
+        let mut task_runs = Vec::with_capacity(touched.len());
+        let mut associations = Vec::with_capacity(touched.len());
+        for run_id in touched {
+            let Some(mut current) = self.model.task_run(&run_id).cloned() else {
+                continue;
+            };
+            let prior_run = prior.as_ref().and_then(|model| model.task_run(&run_id));
+            let prior_state = prior
+                .as_ref()
+                .and_then(|model| model.task_run_v6_state(&run_id));
+            let mut state = self
+                .model
+                .task_run_v6_state(&run_id)
+                .cloned()
+                .unwrap_or_default();
+
+            if historical {
+                if prior_state.is_some_and(|state| state.history_ready) {
+                    let prior_run = prior_run.expect("a ready v6 row must have a task run");
+                    current.state = prior_run.state;
+                    current.has_controller_task_state_event =
+                        prior_run.has_controller_task_state_event;
+                    current.updated_at_ms = prior_run.updated_at_ms;
+                    current.finished_at_ms = prior_run.finished_at_ms;
+                    current.dismissed_at_ms = prior_run.dismissed_at_ms;
+                    current.subject = prior_run.subject.clone().or(current.subject);
+                    current.created_at_ms = match (prior_run.created_at_ms, current.created_at_ms) {
+                        (Some(left), Some(right)) => Some(left.min(right)),
+                        (left @ Some(_), None) => left,
+                        (None, right) => right,
+                    };
+                    state = prior_state.cloned().expect("checked above");
+                } else {
+                    state.history_ready = false;
+                }
+            } else {
+                state.history_ready = true;
+            }
+            state.latest_provider_at_ms = Some(
+                state
+                    .latest_provider_at_ms
+                    .map_or(provider_at_ms, |stored| stored.max(provider_at_ms)),
+            );
+            self.model.insert_task_run(current.clone());
+            self.model.set_task_run_v6_state(run_id, state.clone());
+
+            let mut persisted = operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    PersistOp::UpsertTaskRun(task_run) if task_run.task_run.run_id == run_id => {
+                        Some(task_run.clone())
+                    }
+                    PersistOp::PromoteTaskRunKey { promoted, .. }
+                        if promoted.task_run.run_id == run_id =>
+                    {
+                        Some(promoted.clone())
+                    }
+                    _ => None,
+                })
+                .next_back()
+                .expect("a touched run must have an upsert or promotion");
+            persisted.task_run = current.clone();
+            persisted.created_at_ms = current.created_at_ms.unwrap_or(persisted.created_at_ms);
+            persisted.updated_at_ms = current.updated_at_ms.unwrap_or(persisted.updated_at_ms);
+            persisted.finished_at_ms = current.finished_at_ms;
+            for operation in &mut operations {
+                match operation {
+                    PersistOp::UpsertTaskRun(task_run) if task_run.task_run.run_id == run_id => {
+                        *task_run = persisted.clone();
+                    }
+                    PersistOp::PromoteTaskRunKey { promoted, .. }
+                        if promoted.task_run.run_id == run_id =>
+                    {
+                        *promoted = persisted.clone();
+                    }
+                    _ => {}
+                }
+            }
+            task_runs.push(PersistTaskRunV6 {
+                task_run: persisted,
+                state,
+            });
+            if let ObservationOrigin::Historical { drain_id, .. } = origin {
+                associations.push(PersistHistoryDrainRun {
+                    drain_id: drain_id.clone(),
+                    run_id,
+                });
+            }
+        }
+        self.defer_provider_publication = false;
+        PersistV6Batch {
+            operations,
+            task_runs,
+            history_drains: if historical {
+                history_manifest.cloned().into_iter().collect()
+            } else {
+                Vec::new()
+            },
+            history_associations: associations,
+            ..PersistV6Batch::default()
+        }
+    }
+
+    pub(crate) fn cancel_provider_observation(&mut self) {
+        self.defer_provider_publication = false;
     }
 
     pub(crate) fn apply_pane_agent_observation(
@@ -1118,6 +1310,45 @@ impl Reducer {
         self.operator.apply_submission(&batch);
         self.publish();
         Ok(permit.enqueue(batch))
+    }
+
+    /// Installs a validated provider delta while returning its transaction for v6 decoration.
+    pub(crate) fn commit_staged_unqueued(
+        &mut self,
+        mut delta: MaterializedDelta,
+    ) -> Result<PersistBatch, CommitStagedError> {
+        let Some(ingest_seq) = self.next_ingest_seq.filter(|value| *value > 0) else {
+            self.model
+                .controller_diagnostics_mut()
+                .record_ingest_sequence_exhaustion();
+            self.publish();
+            return Err(CommitStagedError::IngestSequenceExhausted);
+        };
+        let Ok(ingest_seq_u64) = u64::try_from(ingest_seq) else {
+            self.model
+                .controller_diagnostics_mut()
+                .record_ingest_sequence_exhaustion();
+            self.publish();
+            return Err(CommitStagedError::IngestSequenceExhausted);
+        };
+        for operation in &mut delta.batch {
+            if let PersistOp::RecordEvent { event, .. } = operation {
+                event_metadata_mut(event).ingest_seq = Some(ingest_seq_u64);
+            }
+        }
+        let mut batch = vec![PersistOp::AdvanceIngestSequence { ingest_seq }];
+        batch.extend(delta.batch);
+        normalize_persist_batch_lineage(&mut batch);
+
+        self.model = delta.post_model;
+        self.next_ordinal = delta.post_next_ordinal;
+        self.terminal_event_sources = delta.post_terminal_event_sources;
+        self.non_lane_task_state_runs = delta.post_non_lane_task_state_runs;
+        self.next_ingest_seq = ingest_seq.checked_add(1);
+        self.apply_controller_diagnostic_deltas(delta.diagnostic_deltas);
+        self.operator.apply_submission(&batch);
+        self.publish();
+        Ok(batch)
     }
 
     fn apply_controller_diagnostic_deltas(&mut self, deltas: ControllerDiagnosticDeltas) {
@@ -2668,6 +2899,9 @@ impl Reducer {
 
     fn publish(&mut self) {
         self.apply_pending_telemetry_for_known_runs();
+        if self.defer_provider_publication {
+            return;
+        }
         #[cfg(test)]
         {
             self.publish_count.set(self.publish_count.get() + 1);
@@ -2677,7 +2911,8 @@ impl Reducer {
         #[cfg(feature = "workload-harness")]
         let workload_publish_started = Instant::now();
         // increment5-workload-harness: end reducer clone publication timing start
-        self.publisher.send_replace(Arc::new(self.model.clone()));
+        self.publisher
+            .send_replace(Arc::new(self.model.publication_snapshot()));
         // increment5-workload-harness: begin reducer clone publication timing finish
         #[cfg(feature = "workload-harness")]
         record_workload_timing_segment(
@@ -3074,23 +3309,100 @@ mod tests {
         EventMetadata, ExecState, Execution, ExecutionEdge, GapKind, MinimalProviderMetadata,
         NormalizedEvent, OperatorCommand, Pane, PaneAgentStatus, PaneAgentStatusObservation,
         PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SharedModel, SnapshotAgent, Tab,
-        TaskRun, TaskState, TopologyAuthority, TopologyEntity, TopologyEntityId, TopologySnapshot,
-        TurnAttr, Workspace,
+        TaskRun, TaskRunV6State, TaskState, TopologyAuthority, TopologyEntity, TopologyEntityId,
+        TopologySnapshot, TurnAttr, Workspace,
     };
-    use crate::provider::ProviderEvent;
     use crate::provider::claude_facts::{extract_claude_line, extract_meta_json};
     use crate::provider::facts::{EvidenceId, LogFact, SessionScope};
     use crate::provider::lane::{
         Admission, AdmissionIndex, SOURCE_LOG_LANE, Synthesis, run_key_for_scope,
     };
+    use crate::provider::{HistoryDrainBarrier, ProviderEvent};
     use crate::store::{
-        NativeSessionBinding, PersistOp, PersistTaskRun, RestoredState, WriterClient,
+        NativeSessionBinding, PersistHistoryDrain, PersistHistoryDrainRun, PersistOp,
+        PersistTaskRun, PersistTaskRunV6, PersistV6Batch, RestoredState, WriterClient,
         database_path, open_reader, open_writer, spawn_writer,
     };
 
     use super::{
         ApplyOutcome, CommitStagedError, Reducer, ReducerError, RejectReason, unix_now_ms,
     };
+
+    #[test]
+    fn history_finalization_is_staged_then_published_once_after_known_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let run_id = RunId::new();
+        let drain_id = crate::model::HistoryDrainId::new("codex:reducer-finalize").unwrap();
+        let task_run = run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "reducer-finalize".to_owned(),
+            },
+            1,
+            TaskState::Queued,
+        );
+        store
+            .apply_v6_batch(PersistV6Batch {
+                task_runs: vec![PersistTaskRunV6 {
+                    task_run: PersistTaskRun {
+                        task_run,
+                        native_session: Some(NativeSessionBinding {
+                            provider: Provider::Codex,
+                            native_session_id: "reducer-finalize".to_owned(),
+                        }),
+                        created_at_ms: 1_000,
+                        updated_at_ms: 4_000,
+                        finished_at_ms: None,
+                    },
+                    state: TaskRunV6State {
+                        history_ready: false,
+                        latest_provider_at_ms: Some(4_000),
+                        ..TaskRunV6State::default()
+                    },
+                }],
+                history_drains: vec![PersistHistoryDrain {
+                    drain_id: drain_id.clone(),
+                    provider: Provider::Codex,
+                    created_at_ms: 1_000,
+                    artifacts: Vec::new(),
+                }],
+                history_associations: vec![PersistHistoryDrainRun {
+                    drain_id: drain_id.clone(),
+                    run_id,
+                }],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+        let restored = store.load_restored_state().unwrap();
+        let (mut reducer, shared) = Reducer::new(restored);
+        let publish_count = reducer.shared_publish_count();
+        let barrier = HistoryDrainBarrier::new(drain_id.clone(), 5_000);
+
+        let staged = reducer.stage_history_finalization(&barrier);
+
+        assert_eq!(staged.drain_id, drain_id);
+        assert_eq!(publish_count.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(shared.borrow().task_run(&run_id).is_none());
+
+        let durable_page = store
+            .finalize_history_drain(&staged.drain_id, staged.observed_at_ms)
+            .unwrap();
+        assert!(reducer.apply_history_finalization(&durable_page));
+        assert_eq!(publish_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(
+            shared
+                .borrow()
+                .task_run_v6_state(&run_id)
+                .unwrap()
+                .history_ready
+        );
+
+        assert!(!reducer.apply_history_finalization(&durable_page));
+        assert_eq!(publish_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn i4_operator_merge_triggering_record_round_trips_canonical_lineage() {

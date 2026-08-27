@@ -10,19 +10,21 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
 use crate::model::{
-    ControllerEvent, ExecState, MinimalProviderMetadata, Provider, ProviderDiagnosticsHandle,
-    RunId, RunKey, TokenBreakdown,
+    ControllerEvent, ExecState, HistoryDrainId, MinimalProviderMetadata, ObservationOrigin,
+    Provider, ProviderDiagnosticsHandle, RunId, RunKey, TokenBreakdown,
 };
+use crate::store::PersistHistoryDrain;
 
 pub mod claude;
 pub mod claude_facts;
@@ -54,6 +56,124 @@ pub const MALFORMED_SAMPLES_PER_GENERATION: usize = 4;
 /// Maximum time to wait for the provider I/O thread's exit acknowledgement.
 pub const PROVIDER_EXIT_TIMEOUT: Duration = Duration::from_secs(1);
 
+const HISTORY_DRAIN_DOMAIN: &[u8] = b"herdr-top:history-drain:v1";
+
+/// One immutable member of a provider's frozen startup/backfill manifest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrozenHistoryArtifact {
+    pub provider: Provider,
+    pub artifact_id: String,
+    pub generation: String,
+    pub goalpost: u64,
+}
+
+/// Computes a stable bounded identity from a canonical frozen artifact manifest.
+pub fn stable_history_drain_id(
+    provider: Provider,
+    artifacts: impl IntoIterator<Item = FrozenHistoryArtifact>,
+) -> Result<HistoryDrainId, &'static str> {
+    let mut artifacts = artifacts.into_iter().collect::<Vec<_>>();
+    if artifacts
+        .iter()
+        .any(|artifact| artifact.provider != provider)
+    {
+        return Err("history drain manifest mixes providers");
+    }
+    artifacts.sort_by(|left, right| {
+        provider_rank(left.provider)
+            .cmp(&provider_rank(right.provider))
+            .then_with(|| left.artifact_id.cmp(&right.artifact_id))
+            .then_with(|| left.generation.cmp(&right.generation))
+            .then_with(|| left.goalpost.cmp(&right.goalpost))
+    });
+    let mut digest = Sha256::new();
+    digest.update((HISTORY_DRAIN_DOMAIN.len() as u64).to_be_bytes());
+    digest.update(HISTORY_DRAIN_DOMAIN);
+    let manifest_provider = match provider {
+        Provider::Claude => b"claude".as_slice(),
+        Provider::Codex => b"codex".as_slice(),
+    };
+    digest.update((manifest_provider.len() as u64).to_be_bytes());
+    digest.update(manifest_provider);
+    digest.update((artifacts.len() as u64).to_be_bytes());
+    for artifact in artifacts {
+        let provider = match artifact.provider {
+            Provider::Claude => b"claude".as_slice(),
+            Provider::Codex => b"codex".as_slice(),
+        };
+        for field in [
+            provider,
+            artifact.artifact_id.as_bytes(),
+            artifact.generation.as_bytes(),
+        ] {
+            digest.update((field.len() as u64).to_be_bytes());
+            digest.update(field);
+        }
+        digest.update(8_u64.to_be_bytes());
+        digest.update(artifact.goalpost.to_be_bytes());
+    }
+    let bytes = digest.finalize();
+    let mut encoded = String::with_capacity(67);
+    encoded.push_str("v1:");
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    HistoryDrainId::new(encoded)
+}
+
+const HISTORY_BARRIER_PENDING: u8 = 0;
+const HISTORY_BARRIER_COMMITTED: u8 = 1;
+
+/// Cloneable bounded acknowledgement shared by one provider barrier and the collector.
+#[derive(Clone, Debug)]
+pub struct HistoryDrainAcknowledgement(Arc<AtomicU8>);
+
+impl HistoryDrainAcknowledgement {
+    #[must_use]
+    pub fn is_committed(&self) -> bool {
+        self.0.load(Ordering::Acquire) == HISTORY_BARRIER_COMMITTED
+    }
+
+    pub fn acknowledge_committed(&self) {
+        self.0.store(HISTORY_BARRIER_COMMITTED, Ordering::Release);
+    }
+}
+
+impl PartialEq for HistoryDrainAcknowledgement {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for HistoryDrainAcknowledgement {}
+
+/// Final ordered token for one frozen historical drain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryDrainBarrier {
+    pub drain_id: HistoryDrainId,
+    pub observed_at_ms: i64,
+    acknowledgement: HistoryDrainAcknowledgement,
+}
+
+impl HistoryDrainBarrier {
+    #[must_use]
+    pub fn new(drain_id: HistoryDrainId, observed_at_ms: i64) -> Self {
+        Self {
+            drain_id,
+            observed_at_ms,
+            acknowledgement: HistoryDrainAcknowledgement(Arc::new(AtomicU8::new(
+                HISTORY_BARRIER_PENDING,
+            ))),
+        }
+    }
+
+    #[must_use]
+    pub fn acknowledgement(&self) -> HistoryDrainAcknowledgement {
+        self.acknowledgement.clone()
+    }
+}
+
 /// Source position meaningful only within one discovered file.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourcePosition {
@@ -66,9 +186,15 @@ pub struct SourcePosition {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderSourceState {
     Available,
-    AvailableWithBindings { bindings: Vec<CodexPaneBinding> },
-    Unavailable { detail: String },
+    AvailableWithBindings {
+        bindings: Vec<CodexPaneBinding>,
+    },
+    Unavailable {
+        detail: String,
+    },
     NotApplicable,
+    /// Internal ordered control carrying one completed historical drain to the collector.
+    HistoryDrainBarrier(HistoryDrainBarrier),
 }
 
 /// One globally unambiguous sessionless Codex pane-to-rollout match.
@@ -147,6 +273,29 @@ pub enum ProviderEvent {
 }
 
 impl ProviderEvent {
+    pub(crate) fn provider(&self) -> Option<Provider> {
+        match self {
+            Self::Synthesized(event) => event.metadata.provider,
+            Self::RunLiveness { key, .. }
+            | Self::LaneClose { key, .. }
+            | Self::Telemetry { key, .. } => match key {
+                RunKey::Controller(key) if key.starts_with("hook:claude-code:") => {
+                    Some(Provider::Claude)
+                }
+                RunKey::Controller(key) if key.starts_with("hook:codex:") => Some(Provider::Codex),
+                RunKey::Native { provider, .. } | RunKey::NativePath { provider, .. } => {
+                    Some(*provider)
+                }
+                RunKey::Controller(_) | RunKey::Provisional { .. } => None,
+            },
+            Self::SessionResolved { provider, .. }
+            | Self::AgentUpsert { provider, .. }
+            | Self::Activity { provider, .. }
+            | Self::SourceState { provider, .. }
+            | Self::Malformed { provider, .. } => Some(*provider),
+        }
+    }
+
     pub(crate) const fn requires_admission(&self) -> bool {
         match self {
             Self::Synthesized(_)
@@ -230,6 +379,8 @@ enum ProviderEventSender {
 pub(crate) struct ProviderIngressEvent {
     pub event: ProviderEvent,
     pub admission: Option<crate::performance::Admission>,
+    pub origin: ObservationOrigin,
+    pub history_manifest: Option<Arc<PersistHistoryDrain>>,
 }
 
 impl ProviderEventSender {
@@ -238,6 +389,8 @@ impl ProviderEventSender {
     fn try_send(
         &self,
         event: ProviderEvent,
+        origin: ObservationOrigin,
+        history_manifest: Option<Arc<PersistHistoryDrain>>,
     ) -> Result<(), tokio::sync::mpsc::error::TrySendError<ProviderEvent>> {
         match self {
             Self::Raw(sender) => sender.try_send(event),
@@ -252,7 +405,12 @@ impl ProviderEventSender {
                     }
                 };
                 let admission = event.requires_admission().then(|| ingress.admit());
-                permit.send(ProviderIngressEvent { event, admission });
+                permit.send(ProviderIngressEvent {
+                    event,
+                    admission,
+                    origin,
+                    history_manifest,
+                });
                 Ok(())
             }
         }
@@ -264,7 +422,12 @@ impl ProviderEventSender {
             Self::Tracked { sender, ingress } => {
                 let admission = event.requires_admission().then(|| ingress.admit());
                 sender
-                    .blocking_send(ProviderIngressEvent { event, admission })
+                    .blocking_send(ProviderIngressEvent {
+                        event,
+                        admission,
+                        origin: ObservationOrigin::Live,
+                        history_manifest: None,
+                    })
                     .is_ok()
             }
         }
@@ -870,6 +1033,8 @@ struct EntityKey {
 #[derive(Clone, Debug)]
 struct PendingSlot {
     event: ProviderEvent,
+    origin: ObservationOrigin,
+    history_manifest: Option<Arc<PersistHistoryDrain>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -891,7 +1056,7 @@ struct MalformedKey {
 
 #[derive(Clone, Debug, Default)]
 struct PendingMalformed {
-    samples: VecDeque<ProviderEvent>,
+    samples: VecDeque<PendingSlot>,
 }
 
 /// Result of merging an event into the pending buffer.
@@ -912,16 +1077,18 @@ enum PendingToken {
     Activity(EntityKey),
     LaneActivity(EntityKey),
     Malformed(MalformedKey),
+    HistoryDrainBarrier,
 }
 
 /// Fixed-capacity, per-entity merge buffer in front of provider egress.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PendingEvents {
     capacity: usize,
-    sources: HashMap<Provider, ProviderEvent>,
-    lane: VecDeque<ProviderEvent>,
+    sources: HashMap<Provider, PendingSlot>,
+    lane: VecDeque<PendingSlot>,
     entities: HashMap<EntityKey, PendingEntity>,
     malformed: HashMap<MalformedKey, PendingMalformed>,
+    history_barrier: Option<PendingSlot>,
     diagnostics: ProviderDiagnostics,
 }
 
@@ -935,6 +1102,7 @@ impl PendingEvents {
             lane: VecDeque::new(),
             entities: HashMap::new(),
             malformed: HashMap::new(),
+            history_barrier: None,
             diagnostics,
         }
     }
@@ -947,18 +1115,58 @@ impl PendingEvents {
             lane: VecDeque::new(),
             entities: HashMap::new(),
             malformed: HashMap::new(),
+            history_barrier: None,
             diagnostics,
         }
     }
 
     /// Merges one event. A returned `AtCapacity` event must be retried before tail advancement.
     pub fn merge(&mut self, event: ProviderEvent) -> MergeOutcome {
+        self.merge_with_origin(event, ObservationOrigin::Live, None)
+    }
+
+    /// Merges one event while retaining its reducer-visible historical provenance and manifest.
+    pub(crate) fn merge_with_origin(
+        &mut self,
+        event: ProviderEvent,
+        origin: ObservationOrigin,
+        history_manifest: Option<Arc<PersistHistoryDrain>>,
+    ) -> MergeOutcome {
         match event {
+            event @ ProviderEvent::SourceState {
+                state: ProviderSourceState::HistoryDrainBarrier(_),
+                ..
+            } => {
+                if self
+                    .history_barrier
+                    .as_ref()
+                    .is_some_and(|stored| stored.event == event)
+                {
+                    self.diagnostics.record_duplicate();
+                    MergeOutcome::Duplicate
+                } else if self.history_barrier.is_some() {
+                    MergeOutcome::AtCapacity(Box::new(event))
+                } else {
+                    self.history_barrier = Some(PendingSlot {
+                        event,
+                        origin,
+                        history_manifest,
+                    });
+                    MergeOutcome::Accepted
+                }
+            }
             event @ ProviderEvent::SourceState { provider, .. } => {
-                if self.sources.insert(provider, event).is_some() {
+                let incoming = PendingSlot {
+                    event,
+                    origin,
+                    history_manifest,
+                };
+                if let Some(stored) = self.sources.get_mut(&provider) {
+                    *stored = incoming;
                     self.diagnostics.record_coalesced();
                     MergeOutcome::Coalesced
                 } else {
+                    self.sources.insert(provider, incoming);
                     MergeOutcome::Accepted
                 }
             }
@@ -980,7 +1188,11 @@ impl PendingEvents {
                 self.diagnostics.record_malformed();
                 let pending = self.malformed.entry(key).or_default();
                 if pending.samples.len() < MALFORMED_SAMPLES_PER_GENERATION {
-                    pending.samples.push_back(event);
+                    pending.samples.push_back(PendingSlot {
+                        event,
+                        origin,
+                        history_manifest,
+                    });
                     MergeOutcome::Accepted
                 } else {
                     self.diagnostics.record_coalesced();
@@ -994,15 +1206,24 @@ impl PendingEvents {
                 if self.lane.len() >= self.capacity {
                     MergeOutcome::AtCapacity(Box::new(event))
                 } else {
-                    self.lane.push_back(event);
+                    self.lane.push_back(PendingSlot {
+                        event,
+                        origin,
+                        history_manifest,
+                    });
                     MergeOutcome::Accepted
                 }
             }
-            event => self.merge_entity(event),
+            event => self.merge_entity(event, origin, history_manifest),
         }
     }
 
-    fn merge_entity(&mut self, event: ProviderEvent) -> MergeOutcome {
+    fn merge_entity(
+        &mut self,
+        event: ProviderEvent,
+        origin: ObservationOrigin,
+        history_manifest: Option<Arc<PersistHistoryDrain>>,
+    ) -> MergeOutcome {
         let lane_activity = matches!(
             &event,
             ProviderEvent::Activity { activity, .. }
@@ -1084,7 +1305,7 @@ impl PendingEvents {
             | ProviderEvent::SourceState { .. }
             | ProviderEvent::Malformed { .. } => unreachable!(),
         };
-        merge_slot(slot, event, &self.diagnostics)
+        merge_slot(slot, event, origin, history_manifest, &self.diagnostics)
     }
 
     /// Returns whether another previously unseen entity can be admitted.
@@ -1099,14 +1320,53 @@ impl PendingEvents {
         self.entities.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn total_count_for_test(&self) -> usize {
+        self.sources.len()
+            + self.lane.len()
+            + self
+                .entities
+                .values()
+                .map(|entity| {
+                    usize::from(entity.identity.is_some())
+                        + usize::from(entity.upsert.is_some())
+                        + usize::from(entity.activity.is_some())
+                        + usize::from(entity.lane_activity.is_some())
+                })
+                .sum::<usize>()
+            + self
+                .malformed
+                .values()
+                .map(|pending| pending.samples.len())
+                .sum::<usize>()
+            + usize::from(self.history_barrier.is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn originated_events_for_test(
+        &self,
+    ) -> Vec<(
+        ProviderEvent,
+        ObservationOrigin,
+        Option<Arc<PersistHistoryDrain>>,
+    )> {
+        let mut snapshot = self.clone();
+        let mut events = Vec::new();
+        while let Some((token, pending)) = snapshot.next_event() {
+            events.push((pending.event, pending.origin, pending.history_manifest));
+            snapshot.remove(token);
+        }
+        events
+    }
+
     /// Flushes in deterministic source/depth/slot/malformed order without blocking.
     pub fn flush_to(&mut self, sender: &tokio_mpsc::Sender<ProviderEvent>) {
         self.flush_to_sender(&ProviderEventSender::Raw(sender.clone()));
     }
 
     fn flush_to_sender(&mut self, sender: &ProviderEventSender) {
-        while let Some((token, event)) = self.next_event() {
-            match sender.try_send(event) {
+        while let Some((token, pending)) = self.next_event() {
+            match sender.try_send(pending.event, pending.origin, pending.history_manifest) {
                 Ok(()) => self.remove(token),
                 Err(tokio_mpsc::error::TrySendError::Full(_)) => {
                     self.diagnostics.record_egress_saturation();
@@ -1120,7 +1380,7 @@ impl PendingEvents {
         }
     }
 
-    fn next_event(&self) -> Option<(PendingToken, ProviderEvent)> {
+    fn next_event(&self) -> Option<(PendingToken, PendingSlot)> {
         for provider in [Provider::Claude, Provider::Codex] {
             if let Some(event) = self.sources.get(&provider) {
                 return Some((PendingToken::Source(provider), event.clone()));
@@ -1145,16 +1405,16 @@ impl PendingEvents {
         for key in keys {
             let entity = &self.entities[key];
             if let Some(slot) = entity.identity.as_ref() {
-                return Some((PendingToken::Identity(key.clone()), slot.event.clone()));
+                return Some((PendingToken::Identity(key.clone()), slot.clone()));
             }
             if let Some(slot) = entity.upsert.as_ref() {
-                return Some((PendingToken::Upsert(key.clone()), slot.event.clone()));
+                return Some((PendingToken::Upsert(key.clone()), slot.clone()));
             }
             if let Some(slot) = entity.activity.as_ref() {
-                return Some((PendingToken::Activity(key.clone()), slot.event.clone()));
+                return Some((PendingToken::Activity(key.clone()), slot.clone()));
             }
             if let Some(slot) = entity.lane_activity.as_ref() {
-                return Some((PendingToken::LaneActivity(key.clone()), slot.event.clone()));
+                return Some((PendingToken::LaneActivity(key.clone()), slot.clone()));
             }
         }
 
@@ -1165,12 +1425,19 @@ impl PendingEvents {
                 .then_with(|| left.path_display.cmp(&right.path_display))
                 .then_with(|| left.generation.cmp(&right.generation))
         });
-        malformed.first().and_then(|key| {
-            self.malformed[*key]
-                .samples
-                .front()
-                .map(|event| (PendingToken::Malformed((*key).clone()), event.clone()))
-        })
+        malformed
+            .first()
+            .and_then(|key| {
+                self.malformed[*key]
+                    .samples
+                    .front()
+                    .map(|event| (PendingToken::Malformed((*key).clone()), event.clone()))
+            })
+            .or_else(|| {
+                self.history_barrier
+                    .as_ref()
+                    .map(|event| (PendingToken::HistoryDrainBarrier, event.clone()))
+            })
     }
 
     fn remove(&mut self, token: PendingToken) {
@@ -1213,6 +1480,9 @@ impl PendingEvents {
                     }
                 }
             }
+            PendingToken::HistoryDrainBarrier => {
+                self.history_barrier = None;
+            }
         }
     }
 
@@ -1231,10 +1501,16 @@ impl PendingEvents {
 fn merge_slot(
     slot: &mut Option<PendingSlot>,
     incoming: ProviderEvent,
+    incoming_origin: ObservationOrigin,
+    incoming_manifest: Option<Arc<PersistHistoryDrain>>,
     diagnostics: &ProviderDiagnostics,
 ) -> MergeOutcome {
-    let Some(stored) = slot.as_ref() else {
-        *slot = Some(PendingSlot { event: incoming });
+    let Some(stored) = slot.as_mut() else {
+        *slot = Some(PendingSlot {
+            event: incoming,
+            origin: incoming_origin,
+            history_manifest: incoming_manifest,
+        });
         return MergeOutcome::Accepted;
     };
     let (stored_id, stored_time, stored_position) = stored
@@ -1245,6 +1521,7 @@ fn merge_slot(
         .slot_details()
         .expect("incoming entity event has position");
     if stored_id == incoming_id {
+        promote_live_origin(stored, incoming_origin, incoming_manifest);
         diagnostics.record_duplicate();
         return MergeOutcome::Duplicate;
     }
@@ -1257,9 +1534,28 @@ fn merge_slot(
     };
     diagnostics.record_coalesced();
     if replace {
-        *slot = Some(PendingSlot { event: incoming });
+        *slot = Some(PendingSlot {
+            event: incoming,
+            origin: incoming_origin,
+            history_manifest: incoming_manifest,
+        });
+    } else {
+        promote_live_origin(stored, incoming_origin, incoming_manifest);
     }
     MergeOutcome::Coalesced
+}
+
+fn promote_live_origin(
+    stored: &mut PendingSlot,
+    incoming_origin: ObservationOrigin,
+    incoming_manifest: Option<Arc<PersistHistoryDrain>>,
+) {
+    if matches!(incoming_origin, ObservationOrigin::Live) {
+        stored.origin = ObservationOrigin::Live;
+        stored.history_manifest = None;
+    } else if stored.history_manifest.is_none() {
+        stored.history_manifest = incoming_manifest;
+    }
 }
 
 const fn provider_rank(provider: Provider) -> u8 {
@@ -2162,6 +2458,11 @@ fn run_provider_cycle(
     force_rescan_cycle: bool,
 ) {
     pending.flush_to_sender(egress);
+    if pending.next_event().is_some() {
+        diagnostics.record_watcher_observation(system_time_ms(SystemTime::now()));
+        diagnostics.record_cycle();
+        return;
+    }
     let current_targets = lock_unpoisoned(targets).clone().unwrap_or_default();
     let mut watch_requests = Vec::new();
     let mut cycle = ProviderCycle {
@@ -2805,10 +3106,231 @@ mod tests {
             ProviderEvent::SessionResolved {
                 agent_thread_id, ..
             } => format!("identity:{agent_thread_id}"),
+            ProviderEvent::SourceState {
+                state: ProviderSourceState::HistoryDrainBarrier(_),
+                ..
+            } => "history-barrier".to_owned(),
             ProviderEvent::SourceState { .. } => "source".to_owned(),
             ProviderEvent::Malformed { .. } => "malformed".to_owned(),
             ProviderEvent::AgentUpsert { .. } => "upsert".to_owned(),
         }
+    }
+
+    #[test]
+    fn stable_history_drain_id_is_manifest_order_independent_and_goalpost_sensitive() {
+        let first = FrozenHistoryArtifact {
+            provider: Provider::Codex,
+            artifact_id: "artifact-a".to_owned(),
+            generation: "device-1:inode-10".to_owned(),
+            goalpost: 101,
+        };
+        let second = FrozenHistoryArtifact {
+            provider: Provider::Codex,
+            artifact_id: "artifact-b".to_owned(),
+            generation: "device-1:inode-11".to_owned(),
+            goalpost: 202,
+        };
+
+        let forward =
+            stable_history_drain_id(Provider::Codex, [first.clone(), second.clone()]).unwrap();
+        let reverse =
+            stable_history_drain_id(Provider::Codex, [second.clone(), first.clone()]).unwrap();
+        assert_eq!(forward, reverse);
+        assert!(forward.as_str().len() <= crate::model::HistoryDrainId::MAX_BYTES);
+
+        let changed_goalpost = stable_history_drain_id(
+            Provider::Codex,
+            [
+                first.clone(),
+                FrozenHistoryArtifact {
+                    goalpost: second.goalpost + 1,
+                    ..second.clone()
+                },
+            ],
+        )
+        .unwrap();
+        let changed_identity = stable_history_drain_id(
+            Provider::Codex,
+            [
+                FrozenHistoryArtifact {
+                    artifact_id: "artifact-c".to_owned(),
+                    ..first.clone()
+                },
+                second.clone(),
+            ],
+        )
+        .unwrap();
+        let changed_generation = stable_history_drain_id(
+            Provider::Codex,
+            [
+                first,
+                FrozenHistoryArtifact {
+                    generation: "device-1:inode-12".to_owned(),
+                    ..second
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_ne!(forward, changed_goalpost);
+        assert_ne!(forward, changed_identity);
+        assert_ne!(forward, changed_generation);
+    }
+
+    #[test]
+    fn pending_history_barrier_never_overtakes_ordinary_slots() {
+        let mut pending = PendingEvents::with_capacity(8, ProviderDiagnostics::default());
+        assert_eq!(
+            pending.merge(ProviderEvent::RunLiveness {
+                key: RunKey::Controller("lane".to_owned()),
+                at_ms: 10,
+            }),
+            MergeOutcome::Accepted
+        );
+        assert_eq!(
+            pending.merge(identity(Provider::Codex, "entity", Some(0), 11)),
+            MergeOutcome::Accepted
+        );
+        assert_eq!(
+            pending.merge(activity(
+                Provider::Codex,
+                "entity",
+                "coalesced-old",
+                12,
+                position(41, 0, 12),
+                "old"
+            )),
+            MergeOutcome::Accepted
+        );
+        assert_eq!(
+            pending.merge(activity(
+                Provider::Codex,
+                "entity",
+                "coalesced-new",
+                13,
+                position(41, 0, 13),
+                "new"
+            )),
+            MergeOutcome::Coalesced
+        );
+        assert_eq!(
+            pending.merge(ProviderEvent::Malformed {
+                provider: Provider::Codex,
+                path_display: "artifact.jsonl".to_owned(),
+                generation: 0,
+                byte_offset: 14,
+                error_code: "json",
+            }),
+            MergeOutcome::Accepted
+        );
+        let barrier = HistoryDrainBarrier::new(
+            crate::model::HistoryDrainId::new("history:v1:barrier-order").unwrap(),
+            15,
+        );
+        assert_eq!(
+            pending.merge(ProviderEvent::SourceState {
+                provider: Provider::Codex,
+                state: ProviderSourceState::HistoryDrainBarrier(barrier.clone()),
+            }),
+            MergeOutcome::Accepted
+        );
+        assert_eq!(
+            pending.merge(ProviderEvent::SourceState {
+                provider: Provider::Codex,
+                state: ProviderSourceState::HistoryDrainBarrier(barrier.clone()),
+            }),
+            MergeOutcome::Duplicate,
+            "replaying the held barrier must not allocate a second slot"
+        );
+
+        let (sender, mut receiver) = tokio_mpsc::channel(16);
+        pending.flush_to(&sender);
+        let mut actual = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            actual.push(event_kind(event));
+        }
+        assert_eq!(
+            actual,
+            [
+                "liveness",
+                "identity:entity",
+                "new",
+                "malformed",
+                "history-barrier"
+            ]
+        );
+        assert!(!barrier.acknowledgement().is_committed());
+    }
+
+    #[test]
+    fn full_pending_buffer_preserves_unaccepted_parser_cursor_and_pauses_worker() {
+        struct CursorWorker {
+            calls: usize,
+            cursor: u64,
+        }
+
+        impl ProviderWorker for CursorWorker {
+            fn process(&mut self, cycle: &mut ProviderCycle<'_>) -> io::Result<()> {
+                self.calls += 1;
+                let next_cursor = self.cursor + 1;
+                if !matches!(
+                    cycle.pending.merge(ProviderEvent::RunLiveness {
+                        key: RunKey::Controller(format!("cursor-{next_cursor}")),
+                        at_ms: next_cursor as i64,
+                    }),
+                    MergeOutcome::AtCapacity(_)
+                ) {
+                    self.cursor = next_cursor;
+                }
+                Ok(())
+            }
+        }
+
+        let diagnostics = ProviderDiagnostics::default();
+        let mut pending = PendingEvents::with_capacity(1, diagnostics.clone());
+        assert_eq!(
+            pending.merge(ProviderEvent::RunLiveness {
+                key: RunKey::Controller("already-pending".to_owned()),
+                at_ms: 1,
+            }),
+            MergeOutcome::Accepted
+        );
+        let (egress, _receiver) = tokio_mpsc::channel(1);
+        egress.try_send(source_state(Provider::Claude)).unwrap();
+        let targets = Arc::new(Mutex::new(Some(TargetSet::default())));
+        let force_rescan = AtomicBool::new(false);
+        let stop_flag = AtomicBool::new(false);
+        let watcher = Arc::new(Mutex::new(Some(WatchRegistry::new(
+            Box::new(NoopWatcher),
+            diagnostics.clone(),
+        ))));
+        let mut worker = CursorWorker {
+            calls: 0,
+            cursor: 77,
+        };
+
+        run_provider_cycle(
+            &mut worker,
+            &ProviderEventSender::Raw(egress),
+            &targets,
+            &force_rescan,
+            &stop_flag,
+            &watcher,
+            &diagnostics,
+            &mut pending,
+            None,
+            false,
+        );
+
+        assert_eq!(
+            worker.calls, 0,
+            "worker parsed while prior output was blocked"
+        );
+        assert_eq!(worker.cursor, 77, "unaccepted parser cursor advanced");
+        assert!(matches!(
+            pending.next_event(),
+            Some((PendingToken::Lane, _))
+        ));
     }
 
     #[test]
@@ -3616,8 +4138,8 @@ mod tests {
     }
 
     #[test]
-    fn saturated_egress_never_blocks_provider_thread_progress() {
-        run_bounded("saturated egress progress", || {
+    fn saturated_egress_pauses_worker_without_blocking_provider_thread() {
+        run_bounded("saturated egress pause", || {
             let calls = Arc::new(AtomicUsize::new(0));
             let worker = CountingWorker {
                 calls: Arc::clone(&calls),
@@ -3636,13 +4158,12 @@ mod tests {
                 thread::yield_now();
             }
             for index in 0..3 {
-                let previous_calls = calls.load(Ordering::Relaxed);
                 handle.hint(PathBuf::from(format!("hint-{index}")));
-                while calls.load(Ordering::Relaxed) == previous_calls && Instant::now() < deadline {
-                    thread::yield_now();
-                }
             }
-            assert!(calls.load(Ordering::Relaxed) >= 4);
+            while handle.diagnostics().egress_saturations() == 0 && Instant::now() < deadline {
+                thread::yield_now();
+            }
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
             assert!(handle.diagnostics().egress_saturations() > 0);
             tokio::runtime::Runtime::new()
                 .unwrap()
