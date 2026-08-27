@@ -1,6 +1,6 @@
 # Live truth corrections: snapshot-authoritative topology and resumable turns
 
-Status: awaiting user approval
+Status: approved 2026-08-27
 Branch: `agent/live-truth-corrections`
 
 ## Background
@@ -67,20 +67,42 @@ The collector uses a subscribe/snapshot/drain/snapshot handshake:
    the existing no-gap ordering.
 2. Install the first complete snapshot as the current authority.
 3. Drain the subscription's catch-up burst without applying its
-   topology-shaping frames. Coalesce them into at most one refresh request.
-4. Take a closing snapshot after the catch-up quiet boundary and atomically
-   reconcile that snapshot before entering live mode. A real mutation between
-   subscription establishment and the closing snapshot is therefore retained;
-   historical replay cannot override the snapshot.
+   topology-shaping frames. Coalesce them into at most one refresh request at
+   each quiet boundary.
+4. If the catch-up burst contained any topology-shaping frame, take one
+   closing snapshot after its quiet boundary and atomically reconcile that
+   snapshot before entering live mode. With no such frame, the first snapshot
+   already closes the subscribe/snapshot gap. A real mutation between
+   subscription establishment and a required closing snapshot is therefore
+   retained; historical replay cannot override the snapshot.
 5. In live mode, a topology-shaping frame triggers an immediate, coalesced
    snapshot refresh. Events arriving while a refresh is in flight request at
-   most one subsequent refresh. The refresh result, not the triggering frame,
-   is applied.
+   most one subsequent refresh at the next quiet boundary. The refresh result,
+   not the triggering frame, is applied.
+
+An initial/reconnect catch-up or a live topology hint starts one refresh
+episode with a budget of three immediate hint-caused snapshot requests. Each
+request consumes one unit immediately before it is issued, whether it succeeds
+or fails. Reaching a quiet replay drain with no topology hint enters `Live` and
+resets the budget. If topology hints accompany every permitted request, the
+collector does not start a fourth immediate request: it remains
+`Reconciling`, admits and drops further topology hints, and waits for one full
+quiet watchdog interval. A healthy quiescence probe resets the episode budget
+and permits one recovery snapshot; a failed or divergent probe takes the
+bounded reconnect path. Cancellation and stream end retain their existing
+termination behavior. This preserves the existing three-attempt ceiling while
+preventing either an unbounded immediate request chain or a false transition to
+`Live` during continuous topology churn.
 
 If a refresh fails, the triggering frame is never applied speculatively. The
 last complete snapshot remains the materialized truth, observation quality
-leaves `Live`, and the existing bounded reconnect/retry machinery obtains a new
-complete snapshot. This is a drop/preserve-last-good fail-safe.
+leaves `Live`, and the same bounded reconnect/backoff path used by watchdog
+reconnects obtains a new complete snapshot. Request transport, timeout, wire,
+decode, topology-conversion, reducer, unexpected writer, and unexpected owner
+failures each carry a closed reconnect reason. A classified persistence or
+owner write degradation uses the existing `RuntimeWriteOutcome` recovery path
+and does not roll the in-memory snapshot back. Cancellation and EOF are not
+reported as refresh failures. This is a drop/preserve-last-good fail-safe.
 
 No decision relies on `PaneInfo.revision`: observed historical pane revisions
 were monotone within the replay, but a real pane-label change did not advance
@@ -110,7 +132,12 @@ Primary-stream diagnostics gain bounded, in-memory counters for suppressed
 catch-up topology frames and event-triggered topology refreshes. They are test
 and diagnosis surfaces only in this increment; persisted records and doctor
 JSON do not change schema. Counter arithmetic saturates like the existing
-primary-stream counters.
+primary-stream counters. `suppressed_topology_frames` increments once for each
+catch-up topology frame that is admitted and dropped. It does not count live
+hints. `event_triggered_topology_refreshes` increments once immediately before
+each snapshot request actually caused by a topology hint, including a failed
+request and a single coalesced follow-up, but excluding watchdog probes and
+startup/reconnect snapshots.
 
 ### T2: absence is authoritative for display names
 
@@ -292,9 +319,9 @@ Run the complete gates under a process that explicitly restores default
 SIGHUP handling:
 
 ```sh
-setsid perl -e '$SIG{HUP}="DEFAULT"; exec @ARGV' -- \
+setsid --wait perl -e '$SIG{HUP}="DEFAULT"; exec @ARGV' -- \
   mise exec rust@1.97.1 -- make test
-setsid perl -e '$SIG{HUP}="DEFAULT"; exec @ARGV' -- \
+setsid --wait perl -e '$SIG{HUP}="DEFAULT"; exec @ARGV' -- \
   mise exec rust@1.97.1 -- make lint
 ```
 
