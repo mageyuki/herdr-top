@@ -266,7 +266,7 @@ commands exit non-zero, so agent work is not blocked by monitoring delivery.
 Within one hook invocation, mapped envelopes are delivered strictly in order.
 Delivery stops at the first failure. In particular, the adapter never delivers a
 child's `task_started` after the preceding `dispatch` has failed, because that
-would create a permanently unlinked run.
+would create a run with no recorded task relationships.
 
 If an earlier hook is lost, a later terminal event can still create a
 forward-referenced terminal run. Herdr Top flags that degraded outcome in
@@ -445,7 +445,7 @@ Use these checks for common symptoms:
 | --- | --- |
 | Nothing appears in the TUI | Inspect `log_lane.readable`, `log_lane.coverage`, and `log_lane.freshness`, then confirm session resolution and Herdr reachability. Hook setup is not required for the primary view. |
 | The tree appears but optional Controller detail does not | Confirm that the same-release standalone binary is on the hook process's `PATH`, recheck the append-only registration, complete Codex hook trust, and inspect Controller-socket availability. Outside a managed pane, a clean no-delivery result is expected. |
-| Runs appear but stay unlinked | Inspect hook standard error for a failed `dispatch`, confirm that the relevant start hook remains registered, and review [Understand delivery behavior](#understand-delivery-behavior). A later terminal event can intentionally create a diagnostic-flagged forward reference. |
+| Runs have no recorded task relationships | Open Selected Detail and inspect `dispatch_parent`, `prerequisites`, `dependents`, and `task_relationships`. Then inspect hook standard error for a failed `dispatch`, confirm that the relevant start hook remains registered, and review [Understand delivery behavior](#understand-delivery-behavior). A later terminal event can intentionally create a diagnostic-flagged forward reference. |
 | An admitted inner Codex run appears under `Unattached` | Supply lineage through a `.meta.json` subagent record, a Codex `sub_agent_activity.agent_thread_id` reference, or an actual `codex exec resume <uuid>` / `claude --resume <uuid>` Bash invocation; otherwise use explicit Controller dispatch events. Merely echoing the ID into the transcript is not evidence. |
 | A subagent run has no label | Confirm that `SubagentStart` is registered and that its payload contains `agent_type`; the label comes only from that structural field. |
 | A manual hook test seems to hang | The adapter is waiting for standard-input EOF. Use a piped probe from [Test a hook without an agent](#test-a-hook-without-an-agent). |

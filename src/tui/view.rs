@@ -1119,6 +1119,14 @@ fn help_lines(diagnostics: &RuntimeDiagnosticsSnapshot, setup: &TuiSetup) -> Vec
         "Recovery: ancestor, stable neighbor, first; reasons are typed".to_owned(),
         "Controller input is optional capability; standalone setup is optional".to_owned(),
     ];
+    lines.extend([
+        "Task status: queued=announced, working=active, idle=waiting, blocked=needs attention"
+            .to_owned(),
+        "Task status: done=finished, error=failed, cancelled=stopped, unknown=insufficient evidence"
+            .to_owned(),
+        "Warning: ⚠ means stalled; it does not replace the status word".to_owned(),
+        "Status source: pane-backed rows use Herdr; headless rows use task/agent evidence".to_owned(),
+    ]);
     lines.push(match diagnostics.persistence {
         PersistenceStatus::Healthy => "persistence: healthy".to_owned(),
         PersistenceStatus::Degraded { failure } => format!(
@@ -4031,6 +4039,22 @@ mod tests {
         )
     }
 
+    fn healthy_runtime_diagnostics() -> RuntimeDiagnosticsSnapshot {
+        RuntimeDiagnosticsSnapshot {
+            persistence: PersistenceStatus::Healthy,
+            persistence_detail: None,
+            controller_input: ControllerInputStatus::Available,
+            owner: OwnerFreshness::Current,
+            persistence_counters: PersistenceCounters::default(),
+            controller_counters: ControllerCounterSnapshot::default(),
+            enrichment_counters: crate::diagnostics::EnrichmentCounterSnapshot::default(),
+            provider_counters: crate::diagnostics::ProviderCounterSnapshot::default(),
+            source_coverage: Vec::new(),
+            dangling_announcement_components: 0,
+            first_failure_log: OccurrenceLogStatus::NotAttempted,
+        }
+    }
+
     fn buffer_rows(buffer: &Buffer) -> Vec<String> {
         let mut rows = Vec::new();
         for y in 0..buffer.area.height {
@@ -4830,6 +4854,69 @@ mod tests {
         assert!(!extreme.contains("up:"), "{extreme}");
         assert!(extreme.contains("session:"), "{extreme}");
         assert!(extreme.contains("LIVE"), "{extreme}");
+    }
+
+    #[test]
+    fn help_lists_every_task_status_and_stall_semantics() {
+        let help_lines = help_lines(&healthy_runtime_diagnostics(), &TuiSetup::default());
+        assert!(
+            help_lines.iter().any(|line| line
+                == "Task status: queued=announced, working=active, idle=waiting, blocked=needs attention"),
+            "{help_lines:#?}"
+        );
+        assert!(
+            help_lines.iter().any(|line| line
+                == "Task status: done=finished, error=failed, cancelled=stopped, unknown=insufficient evidence"),
+            "{help_lines:#?}"
+        );
+        let help = help_lines.join("\n");
+
+        assert!(help.contains("blocked=needs attention"), "{help}");
+        assert!(!help.contains("blocked=approval"), "{help}");
+        assert!(!help.contains("approval required"), "{help}");
+        assert!(help.contains("⚠ means stalled"), "{help}");
+        assert!(
+            help.contains("it does not replace the status word"),
+            "{help}"
+        );
+    }
+
+    #[test]
+    fn help_explains_pane_backed_and_headless_sources() {
+        let help = help_lines(&healthy_runtime_diagnostics(), &TuiSetup::default()).join("\n");
+
+        assert!(help.contains("pane-backed rows use Herdr"), "{help}");
+        assert!(
+            help.contains("headless rows use task/agent evidence"),
+            "{help}"
+        );
+    }
+
+    #[test]
+    fn help_status_section_scrolls_in_narrow_height() {
+        let mut app = app(
+            DomainModel::default(),
+            ObservationQuality::Live,
+            "status-help",
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+
+        let mut transcript = String::new();
+        for _ in 0..40 {
+            transcript.push_str(&render(&app, 120, 14).join("\n"));
+            transcript.push('\n');
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+
+        assert!(
+            transcript.contains("Task status: queued=announced"),
+            "{transcript}"
+        );
+        assert!(transcript.contains("persistence: healthy"), "{transcript}");
+        assert!(
+            transcript.contains("standalone probe: not evaluated (non-owner/default)"),
+            "{transcript}"
+        );
     }
 
     #[test]
