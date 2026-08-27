@@ -182,6 +182,17 @@ impl RunTelemetry {
 
 pub type RunTelemetryMap = HashMap<RunId, RunTelemetry>;
 
+/// Process-local baseline for one live-epoch active-time rate ledger.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RunRateCursor {
+    pub(crate) baseline_output_tokens: u64,
+    pub(crate) last_observed_at_ms: i64,
+    pub(crate) working: bool,
+    pub(crate) measurement_epoch: u64,
+    pub(crate) identity_basis: RunKey,
+    pub(crate) live_baseline: bool,
+}
+
 /// Stable provider run kinds recomputed from provider logs at startup.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunKind(String);
@@ -712,6 +723,7 @@ pub struct DomainModel {
     run_ids_by_key: HashMap<RunKey, RunId>,
     task_run_v6_state: HashMap<RunId, TaskRunV6State>,
     run_rate_totals: HashMap<RunId, RunRateTotals>,
+    run_rate_cursors: HashMap<RunId, RunRateCursor>,
     /// Recomputed from provider logs at startup; no serialized or database projection owns it.
     telemetry: RunTelemetryMap,
     /// First provider kind per run; recomputed at startup and never persisted.
@@ -1012,6 +1024,32 @@ impl DomainModel {
         saturated
     }
 
+    /// Returns the current process-local rate cursor for one run.
+    #[must_use]
+    pub(crate) fn run_rate_cursor(&self, run_id: &RunId) -> Option<&RunRateCursor> {
+        self.run_rate_cursors.get(run_id)
+    }
+
+    pub(crate) fn set_run_rate_cursor(
+        &mut self,
+        run_id: RunId,
+        cursor: RunRateCursor,
+    ) -> Option<RunRateCursor> {
+        self.run_rate_cursors.insert(run_id, cursor)
+    }
+
+    pub(crate) fn remove_run_rate_cursor(&mut self, run_id: &RunId) -> Option<RunRateCursor> {
+        self.run_rate_cursors.remove(run_id)
+    }
+
+    pub(crate) fn clear_run_rate_cursors(&mut self) {
+        self.run_rate_cursors.clear();
+    }
+
+    pub(crate) fn run_rate_cursors(&self) -> impl Iterator<Item = (&RunId, &RunRateCursor)> {
+        self.run_rate_cursors.iter()
+    }
+
     pub(crate) fn fold_task_run_v6_state(&mut self, survivor: RunId, absorbed: RunId) {
         let absorbed_state = self.task_run_v6_state.remove(&absorbed).unwrap_or_default();
         let survivor_state = self.task_run_v6_state.entry(survivor).or_default();
@@ -1183,6 +1221,7 @@ impl DomainModel {
     pub(crate) fn remove_task_run_record(&mut self, run_id: &RunId) -> Option<TaskRun> {
         self.task_run_v6_state.remove(run_id);
         self.run_rate_totals.remove(run_id);
+        self.run_rate_cursors.remove(run_id);
         self.task_runs.remove(run_id)
     }
 

@@ -3318,6 +3318,13 @@ mod tests {
                     None,
                     false,
                 );
+                model.set_run_rate_totals(
+                    run_id,
+                    crate::model::RunRateTotals {
+                        output_tokens: 10,
+                        working_ms: 1_000,
+                    },
+                );
             }
         }
 
@@ -3911,7 +3918,7 @@ mod tests {
     }
 
     #[test]
-    fn tok_output_only_and_mean_stable_across_completion() {
+    fn lifetime_output_and_measured_rate_are_stable_across_completion() {
         let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let running = label_run(
             run_id,
@@ -3931,6 +3938,13 @@ mod tests {
             Some("xhigh".to_owned()),
             None,
             true,
+        );
+        model.set_run_rate_totals(
+            run_id,
+            crate::model::RunRateTotals {
+                output_tokens: 83,
+                working_ms: 10_000,
+            },
         );
         let running_metrics = projection::run_metric_inputs(&model, &running);
 
@@ -3953,15 +3967,15 @@ mod tests {
             "the cumulative mean must stop at the terminal timestamp"
         );
 
-        let mut future_started = running_metrics.clone();
-        future_started.started_wall_ms = Some(10_001);
+        let mut unrated = running_metrics.clone();
+        unrated.measured_working_ms = Some(0);
         assert_eq!(
-            format_metric_value(MetricColumn::TokPerSecond, &future_started, 10_000),
+            format_metric_value(MetricColumn::TokPerSecond, &unrated, 10_000),
             "—"
         );
-        future_started.started_wall_ms = Some(10_000);
+        unrated.measured_working_ms = None;
         assert_eq!(
-            format_metric_value(MetricColumn::TokPerSecond, &future_started, 10_000),
+            format_metric_value(MetricColumn::TokPerSecond, &unrated, 10_000),
             "—"
         );
     }

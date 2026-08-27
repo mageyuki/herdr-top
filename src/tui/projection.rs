@@ -32,6 +32,9 @@ pub(crate) struct RunMetricInputs {
     pub(crate) model: Option<String>,
     pub(crate) effort: Option<String>,
     pub(crate) output_tokens: Option<u64>,
+    pub(crate) measured_output_tokens: Option<u64>,
+    pub(crate) measured_working_ms: Option<i64>,
+    pub(crate) rate_cursor_initialized: bool,
     pub(crate) started_wall_ms: Option<i64>,
     pub(crate) created_at_ms: Option<i64>,
     pub(crate) finished_at_ms: Option<i64>,
@@ -40,10 +43,14 @@ pub(crate) struct RunMetricInputs {
 
 pub(crate) fn run_metric_inputs(model: &DomainModel, run: &TaskRun) -> RunMetricInputs {
     let telemetry = model.telemetry(&run.run_id);
+    let rate_totals = model.run_rate_totals(&run.run_id);
     RunMetricInputs {
         model: telemetry.and_then(|telemetry| telemetry.model.clone()),
         effort: telemetry.and_then(|telemetry| telemetry.effort.clone()),
         output_tokens: telemetry.map(|telemetry| telemetry.output_tokens),
+        measured_output_tokens: rate_totals.map(|totals| totals.output_tokens),
+        measured_working_ms: rate_totals.map(|totals| totals.working_ms),
+        rate_cursor_initialized: model.run_rate_cursor(&run.run_id).is_some(),
         started_wall_ms: telemetry.map(|telemetry| telemetry.started_wall_ms),
         created_at_ms: run.created_at_ms,
         finished_at_ms: run.finished_at_ms,
@@ -51,19 +58,13 @@ pub(crate) fn run_metric_inputs(model: &DomainModel, run: &TaskRun) -> RunMetric
     }
 }
 
-fn run_rate_terms(metrics: &RunMetricInputs, now_ms: i64) -> Option<(u64, i64)> {
-    let output_tokens = metrics.output_tokens?;
-    let started_wall_ms = metrics.started_wall_ms?;
-    let end_ms = if metrics.terminal {
-        metrics.finished_at_ms?
-    } else {
-        now_ms
-    };
-    let elapsed_ms = end_ms.checked_sub(started_wall_ms)?;
-    if elapsed_ms <= 0 {
+fn run_rate_terms(metrics: &RunMetricInputs, _now_ms: i64) -> Option<(u64, i64)> {
+    let output_tokens = metrics.measured_output_tokens?;
+    let working_ms = metrics.measured_working_ms?;
+    if working_ms <= 0 {
         return None;
     }
-    Some((output_tokens, elapsed_ms))
+    Some((output_tokens, working_ms))
 }
 
 pub(crate) fn run_token_rate(metrics: &RunMetricInputs, now_ms: i64) -> Option<f64> {
@@ -443,6 +444,9 @@ pub(crate) enum DetailEntity {
         evidence_paths: Vec<String>,
         per_turn: Box<[TurnAttr]>,
         output_tokens: Option<u64>,
+        measured_output_tokens: Option<u64>,
+        measured_working_ms: Option<i64>,
+        rate_cursor_initialized: bool,
         token_breakdown: Option<Box<TokenBreakdown>>,
     },
     Agent {
@@ -958,6 +962,13 @@ fn detail_entity(
                         .unwrap_or_default()
                         .into_boxed_slice(),
                     output_tokens: telemetry.map(|telemetry| telemetry.output_tokens),
+                    measured_output_tokens: model
+                        .run_rate_totals(run_id)
+                        .map(|totals| totals.output_tokens),
+                    measured_working_ms: model
+                        .run_rate_totals(run_id)
+                        .map(|totals| totals.working_ms),
+                    rate_cursor_initialized: model.run_rate_cursor(run_id).is_some(),
                     token_breakdown: telemetry
                         .map(|telemetry| Box::new(telemetry.token_breakdown.clone())),
                 }
@@ -1162,6 +1173,9 @@ fn entity_lines(entity: &DetailEntity) -> Vec<String> {
             evidence_paths,
             per_turn,
             output_tokens,
+            measured_output_tokens,
+            measured_working_ms,
+            rate_cursor_initialized,
             token_breakdown,
         } => {
             let mut lines = vec![
@@ -1249,6 +1263,21 @@ fn entity_lines(entity: &DetailEntity) -> Vec<String> {
                 "tokens.output: {}",
                 output_tokens
                     .map_or_else(|| "not retained".to_owned(), |tokens| tokens.to_string())
+            ));
+            lines.push(format!(
+                "rate.measured_output_tokens: {}",
+                measured_output_tokens
+                    .map_or_else(|| "not retained".to_owned(), |tokens| tokens.to_string())
+            ));
+            lines.push(format!(
+                "rate.measured_working_ms: {}",
+                measured_working_ms.map_or_else(
+                    || "not retained".to_owned(),
+                    |working_ms| working_ms.to_string()
+                )
+            ));
+            lines.push(format!(
+                "rate.cursor_initialized: {rate_cursor_initialized}"
             ));
             let token_breakdown = token_breakdown.as_ref();
             lines.push(format!(
@@ -1494,7 +1523,7 @@ mod tests {
     use crate::model::{
         AgentNode, DependencyEdge, DisplayOrdinal, DomainModel, ExecState, Execution,
         ExecutionEdge, NativeSessionEnd, NativeSessionEndStatus, Pane, PaneAgentStatus, Provider,
-        RunId, RunKey, TaskRun, TaskRunV6State, TaskState, Workspace,
+        RunId, RunKey, RunRateTotals, TaskRun, TaskRunV6State, TaskState, Workspace,
     };
     use crate::provider::ProviderEvent;
     use crate::provider::claude_facts::extract_claude_line;
@@ -1741,14 +1770,15 @@ mod tests {
             summary
                 .worker_kinds
                 .iter()
-                .all(|row| row.mean_tokens_per_second.is_some())
+                .all(|row| row.mean_tokens_per_second.is_none()),
+            "artifact replay without authoritative live reconciliation has lifetime tokens but no measured rate"
         );
         drop(model);
         lifecycle.shutdown().await.unwrap();
     }
 
     #[test]
-    fn summary_mean_token_rate_weights_tokens_by_elapsed_time() {
+    fn summary_mean_token_rate_weights_tokens_by_measured_working_time() {
         let mut fast = run(
             "hook:claude-code:session:task:fast",
             1,
@@ -1770,6 +1800,20 @@ mod tests {
         model
             .telemetry_entry(slow.run_id, 0)
             .accumulate(1_000, None, None, None, false);
+        model.set_run_rate_totals(
+            fast.run_id,
+            crate::model::RunRateTotals {
+                output_tokens: 100,
+                working_ms: 1_000,
+            },
+        );
+        model.set_run_rate_totals(
+            slow.run_id,
+            crate::model::RunRateTotals {
+                output_tokens: 1_000,
+                working_ms: 1_000_000,
+            },
+        );
 
         let summary = summary_projection(
             &model,
@@ -1793,6 +1837,123 @@ mod tests {
             (rate - 50.5).abs() > 1e-12,
             "aggregate rate must not be the arithmetic mean 50.5"
         );
+    }
+
+    #[test]
+    fn restored_rate_totals_drive_run_rate_without_a_cursor_or_wall_time() {
+        let mut task_run = run("restored-rate", 1, TaskState::Completed);
+        task_run.created_at_ms = Some(0);
+        task_run.finished_at_ms = Some(1_000_000);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run.clone());
+        model
+            .telemetry_entry(task_run.run_id, 0)
+            .accumulate(1_000, None, None, None, false);
+        model.set_run_rate_totals(
+            task_run.run_id,
+            RunRateTotals {
+                output_tokens: 70,
+                working_ms: 3_000,
+            },
+        );
+
+        let metrics = run_metric_inputs(&model, &task_run);
+        assert_eq!(metrics.output_tokens, Some(1_000));
+        let rate = run_token_rate(&metrics, 9_000_000)
+            .expect("positive restored working duration must remain rateable without a cursor");
+        assert!((rate - (70.0 / 3.0)).abs() < 1e-12, "rate={rate}");
+
+        model.set_run_rate_totals(
+            task_run.run_id,
+            RunRateTotals {
+                output_tokens: 70,
+                working_ms: 0,
+            },
+        );
+        assert_eq!(
+            run_token_rate(&run_metric_inputs(&model, &task_run), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn summary_uses_measured_sums_and_includes_hidden_terminal_history() {
+        let mut first = run("hook:claude-code:hidden-first", 1, TaskState::Completed);
+        first.created_at_ms = Some(0);
+        first.finished_at_ms = Some(1);
+        let mut second = run("hook:claude-code:hidden-second", 2, TaskState::Completed);
+        second.created_at_ms = Some(0);
+        second.finished_at_ms = Some(1);
+        let mut model = DomainModel::default();
+        model.insert_task_run(first.clone());
+        model.insert_task_run(second.clone());
+        model
+            .telemetry_entry(first.run_id, 0)
+            .accumulate(1_000, None, None, None, false);
+        model
+            .telemetry_entry(second.run_id, 0)
+            .accumulate(500, None, None, None, false);
+        model.set_run_rate_totals(
+            first.run_id,
+            RunRateTotals {
+                output_tokens: 70,
+                working_ms: 3_000,
+            },
+        );
+        model.set_run_rate_totals(
+            second.run_id,
+            RunRateTotals {
+                output_tokens: 30,
+                working_ms: 1_000,
+            },
+        );
+
+        let summary = summary_projection(
+            &model,
+            &[],
+            Some(&NodeKey::Session),
+            SummaryScope::Session,
+            crate::activity::DEFAULT_TERMINAL_VISIBILITY_MS + 1,
+        );
+        let row = summary
+            .worker_kinds
+            .iter()
+            .find(|row| row.label == "claude-code")
+            .expect("both hidden retained rows must remain in Summary");
+        assert_eq!(row.run_count, 2);
+        assert_eq!(row.total_output_tokens, Some(1_500));
+        assert_eq!(row.mean_tokens_per_second, Some(25.0));
+    }
+
+    #[test]
+    fn detail_reports_measured_totals_working_time_and_cursor_absence() {
+        let task_run = run("rate-detail", 1, TaskState::Completed);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run.clone());
+        model.set_run_rate_totals(
+            task_run.run_id,
+            RunRateTotals {
+                output_tokens: 70,
+                working_ms: 3_000,
+            },
+        );
+        let selected = NodeKey::Run {
+            run_id: task_run.run_id,
+            pane_id: None,
+        };
+
+        let lines = detail_lines(&detail_projection(
+            &model,
+            &[],
+            &operator(Vec::new(), HashMap::new()),
+            &selected,
+            ViewMode::DependencyDag,
+            None,
+        ));
+
+        assert!(lines.contains(&"rate.measured_output_tokens: 70".to_owned()));
+        assert!(lines.contains(&"rate.measured_working_ms: 3000".to_owned()));
+        assert!(lines.contains(&"rate.cursor_initialized: false".to_owned()));
     }
 
     #[test]

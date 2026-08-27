@@ -12,7 +12,8 @@ use common::mock::{MockConfig, MockHerdr};
 use herdr_top::herdr::collector::{self, CollectorHandle, ObservationQuality};
 use herdr_top::lockfile::{OwnerRecord, StateRoot, state_root_in, try_acquire};
 use herdr_top::model::{
-    DisplayOrdinal, ExecState, Provider, RunId, RunKey, TaskRun, TaskRunV6State, TaskState,
+    DisplayOrdinal, ExecState, Provider, RunId, RunKey, RunRateTotals, TaskRun, TaskRunV6State,
+    TaskState,
 };
 use herdr_top::reducer::Reducer;
 use herdr_top::rendezvous::{
@@ -129,6 +130,66 @@ fn incomplete_history_stays_suppressed_and_completed_drain_restores() {
     let (_reducer, shared) = Reducer::new(restored);
     assert!(shared.borrow().task_run(&incomplete_run).is_none());
     assert!(shared.borrow().task_run(&completed_run).is_some());
+}
+
+#[test]
+fn cold_restore_keeps_persisted_rate_totals_without_restoring_a_cursor() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = StateRoot(directory.path().to_path_buf());
+    let mut store = open_writer(&root).unwrap();
+    let run_id = RunId::new();
+    let task_run = TaskRun {
+        run_id,
+        key: RunKey::Controller("restored-rate-totals".to_owned()),
+        display_ordinal: DisplayOrdinal::new(1),
+        state: TaskState::Completed,
+        has_controller_task_state_event: true,
+        created_at_ms: Some(1_000),
+        updated_at_ms: Some(2_000),
+        finished_at_ms: Some(2_000),
+        subject: None,
+        dismissed_at_ms: None,
+    };
+    store
+        .apply_v6_batch(PersistV6Batch {
+            task_runs: vec![PersistTaskRunV6 {
+                task_run: PersistTaskRun {
+                    task_run,
+                    native_session: None,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 2_000,
+                    finished_at_ms: Some(2_000),
+                },
+                state: TaskRunV6State::default(),
+            }],
+            rate_totals: vec![(
+                run_id,
+                RunRateTotals {
+                    output_tokens: 70,
+                    working_ms: 3_000,
+                },
+            )],
+            ..PersistV6Batch::default()
+        })
+        .unwrap();
+    drop(store);
+
+    let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+    assert_eq!(
+        restored.model.run_rate_totals(&run_id),
+        Some(&RunRateTotals {
+            output_tokens: 70,
+            working_ms: 3_000,
+        })
+    );
+    let (_reducer, shared) = Reducer::new(restored);
+    assert_eq!(
+        shared.borrow().run_rate_totals(&run_id),
+        Some(&RunRateTotals {
+            output_tokens: 70,
+            working_ms: 3_000,
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

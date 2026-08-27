@@ -21,9 +21,9 @@ use crate::model::{
     EventMetadata, ExecState, Execution, ExecutionEdge, MinimalProviderMetadata,
     NativeLifecycleWatermark, NativeSessionEnd, NativeSessionEndStatus, NormalizedEvent,
     ObservationOrigin, OperatorCommand, Pane, PaneAgentStatusObservation, Provider,
-    ProviderDiagnosticsHandle, ReconcileBatch, RunId, RunKey, SharedModel, TaskRun, TaskRunV6State,
-    TaskState, TopologyAuthority, TopologyEntity, TopologyEntityId, TopologySnapshot,
-    sanitize_controller_text,
+    ProviderDiagnosticsHandle, ReconcileBatch, RunId, RunKey, RunRateCursor, RunRateTotals,
+    SharedModel, TaskRun, TaskRunV6State, TaskState, TopologyAuthority, TopologyEntity,
+    TopologyEntityId, TopologySnapshot, sanitize_controller_text,
 };
 use crate::operator::OperatorProjection;
 use crate::store::{
@@ -290,6 +290,19 @@ struct PendingTelemetry {
     attribution: crate::model::TurnAttr,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RateObservationOrigin {
+    Historical,
+    Live { epoch: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RateObservation {
+    pub(crate) run_id: RunId,
+    pub(crate) origin: RateObservationOrigin,
+    pub(crate) observed_at_ms: i64,
+}
+
 /// Serialized owner of domain transitions and display-ordinal allocation.
 pub struct Reducer {
     model: DomainModel,
@@ -300,6 +313,11 @@ pub struct Reducer {
     pending_telemetry: HashMap<RunKey, VecDeque<PendingTelemetry>>,
     pending_telemetry_order: VecDeque<RunKey>,
     pending_telemetry_count: usize,
+    rate_epoch: u64,
+    rate_epoch_active: bool,
+    dirty_rate_totals: HashSet<RunId>,
+    pending_rate_observation_runs: HashSet<RunId>,
+    rate_observation_context: Option<(RateObservationOrigin, i64)>,
     publisher: watch::Sender<Arc<DomainModel>>,
     operator: OperatorProjection,
     defer_provider_publication: bool,
@@ -309,6 +327,8 @@ pub struct Reducer {
     publish_count: std::cell::Cell<u64>,
     #[cfg(test)]
     shared_publish_count: Arc<AtomicU64>,
+    #[cfg(test)]
+    rate_observation_count: usize,
     // increment5-workload-harness: begin reducer timing configuration field
     #[cfg(feature = "workload-harness")]
     workload_observation_timing: Option<WorkloadObservationTiming>,
@@ -371,6 +391,11 @@ impl Reducer {
                 pending_telemetry: HashMap::new(),
                 pending_telemetry_order: VecDeque::new(),
                 pending_telemetry_count: 0,
+                rate_epoch: 0,
+                rate_epoch_active: false,
+                dirty_rate_totals: HashSet::new(),
+                pending_rate_observation_runs: HashSet::new(),
+                rate_observation_context: None,
                 publisher,
                 operator,
                 defer_provider_publication: false,
@@ -380,6 +405,8 @@ impl Reducer {
                 publish_count: std::cell::Cell::new(0),
                 #[cfg(test)]
                 shared_publish_count: Arc::new(AtomicU64::new(0)),
+                #[cfg(test)]
+                rate_observation_count: 0,
                 // increment5-workload-harness: begin reducer timing configuration initialization
                 #[cfg(feature = "workload-harness")]
                 workload_observation_timing: None,
@@ -454,7 +481,7 @@ impl Reducer {
         };
         self.recompute_dangling_announcement_components();
         normalize_persist_batch_lineage(&mut persist);
-        self.operator.apply_submission(&persist);
+        self.apply_operator_submission(&persist);
         self.publish();
         ApplyOutcome::Applied(persist)
     }
@@ -465,6 +492,202 @@ impl Reducer {
         events: Vec<NormalizedEvent>,
     ) -> Result<ApplyOutcome, ReducerError> {
         self.apply_observation_inner(events, None)
+    }
+
+    pub(crate) fn begin_rate_epoch(&mut self) -> u64 {
+        self.rate_epoch = self.rate_epoch.wrapping_add(1);
+        self.rate_epoch_active = false;
+        self.model.clear_run_rate_cursors();
+        self.pending_rate_observation_runs.clear();
+        self.rate_epoch
+    }
+
+    pub(crate) fn activate_rate_epoch(&mut self, observed_at_ms: i64) {
+        self.rate_epoch_active = true;
+        let statuses = crate::status::StatusReadModel::from_model(&self.model, observed_at_ms);
+        let mut run_ids = self
+            .model
+            .task_runs()
+            .filter(|run| {
+                matches!(
+                    statuses.run_rate_activity(&self.model, run),
+                    crate::status::RunRateActivity::Working
+                )
+            })
+            .map(|run| run.run_id)
+            .collect::<Vec<_>>();
+        run_ids.sort_unstable();
+        for run_id in run_ids {
+            self.observe_run_rates_with_activity(
+                RateObservation {
+                    run_id,
+                    origin: RateObservationOrigin::Live {
+                        epoch: self.rate_epoch,
+                    },
+                    observed_at_ms,
+                },
+                true,
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rate_epoch(&self) -> u64 {
+        self.rate_epoch
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn observe_run_rates(&mut self, observation: RateObservation) -> PersistBatch {
+        let Some(run) = self.model.task_run(&observation.run_id).cloned() else {
+            self.model.remove_run_rate_cursor(&observation.run_id);
+            return Vec::new();
+        };
+        let working = matches!(
+            crate::status::StatusReadModel::run_rate_activity_from_model(
+                &self.model,
+                &run,
+                observation.observed_at_ms,
+            ),
+            crate::status::RunRateActivity::Working
+        );
+        self.observe_run_rates_with_activity(observation, working)
+    }
+
+    fn observe_run_rates_with_activity(
+        &mut self,
+        observation: RateObservation,
+        working: bool,
+    ) -> PersistBatch {
+        #[cfg(test)]
+        {
+            self.rate_observation_count += 1;
+        }
+        let Some(run) = self.model.task_run(&observation.run_id).cloned() else {
+            self.model.remove_run_rate_cursor(&observation.run_id);
+            return Vec::new();
+        };
+        let output_tokens = self
+            .model
+            .telemetry(&observation.run_id)
+            .map_or(0, |telemetry| telemetry.output_tokens);
+        let (measurement_epoch, live_baseline) = match observation.origin {
+            RateObservationOrigin::Historical => (self.rate_epoch, false),
+            RateObservationOrigin::Live { epoch } => (epoch, true),
+        };
+        let Some(cursor) = self.model.run_rate_cursor(&observation.run_id).cloned() else {
+            self.model.set_run_rate_cursor(
+                observation.run_id,
+                RunRateCursor {
+                    baseline_output_tokens: output_tokens,
+                    last_observed_at_ms: observation.observed_at_ms,
+                    working,
+                    measurement_epoch,
+                    identity_basis: run.key,
+                    live_baseline,
+                },
+            );
+            return Vec::new();
+        };
+
+        let observed_at_ms = cursor.last_observed_at_ms.max(observation.observed_at_ms);
+        let trustworthy_live_baseline = live_baseline
+            && cursor.live_baseline
+            && cursor.measurement_epoch == measurement_epoch
+            && cursor.identity_basis == run.key;
+        if trustworthy_live_baseline {
+            let output_delta = output_tokens.saturating_sub(cursor.baseline_output_tokens);
+            let counter_regressed = output_tokens < cursor.baseline_output_tokens;
+            let working_ms = if cursor.working {
+                observed_at_ms.saturating_sub(cursor.last_observed_at_ms)
+            } else {
+                0
+            };
+            if output_delta > 0 || working_ms > 0 {
+                self.model.accumulate_run_rate_totals(
+                    observation.run_id,
+                    RunRateTotals {
+                        output_tokens: if counter_regressed { 0 } else { output_delta },
+                        working_ms,
+                    },
+                );
+                self.dirty_rate_totals.insert(observation.run_id);
+            }
+        }
+        self.model.set_run_rate_cursor(
+            observation.run_id,
+            RunRateCursor {
+                baseline_output_tokens: output_tokens,
+                last_observed_at_ms: observed_at_ms,
+                working,
+                measurement_epoch,
+                identity_basis: run.key,
+                live_baseline,
+            },
+        );
+        Vec::new()
+    }
+
+    /// Closes the current live intervals and returns only totals changed since the last flush.
+    pub(crate) fn checkpoint_run_rates(
+        &mut self,
+        observed_at_ms: i64,
+    ) -> Vec<(RunId, RunRateTotals)> {
+        let mut run_ids = self
+            .model
+            .run_rate_cursors()
+            .filter_map(|(run_id, cursor)| cursor.working.then_some(*run_id))
+            .collect::<Vec<_>>();
+        run_ids.sort_unstable();
+        let before = run_ids
+            .iter()
+            .map(|run_id| (*run_id, self.model.run_rate_totals(run_id).copied()))
+            .collect::<HashMap<_, _>>();
+        if self.rate_epoch_active {
+            for run_id in &run_ids {
+                self.observe_run_rates_with_activity(
+                    RateObservation {
+                        run_id: *run_id,
+                        origin: RateObservationOrigin::Live {
+                            epoch: self.rate_epoch,
+                        },
+                        observed_at_ms,
+                    },
+                    true,
+                );
+            }
+        }
+        if before
+            .iter()
+            .any(|(run_id, totals)| self.model.run_rate_totals(run_id).copied() != *totals)
+        {
+            self.publish_snapshot();
+        }
+
+        let mut dirty = self.dirty_rate_totals.drain().collect::<Vec<_>>();
+        dirty.sort_unstable();
+        dirty
+            .into_iter()
+            .filter_map(|run_id| {
+                self.model
+                    .run_rate_totals(&run_id)
+                    .copied()
+                    .map(|totals| (run_id, totals))
+            })
+            .collect()
+    }
+
+    pub(crate) fn restore_dirty_rate_totals(&mut self, totals: &[(RunId, RunRateTotals)]) {
+        self.dirty_rate_totals
+            .extend(totals.iter().map(|(run_id, _)| *run_id));
+    }
+
+    pub(crate) fn has_dirty_rate_totals(&self) -> bool {
+        !self.dirty_rate_totals.is_empty()
+    }
+
+    #[cfg(test)]
+    fn take_rate_observation_count(&mut self) -> usize {
+        std::mem::take(&mut self.rate_observation_count)
     }
 
     /// Stages one drain finalization request without mutating or publishing the live model.
@@ -500,9 +723,15 @@ impl Reducer {
                 self.model
                     .set_task_run_v6_state(finalized.run_id, finalized.state.clone());
             }
+            self.pending_rate_observation_runs.insert(finalized.run_id);
         }
         self.operator.publish_accumulated(&finalization.drain_id);
+        let prior_rate_context = self.rate_observation_context.replace((
+            RateObservationOrigin::Historical,
+            finalization.finalized_at_ms,
+        ));
         self.publish();
+        self.rate_observation_context = prior_rate_context;
         true
     }
 
@@ -510,7 +739,17 @@ impl Reducer {
     pub(crate) fn begin_provider_observation(
         &mut self,
         origin: &ObservationOrigin,
+        observed_at_ms: i64,
     ) -> Option<DomainModel> {
+        self.rate_observation_context = Some((
+            match origin {
+                ObservationOrigin::Historical { .. } => RateObservationOrigin::Historical,
+                ObservationOrigin::Live => RateObservationOrigin::Live {
+                    epoch: self.rate_epoch,
+                },
+            },
+            observed_at_ms,
+        ));
         if let ObservationOrigin::Historical { drain_id, .. } = origin {
             self.defer_provider_publication = true;
             self.deferred_provider_drain = Some(drain_id.clone());
@@ -632,6 +871,7 @@ impl Reducer {
         }
         self.defer_provider_publication = false;
         self.deferred_provider_drain = None;
+        self.rate_observation_context = None;
         PersistV6Batch {
             operations,
             task_runs,
@@ -648,6 +888,7 @@ impl Reducer {
     pub(crate) fn cancel_provider_observation(&mut self) {
         self.defer_provider_publication = false;
         self.deferred_provider_drain = None;
+        self.rate_observation_context = None;
     }
 
     pub(crate) fn apply_pane_agent_observation(
@@ -701,6 +942,12 @@ impl Reducer {
         if pane_agent_status_changed {
             let observation = pane_agent_observation
                 .expect("a changed pane-agent status must have an observation");
+            self.pending_rate_observation_runs.extend(
+                self.model
+                    .executions()
+                    .filter(|execution| execution.pane_id == observation.pane_id)
+                    .map(|execution| execution.task_run_id),
+            );
             self.model
                 .set_pane_agent_status(observation.pane_id, observation.status);
         }
@@ -993,6 +1240,7 @@ impl Reducer {
             sample.attribution.sandbox,
             retain_turn,
         );
+        self.pending_rate_observation_runs.insert(run_id);
         true
     }
 
@@ -1574,26 +1822,75 @@ impl Reducer {
             .collect::<HashSet<_>>();
         let task_runs = touched
             .into_iter()
-            .filter_map(|run_id| {
-                let run = self.model.task_run(&run_id)?.clone();
-                let state = self.model.task_run_v6_state(&run_id)?.clone();
-                let PersistOp::UpsertTaskRun(task_run) = self.persist_task_run(
-                    run,
-                    state
-                        .lifecycle_watermark
-                        .as_ref()
-                        .map_or(0, |w| w.observed_at_ms),
-                ) else {
-                    unreachable!("persist_task_run always returns an upsert");
-                };
-                Some(PersistTaskRunV6 { task_run, state })
-            })
+            .filter_map(|run_id| self.persist_task_run_v6(run_id))
             .collect();
         PersistV6Batch {
             operations,
             task_runs,
             ..PersistV6Batch::default()
         }
+    }
+
+    pub(crate) fn decorate_reconciliation_batch(&self, operations: PersistBatch) -> PersistV6Batch {
+        let referenced_runs = operations
+            .iter()
+            .filter_map(|operation| match operation {
+                PersistOp::UpsertExecution(value) => Some(value.execution.task_run_id),
+                PersistOp::UpsertAgentNode(node) => Some(node.task_run_id),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let mut batch = self.decorate_v6_batch(operations);
+        let mut seeded = batch
+            .task_runs
+            .iter()
+            .map(|run| run.task_run.task_run.run_id)
+            .collect::<HashSet<_>>();
+        for run_id in referenced_runs {
+            if seeded.insert(run_id)
+                && let Some(task_run) = self.persist_task_run_v6(run_id)
+            {
+                batch.task_runs.push(task_run);
+            }
+        }
+        batch
+    }
+
+    pub(crate) fn decorate_rate_checkpoint(
+        &self,
+        operations: PersistBatch,
+        rate_totals: Vec<(RunId, RunRateTotals)>,
+    ) -> PersistV6Batch {
+        let mut batch = self.decorate_v6_batch(operations);
+        let mut seeded = batch
+            .task_runs
+            .iter()
+            .map(|run| run.task_run.task_run.run_id)
+            .collect::<HashSet<_>>();
+        for (run_id, _) in &rate_totals {
+            if seeded.insert(*run_id)
+                && let Some(task_run) = self.persist_task_run_v6(*run_id)
+            {
+                batch.task_runs.push(task_run);
+            }
+        }
+        batch.rate_totals = rate_totals;
+        batch
+    }
+
+    fn persist_task_run_v6(&self, run_id: RunId) -> Option<PersistTaskRunV6> {
+        let run = self.model.task_run(&run_id)?.clone();
+        let state = self.model.task_run_v6_state(&run_id)?.clone();
+        let PersistOp::UpsertTaskRun(task_run) = self.persist_task_run(
+            run,
+            state
+                .lifecycle_watermark
+                .as_ref()
+                .map_or(0, |watermark| watermark.observed_at_ms),
+        ) else {
+            unreachable!("persist_task_run always returns an upsert");
+        };
+        Some(PersistTaskRunV6 { task_run, state })
     }
 
     fn apply_inner(&mut self, mut event: NormalizedEvent) -> Result<PersistBatch, ReducerError> {
@@ -1738,6 +2035,9 @@ impl Reducer {
                 normalize_persist_batch_lineage(&mut persist);
                 self.recompute_dangling_announcement_components();
                 self.apply_operator_submission(&persist);
+                self.apply_pending_telemetry_for_known_runs();
+                self.begin_rate_epoch();
+                self.activate_rate_epoch(unix_now_ms());
                 self.publish();
                 Ok(persist)
             }
@@ -1761,6 +2061,24 @@ impl Reducer {
     }
 
     fn apply_operator_submission(&mut self, persist: &[PersistOp]) {
+        for operation in persist {
+            let touched_run = match operation {
+                PersistOp::UpsertTaskRun(value) => Some(value.task_run.run_id),
+                PersistOp::PromoteTaskRunKey { promoted, .. } => Some(promoted.task_run.run_id),
+                PersistOp::MergeTaskRuns { survivor, absorbed } => {
+                    self.dirty_rate_totals.remove(absorbed);
+                    self.dirty_rate_totals.insert(*survivor);
+                    Some(*survivor)
+                }
+                PersistOp::UpsertExecution(value) => Some(value.execution.task_run_id),
+                PersistOp::UpsertAgentNode(node) => Some(node.task_run_id),
+                PersistOp::RecordEvent { event, .. } => event_metadata(event).task_run_id,
+                _ => None,
+            };
+            if let Some(run_id) = touched_run {
+                self.pending_rate_observation_runs.insert(run_id);
+            }
+        }
         if self.defer_provider_publication {
             self.operator.apply_submission_without_publishing(
                 self.deferred_provider_drain
@@ -3225,6 +3543,42 @@ impl Reducer {
 
     fn publish(&mut self) {
         self.apply_pending_telemetry_for_known_runs();
+        let (origin, observed_at_ms) = self.rate_observation_context.unwrap_or((
+            RateObservationOrigin::Live {
+                epoch: self.rate_epoch,
+            },
+            unix_now_ms(),
+        ));
+        let mut run_ids = self
+            .pending_rate_observation_runs
+            .drain()
+            .collect::<Vec<_>>();
+        run_ids.sort_unstable();
+        if matches!(origin, RateObservationOrigin::Historical) || self.rate_epoch_active {
+            let statuses = crate::status::StatusReadModel::from_model(&self.model, observed_at_ms);
+            for run_id in run_ids {
+                let Some(run) = self.model.task_run(&run_id).cloned() else {
+                    self.model.remove_run_rate_cursor(&run_id);
+                    continue;
+                };
+                let working = matches!(
+                    statuses.run_rate_activity(&self.model, &run),
+                    crate::status::RunRateActivity::Working
+                );
+                self.observe_run_rates_with_activity(
+                    RateObservation {
+                        run_id,
+                        origin,
+                        observed_at_ms,
+                    },
+                    working,
+                );
+            }
+        }
+        self.publish_snapshot();
+    }
+
+    fn publish_snapshot(&mut self) {
         if self.defer_provider_publication {
             return;
         }
@@ -3674,7 +4028,7 @@ mod tests {
         EventMetadata, ExecState, Execution, ExecutionEdge, GapKind, MinimalProviderMetadata,
         NativeLifecycleWatermark, NativeSessionEndStatus, NormalizedEvent, OperatorCommand, Pane,
         PaneAgentStatus, PaneAgentStatusObservation, PaneSnapshot, Provider, ReconcileBatch, RunId,
-        RunKey, SharedModel, SnapshotAgent, Tab, TaskRun, TaskRunV6State, TaskState,
+        RunKey, RunRateTotals, SharedModel, SnapshotAgent, Tab, TaskRun, TaskRunV6State, TaskState,
         TopologyAuthority, TopologyEntity, TopologyEntityId, TopologySnapshot, TurnAttr, Workspace,
     };
     use crate::provider::claude_facts::{extract_claude_line, extract_meta_json};
@@ -3690,8 +4044,590 @@ mod tests {
     };
 
     use super::{
-        ApplyOutcome, CommitStagedError, Reducer, ReducerError, RejectReason, unix_now_ms,
+        ApplyOutcome, CommitStagedError, RateObservation, RateObservationOrigin, Reducer,
+        ReducerError, RejectReason, unix_now_ms,
     };
+
+    fn rate_reducer() -> (Reducer, SharedModel, RunId, RunKey) {
+        let run_id = RunId::new();
+        let key = RunKey::Controller("rate-ledger".to_owned());
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(run_id, key.clone(), 1, TaskState::Running));
+        model.insert_execution(execution(run_id, "rate-execution", ExecState::Working));
+        model.set_pane_agent_status("pane-1".to_owned(), PaneAgentStatus::Working);
+        let (reducer, shared) = Reducer::new(restored(model, 2));
+        (reducer, shared, run_id, key)
+    }
+
+    fn add_rate_tokens(reducer: &mut Reducer, run_id: RunId, at_ms: i64, output_tokens: u64) {
+        reducer.model.telemetry_entry(run_id, at_ms).accumulate(
+            output_tokens,
+            None,
+            None,
+            None,
+            false,
+        );
+    }
+
+    fn observe_live_rate(reducer: &mut Reducer, run_id: RunId, epoch: u64, at_ms: i64) {
+        let persist = reducer.observe_run_rates(RateObservation {
+            run_id,
+            origin: RateObservationOrigin::Live { epoch },
+            observed_at_ms: at_ms,
+        });
+        assert!(
+            persist.is_empty(),
+            "rate observations are checkpointed separately"
+        );
+    }
+
+    #[test]
+    fn active_rate_ledger_uses_prior_working_intervals_and_delayed_idle_tokens() {
+        let (mut reducer, _shared, run_id, _) = rate_reducer();
+        let epoch = reducer.begin_rate_epoch();
+
+        add_rate_tokens(&mut reducer, run_id, 1_000, 100);
+        observe_live_rate(&mut reducer, run_id, epoch, 1_000);
+        add_rate_tokens(&mut reducer, run_id, 3_000, 40);
+        observe_live_rate(&mut reducer, run_id, epoch, 3_000);
+
+        reducer
+            .model
+            .set_pane_agent_status("pane-1".to_owned(), PaneAgentStatus::Idle);
+        observe_live_rate(&mut reducer, run_id, epoch, 3_000);
+        add_rate_tokens(&mut reducer, run_id, 13_000, 10);
+        observe_live_rate(&mut reducer, run_id, epoch, 13_000);
+
+        reducer
+            .model
+            .set_pane_agent_status("pane-1".to_owned(), PaneAgentStatus::Working);
+        observe_live_rate(&mut reducer, run_id, epoch, 13_000);
+        add_rate_tokens(&mut reducer, run_id, 14_000, 20);
+        observe_live_rate(&mut reducer, run_id, epoch, 14_000);
+
+        assert_eq!(
+            reducer.model.run_rate_totals(&run_id),
+            Some(&RunRateTotals {
+                output_tokens: 70,
+                working_ms: 3_000,
+            })
+        );
+    }
+
+    #[test]
+    fn blocked_queued_unknown_and_terminal_rate_states_remain_paused() {
+        let cases = [
+            ("blocked", TaskState::Blocked, None, None),
+            ("queued", TaskState::Queued, None, None),
+            (
+                "unknown",
+                TaskState::Running,
+                Some(ExecState::Unknown),
+                None,
+            ),
+            ("semantic-terminal", TaskState::Completed, None, None),
+            (
+                "native-terminal",
+                TaskState::Running,
+                None,
+                Some(NativeSessionEndStatus::Done),
+            ),
+        ];
+
+        for (label, state, execution_state, native_end) in cases {
+            let run_id = RunId::new();
+            let mut model = DomainModel::default();
+            model.insert_task_run(run_with_controller_evidence(
+                run_id,
+                RunKey::Controller(format!("rate-{label}")),
+                1,
+                state,
+            ));
+            if let Some(execution_state) = execution_state {
+                model.insert_execution(execution(run_id, "paused-execution", execution_state));
+            }
+            if let Some(status) = native_end {
+                model.set_task_run_v6_state(
+                    run_id,
+                    TaskRunV6State {
+                        native_session_end: Some(crate::model::NativeSessionEnd {
+                            status,
+                            at_ms: 500,
+                        }),
+                        ..TaskRunV6State::default()
+                    },
+                );
+            }
+            let (mut reducer, _shared) = Reducer::new(restored(model, 2));
+            let epoch = reducer.begin_rate_epoch();
+            add_rate_tokens(&mut reducer, run_id, 1_000, 100);
+            observe_live_rate(&mut reducer, run_id, epoch, 1_000);
+            add_rate_tokens(&mut reducer, run_id, 11_000, 10);
+            observe_live_rate(&mut reducer, run_id, epoch, 11_000);
+
+            assert_eq!(
+                reducer
+                    .model
+                    .run_rate_totals(&run_id)
+                    .map(|totals| totals.working_ms),
+                Some(0),
+                "case {label} must add no working duration"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_working_pane_occurrences_or_without_multiplying_elapsed_time() {
+        let (mut reducer, _shared, run_id, _) = rate_reducer();
+        reducer.model.insert_execution(Execution {
+            execution_id: "rate-execution-2".to_owned(),
+            pane_id: "pane-2".to_owned(),
+            terminal_id: "terminal-2".to_owned(),
+            task_run_id: run_id,
+            state: ExecState::Idle,
+        });
+        reducer
+            .model
+            .set_pane_agent_status("pane-1".to_owned(), PaneAgentStatus::Idle);
+        reducer
+            .model
+            .set_pane_agent_status("pane-2".to_owned(), PaneAgentStatus::Working);
+        let epoch = reducer.begin_rate_epoch();
+
+        add_rate_tokens(&mut reducer, run_id, 1_000, 100);
+        observe_live_rate(&mut reducer, run_id, epoch, 1_000);
+        add_rate_tokens(&mut reducer, run_id, 2_000, 10);
+        observe_live_rate(&mut reducer, run_id, epoch, 2_000);
+
+        assert_eq!(
+            reducer.model.run_rate_totals(&run_id),
+            Some(&RunRateTotals {
+                output_tokens: 10,
+                working_ms: 1_000,
+            })
+        );
+    }
+
+    #[test]
+    fn same_observation_uses_post_transition_status_and_tokens_coherently() {
+        let (mut reducer, _shared, run_id, _) = rate_reducer();
+        let epoch = reducer.begin_rate_epoch();
+        add_rate_tokens(&mut reducer, run_id, 1_000, 100);
+        observe_live_rate(&mut reducer, run_id, epoch, 1_000);
+
+        reducer
+            .model
+            .set_pane_agent_status("pane-1".to_owned(), PaneAgentStatus::Idle);
+        add_rate_tokens(&mut reducer, run_id, 3_000, 40);
+        observe_live_rate(&mut reducer, run_id, epoch, 3_000);
+        add_rate_tokens(&mut reducer, run_id, 13_000, 10);
+        observe_live_rate(&mut reducer, run_id, epoch, 13_000);
+
+        assert_eq!(
+            reducer.model.run_rate_totals(&run_id),
+            Some(&RunRateTotals {
+                output_tokens: 50,
+                working_ms: 2_000,
+            })
+        );
+    }
+
+    #[test]
+    fn historical_replay_only_rebaselines_before_the_first_live_sample() {
+        let (mut reducer, _shared, run_id, _) = rate_reducer();
+        let historical = RateObservationOrigin::Historical;
+        add_rate_tokens(&mut reducer, run_id, 1_000, 100);
+        reducer.observe_run_rates(RateObservation {
+            run_id,
+            origin: historical,
+            observed_at_ms: 1_000,
+        });
+        add_rate_tokens(&mut reducer, run_id, 3_000, 40);
+        reducer.observe_run_rates(RateObservation {
+            run_id,
+            origin: historical,
+            observed_at_ms: 3_000,
+        });
+        assert_eq!(reducer.model.run_rate_totals(&run_id), None);
+
+        let epoch = reducer.begin_rate_epoch();
+        observe_live_rate(&mut reducer, run_id, epoch, 4_000);
+        add_rate_tokens(&mut reducer, run_id, 5_000, 10);
+        observe_live_rate(&mut reducer, run_id, epoch, 5_000);
+
+        assert_eq!(
+            reducer.model.run_rate_totals(&run_id),
+            Some(&RunRateTotals {
+                output_tokens: 10,
+                working_ms: 1_000,
+            })
+        );
+    }
+
+    #[test]
+    fn counter_regression_adds_no_tokens_but_closes_prior_working_time() {
+        let (mut reducer, _shared, run_id, _) = rate_reducer();
+        let epoch = reducer.begin_rate_epoch();
+        add_rate_tokens(&mut reducer, run_id, 1_000, 100);
+        observe_live_rate(&mut reducer, run_id, epoch, 1_000);
+        add_rate_tokens(&mut reducer, run_id, 2_000, 10);
+        observe_live_rate(&mut reducer, run_id, epoch, 2_000);
+
+        reducer.model.telemetry_entry(run_id, 2_500).output_tokens = 25;
+        observe_live_rate(&mut reducer, run_id, epoch, 2_500);
+
+        assert_eq!(
+            reducer.model.run_rate_totals(&run_id),
+            Some(&RunRateTotals {
+                output_tokens: 10,
+                working_ms: 1_500,
+            })
+        );
+        assert_eq!(
+            reducer
+                .model
+                .run_rate_cursor(&run_id)
+                .map(|cursor| cursor.baseline_output_tokens),
+            Some(25)
+        );
+    }
+
+    #[test]
+    fn clock_reversal_adds_positive_token_delta_once_and_zero_duration() {
+        let (mut reducer, _shared, run_id, _) = rate_reducer();
+        let epoch = reducer.begin_rate_epoch();
+        add_rate_tokens(&mut reducer, run_id, 1_000, 100);
+        observe_live_rate(&mut reducer, run_id, epoch, 1_000);
+        add_rate_tokens(&mut reducer, run_id, 2_000, 10);
+        observe_live_rate(&mut reducer, run_id, epoch, 2_000);
+
+        reducer.model.telemetry_entry(run_id, 1_500).output_tokens = 115;
+        observe_live_rate(&mut reducer, run_id, epoch, 1_500);
+        assert_eq!(
+            reducer.model.run_rate_totals(&run_id),
+            Some(&RunRateTotals {
+                output_tokens: 15,
+                working_ms: 1_000,
+            })
+        );
+
+        observe_live_rate(&mut reducer, run_id, epoch, 2_500);
+        assert_eq!(
+            reducer.model.run_rate_totals(&run_id),
+            Some(&RunRateTotals {
+                output_tokens: 15,
+                working_ms: 1_500,
+            }),
+            "the monotonic cumulative delta from the reversed timestamp must not repeat"
+        );
+    }
+
+    #[test]
+    fn new_epoch_and_cold_restore_drop_cursors_without_losing_closed_totals() {
+        let (mut reducer, _shared, run_id, _) = rate_reducer();
+        let first_epoch = reducer.begin_rate_epoch();
+        add_rate_tokens(&mut reducer, run_id, 1_000, 100);
+        observe_live_rate(&mut reducer, run_id, first_epoch, 1_000);
+        add_rate_tokens(&mut reducer, run_id, 2_000, 10);
+        observe_live_rate(&mut reducer, run_id, first_epoch, 2_000);
+
+        let second_epoch = reducer.begin_rate_epoch();
+        add_rate_tokens(&mut reducer, run_id, 12_000, 90);
+        observe_live_rate(&mut reducer, run_id, second_epoch, 12_000);
+        add_rate_tokens(&mut reducer, run_id, 13_000, 10);
+        observe_live_rate(&mut reducer, run_id, second_epoch, 13_000);
+        assert_eq!(
+            reducer.model.run_rate_totals(&run_id),
+            Some(&RunRateTotals {
+                output_tokens: 20,
+                working_ms: 2_000,
+            })
+        );
+
+        let mut restored_model = DomainModel::default();
+        restored_model.insert_task_run(run(
+            run_id,
+            RunKey::Controller("rate-ledger".to_owned()),
+            1,
+            TaskState::Running,
+        ));
+        restored_model.insert_execution(execution(
+            run_id,
+            "restored-rate-execution",
+            ExecState::Working,
+        ));
+        restored_model.set_run_rate_totals(
+            run_id,
+            RunRateTotals {
+                output_tokens: 20,
+                working_ms: 2_000,
+            },
+        );
+        let (mut restarted, _restarted_shared) = Reducer::new(restored(restored_model, 2));
+        let restarted_epoch = restarted.begin_rate_epoch();
+        add_rate_tokens(&mut restarted, run_id, 23_000, 1_000);
+        observe_live_rate(&mut restarted, run_id, restarted_epoch, 23_000);
+
+        assert_eq!(
+            restarted.model.run_rate_totals(&run_id),
+            Some(&RunRateTotals {
+                output_tokens: 20,
+                working_ms: 2_000,
+            })
+        );
+    }
+
+    #[test]
+    fn sweep_checkpoint_emits_only_changed_totals_and_graceful_tail() {
+        let (mut reducer, _shared, run_id, _) = rate_reducer();
+        reducer.begin_rate_epoch();
+        add_rate_tokens(&mut reducer, run_id, 1_000, 100);
+        reducer.activate_rate_epoch(1_000);
+        assert!(reducer.checkpoint_run_rates(1_000).is_empty());
+
+        add_rate_tokens(&mut reducer, run_id, 3_000, 20);
+        assert_eq!(
+            reducer.checkpoint_run_rates(3_000),
+            vec![(
+                run_id,
+                RunRateTotals {
+                    output_tokens: 20,
+                    working_ms: 2_000,
+                },
+            )]
+        );
+        assert!(
+            reducer.checkpoint_run_rates(3_000).is_empty(),
+            "an unchanged sweep must not rewrite closed totals"
+        );
+
+        add_rate_tokens(&mut reducer, run_id, 4_000, 5);
+        assert_eq!(
+            reducer.checkpoint_run_rates(4_000),
+            vec![(
+                run_id,
+                RunRateTotals {
+                    output_tokens: 25,
+                    working_ms: 3_000,
+                },
+            )],
+            "the graceful final checkpoint must include the unflushed tail"
+        );
+    }
+
+    #[test]
+    fn inactive_gap_epoch_ignores_publications_tokens_and_checkpoint_time() {
+        let (mut reducer, _shared, run_id, key) = rate_reducer();
+        reducer.begin_rate_epoch();
+        reducer.apply_telemetry(&key, 10_000, 150, None, None, None);
+
+        assert!(reducer.checkpoint_run_rates(20_000).is_empty());
+        assert_eq!(reducer.model.run_rate_cursor(&run_id), None);
+        assert_eq!(reducer.model.run_rate_totals(&run_id), None);
+
+        reducer.activate_rate_epoch(20_000);
+        assert!(reducer.checkpoint_run_rates(20_000).is_empty());
+        assert_eq!(
+            reducer
+                .model
+                .run_rate_cursor(&run_id)
+                .map(|cursor| cursor.baseline_output_tokens),
+            Some(150),
+            "the first post-reconciliation baseline must exclude offline tokens"
+        );
+    }
+
+    #[test]
+    fn reconciliation_drains_newly_attributable_telemetry_before_live_baseline() {
+        let (mut reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "pending-before-snapshot".to_owned(),
+        };
+        reducer.apply_telemetry(&key, 1_000, 100, None, None, None);
+
+        reducer
+            .reconcile_snapshot(native_snapshot("pending-before-snapshot"))
+            .unwrap();
+
+        let run_id = reducer.model.task_run_by_key(&key).unwrap().run_id;
+        assert_eq!(
+            reducer
+                .model
+                .telemetry(&run_id)
+                .map(|value| value.output_tokens),
+            Some(100),
+            "the authoritative snapshot must make the queued sample attributable"
+        );
+        assert_eq!(
+            reducer
+                .model
+                .run_rate_cursor(&run_id)
+                .map(|cursor| cursor.baseline_output_tokens),
+            Some(100),
+            "pre-snapshot tokens belong in the fresh live baseline"
+        );
+        assert_eq!(
+            reducer.model.run_rate_totals(&run_id),
+            None,
+            "pre-snapshot tokens must never enter the measured numerator"
+        );
+    }
+
+    #[test]
+    fn durable_history_finalization_rebaselines_before_live_measurement_resumes() {
+        let (mut reducer, _shared, run_id, _) = rate_reducer();
+        let epoch = reducer.begin_rate_epoch();
+        let finalized_at_ms = unix_now_ms();
+        reducer.activate_rate_epoch(finalized_at_ms.saturating_sub(4_000));
+
+        add_rate_tokens(
+            &mut reducer,
+            run_id,
+            finalized_at_ms.saturating_sub(3_000),
+            100,
+        );
+        reducer.observe_run_rates(RateObservation {
+            run_id,
+            origin: RateObservationOrigin::Historical,
+            observed_at_ms: finalized_at_ms.saturating_sub(3_000),
+        });
+        add_rate_tokens(
+            &mut reducer,
+            run_id,
+            finalized_at_ms.saturating_sub(2_000),
+            40,
+        );
+        reducer.observe_run_rates(RateObservation {
+            run_id,
+            origin: RateObservationOrigin::Historical,
+            observed_at_ms: finalized_at_ms.saturating_sub(2_000),
+        });
+
+        let drain_id = crate::model::HistoryDrainId::new("codex:rate-finalization").unwrap();
+        assert!(
+            reducer.apply_history_finalization(&crate::store::HistoryDrainFinalization {
+                drain_id,
+                finalized_at_ms,
+                runs: vec![crate::store::FinalizedHistoryRun {
+                    run_id,
+                    state: reducer
+                        .model
+                        .task_run_v6_state(&run_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                }],
+            })
+        );
+
+        add_rate_tokens(&mut reducer, run_id, finalized_at_ms + 1_000, 10);
+        observe_live_rate(&mut reducer, run_id, epoch, finalized_at_ms + 1_000);
+        assert_eq!(
+            reducer.model.run_rate_totals(&run_id),
+            None,
+            "the first real post-barrier live observation establishes a baseline only"
+        );
+
+        add_rate_tokens(&mut reducer, run_id, finalized_at_ms + 2_000, 10);
+        observe_live_rate(&mut reducer, run_id, epoch, finalized_at_ms + 2_000);
+        assert_eq!(
+            reducer.model.run_rate_totals(&run_id),
+            Some(&RunRateTotals {
+                output_tokens: 10,
+                working_ms: 1_000,
+            })
+        );
+    }
+
+    #[test]
+    fn retained_history_does_not_expand_activation_or_checkpoint_rate_operations() {
+        let active_run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run(
+            active_run_id,
+            RunKey::Controller("active-rate".to_owned()),
+            1,
+            TaskState::Running,
+        ));
+        model.insert_execution(execution(
+            active_run_id,
+            "active-rate-execution",
+            ExecState::Working,
+        ));
+        model.set_pane_agent_status("pane-1".to_owned(), PaneAgentStatus::Working);
+        for ordinal in 2..=257 {
+            let run_id = RunId::new();
+            model.insert_task_run(run_with_controller_evidence(
+                run_id,
+                RunKey::Controller(format!("retained-terminal-{ordinal}")),
+                ordinal,
+                TaskState::Completed,
+            ));
+        }
+        model
+            .telemetry_entry(active_run_id, 1_000)
+            .accumulate(100, None, None, None, false);
+        let (mut reducer, _shared) = Reducer::new(restored(model, 258));
+        reducer.begin_rate_epoch();
+
+        reducer.take_rate_observation_count();
+        reducer.activate_rate_epoch(1_000);
+        let activation_observations = reducer.take_rate_observation_count();
+        reducer.checkpoint_run_rates(2_000);
+        let checkpoint_observations = reducer.take_rate_observation_count();
+
+        assert_eq!(
+            (activation_observations, checkpoint_observations),
+            (1, 1),
+            "256 retained terminal runs must add zero rate operations"
+        );
+    }
+
+    #[test]
+    fn one_publication_derives_status_evidence_once_for_multiple_touched_runs() {
+        let mut model = DomainModel::default();
+        let mut touched = Vec::new();
+        for ordinal in 1..=64 {
+            let run_id = RunId::new();
+            let key = RunKey::Controller(format!("publication-rate-{ordinal}"));
+            model.insert_task_run(run(run_id, key.clone(), ordinal, TaskState::Running));
+            model.insert_execution(Execution {
+                execution_id: format!("publication-execution-{ordinal}"),
+                pane_id: format!("publication-pane-{ordinal}"),
+                terminal_id: format!("publication-terminal-{ordinal}"),
+                task_run_id: run_id,
+                state: ExecState::Working,
+            });
+            if ordinal <= 2 {
+                touched.push((run_id, key));
+            }
+        }
+        let (mut reducer, _shared) = Reducer::new(restored(model, 65));
+        let epoch = reducer.begin_rate_epoch();
+        reducer.rate_epoch_active = true;
+        for (run_id, key) in &touched {
+            reducer.model.set_run_rate_cursor(
+                *run_id,
+                crate::model::RunRateCursor {
+                    baseline_output_tokens: 0,
+                    last_observed_at_ms: 1_000,
+                    working: true,
+                    measurement_epoch: epoch,
+                    identity_basis: key.clone(),
+                    live_baseline: true,
+                },
+            );
+            reducer.pending_rate_observation_runs.insert(*run_id);
+        }
+
+        crate::status::reset_rate_status_evidence_visits();
+        reducer.publish();
+        assert_eq!(
+            crate::status::rate_status_evidence_visits(),
+            64,
+            "two touched runs must share one 64-execution status derivation"
+        );
+    }
 
     #[test]
     fn history_finalization_is_staged_then_published_once_after_known_commit() {
@@ -3817,7 +4753,7 @@ mod tests {
         controller.metadata.provider = Some(Provider::Codex);
         controller.metadata.native_session_id = Some("historical-new-run".to_owned());
 
-        let prior = reducer.begin_provider_observation(&origin);
+        let prior = reducer.begin_provider_observation(&origin, 2_000);
         let delta = reducer.validate_controller_event(&controller).unwrap();
         let operations = reducer.commit_staged_unqueued(delta).unwrap();
         let batch =
@@ -3839,7 +4775,7 @@ mod tests {
         );
         sibling_controller.metadata.provider = Some(Provider::Claude);
         sibling_controller.metadata.native_session_id = Some("historical-sibling-run".to_owned());
-        let sibling_prior = reducer.begin_provider_observation(&sibling_origin);
+        let sibling_prior = reducer.begin_provider_observation(&sibling_origin, 2_200);
         let sibling_delta = reducer
             .validate_controller_event(&sibling_controller)
             .unwrap();

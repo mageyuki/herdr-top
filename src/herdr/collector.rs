@@ -582,6 +582,8 @@ pub(crate) struct RuntimePersistence {
     recovery: PersistenceRecovery,
     #[cfg(test)]
     test_write_injection: Option<TestWriteInjection>,
+    #[cfg(test)]
+    repeating_test_write_injection: Option<TestWriteInjection>,
 }
 
 impl RuntimePersistence {
@@ -646,6 +648,8 @@ impl RuntimePersistence {
             recovery: PersistenceRecovery::new(retry_interval),
             #[cfg(test)]
             test_write_injection: None,
+            #[cfg(test)]
+            repeating_test_write_injection: None,
         };
         persistence.refresh_pane_coverage(model);
         persistence.publish();
@@ -696,10 +700,32 @@ impl RuntimePersistence {
     }
 
     #[cfg(test)]
-    fn injected_write_result(
+    fn inject_repeating_write_result(&mut self, injection: TestWriteInjection) {
+        self.repeating_test_write_injection = Some(injection);
+    }
+
+    #[cfg(test)]
+    fn take_injected_write_result(
         &mut self,
         class: RuntimeCommandClass,
-    ) -> Option<Result<RuntimeWriteOutcome, WriterError>> {
+    ) -> Option<TestWriteResult> {
+        if let Some(injection) = self.repeating_test_write_injection.as_mut()
+            && matches!(
+                (injection.class, class),
+                (RuntimeCommandClass::Batch, RuntimeCommandClass::Batch)
+                    | (
+                        RuntimeCommandClass::OwnerLocation,
+                        RuntimeCommandClass::OwnerLocation
+                    )
+            )
+        {
+            if injection.successes_before_failure > 0 {
+                injection.successes_before_failure -= 1;
+                return None;
+            }
+            return Some(injection.result);
+        }
+
         let injection = self.test_write_injection.as_mut()?;
         if !matches!(
             (injection.class, class),
@@ -715,7 +741,15 @@ impl RuntimePersistence {
             injection.successes_before_failure -= 1;
             return None;
         }
-        let result = self.test_write_injection.take().unwrap().result;
+        Some(self.test_write_injection.take().unwrap().result)
+    }
+
+    #[cfg(test)]
+    fn injected_write_result(
+        &mut self,
+        class: RuntimeCommandClass,
+    ) -> Option<Result<RuntimeWriteOutcome, WriterError>> {
+        let result = self.take_injected_write_result(class)?;
         Some(match result {
             TestWriteResult::Unexpected => Err(WriterError::Closed),
             TestWriteResult::Classified(RuntimeWriteOutcome::Skipped) => {
@@ -1357,12 +1391,100 @@ async fn persist_submission(
     reducer: &mut Reducer,
     batch: PersistBatch,
 ) -> Result<RuntimeWriteOutcome, WriterError> {
-    let outcome = persistence
-        .apply_v6(reducer.decorate_v6_batch(batch))
-        .await?;
+    let batch = reducer.decorate_v6_batch(batch);
+    persist_decorated_submission(persistence, reducer, batch).await
+}
+
+async fn persist_reconciliation_submission(
+    persistence: &mut RuntimePersistence,
+    reducer: &mut Reducer,
+    batch: PersistBatch,
+) -> Result<RuntimeWriteOutcome, WriterError> {
+    let batch = reducer.decorate_reconciliation_batch(batch);
+    persist_decorated_submission(persistence, reducer, batch).await
+}
+
+async fn persist_decorated_submission(
+    persistence: &mut RuntimePersistence,
+    reducer: &mut Reducer,
+    batch: PersistV6Batch,
+) -> Result<RuntimeWriteOutcome, WriterError> {
+    let outcome = persistence.apply_v6(batch).await?;
     reducer.complete_operator_submission(outcome);
     persist_recovery_marker_if_pending(persistence, reducer).await?;
     Ok(outcome)
+}
+
+async fn persist_rate_checkpoint(
+    persistence: &mut RuntimePersistence,
+    reducer: &mut Reducer,
+    operations: PersistBatch,
+    observed_at_ms: i64,
+) -> Result<RuntimeWriteOutcome, WriterError> {
+    let rate_totals = reducer.checkpoint_run_rates(observed_at_ms);
+    if operations.is_empty() && rate_totals.is_empty() {
+        return Ok(RuntimeWriteOutcome::Skipped);
+    }
+    let batch = reducer.decorate_rate_checkpoint(operations, rate_totals.clone());
+    let outcome = match persistence.apply_v6(batch).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            reducer.restore_dirty_rate_totals(&rate_totals);
+            return Err(error);
+        }
+    };
+    if !matches!(
+        outcome,
+        RuntimeWriteOutcome::Durable | RuntimeWriteOutcome::CommittedButDegraded(_)
+    ) {
+        reducer.restore_dirty_rate_totals(&rate_totals);
+    }
+    reducer.complete_operator_submission(outcome);
+    persist_recovery_marker_if_pending(persistence, reducer).await?;
+    Ok(outcome)
+}
+
+async fn persist_graceful_rate_checkpoint(
+    persistence: &mut RuntimePersistence,
+    reducer: &mut Reducer,
+    observed_at_ms: i64,
+) -> Result<(), CollectorError> {
+    let mut final_outcome = RuntimeWriteOutcome::Skipped;
+    for attempt in 0..2 {
+        final_outcome =
+            persist_rate_checkpoint(persistence, reducer, Vec::new(), observed_at_ms).await?;
+        if !reducer.has_dirty_rate_totals() {
+            return Ok(());
+        }
+        if attempt == 0 {
+            // A classified facade failure may leave the writer itself healthy. Refreshing the
+            // facade permits the repository's existing recovery marker path to run before one
+            // bounded retry; a genuinely degraded writer remains degraded and is not spun on.
+            persistence.observe_writer_health();
+        }
+    }
+
+    let outcome = match final_outcome {
+        RuntimeWriteOutcome::NotCommitted(_) => "not_committed",
+        RuntimeWriteOutcome::DurabilityUnknown(_) => "durability_unknown",
+        RuntimeWriteOutcome::Skipped => "skipped",
+        RuntimeWriteOutcome::Durable | RuntimeWriteOutcome::CommittedButDegraded(_) => {
+            unreachable!("known committed rate totals must not remain dirty")
+        }
+    };
+    Err(CollectorError::GracefulRateCheckpointNotCommitted { outcome })
+}
+
+fn begin_rate_gap(reducer: &mut Reducer) {
+    reducer.begin_rate_epoch();
+}
+
+fn begin_rate_gap_if_overflowed(reducer: &mut Reducer, overflowed: &AtomicBool) -> bool {
+    if !overflowed.swap(false, Ordering::AcqRel) {
+        return false;
+    }
+    begin_rate_gap(reducer);
+    true
 }
 
 async fn persist_recovery_marker_if_pending(
@@ -1462,6 +1584,9 @@ pub enum CollectorError {
     /// The SQLite writer rejected an operation.
     #[error(transparent)]
     Writer(#[from] WriterError),
+    /// An orderly shutdown had pending rate totals but could not prove they committed.
+    #[error("graceful rate checkpoint was not durably committed: {outcome}")]
+    GracefulRateCheckpointNotCommitted { outcome: &'static str },
     /// Herdr returned an invalid or failed wire exchange.
     #[error(transparent)]
     Wire(#[from] WireError),
@@ -2265,6 +2390,7 @@ async fn run_collector(
                         "Herdr event subscription failed; retrying"
                     );
                 }
+                begin_rate_gap(&mut reducer);
                 provider.set_herdr_quality(
                     ObservationQuality::Disconnected,
                     &mut persistence,
@@ -2295,6 +2421,7 @@ async fn run_collector(
         } else {
             GapKind::Reconnect
         };
+        begin_rate_gap(&mut reducer);
         provider.set_herdr_quality(ObservationQuality::Reconciling, &mut persistence, &shared);
 
         let reader_cancellation = cancellation.child_token();
@@ -2367,6 +2494,7 @@ async fn run_collector(
         }
         match reader_report.reason {
             EventReaderExitReason::WireError(error) => {
+                begin_rate_gap(&mut reducer);
                 provider.set_herdr_quality(
                     ObservationQuality::Disconnected,
                     &mut persistence,
@@ -2382,6 +2510,7 @@ async fn run_collector(
         match outcome.outcome {
             SubscriptionOutcome::Cancelled => break,
             SubscriptionOutcome::Reconnect(reason) => {
+                begin_rate_gap(&mut reducer);
                 provider.set_herdr_quality(
                     ObservationQuality::Disconnected,
                     &mut persistence,
@@ -2410,6 +2539,7 @@ async fn run_collector(
                 }
             }
             SubscriptionOutcome::Ended => {
+                begin_rate_gap(&mut reducer);
                 provider.set_herdr_quality(
                     ObservationQuality::Disconnected,
                     &mut persistence,
@@ -2426,7 +2556,8 @@ async fn run_collector(
         &shared,
         &mut persistence,
     )
-    .await
+    .await?;
+    persist_graceful_rate_checkpoint(&mut persistence, &mut reducer, unix_now_ms()).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2600,7 +2731,7 @@ async fn converge(
                 kind: gap_kind,
             }));
         }
-        if persist_submission(persistence, reducer, std::mem::take(&mut batch))
+        if persist_reconciliation_submission(persistence, reducer, std::mem::take(&mut batch))
             .await
             .is_err()
         {
@@ -2688,6 +2819,7 @@ async fn converge(
                 .await?
                 {
                     ReplayOutcome::TopologyRefreshRequired(RefreshOrigin::LiveRefresh) => {
+                        begin_rate_gap(reducer);
                         provider.set_herdr_quality(
                             ObservationQuality::Reconciling,
                             persistence,
@@ -2731,15 +2863,9 @@ async fn converge(
                     }
                 }
             }
-            ReplayOutcome::TopologyRefreshRequired(origin)
-            | ReplayOutcome::RecoveryRefreshRequired(origin) => {
-                let cause = match replay {
-                    ReplayOutcome::TopologyRefreshRequired(_) => {
-                        ImmediateRequestCause::TopologyHint
-                    }
-                    ReplayOutcome::RecoveryRefreshRequired(_) => ImmediateRequestCause::Overflow,
-                    _ => unreachable!("dirty replay matched an invalid outcome"),
-                };
+            ReplayOutcome::TopologyRefreshRequired(origin) => {
+                let cause = ImmediateRequestCause::TopologyHint;
+                begin_rate_gap(reducer);
                 provider.set_herdr_quality(ObservationQuality::Reconciling, persistence, shared);
                 refresh_origin = origin;
                 if immediate_refresh_requests >= RESNAPSHOT_ATTEMPTS {
@@ -2751,6 +2877,60 @@ async fn converge(
                         owner,
                         session,
                         &mut events,
+                        &overflowed,
+                        enrichment,
+                        cancellation,
+                        &mut pending_closures,
+                        controller_requests,
+                        operator_commands,
+                        provider,
+                        liveness_policy,
+                        primary_stream_diagnostics,
+                        refresh_origin,
+                    )
+                    .await?
+                    {
+                        ReconcilingOutcome::RestartGeneration(origin) => {
+                            refresh_origin = origin;
+                            immediate_refresh_requests = 0;
+                            continue;
+                        }
+                        ReconcilingOutcome::Ended => {
+                            return Ok(ConvergeOutcome::new(
+                                SubscriptionOutcome::Ended,
+                                gap_committed,
+                            ));
+                        }
+                        ReconcilingOutcome::Cancelled => {
+                            return Ok(ConvergeOutcome::new(
+                                SubscriptionOutcome::Cancelled,
+                                gap_committed,
+                            ));
+                        }
+                        ReconcilingOutcome::Reconnect(reason) => {
+                            return Ok(ConvergeOutcome::new(
+                                SubscriptionOutcome::Reconnect(reason),
+                                gap_committed,
+                            ));
+                        }
+                    }
+                }
+                immediate_request_cause = Some(cause);
+            }
+            ReplayOutcome::RecoveryRefreshRequired(origin) => {
+                let cause = ImmediateRequestCause::Overflow;
+                provider.set_herdr_quality(ObservationQuality::Reconciling, persistence, shared);
+                refresh_origin = origin;
+                if immediate_refresh_requests >= RESNAPSHOT_ATTEMPTS {
+                    match monitor_reconciling(
+                        sock,
+                        reducer,
+                        shared,
+                        persistence,
+                        owner,
+                        session,
+                        &mut events,
+                        &overflowed,
                         enrichment,
                         cancellation,
                         &mut pending_closures,
@@ -2822,16 +3002,25 @@ async fn replay_generation(
 ) -> Result<ReplayOutcome, CollectorError> {
     let mut refresh_required = false;
     let mut channel_state = drain_events(events, buffered, overflowed, origin);
+    if recover_replay_overflow(reducer, buffered, overflowed, origin) {
+        return Ok(ReplayOutcome::RecoveryRefreshRequired(origin));
+    }
 
     loop {
         if cancellation.is_cancelled() {
             return Ok(ReplayOutcome::Cancelled);
+        }
+        if recover_replay_overflow(reducer, buffered, overflowed, origin) {
+            return Ok(ReplayOutcome::RecoveryRefreshRequired(origin));
         }
         let _ = retry_pending_history_mutation(provider, reducer, persistence).await?;
         enrichment.discard_episode_payloads();
         while let Some(admitted) = buffered.pop_front() {
             if cancellation.is_cancelled() {
                 return Ok(ReplayOutcome::Cancelled);
+            }
+            if recover_replay_overflow(reducer, buffered, overflowed, origin) {
+                return Ok(ReplayOutcome::RecoveryRefreshRequired(origin));
             }
             let _ = retry_pending_history_mutation(provider, reducer, persistence).await?;
             let (received, admission) = admitted.into_parts();
@@ -2862,6 +3051,9 @@ async fn replay_generation(
                 }
             }
             channel_state = drain_events(events, buffered, overflowed, origin);
+            if recover_replay_overflow(reducer, buffered, overflowed, origin) {
+                return Ok(ReplayOutcome::RecoveryRefreshRequired(origin));
+            }
         }
         if channel_state == EventChannelState::Closed {
             return Ok(ReplayOutcome::Ended);
@@ -2909,7 +3101,7 @@ async fn replay_generation(
         }
     }
 
-    if overflowed.load(Ordering::Acquire) {
+    if recover_replay_overflow(reducer, buffered, overflowed, origin) {
         Ok(ReplayOutcome::RecoveryRefreshRequired(origin))
     } else if refresh_required {
         Ok(ReplayOutcome::TopologyRefreshRequired(origin))
@@ -3211,12 +3403,22 @@ async fn monitor_live(
         if cancellation.is_cancelled() {
             return Ok(ReplayOutcome::Cancelled);
         }
+        if begin_rate_gap_if_overflowed(reducer, overflowed) {
+            return Ok(ReplayOutcome::RecoveryRefreshRequired(
+                RefreshOrigin::LiveRefresh,
+            ));
+        }
         let _ = retry_pending_history_mutation(provider, reducer, persistence).await?;
         let mut provider_event = None;
         let provider_ingress_open = provider.provider_ingress_open();
         let received = tokio::select! {
             () = cancellation.cancelled() => return Ok(ReplayOutcome::Cancelled),
             request = receive_controller(controller_requests) => {
+                if begin_rate_gap_if_overflowed(reducer, overflowed) {
+                    return Ok(ReplayOutcome::RecoveryRefreshRequired(
+                        RefreshOrigin::LiveRefresh,
+                    ));
+                }
                 service_controller(
                     request,
                     controller_requests,
@@ -3230,6 +3432,11 @@ async fn monitor_live(
                 continue;
             }
             command = receive_operator_command(operator_commands) => {
+                if begin_rate_gap_if_overflowed(reducer, overflowed) {
+                    return Ok(ReplayOutcome::RecoveryRefreshRequired(
+                        RefreshOrigin::LiveRefresh,
+                    ));
+                }
                 if service_operator_command(
                     command,
                     operator_commands,
@@ -3251,6 +3458,11 @@ async fn monitor_live(
                 PrimaryProviderReceipt::Primary(Some(received)) => LiveReceipt::Primary(received),
                 PrimaryProviderReceipt::Primary(None) => return Ok(ReplayOutcome::Ended),
                 PrimaryProviderReceipt::Provider => {
+                    if begin_rate_gap_if_overflowed(reducer, overflowed) {
+                        return Ok(ReplayOutcome::RecoveryRefreshRequired(
+                            RefreshOrigin::LiveRefresh,
+                        ));
+                    }
                     service_provider_event(
                         provider_event.take(),
                         provider,
@@ -3295,6 +3507,11 @@ async fn monitor_live(
             },
             _ = stale_sweep.tick() => LiveReceipt::Sweep,
         };
+        if begin_rate_gap_if_overflowed(reducer, overflowed) {
+            return Ok(ReplayOutcome::RecoveryRefreshRequired(
+                RefreshOrigin::LiveRefresh,
+            ));
+        }
         match received {
             LiveReceipt::Probe(WatchdogProbeOutcome::HealthyIdle) => {
                 watchdog_probe = None;
@@ -3313,15 +3530,17 @@ async fn monitor_live(
                 return Ok(ReplayOutcome::Reconnect(reason));
             }
             LiveReceipt::Sweep => {
-                let mut persist = reducer.sweep_stale(unix_now_ms());
+                let observed_at_ms = unix_now_ms();
+                let mut persist = reducer.sweep_stale(observed_at_ms);
                 persist.extend(apply_pending_topology_closures(
                     reducer,
                     shared,
                     session,
                     pending_closures,
                 )?);
-                if !persist.is_empty() {
-                    let _ = persist_submission(persistence, reducer, persist).await?;
+                let outcome =
+                    persist_rate_checkpoint(persistence, reducer, persist, observed_at_ms).await?;
+                if outcome != RuntimeWriteOutcome::Skipped {
                     provider.publish_targets(shared);
                 }
                 let _ = persistence.cleanup(unix_now_ms()).await?;
@@ -3353,7 +3572,6 @@ async fn monitor_live(
                 if classify_primary_event(&received.event) == PrimaryEventClass::TopologyHint {
                     record_topology_hint_diagnostics(&received);
                     admission.complete();
-                    overflowed.store(false, Ordering::Release);
                     return Ok(ReplayOutcome::TopologyRefreshRequired(
                         RefreshOrigin::LiveRefresh,
                     ));
@@ -3372,7 +3590,7 @@ async fn monitor_live(
                 )
                 .await?;
                 enrichment.apply_target_delta(target_delta);
-                if overflowed.swap(false, Ordering::AcqRel) {
+                if begin_rate_gap_if_overflowed(reducer, overflowed) {
                     return Ok(ReplayOutcome::RecoveryRefreshRequired(
                         RefreshOrigin::LiveRefresh,
                     ));
@@ -3391,6 +3609,7 @@ async fn monitor_reconciling(
     owner: &mut OwnerTracker,
     session: &str,
     events: &mut mpsc::Receiver<Admitted<ReceivedEvent>>,
+    overflowed: &AtomicBool,
     enrichment: &mut EnrichmentConverge,
     cancellation: &CancellationToken,
     pending_closures: &mut PendingTopologyClosures,
@@ -3416,6 +3635,9 @@ async fn monitor_reconciling(
         if cancellation.is_cancelled() {
             return Ok(ReconcilingOutcome::Cancelled);
         }
+        if begin_rate_gap_if_overflowed(reducer, overflowed) {
+            return Ok(ReconcilingOutcome::RestartGeneration(origin));
+        }
         let _ = retry_pending_history_mutation(provider, reducer, persistence).await?;
         enrichment.discard_episode_payloads();
         let mut provider_event = None;
@@ -3423,6 +3645,9 @@ async fn monitor_reconciling(
         let received = tokio::select! {
             () = cancellation.cancelled() => return Ok(ReconcilingOutcome::Cancelled),
             request = receive_controller(controller_requests) => {
+                if begin_rate_gap_if_overflowed(reducer, overflowed) {
+                    return Ok(ReconcilingOutcome::RestartGeneration(origin));
+                }
                 service_controller(
                     request,
                     controller_requests,
@@ -3436,6 +3661,9 @@ async fn monitor_reconciling(
                 continue;
             }
             command = receive_operator_command(operator_commands) => {
+                if begin_rate_gap_if_overflowed(reducer, overflowed) {
+                    return Ok(ReconcilingOutcome::RestartGeneration(origin));
+                }
                 if service_operator_command(
                     command,
                     operator_commands,
@@ -3459,6 +3687,9 @@ async fn monitor_reconciling(
                 }
                 PrimaryProviderReceipt::Primary(None) => return Ok(ReconcilingOutcome::Ended),
                 PrimaryProviderReceipt::Provider => {
+                    if begin_rate_gap_if_overflowed(reducer, overflowed) {
+                        return Ok(ReconcilingOutcome::RestartGeneration(origin));
+                    }
                     service_provider_event(
                         provider_event.take(),
                         provider,
@@ -3488,9 +3719,13 @@ async fn monitor_reconciling(
             },
             _ = stale_sweep.tick() => ReconcilingReceipt::Sweep,
         };
+        if begin_rate_gap_if_overflowed(reducer, overflowed) {
+            return Ok(ReconcilingOutcome::RestartGeneration(origin));
+        }
         let received = match received {
             ReconcilingReceipt::Probe(WatchdogProbeOutcome::HealthyIdle) => {
                 tracing::debug!("silent reconciling Herdr subscription passed its topology probe");
+                begin_rate_gap(reducer);
                 return Ok(ReconcilingOutcome::RestartGeneration(origin));
             }
             ReconcilingReceipt::Probe(WatchdogProbeOutcome::Inconclusive) => {
@@ -3506,15 +3741,17 @@ async fn monitor_reconciling(
                 return Ok(ReconcilingOutcome::Reconnect(reason));
             }
             ReconcilingReceipt::Sweep => {
-                let mut persist = reducer.sweep_stale(unix_now_ms());
+                let observed_at_ms = unix_now_ms();
+                let mut persist = reducer.sweep_stale(observed_at_ms);
                 persist.extend(apply_pending_topology_closures(
                     reducer,
                     shared,
                     session,
                     pending_closures,
                 )?);
-                if !persist.is_empty() {
-                    let _ = persist_submission(persistence, reducer, persist).await?;
+                let outcome =
+                    persist_rate_checkpoint(persistence, reducer, persist, observed_at_ms).await?;
+                if outcome != RuntimeWriteOutcome::Skipped {
                     provider.publish_targets(shared);
                 }
                 let _ = persistence.cleanup(unix_now_ms()).await?;
@@ -3550,6 +3787,9 @@ async fn monitor_reconciling(
             provider,
         )
         .await?;
+        if begin_rate_gap_if_overflowed(reducer, overflowed) {
+            return Ok(ReconcilingOutcome::RestartGeneration(origin));
+        }
         if produced_observations {
             watchdog_probe = None;
             watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
@@ -6254,6 +6494,34 @@ fn retain_primary_event_or_mark_overflow(
     admission.complete();
 }
 
+fn recover_replay_overflow(
+    reducer: &mut Reducer,
+    buffered: &mut VecDeque<Admitted<ReceivedEvent>>,
+    overflowed: &AtomicBool,
+    origin: RefreshOrigin,
+) -> bool {
+    if !begin_rate_gap_if_overflowed(reducer, overflowed) {
+        return false;
+    }
+
+    // Nothing admitted in an incomplete generation may reach the reducer. Preserve the
+    // diagnostics and admission accounting that describe what was discarded, then recover from
+    // a fresh authoritative snapshot.
+    while let Some(admitted) = buffered.pop_front() {
+        let (received, admission) = admitted.into_parts();
+        if classify_primary_event(&received.event) == PrimaryEventClass::TopologyHint {
+            record_topology_hint_diagnostics(&received);
+            if origin == RefreshOrigin::CatchUp {
+                received
+                    .primary_stream_diagnostics
+                    .record_suppressed_topology_frame();
+            }
+        }
+        admission.complete();
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn apply_received_event(
     reducer: &mut Reducer,
@@ -6543,7 +6811,11 @@ async fn apply_provider_event_with_admission(
     pending_history_mutation: &mut Option<PendingHistoryMutation>,
 ) -> Result<(), CollectorError> {
     let provider_at_ms = provider_event_timestamp_ms(&event);
-    let mut prior = reducer.begin_provider_observation(&origin);
+    let observed_at_ms = match &origin {
+        crate::model::ObservationOrigin::Historical { .. } => provider_at_ms,
+        crate::model::ObservationOrigin::Live => unix_now_ms(),
+    };
+    let mut prior = reducer.begin_provider_observation(&origin, observed_at_ms);
     match event {
         ProviderEvent::Synthesized(mut event) => {
             event.metadata.herdr_session = session.to_owned();
@@ -8769,8 +9041,426 @@ mod tests {
     };
     use crate::store::{
         LedgerEntry, PersistExecution, PersistHistoryDrain, PersistHistoryDrainRun, PersistTaskRun,
-        PersistTaskRunV6, PersistV6Batch, open_reader, open_writer, spawn_writer,
+        PersistTaskRunV6, PersistV6Batch, RestoredState, open_reader, open_writer, spawn_writer,
     };
+
+    #[test]
+    fn disconnected_reconciling_and_overflow_gap_transitions_advance_rate_epochs() {
+        let (mut reducer, _shared) = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let initial = reducer.begin_rate_epoch();
+
+        for transition in ["disconnected", "reconciling", "overflow-recovery"] {
+            let prior = reducer.rate_epoch();
+            begin_rate_gap(&mut reducer);
+            assert_eq!(
+                reducer.rate_epoch(),
+                prior.wrapping_add(1),
+                "{transition} must establish a new epoch before its next sweep"
+            );
+        }
+        assert_eq!(reducer.rate_epoch(), initial.wrapping_add(3));
+    }
+
+    #[tokio::test]
+    async fn graceful_rate_checkpoint_persists_the_final_tail_without_a_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let run_id = RunId::new();
+        let key = RunKey::Controller("final-rate-tail".to_owned());
+        let task_run = TaskRun {
+            run_id,
+            key: key.clone(),
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+            created_at_ms: Some(1_000),
+            updated_at_ms: Some(1_000),
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        };
+        let execution = Execution {
+            execution_id: "final-rate-execution".to_owned(),
+            pane_id: "final-rate-pane".to_owned(),
+            terminal_id: "final-rate-terminal".to_owned(),
+            task_run_id: run_id,
+            state: ExecState::Working,
+        };
+        let mut store = open_writer(&root).unwrap();
+        store
+            .apply_batch(vec![
+                PersistOp::UpsertTaskRun(PersistTaskRun {
+                    task_run: task_run.clone(),
+                    native_session: None,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                    finished_at_ms: None,
+                }),
+                PersistOp::UpsertExecution(PersistExecution {
+                    execution: execution.clone(),
+                    started_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                    ended_at_ms: None,
+                }),
+            ])
+            .unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut persistence, _diagnostics) =
+            RuntimePersistence::new_for_test(writer, Arc::new(RecordingOccurrenceSink::default()));
+
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        model.insert_execution(execution);
+        model
+            .telemetry_entry(run_id, 1_000)
+            .accumulate(100, None, None, None, false);
+        let (mut reducer, _shared) = Reducer::new(RestoredState {
+            model,
+            next_ordinal: 2,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        reducer.begin_rate_epoch();
+        reducer.activate_rate_epoch(1_000);
+        assert!(reducer.checkpoint_run_rates(1_000).is_empty());
+
+        reducer.begin_provider_observation(&crate::model::ObservationOrigin::Live, 3_000);
+        reducer.apply_telemetry_with_breakdown(
+            &key,
+            3_000,
+            20,
+            crate::model::TokenBreakdown::default(),
+            crate::model::TurnAttr {
+                model: None,
+                effort: None,
+                sandbox: None,
+            },
+        );
+        reducer.cancel_provider_observation();
+        assert_eq!(
+            persist_rate_checkpoint(&mut persistence, &mut reducer, Vec::new(), 3_000)
+                .await
+                .unwrap(),
+            RuntimeWriteOutcome::Durable
+        );
+        lifecycle.shutdown().await.unwrap();
+
+        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+        assert_eq!(
+            restored.model.run_rate_totals(&run_id),
+            Some(&crate::model::RunRateTotals {
+                output_tokens: 20,
+                working_ms: 2_000,
+            })
+        );
+        assert_eq!(restored.model.run_rate_cursor(&run_id), None);
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_requires_a_known_commit_for_every_pending_rate_tail() {
+        let cases = [
+            ("durable", RuntimeWriteOutcome::Durable, true),
+            (
+                "committed-but-degraded",
+                RuntimeWriteOutcome::CommittedButDegraded(failure(
+                    PersistenceOperation::Apply,
+                    PersistencePhase::PostApplyCommit,
+                    PersistenceFailureCode::Io,
+                    DurabilityDisposition::Committed,
+                )),
+                true,
+            ),
+            (
+                "not-committed",
+                RuntimeWriteOutcome::NotCommitted(failure(
+                    PersistenceOperation::Apply,
+                    PersistencePhase::CommandExecution,
+                    PersistenceFailureCode::Sqlite,
+                    DurabilityDisposition::NotCommitted,
+                )),
+                false,
+            ),
+            (
+                "durability-unknown",
+                RuntimeWriteOutcome::DurabilityUnknown(failure(
+                    PersistenceOperation::Apply,
+                    PersistencePhase::Acknowledgement,
+                    PersistenceFailureCode::AcknowledgementDropped,
+                    DurabilityDisposition::Unknown,
+                )),
+                false,
+            ),
+            ("skipped", RuntimeWriteOutcome::Skipped, false),
+        ];
+
+        for (label, injected_outcome, expect_success) in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+            let store = open_writer(&root).unwrap();
+            let (lifecycle, writer) = spawn_writer(store).unwrap();
+            let (mut persistence, _diagnostics) = RuntimePersistence::new_for_test(
+                writer,
+                Arc::new(RecordingOccurrenceSink::default()),
+            );
+            persistence.inject_repeating_write_result(TestWriteInjection {
+                class: RuntimeCommandClass::Batch,
+                successes_before_failure: 0,
+                result: TestWriteResult::Classified(injected_outcome),
+            });
+
+            let run_id = RunId::new();
+            let key = RunKey::Controller(format!("graceful-outcome-{label}"));
+            let baseline_at_ms = unix_now_ms();
+            let mut model = DomainModel::default();
+            model.insert_task_run(TaskRun {
+                run_id,
+                key: key.clone(),
+                display_ordinal: DisplayOrdinal::new(1),
+                state: TaskState::Running,
+                has_controller_task_state_event: true,
+                created_at_ms: Some(baseline_at_ms),
+                updated_at_ms: Some(baseline_at_ms),
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
+            });
+            model.insert_execution(Execution {
+                execution_id: format!("graceful-execution-{label}"),
+                pane_id: format!("graceful-pane-{label}"),
+                terminal_id: format!("graceful-terminal-{label}"),
+                task_run_id: run_id,
+                state: ExecState::Working,
+            });
+            model
+                .telemetry_entry(run_id, baseline_at_ms)
+                .accumulate(100, None, None, None, false);
+            let (mut reducer, shared) = Reducer::new(RestoredState {
+                model,
+                next_ordinal: 2,
+                next_ingest_seq: Some(1),
+                event_ledger: Vec::new(),
+            });
+            reducer.begin_rate_epoch();
+            reducer.activate_rate_epoch(baseline_at_ms);
+            reducer.apply_telemetry(&key, baseline_at_ms + 1, 20, None, None, None);
+
+            let cancellation = CancellationToken::new();
+            cancellation.cancel();
+            let (provider_sender, provider, provider_thread) = inactive_provider_integration();
+            drop(provider_sender);
+            let (performance, _sampler) =
+                performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
+            let result = run_collector(
+                directory.path().join("unused-herdr.sock"),
+                format!("graceful-outcome-{label}"),
+                persistence,
+                reducer,
+                shared,
+                performance,
+                cancellation,
+                OwnerTracker::from_environment(),
+                None,
+                None,
+                provider,
+                LivenessPolicy::default(),
+                PrimaryStreamDiagnosticsHandle::default(),
+            )
+            .await;
+
+            assert_eq!(
+                result.is_ok(),
+                expect_success,
+                "{label}: graceful shutdown result was {result:?}"
+            );
+            provider_thread.stop().await.unwrap();
+            lifecycle.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn live_monitor_overflow_invalidates_rate_epoch_before_the_ready_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut persistence =
+            RuntimePersistence::new_for_test(writer, Arc::new(RecordingOccurrenceSink::default()))
+                .0;
+        let baseline_at_ms = unix_now_ms();
+        let mut model =
+            pane_status_test_model(true, ExecState::Working, Some(PaneAgentStatus::Working));
+        let run_id = model.task_runs().next().unwrap().run_id;
+        model
+            .telemetry_entry(run_id, baseline_at_ms)
+            .accumulate(100, None, None, None, false);
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model,
+            next_ordinal: 2,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let epoch = reducer.begin_rate_epoch();
+        reducer.activate_rate_epoch(baseline_at_ms);
+
+        let (performance, _sampler) =
+            performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
+        let (primary_sender, mut primary_events) = admitted_channel(1, performance.clone());
+        primary_sender.send(status_received("idle")).await.unwrap();
+        let overflowed = AtomicBool::new(true);
+        let (provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+        let (target_publisher, _target_receiver) = watch::channel(BTreeSet::new());
+        let (_enrichment_sender, enrichment_events) = mpsc::channel(1);
+        let (_prune_sender, prune_events) = mpsc::unbounded_channel();
+        let mut enrichment = EnrichmentConverge {
+            target_set: BTreeSet::new(),
+            target_publisher,
+            published: false,
+            events: enrichment_events,
+            prunes: prune_events,
+            diagnostics: EnrichmentDiagnosticsHandle::default(),
+            performance,
+        };
+        let cancellation = CancellationToken::new();
+        let outcome = monitor_live(
+            &directory.path().join("unused-herdr.sock"),
+            &mut reducer,
+            &shared,
+            &mut persistence,
+            &mut OwnerTracker::from_environment(),
+            "overflow-rate",
+            &mut primary_events,
+            &overflowed,
+            &mut enrichment,
+            &cancellation,
+            &mut PendingTopologyClosures::default(),
+            &mut None,
+            &mut None,
+            &mut provider,
+            LivenessPolicy { timeout_ms: 60_000 },
+            &PrimaryStreamDiagnosticsHandle::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ReplayOutcome::RecoveryRefreshRequired(RefreshOrigin::LiveRefresh)
+        ));
+        assert_eq!(
+            reducer.rate_epoch(),
+            epoch.wrapping_add(1),
+            "overflow must invalidate the incomplete epoch inside the live monitor"
+        );
+        assert_eq!(
+            shared.borrow().pane_agent_status("w1:p1"),
+            Some(PaneAgentStatus::Working),
+            "the ready event must not be observed after overflow was known"
+        );
+
+        drop(primary_sender);
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+        drop(persistence);
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_overflow_invalidates_rate_epoch_before_buffered_observation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut persistence =
+            RuntimePersistence::new_for_test(writer, Arc::new(RecordingOccurrenceSink::default()))
+                .0;
+        let baseline_at_ms = unix_now_ms();
+        let mut model =
+            pane_status_test_model(true, ExecState::Working, Some(PaneAgentStatus::Working));
+        let run_id = model.task_runs().next().unwrap().run_id;
+        model
+            .telemetry_entry(run_id, baseline_at_ms)
+            .accumulate(100, None, None, None, false);
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model,
+            next_ordinal: 2,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let epoch = reducer.begin_rate_epoch();
+        reducer.activate_rate_epoch(baseline_at_ms);
+
+        let (performance, _sampler) =
+            performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
+        let (primary_sender, mut primary_events) = admitted_channel(1, performance.clone());
+        primary_sender.send(status_received("idle")).await.unwrap();
+        let mut buffered = VecDeque::from([primary_events.recv().await.unwrap()]);
+        let overflowed = AtomicBool::new(true);
+        let (provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+        let (target_publisher, _target_receiver) = watch::channel(BTreeSet::new());
+        let (_enrichment_sender, enrichment_events) = mpsc::channel(1);
+        let (_prune_sender, prune_events) = mpsc::unbounded_channel();
+        let mut enrichment = EnrichmentConverge {
+            target_set: BTreeSet::new(),
+            target_publisher,
+            published: false,
+            events: enrichment_events,
+            prunes: prune_events,
+            diagnostics: EnrichmentDiagnosticsHandle::default(),
+            performance,
+        };
+        let cancellation = CancellationToken::new();
+        let mut owner = OwnerTracker::from_environment();
+        let mut pending_closures = PendingTopologyClosures::default();
+        let mut controller_requests = None;
+        let mut operator_commands = None;
+        let outcome = replay_generation(
+            &mut reducer,
+            &shared,
+            &mut persistence,
+            &mut owner,
+            "overflow-replay-rate",
+            &snapshot_with_names(),
+            &mut primary_events,
+            &mut buffered,
+            &overflowed,
+            &mut enrichment,
+            &cancellation,
+            &mut pending_closures,
+            &mut controller_requests,
+            &mut operator_commands,
+            &mut provider,
+            RefreshOrigin::CatchUp,
+            &PrimaryStreamDiagnosticsHandle::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ReplayOutcome::RecoveryRefreshRequired(RefreshOrigin::CatchUp)
+        ));
+        assert_eq!(
+            reducer.rate_epoch(),
+            epoch.wrapping_add(1),
+            "overflow must invalidate the incomplete epoch inside replay"
+        );
+        assert_eq!(
+            shared.borrow().pane_agent_status("w1:p1"),
+            Some(PaneAgentStatus::Working),
+            "buffered observations from an incomplete replay generation must not accrue"
+        );
+
+        drop(primary_sender);
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+        drop(persistence);
+        lifecycle.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn history_barrier_writer_outcome_matrix_retries_until_commit_known() {
@@ -14571,11 +15261,28 @@ mod tests {
         );
         let publish_count = Arc::clone(&harness.publish_count);
         let baseline_publications = publish_count.load(Ordering::Relaxed);
+        let final_model = harness.model.clone();
         let primary_counters = harness.primary_stream_diagnostics.clone();
         let contents = harness.stop().await;
         server.stop().await;
         assert!(primary_counters.gap_committed());
-        assert_eq!(publish_count.load(Ordering::Relaxed), baseline_publications);
+        assert_eq!(
+            publish_count.load(Ordering::Relaxed),
+            baseline_publications + 1,
+            "direct Live cancellation must publish exactly one graceful rate checkpoint"
+        );
+        let final_snapshot = final_model.borrow();
+        let run_id = final_snapshot
+            .task_runs()
+            .next()
+            .expect("the installed live pane must retain its run")
+            .run_id;
+        assert!(
+            final_snapshot
+                .run_rate_totals(&run_id)
+                .is_some_and(|totals| totals.working_ms > 0),
+            "the final publication must close positive measured Working time"
+        );
         assert_eq!(
             primary_counter_value(&primary_counters, "event_triggered_topology_refreshes"),
             0

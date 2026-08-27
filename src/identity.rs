@@ -841,7 +841,8 @@ fn merge_in_memory(
     model.fold_run_kind(survivor, absorbed);
     model.fold_task_run_v6_state(survivor, absorbed);
     model.fold_run_rate_totals(survivor, absorbed);
-    // Rate cursors are deliberately process-local and are not part of DomainModel persistence.
+    // Neither pre-merge identity basis may bridge into the canonical post-merge run.
+    model.remove_run_rate_cursor(&survivor);
     model.remove_task_run_record(&absorbed);
     for execution in model.executions_mut() {
         if execution.task_run_id == absorbed {
@@ -2067,8 +2068,8 @@ mod tests {
             latest_provider_at_ms: Some(1_900),
         };
         let survivor_totals = RunRateTotals {
-            output_tokens: 13,
-            working_ms: 700,
+            output_tokens: i64::MAX as u64 - 10,
+            working_ms: i64::MAX - 100,
         };
         let absorbed_totals = RunRateTotals {
             output_tokens: 29,
@@ -2140,6 +2141,20 @@ mod tests {
         model.set_task_run_v6_state(absorbed, absorbed_state.clone());
         model.set_run_rate_totals(survivor, survivor_totals);
         model.set_run_rate_totals(absorbed, absorbed_totals);
+        for run_id in [survivor, absorbed] {
+            let identity_basis = model.task_run(&run_id).unwrap().key.clone();
+            model.set_run_rate_cursor(
+                run_id,
+                crate::model::RunRateCursor {
+                    baseline_output_tokens: 10,
+                    last_observed_at_ms: 1_950,
+                    working: true,
+                    measurement_epoch: 7,
+                    identity_basis,
+                    live_baseline: true,
+                },
+            );
+        }
 
         let batch =
             apply_binding_plan_at(&mut model, BindingPlan::Merge { survivor, absorbed }, 2_000)
@@ -2153,6 +2168,8 @@ mod tests {
         )));
         assert_eq!(model.task_run_v6_state(&absorbed), None);
         assert_eq!(model.run_rate_totals(&absorbed), None);
+        assert_eq!(model.run_rate_cursor(&survivor), None);
+        assert_eq!(model.run_rate_cursor(&absorbed), None);
         assert_eq!(
             model.task_run_v6_state(&survivor),
             Some(&TaskRunV6State {
@@ -2165,8 +2182,8 @@ mod tests {
         assert_eq!(
             model.run_rate_totals(&survivor),
             Some(&RunRateTotals {
-                output_tokens: 42,
-                working_ms: 2_000,
+                output_tokens: i64::MAX as u64,
+                working_ms: i64::MAX,
             })
         );
 
