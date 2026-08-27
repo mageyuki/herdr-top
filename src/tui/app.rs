@@ -2298,7 +2298,7 @@ mod tests {
             native_session_id: Some("native  cafe\u{301}".to_owned()),
             task_run_id: searchable,
             display_ordinal: DisplayOrdinal::new(3),
-            parent_agent_node_id: None,
+            parent_agent_node_id: Some("provider-root".to_owned()),
             state: Some(ExecState::Working),
             model_id: Some("GPT-SAFE".to_owned()),
             last_event_kind: None,
@@ -2523,7 +2523,7 @@ mod tests {
             native_session_id: Some("agent-native".to_owned()),
             task_run_id: run,
             display_ordinal: DisplayOrdinal::new(2),
-            parent_agent_node_id: None,
+            parent_agent_node_id: Some("provider-root".to_owned()),
             state: Some(ExecState::Working),
             model_id: None,
             last_event_kind: None,
@@ -2736,7 +2736,7 @@ mod tests {
             native_session_id: Some("filter-me".to_owned()),
             task_run_id: run,
             display_ordinal: DisplayOrdinal::new(2),
-            parent_agent_node_id: None,
+            parent_agent_node_id: Some("provider-root".to_owned()),
             state: Some(ExecState::Working),
             model_id: None,
             last_event_kind: None,
@@ -3834,7 +3834,7 @@ mod tests {
                 pane_id: None,
             })
         );
-        assert!(render(&app).contains("Selected: ● first first"));
+        assert!(render(&app).contains("Selected: ● working first first"));
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.state().view_mode(), ViewMode::ExecutionTree);
@@ -4084,7 +4084,7 @@ mod tests {
         let following_rows = render_lines(&following, 100, 14);
         let following_view = following_rows[3..9].join("\n");
         assert!(following_view.contains("Dependency DAG"));
-        assert!(!following_view.contains("> ● run-0 run-0"));
+        assert!(!following_view.contains("> ● working run-0 run-0"));
         assert!(following_view.contains("run-7 run-7"));
 
         let (mut manual, _sender) = app_with_model(edgeful_model());
@@ -4096,7 +4096,7 @@ mod tests {
         manual.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let manual_rows = render_lines(&manual, 100, 14);
         let manual_view = manual_rows[3..9].join("\n");
-        assert!(manual_view.contains("> ● run-0 run-0"));
+        assert!(manual_view.contains("> ● working run-0 run-0"));
     }
 
     #[test]

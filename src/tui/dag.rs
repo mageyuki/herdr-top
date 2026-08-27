@@ -6,6 +6,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use crate::model::{DomainModel, RunId};
 
 use super::app::NodeKey;
+use super::projection::StatusReadModel;
 use super::view::{TreeRow, short_run_name, task_run_label};
 
 /// Session-local dependency order derived from the last displayed DAG.
@@ -142,7 +143,18 @@ impl DagOrder {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn build_rows(model: &DomainModel, order: &DagOrder, now_ms: i64) -> Vec<TreeRow> {
+    let statuses = StatusReadModel::from_model(model, now_ms);
+    build_rows_with_statuses(model, order, now_ms, &statuses)
+}
+
+pub(crate) fn build_rows_with_statuses(
+    model: &DomainModel,
+    order: &DagOrder,
+    now_ms: i64,
+    statuses: &StatusReadModel,
+) -> Vec<TreeRow> {
     let stalled_runs =
         super::projection::stalled_run_ids(model, now_ms, crate::activity::stall_warn_ms());
     let mut prerequisites = HashMap::<RunId, Vec<RunId>>::new();
@@ -178,23 +190,21 @@ pub(crate) fn build_rows(model: &DomainModel, order: &DagOrder, now_ms: i64) -> 
         .run_ids()
         .iter()
         .filter_map(|run_id| model.task_run(run_id))
-        .map(|run| TreeRow {
-            key: NodeKey::Run {
-                run_id: run.run_id,
-                pane_id: None,
-            },
-            depth: 0,
-            label: task_run_label(
-                model,
-                run,
-                false,
-                now_ms,
-                stalled_runs.contains(&run.run_id),
-                true,
-            ),
-            label_without_duration_suffix: None,
-            prerequisites: neighbor_names(prerequisites.get(&run.run_id)),
-            dependents: neighbor_names(dependents.get(&run.run_id)),
+        .map(|run| {
+            let display_status =
+                statuses.task_display_status(model, run, None, stalled_runs.contains(&run.run_id));
+            TreeRow {
+                key: NodeKey::Run {
+                    run_id: run.run_id,
+                    pane_id: None,
+                },
+                depth: 0,
+                label: task_run_label(model, run, display_status, false, now_ms, true),
+                label_without_duration_suffix: None,
+                display_status: Some(display_status),
+                prerequisites: neighbor_names(prerequisites.get(&run.run_id)),
+                dependents: neighbor_names(dependents.get(&run.run_id)),
+            }
         })
         // DAG rows are run-only today. Keep the shared Agent Node boundary on the final row
         // stream so a future Agent row cannot bypass the tree's display-staleness rule.
@@ -481,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_are_run_only_with_tree_vocabulary_and_ordinal_sorted_direct_neighbors() {
+    fn dag_rows_use_the_shared_status_prefix_without_unlinked() {
         let (mut model, ids) = model(
             &[
                 ("Dispatcher", 1),
@@ -536,7 +546,14 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(dependent.label, "◌ D D [dispatched by: Dispatcher]");
+        assert_eq!(dependent.label, "◌ queued D D [dispatched by: Dispatcher]");
+        assert_eq!(
+            dependent.display_status,
+            Some(crate::tui::projection::DisplayStatus::new(
+                crate::tui::projection::TaskDisplayStatus::Queued,
+                crate::tui::projection::StatusSource::TaskState,
+            )),
+        );
         assert_eq!(dependent.prerequisites, ["Q", "P"]);
         assert_eq!(dependent.dependents, ["Z1", "Z2"]);
         let second_hop = rows
@@ -561,7 +578,7 @@ mod tests {
             .unwrap();
         assert!(first_hop.prerequisites.is_empty());
         assert_eq!(first_hop.dependents, ["D"]);
-        let unlinked = rows
+        let isolated = rows
             .iter()
             .find(|row| {
                 matches!(
@@ -570,7 +587,8 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(unlinked.label, "◌ U U [unlinked]");
+        assert_eq!(isolated.label, "◌ queued U U");
+        assert!(!isolated.label.contains("[unlinked]"));
     }
 
     #[test]
@@ -654,7 +672,7 @@ mod tests {
             .find(|row| row.key.run_id() == Some(worker_id))
             .expect("DAG has the worker row");
 
-        assert_eq!(worker.label, "⚠ Codex [dispatched by: Parent]");
+        assert_eq!(worker.label, "⚠ working Codex [dispatched by: Parent]");
     }
 
     #[test]

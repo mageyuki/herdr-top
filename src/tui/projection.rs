@@ -13,8 +13,8 @@ use crate::activity::{
 use crate::diagnostics::{ControllerInputStatus, RuntimeDiagnosticsSnapshot};
 use crate::herdr::collector::ObservationQuality;
 use crate::model::{
-    AgentNode, DomainModel, ExecState, Provider, RunId, RunKey, TaskRun, TaskState, TokenBreakdown,
-    TurnAttr,
+    AgentNode, DomainModel, ExecState, PaneAgentStatus, Provider, RunId, RunKey, TaskRun,
+    TaskState, TokenBreakdown, TurnAttr,
 };
 use crate::store::writer::PersistenceStatus;
 
@@ -23,6 +23,265 @@ use super::dag;
 use super::view::TreeRow;
 
 pub(crate) const DETAIL_ACTIVITY_LIMIT: usize = 100;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TaskDisplayStatus {
+    Queued,
+    Working,
+    Idle,
+    Blocked,
+    Done,
+    Error,
+    Cancelled,
+    Unknown,
+}
+
+impl TaskDisplayStatus {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Working => "working",
+            Self::Idle => "idle",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::Error => "error",
+            Self::Cancelled => "cancelled",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StatusSource {
+    TaskState,
+    PaneAgentStatus,
+    ExecutionState,
+    AgentNodeState,
+    Fallback,
+}
+
+impl StatusSource {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::TaskState => "task_state",
+            Self::PaneAgentStatus => "pane_agent_status",
+            Self::ExecutionState => "execution_state",
+            Self::AgentNodeState => "agent_node_state",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DisplayStatus {
+    pub(crate) status: TaskDisplayStatus,
+    pub(crate) source: StatusSource,
+    pub(crate) stalled: bool,
+}
+
+impl DisplayStatus {
+    pub(crate) const fn new(status: TaskDisplayStatus, source: StatusSource) -> Self {
+        Self {
+            status,
+            source,
+            stalled: false,
+        }
+    }
+
+    fn with_stalled(mut self, stalled: bool) -> Self {
+        if !matches!(
+            self.status,
+            TaskDisplayStatus::Done | TaskDisplayStatus::Error | TaskDisplayStatus::Cancelled
+        ) {
+            self.stalled |= stalled;
+        }
+        self
+    }
+
+    pub(crate) const fn glyph(self) -> &'static str {
+        if self.stalled {
+            return "⚠";
+        }
+        match self.status {
+            TaskDisplayStatus::Queued => "◌",
+            TaskDisplayStatus::Working | TaskDisplayStatus::Blocked => "●",
+            TaskDisplayStatus::Idle => "○",
+            TaskDisplayStatus::Done => "✓",
+            TaskDisplayStatus::Error => "✗",
+            TaskDisplayStatus::Cancelled => "⊘",
+            TaskDisplayStatus::Unknown => "?",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AgentStatusEvidence {
+    state: Option<ExecState>,
+    last_activity_at_ms: Option<i64>,
+    agent_node_id: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StatusReadModel {
+    pane_executions: HashMap<(RunId, String), ExecState>,
+    root_agents: HashMap<RunId, AgentStatusEvidence>,
+}
+
+impl StatusReadModel {
+    pub(crate) fn from_model(model: &DomainModel, now_ms: i64) -> Self {
+        let mut selected_executions = HashMap::<(RunId, String), (bool, String, ExecState)>::new();
+        for execution in model.executions() {
+            let key = (execution.task_run_id, execution.pane_id.clone());
+            let candidate = (
+                execution.state.is_terminal(),
+                execution.execution_id.clone(),
+                execution.state.clone(),
+            );
+            selected_executions
+                .entry(key)
+                .and_modify(|selected| {
+                    if (candidate.0, candidate.1.as_str()) < (selected.0, selected.1.as_str()) {
+                        selected.clone_from(&candidate);
+                    }
+                })
+                .or_insert(candidate);
+        }
+        let pane_executions = selected_executions
+            .into_iter()
+            .map(|(key, (_, _, state))| (key, state))
+            .collect();
+
+        let mut root_agents = HashMap::<RunId, AgentStatusEvidence>::new();
+        for agent in model.agent_nodes() {
+            if agent.parent_agent_node_id.is_some()
+                || agent.last_event_kind.as_deref()
+                    == Some(crate::provider::lane::LIVE_LINE_EVENT_KIND)
+                || agent_node_is_display_stale(agent, now_ms)
+                || model
+                    .task_run(&agent.task_run_id)
+                    .and_then(task_run_provider)
+                    .is_some_and(|provider| provider != agent.provider)
+            {
+                continue;
+            }
+            let candidate = AgentStatusEvidence {
+                state: agent.state.clone(),
+                last_activity_at_ms: agent.last_activity_at_ms,
+                agent_node_id: agent.agent_node_id.clone(),
+            };
+            root_agents
+                .entry(agent.task_run_id)
+                .and_modify(|selected| {
+                    if (
+                        selected.last_activity_at_ms,
+                        selected.agent_node_id.as_str(),
+                    ) < (
+                        candidate.last_activity_at_ms,
+                        candidate.agent_node_id.as_str(),
+                    ) {
+                        selected.clone_from(&candidate);
+                    }
+                })
+                .or_insert(candidate);
+        }
+
+        Self {
+            pane_executions,
+            root_agents,
+        }
+    }
+
+    pub(crate) fn task_display_status(
+        &self,
+        model: &DomainModel,
+        run: &TaskRun,
+        pane_id: Option<&str>,
+        inactive: bool,
+    ) -> DisplayStatus {
+        let semantic = match run.state {
+            TaskState::Completed => Some(TaskDisplayStatus::Done),
+            TaskState::Failed => Some(TaskDisplayStatus::Error),
+            TaskState::Cancelled => Some(TaskDisplayStatus::Cancelled),
+            TaskState::EndedUnknown => Some(TaskDisplayStatus::Unknown),
+            TaskState::Queued => Some(TaskDisplayStatus::Queued),
+            TaskState::Blocked => Some(TaskDisplayStatus::Blocked),
+            TaskState::Running => None,
+        };
+        if let Some(status) = semantic {
+            return DisplayStatus::new(status, StatusSource::TaskState).with_stalled(inactive);
+        }
+
+        if let Some(pane_id) = pane_id
+            && let Some(execution) = self.pane_executions.get(&(run.run_id, pane_id.to_owned()))
+        {
+            if let Some(status) = model.pane_agent_status(pane_id) {
+                return pane_agent_display_status(status).with_stalled(inactive);
+            }
+            return execution_display_status(execution, false).with_stalled(inactive);
+        }
+
+        if let Some(evidence) = self.root_agents.get(&run.run_id)
+            && let Some(state) = evidence.state.as_ref()
+            && !matches!(state, ExecState::Unknown)
+        {
+            return execution_display_status(state, false)
+                .with_source(StatusSource::AgentNodeState)
+                .with_stalled(inactive);
+        }
+
+        DisplayStatus::new(TaskDisplayStatus::Working, StatusSource::TaskState)
+            .with_stalled(inactive)
+    }
+}
+
+impl DisplayStatus {
+    const fn with_source(mut self, source: StatusSource) -> Self {
+        self.source = source;
+        self
+    }
+}
+
+fn task_run_provider(run: &TaskRun) -> Option<Provider> {
+    match &run.key {
+        RunKey::Native { provider, .. } | RunKey::NativePath { provider, .. } => Some(*provider),
+        RunKey::Controller(_) | RunKey::Provisional { .. } => None,
+    }
+}
+
+fn pane_agent_display_status(status: PaneAgentStatus) -> DisplayStatus {
+    let status = match status {
+        PaneAgentStatus::Idle => TaskDisplayStatus::Idle,
+        PaneAgentStatus::Working => TaskDisplayStatus::Working,
+        PaneAgentStatus::Blocked => TaskDisplayStatus::Blocked,
+        PaneAgentStatus::Done => TaskDisplayStatus::Done,
+        PaneAgentStatus::Unknown => TaskDisplayStatus::Unknown,
+    };
+    DisplayStatus::new(status, StatusSource::PaneAgentStatus)
+}
+
+fn execution_display_status(state: &ExecState, ended_is_done: bool) -> DisplayStatus {
+    let (status, stalled) = match state {
+        ExecState::Unknown => (TaskDisplayStatus::Unknown, false),
+        ExecState::Idle => (TaskDisplayStatus::Idle, false),
+        ExecState::Working => (TaskDisplayStatus::Working, false),
+        ExecState::Blocked => (TaskDisplayStatus::Blocked, false),
+        ExecState::Stale { .. } => (TaskDisplayStatus::Unknown, true),
+        ExecState::Ended if ended_is_done => (TaskDisplayStatus::Done, false),
+        ExecState::Ended => (TaskDisplayStatus::Unknown, false),
+    };
+    DisplayStatus {
+        status,
+        source: StatusSource::ExecutionState,
+        stalled,
+    }
+}
+
+pub(crate) fn native_agent_display_status(agent: &AgentNode) -> DisplayStatus {
+    agent.state.as_ref().map_or_else(
+        || DisplayStatus::new(TaskDisplayStatus::Unknown, StatusSource::Fallback),
+        |state| execution_display_status(state, true).with_source(StatusSource::AgentNodeState),
+    )
+}
 
 /// Raw run-scoped inputs gathered during paint so elapsed values follow the paint clock.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -431,6 +690,11 @@ pub(crate) enum DetailEntity {
         name: String,
         native_session_id: Option<String>,
         state: TaskState,
+        display_status: DisplayStatus,
+        dispatch_parent: Option<String>,
+        prerequisite_count: usize,
+        dependent_count: usize,
+        has_task_relationships: bool,
         created_at_ms: Option<i64>,
         updated_at_ms: Option<i64>,
         finished_at_ms: Option<i64>,
@@ -439,7 +703,7 @@ pub(crate) enum DetailEntity {
         effort: Option<String>,
         sandbox: Option<String>,
         evidence_paths: Vec<String>,
-        per_turn: Vec<TurnAttr>,
+        per_turn: Box<[TurnAttr]>,
         output_tokens: Option<u64>,
         token_breakdown: Option<Box<TokenBreakdown>>,
     },
@@ -448,6 +712,7 @@ pub(crate) enum DetailEntity {
         native_session_id: Option<String>,
         provider: Provider,
         state: Option<ExecState>,
+        display_status: DisplayStatus,
         model_id: Option<String>,
         parent_agent_node_id: Option<String>,
         session_file: Option<String>,
@@ -687,6 +952,9 @@ fn searchable_fields(model: &DomainModel, row: &TreeRow) -> Vec<String> {
         }
         NodeKey::Run { run_id, .. } => {
             let mut fields = vec!["task run".to_owned(), run_id.to_string()];
+            if let Some(display_status) = row.display_status {
+                fields.push(display_status.status.label().to_owned());
+            }
             if let Some(run) = model.task_run(run_id) {
                 fields.push(task_state_name(run.state).to_owned());
                 match &run.key {
@@ -752,6 +1020,9 @@ fn searchable_fields(model: &DomainModel, row: &TreeRow) -> Vec<String> {
                 "child".to_owned(),
                 agent_node_id.clone(),
             ];
+            if let Some(display_status) = row.display_status {
+                fields.push(display_status.status.label().to_owned());
+            }
             if let Some(agent) = model.agent_node(agent_node_id) {
                 fields.push(provider_name(agent.provider).to_owned());
                 fields.push(agent.task_run_id.to_string());
@@ -780,7 +1051,7 @@ pub(crate) fn detail_projection(
     mode: ViewMode,
     home: Option<&OsStr>,
 ) -> DetailProjection {
-    let entity = detail_entity(model, selected, home);
+    let entity = detail_entity(model, full_rows, selected, home);
     let mut matching = operator
         .activity
         .iter()
@@ -802,7 +1073,12 @@ pub(crate) fn detail_projection(
     }
 }
 
-fn detail_entity(model: &DomainModel, selected: &NodeKey, home: Option<&OsStr>) -> DetailEntity {
+fn detail_entity(
+    model: &DomainModel,
+    full_rows: &[TreeRow],
+    selected: &NodeKey,
+    home: Option<&OsStr>,
+) -> DetailEntity {
     match selected {
         NodeKey::Session => DetailEntity::Session,
         NodeKey::Workspace(workspace_id) => DetailEntity::Workspace {
@@ -827,6 +1103,36 @@ fn detail_entity(model: &DomainModel, selected: &NodeKey, home: Option<&OsStr>) 
         }
         NodeKey::Run { run_id, .. } => {
             model.task_run(run_id).map_or(DetailEntity::Missing, |run| {
+                let display_status = full_rows
+                    .iter()
+                    .find(|row| row.key == *selected)
+                    .and_then(|row| row.display_status)
+                    .unwrap_or_else(|| {
+                        DisplayStatus::new(TaskDisplayStatus::Unknown, StatusSource::Fallback)
+                    });
+                let mut dispatch_parents = model
+                    .execution_edges()
+                    .filter(|edge| edge.child_run_id == *run_id)
+                    .filter_map(|edge| model.task_run(&edge.parent_run_id))
+                    .collect::<Vec<_>>();
+                dispatch_parents
+                    .sort_by_key(|parent| (parent.display_ordinal.get(), parent.run_id));
+                let dispatch_parent = dispatch_parents
+                    .first()
+                    .map(|parent| super::view::short_run_name(parent));
+                let prerequisite_count = model
+                    .dependency_edges()
+                    .filter(|edge| edge.dependent_run_id == *run_id)
+                    .count();
+                let dependent_count = model
+                    .dependency_edges()
+                    .filter(|edge| edge.prerequisite_run_id == *run_id)
+                    .count();
+                let has_task_relationships = model
+                    .execution_edges()
+                    .any(|edge| edge.parent_run_id == *run_id || edge.child_run_id == *run_id)
+                    || prerequisite_count > 0
+                    || dependent_count > 0;
                 let telemetry = model.telemetry(run_id);
                 let mut evidence_paths = model
                     .agent_nodes()
@@ -844,6 +1150,11 @@ fn detail_entity(model: &DomainModel, selected: &NodeKey, home: Option<&OsStr>) 
                     name: safe_run_name(run_id, &run.key),
                     native_session_id: bound_native_session_id(model, run_id, &run.key),
                     state: run.state,
+                    display_status,
+                    dispatch_parent,
+                    prerequisite_count,
+                    dependent_count,
+                    has_task_relationships,
                     created_at_ms: run.created_at_ms,
                     updated_at_ms: run.updated_at_ms,
                     finished_at_ms: run.finished_at_ms,
@@ -854,7 +1165,8 @@ fn detail_entity(model: &DomainModel, selected: &NodeKey, home: Option<&OsStr>) 
                     evidence_paths,
                     per_turn: telemetry
                         .map(|telemetry| telemetry.per_turn.clone())
-                        .unwrap_or_default(),
+                        .unwrap_or_default()
+                        .into_boxed_slice(),
                     output_tokens: telemetry.map(|telemetry| telemetry.output_tokens),
                     token_breakdown: telemetry
                         .map(|telemetry| Box::new(telemetry.token_breakdown.clone())),
@@ -869,6 +1181,11 @@ fn detail_entity(model: &DomainModel, selected: &NodeKey, home: Option<&OsStr>) 
                     native_session_id: agent.native_session_id.as_deref().map(escape_controls),
                     provider: agent.provider,
                     state: agent.state.clone(),
+                    display_status: full_rows
+                        .iter()
+                        .find(|row| row.key == *selected)
+                        .and_then(|row| row.display_status)
+                        .unwrap_or_else(|| native_agent_display_status(agent)),
                     model_id: agent.model_id.as_deref().map(escape_controls),
                     parent_agent_node_id: agent
                         .parent_agent_node_id
@@ -1037,6 +1354,11 @@ fn entity_lines(entity: &DetailEntity) -> Vec<String> {
             name,
             native_session_id,
             state,
+            display_status,
+            dispatch_parent,
+            prerequisite_count,
+            dependent_count,
+            has_task_relationships,
             created_at_ms,
             updated_at_ms,
             finished_at_ms,
@@ -1059,6 +1381,23 @@ fn entity_lines(entity: &DetailEntity) -> Vec<String> {
                     native_session_id.as_deref().unwrap_or("unknown")
                 ),
                 format!("state: {}", task_state_name(*state)),
+                format!("effective_status: {}", display_status.status.label()),
+                format!("status_source: {}", display_status.source.label()),
+                format!("stalled: {}", display_status.stalled),
+                format!(
+                    "dispatch_parent: {}",
+                    dispatch_parent.as_deref().unwrap_or("none")
+                ),
+                format!("prerequisites: {prerequisite_count}"),
+                format!("dependents: {dependent_count}"),
+                format!(
+                    "task_relationships: {}",
+                    if *has_task_relationships {
+                        "present"
+                    } else {
+                        "none"
+                    }
+                ),
                 format!(
                     "model: {}",
                     model
@@ -1142,6 +1481,7 @@ fn entity_lines(entity: &DetailEntity) -> Vec<String> {
             native_session_id,
             provider,
             state,
+            display_status,
             model_id,
             parent_agent_node_id,
             session_file,
@@ -1157,6 +1497,9 @@ fn entity_lines(entity: &DetailEntity) -> Vec<String> {
                 "state: {}",
                 state.as_ref().map_or("unknown", exec_state_name)
             ),
+            format!("effective_status: {}", display_status.status.label()),
+            format!("status_source: {}", display_status.source.label()),
+            format!("stalled: {}", display_status.stalled),
             format!("model: {}", model_id.as_deref().unwrap_or("unknown")),
             format!(
                 "parent_agent_node_id: {}",
@@ -1348,7 +1691,8 @@ mod tests {
     use crate::lockfile::StateRoot;
     use crate::model::{
         AgentNode, DependencyEdge, DisplayOrdinal, DomainModel, ExecState, Execution,
-        ExecutionEdge, Pane, Provider, RunId, RunKey, TaskRun, TaskState, Workspace,
+        ExecutionEdge, Pane, PaneAgentStatus, Provider, RunId, RunKey, TaskRun, TaskState,
+        Workspace,
     };
     use crate::provider::ProviderEvent;
     use crate::provider::claude_facts::extract_claude_line;
@@ -1931,6 +2275,391 @@ mod tests {
         }
     }
 
+    fn execution(run_id: RunId, pane_id: &str, execution_id: &str, state: ExecState) -> Execution {
+        Execution {
+            execution_id: execution_id.to_owned(),
+            pane_id: pane_id.to_owned(),
+            terminal_id: format!("terminal-{pane_id}"),
+            task_run_id: run_id,
+            state,
+        }
+    }
+
+    fn status_agent(
+        run_id: RunId,
+        agent_node_id: &str,
+        provider: Provider,
+        parent_agent_node_id: Option<&str>,
+        state: Option<ExecState>,
+        last_activity_at_ms: i64,
+    ) -> AgentNode {
+        AgentNode {
+            agent_node_id: agent_node_id.to_owned(),
+            provider,
+            native_session_id: Some(agent_node_id.to_owned()),
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(last_activity_at_ms),
+            parent_agent_node_id: parent_agent_node_id.map(str::to_owned),
+            state,
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: Some(last_activity_at_ms),
+            session_file: None,
+        }
+    }
+
+    #[test]
+    fn task_display_status_obeys_semantic_precedence() {
+        let mut task_run = run("semantic", 1, TaskState::Running);
+        let mut model = DomainModel::default();
+        model.insert_execution(execution(
+            task_run.run_id,
+            "pane",
+            "execution",
+            ExecState::Idle,
+        ));
+        model.set_pane_agent_status("pane".to_owned(), PaneAgentStatus::Working);
+        let statuses = StatusReadModel::from_model(&model, 0);
+
+        for (state, expected) in [
+            (
+                TaskState::Queued,
+                DisplayStatus::new(TaskDisplayStatus::Queued, StatusSource::TaskState),
+            ),
+            (
+                TaskState::Running,
+                DisplayStatus::new(TaskDisplayStatus::Working, StatusSource::PaneAgentStatus),
+            ),
+            (
+                TaskState::Blocked,
+                DisplayStatus::new(TaskDisplayStatus::Blocked, StatusSource::TaskState),
+            ),
+            (
+                TaskState::Completed,
+                DisplayStatus::new(TaskDisplayStatus::Done, StatusSource::TaskState),
+            ),
+            (
+                TaskState::Failed,
+                DisplayStatus::new(TaskDisplayStatus::Error, StatusSource::TaskState),
+            ),
+            (
+                TaskState::Cancelled,
+                DisplayStatus::new(TaskDisplayStatus::Cancelled, StatusSource::TaskState),
+            ),
+            (
+                TaskState::EndedUnknown,
+                DisplayStatus::new(TaskDisplayStatus::Unknown, StatusSource::TaskState),
+            ),
+        ] {
+            task_run.state = state;
+            assert_eq!(
+                statuses.task_display_status(&model, &task_run, Some("pane"), false),
+                expected,
+                "semantic precedence for {state:?}",
+            );
+        }
+
+        task_run.state = TaskState::Running;
+        assert_eq!(
+            statuses.task_display_status(&model, &task_run, None, false),
+            DisplayStatus::new(TaskDisplayStatus::Working, StatusSource::TaskState),
+        );
+    }
+
+    #[test]
+    fn pane_display_status_preserves_each_shared_occurrence() {
+        let task_run = run("shared", 1, TaskState::Running);
+        let mut model = DomainModel::default();
+        for (pane_id, status) in [
+            ("pane-a", PaneAgentStatus::Working),
+            ("pane-b", PaneAgentStatus::Blocked),
+            ("pane-c", PaneAgentStatus::Idle),
+            ("pane-d", PaneAgentStatus::Done),
+        ] {
+            model.insert_execution(execution(
+                task_run.run_id,
+                pane_id,
+                &format!("execution-{pane_id}"),
+                ExecState::Working,
+            ));
+            model.set_pane_agent_status(pane_id.to_owned(), status);
+        }
+        let statuses = StatusReadModel::from_model(&model, 0);
+
+        assert_eq!(
+            statuses.task_display_status(&model, &task_run, Some("pane-a"), false),
+            DisplayStatus::new(TaskDisplayStatus::Working, StatusSource::PaneAgentStatus,),
+        );
+        assert_eq!(
+            statuses.task_display_status(&model, &task_run, Some("pane-b"), false),
+            DisplayStatus::new(TaskDisplayStatus::Blocked, StatusSource::PaneAgentStatus,),
+        );
+        assert_eq!(
+            statuses.task_display_status(&model, &task_run, Some("pane-c"), false),
+            DisplayStatus::new(TaskDisplayStatus::Idle, StatusSource::PaneAgentStatus,),
+        );
+        assert_eq!(
+            statuses.task_display_status(&model, &task_run, Some("pane-d"), false),
+            DisplayStatus::new(TaskDisplayStatus::Done, StatusSource::PaneAgentStatus,),
+        );
+    }
+
+    #[test]
+    fn explicit_pane_unknown_does_not_fall_through() {
+        let task_run = run("unknown", 1, TaskState::Running);
+        let mut model = DomainModel::default();
+        model.insert_execution(execution(
+            task_run.run_id,
+            "pane",
+            "execution",
+            ExecState::Working,
+        ));
+        model.set_pane_agent_status("pane".to_owned(), PaneAgentStatus::Unknown);
+        let statuses = StatusReadModel::from_model(&model, 0);
+
+        assert_eq!(
+            statuses.task_display_status(&model, &task_run, Some("pane"), false),
+            DisplayStatus::new(TaskDisplayStatus::Unknown, StatusSource::PaneAgentStatus,),
+        );
+    }
+
+    #[test]
+    fn missing_pane_status_falls_back_to_matching_execution() {
+        let task_run = run("execution", 1, TaskState::Running);
+        let mut model = DomainModel::default();
+        for (execution_id, state) in [
+            ("0-ended", ExecState::Ended),
+            ("z-live", ExecState::Working),
+            ("a-live", ExecState::Blocked),
+        ] {
+            model.insert_execution(execution(task_run.run_id, "pane", execution_id, state));
+        }
+        model.insert_execution(execution(
+            task_run.run_id,
+            "ended-pane",
+            "ended",
+            ExecState::Ended,
+        ));
+        let statuses = StatusReadModel::from_model(&model, 0);
+
+        assert_eq!(
+            statuses.task_display_status(&model, &task_run, Some("pane"), false),
+            DisplayStatus::new(TaskDisplayStatus::Blocked, StatusSource::ExecutionState),
+        );
+        assert_eq!(
+            statuses.task_display_status(&model, &task_run, Some("ended-pane"), false),
+            DisplayStatus::new(TaskDisplayStatus::Unknown, StatusSource::ExecutionState),
+        );
+    }
+
+    #[test]
+    fn headless_status_uses_only_its_newest_root_agent() {
+        let mut task_run = run("native", 1, TaskState::Running);
+        task_run.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "native".to_owned(),
+        };
+        let mut model = DomainModel::default();
+        for agent in [
+            status_agent(
+                task_run.run_id,
+                "agent-a",
+                Provider::Codex,
+                None,
+                Some(ExecState::Blocked),
+                10,
+            ),
+            status_agent(
+                task_run.run_id,
+                "agent-b",
+                Provider::Codex,
+                None,
+                Some(ExecState::Idle),
+                20,
+            ),
+            status_agent(
+                task_run.run_id,
+                "agent-c",
+                Provider::Codex,
+                None,
+                Some(ExecState::Working),
+                20,
+            ),
+            status_agent(
+                task_run.run_id,
+                "agent-d",
+                Provider::Claude,
+                None,
+                Some(ExecState::Blocked),
+                30,
+            ),
+        ] {
+            model.insert_agent_node(agent);
+        }
+        model.insert_task_run(task_run.clone());
+        let statuses = StatusReadModel::from_model(&model, 30);
+
+        assert_eq!(
+            statuses.task_display_status(&model, &task_run, None, false),
+            DisplayStatus::new(TaskDisplayStatus::Working, StatusSource::AgentNodeState),
+        );
+
+        model.insert_agent_node(status_agent(
+            task_run.run_id,
+            "agent-e",
+            Provider::Codex,
+            None,
+            Some(ExecState::Ended),
+            30,
+        ));
+        let statuses = StatusReadModel::from_model(&model, 30);
+
+        assert_eq!(
+            statuses.task_display_status(&model, &task_run, None, false),
+            DisplayStatus::new(TaskDisplayStatus::Unknown, StatusSource::AgentNodeState),
+        );
+    }
+
+    #[test]
+    fn headless_descendant_activity_does_not_change_parent_status() {
+        let task_run = run("headless", 1, TaskState::Running);
+        let mut model = DomainModel::default();
+        model.insert_agent_node(status_agent(
+            task_run.run_id,
+            "root",
+            Provider::Claude,
+            None,
+            Some(ExecState::Idle),
+            10,
+        ));
+        model.insert_agent_node(status_agent(
+            task_run.run_id,
+            "child",
+            Provider::Claude,
+            Some("root"),
+            Some(ExecState::Working),
+            20,
+        ));
+        let statuses = StatusReadModel::from_model(&model, 20);
+
+        assert_eq!(
+            statuses.task_display_status(&model, &task_run, None, false),
+            DisplayStatus::new(TaskDisplayStatus::Idle, StatusSource::AgentNodeState),
+        );
+    }
+
+    #[test]
+    fn headless_status_ignores_live_line_transport_agent() {
+        let task_run = run("headless", 1, TaskState::Running);
+        let mut model = DomainModel::default();
+        model.insert_agent_node(status_agent(
+            task_run.run_id,
+            "real-root",
+            Provider::Claude,
+            None,
+            Some(ExecState::Blocked),
+            10,
+        ));
+        let mut transport = status_agent(
+            task_run.run_id,
+            "transport-root",
+            Provider::Claude,
+            None,
+            Some(ExecState::Working),
+            20,
+        );
+        transport.last_event_kind = Some(crate::provider::lane::LIVE_LINE_EVENT_KIND.to_owned());
+        model.insert_agent_node(transport);
+        let statuses = StatusReadModel::from_model(&model, 20);
+
+        assert_eq!(
+            statuses.task_display_status(&model, &task_run, None, false),
+            DisplayStatus::new(TaskDisplayStatus::Blocked, StatusSource::AgentNodeState),
+        );
+    }
+
+    #[test]
+    fn native_agent_display_status_maps_known_and_ambiguous_states() {
+        let run_id = RunId::new();
+        for (state, expected) in [
+            (
+                None,
+                DisplayStatus::new(TaskDisplayStatus::Unknown, StatusSource::Fallback),
+            ),
+            (
+                Some(ExecState::Unknown),
+                DisplayStatus::new(TaskDisplayStatus::Unknown, StatusSource::AgentNodeState),
+            ),
+            (
+                Some(ExecState::Idle),
+                DisplayStatus::new(TaskDisplayStatus::Idle, StatusSource::AgentNodeState),
+            ),
+            (
+                Some(ExecState::Working),
+                DisplayStatus::new(TaskDisplayStatus::Working, StatusSource::AgentNodeState),
+            ),
+            (
+                Some(ExecState::Blocked),
+                DisplayStatus::new(TaskDisplayStatus::Blocked, StatusSource::AgentNodeState),
+            ),
+            (
+                Some(ExecState::Stale { since_ms: 1 }),
+                DisplayStatus {
+                    status: TaskDisplayStatus::Unknown,
+                    source: StatusSource::AgentNodeState,
+                    stalled: true,
+                },
+            ),
+            (
+                Some(ExecState::Ended),
+                DisplayStatus::new(TaskDisplayStatus::Done, StatusSource::AgentNodeState),
+            ),
+        ] {
+            let agent = status_agent(run_id, "agent", Provider::Codex, Some("root"), state, 0);
+            assert_eq!(native_agent_display_status(&agent), expected);
+        }
+    }
+
+    #[test]
+    fn stale_evidence_is_unknown_with_stalled_warning() {
+        let task_run = run("stale", 1, TaskState::Running);
+        let mut model = DomainModel::default();
+        model.insert_execution(execution(
+            task_run.run_id,
+            "pane",
+            "execution",
+            ExecState::Stale { since_ms: 1 },
+        ));
+        let statuses = StatusReadModel::from_model(&model, 10);
+
+        assert_eq!(
+            statuses.task_display_status(&model, &task_run, Some("pane"), false),
+            DisplayStatus {
+                status: TaskDisplayStatus::Unknown,
+                source: StatusSource::ExecutionState,
+                stalled: true,
+            },
+        );
+        assert_eq!(
+            statuses.task_display_status(&model, &task_run, None, true),
+            DisplayStatus {
+                status: TaskDisplayStatus::Working,
+                source: StatusSource::TaskState,
+                stalled: true,
+            },
+        );
+
+        let mut completed = task_run.clone();
+        completed.state = TaskState::Completed;
+        assert_eq!(
+            statuses.task_display_status(&model, &completed, None, true),
+            DisplayStatus::new(TaskDisplayStatus::Done, StatusSource::TaskState),
+        );
+    }
+
     #[test]
     fn stable_run_kind_label_escapes_controls_and_empty_falls_back() {
         let escaped = run("fallback", 1, TaskState::Running);
@@ -1982,9 +2711,151 @@ mod tests {
             depth,
             label: label.to_owned(),
             label_without_duration_suffix: None,
+            display_status: None,
             prerequisites: Vec::new(),
             dependents: Vec::new(),
         }
+    }
+
+    fn row_with_status(
+        key: NodeKey,
+        depth: usize,
+        label: &str,
+        display_status: DisplayStatus,
+    ) -> TreeRow {
+        TreeRow {
+            display_status: Some(display_status),
+            ..row(key, depth, label)
+        }
+    }
+
+    #[test]
+    fn run_detail_reports_effective_status_source_and_relationships() {
+        let parent = run("Controller", 1, TaskState::Running);
+        let prerequisite = run("Prerequisite", 2, TaskState::Completed);
+        let selected = run("Selected", 3, TaskState::Running);
+        let dependent = run("Dependent", 4, TaskState::Queued);
+        let mut model = DomainModel::default();
+        for task_run in [&parent, &prerequisite, &selected, &dependent] {
+            model.insert_task_run(task_run.clone());
+        }
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: parent.run_id,
+            child_run_id: selected.run_id,
+        });
+        model.insert_dependency_edge(DependencyEdge {
+            prerequisite_run_id: prerequisite.run_id,
+            dependent_run_id: selected.run_id,
+        });
+        model.insert_dependency_edge(DependencyEdge {
+            prerequisite_run_id: selected.run_id,
+            dependent_run_id: dependent.run_id,
+        });
+        let blocked = DisplayStatus::new(TaskDisplayStatus::Blocked, StatusSource::PaneAgentStatus);
+        let working = DisplayStatus::new(TaskDisplayStatus::Working, StatusSource::PaneAgentStatus);
+        let selected_key = NodeKey::Run {
+            run_id: selected.run_id,
+            pane_id: Some("pane-blocked".to_owned()),
+        };
+        let rows = vec![
+            row_with_status(selected_key.clone(), 0, "● blocked Selected", blocked),
+            row_with_status(
+                NodeKey::Run {
+                    run_id: selected.run_id,
+                    pane_id: Some("pane-working".to_owned()),
+                },
+                0,
+                "● working Selected",
+                working,
+            ),
+        ];
+
+        let detail = detail_projection(
+            &model,
+            &rows,
+            &operator(Vec::new(), HashMap::new()),
+            &selected_key,
+            ViewMode::ExecutionTree,
+            None,
+        );
+        let lines = detail_lines(&detail);
+
+        for expected in [
+            "state: running",
+            "effective_status: blocked",
+            "status_source: pane_agent_status",
+            "stalled: false",
+            "dispatch_parent: Controller",
+            "prerequisites: 1",
+            "dependents: 1",
+            "task_relationships: present",
+        ] {
+            assert!(
+                lines.contains(&expected.to_owned()),
+                "missing {expected:?}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_detail_reports_effective_display_status() {
+        let task_run = run("run", 1, TaskState::Running);
+        let agent = status_agent(
+            task_run.run_id,
+            "agent",
+            Provider::Codex,
+            Some("root"),
+            Some(ExecState::Ended),
+            10,
+        );
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run);
+        model.insert_agent_node(agent.clone());
+        let selected = NodeKey::Agent {
+            agent_node_id: agent.agent_node_id.clone(),
+            pane_id: Some("pane".to_owned()),
+        };
+        let rows = vec![row_with_status(
+            selected.clone(),
+            0,
+            "✓ done Codex native agent: agent",
+            native_agent_display_status(&agent),
+        )];
+
+        let detail = detail_projection(
+            &model,
+            &rows,
+            &operator(Vec::new(), HashMap::new()),
+            &selected,
+            ViewMode::ExecutionTree,
+            None,
+        );
+        let lines = detail_lines(&detail);
+
+        assert!(lines.contains(&"effective_status: done".to_owned()));
+        assert!(lines.contains(&"status_source: agent_node_state".to_owned()));
+        assert!(lines.contains(&"stalled: false".to_owned()));
+    }
+
+    #[test]
+    fn filter_searches_display_status_and_keeps_legacy_unlinked_synonym() {
+        let task_run = run("filter", 1, TaskState::Running);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run.clone());
+        let row = row_with_status(
+            NodeKey::Run {
+                run_id: task_run.run_id,
+                pane_id: Some("pane".to_owned()),
+            },
+            0,
+            "● blocked filter",
+            DisplayStatus::new(TaskDisplayStatus::Blocked, StatusSource::PaneAgentStatus),
+        );
+
+        assert!(row_matches(&model, &row, "blocked"));
+        assert!(row_matches(&model, &row, "running"));
+        assert!(row_matches(&model, &row, "unlinked"));
+        assert!(!row.label.contains("unlinked"));
     }
 
     fn operator(
@@ -2534,7 +3405,14 @@ mod tests {
             model.insert_agent_node(agent);
         }
 
-        let label = crate::tui::view::task_run_label(&model, &selected, false, 9_000, false, true);
+        let label = crate::tui::view::task_run_label(
+            &model,
+            &selected,
+            DisplayStatus::new(TaskDisplayStatus::Done, StatusSource::TaskState),
+            false,
+            9_000,
+            true,
+        );
         assert!(!label.contains(full_key));
         let selected_row = row(
             NodeKey::Run {
@@ -2894,7 +3772,14 @@ mod tests {
             dependent_run_id: child.run_id,
         });
 
-        let tree_label = crate::tui::view::task_run_label(&model, &child, false, 0, false, true);
+        let tree_label = crate::tui::view::task_run_label(
+            &model,
+            &child,
+            DisplayStatus::new(TaskDisplayStatus::Working, StatusSource::TaskState),
+            false,
+            0,
+            true,
+        );
         let mut dag_order = crate::tui::dag::DagOrder::default();
         dag_order.recompute(&model);
         let dag_text = crate::tui::dag::build_rows(&model, &dag_order, 0)
@@ -2918,7 +3803,14 @@ mod tests {
                 pane_id: Some("pane".to_owned()),
             },
             0,
-            &crate::tui::view::task_run_label(&model, &child, false, 0, false, true),
+            &crate::tui::view::task_run_label(
+                &model,
+                &child,
+                DisplayStatus::new(TaskDisplayStatus::Working, StatusSource::TaskState),
+                false,
+                0,
+                true,
+            ),
         );
         let tied = operator(
             vec![

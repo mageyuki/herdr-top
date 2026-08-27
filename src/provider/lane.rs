@@ -2466,14 +2466,18 @@ mod tests {
             .task_run_by_key(&run_key_for_scope(&codex_scope))
             .expect("the lane must create the Codex session run");
         let claude_run_id = claude_run.run_id;
-        let claude_label = task_run_label(&model, claude_run, false, 0, false, true);
-        let codex_label = task_run_label(&model, codex_run, false, 0, false, true);
+        let working = crate::tui::projection::DisplayStatus::new(
+            crate::tui::projection::TaskDisplayStatus::Working,
+            crate::tui::projection::StatusSource::TaskState,
+        );
+        let claude_label = task_run_label(&model, claude_run, working, false, 0, true);
+        let codex_label = task_run_label(&model, codex_run, working, false, 0, true);
         assert!(
-            claude_label.starts_with("● reviewer "),
+            claude_label.starts_with("● working reviewer "),
             "Claude row must render agentType: {claude_label}"
         );
         assert!(
-            codex_label.starts_with("● codex_cli_rs"),
+            codex_label.starts_with("● working codex_cli_rs"),
             "Codex row must render rollout originator: {codex_label}"
         );
 
@@ -2561,13 +2565,16 @@ mod tests {
         let stable_label = task_run_label(
             &snapshot,
             snapshot.task_run(&claude_run_id).unwrap(),
+            crate::tui::projection::DisplayStatus::new(
+                crate::tui::projection::TaskDisplayStatus::Working,
+                crate::tui::projection::StatusSource::TaskState,
+            ),
             false,
             1,
-            false,
             true,
         );
         assert!(
-            stable_label.starts_with("● reviewer "),
+            stable_label.starts_with("● working reviewer "),
             "later activity must not overwrite the stable run kind: {stable_label}"
         );
     }

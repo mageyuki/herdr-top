@@ -18266,7 +18266,7 @@ mod provider_integration_tests {
         harness.apply(terminal).await;
         let terminal_row = harness.row_label(run_id);
         assert!(
-            terminal_row.starts_with('✗'),
+            terminal_row.starts_with("⊘ cancelled"),
             "unexpected terminal row: {terminal_row}"
         );
         assert!(!terminal_row.contains("must disappear"));
@@ -18394,7 +18394,7 @@ mod provider_integration_tests {
         assert!(
             harness
                 .row_label(meta_id)
-                .contains("● reviewer Review the meta-derived subject"),
+                .contains("● working reviewer Review the meta-derived subject"),
             "meta.json kind and subject were not first after the status glyph; actual row: {:?}",
             harness.row_label(meta_id)
         );
