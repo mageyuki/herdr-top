@@ -29,13 +29,15 @@ use crate::diagnostics::{
     encode_persistence_occurrence,
 };
 use crate::lockfile::OwnerRecord;
+#[cfg(test)]
+use crate::model::ReconcileBatch;
 use crate::model::{
     AgentNodeObservation, AgentSessionReference, AgentSessionReferenceKind,
     ControllerDiagnosticsHandle, DomainModel, EnrichmentDiagnosticsHandle, EventMetadata,
     ExecState, Execution, GapKind, MinimalProviderMetadata, NormalizedEvent, OperatorCommand, Pane,
-    PaneSnapshot, Provider, ProviderDiagnosticsHandle, ReconcileBatch, RunId, RunKey, SharedModel,
-    SnapshotAgent, SourceCoverage, Tab, TopologyAuthority, TopologyEntity, TopologyEntityId,
-    TopologySnapshot, Workspace, sanitize_controller_text,
+    PaneSnapshot, Provider, ProviderDiagnosticsHandle, RunId, RunKey, SharedModel, SnapshotAgent,
+    SourceCoverage, Tab, TopologyAuthority, TopologyEntity, TopologyEntityId, TopologySnapshot,
+    Workspace, sanitize_controller_text,
 };
 use crate::performance::{
     Admission, Admitted, PerformanceClock, PerformanceIngress, PerformanceSampler,
@@ -511,6 +513,21 @@ enum RuntimeCommandClass {
     OwnerLocation,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum TestWriteResult {
+    Classified(RuntimeWriteOutcome),
+    Unexpected,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct TestWriteInjection {
+    class: RuntimeCommandClass,
+    successes_before_failure: usize,
+    result: TestWriteResult,
+}
+
 struct UnavailableOccurrenceSink;
 
 impl PersistenceOccurrenceSink for UnavailableOccurrenceSink {
@@ -556,6 +573,8 @@ pub(crate) struct RuntimePersistence {
     enrichment_diagnostics: EnrichmentDiagnosticsHandle,
     provider_diagnostics: ProviderDiagnosticsHandle,
     recovery: PersistenceRecovery,
+    #[cfg(test)]
+    test_write_injection: Option<TestWriteInjection>,
 }
 
 impl RuntimePersistence {
@@ -618,6 +637,8 @@ impl RuntimePersistence {
             enrichment_diagnostics,
             provider_diagnostics,
             recovery: PersistenceRecovery::new(retry_interval),
+            #[cfg(test)]
+            test_write_injection: None,
         };
         persistence.refresh_pane_coverage(model);
         persistence.publish();
@@ -662,6 +683,49 @@ impl RuntimePersistence {
         self.enrichment_diagnostics.clone()
     }
 
+    #[cfg(test)]
+    fn inject_write_result(&mut self, injection: TestWriteInjection) {
+        self.test_write_injection = Some(injection);
+    }
+
+    #[cfg(test)]
+    fn injected_write_result(
+        &mut self,
+        class: RuntimeCommandClass,
+    ) -> Option<Result<RuntimeWriteOutcome, WriterError>> {
+        let injection = self.test_write_injection.as_mut()?;
+        if !matches!(
+            (injection.class, class),
+            (RuntimeCommandClass::Batch, RuntimeCommandClass::Batch)
+                | (
+                    RuntimeCommandClass::OwnerLocation,
+                    RuntimeCommandClass::OwnerLocation
+                )
+        ) {
+            return None;
+        }
+        if injection.successes_before_failure > 0 {
+            injection.successes_before_failure -= 1;
+            return None;
+        }
+        let result = self.test_write_injection.take().unwrap().result;
+        Some(match result {
+            TestWriteResult::Unexpected => Err(WriterError::Closed),
+            TestWriteResult::Classified(RuntimeWriteOutcome::Skipped) => {
+                self.record_skip(class);
+                Ok(RuntimeWriteOutcome::Skipped)
+            }
+            TestWriteResult::Classified(RuntimeWriteOutcome::CommittedButDegraded(failure))
+            | TestWriteResult::Classified(RuntimeWriteOutcome::NotCommitted(failure))
+            | TestWriteResult::Classified(RuntimeWriteOutcome::DurabilityUnknown(failure)) => {
+                Ok(self.record_failure(failure, class))
+            }
+            TestWriteResult::Classified(RuntimeWriteOutcome::Durable) => {
+                Ok(RuntimeWriteOutcome::Durable)
+            }
+        })
+    }
+
     pub(crate) fn is_duplicate(&self, event_id: &str) -> bool {
         self.writer.is_duplicate(event_id)
     }
@@ -690,6 +754,7 @@ impl RuntimePersistence {
             provider_diagnostics,
             recovery,
             session: _,
+            ..
         } = self;
         let permit = writer.reserve_enqueue();
         let health = writer_health.borrow().clone();
@@ -736,6 +801,10 @@ impl RuntimePersistence {
     }
 
     async fn apply(&mut self, batch: PersistBatch) -> Result<RuntimeWriteOutcome, WriterError> {
+        #[cfg(test)]
+        if let Some(result) = self.injected_write_result(RuntimeCommandClass::Batch) {
+            return result;
+        }
         if self
             .skip_async_if_degraded(RuntimeCommandClass::Batch)
             .await
@@ -762,6 +831,10 @@ impl RuntimePersistence {
         terminal_id: &str,
         pane_id: &str,
     ) -> Result<RuntimeWriteOutcome, WriterError> {
+        #[cfg(test)]
+        if let Some(result) = self.injected_write_result(RuntimeCommandClass::OwnerLocation) {
+            return result;
+        }
         if self.skip_if_degraded(RuntimeCommandClass::OwnerLocation) {
             return Ok(RuntimeWriteOutcome::Skipped);
         }
@@ -2199,6 +2272,8 @@ async fn run_collector(
             .await
             .map_err(|error| CollectorError::Task(error.to_string()))?;
         let outcome = outcome?;
+        #[cfg(test)]
+        primary_stream_diagnostics.record_gap_committed(outcome.gap_committed);
         if outcome.gap_committed {
             first_subscription = false;
             previous_socket = socket_identity;
@@ -2222,16 +2297,16 @@ async fn run_collector(
         }
         match outcome.outcome {
             SubscriptionOutcome::Cancelled => break,
-            SubscriptionOutcome::WatchdogReconnect(reason) => {
+            SubscriptionOutcome::Reconnect(reason) => {
                 provider.set_herdr_quality(
                     ObservationQuality::Disconnected,
                     &mut persistence,
                     &shared,
                 );
                 tracing::warn!(
-                    warning_code = "herdr_primary_stream_watchdog_silence",
+                    warning_code = "herdr_primary_stream_reconnect",
                     reason = reason.as_str(),
-                    "Herdr event subscription failed its silence probe; reconnecting"
+                    "Herdr primary subscription closed; reconnecting"
                 );
                 let delay = Duration::from_millis(reconnect_backoff.on_watchdog_silence());
                 if wait_or_service_controller(
@@ -2289,49 +2364,111 @@ async fn converge(
     liveness_policy: LivenessPolicy,
     primary_stream_diagnostics: &PrimaryStreamDiagnosticsHandle,
 ) -> Result<ConvergeOutcome, CollectorError> {
-    let mut first_generation = true;
-    let mut resnapshot_attempts = 0;
-    let mut pending_closures = PendingTopologyClosures::default();
+    let mut gap_committed = false;
+    let mut refresh_origin = RefreshOrigin::CatchUp;
+    let mut immediate_refresh_requests = 0_usize;
+    let mut immediate_request_cause = None;
+    let mut pending_closures: PendingTopologyClosures;
+    let mut buffered_events = VecDeque::new();
 
     loop {
         enrichment.discard_episode_payloads();
         overflowed.store(false, Ordering::Release);
-        let snapshot = tokio::select! {
-            () = cancellation.cancelled() => return Ok(ConvergeOutcome::new(SubscriptionOutcome::Cancelled, !first_generation)),
-            request = receive_controller(controller_requests) => {
-                service_controller(
-                    request,
-                    controller_requests,
-                    session,
-                    reducer,
-                    persistence,
-                    shared,
-                    &provider.coverage.registry,
-                ).await;
-                provider.publish_targets(shared);
-                continue;
+        if let Some(cause) = immediate_request_cause.take() {
+            immediate_refresh_requests = immediate_refresh_requests.saturating_add(1);
+            if cause == ImmediateRequestCause::TopologyHint {
+                primary_stream_diagnostics.record_event_triggered_topology_refresh();
             }
-            command = receive_operator_command(operator_commands) => {
-                if service_operator_command(
-                    command,
-                    operator_commands,
-                    reducer,
-                    persistence,
-                    shared,
-                    &provider.coverage.registry,
-                ).await? {
+        }
+        let snapshot_request = tokio::time::timeout(
+            liveness_timeout(&liveness_policy),
+            wire::request(sock, "session.snapshot", json!({})),
+        );
+        tokio::pin!(snapshot_request);
+        let request_result = loop {
+            tokio::select! {
+                () = cancellation.cancelled() => {
+                    return Ok(ConvergeOutcome::new(
+                        SubscriptionOutcome::Cancelled,
+                        gap_committed,
+                    ));
+                }
+                request = receive_controller(controller_requests) => {
+                    service_controller(
+                        request,
+                        controller_requests,
+                        session,
+                        reducer,
+                        persistence,
+                        shared,
+                        &provider.coverage.registry,
+                    ).await;
                     provider.publish_targets(shared);
                 }
-                continue;
-            }
-            result = wire::request(sock, "session.snapshot", json!({})) => {
-                match result.and_then(|value| value.into_snapshot()) {
-                    Ok(snapshot) => snapshot,
-                    Err(_) => return Ok(ConvergeOutcome::new(SubscriptionOutcome::Ended, !first_generation)),
+                command = receive_operator_command(operator_commands) => {
+                    if service_operator_command(
+                        command,
+                        operator_commands,
+                        reducer,
+                        persistence,
+                        shared,
+                        &provider.coverage.registry,
+                    ).await? {
+                        provider.publish_targets(shared);
+                    }
                 }
+                received = events.recv() => {
+                    match received {
+                        Some(received) => retain_primary_event_or_mark_overflow(
+                            &mut buffered_events,
+                            received,
+                            &overflowed,
+                            refresh_origin,
+                        ),
+                        None => {
+                            return Ok(ConvergeOutcome::new(
+                                SubscriptionOutcome::Ended,
+                                gap_committed,
+                            ));
+                        }
+                    }
+                }
+                result = &mut snapshot_request => break result,
             }
         };
-        let topology = topology_from_snapshot(&snapshot)?;
+        let response = match request_result {
+            Err(_) => {
+                return Ok(ConvergeOutcome::new(
+                    SubscriptionOutcome::Reconnect(ReconnectReason::SnapshotTimedOut),
+                    gap_committed,
+                ));
+            }
+            Ok(Err(_)) => {
+                return Ok(ConvergeOutcome::new(
+                    SubscriptionOutcome::Reconnect(ReconnectReason::SnapshotRequestFailed),
+                    gap_committed,
+                ));
+            }
+            Ok(Ok(response)) => response,
+        };
+        let snapshot = match response.into_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                return Ok(ConvergeOutcome::new(
+                    SubscriptionOutcome::Reconnect(ReconnectReason::SnapshotDecodeFailed),
+                    gap_committed,
+                ));
+            }
+        };
+        let topology = match topology_from_snapshot(&snapshot) {
+            Ok(topology) => topology,
+            Err(_) => {
+                return Ok(ConvergeOutcome::new(
+                    SubscriptionOutcome::Reconnect(ReconnectReason::TopologyConversionFailed),
+                    gap_committed,
+                ));
+            }
+        };
         let sessionless_codex_terminals = topology
             .panes
             .iter()
@@ -2345,22 +2482,45 @@ async fn converge(
             })
             .map(|pane| pane.terminal_id.clone())
             .collect::<HashSet<_>>();
-        let mut batch = if first_generation {
-            pending_closures = PendingTopologyClosures::default();
-            let mut batch = reducer.reconcile_gap(ReconcileBatch { topology, gap_kind })?;
+        let first_install = !gap_committed;
+        let mut batch = match reducer.reconcile_snapshot(topology) {
+            Ok(batch) => batch,
+            Err(_) => {
+                return Ok(ConvergeOutcome::new(
+                    SubscriptionOutcome::Reconnect(ReconnectReason::ReducerRejected),
+                    gap_committed,
+                ));
+            }
+        };
+        gap_committed = true;
+        pending_closures = PendingTopologyClosures::default();
+        if first_install {
             batch.push(PersistOp::RecordCollectorGap(CollectorGap {
                 event_id: format!("collector-gap-{}", ulid::Ulid::new()),
                 herdr_session: session.to_owned(),
                 seen_at_ms: unix_now_ms(),
                 kind: gap_kind,
             }));
-            first_generation = false;
-            batch
-        } else {
-            apply_snapshot_in_place(reducer, shared, topology, session, &mut pending_closures)?
-        };
-        provider.observe_sessionless_codex_terminals(shared, &sessionless_codex_terminals);
-        let _ = persist_submission(persistence, reducer, std::mem::take(&mut batch)).await?;
+        }
+        if persist_submission(persistence, reducer, std::mem::take(&mut batch))
+            .await
+            .is_err()
+        {
+            return Ok(ConvergeOutcome::new(
+                SubscriptionOutcome::Reconnect(ReconnectReason::PersistenceUnexpected),
+                gap_committed,
+            ));
+        }
+        if owner
+            .refresh_from_snapshot(&snapshot, persistence)
+            .await
+            .is_err()
+        {
+            return Ok(ConvergeOutcome::new(
+                SubscriptionOutcome::Reconnect(ReconnectReason::OwnerUnexpected),
+                gap_committed,
+            ));
+        }
         enrichment.replace_targets(
             snapshot
                 .panes
@@ -2368,8 +2528,8 @@ async fn converge(
                 .map(|pane| pane.pane_id.clone())
                 .collect(),
         );
+        provider.observe_sessionless_codex_terminals(shared, &sessionless_codex_terminals);
         provider.publish_targets(shared);
-        owner.refresh_from_snapshot(&snapshot, persistence).await?;
         persistence.refresh_snapshot(&shared.borrow(), &provider.coverage.registry);
 
         let replay = replay_generation(
@@ -2380,6 +2540,7 @@ async fn converge(
             session,
             &snapshot,
             &mut events,
+            &mut buffered_events,
             &overflowed,
             enrichment,
             cancellation,
@@ -2387,22 +2548,24 @@ async fn converge(
             controller_requests,
             operator_commands,
             provider,
+            refresh_origin,
+            primary_stream_diagnostics,
         )
         .await?;
         match replay {
             ReplayOutcome::Cancelled => {
                 return Ok(ConvergeOutcome::new(
                     SubscriptionOutcome::Cancelled,
-                    !first_generation,
+                    gap_committed,
                 ));
             }
             ReplayOutcome::Ended => {
                 return Ok(ConvergeOutcome::new(
                     SubscriptionOutcome::Ended,
-                    !first_generation,
+                    gap_committed,
                 ));
             }
-            ReplayOutcome::Clean => {
+            ReplayOutcome::Quiet => {
                 enrichment.discard_episode_payloads();
                 enrichment.activate();
                 provider.set_herdr_quality(ObservationQuality::Live, persistence, shared);
@@ -2426,38 +2589,62 @@ async fn converge(
                 )
                 .await?
                 {
-                    ReplayOutcome::Dirty => {
+                    ReplayOutcome::TopologyRefreshRequired(RefreshOrigin::LiveRefresh) => {
                         provider.set_herdr_quality(
                             ObservationQuality::Reconciling,
                             persistence,
                             shared,
                         );
-                        resnapshot_attempts = 0;
+                        refresh_origin = RefreshOrigin::LiveRefresh;
+                        immediate_refresh_requests = 0;
+                        immediate_request_cause = Some(ImmediateRequestCause::TopologyHint);
+                    }
+                    ReplayOutcome::RecoveryRefreshRequired(origin) => {
+                        provider.set_herdr_quality(
+                            ObservationQuality::Reconciling,
+                            persistence,
+                            shared,
+                        );
+                        refresh_origin = origin;
+                        immediate_refresh_requests = 0;
+                        immediate_request_cause = Some(ImmediateRequestCause::Overflow);
                     }
                     ReplayOutcome::Ended => {
                         return Ok(ConvergeOutcome::new(
                             SubscriptionOutcome::Ended,
-                            !first_generation,
+                            gap_committed,
                         ));
                     }
                     ReplayOutcome::Cancelled => {
                         return Ok(ConvergeOutcome::new(
                             SubscriptionOutcome::Cancelled,
-                            !first_generation,
+                            gap_committed,
                         ));
                     }
-                    ReplayOutcome::WatchdogReconnect(reason) => {
+                    ReplayOutcome::Reconnect(reason) => {
                         return Ok(ConvergeOutcome::new(
-                            SubscriptionOutcome::WatchdogReconnect(reason),
-                            !first_generation,
+                            SubscriptionOutcome::Reconnect(reason),
+                            gap_committed,
                         ));
                     }
-                    ReplayOutcome::Clean => {}
+                    ReplayOutcome::Quiet
+                    | ReplayOutcome::TopologyRefreshRequired(RefreshOrigin::CatchUp) => {
+                        unreachable!("live monitor returned an invalid origin/outcome")
+                    }
                 }
             }
-            ReplayOutcome::Dirty => {
+            ReplayOutcome::TopologyRefreshRequired(origin)
+            | ReplayOutcome::RecoveryRefreshRequired(origin) => {
+                let cause = match replay {
+                    ReplayOutcome::TopologyRefreshRequired(_) => {
+                        ImmediateRequestCause::TopologyHint
+                    }
+                    ReplayOutcome::RecoveryRefreshRequired(_) => ImmediateRequestCause::Overflow,
+                    _ => unreachable!("dirty replay matched an invalid outcome"),
+                };
                 provider.set_herdr_quality(ObservationQuality::Reconciling, persistence, shared);
-                if resnapshot_attempts == RESNAPSHOT_ATTEMPTS {
+                refresh_origin = origin;
+                if immediate_refresh_requests >= RESNAPSHOT_ATTEMPTS {
                     match monitor_reconciling(
                         sock,
                         reducer,
@@ -2474,36 +2661,41 @@ async fn converge(
                         provider,
                         liveness_policy,
                         primary_stream_diagnostics,
+                        refresh_origin,
                     )
                     .await?
                     {
-                        ReconcilingOutcome::RestartGeneration => continue,
+                        ReconcilingOutcome::RestartGeneration(origin) => {
+                            refresh_origin = origin;
+                            immediate_refresh_requests = 0;
+                            continue;
+                        }
                         ReconcilingOutcome::Ended => {
                             return Ok(ConvergeOutcome::new(
                                 SubscriptionOutcome::Ended,
-                                !first_generation,
+                                gap_committed,
                             ));
                         }
                         ReconcilingOutcome::Cancelled => {
                             return Ok(ConvergeOutcome::new(
                                 SubscriptionOutcome::Cancelled,
-                                !first_generation,
+                                gap_committed,
                             ));
                         }
-                        ReconcilingOutcome::WatchdogReconnect(reason) => {
+                        ReconcilingOutcome::Reconnect(reason) => {
                             return Ok(ConvergeOutcome::new(
-                                SubscriptionOutcome::WatchdogReconnect(reason),
-                                !first_generation,
+                                SubscriptionOutcome::Reconnect(reason),
+                                gap_committed,
                             ));
                         }
                     }
                 }
-                resnapshot_attempts += 1;
+                immediate_request_cause = Some(cause);
             }
-            ReplayOutcome::WatchdogReconnect(reason) => {
+            ReplayOutcome::Reconnect(reason) => {
                 return Ok(ConvergeOutcome::new(
-                    SubscriptionOutcome::WatchdogReconnect(reason),
-                    !first_generation,
+                    SubscriptionOutcome::Reconnect(reason),
+                    gap_committed,
                 ));
             }
         }
@@ -2517,8 +2709,9 @@ async fn replay_generation(
     persistence: &mut RuntimePersistence,
     owner: &mut OwnerTracker,
     session: &str,
-    snapshot: &Snapshot,
+    _snapshot: &Snapshot,
     events: &mut mpsc::Receiver<Admitted<ReceivedEvent>>,
+    buffered: &mut VecDeque<Admitted<ReceivedEvent>>,
     overflowed: &AtomicBool,
     enrichment: &mut EnrichmentConverge,
     cancellation: &CancellationToken,
@@ -2526,42 +2719,43 @@ async fn replay_generation(
     controller_requests: &mut Option<ControllerRequestReceiver>,
     operator_commands: &mut Option<mpsc::Receiver<OperatorCommand>>,
     provider: &mut ProviderIntegration,
+    origin: RefreshOrigin,
+    primary_stream_diagnostics: &PrimaryStreamDiagnosticsHandle,
 ) -> Result<ReplayOutcome, CollectorError> {
-    let snapshot_entities = snapshot_entity_keys(snapshot);
-    let mut buffered = VecDeque::new();
-    let mut created = HashSet::new();
-    let mut closures: HashMap<EntityKey, Vec<usize>> = HashMap::new();
-    let mut candidates = Vec::new();
-    let mut next = 0;
-    let mut channel_state = drain_events(events, &mut buffered);
+    let mut refresh_required = false;
+    let mut channel_state = drain_events(events, buffered, overflowed, origin);
 
     loop {
         enrichment.discard_episode_payloads();
         while let Some(admitted) = buffered.pop_front() {
             let (received, admission) = admitted.into_parts();
-            let target_delta = enrichment_target_delta(&received, shared);
-            record_replay_facts(
-                next,
-                &received,
-                &mut created,
-                &mut closures,
-                &mut candidates,
-            );
-            let _ = apply_received_event(
-                reducer,
-                shared,
-                persistence,
-                owner,
-                session,
-                received,
-                admission,
-                pending_closures,
-                provider,
-            )
-            .await?;
-            enrichment.apply_target_delta(target_delta);
-            next += 1;
-            channel_state = drain_events(events, &mut buffered);
+            match classify_primary_event(&received.event) {
+                PrimaryEventClass::TopologyHint => {
+                    record_topology_hint_diagnostics(&received);
+                    admission.complete();
+                    refresh_required = true;
+                    if origin == RefreshOrigin::CatchUp {
+                        primary_stream_diagnostics.record_suppressed_topology_frame();
+                    }
+                }
+                PrimaryEventClass::EnrichmentGauge | PrimaryEventClass::NoOp => {
+                    let target_delta = enrichment_target_delta(&received, shared);
+                    let _ = apply_received_event(
+                        reducer,
+                        shared,
+                        persistence,
+                        owner,
+                        session,
+                        received,
+                        admission,
+                        pending_closures,
+                        provider,
+                    )
+                    .await?;
+                    enrichment.apply_target_delta(target_delta);
+                }
+            }
+            channel_state = drain_events(events, buffered, overflowed, origin);
         }
         if channel_state == EventChannelState::Closed {
             return Ok(ReplayOutcome::Ended);
@@ -2598,35 +2792,32 @@ async fn replay_generation(
             result = tokio::time::timeout(DRAIN_QUIET_PERIOD, events.recv()) => result,
         };
         match next_received {
-            Ok(Some(received)) => buffered.push_back(received),
+            Ok(Some(received)) => {
+                retain_primary_event_or_mark_overflow(buffered, received, overflowed, origin);
+            }
             Ok(None) => {
-                channel_state = drain_events(events, &mut buffered);
+                channel_state = drain_events(events, buffered, overflowed, origin);
                 debug_assert_eq!(channel_state, EventChannelState::Closed);
             }
             Err(_) => break,
         }
     }
 
-    let anomalous = candidates.into_iter().any(|(index, entity)| {
-        !snapshot_entities.contains(&entity)
-            && !created.contains(&entity)
-            && !closures
-                .get(&entity)
-                .is_some_and(|positions| positions.iter().any(|position| *position > index))
-    });
-    if anomalous || overflowed.load(Ordering::Acquire) {
-        Ok(ReplayOutcome::Dirty)
+    if overflowed.load(Ordering::Acquire) {
+        Ok(ReplayOutcome::RecoveryRefreshRequired(origin))
+    } else if refresh_required {
+        Ok(ReplayOutcome::TopologyRefreshRequired(origin))
     } else if cancellation.is_cancelled() {
         Ok(ReplayOutcome::Cancelled)
     } else {
-        Ok(ReplayOutcome::Clean)
+        Ok(ReplayOutcome::Quiet)
     }
 }
 
 enum WatchdogProbeOutcome {
     HealthyIdle,
     Inconclusive,
-    Reconnect(WatchdogReconnectReason),
+    Reconnect(ReconnectReason),
 }
 
 type WatchdogProbeFuture<'a> = Pin<Box<dyn Future<Output = WatchdogProbeOutcome> + Send + 'a>>;
@@ -2646,15 +2837,15 @@ async fn probe_primary_topology(
         Ok(Ok(value)) => match value.into_snapshot() {
             Ok(snapshot) => snapshot,
             Err(_) => {
-                return WatchdogProbeOutcome::Reconnect(WatchdogReconnectReason::ProbeFailed);
+                return WatchdogProbeOutcome::Reconnect(ReconnectReason::ProbeFailed);
             }
         },
         Ok(Err(_)) | Err(_) => {
-            return WatchdogProbeOutcome::Reconnect(WatchdogReconnectReason::ProbeFailed);
+            return WatchdogProbeOutcome::Reconnect(ReconnectReason::ProbeFailed);
         }
     };
     let Ok(probed) = topology_from_snapshot(&snapshot) else {
-        return WatchdogProbeOutcome::Reconnect(WatchdogReconnectReason::ProbeFailed);
+        return WatchdogProbeOutcome::Reconnect(ReconnectReason::ProbeFailed);
     };
     let Some(current) = current_model_topology(shared, &pending_closures) else {
         return WatchdogProbeOutcome::Inconclusive;
@@ -2662,7 +2853,7 @@ async fn probe_primary_topology(
     if probe_topology_matches_model(probed, current) {
         WatchdogProbeOutcome::HealthyIdle
     } else {
-        WatchdogProbeOutcome::Reconnect(WatchdogReconnectReason::TopologyDiverged)
+        WatchdogProbeOutcome::Reconnect(ReconnectReason::TopologyDiverged)
     }
 }
 
@@ -3004,7 +3195,7 @@ async fn monitor_live(
                 continue;
             }
             LiveReceipt::Probe(WatchdogProbeOutcome::Reconnect(reason)) => {
-                return Ok(ReplayOutcome::WatchdogReconnect(reason));
+                return Ok(ReplayOutcome::Reconnect(reason));
             }
             LiveReceipt::Sweep => {
                 let mut persist = reducer.sweep_stale(unix_now_ms());
@@ -3041,11 +3232,18 @@ async fn monitor_live(
             }
             LiveReceipt::Primary(received) => {
                 let (received, admission) = received.into_parts();
+                watchdog_probe = None;
+                watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
+                if classify_primary_event(&received.event) == PrimaryEventClass::TopologyHint {
+                    record_topology_hint_diagnostics(&received);
+                    admission.complete();
+                    overflowed.store(false, Ordering::Release);
+                    return Ok(ReplayOutcome::TopologyRefreshRequired(
+                        RefreshOrigin::LiveRefresh,
+                    ));
+                }
                 let target_delta = enrichment_target_delta(&received, shared);
-                let anomalous = !is_focus_frame(&received.event)
-                    && updated_entity(&received)
-                        .is_some_and(|entity| !entity_exists(shared, &entity));
-                let produced_observations = apply_received_event(
+                let _ = apply_received_event(
                     reducer,
                     shared,
                     persistence,
@@ -3057,13 +3255,11 @@ async fn monitor_live(
                     provider,
                 )
                 .await?;
-                if produced_observations {
-                    watchdog_probe = None;
-                    watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
-                }
                 enrichment.apply_target_delta(target_delta);
-                if anomalous || overflowed.swap(false, Ordering::AcqRel) {
-                    return Ok(ReplayOutcome::Dirty);
+                if overflowed.swap(false, Ordering::AcqRel) {
+                    return Ok(ReplayOutcome::RecoveryRefreshRequired(
+                        RefreshOrigin::LiveRefresh,
+                    ));
                 }
             }
         }
@@ -3087,6 +3283,7 @@ async fn monitor_reconciling(
     provider: &mut ProviderIntegration,
     liveness_policy: LivenessPolicy,
     primary_stream_diagnostics: &PrimaryStreamDiagnosticsHandle,
+    origin: RefreshOrigin,
 ) -> Result<ReconcilingOutcome, CollectorError> {
     enum ReconcilingReceipt {
         Primary(Admitted<ReceivedEvent>),
@@ -3172,7 +3369,7 @@ async fn monitor_reconciling(
         let received = match received {
             ReconcilingReceipt::Probe(WatchdogProbeOutcome::HealthyIdle) => {
                 tracing::debug!("silent reconciling Herdr subscription passed its topology probe");
-                return Ok(ReconcilingOutcome::RestartGeneration);
+                return Ok(ReconcilingOutcome::RestartGeneration(origin));
             }
             ReconcilingReceipt::Probe(WatchdogProbeOutcome::Inconclusive) => {
                 watchdog_probe = None;
@@ -3184,7 +3381,7 @@ async fn monitor_reconciling(
                 continue;
             }
             ReconcilingReceipt::Probe(WatchdogProbeOutcome::Reconnect(reason)) => {
-                return Ok(ReconcilingOutcome::WatchdogReconnect(reason));
+                return Ok(ReconcilingOutcome::Reconnect(reason));
             }
             ReconcilingReceipt::Sweep => {
                 let mut persist = reducer.sweep_stale(unix_now_ms());
@@ -3207,6 +3404,16 @@ async fn monitor_reconciling(
             ReconcilingReceipt::Primary(received) => received,
         };
         let (received, admission) = received.into_parts();
+        if classify_primary_event(&received.event) == PrimaryEventClass::TopologyHint {
+            record_topology_hint_diagnostics(&received);
+            admission.complete();
+            if origin == RefreshOrigin::CatchUp {
+                primary_stream_diagnostics.record_suppressed_topology_frame();
+            }
+            watchdog_probe = None;
+            watchdog_deadline = silence_deadline(Instant::now(), &liveness_policy);
+            continue;
+        }
         let target_delta = enrichment_target_delta(&received, shared);
         let produced_observations = apply_received_event(
             reducer,
@@ -4962,6 +5169,8 @@ struct ProviderIntegration {
     sessionless_codex_detections: HashMap<RunId, i64>,
     sessionless_codex_detection_history: HashMap<RunId, i64>,
     coverage: CoverageTracker,
+    #[cfg(test)]
+    published_targets_observer: Option<Arc<std::sync::Mutex<TargetSet>>>,
 }
 
 struct CoverageTracker {
@@ -5063,6 +5272,7 @@ impl ProviderIntegration {
             sessionless_codex_detections: HashMap::new(),
             sessionless_codex_detection_history: HashMap::new(),
             coverage,
+            published_targets_observer: None,
         }
     }
 
@@ -5081,6 +5291,8 @@ impl ProviderIntegration {
             sessionless_codex_detections: HashMap::new(),
             sessionless_codex_detection_history: HashMap::new(),
             coverage,
+            #[cfg(test)]
+            published_targets_observer: None,
         }
     }
 
@@ -5127,11 +5339,21 @@ impl ProviderIntegration {
             &shared.borrow(),
             &self.sessionless_codex_detections,
         );
+        #[cfg(test)]
+        if let Some(observer) = &self.published_targets_observer {
+            *observer.lock().unwrap() = targets.clone();
+        }
         self.coverage.update_targeted_session_counts(&targets);
         if targets != self.published_targets {
             self.target_publisher.update_targets(targets.clone());
             self.published_targets = targets;
         }
+    }
+
+    #[cfg(test)]
+    fn observe_published_targets(&mut self, observer: Arc<std::sync::Mutex<TargetSet>>) {
+        *observer.lock().unwrap() = self.published_targets.clone();
+        self.published_targets_observer = Some(observer);
     }
 
     fn admit_sessionless_codex_detection(&mut self, run_id: RunId, observed_at_ms: i64) {
@@ -5319,42 +5541,132 @@ enum EntityKey {
     Pane(String),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefreshOrigin {
+    CatchUp,
+    LiveRefresh,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImmediateRequestCause {
+    TopologyHint,
+    Overflow,
+}
+
 #[derive(Clone, Copy)]
 enum ReplayOutcome {
-    Clean,
-    Dirty,
+    Quiet,
+    TopologyRefreshRequired(RefreshOrigin),
+    RecoveryRefreshRequired(RefreshOrigin),
     Ended,
     Cancelled,
-    WatchdogReconnect(WatchdogReconnectReason),
+    Reconnect(ReconnectReason),
 }
 
 #[derive(Clone, Copy)]
 enum ReconcilingOutcome {
-    RestartGeneration,
+    RestartGeneration(RefreshOrigin),
     Ended,
     Cancelled,
-    WatchdogReconnect(WatchdogReconnectReason),
+    Reconnect(ReconnectReason),
 }
 
 #[derive(Clone, Copy)]
 enum SubscriptionOutcome {
     Ended,
     Cancelled,
-    WatchdogReconnect(WatchdogReconnectReason),
+    Reconnect(ReconnectReason),
 }
 
-#[derive(Clone, Copy)]
-enum WatchdogReconnectReason {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconnectReason {
     ProbeFailed,
     TopologyDiverged,
+    SnapshotRequestFailed,
+    SnapshotTimedOut,
+    SnapshotDecodeFailed,
+    TopologyConversionFailed,
+    ReducerRejected,
+    PersistenceUnexpected,
+    OwnerUnexpected,
 }
 
-impl WatchdogReconnectReason {
+impl ReconnectReason {
     const fn as_str(self) -> &'static str {
         match self {
             Self::ProbeFailed => "snapshot_probe_failed",
             Self::TopologyDiverged => "topology_diverged",
+            Self::SnapshotRequestFailed => "snapshot_request_failed",
+            Self::SnapshotTimedOut => "snapshot_timed_out",
+            Self::SnapshotDecodeFailed => "snapshot_decode_failed",
+            Self::TopologyConversionFailed => "topology_conversion_failed",
+            Self::ReducerRejected => "reducer_rejected",
+            Self::PersistenceUnexpected => "persistence_unexpected",
+            Self::OwnerUnexpected => "owner_unexpected",
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrimaryEventClass {
+    TopologyHint,
+    EnrichmentGauge,
+    NoOp,
+}
+
+fn classify_primary_event(event: &str) -> PrimaryEventClass {
+    match event {
+        "workspace_created"
+        | "workspace_updated"
+        | "workspace_metadata_updated"
+        | "workspace_renamed"
+        | "workspace_moved"
+        | "workspace_reordered"
+        | "workspace_closed"
+        | "workspace.created"
+        | "workspace.updated"
+        | "workspace.metadata_updated"
+        | "workspace.renamed"
+        | "workspace.moved"
+        | "workspace.reordered"
+        | "workspace.closed"
+        | "tab_created"
+        | "tab_renamed"
+        | "tab_moved"
+        | "tab_closed"
+        | "tab.created"
+        | "tab.renamed"
+        | "tab.moved"
+        | "tab.closed"
+        | "pane_created"
+        | "pane_closed"
+        | "pane_updated"
+        | "pane_moved"
+        | "pane_exited"
+        | "pane_agent_detected"
+        | "pane.created"
+        | "pane.closed"
+        | "pane.updated"
+        | "pane.moved"
+        | "pane.exited"
+        | "pane.agent_detected" => PrimaryEventClass::TopologyHint,
+        "pane_agent_status_changed" | "pane.agent_status_changed" => {
+            PrimaryEventClass::EnrichmentGauge
+        }
+        _ => PrimaryEventClass::NoOp,
+    }
+}
+
+fn record_topology_hint_diagnostics(received: &ReceivedEvent) {
+    if matches!(
+        received.event.as_str(),
+        "pane_agent_detected" | "pane.agent_detected"
+    ) && received.data.get("pane").is_none()
+        && string_field(&received.data, "pane_id").is_some()
+    {
+        received
+            .primary_stream_diagnostics
+            .record_flat_pane_agent_detected();
     }
 }
 
@@ -5409,10 +5721,14 @@ enum EventChannelState {
 fn drain_events(
     events: &mut mpsc::Receiver<Admitted<ReceivedEvent>>,
     buffered: &mut VecDeque<Admitted<ReceivedEvent>>,
+    overflowed: &AtomicBool,
+    origin: RefreshOrigin,
 ) -> EventChannelState {
     loop {
         match events.try_recv() {
-            Ok(received) => buffered.push_back(received),
+            Ok(received) => {
+                retain_primary_event_or_mark_overflow(buffered, received, overflowed, origin);
+            }
             Err(mpsc::error::TryRecvError::Empty) => return EventChannelState::Open,
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 return EventChannelState::Closed;
@@ -5421,23 +5737,45 @@ fn drain_events(
     }
 }
 
+fn retain_primary_event_or_mark_overflow(
+    buffered: &mut VecDeque<Admitted<ReceivedEvent>>,
+    received: Admitted<ReceivedEvent>,
+    overflowed: &AtomicBool,
+    origin: RefreshOrigin,
+) {
+    if buffered.len() < EVENT_QUEUE_CAPACITY {
+        buffered.push_back(received);
+        return;
+    }
+    overflowed.store(true, Ordering::Release);
+    let (received, admission) = received.into_parts();
+    if classify_primary_event(&received.event) == PrimaryEventClass::TopologyHint {
+        record_topology_hint_diagnostics(&received);
+        if origin == RefreshOrigin::CatchUp {
+            received
+                .primary_stream_diagnostics
+                .record_suppressed_topology_frame();
+        }
+    }
+    admission.complete();
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn apply_received_event(
     reducer: &mut Reducer,
     shared: &SharedModel,
     persistence: &mut RuntimePersistence,
-    owner: &mut OwnerTracker,
+    _owner: &mut OwnerTracker,
     session: &str,
     received: ReceivedEvent,
     admission: Admission,
     pending_closures: &mut PendingTopologyClosures,
     provider: &mut ProviderIntegration,
 ) -> Result<bool, CollectorError> {
-    if received.event == "pane_moved"
-        && let Err(error) = owner.refresh_from_move(&received.data, persistence).await
-    {
+    if classify_primary_event(&received.event) == PrimaryEventClass::TopologyHint {
+        record_topology_hint_diagnostics(&received);
         admission.complete();
-        return Err(error.into());
+        return Ok(false);
     }
     let normalized = match normalize_event(shared, session, &received) {
         Ok(normalized) => normalized,
@@ -5819,6 +6157,10 @@ fn normalize_event(
     session: &str,
     received: &ReceivedEvent,
 ) -> Result<Vec<NormalizedEvent>, CollectorError> {
+    if classify_primary_event(&received.event) == PrimaryEventClass::TopologyHint {
+        record_topology_hint_diagnostics(received);
+        return Ok(Vec::new());
+    }
     let mut events = Vec::new();
     match received.event.as_str() {
         "workspace_created" => {
@@ -5904,12 +6246,6 @@ fn normalize_event(
                 if shared.borrow().pane(&pane.pane_id).is_some() {
                     append_pane_upsert(shared, session, &received.event, pane, &mut events)?;
                 }
-            } else if received.event == "pane_agent_detected"
-                && string_field(&received.data, "pane_id").is_some()
-            {
-                received
-                    .primary_stream_diagnostics
-                    .record_flat_pane_agent_detected();
             }
         }
         "pane_closed" => {
@@ -6184,221 +6520,6 @@ fn append_execution_ends(
     }
 }
 
-fn apply_snapshot_in_place(
-    reducer: &mut Reducer,
-    shared: &SharedModel,
-    topology: TopologySnapshot,
-    session: &str,
-    pending_closures: &mut PendingTopologyClosures,
-) -> Result<PersistBatch, ReducerError> {
-    let mut persist = Vec::new();
-    let snapshot_workspace_ids: HashSet<_> = topology
-        .workspaces
-        .iter()
-        .map(|workspace| workspace.workspace_id.clone())
-        .collect();
-    let snapshot_tab_ids: HashSet<_> = topology.tabs.iter().map(|tab| tab.tab_id.clone()).collect();
-    let snapshot_pane_ids: HashSet<_> = topology
-        .panes
-        .iter()
-        .map(|pane| pane.pane_id.clone())
-        .collect();
-
-    for workspace in &topology.workspaces {
-        if let Some(batch) = apply_collector_event(
-            reducer,
-            authoritative_topology_upsert(
-                session,
-                "snapshot_workspace",
-                TopologyEntity::Workspace(workspace.clone()),
-            ),
-        )? {
-            persist.extend(batch);
-        }
-    }
-    for tab in &topology.tabs {
-        if let Some(batch) = apply_collector_event(
-            reducer,
-            authoritative_topology_upsert(
-                session,
-                "snapshot_tab",
-                TopologyEntity::Tab(tab.clone()),
-            ),
-        )? {
-            persist.extend(batch);
-        }
-    }
-    for pane in &topology.panes {
-        let mut observation = vec![authoritative_topology_upsert(
-            session,
-            "snapshot_pane",
-            TopologyEntity::Pane(Pane {
-                pane_id: pane.pane_id.clone(),
-                workspace_id: pane.workspace_id.clone(),
-                tab_id: pane.tab_id.clone(),
-                terminal_id: pane.terminal_id.clone(),
-                display_name: pane.display_name.clone(),
-            }),
-        )];
-        let provider = pane.agent.as_ref().and_then(|agent| {
-            snapshot_provider_name(
-                &agent.agent_name,
-                pane.agent_session
-                    .as_ref()
-                    .map(|session| session.agent.as_str()),
-            )
-        });
-        let incoming_sid = pane.agent_session.as_ref().and_then(|reference| {
-            (reference.kind == AgentSessionReferenceKind::Id && !reference.value.is_empty())
-                .then_some(reference.value.as_str())
-        });
-        let current: Vec<_> = shared
-            .borrow()
-            .executions()
-            .filter(|execution| {
-                execution.terminal_id == pane.terminal_id && !execution.state.is_terminal()
-            })
-            .cloned()
-            .collect();
-        let mut reused = false;
-        if let Some(agent) = &pane.agent {
-            for mut execution in current {
-                let has_native = run_has_native_binding(shared, execution.task_run_id);
-                let same_native = provider.zip(incoming_sid).is_some_and(|(provider, sid)| {
-                    run_owns_native(shared, execution.task_run_id, provider, sid)
-                });
-                let should_reuse = incoming_sid.is_none() || same_native || !has_native;
-                if should_reuse && !reused {
-                    execution.pane_id.clone_from(&pane.pane_id);
-                    execution.state = agent.state.clone();
-                    observation.push(NormalizedEvent::ExecutionBegin {
-                        metadata: snapshot_pane_metadata(session, "snapshot_execution", pane),
-                        execution,
-                    });
-                    reused = true;
-                } else {
-                    observation.push(NormalizedEvent::ExecutionEnd {
-                        metadata: metadata(session, "snapshot_different_session"),
-                        execution_id: execution.execution_id,
-                    });
-                }
-            }
-            if !reused {
-                observation.push(snapshot_execution_begin(session, pane, agent));
-            }
-        }
-        if let Some(batch) = apply_collector_observation(reducer, observation)? {
-            persist.extend(batch);
-        }
-    }
-
-    let stale_ids: Vec<_> = shared
-        .borrow()
-        .executions()
-        .filter(|execution| {
-            !execution.state.is_terminal()
-                && !topology
-                    .panes
-                    .iter()
-                    .any(|pane| pane.terminal_id == execution.terminal_id && pane.agent.is_some())
-        })
-        .map(|execution| execution.execution_id.clone())
-        .collect();
-    for execution_id in stale_ids {
-        if let Some(batch) = apply_collector_event(
-            reducer,
-            NormalizedEvent::AgentStatusChanged {
-                metadata: metadata(session, "snapshot_execution_missing"),
-                execution_id,
-                state: ExecState::Stale { since_ms: 0 },
-            },
-        )? {
-            persist.extend(batch);
-        }
-    }
-
-    let old_panes: Vec<_> = shared
-        .borrow()
-        .panes()
-        .filter(|pane| !snapshot_pane_ids.contains(&pane.pane_id))
-        .map(|pane| pane.pane_id.clone())
-        .collect();
-    let old_tabs: Vec<_> = shared
-        .borrow()
-        .tabs()
-        .filter(|tab| !snapshot_tab_ids.contains(&tab.tab_id))
-        .map(|tab| tab.tab_id.clone())
-        .collect();
-    let old_workspaces: Vec<_> = shared
-        .borrow()
-        .workspaces()
-        .filter(|workspace| !snapshot_workspace_ids.contains(&workspace.workspace_id))
-        .map(|workspace| workspace.workspace_id.clone())
-        .collect();
-    pending_closures.panes = old_panes.iter().cloned().collect();
-    pending_closures.tabs = old_tabs.iter().cloned().collect();
-    pending_closures.workspaces = old_workspaces.iter().cloned().collect();
-    for pane_id in old_panes {
-        let in_grace = shared.borrow().executions().any(|execution| {
-            execution.pane_id == pane_id && matches!(execution.state, ExecState::Stale { .. })
-        });
-        if !in_grace {
-            if let Some(batch) = apply_collector_event(
-                reducer,
-                topology_closure(
-                    session,
-                    "snapshot_pane_missing",
-                    TopologyEntityId::Pane {
-                        pane_id: pane_id.clone(),
-                    },
-                ),
-            )? {
-                persist.extend(batch);
-            }
-            pending_closures.panes.remove(&pane_id);
-        }
-    }
-    for tab_id in old_tabs {
-        if !shared.borrow().panes().any(|pane| pane.tab_id == tab_id) {
-            if let Some(batch) = apply_collector_event(
-                reducer,
-                topology_closure(
-                    session,
-                    "snapshot_tab_missing",
-                    TopologyEntityId::Tab {
-                        tab_id: tab_id.clone(),
-                    },
-                ),
-            )? {
-                persist.extend(batch);
-            }
-            pending_closures.tabs.remove(&tab_id);
-        }
-    }
-    for workspace_id in old_workspaces {
-        if !shared
-            .borrow()
-            .tabs()
-            .any(|tab| tab.workspace_id == workspace_id)
-        {
-            if let Some(batch) = apply_collector_event(
-                reducer,
-                topology_closure(
-                    session,
-                    "snapshot_workspace_missing",
-                    TopologyEntityId::Workspace {
-                        workspace_id: workspace_id.clone(),
-                    },
-                ),
-            )? {
-                persist.extend(batch);
-            }
-            pending_closures.workspaces.remove(&workspace_id);
-        }
-    }
-    Ok(persist)
-}
-
 fn apply_pending_topology_closures(
     reducer: &mut Reducer,
     shared: &SharedModel,
@@ -6485,44 +6606,6 @@ fn snapshot_provider_name(agent_name: &str, session_agent: Option<&str>) -> Opti
         .or_else(|| provider_from_name(agent_name))
 }
 
-fn snapshot_pane_metadata(session: &str, kind: &str, pane: &PaneSnapshot) -> EventMetadata {
-    let mut value = metadata(session, kind);
-    value.workspace_id = Some(pane.workspace_id.clone());
-    value.tab_id = Some(pane.tab_id.clone());
-    value.pane_id = Some(pane.pane_id.clone());
-    value.terminal_id = Some(pane.terminal_id.clone());
-    value.provider = pane.agent.as_ref().and_then(|agent| {
-        snapshot_provider_name(
-            &agent.agent_name,
-            pane.agent_session
-                .as_ref()
-                .map(|session| session.agent.as_str()),
-        )
-    });
-    value.native_session_id = pane.agent_session.as_ref().and_then(|reference| {
-        (reference.kind == AgentSessionReferenceKind::Id && !reference.value.is_empty())
-            .then(|| reference.value.clone())
-    });
-    value
-}
-
-fn snapshot_execution_begin(
-    session: &str,
-    pane: &PaneSnapshot,
-    agent: &SnapshotAgent,
-) -> NormalizedEvent {
-    NormalizedEvent::ExecutionBegin {
-        metadata: snapshot_pane_metadata(session, "snapshot_execution_discovered", pane),
-        execution: Execution {
-            execution_id: format!("herdr-execution-{}", ulid::Ulid::new()),
-            pane_id: pane.pane_id.clone(),
-            terminal_id: pane.terminal_id.clone(),
-            task_run_id: RunId::new(),
-            state: agent.state.clone(),
-        },
-    }
-}
-
 fn topology_from_snapshot(snapshot: &Snapshot) -> Result<TopologySnapshot, CollectorError> {
     let workspaces = snapshot
         .workspaces
@@ -6566,11 +6649,16 @@ fn topology_from_snapshot(snapshot: &Snapshot) -> Result<TopologySnapshot, Colle
 fn subscriptions() -> Vec<Subscription> {
     [
         "workspace.created",
+        "workspace.updated",
+        "workspace.metadata_updated",
         "workspace.renamed",
+        "workspace.moved",
+        "workspace.reordered",
         "workspace.closed",
         "workspace.focused",
         "tab.created",
         "tab.renamed",
+        "tab.moved",
         "tab.closed",
         "tab.focused",
         "pane.created",
@@ -6600,18 +6688,6 @@ fn topology_upsert(session: &str, kind: &str, entity: TopologyEntity) -> Normali
     NormalizedEvent::TopologyUpsert {
         metadata: metadata(session, kind),
         authority: TopologyAuthority::Partial,
-        entity,
-    }
-}
-
-fn authoritative_topology_upsert(
-    session: &str,
-    kind: &str,
-    entity: TopologyEntity,
-) -> NormalizedEvent {
-    NormalizedEvent::TopologyUpsert {
-        metadata: metadata(session, kind),
-        authority: TopologyAuthority::Authoritative,
         entity,
     }
 }
@@ -7160,46 +7236,6 @@ fn status_from_str(value: Option<&str>) -> ExecState {
     }
 }
 
-fn snapshot_entity_keys(snapshot: &Snapshot) -> HashSet<EntityKey> {
-    snapshot
-        .workspaces
-        .iter()
-        .map(|workspace| EntityKey::Workspace(workspace.workspace_id.clone()))
-        .chain(
-            snapshot
-                .tabs
-                .iter()
-                .map(|tab| EntityKey::Tab(tab.tab_id.clone())),
-        )
-        .chain(
-            snapshot
-                .panes
-                .iter()
-                .map(|pane| EntityKey::Pane(pane.pane_id.clone())),
-        )
-        .collect()
-}
-
-fn record_replay_facts(
-    index: usize,
-    received: &ReceivedEvent,
-    created: &mut HashSet<EntityKey>,
-    closures: &mut HashMap<EntityKey, Vec<usize>>,
-    candidates: &mut Vec<(usize, EntityKey)>,
-) {
-    for entity in created_entities(received) {
-        created.insert(entity);
-    }
-    for entity in closed_entities(received) {
-        closures.entry(entity).or_default().push(index);
-    }
-    if !is_focus_frame(&received.event)
-        && let Some(entity) = updated_entity(received)
-    {
-        candidates.push((index, entity));
-    }
-}
-
 fn created_entities(received: &ReceivedEvent) -> Vec<EntityKey> {
     let mut entities = Vec::new();
     match received.event.as_str() {
@@ -7236,40 +7272,6 @@ fn created_entities(received: &ReceivedEvent) -> Vec<EntityKey> {
     entities
 }
 
-fn closed_entities(received: &ReceivedEvent) -> Vec<EntityKey> {
-    let mut entities = Vec::new();
-    match received.event.as_str() {
-        "workspace_closed" => string_field(&received.data, "workspace_id")
-            .map(EntityKey::Workspace)
-            .into_iter()
-            .for_each(|entity| entities.push(entity)),
-        "tab_closed" => string_field(&received.data, "tab_id")
-            .map(EntityKey::Tab)
-            .into_iter()
-            .for_each(|entity| entities.push(entity)),
-        "pane_closed" | "pane_exited" => string_field(&received.data, "pane_id")
-            .map(EntityKey::Pane)
-            .into_iter()
-            .for_each(|entity| entities.push(entity)),
-        "pane_moved" => {
-            string_field(&received.data, "previous_pane_id")
-                .map(EntityKey::Pane)
-                .into_iter()
-                .for_each(|entity| entities.push(entity));
-            string_field(&received.data, "closed_tab_id")
-                .map(EntityKey::Tab)
-                .into_iter()
-                .for_each(|entity| entities.push(entity));
-            string_field(&received.data, "closed_workspace_id")
-                .map(EntityKey::Workspace)
-                .into_iter()
-                .for_each(|entity| entities.push(entity));
-        }
-        _ => {}
-    }
-    entities
-}
-
 fn updated_entity(received: &ReceivedEvent) -> Option<EntityKey> {
     match received.event.as_str() {
         "workspace_renamed" => nested_string(&received.data, "workspace", "workspace_id")
@@ -7287,19 +7289,6 @@ fn updated_entity(received: &ReceivedEvent) -> Option<EntityKey> {
             .or_else(|| nested_string(&received.data, "pane", "pane_id"))
             .map(EntityKey::Pane),
         _ => None,
-    }
-}
-
-fn is_focus_frame(event: &str) -> bool {
-    matches!(event, "workspace_focused" | "tab_focused" | "pane_focused")
-}
-
-fn entity_exists(shared: &SharedModel, entity: &EntityKey) -> bool {
-    let model = shared.borrow();
-    match entity {
-        EntityKey::Workspace(workspace_id) => model.workspace(workspace_id).is_some(),
-        EntityKey::Tab(tab_id) => model.tab(tab_id).is_some(),
-        EntityKey::Pane(pane_id) => model.pane(pane_id).is_some(),
     }
 }
 
@@ -7369,29 +7358,6 @@ impl OwnerTracker {
         if let Some(pane) = pane {
             self.update(&pane.terminal_id, &pane.pane_id, persistence)
                 .await?;
-        }
-        Ok(())
-    }
-
-    async fn refresh_from_move(
-        &mut self,
-        data: &Value,
-        persistence: &mut RuntimePersistence,
-    ) -> Result<(), WriterError> {
-        let Some(pane) = data.get("pane") else {
-            return Ok(());
-        };
-        let Some(terminal_id) = string_field(pane, "terminal_id") else {
-            return Ok(());
-        };
-        let Some(pane_id) = string_field(pane, "pane_id") else {
-            return Ok(());
-        };
-        let previous_pane_id = string_field(data, "previous_pane_id");
-        if self.terminal_id.as_deref() == Some(terminal_id.as_str())
-            || self.pane_id.as_deref() == previous_pane_id.as_deref()
-        {
-            self.update(&terminal_id, &pane_id, persistence).await?;
         }
         Ok(())
     }
@@ -7884,14 +7850,16 @@ mod tests {
         TaskState, Workspace,
     };
     use crate::performance::{
-        PerformanceDegradationReason, PerformanceSnapshot, TestPerformanceClock,
-        performance_tracker,
+        PerformanceDegradationReason, PerformanceSampler, PerformanceSnapshot,
+        TestPerformanceClock, performance_tracker,
     };
     use crate::store::writer::{
         DurabilityDisposition, PersistenceFailure, PersistenceFailureCode, PersistenceOperation,
         PersistencePhase,
     };
-    use crate::store::{LedgerEntry, PersistExecution, PersistTaskRun, open_writer, spawn_writer};
+    use crate::store::{
+        LedgerEntry, PersistExecution, PersistTaskRun, open_reader, open_writer, spawn_writer,
+    };
 
     fn provider_target_task_run(run_id: RunId, key: RunKey, ordinal: i64) -> TaskRun {
         TaskRun {
@@ -8584,15 +8552,23 @@ mod tests {
         provider_thread: ProviderThreadHandle,
         lifecycle: crate::store::WriterLifecycle,
         source_quality: watch::Receiver<ObservationQuality>,
+        runtime_diagnostics: watch::Receiver<RuntimeDiagnosticsSnapshot>,
+        performance_sampler: PerformanceSampler,
+        publish_count: Arc<std::sync::atomic::AtomicU64>,
+        published_provider_targets: Arc<Mutex<TargetSet>>,
         log_path: PathBuf,
     }
 
     impl PrimaryCollectorHarness {
         async fn stop(self) -> String {
+            self.stop_with_performance().await.0
+        }
+
+        async fn stop_with_performance(self) -> (String, PerformanceSnapshot) {
             let Self {
                 cancellation,
                 task,
-                model: _,
+                model,
                 primary_stream_diagnostics: _,
                 enrichment_diagnostics: _,
                 provider_events,
@@ -8600,6 +8576,10 @@ mod tests {
                 provider_thread,
                 lifecycle,
                 source_quality: _,
+                runtime_diagnostics: _,
+                mut performance_sampler,
+                publish_count: _,
+                published_provider_targets: _,
                 log_path,
             } = self;
             cancellation.cancel();
@@ -8615,8 +8595,243 @@ mod tests {
                 .unwrap();
             drop(ignored_provider_events);
             shutdown_writer(lifecycle).await;
-            std::fs::read_to_string(log_path).expect("failed to read primary collector log")
+            let performance = performance_sampler.sample(
+                &model.borrow(),
+                &OperatorSnapshot {
+                    activity: Arc::from([]),
+                    terminal_times: Arc::new(HashMap::new()),
+                },
+                unix_now_ms(),
+            );
+            (
+                std::fs::read_to_string(log_path).expect("failed to read primary collector log"),
+                performance,
+            )
         }
+
+        fn performance_snapshot(&mut self) -> PerformanceSnapshot {
+            self.performance_sampler.sample(
+                &self.model.borrow(),
+                &OperatorSnapshot {
+                    activity: Arc::from([]),
+                    terminal_times: Arc::new(HashMap::new()),
+                },
+                unix_now_ms(),
+            )
+        }
+    }
+
+    #[derive(Debug)]
+    enum GatedSnapshotResponse {
+        Json(Value),
+        Raw(Vec<u8>),
+        Close,
+    }
+
+    struct GatedSnapshotArrival {
+        index: usize,
+        release: oneshot::Sender<GatedSnapshotResponse>,
+    }
+
+    enum GatedPrimaryCommand {
+        Push(Value, oneshot::Sender<()>),
+        ClosePrimary(oneshot::Sender<()>),
+    }
+
+    struct GatedPrimaryServer {
+        commands: mpsc::UnboundedSender<GatedPrimaryCommand>,
+        arrivals: mpsc::UnboundedReceiver<GatedSnapshotArrival>,
+        primary_subscriptions: Arc<AtomicUsize>,
+        scoped_subscriptions: Arc<Mutex<Vec<Value>>>,
+        task: JoinHandle<()>,
+    }
+
+    impl GatedPrimaryServer {
+        async fn push(&self, frame: Value) {
+            let (acknowledgement, acknowledged) = oneshot::channel();
+            self.commands
+                .send(GatedPrimaryCommand::Push(frame, acknowledgement))
+                .expect("gated primary server stopped before push");
+            tokio::time::timeout(Duration::from_secs(3), acknowledged)
+                .await
+                .expect("gated primary push acknowledgement timed out")
+                .expect("gated primary push acknowledgement dropped");
+        }
+
+        async fn close_primary(&self) {
+            let (acknowledgement, acknowledged) = oneshot::channel();
+            self.commands
+                .send(GatedPrimaryCommand::ClosePrimary(acknowledgement))
+                .expect("gated primary server stopped before close");
+            tokio::time::timeout(Duration::from_secs(3), acknowledged)
+                .await
+                .expect("gated primary close acknowledgement timed out")
+                .expect("gated primary close acknowledgement dropped");
+        }
+
+        async fn next_snapshot(&mut self) -> GatedSnapshotArrival {
+            tokio::time::timeout(Duration::from_secs(3), self.arrivals.recv())
+                .await
+                .expect("gated snapshot request did not arrive")
+                .expect("gated snapshot arrival channel closed")
+        }
+
+        async fn assert_no_snapshot_for(&mut self, duration: Duration) {
+            assert!(
+                tokio::time::timeout(duration, self.arrivals.recv())
+                    .await
+                    .is_err(),
+                "an unexpected snapshot request crossed the quiet boundary"
+            );
+        }
+
+        fn primary_subscription_count(&self) -> usize {
+            self.primary_subscriptions.load(Ordering::Acquire)
+        }
+
+        fn scoped_subscription_requests(&self) -> Vec<Value> {
+            self.scoped_subscriptions.lock().unwrap().clone()
+        }
+
+        async fn stop(self) {
+            tokio::time::timeout(Duration::from_secs(3), self.task)
+                .await
+                .expect("gated primary server did not stop")
+                .expect("gated primary server task panicked");
+        }
+    }
+
+    fn spawn_gated_primary_server(
+        listener: tokio::net::UnixListener,
+        cancellation: CancellationToken,
+    ) -> GatedPrimaryServer {
+        let (commands, mut command_receiver) = mpsc::unbounded_channel();
+        let (arrival_sender, arrivals) = mpsc::unbounded_channel();
+        let primary = Arc::new(tokio::sync::Mutex::new(None));
+        let primary_subscriptions = Arc::new(AtomicUsize::new(0));
+        let scoped_subscriptions = Arc::new(Mutex::new(Vec::new()));
+        let task_primary = Arc::clone(&primary);
+        let task_primary_subscriptions = Arc::clone(&primary_subscriptions);
+        let task_scoped_subscriptions = Arc::clone(&scoped_subscriptions);
+        let task = tokio::spawn(async move {
+            let mut held_streams = Vec::new();
+            let mut snapshot_tasks = Vec::new();
+            let mut snapshot_index = 0;
+            loop {
+                tokio::select! {
+                    () = cancellation.cancelled() => break,
+                    command = command_receiver.recv() => {
+                        match command {
+                            Some(GatedPrimaryCommand::Push(frame, acknowledgement)) => {
+                                let mut primary = task_primary.lock().await;
+                                let reader = primary
+                                    .as_mut()
+                                    .expect("gated primary push preceded subscription");
+                                write_wire_frame(reader, &frame).await;
+                                let _ = acknowledgement.send(());
+                            }
+                            Some(GatedPrimaryCommand::ClosePrimary(acknowledgement)) => {
+                                drop(task_primary.lock().await.take());
+                                let _ = acknowledgement.send(());
+                            }
+                            None => continue,
+                        }
+                    }
+                    accepted = accept_wire_request(&listener) => {
+                        let (mut reader, request) = accepted;
+                        match request["method"].as_str() {
+                            Some("events.subscribe") => {
+                                write_wire_frame(
+                                    &mut reader,
+                                    &json!({
+                                        "id": request["id"],
+                                        "result": {"type": "subscription_started"},
+                                    }),
+                                )
+                                .await;
+                                if primary_subscription_is_scoped(&request) {
+                                    task_scoped_subscriptions.lock().unwrap().push(request);
+                                    held_streams.push(reader);
+                                } else {
+                                    task_primary_subscriptions.fetch_add(1, Ordering::AcqRel);
+                                    drop(task_primary.lock().await.replace(reader));
+                                }
+                            }
+                            Some("session.snapshot") => {
+                                let index = snapshot_index;
+                                snapshot_index += 1;
+                                let (release, released) = oneshot::channel();
+                                arrival_sender
+                                    .send(GatedSnapshotArrival { index, release })
+                                    .expect("gated snapshot observer closed");
+                                snapshot_tasks.push(tokio::spawn(async move {
+                                    match released.await {
+                                        Ok(GatedSnapshotResponse::Json(mut frame)) => {
+                                            frame["id"] = request["id"].clone();
+                                            write_wire_frame(&mut reader, &frame).await;
+                                        }
+                                        Ok(GatedSnapshotResponse::Raw(bytes)) => {
+                                            reader.get_mut().write_all(&bytes).await.unwrap();
+                                        }
+                                        Ok(GatedSnapshotResponse::Close) | Err(_) => {}
+                                    }
+                                }));
+                            }
+                            method => panic!("unexpected gated primary request: {method:?}"),
+                        }
+                    }
+                }
+            }
+            drop(task_primary.lock().await.take());
+            drop(held_streams);
+            for task in snapshot_tasks {
+                task.abort();
+                let _ = task.await;
+            }
+        });
+        GatedPrimaryServer {
+            commands,
+            arrivals,
+            primary_subscriptions,
+            scoped_subscriptions,
+            task,
+        }
+    }
+
+    fn spawn_gated_primary_collector(
+        directory: &tempfile::TempDir,
+        log_name: &str,
+        liveness_policy: LivenessPolicy,
+    ) -> (PrimaryCollectorHarness, GatedPrimaryServer) {
+        spawn_gated_primary_collector_with_options(directory, log_name, liveness_policy, None, None)
+    }
+
+    fn spawn_gated_primary_collector_with_options(
+        directory: &tempfile::TempDir,
+        log_name: &str,
+        liveness_policy: LivenessPolicy,
+        next_ordinal: Option<i64>,
+        write_injection: Option<TestWriteInjection>,
+    ) -> (PrimaryCollectorHarness, GatedPrimaryServer) {
+        let socket = directory.path().join(format!("{log_name}.sock"));
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let harness = spawn_primary_collector_harness_with_options(
+            directory,
+            socket,
+            log_name,
+            liveness_policy,
+            next_ordinal,
+            write_injection,
+        );
+        let server = spawn_gated_primary_server(listener, harness.cancellation.clone());
+        (harness, server)
+    }
+
+    fn release_snapshot(arrival: GatedSnapshotArrival, frame: Value) {
+        arrival
+            .release
+            .send(GatedSnapshotResponse::Json(frame))
+            .unwrap_or_else(|_| panic!("snapshot request {} was cancelled", arrival.index));
     }
 
     fn spawn_primary_collector_harness(
@@ -8638,6 +8853,24 @@ mod tests {
         log_name: &str,
         liveness_policy: LivenessPolicy,
     ) -> PrimaryCollectorHarness {
+        spawn_primary_collector_harness_with_options(
+            directory,
+            socket,
+            log_name,
+            liveness_policy,
+            None,
+            None,
+        )
+    }
+
+    fn spawn_primary_collector_harness_with_options(
+        directory: &tempfile::TempDir,
+        socket: PathBuf,
+        log_name: &str,
+        liveness_policy: LivenessPolicy,
+        next_ordinal: Option<i64>,
+        write_injection: Option<TestWriteInjection>,
+    ) -> PrimaryCollectorHarness {
         let log_path = directory.path().join(log_name);
         let log = std::fs::File::create(&log_path).unwrap();
         let subscriber = tracing_subscriber::fmt()
@@ -8648,11 +8881,15 @@ mod tests {
             .finish();
         let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
         let mut store = open_writer(&root).unwrap();
-        let restored = store.load_restored_state().unwrap();
+        let mut restored = store.load_restored_state().unwrap();
+        if let Some(next_ordinal) = next_ordinal {
+            restored.next_ordinal = next_ordinal;
+        }
         let owner = OwnerTracker::from_environment();
         store.replace_owner(&owner.record()).unwrap();
         let (lifecycle, writer) = spawn_writer(store).unwrap();
         let (reducer, shared) = Reducer::new(restored);
+        let publish_count = reducer.shared_publish_count();
         let initial_coverage = SourceCoverageRegistry::new(SourceAvailability::NotApplicable);
         let (coverage_sender, _source_coverage) = watch::channel(initial_coverage.clone());
         let (source_quality_sender, source_quality) =
@@ -8662,13 +8899,16 @@ mod tests {
             coverage_sender,
             source_quality_sender,
         );
-        let (persistence, _diagnostics) = RuntimePersistence::new(
+        let (mut persistence, runtime_diagnostics) = RuntimePersistence::new(
             writer,
             "test",
             &shared.borrow(),
             &initial_coverage,
             Arc::new(RecordingOccurrenceSink::default()),
         );
+        if let Some(injection) = write_injection {
+            persistence.inject_write_result(injection);
+        }
         let enrichment_diagnostics = persistence.enrichment_diagnostics();
 
         let provider_diagnostics = crate::provider::ProviderDiagnostics::default();
@@ -8681,15 +8921,17 @@ mod tests {
         )
         .unwrap();
         let (provider_events, provider_receiver) = mpsc::channel(1);
-        let provider = ProviderIntegration::new(
+        let published_provider_targets = Arc::new(Mutex::new(TargetSet::default()));
+        let mut provider = ProviderIntegration::new(
             provider_receiver,
             provider_thread.target_publisher(),
             TargetSet::default(),
             coverage,
         );
+        provider.observe_published_targets(Arc::clone(&published_provider_targets));
         let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
-        let (performance, _sampler) =
+        let (performance, performance_sampler) =
             performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
         let task_model = shared.clone();
         let primary_stream_diagnostics = PrimaryStreamDiagnosticsHandle::default();
@@ -8724,6 +8966,10 @@ mod tests {
             provider_thread,
             lifecycle,
             source_quality,
+            runtime_diagnostics,
+            performance_sampler,
+            publish_count,
+            published_provider_targets,
             log_path,
         }
     }
@@ -10854,6 +11100,2226 @@ mod tests {
             .unwrap()
     }
 
+    fn gated_snapshot_frame(pane_id: &str, label: Option<&str>, sid: &str) -> Value {
+        let mut frame = watchdog_snapshot_frame(&json!({"id": "gated"}), false, "codex");
+        frame["result"]["snapshot"]["focused_pane_id"] = json!(pane_id);
+        let pane = &mut frame["result"]["snapshot"]["panes"][0];
+        pane["pane_id"] = json!(pane_id);
+        pane["label"] = label.map_or(Value::Null, |value| json!(value));
+        pane["agent_session"]["source"] = json!("herdr:codex");
+        pane["agent_session"]["agent"] = json!("codex");
+        pane["agent_session"]["value"] = json!(sid);
+        frame
+    }
+
+    fn gated_pane_updated(pane_id: &str, label: &str, sid: &str) -> Value {
+        json!({
+            "event": "pane_updated",
+            "data": {
+                "type": "pane_updated",
+                "pane": {
+                    "pane_id": pane_id,
+                    "terminal_id": "terminal-4",
+                    "workspace_id": "w1",
+                    "tab_id": "w1:t1",
+                    "label": label,
+                    "agent": "claude",
+                    "agent_status": "working",
+                    "agent_session": {
+                        "source": "herdr:claude",
+                        "agent": "claude",
+                        "kind": "id",
+                        "value": sid,
+                    },
+                },
+            },
+        })
+    }
+
+    fn schema_primary_frame(schema_event: &str) -> Value {
+        let event = schema_event.replace('.', "_");
+        let workspace = json!({
+            "workspace_id": "w1",
+            "number": 1,
+            "label": "workspace",
+            "focused": true,
+            "pane_count": 1,
+            "tab_count": 1,
+            "active_tab_id": "w1:t1",
+            "agent_status": "working",
+        });
+        let tab = json!({
+            "tab_id": "w1:t1",
+            "workspace_id": "w1",
+            "number": 1,
+            "label": "tab",
+            "focused": true,
+            "pane_count": 1,
+            "agent_status": "working",
+        });
+        let pane = json!({
+            "pane_id": "w1:p4",
+            "terminal_id": "terminal-4",
+            "workspace_id": "w1",
+            "tab_id": "w1:t1",
+            "focused": true,
+            "agent": "codex",
+            "agent_status": "working",
+            "revision": 1,
+            "agent_session": {
+                "source": "herdr:codex",
+                "agent": "codex",
+                "kind": "id",
+                "value": "current-session",
+            },
+        });
+        let worktree = json!({
+            "path": "/repo",
+            "is_bare": false,
+            "is_detached": false,
+            "is_prunable": false,
+            "is_linked_worktree": true,
+            "label": "repo",
+        });
+        let data = match event.as_str() {
+            "workspace_created" | "workspace_updated" | "workspace_metadata_updated" => {
+                json!({"type": event, "workspace": workspace})
+            }
+            "workspace_renamed" => {
+                json!({"type": event, "workspace_id": "w1", "label": "renamed"})
+            }
+            "workspace_moved" => json!({
+                "type": event,
+                "workspace_id": "w1",
+                "insert_index": 0,
+                "workspaces": [workspace],
+            }),
+            "workspace_reordered" => json!({
+                "type": event,
+                "workspace_ids": ["w1"],
+                "workspaces": [workspace],
+                "before_workspace_id": null,
+            }),
+            "workspace_closed" => {
+                json!({"type": event, "workspace_id": "w1", "workspace": workspace})
+            }
+            "workspace_focused" => json!({"type": event, "workspace_id": "w1"}),
+            "tab_created" => json!({"type": event, "tab": tab}),
+            "tab_renamed" => json!({
+                "type": event,
+                "tab_id": "w1:t1",
+                "workspace_id": "w1",
+                "label": "renamed",
+            }),
+            "tab_moved" => json!({
+                "type": event,
+                "tab_id": "w1:t1",
+                "workspace_id": "w1",
+                "insert_index": 0,
+                "tabs": [tab],
+            }),
+            "tab_closed" | "tab_focused" => json!({
+                "type": event,
+                "tab_id": "w1:t1",
+                "workspace_id": "w1",
+            }),
+            "pane_created" | "pane_updated" => json!({"type": event, "pane": pane}),
+            "pane_moved" => json!({
+                "type": event,
+                "previous_pane_id": "w1:p4",
+                "previous_workspace_id": "w1",
+                "previous_tab_id": "w1:t1",
+                "closed_workspace_id": null,
+                "closed_tab_id": null,
+                "created_workspace": null,
+                "created_tab": null,
+                "pane": pane,
+            }),
+            "pane_closed" | "pane_exited" | "pane_focused" => json!({
+                "type": event,
+                "pane_id": "w1:p4",
+                "workspace_id": "w1",
+            }),
+            "pane_agent_detected" => json!({
+                "type": event,
+                "pane_id": "w1:p4",
+                "workspace_id": "w1",
+                "agent": "codex",
+                "final_status": "working",
+                "released": false,
+            }),
+            "pane_agent_status_changed" => json!({
+                "type": event,
+                "pane_id": "w1:p4",
+                "workspace_id": "w1",
+                "agent": "codex",
+                "agent_status": "idle",
+            }),
+            "pane_output_changed" => json!({
+                "type": event,
+                "pane_id": "w1:p4",
+                "workspace_id": "w1",
+                "revision": 2,
+            }),
+            "layout_updated" => json!({
+                "type": event,
+                "layout": {
+                    "workspace_id": "w1",
+                    "tab_id": "w1:t1",
+                    "zoomed": false,
+                    "area": {"x": 0, "y": 0, "width": 80, "height": 24},
+                    "focused_pane_id": "w1:p4",
+                    "panes": [{
+                        "pane_id": "w1:p4",
+                        "focused": true,
+                        "rect": {"x": 0, "y": 0, "width": 80, "height": 24},
+                    }],
+                    "splits": [],
+                },
+            }),
+            "worktree_created" => {
+                json!({"type": event, "workspace": workspace, "worktree": worktree})
+            }
+            "worktree_opened" => json!({
+                "type": event,
+                "workspace": workspace,
+                "worktree": worktree,
+                "already_open": false,
+            }),
+            "worktree_removed" => json!({
+                "type": event,
+                "workspace_id": "w1",
+                "workspace": workspace,
+                "worktree": worktree,
+                "forced": false,
+            }),
+            _ => json!({"type": event}),
+        };
+        json!({"event": event, "data": data})
+    }
+
+    async fn wait_for_primary_completions(
+        harness: &mut PrimaryCollectorHarness,
+        expected: u64,
+        context: &str,
+    ) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if harness.performance_snapshot().completion_high_water >= expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{context}: primary completion {expected} was not observed"));
+    }
+
+    async fn wait_for_primary_admissions(
+        harness: &mut PrimaryCollectorHarness,
+        expected: u64,
+        context: &str,
+    ) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if harness.performance_snapshot().admission_high_water >= expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{context}: primary admission {expected} was not observed"));
+    }
+
+    fn primary_counter_value(diagnostics: &PrimaryStreamDiagnosticsHandle, field: &str) -> u64 {
+        serde_json::to_value(diagnostics.snapshot()).unwrap()[field]
+            .as_u64()
+            .unwrap_or_else(|| panic!("primary counter {field} is missing"))
+    }
+
+    async fn wait_for_gap_committed(diagnostics: &PrimaryStreamDiagnosticsHandle) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !diagnostics.gap_committed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("collector outcome did not retain its committed topology gap");
+    }
+
+    #[tokio::test]
+    async fn catch_up_history_cannot_overwrite_closing_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut harness, mut server) = spawn_gated_primary_collector(
+            &directory,
+            "catch-up-history.log",
+            LivenessPolicy { timeout_ms: 10_000 },
+        );
+        let first = server.next_snapshot().await;
+        assert_eq!(first.index, 0);
+        server
+            .push(gated_pane_updated(
+                "w1:p4",
+                "historical-label",
+                "historical-session",
+            ))
+            .await;
+        release_snapshot(
+            first,
+            gated_snapshot_frame("w1:p4", Some("current-label"), "current-session"),
+        );
+
+        let closing = server.next_snapshot().await;
+        assert_eq!(closing.index, 1);
+        release_snapshot(
+            closing,
+            gated_snapshot_frame("w1:p4", Some("current-label"), "current-session"),
+        );
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "catch-up history closing snapshot",
+        )
+        .await;
+
+        let model = harness.model.borrow();
+        assert_eq!(
+            model.pane("w1:p4").unwrap().display_name.as_deref(),
+            Some("current-label")
+        );
+        assert!(
+            model
+                .task_run_by_key(&RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: "current-session".to_owned(),
+                })
+                .is_some()
+        );
+        assert!(
+            model
+                .task_run_by_key(&RunKey::Native {
+                    provider: Provider::Claude,
+                    sid: "historical-session".to_owned(),
+                })
+                .is_none()
+        );
+        drop(model);
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "suppressed_topology_frames",
+            ),
+            1
+        );
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "event_triggered_topology_refreshes",
+            ),
+            1
+        );
+        let _ = harness.stop().await;
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_absent_pane_cannot_resurrect_across_generations() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut harness, mut server) = spawn_gated_primary_collector(
+            &directory,
+            "absent-pane.log",
+            LivenessPolicy { timeout_ms: 10_000 },
+        );
+        let authoritative = gated_snapshot_frame("w1:p4", None, "current-session");
+        let first = server.next_snapshot().await;
+        server
+            .push(json!({
+                "event": "pane_created",
+                "data": {
+                    "pane": {
+                        "pane_id": "w1:historical",
+                        "terminal_id": "historical-terminal",
+                        "workspace_id": "w1",
+                        "tab_id": "w1:t1",
+                    },
+                },
+            }))
+            .await;
+        release_snapshot(first, authoritative.clone());
+        let closing = server.next_snapshot().await;
+        release_snapshot(closing, authoritative.clone());
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "first snapshot-absent generation",
+        )
+        .await;
+        assert_eq!(server.primary_subscription_count(), 1);
+
+        server.close_primary().await;
+        let reconnect = server.next_snapshot().await;
+        assert_eq!(reconnect.index, 2);
+        assert_eq!(server.primary_subscription_count(), 2);
+        assert_eq!(
+            *harness.source_quality.borrow(),
+            ObservationQuality::Reconciling
+        );
+        server
+            .push(gated_pane_updated(
+                "w1:historical",
+                "still-historical",
+                "historical-session",
+            ))
+            .await;
+        release_snapshot(reconnect, authoritative.clone());
+        let reconnect_closing = server.next_snapshot().await;
+        assert_eq!(reconnect_closing.index, 3);
+        release_snapshot(reconnect_closing, authoritative);
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "second snapshot-absent generation",
+        )
+        .await;
+
+        let model = harness.model.borrow();
+        assert!(model.pane("w1:historical").is_none());
+        assert!(
+            !model
+                .executions()
+                .any(|execution| execution.pane_id == "w1:historical"
+                    || execution.terminal_id == "historical-terminal")
+        );
+        assert!(
+            model
+                .task_run_by_key(&RunKey::Native {
+                    provider: Provider::Claude,
+                    sid: "historical-session".to_owned(),
+                })
+                .is_none()
+        );
+        assert_eq!(model.task_runs().count(), 1);
+        assert!(
+            model
+                .task_runs()
+                .all(|run| !matches!(run.key, RunKey::Provisional { .. }))
+        );
+        assert_eq!(model.executions().count(), 1);
+        assert!(model.executions().all(|execution| {
+            execution.pane_id == "w1:p4" && execution.terminal_id == "terminal-4"
+        }));
+        drop(model);
+        assert!(
+            server.scoped_subscription_requests().iter().all(|request| {
+                request["params"]["subscriptions"]
+                    .as_array()
+                    .is_some_and(|subscriptions| {
+                        subscriptions.iter().all(|subscription| {
+                            subscription["pane_id"].as_str() != Some("w1:historical")
+                        })
+                    })
+            }),
+            "a raw historical pane must never become an enrichment target"
+        );
+        let provider_targets = harness.published_provider_targets.lock().unwrap().clone();
+        assert_eq!(
+            provider_targets.sessions().collect::<Vec<_>>(),
+            vec![(Provider::Codex, "current-session")]
+        );
+        assert_eq!(provider_targets.codex_panes().count(), 0);
+        assert_eq!(provider_targets.iter().count(), 0);
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "suppressed_topology_frames",
+            ),
+            2
+        );
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "event_triggered_topology_refreshes",
+            ),
+            2
+        );
+        assert!(harness.primary_stream_diagnostics.gap_committed());
+        assert_eq!(harness.publish_count.load(Ordering::Acquire), 4);
+        let contents = harness.stop().await;
+        server.stop().await;
+        assert!(!contents.contains("herdr_subscription_refresh_failed"));
+    }
+
+    #[tokio::test]
+    async fn catch_up_without_topology_hint_skips_closing_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut harness, mut server) = spawn_gated_primary_collector(
+            &directory,
+            "quiet-catch-up.log",
+            LivenessPolicy { timeout_ms: 10_000 },
+        );
+        let first = server.next_snapshot().await;
+        server
+            .push(json!({
+                "event": "workspace_focused",
+                "data": {"workspace_id": "w1"},
+            }))
+            .await;
+        release_snapshot(
+            first,
+            gated_snapshot_frame("w1:p4", None, "current-session"),
+        );
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "quiet catch-up",
+        )
+        .await;
+        server
+            .assert_no_snapshot_for(Duration::from_millis(100))
+            .await;
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "event_triggered_topology_refreshes",
+            ),
+            0
+        );
+        let _ = harness.stop().await;
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn catch_up_topology_burst_coalesces_one_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut harness, mut server) = spawn_gated_primary_collector(
+            &directory,
+            "catch-up-burst.log",
+            LivenessPolicy { timeout_ms: 10_000 },
+        );
+        let authoritative = gated_snapshot_frame("w1:p4", Some("current"), "current-session");
+        let first = server.next_snapshot().await;
+        for index in 0..5 {
+            server
+                .push(gated_pane_updated(
+                    "w1:p4",
+                    &format!("historical-{index}"),
+                    "historical-session",
+                ))
+                .await;
+        }
+        release_snapshot(first, authoritative.clone());
+        let closing = server.next_snapshot().await;
+        assert_eq!(closing.index, 1);
+        release_snapshot(closing, authoritative);
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "coalesced catch-up burst",
+        )
+        .await;
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "suppressed_topology_frames",
+            ),
+            5
+        );
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "event_triggered_topology_refreshes",
+            ),
+            1
+        );
+        let _ = harness.stop().await;
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn primary_event_classifier_is_total_and_refreshes_only_topology() {
+        let subscribed = subscriptions()
+            .into_iter()
+            .map(|subscription| subscription.event_type)
+            .collect::<HashSet<_>>();
+        let topology_events = [
+            "workspace.created",
+            "workspace.updated",
+            "workspace.metadata_updated",
+            "workspace.renamed",
+            "workspace.moved",
+            "workspace.reordered",
+            "workspace.closed",
+            "tab.created",
+            "tab.renamed",
+            "tab.moved",
+            "tab.closed",
+            "pane.created",
+            "pane.closed",
+            "pane.updated",
+            "pane.moved",
+            "pane.exited",
+            "pane.agent_detected",
+        ];
+        for event in topology_events {
+            assert!(
+                subscribed.contains(event),
+                "missing topology subscription {event}"
+            );
+            assert_eq!(
+                classify_primary_event(event),
+                PrimaryEventClass::TopologyHint,
+                "subscribed topology event {event} was misclassified"
+            );
+        }
+        for event in [
+            "pane.output_changed",
+            "worktree.created",
+            "worktree.opened",
+            "worktree.removed",
+        ] {
+            assert!(
+                !subscribed.contains(event),
+                "unexpected subscription {event}"
+            );
+            assert_eq!(classify_primary_event(event), PrimaryEventClass::NoOp);
+        }
+        for event in [
+            "workspace.focused",
+            "tab.focused",
+            "pane.focused",
+            "layout.updated",
+        ] {
+            assert!(subscribed.contains(event));
+            assert_eq!(classify_primary_event(event), PrimaryEventClass::NoOp);
+        }
+        assert_eq!(
+            classify_primary_event("pane.agent_status_changed"),
+            PrimaryEventClass::EnrichmentGauge
+        );
+        assert!(!subscribed.contains("pane.agent_status_changed"));
+        assert_eq!(
+            classify_primary_event("permissive_server_future_event"),
+            PrimaryEventClass::NoOp
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let (mut harness, mut server) = spawn_gated_primary_collector(
+            &directory,
+            "classifier-dispatch.log",
+            LivenessPolicy { timeout_ms: 10_000 },
+        );
+        let authoritative = gated_snapshot_frame("w1:p4", Some("current"), "current-session");
+        let initial = server.next_snapshot().await;
+        assert_eq!(initial.index, 0);
+        release_snapshot(initial, authoritative.clone());
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "classifier initial live",
+        )
+        .await;
+
+        let mut completed = 0;
+        for (request_index, event) in topology_events.into_iter().enumerate() {
+            server.push(schema_primary_frame(event)).await;
+            let refresh = server.next_snapshot().await;
+            assert_eq!(
+                refresh.index,
+                request_index + 1,
+                "{event} did not issue exactly one gated topology refresh"
+            );
+            completed += 1;
+            wait_for_primary_completions(&mut harness, completed, event).await;
+            assert_eq!(
+                *harness.source_quality.borrow(),
+                ObservationQuality::Reconciling,
+                "{event} did not enter the refresh state"
+            );
+            release_snapshot(refresh, authoritative.clone());
+            wait_for_quality(&mut harness.source_quality, ObservationQuality::Live, event).await;
+        }
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "event_triggered_topology_refreshes",
+            ),
+            u64::try_from(topology_events.len()).unwrap()
+        );
+
+        for event in [
+            "workspace.focused",
+            "tab.focused",
+            "pane.focused",
+            "layout.updated",
+            "pane.output_changed",
+            "worktree.created",
+            "worktree.opened",
+            "worktree.removed",
+        ] {
+            server.push(schema_primary_frame(event)).await;
+            completed += 1;
+            wait_for_primary_completions(&mut harness, completed, event).await;
+            server
+                .assert_no_snapshot_for(Duration::from_millis(5))
+                .await;
+        }
+
+        server
+            .push(schema_primary_frame("pane.agent_status_changed"))
+            .await;
+        completed += 1;
+        wait_for_primary_completions(&mut harness, completed, "known-pane status").await;
+        server
+            .assert_no_snapshot_for(Duration::from_millis(5))
+            .await;
+        assert!(
+            harness
+                .model
+                .borrow()
+                .executions()
+                .filter(|execution| execution.pane_id == "w1:p4")
+                .all(|execution| execution.state == ExecState::Idle),
+            "the enrichment gauge must update an already snapshot-admitted pane"
+        );
+
+        let before_unknown = {
+            let model = harness.model.borrow();
+            (
+                model.panes().count(),
+                model.executions().count(),
+                model.task_runs().count(),
+            )
+        };
+        let mut unknown_status = schema_primary_frame("pane.agent_status_changed");
+        unknown_status["data"]["pane_id"] = json!("unknown-pane");
+        server.push(unknown_status).await;
+        completed += 1;
+        wait_for_primary_completions(&mut harness, completed, "unknown-pane status").await;
+        server
+            .assert_no_snapshot_for(Duration::from_millis(5))
+            .await;
+        let after_unknown = {
+            let model = harness.model.borrow();
+            (
+                model.panes().count(),
+                model.executions().count(),
+                model.task_runs().count(),
+            )
+        };
+        assert_eq!(after_unknown, before_unknown);
+
+        server
+            .push(json!({
+                "event": "permissive_server_future_event",
+                "data": {"type": "permissive_server_future_event"},
+            }))
+            .await;
+        completed += 1;
+        wait_for_primary_completions(&mut harness, completed, "future no-op").await;
+        server
+            .assert_no_snapshot_for(Duration::from_millis(5))
+            .await;
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "event_triggered_topology_refreshes",
+            ),
+            u64::try_from(topology_events.len()).unwrap(),
+            "non-topology frames must not issue a snapshot request"
+        );
+
+        let performance = harness.performance_snapshot();
+        assert_eq!(performance.admission_high_water, completed);
+        assert_eq!(performance.completion_high_water, completed);
+        assert_eq!(performance.pending_events, 0);
+        let _ = harness.stop().await;
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn live_topology_hint_applies_only_snapshot_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut harness, mut server) = spawn_gated_primary_collector(
+            &directory,
+            "live-hint.log",
+            LivenessPolicy { timeout_ms: 10_000 },
+        );
+        let first = server.next_snapshot().await;
+        release_snapshot(
+            first,
+            gated_snapshot_frame("w1:p4", Some("initial"), "current-session"),
+        );
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "initial live",
+        )
+        .await;
+        server
+            .push(gated_pane_updated(
+                "w1:p4",
+                "raw-hint",
+                "historical-session",
+            ))
+            .await;
+        let refresh = server.next_snapshot().await;
+        release_snapshot(
+            refresh,
+            gated_snapshot_frame("w1:p4", Some("snapshot-payload"), "current-session"),
+        );
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "live topology refresh",
+        )
+        .await;
+        assert_eq!(
+            harness
+                .model
+                .borrow()
+                .pane("w1:p4")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("snapshot-payload")
+        );
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "suppressed_topology_frames",
+            ),
+            0
+        );
+        let _ = harness.stop().await;
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn topology_hints_during_refresh_coalesce_one_follow_up() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut harness, mut server) = spawn_gated_primary_collector(
+            &directory,
+            "live-follow-up.log",
+            LivenessPolicy { timeout_ms: 10_000 },
+        );
+        let authoritative = gated_snapshot_frame("w1:p4", Some("authoritative"), "current-session");
+        let first = server.next_snapshot().await;
+        release_snapshot(first, authoritative.clone());
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "initial live",
+        )
+        .await;
+        server
+            .push(gated_pane_updated("w1:p4", "trigger", "historical-session"))
+            .await;
+        let refresh = server.next_snapshot().await;
+        for index in 0..3 {
+            server
+                .push(gated_pane_updated(
+                    "w1:p4",
+                    &format!("buffered-{index}"),
+                    "historical-session",
+                ))
+                .await;
+        }
+        release_snapshot(refresh, authoritative.clone());
+        let follow_up = server.next_snapshot().await;
+        assert_eq!(follow_up.index, 2);
+        release_snapshot(follow_up, authoritative);
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "coalesced live follow-up",
+        )
+        .await;
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "event_triggered_topology_refreshes",
+            ),
+            2
+        );
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "suppressed_topology_frames",
+            ),
+            0
+        );
+        let _ = harness.stop().await;
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn continuous_topology_hints_stop_after_three_requests_until_quiescent() {
+        let directory = tempfile::tempdir().unwrap();
+        let liveness_policy = LivenessPolicy { timeout_ms: 120 };
+        let (mut harness, mut server) =
+            spawn_gated_primary_collector(&directory, "continuous-hints.log", liveness_policy);
+        let authoritative = gated_snapshot_frame("w1:p4", Some("current"), "current-session");
+
+        let first = server.next_snapshot().await;
+        server
+            .push(gated_pane_updated("w1:p4", "catch-up-0", "historical"))
+            .await;
+        release_snapshot(first, authoritative.clone());
+        for request in 1..=RESNAPSHOT_ATTEMPTS {
+            let arrival = server.next_snapshot().await;
+            assert_eq!(arrival.index, request);
+            assert_eq!(
+                primary_counter_value(
+                    &harness.primary_stream_diagnostics,
+                    "event_triggered_topology_refreshes",
+                ),
+                u64::try_from(request).unwrap(),
+                "each issued CatchUp hint request must increment exactly once"
+            );
+            assert_eq!(
+                primary_counter_value(
+                    &harness.primary_stream_diagnostics,
+                    "suppressed_topology_frames",
+                ),
+                u64::try_from(request).unwrap(),
+                "each admitted CatchUp replay hint must be suppressed exactly once"
+            );
+            server
+                .push(gated_pane_updated(
+                    "w1:p4",
+                    &format!("catch-up-{request}"),
+                    "historical",
+                ))
+                .await;
+            release_snapshot(arrival, authoritative.clone());
+        }
+        for index in 0..2 {
+            let quiet_started = (index == 1).then(Instant::now);
+            server
+                .push(gated_pane_updated(
+                    "w1:p4",
+                    &format!("catch-up-monitor-{index}"),
+                    "historical",
+                ))
+                .await;
+            if let Some(quiet_started) = quiet_started {
+                wait_for_primary_completions(&mut harness, 6, "CatchUp monitor hints").await;
+                let catch_up_probe = server.next_snapshot().await;
+                assert_eq!(catch_up_probe.index, 4);
+                assert!(
+                    quiet_started.elapsed() >= liveness_timeout(&liveness_policy),
+                    "the first post-budget request arrived before a full quiet watchdog interval"
+                );
+                assert_eq!(
+                    primary_counter_value(
+                        &harness.primary_stream_diagnostics,
+                        "event_triggered_topology_refreshes",
+                    ),
+                    3,
+                    "the watchdog probe must not count as an event-triggered request"
+                );
+                assert_eq!(
+                    primary_counter_value(
+                        &harness.primary_stream_diagnostics,
+                        "suppressed_topology_frames",
+                    ),
+                    6,
+                    "CatchUp replay and monitor hints must each count exactly once"
+                );
+                release_snapshot(catch_up_probe, authoritative.clone());
+            }
+        }
+        let catch_up_recovery = server.next_snapshot().await;
+        assert_eq!(catch_up_recovery.index, 5);
+        release_snapshot(catch_up_recovery, authoritative.clone());
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "catch-up quiescence recovery",
+        )
+        .await;
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "event_triggered_topology_refreshes",
+            ),
+            3
+        );
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "suppressed_topology_frames",
+            ),
+            6
+        );
+
+        server
+            .push(gated_pane_updated("w1:p4", "live-trigger", "historical"))
+            .await;
+        for request in 6..=8 {
+            let arrival = server.next_snapshot().await;
+            assert_eq!(arrival.index, request);
+            assert_eq!(
+                primary_counter_value(
+                    &harness.primary_stream_diagnostics,
+                    "event_triggered_topology_refreshes",
+                ),
+                u64::try_from(request - 2).unwrap(),
+                "each issued LiveRefresh hint request must increment exactly once"
+            );
+            assert_eq!(
+                primary_counter_value(
+                    &harness.primary_stream_diagnostics,
+                    "suppressed_topology_frames",
+                ),
+                6,
+                "LiveRefresh replay hints must not increment suppression"
+            );
+            server
+                .push(gated_pane_updated(
+                    "w1:p4",
+                    &format!("live-buffered-{request}"),
+                    "historical",
+                ))
+                .await;
+            release_snapshot(arrival, authoritative.clone());
+        }
+        for index in 0..2 {
+            let quiet_started = (index == 1).then(Instant::now);
+            server
+                .push(gated_pane_updated(
+                    "w1:p4",
+                    &format!("live-monitor-{index}"),
+                    "historical",
+                ))
+                .await;
+            if let Some(quiet_started) = quiet_started {
+                wait_for_primary_completions(&mut harness, 12, "LiveRefresh monitor hints").await;
+                let live_probe = server.next_snapshot().await;
+                assert_eq!(live_probe.index, 9);
+                assert!(
+                    quiet_started.elapsed() >= liveness_timeout(&liveness_policy),
+                    "the LiveRefresh probe arrived before a full quiet watchdog interval"
+                );
+                assert_eq!(
+                    primary_counter_value(
+                        &harness.primary_stream_diagnostics,
+                        "event_triggered_topology_refreshes",
+                    ),
+                    6,
+                    "the LiveRefresh watchdog probe must not increment the request counter"
+                );
+                assert_eq!(
+                    primary_counter_value(
+                        &harness.primary_stream_diagnostics,
+                        "suppressed_topology_frames",
+                    ),
+                    6,
+                    "LiveRefresh monitor hints must not increment suppression"
+                );
+                release_snapshot(live_probe, authoritative.clone());
+            }
+        }
+        let live_recovery = server.next_snapshot().await;
+        assert_eq!(live_recovery.index, 10);
+        release_snapshot(live_recovery, authoritative.clone());
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "live-origin quiescence recovery",
+        )
+        .await;
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "event_triggered_topology_refreshes",
+            ),
+            6
+        );
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "suppressed_topology_frames",
+            ),
+            6,
+            "live-refresh replay and monitor drops must not increment suppression"
+        );
+        let performance = harness.performance_snapshot();
+        assert_eq!(performance.admission_high_water, 12);
+        assert_eq!(performance.completion_high_water, 12);
+        assert_eq!(performance.pending_events, 0);
+        assert_eq!(server.primary_subscription_count(), 1);
+
+        server
+            .push(gated_pane_updated("w1:p4", "cancel-trigger", "historical"))
+            .await;
+        let cancelled_refresh = server.next_snapshot().await;
+        assert_eq!(cancelled_refresh.index, 11);
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "event_triggered_topology_refreshes",
+            ),
+            7,
+            "the cancellation episode's actually issued request must count"
+        );
+        server
+            .push(gated_pane_updated("w1:p4", "cancel-buffered", "historical"))
+            .await;
+        wait_for_primary_admissions(&mut harness, 14, "buffered cancellation hint").await;
+        harness.cancellation.cancel();
+        drop(cancelled_refresh);
+        let (_, performance) = harness.stop_with_performance().await;
+        assert_eq!(performance.admission_high_water, 14);
+        assert_eq!(performance.completion_high_water, 14);
+        assert_eq!(performance.pending_events, 0);
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn failed_topology_refresh_preserves_last_good_model() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut harness, mut server) = spawn_gated_primary_collector(
+            &directory,
+            "failed-refresh.log",
+            LivenessPolicy { timeout_ms: 10_000 },
+        );
+        let first = server.next_snapshot().await;
+        release_snapshot(
+            first,
+            gated_snapshot_frame("w1:p4", Some("last-good"), "current-session"),
+        );
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "initial live",
+        )
+        .await;
+        server
+            .push(gated_pane_updated("w1:p4", "must-not-land", "historical"))
+            .await;
+        let refresh = server.next_snapshot().await;
+        refresh
+            .release
+            .send(GatedSnapshotResponse::Json(json!({
+                "id": "gated",
+                "error": {"code": "unavailable", "message": "refresh failed"},
+            })))
+            .unwrap();
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Disconnected,
+            "failed topology refresh",
+        )
+        .await;
+        assert_eq!(
+            harness
+                .model
+                .borrow()
+                .pane("w1:p4")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("last-good")
+        );
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "event_triggered_topology_refreshes",
+            ),
+            1
+        );
+        let contents = harness.stop().await;
+        server.stop().await;
+        assert!(contents.contains("reason=\"snapshot_request_failed\""));
+    }
+
+    #[tokio::test]
+    async fn initial_snapshot_in_flight_eof_ends_without_refresh_failure_and_completes_admissions()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let (harness, mut server) = spawn_gated_primary_collector(
+            &directory,
+            "initial-snapshot-eof.log",
+            LivenessPolicy { timeout_ms: 10_000 },
+        );
+        let held_snapshot = server.next_snapshot().await;
+        server
+            .push(gated_pane_updated(
+                "w1:pending",
+                "must-not-land",
+                "pending-session",
+            ))
+            .await;
+
+        let eof_started = Instant::now();
+        server.close_primary().await;
+        let replacement_snapshot = server.next_snapshot().await;
+        assert!(
+            eof_started.elapsed() < Duration::from_secs(1),
+            "snapshot-in-flight EOF waited for timeout/backoff"
+        );
+        assert_eq!(server.primary_subscription_count(), 2);
+        assert!(!harness.primary_stream_diagnostics.gap_committed());
+
+        drop(held_snapshot);
+        drop(replacement_snapshot);
+        let (contents, performance) = harness.stop_with_performance().await;
+        server.stop().await;
+        assert_eq!(performance.admission_high_water, 1);
+        assert_eq!(performance.completion_high_water, 1);
+        assert_eq!(performance.pending_events, 0);
+        assert!(!contents.contains("herdr_primary_stream_reconnect"));
+        assert!(!contents.contains("snapshot_timed_out"));
+    }
+
+    #[tokio::test]
+    async fn initial_snapshot_in_flight_cancellation_completes_admissions_without_reconnect() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut harness, mut server) = spawn_gated_primary_collector(
+            &directory,
+            "initial-snapshot-cancel.log",
+            LivenessPolicy { timeout_ms: 10_000 },
+        );
+        let held_snapshot = server.next_snapshot().await;
+        server
+            .push(gated_pane_updated(
+                "w1:pending",
+                "must-not-land",
+                "pending-session",
+            ))
+            .await;
+
+        wait_for_primary_admissions(&mut harness, 1, "in-flight cancellation hint").await;
+        harness.cancellation.cancel();
+        drop(held_snapshot);
+        let gap_committed = harness.primary_stream_diagnostics.clone();
+        let (contents, performance) = harness.stop_with_performance().await;
+        server.stop().await;
+        assert!(!gap_committed.gap_committed());
+        assert_eq!(performance.admission_high_water, 1);
+        assert_eq!(performance.completion_high_water, 1);
+        assert_eq!(performance.pending_events, 0);
+        assert!(!contents.contains("herdr_primary_stream_reconnect"));
+        assert!(!contents.contains("snapshot_timed_out"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_in_flight_overflow_bounds_admissions_and_forces_authoritative_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut harness, mut server) = spawn_gated_primary_collector(
+            &directory,
+            "snapshot-in-flight-overflow.log",
+            LivenessPolicy { timeout_ms: 10_000 },
+        );
+        let held_snapshot = server.next_snapshot().await;
+        let delivered = EVENT_QUEUE_CAPACITY + 8;
+        for index in 0..delivered {
+            let frame = if index == EVENT_QUEUE_CAPACITY {
+                json!({
+                    "event": "pane_agent_detected",
+                    "data": {
+                        "type": "pane_agent_detected",
+                        "pane_id": "w1:p4",
+                        "terminal_id": "terminal-4",
+                        "agent": "claude-code",
+                    },
+                })
+            } else {
+                gated_pane_updated("w1:p4", &format!("overflow-{index}"), "raw-session")
+            };
+            server.push(frame).await;
+        }
+        wait_for_primary_admissions(
+            &mut harness,
+            u64::try_from(delivered).unwrap(),
+            "snapshot-in-flight overflow burst",
+        )
+        .await;
+
+        wait_for_primary_completions(
+            &mut harness,
+            u64::try_from(delivered).unwrap(),
+            "snapshot-in-flight overflow drops",
+        )
+        .await;
+        let retained = harness.performance_snapshot();
+        assert_eq!(retained.pending_events, EVENT_QUEUE_CAPACITY);
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "suppressed_topology_frames",
+            ),
+            8,
+            "all cap-excess CatchUp topology hints must be diagnosed before release"
+        );
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "flat_pane_agent_detected",
+            ),
+            1,
+            "a cap-excess flat pane_agent_detected frame must retain its shape diagnostic"
+        );
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "event_triggered_topology_refreshes",
+            ),
+            0
+        );
+
+        release_snapshot(
+            held_snapshot,
+            gated_snapshot_frame("w1:p4", Some("held"), "held-session"),
+        );
+        let recovery = server.next_snapshot().await;
+        assert_eq!(recovery.index, 1);
+        assert_eq!(server.primary_subscription_count(), 1);
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "event_triggered_topology_refreshes",
+            ),
+            0,
+            "overflow recovery must not increment the hint-caused request counter"
+        );
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "suppressed_topology_frames",
+            ),
+            delivered as u64,
+            "retained and cap-excess CatchUp hints must each count exactly once"
+        );
+        release_snapshot(
+            recovery,
+            gated_snapshot_frame("w1:p4", Some("recovered"), "recovered-session"),
+        );
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "snapshot-in-flight overflow recovery",
+        )
+        .await;
+        assert_eq!(
+            harness
+                .model
+                .borrow()
+                .pane("w1:p4")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("recovered")
+        );
+        assert_eq!(server.primary_subscription_count(), 1);
+
+        let (contents, performance) = harness.stop_with_performance().await;
+        server.stop().await;
+        assert_eq!(performance.admission_high_water, delivered as u64);
+        assert_eq!(performance.completion_high_water, delivered as u64);
+        assert_eq!(performance.pending_events, 0);
+        assert!(!contents.contains("herdr_primary_stream_reconnect"));
+        assert!(!contents.contains("snapshot_timed_out"));
+    }
+
+    #[tokio::test]
+    async fn repeated_snapshot_overflow_exhausts_immediate_budget_before_quiescent_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let liveness_policy = LivenessPolicy { timeout_ms: 180 };
+        let (mut harness, mut server) = spawn_gated_primary_collector(
+            &directory,
+            "repeated-snapshot-overflow.log",
+            liveness_policy,
+        );
+        let authoritative = gated_snapshot_frame("w1:p4", Some("authoritative"), "current-session");
+        let delivered_per_overflow = EVENT_QUEUE_CAPACITY + 1;
+        let mut total_delivered = 0_u64;
+        let mut request = server.next_snapshot().await;
+
+        for dirty_boundary in 0..=RESNAPSHOT_ATTEMPTS {
+            assert_eq!(request.index, dirty_boundary);
+            for event in 0..delivered_per_overflow {
+                server
+                    .push(gated_pane_updated(
+                        "w1:p4",
+                        &format!("overflow-{dirty_boundary}-{event}"),
+                        "raw-session",
+                    ))
+                    .await;
+            }
+            total_delivered =
+                total_delivered.saturating_add(u64::try_from(delivered_per_overflow).unwrap());
+            wait_for_primary_admissions(
+                &mut harness,
+                total_delivered,
+                "repeated snapshot overflow admissions",
+            )
+            .await;
+            wait_for_primary_completions(
+                &mut harness,
+                total_delivered,
+                "repeated snapshot overflow excess drop",
+            )
+            .await;
+            assert_eq!(
+                harness.performance_snapshot().pending_events,
+                EVENT_QUEUE_CAPACITY
+            );
+
+            if dirty_boundary == RESNAPSHOT_ATTEMPTS {
+                let quiet_started = Instant::now();
+                release_snapshot(request, authoritative.clone());
+                let probe = server.next_snapshot().await;
+                assert_eq!(probe.index, RESNAPSHOT_ATTEMPTS + 1);
+                assert!(
+                    quiet_started.elapsed() >= liveness_timeout(&liveness_policy),
+                    "a fourth immediate overflow recovery request bypassed quiescence"
+                );
+                assert_eq!(server.primary_subscription_count(), 1);
+                assert_eq!(
+                    primary_counter_value(
+                        &harness.primary_stream_diagnostics,
+                        "event_triggered_topology_refreshes",
+                    ),
+                    0,
+                    "overflow requests and the quiescence probe are not hint-caused"
+                );
+                assert_eq!(
+                    primary_counter_value(
+                        &harness.primary_stream_diagnostics,
+                        "suppressed_topology_frames",
+                    ),
+                    total_delivered,
+                    "every retained or cap-excess CatchUp hint must count once"
+                );
+                release_snapshot(probe, authoritative.clone());
+                let recovery = server.next_snapshot().await;
+                assert_eq!(recovery.index, RESNAPSHOT_ATTEMPTS + 2);
+                release_snapshot(recovery, authoritative.clone());
+                break;
+            }
+
+            release_snapshot(request, authoritative.clone());
+            request = server.next_snapshot().await;
+            assert_eq!(
+                primary_counter_value(
+                    &harness.primary_stream_diagnostics,
+                    "event_triggered_topology_refreshes",
+                ),
+                0,
+                "an immediate overflow recovery must not increment the hint counter"
+            );
+        }
+
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "quiescent repeated-overflow recovery",
+        )
+        .await;
+        assert_eq!(server.primary_subscription_count(), 1);
+        assert_eq!(
+            harness
+                .model
+                .borrow()
+                .pane("w1:p4")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("authoritative")
+        );
+
+        let (contents, performance) = harness.stop_with_performance().await;
+        server.stop().await;
+        assert_eq!(performance.admission_high_water, total_delivered);
+        assert_eq!(performance.completion_high_water, total_delivered);
+        assert_eq!(performance.pending_events, 0);
+        assert!(!contents.contains("herdr_primary_stream_reconnect"));
+        assert!(!contents.contains("snapshot_timed_out"));
+    }
+
+    #[tokio::test]
+    async fn initial_snapshot_failures_preserve_empty_truth_and_uncommitted_gap() {
+        enum InitialFailure {
+            Release(GatedSnapshotResponse),
+            HoldForTimeout,
+        }
+
+        async fn assert_initial_failure(
+            log_name: &str,
+            expected_reason: &str,
+            next_ordinal: Option<i64>,
+            response: InitialFailure,
+        ) {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut harness, mut server) = spawn_gated_primary_collector_with_options(
+                &directory,
+                log_name,
+                LivenessPolicy { timeout_ms: 60 },
+                next_ordinal,
+                None,
+            );
+            let request = server.next_snapshot().await;
+            match response {
+                InitialFailure::Release(response) => request.release.send(response).unwrap(),
+                InitialFailure::HoldForTimeout => {
+                    wait_for_quality(
+                        &mut harness.source_quality,
+                        ObservationQuality::Disconnected,
+                        expected_reason,
+                    )
+                    .await;
+                    drop(request);
+                }
+            }
+            wait_for_quality(
+                &mut harness.source_quality,
+                ObservationQuality::Disconnected,
+                expected_reason,
+            )
+            .await;
+            assert!(!harness.primary_stream_diagnostics.gap_committed());
+            assert_eq!(
+                primary_counter_value(
+                    &harness.primary_stream_diagnostics,
+                    "event_triggered_topology_refreshes",
+                ),
+                0,
+                "startup failures must not count their non-event snapshot request"
+            );
+            assert_eq!(harness.publish_count.load(Ordering::Acquire), 0);
+            {
+                let model = harness.model.borrow();
+                assert_eq!(model.workspaces().count(), 0);
+                assert_eq!(model.tabs().count(), 0);
+                assert_eq!(model.panes().count(), 0);
+                assert_eq!(model.task_runs().count(), 0);
+                assert_eq!(model.executions().count(), 0);
+            }
+            assert_eq!(
+                harness
+                    .published_provider_targets
+                    .lock()
+                    .unwrap()
+                    .sessions()
+                    .count(),
+                0
+            );
+            server
+                .assert_no_snapshot_for(Duration::from_millis(100))
+                .await;
+            let contents = harness.stop().await;
+            server.stop().await;
+            assert!(
+                contents.contains(&format!("reason=\"{expected_reason}\"")),
+                "missing initial failure reason {expected_reason}: {contents}"
+            );
+        }
+
+        assert_initial_failure(
+            "initial-request-failure.log",
+            "snapshot_request_failed",
+            None,
+            InitialFailure::Release(GatedSnapshotResponse::Close),
+        )
+        .await;
+        assert_initial_failure(
+            "initial-wire-failure.log",
+            "snapshot_request_failed",
+            None,
+            InitialFailure::Release(GatedSnapshotResponse::Raw(b"{not-json}\n".to_vec())),
+        )
+        .await;
+        assert_initial_failure(
+            "initial-timeout-failure.log",
+            "snapshot_timed_out",
+            None,
+            InitialFailure::HoldForTimeout,
+        )
+        .await;
+        assert_initial_failure(
+            "initial-decode-failure.log",
+            "snapshot_decode_failed",
+            None,
+            InitialFailure::Release(GatedSnapshotResponse::Json(json!({
+                "id": "gated",
+                "result": {"type": "session_snapshot", "snapshot": "malformed"},
+            }))),
+        )
+        .await;
+        let mut invalid_topology =
+            gated_snapshot_frame("w1:p4", Some("must-not-land"), "current-session");
+        invalid_topology["result"]["snapshot"]["panes"][0]["tab_id"] = Value::Null;
+        assert_initial_failure(
+            "initial-conversion-failure.log",
+            "topology_conversion_failed",
+            None,
+            InitialFailure::Release(GatedSnapshotResponse::Json(invalid_topology)),
+        )
+        .await;
+        assert_initial_failure(
+            "initial-reducer-failure.log",
+            "reducer_rejected",
+            Some(i64::MAX),
+            InitialFailure::Release(GatedSnapshotResponse::Json(gated_snapshot_frame(
+                "w1:p4",
+                Some("must-not-land"),
+                "current-session",
+            ))),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn topology_refresh_failure_reasons_preserve_model_and_route_exactly() {
+        enum FailureResponse {
+            Release(GatedSnapshotResponse),
+            HoldForTimeout,
+        }
+
+        async fn assert_failure(log_name: &str, expected_reason: &str, response: FailureResponse) {
+            let directory = tempfile::tempdir().unwrap();
+            let policy = LivenessPolicy { timeout_ms: 60 };
+            let (mut harness, mut server) =
+                spawn_gated_primary_collector(&directory, log_name, policy);
+            let first = server.next_snapshot().await;
+            release_snapshot(
+                first,
+                gated_snapshot_frame("w1:p4", Some("last-good"), "current-session"),
+            );
+            wait_for_quality(
+                &mut harness.source_quality,
+                ObservationQuality::Live,
+                "failure-table initial live",
+            )
+            .await;
+            server
+                .push(gated_pane_updated("w1:p4", "must-not-land", "historical"))
+                .await;
+            let refresh = server.next_snapshot().await;
+            let publish_count = harness.publish_count.load(Ordering::Relaxed);
+            let failure_started = Instant::now();
+            match response {
+                FailureResponse::Release(response) => {
+                    refresh.release.send(response).unwrap();
+                }
+                FailureResponse::HoldForTimeout => {
+                    wait_for_quality(
+                        &mut harness.source_quality,
+                        ObservationQuality::Disconnected,
+                        expected_reason,
+                    )
+                    .await;
+                    drop(refresh);
+                }
+            }
+            wait_for_quality(
+                &mut harness.source_quality,
+                ObservationQuality::Disconnected,
+                expected_reason,
+            )
+            .await;
+            wait_for_gap_committed(&harness.primary_stream_diagnostics).await;
+            assert_eq!(
+                harness
+                    .model
+                    .borrow()
+                    .pane("w1:p4")
+                    .unwrap()
+                    .display_name
+                    .as_deref(),
+                Some("last-good")
+            );
+            assert_eq!(server.primary_subscription_count(), 1);
+            assert_eq!(harness.publish_count.load(Ordering::Relaxed), publish_count);
+            assert_eq!(
+                primary_counter_value(
+                    &harness.primary_stream_diagnostics,
+                    "event_triggered_topology_refreshes",
+                ),
+                1
+            );
+            let recovery = server.next_snapshot().await;
+            assert!(
+                failure_started.elapsed() >= Duration::from_secs(1),
+                "{expected_reason} reconnect skipped the one-second failure backoff"
+            );
+            release_snapshot(
+                recovery,
+                gated_snapshot_frame("w1:p4", Some("last-good"), "current-session"),
+            );
+            wait_for_quality(
+                &mut harness.source_quality,
+                ObservationQuality::Live,
+                "failure-table recovery",
+            )
+            .await;
+            assert_eq!(server.primary_subscription_count(), 2);
+            let contents = harness.stop().await;
+            server.stop().await;
+            assert!(
+                contents.contains(&format!("reason=\"{expected_reason}\"")),
+                "missing exact failure reason {expected_reason}: {contents}"
+            );
+        }
+
+        assert_failure(
+            "wire-failure.log",
+            "snapshot_request_failed",
+            FailureResponse::Release(GatedSnapshotResponse::Close),
+        )
+        .await;
+        assert_failure(
+            "malformed-wire-failure.log",
+            "snapshot_request_failed",
+            FailureResponse::Release(GatedSnapshotResponse::Raw(b"{not-json}\n".to_vec())),
+        )
+        .await;
+        assert_failure(
+            "timeout-failure.log",
+            "snapshot_timed_out",
+            FailureResponse::HoldForTimeout,
+        )
+        .await;
+        assert_failure(
+            "decode-failure.log",
+            "snapshot_decode_failed",
+            FailureResponse::Release(GatedSnapshotResponse::Json(json!({
+                "id": "gated",
+                "result": {"type": "session_snapshot", "snapshot": "malformed"},
+            }))),
+        )
+        .await;
+        let mut invalid_topology =
+            gated_snapshot_frame("w1:p4", Some("must-not-land"), "current-session");
+        invalid_topology["result"]["snapshot"]["panes"][0]["tab_id"] = Value::Null;
+        assert_failure(
+            "conversion-failure.log",
+            "topology_conversion_failed",
+            FailureResponse::Release(GatedSnapshotResponse::Json(invalid_topology)),
+        )
+        .await;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (mut harness, mut server) = spawn_gated_primary_collector_with_options(
+            &directory,
+            "reducer-failure.log",
+            LivenessPolicy { timeout_ms: 10_000 },
+            Some(i64::MAX),
+            None,
+        );
+        let mut empty = gated_snapshot_frame("w1:p4", None, "unused");
+        empty["result"]["snapshot"]["workspaces"] = json!([]);
+        empty["result"]["snapshot"]["tabs"] = json!([]);
+        empty["result"]["snapshot"]["panes"] = json!([]);
+        empty["result"]["snapshot"]["focused_workspace_id"] = Value::Null;
+        empty["result"]["snapshot"]["focused_tab_id"] = Value::Null;
+        empty["result"]["snapshot"]["focused_pane_id"] = Value::Null;
+        let first = server.next_snapshot().await;
+        release_snapshot(first, empty.clone());
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "reducer-table initial live",
+        )
+        .await;
+        server
+            .push(gated_pane_updated("raw", "must-not-land", "historical"))
+            .await;
+        let refresh = server.next_snapshot().await;
+        let publish_count = harness.publish_count.load(Ordering::Relaxed);
+        let failure_started = Instant::now();
+        release_snapshot(
+            refresh,
+            gated_snapshot_frame("w1:p4", Some("must-not-land"), "new-session"),
+        );
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Disconnected,
+            "reducer rejection",
+        )
+        .await;
+        wait_for_gap_committed(&harness.primary_stream_diagnostics).await;
+        assert!(harness.model.borrow().panes().next().is_none());
+        assert_eq!(harness.publish_count.load(Ordering::Relaxed), publish_count);
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "event_triggered_topology_refreshes",
+            ),
+            1
+        );
+        let recovery = server.next_snapshot().await;
+        assert!(
+            failure_started.elapsed() >= Duration::from_secs(1),
+            "reducer rejection reconnect skipped the one-second failure backoff"
+        );
+        release_snapshot(recovery, empty);
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "reducer failure recovery",
+        )
+        .await;
+        let contents = harness.stop().await;
+        server.stop().await;
+        assert!(contents.contains("reason=\"reducer_rejected\""));
+
+        for (class, reason) in [
+            (RuntimeCommandClass::Batch, "persistence_unexpected"),
+            (RuntimeCommandClass::OwnerLocation, "owner_unexpected"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut harness, mut server) = spawn_gated_primary_collector_with_options(
+                &directory,
+                &format!("{reason}.log"),
+                LivenessPolicy { timeout_ms: 10_000 },
+                None,
+                Some(TestWriteInjection {
+                    class,
+                    successes_before_failure: 1,
+                    result: TestWriteResult::Unexpected,
+                }),
+            );
+            let first = server.next_snapshot().await;
+            release_snapshot(
+                first,
+                gated_snapshot_frame("w1:p4", Some("last-good"), "initial-session"),
+            );
+            wait_for_quality(
+                &mut harness.source_quality,
+                ObservationQuality::Live,
+                "unexpected-write initial live",
+            )
+            .await;
+            server
+                .push(gated_pane_updated("w1:p4", "hint", "historical"))
+                .await;
+            let refresh = server.next_snapshot().await;
+            let publish_count = harness.publish_count.load(Ordering::Relaxed);
+            let failure_started = Instant::now();
+            release_snapshot(
+                refresh,
+                gated_snapshot_frame("w1:p5", Some("installed"), "new-session"),
+            );
+            wait_for_quality(
+                &mut harness.source_quality,
+                ObservationQuality::Disconnected,
+                reason,
+            )
+            .await;
+            wait_for_gap_committed(&harness.primary_stream_diagnostics).await;
+            assert_eq!(
+                harness.publish_count.load(Ordering::Relaxed),
+                publish_count + 1
+            );
+            assert_eq!(
+                harness
+                    .model
+                    .borrow()
+                    .pane("w1:p5")
+                    .unwrap()
+                    .display_name
+                    .as_deref(),
+                Some("installed")
+            );
+            assert_eq!(
+                primary_counter_value(
+                    &harness.primary_stream_diagnostics,
+                    "event_triggered_topology_refreshes",
+                ),
+                1
+            );
+            let recovery = server.next_snapshot().await;
+            assert!(
+                failure_started.elapsed() >= Duration::from_secs(1),
+                "{reason} reconnect skipped the one-second failure backoff"
+            );
+            release_snapshot(
+                recovery,
+                gated_snapshot_frame("w1:p5", Some("installed"), "new-session"),
+            );
+            wait_for_quality(
+                &mut harness.source_quality,
+                ObservationQuality::Live,
+                "unexpected-write recovery",
+            )
+            .await;
+            let contents = harness.stop().await;
+            server.stop().await;
+            assert!(contents.contains(&format!("reason=\"{reason}\"")));
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let (mut harness, mut server) = spawn_gated_primary_collector(
+            &directory,
+            "eof-no-backoff.log",
+            LivenessPolicy { timeout_ms: 10_000 },
+        );
+        let first = server.next_snapshot().await;
+        release_snapshot(
+            first,
+            gated_snapshot_frame("w1:p4", Some("last-good"), "initial-session"),
+        );
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "EOF initial live",
+        )
+        .await;
+        let publish_count = harness.publish_count.load(Ordering::Relaxed);
+        let eof_started = Instant::now();
+        server.close_primary().await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while server.primary_subscription_count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("EOF did not open a fresh subscription without reconnect backoff");
+        assert!(
+            eof_started.elapsed() < Duration::from_secs(1),
+            "clean EOF incorrectly waited for failure backoff"
+        );
+        wait_for_gap_committed(&harness.primary_stream_diagnostics).await;
+        assert_eq!(harness.publish_count.load(Ordering::Relaxed), publish_count);
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "event_triggered_topology_refreshes",
+            ),
+            0
+        );
+        assert_eq!(
+            harness
+                .model
+                .borrow()
+                .pane("w1:p4")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("last-good")
+        );
+        let publish_count = Arc::clone(&harness.publish_count);
+        let baseline_publications = publish_count.load(Ordering::Relaxed);
+        let primary_counters = harness.primary_stream_diagnostics.clone();
+        let contents = harness.stop().await;
+        server.stop().await;
+        assert_eq!(publish_count.load(Ordering::Relaxed), baseline_publications);
+        assert_eq!(
+            primary_counter_value(&primary_counters, "event_triggered_topology_refreshes"),
+            0
+        );
+        assert!(!contents.contains("herdr_primary_stream_reconnect"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let (mut harness, mut server) = spawn_gated_primary_collector(
+            &directory,
+            "cancellation-no-backoff.log",
+            LivenessPolicy { timeout_ms: 10_000 },
+        );
+        let first = server.next_snapshot().await;
+        release_snapshot(
+            first,
+            gated_snapshot_frame("w1:p4", Some("last-good"), "initial-session"),
+        );
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "cancellation initial live",
+        )
+        .await;
+        assert_eq!(
+            harness
+                .model
+                .borrow()
+                .pane("w1:p4")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("last-good")
+        );
+        let publish_count = Arc::clone(&harness.publish_count);
+        let baseline_publications = publish_count.load(Ordering::Relaxed);
+        let primary_counters = harness.primary_stream_diagnostics.clone();
+        let contents = harness.stop().await;
+        server.stop().await;
+        assert!(primary_counters.gap_committed());
+        assert_eq!(publish_count.load(Ordering::Relaxed), baseline_publications);
+        assert_eq!(
+            primary_counter_value(&primary_counters, "event_triggered_topology_refreshes"),
+            0
+        );
+        assert!(!contents.contains("herdr_primary_stream_reconnect"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_refresh_updates_owner_and_enrichment_targets_after_install() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let (mut harness, mut server) = spawn_gated_primary_collector(
+            &directory,
+            "derived-state.log",
+            LivenessPolicy { timeout_ms: 10_000 },
+        );
+        let first = server.next_snapshot().await;
+        release_snapshot(
+            first,
+            gated_snapshot_frame("w1:p4", None, "initial-session"),
+        );
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "initial live",
+        )
+        .await;
+        server
+            .push(json!({
+                "event": "pane_moved",
+                "data": {"pane": {"pane_id": "w1:raw", "terminal_id": "terminal-4", "workspace_id": "w1", "tab_id": "w1:t1"}},
+            }))
+            .await;
+        let refresh = server.next_snapshot().await;
+        release_snapshot(
+            refresh,
+            gated_snapshot_frame("w1:p5", None, "refreshed-session"),
+        );
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "derived state refresh",
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if server.scoped_subscription_requests().iter().any(|request| {
+                    request["params"]["subscriptions"]
+                        .as_array()
+                        .is_some_and(|subscriptions| {
+                            subscriptions
+                                .iter()
+                                .any(|value| value["pane_id"] == "w1:p5")
+                        })
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refreshed enrichment target was not subscribed");
+        {
+            let model = harness.model.borrow();
+            assert!(model.pane("w1:p4").is_none());
+            assert!(model.pane("w1:raw").is_none());
+            assert!(model.pane("w1:p5").is_some());
+            assert!(has_provider_session_target(
+                &model,
+                Provider::Codex,
+                "refreshed-session"
+            ));
+        }
+        let _ = harness.stop().await;
+        server.stop().await;
+        let owner = open_reader(&root).unwrap().read_owner().unwrap().unwrap();
+        assert_eq!(owner.pane_id.as_deref(), Some("w1:p5"));
+        assert_eq!(owner.terminal_id.as_deref(), Some("terminal-4"));
+    }
+
+    #[tokio::test]
+    async fn classified_persistence_and_owner_degradation_keep_installed_snapshot() {
+        for class in [
+            RuntimeCommandClass::Batch,
+            RuntimeCommandClass::OwnerLocation,
+        ] {
+            let operation = match class {
+                RuntimeCommandClass::Batch => PersistenceOperation::Apply,
+                RuntimeCommandClass::OwnerLocation => PersistenceOperation::UpdateOwnerLocation,
+            };
+            let outcomes = [
+                (
+                    "not-committed",
+                    RuntimeWriteOutcome::NotCommitted(failure(
+                        operation,
+                        PersistencePhase::CommandExecution,
+                        PersistenceFailureCode::Sqlite,
+                        DurabilityDisposition::NotCommitted,
+                    )),
+                ),
+                (
+                    "durability-unknown",
+                    RuntimeWriteOutcome::DurabilityUnknown(failure(
+                        operation,
+                        PersistencePhase::Acknowledgement,
+                        PersistenceFailureCode::AcknowledgementDropped,
+                        DurabilityDisposition::Unknown,
+                    )),
+                ),
+                (
+                    "committed-degraded",
+                    RuntimeWriteOutcome::CommittedButDegraded(failure(
+                        operation,
+                        PersistencePhase::PostApplyCommit,
+                        PersistenceFailureCode::Io,
+                        DurabilityDisposition::Committed,
+                    )),
+                ),
+                ("skipped", RuntimeWriteOutcome::Skipped),
+            ];
+            for (label, outcome) in outcomes {
+                let class_label = match class {
+                    RuntimeCommandClass::Batch => "batch",
+                    RuntimeCommandClass::OwnerLocation => "owner",
+                };
+                let directory = tempfile::tempdir().unwrap();
+                let log_name = format!("classified-{class_label}-{label}.log");
+                let (mut harness, mut server) = spawn_gated_primary_collector_with_options(
+                    &directory,
+                    &log_name,
+                    LivenessPolicy { timeout_ms: 10_000 },
+                    None,
+                    Some(TestWriteInjection {
+                        class,
+                        successes_before_failure: 1,
+                        result: TestWriteResult::Classified(outcome),
+                    }),
+                );
+                let first = server.next_snapshot().await;
+                release_snapshot(
+                    first,
+                    gated_snapshot_frame("w1:p4", None, "initial-session"),
+                );
+                wait_for_quality(
+                    &mut harness.source_quality,
+                    ObservationQuality::Live,
+                    "classified initial live",
+                )
+                .await;
+                server
+                    .push(gated_pane_updated("w1:p4", "hint", "historical"))
+                    .await;
+                let refresh = server.next_snapshot().await;
+                let publish_count = harness.publish_count.load(Ordering::Relaxed);
+                release_snapshot(
+                    refresh,
+                    gated_snapshot_frame("w1:p5", Some("installed"), "refreshed-session"),
+                );
+                wait_for_quality(
+                    &mut harness.source_quality,
+                    ObservationQuality::Live,
+                    "classified degradation snapshot retention",
+                )
+                .await;
+                assert_eq!(
+                    harness
+                        .model
+                        .borrow()
+                        .pane("w1:p5")
+                        .unwrap()
+                        .display_name
+                        .as_deref(),
+                    Some("installed")
+                );
+                let diagnostics = harness.runtime_diagnostics.borrow().clone();
+                match (class, outcome) {
+                    (RuntimeCommandClass::Batch, RuntimeWriteOutcome::NotCommitted(_)) => {
+                        assert_eq!(diagnostics.persistence_counters.not_committed_batches, 1);
+                    }
+                    (RuntimeCommandClass::Batch, RuntimeWriteOutcome::DurabilityUnknown(_)) => {
+                        assert_eq!(
+                            diagnostics.persistence_counters.durability_unknown_batches,
+                            1
+                        );
+                    }
+                    (RuntimeCommandClass::Batch, RuntimeWriteOutcome::CommittedButDegraded(_)) => {
+                        assert_eq!(
+                            diagnostics
+                                .persistence_counters
+                                .committed_but_degraded_batches,
+                            1
+                        );
+                    }
+                    (RuntimeCommandClass::Batch, RuntimeWriteOutcome::Skipped) => {
+                        assert_eq!(diagnostics.persistence_counters.skipped_batches, 1);
+                    }
+                    (RuntimeCommandClass::OwnerLocation, _) => {
+                        assert_eq!(diagnostics.owner, OwnerFreshness::Stale);
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(server.primary_subscription_count(), 1);
+                assert_eq!(
+                    harness.publish_count.load(Ordering::Relaxed),
+                    publish_count + 1
+                );
+                assert_eq!(
+                    primary_counter_value(
+                        &harness.primary_stream_diagnostics,
+                        "event_triggered_topology_refreshes",
+                    ),
+                    1
+                );
+                let contents = harness.stop().await;
+                server.stop().await;
+                assert!(!contents.contains("herdr_primary_stream_reconnect"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn suppressed_replay_stays_live_across_two_watchdog_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let liveness_policy = LivenessPolicy { timeout_ms: 100 };
+        let (mut harness, mut server) =
+            spawn_gated_primary_collector(&directory, "suppressed-watchdog.log", liveness_policy);
+        let authoritative = gated_snapshot_frame("w1:p4", Some("current"), "current-session");
+        let first = server.next_snapshot().await;
+        server
+            .push(gated_pane_updated("w1:p4", "historical", "historical"))
+            .await;
+        release_snapshot(first, authoritative.clone());
+        let closing = server.next_snapshot().await;
+        release_snapshot(closing, authoritative.clone());
+        wait_for_quality(
+            &mut harness.source_quality,
+            ObservationQuality::Live,
+            "suppressed replay live",
+        )
+        .await;
+        for expected in 2..=3 {
+            let probe = server.next_snapshot().await;
+            assert_eq!(probe.index, expected);
+            release_snapshot(probe, authoritative.clone());
+        }
+        server
+            .assert_no_snapshot_for(Duration::from_millis(20))
+            .await;
+        assert_eq!(server.primary_subscription_count(), 1);
+        assert_eq!(*harness.source_quality.borrow(), ObservationQuality::Live);
+        assert_eq!(
+            harness
+                .model
+                .borrow()
+                .pane("w1:p4")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("current")
+        );
+        assert_eq!(
+            primary_counter_value(
+                &harness.primary_stream_diagnostics,
+                "suppressed_topology_frames",
+            ),
+            1
+        );
+        let contents = harness.stop().await;
+        server.stop().await;
+        assert!(!contents.contains("topology_diverged"));
+    }
+
     async fn write_unknown_focus_frames(reader: &mut tokio::io::BufReader<tokio::net::UnixStream>) {
         for frame in [
             json!({
@@ -11119,10 +13585,14 @@ mod tests {
                                     .as_mut()
                                     .expect("snapshot arrived before the primary subscription"),
                                 &json!({
-                                    "event": "pane_agent_status_changed",
+                                    "event": "pane_updated",
                                     "data": {
-                                        "pane_id": format!("missing-pane-{snapshots}"),
-                                        "agent_status": "working",
+                                        "pane": {
+                                            "pane_id": format!("raw-hint-{snapshots}"),
+                                            "terminal_id": "raw-terminal",
+                                            "workspace_id": "w1",
+                                            "tab_id": "w1:t1",
+                                        },
                                     },
                                 }),
                             )
@@ -11310,8 +13780,8 @@ mod tests {
             .expect("observation-producing receipt did not allow a replacement probe")
             .expect("replacement-probe observer was dropped");
         assert!(
-            reprobe_elapsed >= liveness_timeout(&liveness_policy),
-            "replacement probe arrived before the reset deadline: {reprobe_elapsed:?}"
+            reprobe_elapsed < liveness_timeout(&liveness_policy),
+            "topology hint did not start its immediate authoritative refresh: {reprobe_elapsed:?}"
         );
 
         let contents = harness.stop().await;
@@ -12001,7 +14471,7 @@ mod tests {
         join_fake_server(server, "starved watchdog reconnect").await;
         assert_eq!(reconnect_gap_count(&root), 1, "collector log: {contents}");
         assert!(
-            contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            contents.contains("warning_code=\"herdr_primary_stream_reconnect\""),
             "starved subscription did not emit the watchdog warning: {contents}"
         );
     }
@@ -12216,7 +14686,7 @@ mod tests {
         join_fake_server(server, "nonresponsive watchdog reconnect").await;
         assert_eq!(reconnect_gap_count(&root), 1, "collector log: {contents}");
         assert!(
-            contents.contains("warning_code=\"herdr_primary_stream_watchdog_silence\""),
+            contents.contains("warning_code=\"herdr_primary_stream_reconnect\""),
             "nonresponsive subscription did not emit the watchdog warning: {contents}"
         );
         assert!(
@@ -13069,25 +15539,13 @@ mod tests {
         label: Option<&str>,
         terminal_title_stripped: Option<&str>,
     ) -> Option<String> {
-        let shared = watch::channel(Arc::new(DomainModel::default())).1;
-        let normalized = normalize_event(
-            &shared,
-            "name-session",
-            &pane_created_with_names(label, terminal_title_stripped),
-        )
-        .expect("pane_created should normalize");
-        let Some(NormalizedEvent::TopologyUpsert {
-            entity: TopologyEntity::Pane(pane),
-            ..
-        }) = normalized.first()
-        else {
-            panic!("pane_created must emit a pane topology upsert first");
-        };
-        pane.display_name.clone()
+        let received = pane_created_with_names(label, terminal_title_stripped);
+        let pane: PaneInfo = decode_wire(received.data.get("pane").unwrap()).unwrap();
+        pane_display_name(&pane)
     }
 
     #[test]
-    fn live_pane_upserts_capture_sanitized_display_names() {
+    fn authoritative_snapshot_panes_capture_sanitized_display_names() {
         assert_eq!(
             normalized_pane_display_name(Some("UI修正"), None).as_deref(),
             Some("UI修正")
@@ -13128,33 +15586,30 @@ mod tests {
     }
 
     #[test]
-    fn tab_created_captures_sanitized_label() {
-        let mut model = DomainModel::default();
-        model.insert_workspace(Workspace {
-            workspace_id: "w1".to_owned(),
-        });
+    fn authoritative_snapshot_tab_captures_sanitized_label() {
         let (mut reducer, shared) = Reducer::new(RestoredState {
-            model,
+            model: DomainModel::default(),
             next_ordinal: 1,
             next_ingest_seq: Some(1),
             event_ledger: Vec::new(),
         });
-        let received = ReceivedEvent {
-            event: "tab_created".to_owned(),
-            data: json!({
-                "tab": {
-                    "tab_id": "w1:t1",
-                    "workspace_id": "w1",
-                    "label": "レビュー",
-                },
-            }),
-            primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
-        };
-
-        let normalized = normalize_event(&shared, "name-session", &received).unwrap();
-        let persist = apply_collector_observation(&mut reducer, normalized)
-            .unwrap()
-            .expect("tab upsert should apply");
+        let persist = reducer
+            .reconcile_snapshot(TopologySnapshot {
+                workspaces: vec![Workspace {
+                    workspace_id: "w1".to_owned(),
+                }],
+                tabs: vec![tab_entity(TabInfo {
+                    tab_id: "w1:t1".to_owned(),
+                    workspace_id: "w1".to_owned(),
+                    number: None,
+                    label: Some("レビュー".to_owned()),
+                    focused: None,
+                    pane_count: None,
+                    agent_status: None,
+                })],
+                panes: Vec::new(),
+            })
+            .unwrap();
 
         assert_eq!(
             shared.borrow().tab("w1:t1").unwrap().label.as_deref(),
@@ -13245,7 +15700,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_renamed_updates_existing_label_preserves_empty_and_ignores_unknown_tabs() {
+    fn tab_renamed_is_invalidation_only_for_known_empty_and_unknown_tabs() {
         let mut model = DomainModel::default();
         model.insert_workspace(Workspace {
             workspace_id: "w1".to_owned(),
@@ -13255,100 +15710,33 @@ mod tests {
             workspace_id: "w1".to_owned(),
             label: Some("old".to_owned()),
         });
-        let (mut reducer, shared) = Reducer::new(RestoredState {
+        let (_reducer, shared) = Reducer::new(RestoredState {
             model,
             next_ordinal: 1,
             next_ingest_seq: Some(1),
             event_ledger: Vec::new(),
         });
 
-        let normalized = normalize_event(
-            &shared,
-            "rename-session",
-            &tab_renamed_event("w1:t1", Some("レビュー")),
-        )
-        .unwrap();
-        let persist = apply_collector_observation(&mut reducer, normalized)
-            .unwrap()
-            .expect("known tab rename should apply");
-        assert_eq!(
-            shared.borrow().tab("w1:t1").unwrap().label.as_deref(),
-            Some("レビュー")
-        );
-        assert!(persist.iter().any(|operation| matches!(
-            operation,
-            PersistOp::UpsertTab { tab, .. }
-                if tab.tab_id == "w1:t1"
-                    && tab.workspace_id == "w1"
-                    && tab.label.as_deref() == Some("レビュー")
-        )));
-
-        let normalized = normalize_event(
-            &shared,
-            "rename-session",
-            &tab_renamed_event("w1:t1", Some("")),
-        )
-        .unwrap();
-        let persist = apply_collector_observation(&mut reducer, normalized)
-            .unwrap()
-            .expect("empty known tab rename should apply");
-        assert_eq!(
-            shared.borrow().tab("w1:t1").unwrap().label.as_deref(),
-            Some("レビュー")
-        );
-        assert!(persist.iter().any(|operation| matches!(
-            operation,
-            PersistOp::UpsertTab { tab, .. }
-                if tab.tab_id == "w1:t1"
-                    && tab.workspace_id == "w1"
-                    && tab.label.as_deref() == Some("レビュー")
-        )));
-        assert!(!persist.iter().any(|operation| matches!(
-            operation,
-            PersistOp::ClearTabLabel { tab_id } if tab_id == "w1:t1"
-        )));
-
-        let normalized = normalize_event(
-            &shared,
-            "rename-session",
-            &tab_renamed_event("w1:t1", Some("before absent")),
-        )
-        .unwrap();
-        apply_collector_observation(&mut reducer, normalized)
-            .unwrap()
-            .expect("known tab rename should apply");
-        assert_eq!(
-            shared.borrow().tab("w1:t1").unwrap().label.as_deref(),
-            Some("before absent")
-        );
-        let normalized =
-            normalize_event(&shared, "rename-session", &tab_renamed_event("w1:t1", None)).unwrap();
-        let persist = apply_collector_observation(&mut reducer, normalized)
-            .unwrap()
-            .expect("absent-label known tab rename should apply");
-        assert_eq!(
-            shared.borrow().tab("w1:t1").unwrap().label.as_deref(),
-            Some("before absent")
-        );
-        assert!(persist.iter().any(|operation| matches!(
-            operation,
-            PersistOp::UpsertTab { tab, .. }
-                if tab.tab_id == "w1:t1"
-                    && tab.workspace_id == "w1"
-                    && tab.label.as_deref() == Some("before absent")
-        )));
-        assert!(!persist.iter().any(|operation| matches!(
-            operation,
-            PersistOp::ClearTabLabel { tab_id } if tab_id == "w1:t1"
-        )));
-
-        let normalized = normalize_event(
-            &shared,
-            "rename-session",
-            &tab_renamed_event("unknown-tab", Some("ignored")),
-        )
-        .unwrap();
-        assert!(normalized.is_empty());
+        for received in [
+            tab_renamed_event("w1:t1", Some("レビュー")),
+            tab_renamed_event("w1:t1", Some("")),
+            tab_renamed_event("w1:t1", None),
+            tab_renamed_event("unknown-tab", Some("ignored")),
+        ] {
+            assert_eq!(
+                classify_primary_event(&received.event),
+                PrimaryEventClass::TopologyHint
+            );
+            assert!(
+                normalize_event(&shared, "rename-session", &received)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                shared.borrow().tab("w1:t1").unwrap().label.as_deref(),
+                Some("old")
+            );
+        }
     }
 
     fn snapshot_with_names() -> Snapshot {
@@ -13466,14 +15854,7 @@ mod tests {
         let mut nameless_topology = named_topology;
         nameless_topology.tabs[0].label = None;
         nameless_topology.panes[0].display_name = None;
-        let persist = apply_snapshot_in_place(
-            &mut reducer,
-            &shared,
-            nameless_topology,
-            "snapshot-session",
-            &mut PendingTopologyClosures::default(),
-        )
-        .unwrap();
+        let persist = reducer.reconcile_snapshot(nameless_topology).unwrap();
 
         assert_eq!(shared.borrow().tab("w1:t1").unwrap().label, None);
         assert_eq!(shared.borrow().pane("w1:p4").unwrap().display_name, None);
@@ -13514,10 +15895,12 @@ mod tests {
             &tab_renamed_event("w1:t1", Some("レビュー")),
         )
         .unwrap();
-        apply_collector_observation(&mut reducer, normalized)
-            .unwrap()
-            .expect("known tab rename should apply");
+        assert!(normalized.is_empty());
 
+        let current = current_model_topology(&shared, &PendingTopologyClosures::default()).unwrap();
+        assert!(!probe_topology_matches_model(probed.clone(), current));
+
+        reducer.reconcile_snapshot(probed.clone()).unwrap();
         let current = current_model_topology(&shared, &PendingTopologyClosures::default()).unwrap();
         assert!(probe_topology_matches_model(probed.clone(), current));
 
@@ -13527,13 +15910,7 @@ mod tests {
             &tab_renamed_event("w1:t1", Some("")),
         )
         .unwrap();
-        let persist = apply_collector_observation(&mut reducer, normalized)
-            .unwrap()
-            .expect("empty-label known tab rename should apply");
-        assert!(!persist.iter().any(|operation| matches!(
-            operation,
-            PersistOp::ClearTabLabel { tab_id } if tab_id == "w1:t1"
-        )));
+        assert!(normalized.is_empty());
         assert_eq!(
             shared.borrow().tab("w1:t1").unwrap().label.as_deref(),
             Some("レビュー")
@@ -13547,7 +15924,7 @@ mod tests {
     }
 
     #[test]
-    fn in_place_authoritative_snapshot_clears_absent_tab_and_pane_names() {
+    fn authoritative_snapshot_clears_absent_tab_and_pane_names() {
         let named_topology = topology_from_snapshot(&snapshot_with_names()).unwrap();
         let (mut reducer, shared) = empty_reducer();
         reducer
@@ -13559,16 +15936,7 @@ mod tests {
         let mut topology = named_topology;
         topology.tabs[0].label = None;
         topology.panes[0].display_name = None;
-        let mut pending = PendingTopologyClosures::default();
-
-        let persist = apply_snapshot_in_place(
-            &mut reducer,
-            &shared,
-            topology,
-            "snapshot-session",
-            &mut pending,
-        )
-        .unwrap();
+        let persist = reducer.reconcile_snapshot(topology).unwrap();
 
         assert_eq!(shared.borrow().tab("w1:t1").unwrap().label, None);
         assert_eq!(shared.borrow().pane("w1:p4").unwrap().display_name, None);
@@ -13945,30 +16313,28 @@ mod tests {
     }
 
     #[test]
-    fn flat_pane_agent_detected_counts_without_topology_mutation() {
+    fn flat_pane_agent_detected_is_invalidation_without_topology_mutation() {
         let shared = known_pane_model();
         let flat_diagnostics = PrimaryStreamDiagnosticsHandle::default();
         let flat = flat_pane_agent_detected("w1:p4", flat_diagnostics.clone());
-
-        let normalized = normalize_event(&shared, "flat-frame-session", &flat)
-            .expect("flat pane_agent_detected should be tolerated");
-        assert!(
-            normalized.is_empty(),
-            "flat pane_agent_detected must not produce topology or persistence operations"
+        assert_eq!(
+            classify_primary_event(&flat.event),
+            PrimaryEventClass::TopologyHint
         );
-        assert_eq!(flat_diagnostics.snapshot().flat_pane_agent_detected, 1);
+        assert!(
+            normalize_event(&shared, "flat-frame-session", &flat)
+                .unwrap()
+                .is_empty()
+        );
 
         let nested_diagnostics = PrimaryStreamDiagnosticsHandle::default();
         let nested = nested_pane_agent_detected(nested_diagnostics.clone());
-        let normalized = normalize_event(&shared, "nested-frame-session", &nested)
-            .expect("nested pane_agent_detected should still normalize");
-        assert!(normalized.iter().any(|event| matches!(
-            event,
-            NormalizedEvent::TopologyUpsert {
-                entity: TopologyEntity::Pane(pane),
-                ..
-            } if pane.pane_id == "w1:p4"
-        )));
+        assert_eq!(
+            classify_primary_event(&nested.event),
+            PrimaryEventClass::TopologyHint
+        );
+        assert!(shared.borrow().pane("w1:p4").is_some());
+        assert_eq!(flat_diagnostics.snapshot().flat_pane_agent_detected, 1);
         assert_eq!(nested_diagnostics.snapshot().flat_pane_agent_detected, 0);
     }
 
@@ -13979,22 +16345,12 @@ mod tests {
         let flat_unknown = flat_pane_agent_detected("w1:p9", diagnostics.clone());
         let nested = nested_pane_agent_detected(diagnostics);
 
-        assert_eq!(
-            updated_entity(&flat_known),
-            Some(EntityKey::Pane("w1:p4".to_owned()))
-        );
-        assert_eq!(
-            updated_entity(&nested),
-            Some(EntityKey::Pane("w1:p4".to_owned()))
-        );
-
-        let shared = known_pane_model();
-        assert!(
-            !updated_entity(&flat_known).is_some_and(|entity| !entity_exists(&shared, &entity))
-        );
-        assert!(
-            updated_entity(&flat_unknown).is_some_and(|entity| !entity_exists(&shared, &entity))
-        );
+        for received in [flat_known, flat_unknown, nested] {
+            assert_eq!(
+                classify_primary_event(&received.event),
+                PrimaryEventClass::TopologyHint
+            );
+        }
     }
 
     fn status_received(status: &str) -> ReceivedEvent {
@@ -14374,6 +16730,100 @@ mod tests {
             shared.borrow().execution("terminal").unwrap().state,
             ExecState::Ended
         );
+    }
+
+    #[tokio::test]
+    async fn direct_raw_topology_hint_cannot_refresh_owner_location() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let mut owner = OwnerTracker {
+            terminal_id: Some("owner-terminal".to_owned()),
+            pane_id: Some("owner-pane".to_owned()),
+            started_at_ms: 1,
+        };
+        let mut store = open_writer(&root).unwrap();
+        store.replace_owner(&owner.record()).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let coverage = SourceCoverageRegistry::new(SourceAvailability::NotApplicable);
+        let (mut persistence, _diagnostics) = RuntimePersistence::new(
+            writer,
+            "test",
+            &shared.borrow(),
+            &coverage,
+            Arc::new(RecordingOccurrenceSink::default()),
+        );
+        let (provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+        let (performance, mut sampler) =
+            performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
+
+        apply_received_event(
+            &mut reducer,
+            &shared,
+            &mut persistence,
+            &mut owner,
+            "session",
+            ReceivedEvent {
+                event: "pane_moved".to_owned(),
+                data: json!({
+                    "previous_pane_id": "owner-pane",
+                    "pane": {
+                        "pane_id": "moved-pane",
+                        "terminal_id": "owner-terminal",
+                        "workspace_id": "raw-workspace",
+                        "tab_id": "raw-tab",
+                        "focused": true,
+                        "agent": "codex",
+                        "agent_status": "working",
+                        "revision": 1,
+                    },
+                }),
+                primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
+            },
+            performance.admit(),
+            &mut PendingTopologyClosures::default(),
+            &mut provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(owner.terminal_id.as_deref(), Some("owner-terminal"));
+        assert_eq!(owner.pane_id.as_deref(), Some("owner-pane"));
+        {
+            let model = shared.borrow();
+            assert!(model.panes().next().is_none());
+            assert!(model.task_runs().next().is_none());
+            assert!(model.executions().next().is_none());
+        }
+        assert_eq!(provider.published_targets, TargetSet::default());
+        assert!(provider.sessionless_codex_detections.is_empty());
+        assert!(provider.sessionless_codex_detection_history.is_empty());
+        let performance = sampler.sample(
+            &shared.borrow(),
+            &OperatorSnapshot {
+                activity: Arc::from([]),
+                terminal_times: Arc::new(HashMap::new()),
+            },
+            unix_now_ms(),
+        );
+        assert_eq!(performance.admission_high_water, 1);
+        assert_eq!(performance.completion_high_water, 1);
+        assert_eq!(performance.pending_events, 0);
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+        drop(persistence);
+        shutdown_writer(lifecycle).await;
+        let persisted_owner = open_reader(&root).unwrap().read_owner().unwrap().unwrap();
+        assert_eq!(
+            persisted_owner.terminal_id.as_deref(),
+            Some("owner-terminal")
+        );
+        assert_eq!(persisted_owner.pane_id.as_deref(), Some("owner-pane"));
     }
 
     #[tokio::test]
@@ -16217,66 +18667,51 @@ mod provider_integration_tests {
         }
     }
 
-    fn g7_pane_exited_event() -> ReceivedEvent {
-        ReceivedEvent {
-            event: "pane_exited".to_owned(),
-            data: json!({ "pane_id": "g7-event-pane" }),
-            primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
-        }
-    }
-
-    async fn g7_apply_received_event(
+    async fn g7_install_pane_snapshot(
         harness: &mut LaneModelHarness,
         provider: &mut ProviderIntegration,
-        owner: &mut OwnerTracker,
-        pending_closures: &mut PendingTopologyClosures,
-        received: ReceivedEvent,
+        agent: &str,
+        state: ExecState,
+        agent_session: Option<AgentSessionReference>,
     ) {
-        let (performance, _sampler) = performance_tracker(Arc::new(SystemPerformanceClock::new()));
-        apply_received_event(
-            &mut harness.reducer,
-            &harness.shared,
-            &mut harness.persistence,
-            owner,
-            "session",
-            received,
-            performance.admit(),
-            pending_closures,
-            provider,
-        )
-        .await
-        .unwrap();
-    }
-
-    async fn g7_prepare_pane_topology(
-        harness: &mut LaneModelHarness,
-        provider: &mut ProviderIntegration,
-        owner: &mut OwnerTracker,
-        pending_closures: &mut PendingTopologyClosures,
-    ) {
-        for received in [
-            ReceivedEvent {
-                event: "workspace_created".to_owned(),
-                data: json!({
-                    "workspace": {
-                        "workspace_id": "g7-event-workspace"
-                    }
-                }),
-                primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
-            },
-            ReceivedEvent {
-                event: "tab_created".to_owned(),
-                data: json!({
-                    "tab": {
-                        "tab_id": "g7-event-tab",
-                        "workspace_id": "g7-event-workspace"
-                    }
-                }),
-                primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
-            },
-        ] {
-            g7_apply_received_event(harness, provider, owner, pending_closures, received).await;
-        }
+        let sessionless_codex_terminals = if agent == "codex" && agent_session.is_none() {
+            HashSet::from(["g7-event-terminal".to_owned()])
+        } else {
+            HashSet::new()
+        };
+        let persist = harness
+            .reducer
+            .reconcile_snapshot(TopologySnapshot {
+                workspaces: vec![Workspace {
+                    workspace_id: "g7-event-workspace".to_owned(),
+                }],
+                tabs: vec![Tab {
+                    tab_id: "g7-event-tab".to_owned(),
+                    workspace_id: "g7-event-workspace".to_owned(),
+                    label: None,
+                }],
+                panes: vec![PaneSnapshot {
+                    pane_id: "g7-event-pane".to_owned(),
+                    workspace_id: "g7-event-workspace".to_owned(),
+                    tab_id: "g7-event-tab".to_owned(),
+                    terminal_id: "g7-event-terminal".to_owned(),
+                    display_name: None,
+                    agent: Some(SnapshotAgent {
+                        agent_name: agent.to_owned(),
+                        state,
+                    }),
+                    agent_session,
+                }],
+            })
+            .unwrap();
+        let _ = persist_submission(&mut harness.persistence, &mut harness.reducer, persist)
+            .await
+            .unwrap();
+        provider.observe_sessionless_codex_terminals(&harness.shared, &sessionless_codex_terminals);
+        provider.publish_targets(&harness.shared);
+        harness
+            .persistence
+            .refresh_snapshot(&harness.shared.borrow(), &provider.coverage.registry);
     }
 
     async fn g7_service_binding(
@@ -16432,23 +18867,12 @@ mod provider_integration_tests {
     async fn g7_round2_explicit_path_event_clears_sessionless_detection() {
         let mut harness = LaneModelHarness::new();
         let (provider_sender, mut provider, provider_thread) = g7_provider_integration();
-        let mut owner = OwnerTracker::from_environment();
-        let mut pending_closures = PendingTopologyClosures::default();
-
-        g7_prepare_pane_topology(
+        g7_install_pane_snapshot(
             &mut harness,
             &mut provider,
-            &mut owner,
-            &mut pending_closures,
-        )
-        .await;
-
-        g7_apply_received_event(
-            &mut harness,
-            &mut provider,
-            &mut owner,
-            &mut pending_closures,
-            g7_pane_event("pane_created", "codex", None),
+            "codex",
+            ExecState::Working,
+            None,
         )
         .await;
         let target = provider
@@ -16470,21 +18894,17 @@ mod provider_integration_tests {
             observed_at_ms: target.detected_at_ms,
         };
 
-        g7_apply_received_event(
+        g7_install_pane_snapshot(
             &mut harness,
             &mut provider,
-            &mut owner,
-            &mut pending_closures,
-            g7_pane_event(
-                "pane_updated",
-                "codex",
-                Some(json!({
-                    "source": "herdr",
-                    "agent": "codex",
-                    "kind": "path",
-                    "value": "/tmp/explicit-rollout.jsonl"
-                })),
-            ),
+            "codex",
+            ExecState::Working,
+            Some(AgentSessionReference {
+                source: "herdr".to_owned(),
+                agent: "codex".to_owned(),
+                kind: AgentSessionReferenceKind::Path,
+                value: "/tmp/explicit-rollout.jsonl".to_owned(),
+            }),
         )
         .await;
 
@@ -16530,24 +18950,14 @@ mod provider_integration_tests {
     async fn g7_round2_queued_binding_drops_after_provider_transition() {
         let mut harness = LaneModelHarness::new();
         let (provider_sender, mut provider, provider_thread) = g7_provider_integration();
-        let mut owner = OwnerTracker::from_environment();
-        let mut pending_closures = PendingTopologyClosures::default();
         let stale_sid = "66666666-6666-4666-8666-666666666666";
 
-        g7_prepare_pane_topology(
+        g7_install_pane_snapshot(
             &mut harness,
             &mut provider,
-            &mut owner,
-            &mut pending_closures,
-        )
-        .await;
-
-        g7_apply_received_event(
-            &mut harness,
-            &mut provider,
-            &mut owner,
-            &mut pending_closures,
-            g7_pane_event("pane_created", "codex", None),
+            "codex",
+            ExecState::Working,
+            None,
         )
         .await;
         let target = provider
@@ -16568,12 +18978,12 @@ mod provider_integration_tests {
             observed_at_ms: target.detected_at_ms,
         };
 
-        g7_apply_received_event(
+        g7_install_pane_snapshot(
             &mut harness,
             &mut provider,
-            &mut owner,
-            &mut pending_closures,
-            g7_pane_event("pane_updated", "claude", None),
+            "claude",
+            ExecState::Working,
+            None,
         )
         .await;
         assert_eq!(provider.published_targets.codex_panes().count(), 0);
@@ -16797,24 +19207,14 @@ mod provider_integration_tests {
     async fn g7_round2_queued_binding_drops_after_terminal_event() {
         let mut harness = LaneModelHarness::new();
         let (provider_sender, mut provider, provider_thread) = g7_provider_integration();
-        let mut owner = OwnerTracker::from_environment();
-        let mut pending_closures = PendingTopologyClosures::default();
         let stale_sid = "99999999-9999-4999-8999-999999999999";
 
-        g7_prepare_pane_topology(
+        g7_install_pane_snapshot(
             &mut harness,
             &mut provider,
-            &mut owner,
-            &mut pending_closures,
-        )
-        .await;
-
-        g7_apply_received_event(
-            &mut harness,
-            &mut provider,
-            &mut owner,
-            &mut pending_closures,
-            g7_pane_event("pane_created", "codex", None),
+            "codex",
+            ExecState::Working,
+            None,
         )
         .await;
         let target = provider
@@ -16835,14 +19235,8 @@ mod provider_integration_tests {
             observed_at_ms: target.detected_at_ms,
         };
 
-        g7_apply_received_event(
-            &mut harness,
-            &mut provider,
-            &mut owner,
-            &mut pending_closures,
-            g7_pane_exited_event(),
-        )
-        .await;
+        g7_install_pane_snapshot(&mut harness, &mut provider, "codex", ExecState::Ended, None)
+            .await;
         assert_eq!(provider.published_targets.codex_panes().count(), 0);
         assert!(
             harness
@@ -17612,62 +20006,15 @@ mod provider_integration_tests {
     #[tokio::test]
     async fn sessionless_codex_event_publishes_target_until_promotion() {
         let mut harness = LaneModelHarness::new();
-        let provider_diagnostics = crate::provider::ProviderDiagnostics::default();
-        let (ignored_events, _ignored_receiver) = mpsc::channel(1);
-        let provider_thread = spawn_provider_thread_with_diagnostics(
-            AdapterProviderWorker::new(Vec::new(), provider_diagnostics.clone()),
-            ignored_events,
-            None,
-            provider_diagnostics,
-        )
-        .unwrap();
-        let (_provider_sender, provider_events) = mpsc::channel(1);
-        let initial_coverage = SourceCoverageRegistry::new(SourceAvailability::Available);
-        let (coverage_sender, _source_coverage) = watch::channel(initial_coverage);
-        let (source_quality_sender, _source_quality) =
-            watch::channel(ObservationQuality::Reconciling);
-        let coverage = CoverageTracker::new(
-            SourceAvailability::Available,
-            coverage_sender,
-            source_quality_sender,
-        );
-        let mut provider = ProviderIntegration::new(
-            provider_events,
-            provider_thread.target_publisher(),
-            TargetSet::default(),
-            coverage,
-        );
-        let (performance, _sampler) = performance_tracker(Arc::new(SystemPerformanceClock::new()));
-        let received = ReceivedEvent {
-            event: "pane_created".to_owned(),
-            data: json!({
-                "pane": {
-                    "agent": "codex",
-                    "agent_status": "working",
-                    "pane_id": "g7-event-pane",
-                    "tab_id": "g7-event-tab",
-                    "terminal_id": "g7-event-terminal",
-                    "workspace_id": "g7-event-workspace"
-                }
-            }),
-            primary_stream_diagnostics: PrimaryStreamDiagnosticsHandle::default(),
-        };
-        let mut owner = OwnerTracker::from_environment();
-        let mut pending_closures = PendingTopologyClosures::default();
-
-        apply_received_event(
-            &mut harness.reducer,
-            &harness.shared,
-            &mut harness.persistence,
-            &mut owner,
-            "session",
-            received,
-            performance.admit(),
-            &mut pending_closures,
+        let (provider_sender, mut provider, provider_thread) = g7_provider_integration();
+        g7_install_pane_snapshot(
+            &mut harness,
             &mut provider,
+            "codex",
+            ExecState::Working,
+            None,
         )
-        .await
-        .unwrap();
+        .await;
 
         let published = provider.published_targets.codex_panes().collect::<Vec<_>>();
         let [target] = published.as_slice() else {
@@ -17704,6 +20051,7 @@ mod provider_integration_tests {
             0,
             "promoted pane must disappear from published sessionless targets"
         );
+        drop(provider_sender);
         provider_thread.stop().await.unwrap();
         harness.shutdown().await;
     }

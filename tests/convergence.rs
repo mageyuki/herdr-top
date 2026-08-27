@@ -42,6 +42,7 @@ struct ScopedHerdrConfig {
     reject_pane_once: Option<String>,
     reject_all_enrichment: bool,
     snapshot_delay: Duration,
+    gate_snapshot_responses: bool,
 }
 
 impl ScopedHerdrConfig {
@@ -51,8 +52,14 @@ impl ScopedHerdrConfig {
             reject_pane_once: None,
             reject_all_enrichment: false,
             snapshot_delay: Duration::ZERO,
+            gate_snapshot_responses: false,
         }
     }
+}
+
+struct ScopedSnapshotArrival {
+    index: usize,
+    release: oneshot::Sender<()>,
 }
 
 enum ScopedStreamCommand {
@@ -71,6 +78,8 @@ struct ScopedHerdr {
     enrichment_subscriptions: Arc<AtomicUsize>,
     enrichment_closures: Arc<AtomicUsize>,
     snapshot_requests: Arc<AtomicUsize>,
+    snapshot_state: Arc<Mutex<Value>>,
+    snapshot_arrivals: tokio::sync::Mutex<mpsc::UnboundedReceiver<ScopedSnapshotArrival>>,
     accept_task: JoinHandle<()>,
 }
 
@@ -86,6 +95,14 @@ impl ScopedHerdr {
         let enrichment_subscriptions = Arc::new(AtomicUsize::new(0));
         let enrichment_closures = Arc::new(AtomicUsize::new(0));
         let snapshot_requests = Arc::new(AtomicUsize::new(0));
+        let snapshot_state = Arc::new(Mutex::new(
+            config
+                .snapshots
+                .first()
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+        ));
+        let (snapshot_arrival_sender, snapshot_arrivals) = mpsc::unbounded_channel();
         let rejected = Arc::new(AtomicBool::new(false));
         let config = Arc::new(config);
         let accept_task = {
@@ -96,6 +113,8 @@ impl ScopedHerdr {
             let enrichment_subscriptions = Arc::clone(&enrichment_subscriptions);
             let enrichment_closures = Arc::clone(&enrichment_closures);
             let snapshot_requests = Arc::clone(&snapshot_requests);
+            let snapshot_state = Arc::clone(&snapshot_state);
+            let snapshot_arrival_sender = snapshot_arrival_sender.clone();
             tokio::spawn(async move {
                 while let Ok((stream, _)) = listener.accept().await {
                     let config = Arc::clone(&config);
@@ -106,6 +125,8 @@ impl ScopedHerdr {
                     let enrichment_subscriptions = Arc::clone(&enrichment_subscriptions);
                     let enrichment_closures = Arc::clone(&enrichment_closures);
                     let snapshot_requests = Arc::clone(&snapshot_requests);
+                    let snapshot_state = Arc::clone(&snapshot_state);
+                    let snapshot_arrival_sender = snapshot_arrival_sender.clone();
                     let rejected = Arc::clone(&rejected);
                     tokio::spawn(async move {
                         let _ = scoped_handle_connection(
@@ -118,6 +139,8 @@ impl ScopedHerdr {
                             &enrichment_subscriptions,
                             &enrichment_closures,
                             &snapshot_requests,
+                            &snapshot_state,
+                            &snapshot_arrival_sender,
                             &rejected,
                         )
                         .await;
@@ -135,6 +158,8 @@ impl ScopedHerdr {
             enrichment_subscriptions,
             enrichment_closures,
             snapshot_requests,
+            snapshot_state,
+            snapshot_arrivals: tokio::sync::Mutex::new(snapshot_arrivals),
             accept_task,
         })
     }
@@ -163,7 +188,15 @@ impl ScopedHerdr {
         self.snapshot_requests.load(Ordering::SeqCst)
     }
 
+    async fn next_snapshot_request(&self) -> ScopedSnapshotArrival {
+        tokio::time::timeout(WAIT, self.snapshot_arrivals.lock().await.recv())
+            .await
+            .expect("snapshot request-arrival gate timed out")
+            .expect("snapshot request-arrival gate closed")
+    }
+
     async fn push_primary(&self, frame: Value) -> std::io::Result<()> {
+        apply_primary_hint_to_snapshot(&mut self.snapshot_state.lock().unwrap(), &frame);
         scoped_push(&self.primary, frame).await
     }
 
@@ -221,6 +254,8 @@ async fn scoped_handle_connection(
     enrichment_subscriptions: &AtomicUsize,
     enrichment_closures: &AtomicUsize,
     snapshot_requests: &AtomicUsize,
+    snapshot_state: &Mutex<Value>,
+    snapshot_arrival_sender: &mpsc::UnboundedSender<ScopedSnapshotArrival>,
     rejected: &AtomicBool,
 ) -> std::io::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
@@ -242,11 +277,26 @@ async fn scoped_handle_connection(
             if !config.snapshot_delay.is_zero() {
                 tokio::time::sleep(config.snapshot_delay).await;
             }
-            let snapshot = config
-                .snapshots
-                .get(index)
-                .or_else(|| config.snapshots.last())
-                .ok_or_else(|| std::io::Error::other("no snapshot configured"))?;
+            if config.gate_snapshot_responses {
+                let (release, released) = oneshot::channel();
+                snapshot_arrival_sender
+                    .send(ScopedSnapshotArrival { index, release })
+                    .map_err(|_| std::io::Error::other("snapshot arrival observer closed"))?;
+                released
+                    .await
+                    .map_err(|_| std::io::Error::other("snapshot response release dropped"))?;
+            }
+            let snapshot = config.snapshots.get(index).cloned().unwrap_or_else(|| {
+                snapshot_state
+                    .lock()
+                    .expect("snapshot fixture mutex poisoned")
+                    .clone()
+            });
+            if index > 0 && index < config.snapshots.len() {
+                *snapshot_state
+                    .lock()
+                    .expect("snapshot fixture mutex poisoned") = snapshot.clone();
+            }
             scoped_write_frame(
                 &mut write_half,
                 &json!({"id": id, "result": {"type": "session_snapshot", "snapshot": snapshot}}),
@@ -380,6 +430,204 @@ async fn scoped_push(
         .map_err(|_| std::io::Error::other("scoped push was not acknowledged"))
 }
 
+fn apply_primary_hint_to_snapshot(snapshot: &mut Value, frame: &Value) {
+    let Some(event) = frame["event"].as_str() else {
+        return;
+    };
+    let event = event.replace('.', "_");
+    let data = &frame["data"];
+
+    match event.as_str() {
+        "workspace_created"
+        | "workspace_updated"
+        | "workspace_metadata_updated"
+        | "workspace_renamed"
+        | "workspace_moved"
+        | "workspace_reordered" => {
+            if let Some(workspace) = data.get("workspace") {
+                upsert_snapshot_entity(snapshot, "workspaces", "workspace_id", workspace);
+            } else if let Some(workspace_id) = data["workspace_id"].as_str() {
+                merge_snapshot_entity(snapshot, "workspaces", "workspace_id", workspace_id, data);
+            }
+        }
+        "workspace_closed" => {
+            if let Some(workspace_id) = data["workspace_id"].as_str() {
+                remove_snapshot_entity(snapshot, "workspaces", "workspace_id", workspace_id);
+                remove_snapshot_members(snapshot, "tabs", "workspace_id", workspace_id);
+                remove_snapshot_members(snapshot, "panes", "workspace_id", workspace_id);
+            }
+        }
+        "tab_created" | "tab_renamed" | "tab_moved" => {
+            if let Some(tab) = data.get("tab") {
+                upsert_snapshot_entity(snapshot, "tabs", "tab_id", tab);
+            } else if let Some(tab_id) = data["tab_id"].as_str() {
+                merge_snapshot_entity(snapshot, "tabs", "tab_id", tab_id, data);
+            }
+        }
+        "tab_closed" => {
+            if let Some(tab_id) = data["tab_id"].as_str() {
+                remove_snapshot_entity(snapshot, "tabs", "tab_id", tab_id);
+                remove_snapshot_members(snapshot, "panes", "tab_id", tab_id);
+            }
+        }
+        "pane_created" | "pane_updated" | "pane_agent_detected" => {
+            if let Some(pane) = data.get("pane") {
+                upsert_snapshot_entity(snapshot, "panes", "pane_id", pane);
+            }
+        }
+        "pane_moved" => {
+            if let Some(previous_pane_id) = data["previous_pane_id"].as_str() {
+                remove_snapshot_entity(snapshot, "panes", "pane_id", previous_pane_id);
+            }
+            if let Some(workspace_id) = data["closed_workspace_id"].as_str() {
+                remove_snapshot_entity(snapshot, "workspaces", "workspace_id", workspace_id);
+                remove_snapshot_members(snapshot, "tabs", "workspace_id", workspace_id);
+                remove_snapshot_members(snapshot, "panes", "workspace_id", workspace_id);
+            }
+            if let Some(tab_id) = data["closed_tab_id"].as_str() {
+                remove_snapshot_entity(snapshot, "tabs", "tab_id", tab_id);
+                remove_snapshot_members(snapshot, "panes", "tab_id", tab_id);
+            }
+            if let Some(tab) = data.get("created_tab") {
+                upsert_snapshot_entity(snapshot, "tabs", "tab_id", tab);
+            }
+            if let Some(pane) = data.get("pane") {
+                upsert_snapshot_entity(snapshot, "panes", "pane_id", pane);
+            }
+        }
+        "pane_closed" | "pane_exited" => {
+            if let Some(pane_id) = data["pane_id"].as_str() {
+                remove_snapshot_entity(snapshot, "panes", "pane_id", pane_id);
+            }
+        }
+        _ => return,
+    }
+
+    refresh_snapshot_counts(snapshot);
+}
+
+fn snapshot_after_primary_hints(mut snapshot: Value, frames: &[Value]) -> Value {
+    for frame in frames {
+        apply_primary_hint_to_snapshot(&mut snapshot, frame);
+    }
+    snapshot
+}
+
+fn upsert_snapshot_entity(snapshot: &mut Value, collection: &str, id_field: &str, entity: &Value) {
+    let Some(entity_id) = entity[id_field].as_str() else {
+        return;
+    };
+    let Some(items) = snapshot[collection].as_array_mut() else {
+        return;
+    };
+    if let Some(existing) = items
+        .iter_mut()
+        .find(|item| item[id_field].as_str() == Some(entity_id))
+    {
+        merge_json_object(existing, entity);
+    } else {
+        items.push(entity.clone());
+    }
+}
+
+fn merge_snapshot_entity(
+    snapshot: &mut Value,
+    collection: &str,
+    id_field: &str,
+    entity_id: &str,
+    update: &Value,
+) {
+    let Some(items) = snapshot[collection].as_array_mut() else {
+        return;
+    };
+    if let Some(existing) = items
+        .iter_mut()
+        .find(|item| item[id_field].as_str() == Some(entity_id))
+    {
+        merge_json_object(existing, update);
+    }
+}
+
+fn merge_json_object(target: &mut Value, update: &Value) {
+    let (Some(target), Some(update)) = (target.as_object_mut(), update.as_object()) else {
+        return;
+    };
+    for (key, value) in update {
+        if key != "type" {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+fn remove_snapshot_entity(snapshot: &mut Value, collection: &str, id_field: &str, id: &str) {
+    if let Some(items) = snapshot[collection].as_array_mut() {
+        items.retain(|item| item[id_field].as_str() != Some(id));
+    }
+}
+
+fn remove_snapshot_members(
+    snapshot: &mut Value,
+    collection: &str,
+    parent_field: &str,
+    parent_id: &str,
+) {
+    if let Some(items) = snapshot[collection].as_array_mut() {
+        items.retain(|item| item[parent_field].as_str() != Some(parent_id));
+    }
+}
+
+fn refresh_snapshot_counts(snapshot: &mut Value) {
+    let pane_parents: Vec<_> = snapshot["panes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|pane| {
+            (
+                pane["workspace_id"].as_str().map(str::to_owned),
+                pane["tab_id"].as_str().map(str::to_owned),
+            )
+        })
+        .collect();
+    let tab_parents: Vec<_> = snapshot["tabs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tab| tab["workspace_id"].as_str().map(str::to_owned))
+        .collect();
+
+    if let Some(workspaces) = snapshot["workspaces"].as_array_mut() {
+        for workspace in workspaces {
+            let workspace_id = workspace["workspace_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            workspace["pane_count"] = json!(
+                pane_parents
+                    .iter()
+                    .filter(|(parent, _)| parent.as_deref() == Some(workspace_id.as_str()))
+                    .count()
+            );
+            workspace["tab_count"] = json!(
+                tab_parents
+                    .iter()
+                    .filter(|parent| parent.as_str() == workspace_id.as_str())
+                    .count()
+            );
+        }
+    }
+    if let Some(tabs) = snapshot["tabs"].as_array_mut() {
+        for tab in tabs {
+            let tab_id = tab["tab_id"].as_str().unwrap_or_default().to_owned();
+            tab["pane_count"] = json!(
+                pane_parents
+                    .iter()
+                    .filter(|(_, parent)| parent.as_deref() == Some(tab_id.as_str()))
+                    .count()
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn scoped_subscription_keeps_primary_unscoped_and_enriches_each_snapshot_pane() {
     let mut snapshot = p1_snapshot();
@@ -412,11 +660,16 @@ async fn scoped_subscription_keeps_primary_unscoped_and_enriches_each_snapshot_p
         subscriptions[0]["params"]["subscriptions"],
         json!([
             {"type":"workspace.created"},
+            {"type":"workspace.updated"},
+            {"type":"workspace.metadata_updated"},
             {"type":"workspace.renamed"},
+            {"type":"workspace.moved"},
+            {"type":"workspace.reordered"},
             {"type":"workspace.closed"},
             {"type":"workspace.focused"},
             {"type":"tab.created"},
             {"type":"tab.renamed"},
+            {"type":"tab.moved"},
             {"type":"tab.closed"},
             {"type":"tab.focused"},
             {"type":"pane.created"},
@@ -795,12 +1048,7 @@ async fn queued_enrichment_during_convergence_is_discarded_before_live() {
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
     wait_until(|| mock.enrichment_subscriptions() == 1).await;
 
-    mock.push_primary(push(
-        "pane_agent_status_changed",
-        json!({"type":"pane_agent_status_changed", "pane_id":"ghost:p1", "workspace_id":"ghost"}),
-    ))
-    .await
-    .unwrap();
+    mock.push_primary(resnapshot_anomaly()).await.unwrap();
     wait_until(|| mock.snapshot_requests() == 2).await;
     mock.push_enrichment_many(
         (0..10)
@@ -876,8 +1124,9 @@ async fn pane_updated_fallback_converges_when_enrichment_is_unavailable() {
     .await
     .unwrap();
     wait_execution_state(&handle, ExecState::Working).await;
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
     assert_eq!(*handle.quality.borrow(), ObservationQuality::Live);
-    assert_eq!(mock.snapshot_requests(), 1);
+    assert_eq!(mock.snapshot_requests(), 2);
 
     shutdown(handle, lifecycle).await;
 }
@@ -900,10 +1149,11 @@ async fn terminal_reconciling_keeps_discarding_enrichment_at_the_driven_rate() {
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
     wait_until(|| mock.enrichment_subscriptions() == 1).await;
 
-    for expected_snapshot in 2..=5 {
+    for expected_snapshot in 2..=4 {
         mock.push_primary(resnapshot_anomaly()).await.unwrap();
         wait_until(|| mock.snapshot_requests() == expected_snapshot).await;
     }
+    mock.push_primary(resnapshot_anomaly()).await.unwrap();
     wait_quality(&mut handle.quality, ObservationQuality::Reconciling).await;
 
     for _ in 0..3 {
@@ -931,7 +1181,7 @@ async fn terminal_reconciling_keeps_discarding_enrichment_at_the_driven_rate() {
 }
 
 #[tokio::test]
-async fn member_pane_stale_from_agentless_snapshot_is_restored_by_live_status() {
+async fn agentless_snapshot_ends_execution_and_status_cannot_restore_provider_identity() {
     let present = agent_snapshot("stale-member", AgentSessionReferenceKind::Id, "idle");
     let mut agentless = present.clone();
     agentless["panes"][0]["agent"] = Value::Null;
@@ -960,31 +1210,36 @@ async fn member_pane_stale_from_agentless_snapshot_is_restored_by_live_status() 
             .model
             .borrow()
             .executions()
-            .any(|execution| matches!(execution.state, ExecState::Stale { .. }))
+            .all(|execution| execution.state.is_terminal())
     })
     .await;
     mock.push_enrichment(agent_status_push("w1:p1", "term_6583d08d791e41", "working"))
         .await
         .unwrap();
-    wait_execution_state(&handle, ExecState::Working).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(handle.model.borrow().pane("w1:p1").is_some());
+    assert!(
+        handle
+            .model
+            .borrow()
+            .executions()
+            .all(|execution| execution.state.is_terminal())
+    );
 
     shutdown(handle, lifecycle).await;
     let connection = Connection::open(database_path(&root)).unwrap();
-    let row: (i64, i64, String) = connection
+    let rows: i64 = connection
         .query_row(
-            "SELECT seen_at_ms, event_timestamp_ms, source_event_type FROM events \
-             WHERE source_event_type = 'pane_agent_status_changed'",
+            "SELECT COUNT(*) FROM events WHERE source_event_type = 'pane_agent_status_changed'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(row.0, row.1);
-    assert_eq!(row.2, "pane_agent_status_changed");
+    assert_eq!(rows, 0);
 }
 
 #[tokio::test]
-async fn grace_remnant_status_is_rescue_only_and_never_applies_outside_target_set() {
+async fn removed_pane_status_never_applies_outside_snapshot_target_set() {
     let mut present = agent_snapshot("grace-gate", AgentSessionReferenceKind::Id, "working");
     let survivor = pane_value("w1:p2", "terminal-2", "w1", "w1:t1");
     present["panes"]
@@ -1017,9 +1272,14 @@ async fn grace_remnant_status_is_rescue_only_and_never_applies_outside_target_se
         .await
         .expect("grace-remnant payload must be written to the active enrichment stream");
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(handle.model.borrow().executions().any(|execution| {
-        execution.pane_id == "w1:p1" && matches!(execution.state, ExecState::Stale { .. })
-    }));
+    assert!(handle.model.borrow().pane("w1:p1").is_none());
+    assert!(
+        handle
+            .model
+            .borrow()
+            .executions()
+            .all(|execution| { execution.pane_id != "w1:p1" || execution.state.is_terminal() })
+    );
     assert_eq!(
         handle.performance.borrow().snapshot.admission_high_water,
         before
@@ -1186,10 +1446,11 @@ async fn subscribe_buffer_snapshot_replay_order() {
             json!({"type": "pane_created", "pane": pane_value("w1:p2", "terminal-2", "w1", "w1:t1")}),
         ),
     ];
-    let mock = MockHerdr::start(
-        MockConfig::default()
-            .respond("session.snapshot", snapshot_result(snapshot))
-            .subscription_pushes(pushes),
+    let closing_snapshot = snapshot_after_primary_hints(snapshot.clone(), &pushes);
+    let mock = ScriptedHerdr::start(
+        ScriptedConfig::default()
+            .snapshots(vec![snapshot, closing_snapshot])
+            .generations(vec![pushes, vec![]]),
     )
     .await
     .expect("mock server should bind");
@@ -1223,9 +1484,49 @@ async fn subscribe_buffer_snapshot_replay_order() {
 }
 
 #[tokio::test]
+async fn snapshot_refresh_replay_never_resurrects_absent_pane() {
+    let authoritative = p1_snapshot();
+    let mut config =
+        ScopedHerdrConfig::snapshots(vec![authoritative.clone(), authoritative.clone()]);
+    config.gate_snapshot_responses = true;
+    let mock = ScopedHerdr::start(config).await.unwrap();
+    let (_directory, _root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .unwrap();
+
+    let first = mock.next_snapshot_request().await;
+    assert_eq!(first.index, 0);
+    mock.push_primary(push(
+        "pane_created",
+        json!({
+            "type": "pane_created",
+            "pane": pane_value("w1:historical", "historical-terminal", "w1", "w1:t1"),
+        }),
+    ))
+    .await
+    .unwrap();
+    first.release.send(()).unwrap();
+
+    let closing = mock.next_snapshot_request().await;
+    assert_eq!(closing.index, 1);
+    closing.release.send(()).unwrap();
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+
+    assert!(handle.model.borrow().pane("w1:historical").is_none());
+    assert_eq!(mock.snapshot_requests(), 2);
+    shutdown(handle, lifecycle).await;
+}
+
+#[tokio::test]
 async fn replay_drains_admitted_events_before_closed_end() {
     let final_sid = "replay-drain-final";
-    let generation = ["replay-drain-first", "replay-drain-second", final_sid]
+    let generation: Vec<_> = ["replay-drain-first", "replay-drain-second", final_sid]
         .into_iter()
         .map(|sid| {
             push(
@@ -1243,11 +1544,13 @@ async fn replay_drains_admitted_events_before_closed_end() {
             )
         })
         .collect();
+    let initial = p1_snapshot();
+    let closing_snapshot = snapshot_after_primary_hints(initial.clone(), &generation);
     let mock = ScriptedHerdr::start(
         ScriptedConfig::default()
-            .snapshots(vec![p1_snapshot()])
+            .snapshots(vec![initial, closing_snapshot])
             .generations(vec![generation])
-            .close_after_snapshots(vec![0]),
+            .close_after_snapshots(vec![1]),
     )
     .await
     .expect("scripted mock should bind");
@@ -1283,6 +1586,34 @@ async fn replay_drains_admitted_events_before_closed_end() {
         provider: Provider::Codex,
         sid: final_sid.to_owned(),
     };
+    tokio::time::timeout(WAIT, async {
+        while mock.snapshot_requests() != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "closing snapshot request did not arrive; observed {}",
+            mock.snapshot_requests()
+        )
+    });
+    assert_eq!(mock.snapshot_requests(), 2);
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if handle
+                .model
+                .borrow()
+                .task_run_by_key(&expected_key)
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("closing snapshot identity did not reach the model");
     let in_memory = handle
         .model
         .borrow()
@@ -1297,8 +1628,12 @@ async fn replay_drains_admitted_events_before_closed_end() {
     let persisted = restored.model.task_run_by_key(&expected_key).is_some();
 
     assert!(
-        in_memory && persisted,
-        "every event admitted before channel closure must reach the final model and store"
+        in_memory,
+        "the closing authoritative snapshot must reach the in-memory model"
+    );
+    assert!(
+        persisted,
+        "the closing authoritative snapshot must reach durable storage before EOF"
     );
 }
 
@@ -1350,7 +1685,7 @@ async fn anomaly_triggers_fresh_generation_resnapshot() {
 }
 
 #[tokio::test]
-async fn later_closure_exempts_anomaly() {
+async fn later_closure_coalesces_to_one_refresh_without_raw_mutation() {
     let snapshot = p1_snapshot();
     let generation = vec![
         push(
@@ -1364,8 +1699,8 @@ async fn later_closure_exempts_anomaly() {
     ];
     let mock = ScriptedHerdr::start(
         ScriptedConfig::default()
-            .snapshots(vec![snapshot])
-            .generations(vec![generation]),
+            .snapshots(vec![snapshot.clone(), snapshot])
+            .generations(vec![generation, vec![]]),
     )
     .await
     .expect("scripted mock should bind");
@@ -1381,17 +1716,15 @@ async fn later_closure_exempts_anomaly() {
     .expect("collector should start");
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
 
-    assert_eq!(mock.snapshot_requests(), 1);
+    assert_eq!(mock.snapshot_requests(), 2);
+    assert!(handle.model.borrow().pane("ghost:p1").is_none());
     shutdown(handle, lifecycle).await;
 }
 
 #[tokio::test]
 async fn three_attempts_then_stays_reconciling() {
     let snapshot = p1_snapshot();
-    let anomaly = push(
-        "pane_agent_status_changed",
-        json!({"type": "pane_agent_status_changed", "pane_id": "ghost:p1", "workspace_id": "ghost"}),
-    );
+    let anomaly = resnapshot_anomaly();
     let mock = ScriptedHerdr::start(
         ScriptedConfig::default()
             .snapshots(vec![snapshot; 4])
@@ -1418,7 +1751,7 @@ async fn three_attempts_then_stays_reconciling() {
 }
 
 #[tokio::test]
-async fn overflow_consumes_shared_counter_no_retirement() {
+async fn overflow_recovery_shares_immediate_attempt_budget_without_retiring_execution() {
     let sid = "overflow-native-session";
     let snapshot = agent_snapshot(sid, AgentSessionReferenceKind::Id, "working");
     let flood: Vec<_> = (0..100)
@@ -1429,13 +1762,10 @@ async fn overflow_consumes_shared_counter_no_retirement() {
             )
         })
         .collect();
-    let anomaly = push(
-        "pane_agent_status_changed",
-        json!({"type": "pane_agent_status_changed", "pane_id": "ghost:p1", "workspace_id": "ghost"}),
-    );
+    let anomaly = resnapshot_anomaly();
     let mock = ScriptedHerdr::start(
         ScriptedConfig::default()
-            .snapshots(vec![snapshot; 4])
+            .snapshots(vec![snapshot; 5])
             .generations(vec![
                 flood,
                 vec![anomaly.clone()],
@@ -1456,11 +1786,33 @@ async fn overflow_consumes_shared_counter_no_retirement() {
     )
     .await
     .expect("collector should start");
-    wait_until(|| mock.snapshot_requests() == 4).await;
-    tokio::time::sleep(Duration::from_millis(25)).await;
+    wait_until(|| handle.primary_stream_counters().suppressed_topology_frames == 3).await;
+
+    // One second spans 200 five-millisecond drain-quiet periods while remaining
+    // thirty times shorter than this integration path's default watchdog. An
+    // independent fourth immediate slot would therefore accept request five;
+    // the quiescent monitor must not.
+    let fifth_request = tokio::time::timeout(Duration::from_secs(1), async {
+        while mock.snapshot_requests() < 5 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        fifth_request.is_err(),
+        "overflow recovery exposed an independent fourth immediate request slot"
+    );
 
     let model = handle.model.borrow();
+    assert_eq!(mock.snapshot_requests(), 4);
     assert_eq!(*handle.quality.borrow(), ObservationQuality::Reconciling);
+    assert_eq!(
+        handle
+            .primary_stream_counters()
+            .event_triggered_topology_refreshes,
+        2,
+        "overflow recovery is not hint-caused, and the third anomaly must stop at quiescence"
+    );
     assert_eq!(
         model
             .executions()
@@ -1626,10 +1978,11 @@ async fn terminal_id_preserved_across_move_replay() {
         .as_str()
         .expect("fixture terminal id should be a string")
         .to_owned();
-    let mock = MockHerdr::start(
-        MockConfig::default()
-            .respond("session.snapshot", snapshot_result(snapshot))
-            .subscription_pushes(pushes),
+    let closing_snapshot = snapshot_after_primary_hints(snapshot.clone(), &pushes);
+    let mock = ScriptedHerdr::start(
+        ScriptedConfig::default()
+            .snapshots(vec![snapshot, closing_snapshot])
+            .generations(vec![pushes, vec![]]),
     )
     .await
     .expect("mock server should bind");
@@ -1661,10 +2014,7 @@ async fn terminal_id_preserved_across_move_replay() {
 #[tokio::test]
 async fn live_only_after_clean_drain() {
     let snapshot = p1_snapshot();
-    let anomaly = push(
-        "pane_agent_status_changed",
-        json!({"type": "pane_agent_status_changed", "pane_id": "ghost:p1", "workspace_id": "ghost"}),
-    );
+    let anomaly = resnapshot_anomaly();
     let mock = ScriptedHerdr::start(
         ScriptedConfig::default()
             .snapshots(vec![snapshot.clone(), snapshot])
@@ -1701,10 +2051,11 @@ async fn owner_location_refreshed_on_move() {
         .into_iter()
         .filter(|payload| payload.get("event").is_some())
         .collect();
-    let mock = MockHerdr::start(
-        MockConfig::default()
-            .respond("session.snapshot", snapshot_result(snapshot))
-            .subscription_pushes(pushes),
+    let closing_snapshot = snapshot_after_primary_hints(snapshot.clone(), &pushes);
+    let mock = ScriptedHerdr::start(
+        ScriptedConfig::default()
+            .snapshots(vec![snapshot, closing_snapshot])
+            .generations(vec![pushes, vec![]]),
     )
     .await
     .expect("mock server should bind");
@@ -1884,13 +2235,16 @@ async fn periodic_cleanup_after_ingestion() {
 async fn i4_d3_cleanup_failure_keeps_collector_alive() {
     let snapshot = p1_snapshot();
     let later_pane = pane_value("w1:p2", "terminal-2", "w1", "w1:t1");
-    let mock = MockHerdr::start(
-        MockConfig::default()
-            .respond("session.snapshot", snapshot_result(snapshot))
-            .subscription_pushes(vec![push(
-                "pane_created",
-                json!({"type": "pane_created", "pane": later_pane}),
-            )]),
+    let pane_created = push(
+        "pane_created",
+        json!({"type": "pane_created", "pane": later_pane}),
+    );
+    let closing_snapshot =
+        snapshot_after_primary_hints(snapshot.clone(), std::slice::from_ref(&pane_created));
+    let mock = ScriptedHerdr::start(
+        ScriptedConfig::default()
+            .snapshots(vec![snapshot, closing_snapshot])
+            .generations(vec![vec![pane_created], vec![]]),
     )
     .await
     .expect("mock server should bind");
@@ -1984,10 +2338,11 @@ async fn i4_d3_apply_failure_keeps_in_memory_model_advancing() {
             json!({"type": "pane_created", "pane": pane_value("w1:p3", "terminal-3", "w1", "w1:t1")}),
         ),
     ];
-    let mock = MockHerdr::start(
-        MockConfig::default()
-            .respond("session.snapshot", snapshot_result(snapshot))
-            .subscription_pushes(pushes),
+    let closing_snapshot = snapshot_after_primary_hints(snapshot.clone(), &pushes);
+    let mock = ScriptedHerdr::start(
+        ScriptedConfig::default()
+            .snapshots(vec![snapshot, closing_snapshot])
+            .generations(vec![pushes, vec![]]),
     )
     .await
     .expect("mock server should bind");
@@ -2012,38 +2367,17 @@ async fn i4_d3_apply_failure_keeps_in_memory_model_advancing() {
     .await
     .expect("collector should start");
     let mut diagnostics = handle.diagnostics.clone();
-    let mut operator = handle.operator.clone();
-    let _ = operator.borrow_and_update();
     wait_model_pane(&handle.model, "w1:p3").await;
-    tokio::time::timeout(WAIT, async {
-        loop {
-            let snapshot = operator.borrow();
-            let pane_created: Vec<_> = snapshot
-                .activity
-                .iter()
-                .filter(|item| {
-                    item.source == "herdr"
-                        && item.normalized_kind == "topology_upsert"
-                        && item.source_event_type == "pane_created"
-                })
-                .collect();
-            if pane_created.len() == 2
-                && pane_created
-                    .iter()
-                    .all(|item| item.durability == ActivityDurability::CurrentOnly)
-            {
-                break;
-            }
-            drop(snapshot);
-            operator
-                .changed()
-                .await
-                .expect("operator publisher must remain open");
-        }
-    })
-    .await
-    .expect("failure-causing and post-degradation activity must become current-only");
     wait_for_persistence_degradation(&mut persistence, &mut diagnostics).await;
+    assert!(
+        handle
+            .operator
+            .borrow()
+            .activity
+            .iter()
+            .all(|item| item.durability != ActivityDurability::Durable),
+        "the rejected authoritative snapshot batch must not be reported durable"
+    );
     let model = handle.model.borrow();
     assert!(model.pane("w1:p2").is_some());
     assert!(model.pane("w1:p3").is_some());
@@ -2100,16 +2434,18 @@ async fn fifty_pane_mock_smoke() {
 }
 
 #[tokio::test]
-async fn pane_update_with_new_sid_promotes_provisional() {
+async fn authoritative_snapshot_new_sid_replaces_provisional_run() {
     let initial = agent_snapshot("", AgentSessionReferenceKind::Id, "working");
     let update = push(
         "pane_updated",
         json!({"type": "pane_updated", "pane": agent_pane_value("w1:p1", "term_6583d08d791e41", "w1", "w1:t1", "promoted-sid")}),
     );
-    let mock = MockHerdr::start(
-        MockConfig::default()
-            .respond("session.snapshot", snapshot_result(initial))
-            .subscription_pushes(vec![update]),
+    let closing_snapshot =
+        snapshot_after_primary_hints(initial.clone(), std::slice::from_ref(&update));
+    let mock = ScriptedHerdr::start(
+        ScriptedConfig::default()
+            .snapshots(vec![initial, closing_snapshot])
+            .generations(vec![vec![update], vec![]]),
     )
     .await
     .expect("mock server should bind");
@@ -2131,8 +2467,14 @@ async fn pane_update_with_new_sid_promotes_provisional() {
             provider: Provider::Codex,
             sid: "promoted-sid".to_owned(),
         })
-        .expect("pane update identity must promote the provisional run");
-    assert_eq!(model.task_runs().count(), 1);
+        .expect("authoritative snapshot must install the native run");
+    assert_eq!(model.task_runs().count(), 2);
+    assert!(
+        model
+            .task_runs()
+            .filter(|run| run.run_id != promoted.run_id)
+            .all(|run| run.state.is_terminal())
+    );
     assert_eq!(
         model
             .executions()
@@ -2153,10 +2495,12 @@ async fn different_sid_same_terminal_starts_new_run() {
         "pane_updated",
         json!({"type": "pane_updated", "pane": agent_pane_value("w1:p1", "term_6583d08d791e41", "w1", "w1:t1", "new-sid")}),
     );
-    let mock = MockHerdr::start(
-        MockConfig::default()
-            .respond("session.snapshot", snapshot_result(initial))
-            .subscription_pushes(vec![update]),
+    let closing_snapshot =
+        snapshot_after_primary_hints(initial.clone(), std::slice::from_ref(&update));
+    let mock = ScriptedHerdr::start(
+        ScriptedConfig::default()
+            .snapshots(vec![initial, closing_snapshot])
+            .generations(vec![vec![update], vec![]]),
     )
     .await
     .expect("mock server should bind");
@@ -2223,10 +2567,12 @@ async fn provider_transition_starts_new_run() {
         "pane_updated",
         json!({"type": "pane_updated", "pane": replacement}),
     );
-    let mock = MockHerdr::start(
-        MockConfig::default()
-            .respond("session.snapshot", snapshot_result(initial))
-            .subscription_pushes(vec![update]),
+    let closing_snapshot =
+        snapshot_after_primary_hints(initial.clone(), std::slice::from_ref(&update));
+    let mock = ScriptedHerdr::start(
+        ScriptedConfig::default()
+            .snapshots(vec![initial, closing_snapshot])
+            .generations(vec![vec![update], vec![]]),
     )
     .await
     .expect("mock server should bind");
@@ -2360,9 +2706,29 @@ fn binding_conflict_returns_typed_dropped_result() {
 }
 
 #[tokio::test]
-async fn binding_conflict_is_non_fatal_diagnostic() {
+async fn authoritative_provider_move_replaces_prior_identity_without_raw_conflict() {
     let initial = agent_snapshot("bound-codex-sid", AgentSessionReferenceKind::Id, "working");
-    let mock = LiveHerdr::start(LiveConfig::default().snapshots(vec![initial]))
+    let mut moved = agent_pane_value(
+        "w1:p2",
+        "term_6583d08d791e41",
+        "w1",
+        "w1:t1",
+        "different-claude-sid",
+    );
+    moved["agent"] = json!("claude");
+    moved["agent_session"]["source"] = json!("herdr:claude");
+    moved["agent_session"]["agent"] = json!("claude");
+    let moved_frame = push(
+        "pane_moved",
+        json!({
+            "type": "pane_moved",
+            "previous_pane_id": "w1:p1",
+            "pane": moved,
+        }),
+    );
+    let closing_snapshot =
+        snapshot_after_primary_hints(initial.clone(), std::slice::from_ref(&moved_frame));
+    let mock = LiveHerdr::start(LiveConfig::default().snapshots(vec![initial, closing_snapshot]))
         .await
         .expect("live mock should bind");
     let (_directory, _root, lifecycle, writer) = test_writer();
@@ -2375,10 +2741,8 @@ async fn binding_conflict_is_non_fatal_diagnostic() {
     .await
     .expect("collector should start");
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
-    let _ = handle.model.borrow_and_update();
-    let _ = handle.diagnostics.borrow_and_update();
 
-    let (execution_id, run_id) = {
+    let (execution_id, old_run_id) = {
         let model = handle.model.borrow();
         let execution = model
             .executions()
@@ -2386,75 +2750,35 @@ async fn binding_conflict_is_non_fatal_diagnostic() {
             .expect("snapshot should create one execution");
         (execution.execution_id.clone(), execution.task_run_id)
     };
-    let mut moved = agent_pane_value(
-        "w1:p2",
-        "term_6583d08d791e41",
-        "w1",
-        "w1:t1",
-        "different-claude-sid",
-    );
-    moved["agent"] = json!("claude");
-    moved["agent_session"]["source"] = json!("herdr:claude");
-    moved["agent_session"]["agent"] = json!("claude");
-    mock.push(push(
-        "pane_moved",
-        json!({
-            "type": "pane_moved",
-            "previous_pane_id": "w1:p1",
-            "pane": moved,
-        }),
-    ))
-    .await
-    .expect("conflicting pane move should be delivered");
-
-    wait_until(|| {
-        handle
-            .model
-            .borrow()
-            .controller_diagnostics()
-            .binding_conflicts()
-            == 1
-    })
-    .await;
-    tokio::time::timeout(WAIT, async {
-        loop {
-            if handle
-                .diagnostics
-                .borrow()
-                .controller_counters
-                .binding_conflicts
-                == 1
-            {
-                break;
-            }
-            handle
-                .diagnostics
-                .changed()
-                .await
-                .expect("runtime diagnostics publisher must remain open");
-        }
-    })
-    .await
-    .expect("binding conflict must wake consolidated diagnostics");
-    assert_eq!(
-        handle
-            .diagnostics
-            .borrow()
-            .controller_counters
-            .binding_conflicts,
-        1
-    );
+    mock.push(moved_frame)
+        .await
+        .expect("conflicting pane move should be delivered");
+    wait_until(|| mock.snapshot_requests() == 2).await;
+    wait_model_pane(&handle.model, "w1:p2").await;
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
     assert_eq!(*handle.quality.borrow(), ObservationQuality::Live);
     let model = handle.model.borrow();
     let execution = model
         .execution(&execution_id)
-        .expect("the original execution should remain");
-    assert_eq!(execution.task_run_id, run_id);
+        .expect("the original execution should remain as history");
+    assert_eq!(execution.task_run_id, old_run_id);
     assert_eq!(execution.pane_id, "w1:p1");
-    assert_eq!(execution.state, ExecState::Working);
-    assert!(model.pane("w1:p1").is_some());
-    assert!(model.pane("w1:p2").is_none());
-    assert_eq!(model.task_runs().count(), 1);
+    assert!(execution.state.is_terminal());
+    let replacement = model
+        .task_run_by_key(&RunKey::Native {
+            provider: Provider::Claude,
+            sid: "different-claude-sid".to_owned(),
+        })
+        .expect("the authoritative snapshot should install the replacement identity");
+    assert!(model.executions().any(|execution| {
+        execution.task_run_id == replacement.run_id
+            && execution.pane_id == "w1:p2"
+            && execution.state == ExecState::Working
+    }));
+    assert!(model.pane("w1:p1").is_none());
+    assert!(model.pane("w1:p2").is_some());
+    assert_eq!(model.controller_diagnostics().binding_conflicts(), 0);
+    assert_eq!(model.task_runs().count(), 2);
     drop(model);
 
     shutdown(handle, lifecycle).await;
@@ -2541,9 +2865,27 @@ async fn different_sid_replacement_publishes_once() {
 }
 
 #[tokio::test]
-async fn sid_only_push_promotes_without_agent() {
+async fn authoritative_sid_snapshot_replaces_provisional_without_raw_agent_payload() {
     let initial = agent_snapshot("", AgentSessionReferenceKind::Id, "blocked");
-    let mock = LiveHerdr::start(LiveConfig::default().snapshots(vec![initial]))
+    let mut sid_only = agent_pane_value(
+        "w1:p1",
+        "term_6583d08d791e41",
+        "w1",
+        "w1:t1",
+        "promoted-without-agent",
+    );
+    sid_only
+        .as_object_mut()
+        .expect("pane fixture should be an object")
+        .remove("agent");
+    sid_only["agent_status"] = json!("blocked");
+    let update = push(
+        "pane_updated",
+        json!({"type": "pane_updated", "pane": sid_only}),
+    );
+    let closing_snapshot =
+        snapshot_after_primary_hints(initial.clone(), std::slice::from_ref(&update));
+    let mock = LiveHerdr::start(LiveConfig::default().snapshots(vec![initial, closing_snapshot]))
         .await
         .expect("live mock should bind");
     let (_directory, _root, lifecycle, writer) = test_writer();
@@ -2571,23 +2913,9 @@ async fn sid_only_push_promotes_without_agent() {
         (provisional.run_id, execution.execution_id.clone())
     };
 
-    let mut sid_only = agent_pane_value(
-        "w1:p1",
-        "term_6583d08d791e41",
-        "w1",
-        "w1:t1",
-        "promoted-without-agent",
-    );
-    sid_only
-        .as_object_mut()
-        .expect("pane fixture should be an object")
-        .remove("agent");
-    mock.push(push(
-        "pane_updated",
-        json!({"type": "pane_updated", "pane": sid_only}),
-    ))
-    .await
-    .expect("SID-only push should deliver");
+    mock.push(update)
+        .await
+        .expect("SID-only push should deliver");
     wait_until(|| {
         handle
             .model
@@ -2607,26 +2935,62 @@ async fn sid_only_push_promotes_without_agent() {
             sid: "promoted-without-agent".to_owned(),
         })
         .expect("SID-only push should promote the existing provisional run");
-    assert_eq!(
-        promoted.run_id, provisional_run_id,
-        "promotion must keep the provisional run, not end-and-recreate it"
-    );
-    assert_eq!(model.task_runs().count(), 1);
+    assert_ne!(promoted.run_id, provisional_run_id);
+    assert_eq!(model.task_runs().count(), 2);
     let executions: Vec<_> = model.executions().collect();
-    assert_eq!(executions.len(), 1);
-    assert_eq!(executions[0].execution_id, provisional_execution_id);
-    assert_eq!(executions[0].state, ExecState::Blocked);
+    assert_eq!(executions.len(), 2);
+    assert!(executions.iter().any(|execution| {
+        execution.execution_id == provisional_execution_id && execution.state.is_terminal()
+    }));
+    assert!(executions.iter().any(|execution| {
+        execution.task_run_id == promoted.run_id && execution.state == ExecState::Blocked
+    }));
     drop(model);
     shutdown(handle, lifecycle).await;
 }
 
 #[tokio::test]
-async fn conflicting_sid_only_push_is_skipped_not_fatal() {
+async fn successive_authoritative_sid_snapshots_retain_history_and_restore_established_run() {
     let established = "established-binding";
     let initial = agent_snapshot(established, AgentSessionReferenceKind::Id, "working");
-    let mock = LiveHerdr::start(LiveConfig::default().snapshots(vec![initial]))
-        .await
-        .expect("live mock should bind");
+    let mut stale = agent_pane_value(
+        "w1:p1",
+        "term_6583d08d791e41",
+        "w1",
+        "w1:t1",
+        "stale-latched-sid",
+    );
+    stale
+        .as_object_mut()
+        .expect("pane fixture should be an object")
+        .remove("agent");
+    let stale_update = push(
+        "pane_updated",
+        json!({"type": "pane_updated", "pane": stale}),
+    );
+    let mut follow_up =
+        agent_pane_value("w1:p1", "term_6583d08d791e41", "w1", "w1:t1", established);
+    follow_up
+        .as_object_mut()
+        .expect("pane fixture should be an object")
+        .insert("agent_status".to_owned(), json!("idle"));
+    let follow_up_update = push(
+        "pane_updated",
+        json!({"type": "pane_updated", "pane": follow_up}),
+    );
+    let stale_snapshot =
+        snapshot_after_primary_hints(initial.clone(), std::slice::from_ref(&stale_update));
+    let final_snapshot = snapshot_after_primary_hints(
+        stale_snapshot.clone(),
+        std::slice::from_ref(&follow_up_update),
+    );
+    let mock = LiveHerdr::start(LiveConfig::default().snapshots(vec![
+        initial,
+        stale_snapshot,
+        final_snapshot,
+    ]))
+    .await
+    .expect("live mock should bind");
     let (_directory, _root, lifecycle, writer) = test_writer();
     let mut handle = collector::spawn(
         mock.socket_path().to_path_buf(),
@@ -2649,36 +3013,14 @@ async fn conflicting_sid_only_push_is_skipped_not_fatal() {
     })
     .await;
 
-    let mut stale = agent_pane_value(
-        "w1:p1",
-        "term_6583d08d791e41",
-        "w1",
-        "w1:t1",
-        "stale-latched-sid",
-    );
-    stale
-        .as_object_mut()
-        .expect("pane fixture should be an object")
-        .remove("agent");
-    mock.push(push(
-        "pane_updated",
-        json!({"type": "pane_updated", "pane": stale}),
-    ))
-    .await
-    .expect("conflicting SID-only push should deliver");
+    mock.push(stale_update)
+        .await
+        .expect("conflicting SID-only push should deliver");
 
-    let mut follow_up =
-        agent_pane_value("w1:p1", "term_6583d08d791e41", "w1", "w1:t1", established);
-    follow_up
-        .as_object_mut()
-        .expect("pane fixture should be an object")
-        .insert("agent_status".to_owned(), json!("idle"));
-    mock.push(push(
-        "pane_updated",
-        json!({"type": "pane_updated", "pane": follow_up}),
-    ))
-    .await
-    .expect("follow-up push should deliver");
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    mock.push(follow_up_update)
+        .await
+        .expect("follow-up push should deliver");
     wait_until(|| {
         handle
             .model
@@ -2696,17 +3038,18 @@ async fn conflicting_sid_only_push_is_skipped_not_fatal() {
                 sid: established.to_owned(),
             })
             .is_some(),
-        "the established binding must survive the conflicting SID-only push"
+        "the established run must be active again after the closing snapshot"
     );
-    assert!(
-        model
-            .task_run_by_key(&RunKey::Native {
-                provider: Provider::Codex,
-                sid: "stale-latched-sid".to_owned(),
-            })
-            .is_none(),
-        "conflicting evidence must be skipped, never bound"
-    );
+    let historical = model
+        .task_run_by_key(&RunKey::Native {
+            provider: Provider::Codex,
+            sid: "stale-latched-sid".to_owned(),
+        })
+        .expect("the intermediate authoritative identity remains historical");
+    assert!(historical.state.is_terminal());
+    assert!(model.executions().any(|execution| {
+        execution.task_run_id == historical.run_id && execution.state.is_terminal()
+    }));
     drop(model);
     shutdown(handle, lifecycle).await;
 }
@@ -2800,7 +3143,7 @@ async fn resnapshot_discovers_new_agent_pane() {
 }
 
 #[tokio::test]
-async fn resnapshot_missing_pane_goes_stale_not_ended() {
+async fn authoritative_resnapshot_removes_missing_pane_and_ends_execution() {
     let initial = agent_snapshot("stale-sid", AgentSessionReferenceKind::Id, "working");
     let missing = snapshot_without_panes(&initial);
     let mock = ScriptedHerdr::start(
@@ -2822,17 +3165,11 @@ async fn resnapshot_missing_pane_goes_stale_not_ended() {
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
 
     let model = handle.model.borrow();
-    assert!(
-        model.pane("w1:p1").is_some(),
-        "stale pane must remain renderable"
-    );
+    assert!(model.pane("w1:p1").is_none());
     assert!(model.tab("w1:t1").is_some());
     assert!(model.workspace("w1").is_some());
-    assert!(model.executions().any(|execution| {
-        execution.pane_id == "w1:p1" && matches!(execution.state, ExecState::Stale { .. })
-    }));
     assert!(
-        !model.executions().any(|execution| {
+        model.executions().any(|execution| {
             execution.pane_id == "w1:p1" && execution.state == ExecState::Ended
         })
     );
@@ -2847,10 +3184,12 @@ async fn explicit_pane_close_bypasses_stale_grace() {
         "pane_closed",
         json!({"type": "pane_closed", "pane_id": "w1:p1"}),
     );
-    let mock = MockHerdr::start(
-        MockConfig::default()
-            .respond("session.snapshot", snapshot_result(initial))
-            .subscription_pushes(vec![close]),
+    let closing_snapshot =
+        snapshot_after_primary_hints(initial.clone(), std::slice::from_ref(&close));
+    let mock = ScriptedHerdr::start(
+        ScriptedConfig::default()
+            .snapshots(vec![initial, closing_snapshot])
+            .generations(vec![vec![close], vec![]]),
     )
     .await
     .expect("mock server should bind");
@@ -2911,13 +3250,18 @@ async fn stale_same_sid_reappearance_preserves_execution() {
 }
 
 #[tokio::test]
-async fn push_reappearance_cancels_pending_retirement() {
+async fn snapshot_reappearance_reuses_identity_until_later_authoritative_exit() {
     let sid = "live-reappearance";
     let present = agent_snapshot(sid, AgentSessionReferenceKind::Id, "working");
     let missing = snapshot_without_panes(&present);
-    let mock = LiveHerdr::start(LiveConfig::default().snapshots(vec![present, missing]))
-        .await
-        .expect("live mock should bind");
+    let mock = LiveHerdr::start(LiveConfig::default().snapshots(vec![
+        present.clone(),
+        missing.clone(),
+        present,
+        missing,
+    ]))
+    .await
+    .expect("live mock should bind");
     let (_directory, _root, lifecycle, writer) = test_writer();
     let mut handle = collector::spawn(
         mock.socket_path().to_path_buf(),
@@ -2933,14 +3277,14 @@ async fn push_reappearance_cancels_pending_retirement() {
         .await
         .expect("anomaly should trigger an in-place snapshot");
     wait_until(|| mock.snapshot_requests() == 2).await;
-    wait_until(|| {
+    wait_until(|| handle.model.borrow().pane("w1:p1").is_none()).await;
+    assert!(
         handle
             .model
             .borrow()
             .executions()
-            .any(|execution| matches!(execution.state, ExecState::Stale { .. }))
-    })
-    .await;
+            .all(|execution| execution.state.is_terminal())
+    );
     wait_quality(&mut handle.quality, ObservationQuality::Live).await;
 
     mock.push(push(
@@ -2981,11 +3325,7 @@ async fn push_reappearance_cancels_pending_retirement() {
     })
     .await;
 
-    tokio::time::sleep(Duration::from_millis(5_250)).await;
-    assert!(
-        handle.model.borrow().pane("w1:p1").is_some(),
-        "the retired pre-reappearance closure must not close the re-observed pane"
-    );
+    assert!(handle.model.borrow().pane("w1:p1").is_none());
     shutdown(handle, lifecycle).await;
 }
 
@@ -2996,10 +3336,12 @@ async fn topology_closure_cascades_and_persists() {
         "workspace_closed",
         json!({"type": "workspace_closed", "workspace_id": "w1"}),
     );
-    let mock = MockHerdr::start(
-        MockConfig::default()
-            .respond("session.snapshot", snapshot_result(initial))
-            .subscription_pushes(vec![close]),
+    let closing_snapshot =
+        snapshot_after_primary_hints(initial.clone(), std::slice::from_ref(&close));
+    let mock = ScriptedHerdr::start(
+        ScriptedConfig::default()
+            .snapshots(vec![initial, closing_snapshot])
+            .generations(vec![vec![close], vec![]]),
     )
     .await
     .expect("mock server should bind");
@@ -3121,7 +3463,7 @@ async fn subscribe_hang_cannot_block_stop() {
 }
 
 #[tokio::test]
-async fn converge_error_cancels_and_joins_reader() {
+async fn reducer_rejection_cancels_and_joins_reader_before_reconnect() {
     let snapshot = agent_snapshot("ordinal-failure", AgentSessionReferenceKind::Id, "working");
     let mock = HardeningHerdr::start(
         HardeningConfig::default().replies(vec![SnapshotReply::Snapshot(snapshot)]),
@@ -3129,7 +3471,7 @@ async fn converge_error_cancels_and_joins_reader() {
     .await
     .expect("hardening mock should bind");
     let (_directory, _root, lifecycle, writer) = test_writer();
-    let handle = collector::spawn(
+    let mut handle = collector::spawn(
         mock.socket_path().to_path_buf(),
         test_session(),
         RestoredState {
@@ -3144,16 +3486,13 @@ async fn converge_error_cancels_and_joins_reader() {
     .expect("collector should start");
     wait_until(|| mock.snapshot_requests() == 1).await;
     wait_until(|| mock.joined_subscriptions() == 1).await;
+    wait_quality(&mut handle.quality, ObservationQuality::Disconnected).await;
 
-    let error = handle
+    assert_eq!(handle.model.borrow().task_runs().count(), 0);
+    handle
         .stop()
         .await
-        .expect_err("ordinal exhaustion must surface from convergence");
-    assert!(
-        error
-            .to_string()
-            .contains("display ordinal allocator is exhausted")
-    );
+        .expect("cancellation during reconnect backoff should remain clean");
     assert_eq!(mock.active_subscriptions(), 0);
     lifecycle.shutdown().await.unwrap();
 }
@@ -3503,8 +3842,11 @@ fn snapshot_without_panes(snapshot: &Value) -> Value {
 
 fn resnapshot_anomaly() -> Value {
     push(
-        "pane_agent_status_changed",
-        json!({"type": "pane_agent_status_changed", "pane_id": "ghost:p1", "workspace_id": "ghost"}),
+        "pane_updated",
+        json!({
+            "type": "pane_updated",
+            "pane": pane_value("ghost:p1", "ghost-terminal", "ghost", "ghost:t1"),
+        }),
     )
 }
 

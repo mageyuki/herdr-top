@@ -2,6 +2,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
@@ -19,7 +21,7 @@ use crate::model::{
     EventMetadata, ExecState, Execution, ExecutionEdge, MinimalProviderMetadata, NormalizedEvent,
     OperatorCommand, Pane, Provider, ProviderDiagnosticsHandle, ReconcileBatch, RunId, RunKey,
     SharedModel, TaskRun, TaskState, TopologyAuthority, TopologyEntity, TopologyEntityId,
-    sanitize_controller_text,
+    TopologySnapshot, sanitize_controller_text,
 };
 use crate::operator::OperatorProjection;
 use crate::store::{
@@ -292,6 +294,8 @@ pub struct Reducer {
     operator: OperatorProjection,
     #[cfg(test)]
     publish_count: std::cell::Cell<u64>,
+    #[cfg(test)]
+    shared_publish_count: Arc<AtomicU64>,
     // increment5-workload-harness: begin reducer timing configuration field
     #[cfg(feature = "workload-harness")]
     workload_observation_timing: Option<WorkloadObservationTiming>,
@@ -358,6 +362,8 @@ impl Reducer {
                 operator,
                 #[cfg(test)]
                 publish_count: std::cell::Cell::new(0),
+                #[cfg(test)]
+                shared_publish_count: Arc::new(AtomicU64::new(0)),
                 // increment5-workload-harness: begin reducer timing configuration initialization
                 #[cfg(feature = "workload-harness")]
                 workload_observation_timing: None,
@@ -508,6 +514,11 @@ impl Reducer {
     #[must_use]
     pub fn controller_diagnostics_handle(&self) -> ControllerDiagnosticsHandle {
         self.model.controller_diagnostics().acceptor_handle()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_publish_count(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.shared_publish_count)
     }
 
     /// Returns the atomic diagnostics handle intended for the provider I/O thread.
@@ -1099,12 +1110,22 @@ impl Reducer {
 
     /// Replaces physical topology across an observation gap in one coherent batch.
     pub fn reconcile_gap(&mut self, batch: ReconcileBatch) -> Result<PersistBatch, ReducerError> {
+        self.reconcile_snapshot(batch.topology)
+    }
+
+    /// Atomically replaces physical topology from one complete authoritative snapshot.
+    pub fn reconcile_snapshot(
+        &mut self,
+        topology: TopologySnapshot,
+    ) -> Result<PersistBatch, ReducerError> {
         let original_model = self.model.clone();
         let original_next_ordinal = self.next_ordinal;
-        match self.reconcile_gap_inner(batch) {
+        match self.reconcile_snapshot_inner(topology) {
             Ok(mut persist) => {
                 normalize_persist_batch_lineage(&mut persist);
+                self.recompute_dangling_announcement_components();
                 self.operator.apply_submission(&persist);
+                self.publish();
                 Ok(persist)
             }
             Err(error) => {
@@ -1120,11 +1141,10 @@ impl Reducer {
         self.operator.complete_submission(outcome);
     }
 
-    fn reconcile_gap_inner(&mut self, batch: ReconcileBatch) -> Result<PersistBatch, ReducerError> {
-        let ReconcileBatch {
-            topology,
-            gap_kind: _,
-        } = batch;
+    fn reconcile_snapshot_inner(
+        &mut self,
+        topology: TopologySnapshot,
+    ) -> Result<PersistBatch, ReducerError> {
         let now_ms = unix_now_ms();
         let mut persist = Vec::new();
         let mut pre_gap_executions: Vec<_> = self.model.executions().cloned().collect();
@@ -1265,8 +1285,6 @@ impl Reducer {
             self.close_run_without_live_execution(run_id, now_ms, &mut persist);
         }
 
-        self.recompute_dangling_announcement_components();
-        self.publish();
         Ok(persist)
     }
 
@@ -2590,7 +2608,10 @@ impl Reducer {
     fn publish(&mut self) {
         self.apply_pending_telemetry_for_known_runs();
         #[cfg(test)]
-        self.publish_count.set(self.publish_count.get() + 1);
+        {
+            self.publish_count.set(self.publish_count.get() + 1);
+            self.shared_publish_count.fetch_add(1, Ordering::Relaxed);
+        }
         // increment5-workload-harness: begin reducer clone publication timing start
         #[cfg(feature = "workload-harness")]
         let workload_publish_started = Instant::now();
@@ -6233,6 +6254,105 @@ mod tests {
 
         assert!(upsert_tab < clear_tab);
         assert!(upsert_pane < clear_pane);
+    }
+
+    #[test]
+    fn authoritative_snapshot_publishes_once_and_rolls_back_on_late_error() {
+        let (mut reducer, mut shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let before_success = reducer.publish_count.get();
+        let successful = topology_snapshot(
+            &["workspace"],
+            &[("tab", "workspace")],
+            &[("pane", "workspace", "tab")],
+        );
+
+        let batch = reducer
+            .reconcile_snapshot(successful)
+            .expect("an authoritative snapshot should install atomically");
+
+        assert_eq!(reducer.publish_count.get() - before_success, 1);
+        assert!(shared.has_changed().unwrap());
+        let installed = Arc::clone(&shared.borrow_and_update());
+        assert!(installed.workspace("workspace").is_some());
+        assert!(installed.tab("tab").is_some());
+        assert!(installed.pane("pane").is_some());
+        assert!(!batch.is_empty());
+
+        let before_next_ordinal = i64::MAX - 1;
+        reducer.next_ordinal = before_next_ordinal;
+        let before_error = reducer.publish_count.get();
+        let before_model = Arc::clone(&shared.borrow());
+        let mut late = topology_snapshot(
+            &["late-workspace"],
+            &[("late-tab", "late-workspace")],
+            &[("late-pane", "late-workspace", "late-tab")],
+        );
+        late.panes[0].agent = Some(SnapshotAgent {
+            agent_name: "codex".to_owned(),
+            state: ExecState::Working,
+        });
+        let result = reducer.reconcile_snapshot(late);
+
+        assert_eq!(result, Err(ReducerError::OrdinalExhausted));
+        assert_eq!(reducer.publish_count.get(), before_error);
+        assert_eq!(
+            reducer.next_ordinal, before_next_ordinal,
+            "the run ordinal allocated before the later agent-node failure must roll back"
+        );
+        assert!(!shared.has_changed().unwrap());
+        assert!(Arc::ptr_eq(&before_model, &shared.borrow()));
+        assert!(shared.borrow().workspace("late-workspace").is_none());
+    }
+
+    #[test]
+    fn authoritative_snapshot_removes_absent_entities_immediately() {
+        let mut initial = topology_snapshot(
+            &["workspace", "absent-workspace"],
+            &[("tab", "workspace"), ("absent-tab", "absent-workspace")],
+            &[
+                ("pane", "workspace", "tab"),
+                ("absent-pane", "absent-workspace", "absent-tab"),
+            ],
+        );
+        initial
+            .panes
+            .iter_mut()
+            .find(|pane| pane.pane_id == "absent-pane")
+            .unwrap()
+            .agent = Some(SnapshotAgent {
+            agent_name: "codex".to_owned(),
+            state: ExecState::Working,
+        });
+        let (mut reducer, shared) = Reducer::new(restored(DomainModel::default(), 1));
+        reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: initial,
+                gap_kind: GapKind::Startup,
+            })
+            .unwrap();
+
+        let batch = reducer
+            .reconcile_snapshot(topology_snapshot(
+                &["workspace"],
+                &[("tab", "workspace")],
+                &[("pane", "workspace", "tab")],
+            ))
+            .unwrap();
+
+        let model = shared.borrow();
+        assert!(model.workspace("absent-workspace").is_none());
+        assert!(model.tab("absent-tab").is_none());
+        assert!(model.pane("absent-pane").is_none());
+        assert!(batch.iter().any(
+            |operation| matches!(operation, PersistOp::DeletePane { pane_id } if pane_id == "absent-pane")
+        ));
+        assert!(batch.iter().any(
+            |operation| matches!(operation, PersistOp::DeleteTab { tab_id } if tab_id == "absent-tab")
+        ));
+        assert!(batch.iter().any(|operation| matches!(
+            operation,
+            PersistOp::DeleteWorkspace { workspace_id } if workspace_id == "absent-workspace"
+        )));
     }
 
     #[test]
