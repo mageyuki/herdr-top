@@ -119,12 +119,19 @@ The physical levels use these row prefixes:
 ```text
 Session: <session>
 Workspace: <workspace-id>
-Tab: <tab-id> (<captured label>)
-Pane: <pane-id> (<captured display name>)
+Tab: <tab-id> (<Herdr label>)
+Tab: <tab-id>
+Pane: <pane-id> (<Herdr label>)
+Pane: <pane-id>
 ```
 
-The names in parentheses appear only when a captured name is available. Unicode
-connectors show sibling structure:
+Tab and pane names come only from their sanitized Herdr labels. Terminal titles
+never occupy the pane-name slot. A complete snapshot is authoritative: a null,
+empty, or sanitized-empty label clears the current and persisted name. A partial
+raw event with an omitted, empty, or sanitized-empty label preserves the current
+value until a complete snapshot replaces it. Parentheses appear only when the
+resulting label is present and non-empty; an absent label renders no `()` at all.
+Unicode connectors show sibling structure:
 
 ```text
 ├── non-final child
@@ -309,4 +316,6 @@ timeout, decode, conversion, or divergent-topology result triggers a reconnect,
 records an observation gap, and runs the normal subscribe-buffer-snapshot
 reconciliation sequence. Reconnect delay backs off from 1 second to at most 60
 seconds and resets after a subscription event, allowing a silently dead stream
-to recover without treating every quiet session as disconnected.
+to recover without treating every quiet session as disconnected. Snapshot names
+are compared exactly: a probed null differs from a current non-null name and is
+not rewritten from the current model before comparison.

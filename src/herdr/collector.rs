@@ -2667,19 +2667,7 @@ async fn probe_primary_topology(
 }
 
 fn probe_topology_matches_model(probed: TopologySnapshot, current: TopologySnapshot) -> bool {
-    let mut probed = canonical_topology(probed);
-    let current = canonical_topology(current);
-    for (probed, current) in probed.tabs.iter_mut().zip(&current.tabs) {
-        if probed.tab_id == current.tab_id && probed.label.is_none() {
-            probed.label.clone_from(&current.label);
-        }
-    }
-    for (probed, current) in probed.panes.iter_mut().zip(&current.panes) {
-        if probed.pane_id == current.pane_id && probed.display_name.is_none() {
-            probed.display_name.clone_from(&current.display_name);
-        }
-    }
-    probed == current
+    canonical_topology(probed) == canonical_topology(current)
 }
 
 fn canonical_topology(mut topology: TopologySnapshot) -> TopologySnapshot {
@@ -6219,7 +6207,7 @@ fn apply_snapshot_in_place(
     for workspace in &topology.workspaces {
         if let Some(batch) = apply_collector_event(
             reducer,
-            topology_upsert(
+            authoritative_topology_upsert(
                 session,
                 "snapshot_workspace",
                 TopologyEntity::Workspace(workspace.clone()),
@@ -6231,13 +6219,17 @@ fn apply_snapshot_in_place(
     for tab in &topology.tabs {
         if let Some(batch) = apply_collector_event(
             reducer,
-            topology_upsert(session, "snapshot_tab", TopologyEntity::Tab(tab.clone())),
+            authoritative_topology_upsert(
+                session,
+                "snapshot_tab",
+                TopologyEntity::Tab(tab.clone()),
+            ),
         )? {
             persist.extend(batch);
         }
     }
     for pane in &topology.panes {
-        let mut observation = vec![topology_upsert(
+        let mut observation = vec![authoritative_topology_upsert(
             session,
             "snapshot_pane",
             TopologyEntity::Pane(Pane {
@@ -6608,6 +6600,18 @@ fn topology_upsert(session: &str, kind: &str, entity: TopologyEntity) -> Normali
     NormalizedEvent::TopologyUpsert {
         metadata: metadata(session, kind),
         authority: TopologyAuthority::Partial,
+        entity,
+    }
+}
+
+fn authoritative_topology_upsert(
+    session: &str,
+    kind: &str,
+    entity: TopologyEntity,
+) -> NormalizedEvent {
+    NormalizedEvent::TopologyUpsert {
+        metadata: metadata(session, kind),
+        authority: TopologyAuthority::Authoritative,
         entity,
     }
 }
@@ -7105,15 +7109,7 @@ fn tab_entity(tab: TabInfo) -> Tab {
 }
 
 fn pane_display_name(pane: &PaneInfo) -> Option<String> {
-    pane.label
-        .as_deref()
-        .filter(|label| !label.is_empty())
-        .or_else(|| {
-            pane.terminal_title_stripped
-                .as_deref()
-                .filter(|title| !title.is_empty())
-        })
-        .and_then(sanitized_name)
+    pane.label.as_deref().and_then(sanitized_name)
 }
 
 fn sanitized_name(value: &str) -> Option<String> {
@@ -10351,7 +10347,7 @@ mod tests {
     }
 
     #[test]
-    fn watchdog_probe_name_comparison_matches_retention_and_detects_non_null_changes() {
+    fn watchdog_probe_name_comparison_is_exact_for_null_and_non_null_names() {
         let mut current = watchdog_probe_topology(None, None);
         current.tabs[0].label = Some("stored tab".to_owned());
         current.panes[0].display_name = Some("stored pane".to_owned());
@@ -10359,7 +10355,7 @@ mod tests {
         let mut nameless_probe = current.clone();
         nameless_probe.tabs[0].label = None;
         nameless_probe.panes[0].display_name = None;
-        assert!(probe_topology_matches_model(
+        assert!(!probe_topology_matches_model(
             nameless_probe.clone(),
             current.clone()
         ));
@@ -10371,6 +10367,17 @@ mod tests {
         let mut changed_pane = nameless_probe;
         changed_pane.panes[0].display_name = Some("renamed pane".to_owned());
         assert!(!probe_topology_matches_model(changed_pane, current));
+    }
+
+    #[test]
+    fn watchdog_probe_compares_authoritative_null_names_exactly() {
+        let mut current = watchdog_probe_topology(None, None);
+        current.tabs[0].label = Some("stored tab".to_owned());
+        current.panes[0].display_name = Some("stored pane".to_owned());
+
+        let probed = watchdog_probe_topology(None, None);
+
+        assert!(!probe_topology_matches_model(probed, current));
     }
 
     #[test]
@@ -13087,7 +13094,7 @@ mod tests {
         );
         assert_eq!(
             normalized_pane_display_name(None, Some("build")).as_deref(),
-            Some("build")
+            None
         );
         assert_eq!(
             normalized_pane_display_name(Some("label wins"), Some("ignored title")).as_deref(),
@@ -13095,7 +13102,7 @@ mod tests {
         );
         assert_eq!(
             normalized_pane_display_name(Some(""), Some("fallback title")).as_deref(),
-            Some("fallback title")
+            None
         );
         assert_eq!(normalized_pane_display_name(None, None), None);
 
@@ -13105,6 +13112,19 @@ mod tests {
         assert!(captured.len() <= 256);
         assert!(std::str::from_utf8(captured.as_bytes()).is_ok());
         assert!(captured.chars().all(|character| character == '界'));
+    }
+
+    #[test]
+    fn pane_display_name_uses_label_without_terminal_title_fallback() {
+        assert_eq!(normalized_pane_display_name(None, Some("build")), None);
+    }
+
+    #[test]
+    fn empty_pane_label_does_not_fall_back_to_terminal_title() {
+        assert_eq!(
+            normalized_pane_display_name(Some(""), Some("fallback title")),
+            None
+        );
     }
 
     #[test]
@@ -13163,7 +13183,7 @@ mod tests {
         }
     }
 
-    fn assert_authoritative_tab_clear_survives_restart(label: Option<&str>) {
+    fn assert_partial_tab_rename_preserves_name_across_restart(label: Option<&str>) {
         let directory = tempfile::tempdir().unwrap();
         let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
         let mut store = open_writer(&root).unwrap();
@@ -13190,32 +13210,42 @@ mod tests {
 
         let normalized = normalize_event(
             &shared,
-            "authoritative-clear-session",
+            "partial-rename-session",
             &tab_renamed_event("w1:t1", label),
         )
         .unwrap();
         let persist = apply_collector_observation(&mut reducer, normalized)
             .unwrap()
             .expect("known tab rename should apply");
-        assert_eq!(shared.borrow().tab("w1:t1").unwrap().label, None);
+        assert_eq!(
+            shared.borrow().tab("w1:t1").unwrap().label.as_deref(),
+            Some("persisted label")
+        );
+        assert!(!persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::ClearTabLabel { tab_id } if tab_id == "w1:t1"
+        )));
 
         store.apply_batch(persist).unwrap();
         let restored = store.load_restored_state().unwrap();
-        assert_eq!(restored.model.tab("w1:t1").unwrap().label, None);
+        assert_eq!(
+            restored.model.tab("w1:t1").unwrap().label.as_deref(),
+            Some("persisted label")
+        );
     }
 
     #[test]
-    fn tab_rename_with_empty_label_clears_store_across_restart() {
-        assert_authoritative_tab_clear_survives_restart(Some(""));
+    fn tab_rename_with_empty_label_preserves_store_across_restart() {
+        assert_partial_tab_rename_preserves_name_across_restart(Some(""));
     }
 
     #[test]
-    fn tab_rename_without_label_clears_store_across_restart() {
-        assert_authoritative_tab_clear_survives_restart(None);
+    fn tab_rename_without_label_preserves_store_across_restart() {
+        assert_partial_tab_rename_preserves_name_across_restart(None);
     }
 
     #[test]
-    fn tab_renamed_updates_existing_label_clears_empty_and_ignores_unknown_tabs() {
+    fn tab_renamed_updates_existing_label_preserves_empty_and_ignores_unknown_tabs() {
         let mut model = DomainModel::default();
         model.insert_workspace(Workspace {
             workspace_id: "w1".to_owned(),
@@ -13262,11 +13292,20 @@ mod tests {
         let persist = apply_collector_observation(&mut reducer, normalized)
             .unwrap()
             .expect("empty known tab rename should apply");
-        assert_eq!(shared.borrow().tab("w1:t1").unwrap().label, None);
+        assert_eq!(
+            shared.borrow().tab("w1:t1").unwrap().label.as_deref(),
+            Some("レビュー")
+        );
         assert!(persist.iter().any(|operation| matches!(
             operation,
             PersistOp::UpsertTab { tab, .. }
-                if tab.tab_id == "w1:t1" && tab.workspace_id == "w1" && tab.label.is_none()
+                if tab.tab_id == "w1:t1"
+                    && tab.workspace_id == "w1"
+                    && tab.label.as_deref() == Some("レビュー")
+        )));
+        assert!(!persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::ClearTabLabel { tab_id } if tab_id == "w1:t1"
         )));
 
         let normalized = normalize_event(
@@ -13287,11 +13326,20 @@ mod tests {
         let persist = apply_collector_observation(&mut reducer, normalized)
             .unwrap()
             .expect("absent-label known tab rename should apply");
-        assert_eq!(shared.borrow().tab("w1:t1").unwrap().label, None);
+        assert_eq!(
+            shared.borrow().tab("w1:t1").unwrap().label.as_deref(),
+            Some("before absent")
+        );
         assert!(persist.iter().any(|operation| matches!(
             operation,
             PersistOp::UpsertTab { tab, .. }
-                if tab.tab_id == "w1:t1" && tab.workspace_id == "w1" && tab.label.is_none()
+                if tab.tab_id == "w1:t1"
+                    && tab.workspace_id == "w1"
+                    && tab.label.as_deref() == Some("before absent")
+        )));
+        assert!(!persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::ClearTabLabel { tab_id } if tab_id == "w1:t1"
         )));
 
         let normalized = normalize_event(
@@ -13397,6 +13445,54 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_null_name_clears_model_and_persistence() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let named_topology = topology_from_snapshot(&snapshot_with_names()).unwrap();
+        let (mut reducer, _shared) = empty_reducer();
+        let persist = reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: named_topology.clone(),
+                gap_kind: GapKind::Startup,
+            })
+            .unwrap();
+        store.apply_batch(persist).unwrap();
+
+        let restored = store.load_restored_state().unwrap();
+        let (mut reducer, shared) = Reducer::new(restored);
+        assert_named_topology(&shared.borrow());
+
+        let mut nameless_topology = named_topology;
+        nameless_topology.tabs[0].label = None;
+        nameless_topology.panes[0].display_name = None;
+        let persist = apply_snapshot_in_place(
+            &mut reducer,
+            &shared,
+            nameless_topology,
+            "snapshot-session",
+            &mut PendingTopologyClosures::default(),
+        )
+        .unwrap();
+
+        assert_eq!(shared.borrow().tab("w1:t1").unwrap().label, None);
+        assert_eq!(shared.borrow().pane("w1:p4").unwrap().display_name, None);
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::ClearTabLabel { tab_id } if tab_id == "w1:t1"
+        )));
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::ClearPaneDisplayName { pane_id } if pane_id == "w1:p4"
+        )));
+
+        store.apply_batch(persist).unwrap();
+        let restored = store.load_restored_state().unwrap();
+        assert_eq!(restored.model.tab("w1:t1").unwrap().label, None);
+        assert_eq!(restored.model.pane("w1:p4").unwrap().display_name, None);
+    }
+
+    #[test]
     fn tab_rename_keeps_watchdog_topology_probe_in_sync() {
         let probed = topology_from_snapshot(&snapshot_with_names()).unwrap();
         let mut initial = probed.clone();
@@ -13423,7 +13519,7 @@ mod tests {
             .expect("known tab rename should apply");
 
         let current = current_model_topology(&shared, &PendingTopologyClosures::default()).unwrap();
-        assert!(probe_topology_matches_model(probed, current));
+        assert!(probe_topology_matches_model(probed.clone(), current));
 
         let normalized = normalize_event(
             &shared,
@@ -13434,19 +13530,24 @@ mod tests {
         let persist = apply_collector_observation(&mut reducer, normalized)
             .unwrap()
             .expect("empty-label known tab rename should apply");
-        assert!(persist.iter().any(|operation| matches!(
+        assert!(!persist.iter().any(|operation| matches!(
             operation,
             PersistOp::ClearTabLabel { tab_id } if tab_id == "w1:t1"
         )));
-        assert_eq!(shared.borrow().tab("w1:t1").unwrap().label, None);
+        assert_eq!(
+            shared.borrow().tab("w1:t1").unwrap().label.as_deref(),
+            Some("レビュー")
+        );
+        let current = current_model_topology(&shared, &PendingTopologyClosures::default()).unwrap();
+        assert!(probe_topology_matches_model(probed, current));
         let mut cleared_probe = topology_from_snapshot(&snapshot_with_names()).unwrap();
         cleared_probe.tabs[0].label = None;
         let current = current_model_topology(&shared, &PendingTopologyClosures::default()).unwrap();
-        assert!(probe_topology_matches_model(cleared_probe, current));
+        assert!(!probe_topology_matches_model(cleared_probe, current));
     }
 
     #[test]
-    fn in_place_snapshot_preserves_captured_tab_and_pane_names() {
+    fn in_place_authoritative_snapshot_clears_absent_tab_and_pane_names() {
         let named_topology = topology_from_snapshot(&snapshot_with_names()).unwrap();
         let (mut reducer, shared) = empty_reducer();
         reducer
@@ -13469,11 +13570,15 @@ mod tests {
         )
         .unwrap();
 
-        assert_named_topology(&shared.borrow());
+        assert_eq!(shared.borrow().tab("w1:t1").unwrap().label, None);
+        assert_eq!(shared.borrow().pane("w1:p4").unwrap().display_name, None);
         assert!(persist.iter().any(|operation| matches!(
             operation,
-            PersistOp::UpsertPane { pane, .. }
-                if pane.display_name.as_deref() == Some("UI修正")
+            PersistOp::ClearTabLabel { tab_id } if tab_id == "w1:t1"
+        )));
+        assert!(persist.iter().any(|operation| matches!(
+            operation,
+            PersistOp::ClearPaneDisplayName { pane_id } if pane_id == "w1:p4"
         )));
     }
 
