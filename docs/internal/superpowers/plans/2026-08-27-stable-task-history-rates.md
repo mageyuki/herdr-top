@@ -171,6 +171,7 @@ The identity merge matrix is part of this task, through the real
 - Modify: `src/provider/lane.rs`
 - Modify: `src/herdr/collector.rs`
 - Modify: `src/reducer.rs`
+- Modify: `src/operator.rs`
 - Modify: `src/store/mod.rs`
 - Modify: `src/store/writer.rs`
 - Test: `tests/convergence.rs`

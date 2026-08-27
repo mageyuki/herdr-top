@@ -10,8 +10,8 @@ use std::path::{Component, Path, PathBuf};
 use crate::activity::{DEFAULT_GHOST_VISIBILITY_MS, DEFAULT_STALL_WARN_MS};
 use crate::hook_adapter::{HookPayload, HookProvider, map_hook_payload};
 use crate::model::{
-    ControllerEvent, ControllerEventKind, EventMetadata, MinimalProviderMetadata, Provider, RunKey,
-    sanitize_controller_text,
+    ControllerEvent, ControllerEventKind, EventMetadata, MinimalProviderMetadata,
+    ObservationOrigin, Provider, RunKey, sanitize_controller_text,
 };
 
 use super::facts::{ActivitySource, CodexInternal, EvidenceId, LogFact, SessionScope};
@@ -78,6 +78,11 @@ struct FactPosition {
     sequence: usize,
 }
 
+struct FactContext<'a> {
+    position: FactPosition,
+    origin: &'a ObservationOrigin,
+}
+
 impl ActivitySelection {
     fn observe(&mut self, source: &ActivitySource, line: &str) {
         match source {
@@ -113,13 +118,18 @@ pub struct Synthesis {
     claude_cwds: HashMap<String, String>,
     published_subjects: HashMap<String, String>,
     started: HashMap<ScopeKey, i64>,
+    started_origins: HashMap<ScopeKey, ObservationOrigin>,
     usage_samples: HashSet<(ScopeKey, String)>,
     subagent_ends: HashMap<(String, String), SubagentEnd>,
     lineage: HashSet<(ScopeKey, ScopeKey)>,
     last_append_ms: HashMap<ScopeKey, i64>,
+    last_append_origins: HashMap<ScopeKey, ObservationOrigin>,
     /// Grace-held outcomes flush on graceful shutdown. After a crash, `EndedUnknown` is the
     /// designed honest recovery for an outcome nobody witnessed.
     pending_completes: HashMap<ScopeKey, ControllerEvent>,
+    pending_complete_origins: HashMap<ScopeKey, ObservationOrigin>,
+    emitted_synthesized_origins: HashMap<String, ObservationOrigin>,
+    emitted_lane_close_origins: HashMap<(RunKey, i64), ObservationOrigin>,
     latest_lifecycle_ms: i64,
     completed: HashSet<ScopeKey>,
     inactivity_closed: HashSet<ScopeKey>,
@@ -155,11 +165,16 @@ impl Synthesis {
             claude_cwds: HashMap::new(),
             published_subjects: HashMap::new(),
             started: HashMap::new(),
+            started_origins: HashMap::new(),
             usage_samples: HashSet::new(),
             subagent_ends: HashMap::new(),
             lineage: HashSet::new(),
             last_append_ms: HashMap::new(),
+            last_append_origins: HashMap::new(),
             pending_completes: HashMap::new(),
+            pending_complete_origins: HashMap::new(),
+            emitted_synthesized_origins: HashMap::new(),
+            emitted_lane_close_origins: HashMap::new(),
             latest_lifecycle_ms: now_ms.max(1),
             completed: HashSet::new(),
             inactivity_closed: HashSet::new(),
@@ -193,8 +208,17 @@ impl Synthesis {
         for (scope, anchor_ms) in inactive {
             self.inactivity_closed.insert(scope.clone());
             self.started.remove(&scope);
+            let key = run_key_for_scope_key(&scope);
+            let origin = self
+                .last_append_origins
+                .remove(&scope)
+                .or_else(|| self.started_origins.remove(&scope));
+            if let Some(origin) = origin {
+                self.emitted_lane_close_origins
+                    .insert((key.clone(), anchor_ms), origin);
+            }
             events.push(ProviderEvent::LaneClose {
-                key: run_key_for_scope_key(&scope),
+                key,
                 at_ms: anchor_ms,
             });
         }
@@ -218,7 +242,12 @@ impl Synthesis {
         for (scope, _) in due {
             if let Some(event) = self.pending_completes.remove(&scope) {
                 self.started.remove(&scope);
-                self.completed.insert(scope);
+                self.started_origins.remove(&scope);
+                self.completed.insert(scope.clone());
+                if let Some(origin) = self.pending_complete_origins.remove(&scope) {
+                    self.emitted_synthesized_origins
+                        .insert(event.metadata.event_id.clone(), origin);
+                }
                 events.push(ProviderEvent::Synthesized(event));
             }
         }
@@ -232,7 +261,12 @@ impl Synthesis {
             .into_iter()
             .map(|(scope, event)| {
                 self.started.remove(&scope);
-                self.completed.insert(scope);
+                self.started_origins.remove(&scope);
+                self.completed.insert(scope.clone());
+                if let Some(origin) = self.pending_complete_origins.remove(&scope) {
+                    self.emitted_synthesized_origins
+                        .insert(event.metadata.event_id.clone(), origin);
+                }
                 ProviderEvent::Synthesized(event)
             })
             .collect()
@@ -246,6 +280,7 @@ impl Synthesis {
     ) -> bool {
         self.flush_due_completes(at_ms, events);
         self.pending_completes.remove(scope);
+        self.pending_complete_origins.remove(scope);
         let was_completed = self.completed.remove(scope);
         let was_inactive = self.inactivity_closed.remove(scope);
         if let ScopeKey::ClaudeSubagent { parent, agent_id } = scope {
@@ -255,19 +290,33 @@ impl Synthesis {
         was_completed || was_inactive
     }
 
-    fn hold_complete(&mut self, scope: ScopeKey, event: ControllerEvent) {
-        self.pending_completes.entry(scope).or_insert(event);
+    fn hold_complete(
+        &mut self,
+        scope: ScopeKey,
+        event: ControllerEvent,
+        origin: &ObservationOrigin,
+    ) {
+        if let Entry::Vacant(entry) = self.pending_completes.entry(scope.clone()) {
+            entry.insert(event);
+            self.pending_complete_origins.insert(scope, origin.clone());
+        }
     }
 
-    fn start_scope(&mut self, scope: ScopeKey, source_at_ms: i64) -> bool {
+    fn start_scope(
+        &mut self,
+        scope: ScopeKey,
+        source_at_ms: i64,
+        origin: &ObservationOrigin,
+    ) -> bool {
         let started_at_ms = if source_at_ms > 0 {
             source_at_ms
         } else {
             self.latest_lifecycle_ms.max(1)
         };
-        match self.started.entry(scope) {
+        match self.started.entry(scope.clone()) {
             Entry::Vacant(entry) => {
                 entry.insert(started_at_ms);
+                self.started_origins.insert(scope, origin.clone());
                 true
             }
             Entry::Occupied(_) => false,
@@ -284,6 +333,23 @@ impl Synthesis {
         facts: impl IntoIterator<Item = (u64, LogFact)>,
         admission: &mut Admission,
         discovered: &AdmissionIndex,
+    ) -> Vec<ProviderEvent> {
+        self.synthesize_batch_with_origin(
+            artifact,
+            facts,
+            admission,
+            discovered,
+            &ObservationOrigin::Live,
+        )
+    }
+
+    pub(crate) fn synthesize_batch_with_origin(
+        &mut self,
+        artifact: &Path,
+        facts: impl IntoIterator<Item = (u64, LogFact)>,
+        admission: &mut Admission,
+        discovered: &AdmissionIndex,
+        origin: &ObservationOrigin,
     ) -> Vec<ProviderEvent> {
         let mut ordinary = Vec::new();
         let mut ended: HashMap<(String, String), (u64, bool, i64)> = HashMap::new();
@@ -335,7 +401,10 @@ impl Synthesis {
         for (ordinal, _, sequence, fact) in ordinary {
             self.synthesize_fact(
                 artifact,
-                FactPosition { ordinal, sequence },
+                FactContext {
+                    position: FactPosition { ordinal, sequence },
+                    origin,
+                },
                 fact,
                 admission,
                 discovered,
@@ -343,6 +412,49 @@ impl Synthesis {
             );
         }
         events
+    }
+
+    pub(crate) fn take_lifecycle_origin(
+        &mut self,
+        event: &ProviderEvent,
+    ) -> Option<ObservationOrigin> {
+        match event {
+            ProviderEvent::Synthesized(event) => self
+                .emitted_synthesized_origins
+                .remove(&event.metadata.event_id),
+            ProviderEvent::LaneClose { key, at_ms } => self
+                .emitted_lane_close_origins
+                .remove(&(key.clone(), *at_ms)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn abandon_origin(&mut self, origin: &ObservationOrigin) {
+        let abandoned_scopes = self
+            .started_origins
+            .iter()
+            .filter_map(|(scope, stored)| (stored == origin).then_some(scope.clone()))
+            .chain(
+                self.last_append_origins
+                    .iter()
+                    .filter_map(|(scope, stored)| (stored == origin).then_some(scope.clone())),
+            )
+            .chain(
+                self.pending_complete_origins
+                    .iter()
+                    .filter_map(|(scope, stored)| (stored == origin).then_some(scope.clone())),
+            )
+            .collect::<HashSet<_>>();
+        for scope in abandoned_scopes {
+            self.started.remove(&scope);
+            self.started_origins.remove(&scope);
+            self.last_append_ms.remove(&scope);
+            self.last_append_origins.remove(&scope);
+            self.pending_completes.remove(&scope);
+            self.pending_complete_origins.remove(&scope);
+            self.completed.remove(&scope);
+            self.inactivity_closed.remove(&scope);
+        }
     }
 
     /// Returns the selected current-turn activity for a session scope.
@@ -359,12 +471,13 @@ impl Synthesis {
     fn synthesize_fact(
         &mut self,
         artifact: &Path,
-        position: FactPosition,
+        context: FactContext<'_>,
         fact: LogFact,
         admission: &mut Admission,
         discovered: &AdmissionIndex,
         events: &mut Vec<ProviderEvent>,
     ) {
+        let FactContext { position, origin } = context;
         let FactPosition { ordinal, sequence } = position;
         if let Some(at_ms) = fact_lifecycle_time(&fact) {
             self.latest_lifecycle_ms = self.latest_lifecycle_ms.max(at_ms);
@@ -374,12 +487,13 @@ impl Synthesis {
                 let key = ScopeKey::from(&scope);
                 let reopen = self.prepare_resume(&key, at_ms, events);
                 self.last_append_ms.insert(key.clone(), at_ms);
+                self.last_append_origins.insert(key.clone(), origin.clone());
                 events.push(ProviderEvent::RunLiveness {
                     key: run_key_for_scope(&scope),
                     at_ms,
                 });
                 if (matches!(scope, SessionScope::ClaudeRoot(_)) || reopen)
-                    && self.start_scope(key, at_ms)
+                    && self.start_scope(key, at_ms, origin)
                 {
                     events.push(ProviderEvent::Synthesized(controller_event(
                         artifact,
@@ -436,7 +550,7 @@ impl Synthesis {
                     .copied()
                     .unwrap_or(self.latest_lifecycle_ms);
                 let _ = self.prepare_resume(&scope_key, at_ms, events);
-                self.start_scope(scope_key, at_ms);
+                self.start_scope(scope_key, at_ms, origin);
                 events.push(ProviderEvent::Synthesized(controller_event(
                     artifact,
                     ordinal,
@@ -475,7 +589,7 @@ impl Synthesis {
                         artifact, ordinal, sequence, &scope, at_ms, None,
                     ));
                 }
-                if self.start_scope(scope_key, at_ms) {
+                if self.start_scope(scope_key, at_ms, origin) {
                     events.push(ProviderEvent::Synthesized(controller_event(
                         artifact,
                         ordinal,
@@ -500,15 +614,17 @@ impl Synthesis {
                     None,
                     None,
                 );
-                self.hold_complete(scope_key, event);
+                self.hold_complete(scope_key, event, origin);
             }
             LogFact::CodexTurnAborted { rollout_id, at_ms } => {
                 let scope = SessionScope::Codex { rollout_id };
                 let scope_key = ScopeKey::from(&scope);
                 self.flush_due_completes(at_ms, events);
                 self.pending_completes.remove(&scope_key);
+                self.pending_complete_origins.remove(&scope_key);
                 self.completed.remove(&scope_key);
                 self.started.remove(&scope_key);
+                self.started_origins.remove(&scope_key);
                 events.push(ProviderEvent::Synthesized(controller_event(
                     artifact,
                     ordinal,
@@ -554,7 +670,7 @@ impl Synthesis {
                     Some(description),
                     Some(provider_metadata),
                 )));
-                self.start_scope(child_key, at_ms);
+                self.start_scope(child_key, at_ms, origin);
             }
             LogFact::SubagentEnded {
                 parent,
@@ -606,12 +722,16 @@ impl Synthesis {
                 );
                 if failed {
                     self.pending_completes.remove(&scope_key);
+                    self.pending_complete_origins.remove(&scope_key);
                     self.completed.remove(&scope_key);
                     self.started.remove(&scope_key);
+                    self.started_origins.remove(&scope_key);
                     events.push(ProviderEvent::Synthesized(event));
                 } else {
                     // Refresh the held event from the accumulated ordinal and timestamp.
-                    self.pending_completes.insert(scope_key, event);
+                    self.pending_completes.insert(scope_key.clone(), event);
+                    self.pending_complete_origins
+                        .insert(scope_key, origin.clone());
                 }
             }
             LogFact::Activity {

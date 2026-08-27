@@ -273,29 +273,6 @@ pub enum ProviderEvent {
 }
 
 impl ProviderEvent {
-    pub(crate) fn provider(&self) -> Option<Provider> {
-        match self {
-            Self::Synthesized(event) => event.metadata.provider,
-            Self::RunLiveness { key, .. }
-            | Self::LaneClose { key, .. }
-            | Self::Telemetry { key, .. } => match key {
-                RunKey::Controller(key) if key.starts_with("hook:claude-code:") => {
-                    Some(Provider::Claude)
-                }
-                RunKey::Controller(key) if key.starts_with("hook:codex:") => Some(Provider::Codex),
-                RunKey::Native { provider, .. } | RunKey::NativePath { provider, .. } => {
-                    Some(*provider)
-                }
-                RunKey::Controller(_) | RunKey::Provisional { .. } => None,
-            },
-            Self::SessionResolved { provider, .. }
-            | Self::AgentUpsert { provider, .. }
-            | Self::Activity { provider, .. }
-            | Self::SourceState { provider, .. }
-            | Self::Malformed { provider, .. } => Some(*provider),
-        }
-    }
-
     pub(crate) const fn requires_admission(&self) -> bool {
         match self {
             Self::Synthesized(_)

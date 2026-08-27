@@ -302,6 +302,7 @@ pub struct Reducer {
     publisher: watch::Sender<Arc<DomainModel>>,
     operator: OperatorProjection,
     defer_provider_publication: bool,
+    deferred_provider_drain: Option<crate::model::HistoryDrainId>,
     published_history_drains: HashSet<crate::model::HistoryDrainId>,
     #[cfg(test)]
     publish_count: std::cell::Cell<u64>,
@@ -372,6 +373,7 @@ impl Reducer {
                 publisher,
                 operator,
                 defer_provider_publication: false,
+                deferred_provider_drain: None,
                 published_history_drains: HashSet::new(),
                 #[cfg(test)]
                 publish_count: std::cell::Cell::new(0),
@@ -498,6 +500,7 @@ impl Reducer {
                     .set_task_run_v6_state(finalized.run_id, finalized.state.clone());
             }
         }
+        self.operator.publish_accumulated(&finalization.drain_id);
         self.publish();
         true
     }
@@ -507,8 +510,9 @@ impl Reducer {
         &mut self,
         origin: &ObservationOrigin,
     ) -> Option<DomainModel> {
-        if matches!(origin, ObservationOrigin::Historical { .. }) {
+        if let ObservationOrigin::Historical { drain_id, .. } = origin {
             self.defer_provider_publication = true;
+            self.deferred_provider_drain = Some(drain_id.clone());
             Some(self.model.clone())
         } else {
             None
@@ -626,6 +630,7 @@ impl Reducer {
             }
         }
         self.defer_provider_publication = false;
+        self.deferred_provider_drain = None;
         PersistV6Batch {
             operations,
             task_runs,
@@ -641,6 +646,7 @@ impl Reducer {
 
     pub(crate) fn cancel_provider_observation(&mut self) {
         self.defer_provider_publication = false;
+        self.deferred_provider_drain = None;
     }
 
     pub(crate) fn apply_pane_agent_observation(
@@ -719,7 +725,7 @@ impl Reducer {
         }
         self.recompute_dangling_announcement_components();
         normalize_persist_batch_lineage(&mut persist);
-        self.operator.apply_submission(&persist);
+        self.apply_operator_submission(&persist);
         self.publish();
         // increment5-workload-harness: begin observed apply scope finish
         #[cfg(feature = "workload-harness")]
@@ -854,7 +860,7 @@ impl Reducer {
         Self::touch_task_run(&mut task_run, at_ms);
         self.model.insert_task_run(task_run.clone());
         let persist = vec![self.persist_task_run(task_run, at_ms)];
-        self.operator.apply_submission(&persist);
+        self.apply_operator_submission(&persist);
         self.publish();
         persist
     }
@@ -1026,7 +1032,7 @@ impl Reducer {
         Self::touch_task_run(&mut task_run, at_ms);
         self.model.insert_task_run(task_run.clone());
         let persist = vec![self.persist_task_run(task_run, at_ms)];
-        self.operator.apply_submission(&persist);
+        self.apply_operator_submission(&persist);
         self.publish();
         persist
     }
@@ -1307,7 +1313,7 @@ impl Reducer {
         self.non_lane_task_state_runs = delta.post_non_lane_task_state_runs;
         self.next_ingest_seq = ingest_seq.checked_add(1);
         self.apply_controller_diagnostic_deltas(delta.diagnostic_deltas);
-        self.operator.apply_submission(&batch);
+        self.apply_operator_submission(&batch);
         self.publish();
         Ok(permit.enqueue(batch))
     }
@@ -1346,7 +1352,7 @@ impl Reducer {
         self.non_lane_task_state_runs = delta.post_non_lane_task_state_runs;
         self.next_ingest_seq = ingest_seq.checked_add(1);
         self.apply_controller_diagnostic_deltas(delta.diagnostic_deltas);
-        self.operator.apply_submission(&batch);
+        self.apply_operator_submission(&batch);
         self.publish();
         Ok(batch)
     }
@@ -1404,7 +1410,7 @@ impl Reducer {
             Ok(mut persist) => {
                 normalize_persist_batch_lineage(&mut persist);
                 self.recompute_dangling_announcement_components();
-                self.operator.apply_submission(&persist);
+                self.apply_operator_submission(&persist);
                 self.publish();
                 Ok(persist)
             }
@@ -1419,6 +1425,25 @@ impl Reducer {
     /// Applies the runtime durability truth to the preceding operator submission.
     pub(crate) fn complete_operator_submission(&mut self, outcome: RuntimeWriteOutcome) {
         self.operator.complete_submission(outcome);
+    }
+
+    /// Applies durability truth to a historical provider submission without publishing it.
+    pub(crate) fn complete_deferred_operator_submission(&mut self, outcome: RuntimeWriteOutcome) {
+        self.operator
+            .complete_submission_without_publishing(outcome);
+    }
+
+    fn apply_operator_submission(&mut self, persist: &[PersistOp]) {
+        if self.defer_provider_publication {
+            self.operator.apply_submission_without_publishing(
+                self.deferred_provider_drain
+                    .as_ref()
+                    .expect("a deferred provider observation must name its history drain"),
+                persist,
+            );
+        } else {
+            self.operator.apply_submission(persist);
+        }
     }
 
     fn reconcile_snapshot_inner(
@@ -2760,7 +2785,7 @@ impl Reducer {
             return persist;
         }
         self.recompute_dangling_announcement_components();
-        self.operator.apply_submission(&persist);
+        self.apply_operator_submission(&persist);
         self.publish();
         persist
     }
@@ -2877,7 +2902,7 @@ impl Reducer {
             self.model.insert_task_run(task_run.clone());
             persist.push(self.persist_task_run(task_run, now_ms));
         }
-        self.operator.apply_submission(&persist);
+        self.apply_operator_submission(&persist);
         self.publish();
         persist
     }
@@ -3297,7 +3322,7 @@ fn unix_now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::Path;
     use std::sync::Arc;
 
@@ -3402,6 +3427,142 @@ mod tests {
 
         assert!(!reducer.apply_history_finalization(&durable_page));
         assert_eq!(publish_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn historical_activity_publishes_model_and_operator_only_at_durable_finalization() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let drain_id = crate::model::HistoryDrainId::new("codex:deferred-operator").unwrap();
+        let manifest = PersistHistoryDrain {
+            drain_id: drain_id.clone(),
+            provider: Provider::Codex,
+            created_at_ms: 1_000,
+            artifacts: Vec::new(),
+        };
+        let sibling_drain_id =
+            crate::model::HistoryDrainId::new("claude:deferred-operator").unwrap();
+        let sibling_manifest = PersistHistoryDrain {
+            drain_id: sibling_drain_id.clone(),
+            provider: Provider::Claude,
+            created_at_ms: 1_000,
+            artifacts: Vec::new(),
+        };
+        store
+            .apply_v6_batch(PersistV6Batch {
+                history_drains: vec![manifest.clone(), sibling_manifest.clone()],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+        let restored = store.load_restored_state().unwrap();
+        let (mut reducer, shared, mut operator) = Reducer::new_with_operator(
+            restored,
+            crate::activity::RestoredOperatorState {
+                activity: Vec::new(),
+                terminal_times: HashMap::new(),
+            },
+        );
+        let origin = crate::model::ObservationOrigin::Historical {
+            drain_id: drain_id.clone(),
+            artifact_id: "frozen.jsonl".to_owned(),
+        };
+        let mut controller = provider_lane_event(
+            "historical-new-run",
+            "historical-new-run",
+            ControllerEventKind::TaskStarted,
+            2_000,
+            2_100,
+        );
+        controller.metadata.provider = Some(Provider::Codex);
+        controller.metadata.native_session_id = Some("historical-new-run".to_owned());
+
+        let prior = reducer.begin_provider_observation(&origin);
+        let delta = reducer.validate_controller_event(&controller).unwrap();
+        let operations = reducer.commit_staged_unqueued(delta).unwrap();
+        let batch =
+            reducer.finish_provider_observation(prior, operations, &origin, Some(&manifest), 2_000);
+        assert_eq!(batch.history_associations.len(), 1);
+        store.apply_v6_batch(batch).unwrap();
+        reducer.complete_deferred_operator_submission(RuntimeWriteOutcome::Durable);
+
+        let sibling_origin = crate::model::ObservationOrigin::Historical {
+            drain_id: sibling_drain_id.clone(),
+            artifact_id: "sibling.jsonl".to_owned(),
+        };
+        let mut sibling_controller = provider_lane_event(
+            "historical-sibling-run",
+            "historical-sibling-run",
+            ControllerEventKind::TaskStarted,
+            2_200,
+            2_300,
+        );
+        sibling_controller.metadata.provider = Some(Provider::Claude);
+        sibling_controller.metadata.native_session_id = Some("historical-sibling-run".to_owned());
+        let sibling_prior = reducer.begin_provider_observation(&sibling_origin);
+        let sibling_delta = reducer
+            .validate_controller_event(&sibling_controller)
+            .unwrap();
+        let sibling_operations = reducer.commit_staged_unqueued(sibling_delta).unwrap();
+        let sibling_batch = reducer.finish_provider_observation(
+            sibling_prior,
+            sibling_operations,
+            &sibling_origin,
+            Some(&sibling_manifest),
+            2_200,
+        );
+        assert_eq!(sibling_batch.history_associations.len(), 1);
+        store.apply_v6_batch(sibling_batch).unwrap();
+        reducer.complete_deferred_operator_submission(RuntimeWriteOutcome::Durable);
+
+        assert!(shared.borrow().task_runs().next().is_none());
+        assert!(
+            operator.borrow().activity.is_empty(),
+            "historical activity escaped through OperatorSnapshot before finalization"
+        );
+
+        assert!(operator.borrow().activity.is_empty());
+
+        let barrier = HistoryDrainBarrier::new(drain_id.clone(), 3_000);
+        let staged = reducer.stage_history_finalization(&barrier);
+        let page = store
+            .finalize_history_drain(&staged.drain_id, staged.observed_at_ms)
+            .unwrap();
+        assert_eq!(page.runs.len(), 1);
+        assert!(reducer.apply_history_finalization(&page));
+        assert_eq!(shared.borrow().task_runs().count(), 1);
+        assert_eq!(operator.borrow().activity.len(), 1);
+        assert_eq!(
+            operator.borrow().activity[0].identity.event_id,
+            "historical-new-run"
+        );
+
+        operator.borrow_and_update();
+        assert!(!reducer.apply_history_finalization(&page));
+        assert!(!operator.has_changed().unwrap());
+        assert_eq!(shared.borrow().task_runs().count(), 1);
+        assert_eq!(operator.borrow().activity.len(), 1);
+
+        let sibling_barrier = HistoryDrainBarrier::new(sibling_drain_id, 3_100);
+        let sibling_staged = reducer.stage_history_finalization(&sibling_barrier);
+        let sibling_page = store
+            .finalize_history_drain(&sibling_staged.drain_id, sibling_staged.observed_at_ms)
+            .unwrap();
+        assert!(reducer.apply_history_finalization(&sibling_page));
+        assert_eq!(shared.borrow().task_runs().count(), 2);
+        let operator_event_ids = operator
+            .borrow()
+            .activity
+            .iter()
+            .map(|activity| activity.identity.event_id.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            operator_event_ids,
+            HashSet::from([
+                "historical-new-run".to_owned(),
+                "historical-sibling-run".to_owned(),
+            ])
+        );
     }
 
     #[test]

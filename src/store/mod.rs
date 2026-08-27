@@ -723,6 +723,9 @@ impl Store {
     /// Applies core and schema-v6 operations in exactly one SQLite transaction.
     pub fn apply_v6_batch(&mut self, batch: PersistV6Batch) -> Result<(), StoreError> {
         let transaction = self.connection.transaction()?;
+        if exact_v6_replay_is_already_durable(&transaction, &batch)? {
+            return Ok(());
+        }
         // Reducer batches may contain agent/event rows before their run upsert. Seed only missing
         // v6 runs first so those foreign keys are valid, then replay the original core order and
         // finish with the authoritative v6 state. Existing rows are deliberately not pre-upserted:
@@ -1930,6 +1933,58 @@ fn apply_operation(transaction: &Transaction<'_>, operation: PersistOp) -> Resul
         }
     }
     Ok(())
+}
+
+fn exact_v6_replay_is_already_durable(
+    transaction: &Transaction<'_>,
+    batch: &PersistV6Batch,
+) -> Result<bool, StoreError> {
+    let Some(PersistOp::AdvanceIngestSequence { ingest_seq }) = batch.operations.first() else {
+        return Ok(false);
+    };
+    if batch
+        .operations
+        .iter()
+        .skip(1)
+        .any(|operation| matches!(operation, PersistOp::AdvanceIngestSequence { .. }))
+    {
+        return Ok(false);
+    }
+    let current: i64 = transaction.query_row(
+        "SELECT value FROM meta WHERE key = 'ingest_seq_high_water'",
+        [],
+        |row| row.get(0),
+    )?;
+    if current < *ingest_seq {
+        return Ok(false);
+    }
+
+    let mut expected_event_ids = HashSet::new();
+    for operation in &batch.operations {
+        let PersistOp::RecordEvent { event, .. } = operation else {
+            continue;
+        };
+        let metadata = event_metadata(event).0;
+        let Some(event_ingest_seq) = metadata
+            .ingest_seq
+            .and_then(|value| i64::try_from(value).ok())
+        else {
+            return Ok(false);
+        };
+        if event_ingest_seq != *ingest_seq || !expected_event_ids.insert(metadata.event_id.clone())
+        {
+            return Ok(false);
+        }
+    }
+    if expected_event_ids.is_empty() {
+        return Ok(false);
+    }
+
+    let mut statement = transaction.prepare("SELECT event_id FROM events WHERE ingest_seq = ?1")?;
+    let durable_event_ids = statement
+        .query_map([ingest_seq], |row| row.get::<_, String>(0))?
+        .collect::<Result<HashSet<_>, _>>()?;
+    Ok(durable_event_ids == expected_event_ids)
 }
 
 fn promote_task_run_key(
@@ -5120,6 +5175,61 @@ mod tests {
             store.load_restored_state().unwrap().next_ingest_seq,
             Some(42)
         );
+    }
+
+    #[test]
+    fn schema_v6_exact_ingest_replay_requires_matching_durable_event_evidence() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let batch = |ingest_seq: i64, event_id: &str| {
+            let mut event = old_topology_event(1_000 + ingest_seq);
+            let NormalizedEvent::TopologyClosure { metadata, .. } = &mut event else {
+                unreachable!("old_topology_event always returns TopologyClosure");
+            };
+            metadata.event_id = event_id.to_owned();
+            metadata.ingest_seq = Some(u64::try_from(ingest_seq).unwrap());
+            PersistV6Batch {
+                operations: vec![
+                    PersistOp::AdvanceIngestSequence { ingest_seq },
+                    PersistOp::RecordEvent {
+                        event: Box::new(event),
+                        seen_at_ms: 1_000 + ingest_seq,
+                    },
+                ],
+                ..PersistV6Batch::default()
+            }
+        };
+
+        let exact = batch(7, "schema-v6-exact-replay");
+        store.apply_v6_batch(exact.clone()).unwrap();
+        store.apply_v6_batch(exact).unwrap();
+
+        let exact_rows: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_id = ?1 AND ingest_seq = 7",
+                ["schema-v6-exact-replay"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exact_rows, 1, "exact replay duplicated its durable event");
+
+        for (ingest_seq, event_id) in [
+            (7, "schema-v6-conflicting-same-sequence"),
+            (6, "schema-v6-missing-older-sequence"),
+        ] {
+            let result = store.apply_v6_batch(batch(ingest_seq, event_id));
+            assert!(
+                matches!(
+                    result,
+                    Err(StoreError::InvalidData {
+                        field,
+                        ..
+                    }) if field == "ingest_seq"
+                ),
+                "sequence {ingest_seq} without matching durable event evidence was accepted: {result:?}"
+            );
+        }
     }
 
     #[test]
