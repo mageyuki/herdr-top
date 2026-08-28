@@ -1,6 +1,7 @@
 #[allow(dead_code)]
 mod common;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -10,6 +11,10 @@ use common::live_mock::{LiveConfig, LiveHerdr};
 use common::mock::{MockConfig, MockHerdr, fixture_payloads};
 use common::scripted_mock::{ScriptedConfig, ScriptedHerdr};
 use herdr_top::activity::ActivityDurability;
+use herdr_top::activity::{
+    DEFAULT_TERMINAL_VISIBILITY_MS, OperatorSnapshot, default_visible_task_run_count,
+    is_default_visible_task_run, runs_with_executions,
+};
 use herdr_top::herdr::collector::{self, CollectorHandle, ObservationQuality};
 use herdr_top::identity::MergeConflict;
 use herdr_top::lockfile::{StateRoot, state_root_in};
@@ -18,7 +23,8 @@ use herdr_top::model::{
     DisplayOrdinal, DomainModel, EventMetadata, ExecState, Execution, ExecutionEdge, GapKind,
     NativeLifecycleWatermark, NativeSessionEndStatus, NormalizedEvent, Pane, PaneAgentStatus,
     PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SnapshotAgent, Tab, TaskRun,
-    TaskRunV6State, TaskState, TopologyAuthority, TopologySnapshot, Workspace,
+    TaskRunV6State, TaskState, TokenBreakdown, TopologyAuthority, TopologySnapshot, TurnAttr,
+    Workspace,
 };
 use herdr_top::reducer::{ApplyOutcome, Reducer};
 use herdr_top::session_key;
@@ -135,6 +141,274 @@ fn historical_enrichment_never_regresses_live_state_or_watermark() {
     assert!(state.history_ready);
     assert_eq!(state.latest_provider_at_ms, Some(500));
     assert_eq!(state.lifecycle_watermark, Some(live_watermark));
+}
+
+#[test]
+fn history_readiness_gate_suppresses_intermediate_working_state() {
+    let run_id = RunId::new();
+    let mut model = DomainModel::default();
+    model.insert_task_run(TaskRun {
+        run_id,
+        key: RunKey::Native {
+            provider: Provider::Codex,
+            sid: "incomplete-history".to_owned(),
+        },
+        display_ordinal: DisplayOrdinal::new(1),
+        state: TaskState::Running,
+        has_controller_task_state_event: true,
+        created_at_ms: Some(1_000),
+        updated_at_ms: Some(2_000),
+        finished_at_ms: None,
+        subject: None,
+        dismissed_at_ms: None,
+    });
+    model.set_task_run_v6_state(
+        run_id,
+        TaskRunV6State {
+            history_ready: false,
+            latest_provider_at_ms: Some(2_000),
+            ..TaskRunV6State::default()
+        },
+    );
+
+    assert!(model.task_run(&run_id).is_some());
+    let (_reducer, shared) = Reducer::new(RestoredState {
+        model,
+        next_ordinal: 2,
+        next_ingest_seq: Some(1),
+        event_ledger: Vec::new(),
+    });
+    assert!(shared.borrow().task_run(&run_id).is_none());
+}
+
+#[test]
+fn terminal_visibility_is_one_hour_at_every_depth_and_closes_over_ancestors() {
+    let now_ms = 10_000_000;
+    let boundary_at_ms = now_ms - DEFAULT_TERMINAL_VISIBILITY_MS;
+    let root = RunId::new();
+    let child = RunId::new();
+    let grandchild = RunId::new();
+    let mut model = DomainModel::default();
+    for (run_id, sid, ordinal) in [
+        (root, "root", 1),
+        (child, "child", 2),
+        (grandchild, "grandchild", 3),
+    ] {
+        model.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::Native {
+                provider: Provider::Codex,
+                sid: sid.to_owned(),
+            },
+            display_ordinal: DisplayOrdinal::new(ordinal),
+            state: TaskState::Completed,
+            has_controller_task_state_event: true,
+            created_at_ms: Some(1),
+            updated_at_ms: Some(boundary_at_ms),
+            finished_at_ms: Some(boundary_at_ms),
+            subject: None,
+            dismissed_at_ms: None,
+        });
+    }
+    model.insert_execution_edge(ExecutionEdge {
+        parent_run_id: root,
+        child_run_id: child,
+    });
+    model.insert_execution_edge(ExecutionEdge {
+        parent_run_id: child,
+        child_run_id: grandchild,
+    });
+    let execution_runs = runs_with_executions(&model);
+    let operator = |times: HashMap<RunId, i64>| OperatorSnapshot {
+        activity: Arc::from([]),
+        terminal_times: Arc::new(times),
+    };
+    let all_at_boundary = operator(HashMap::from([
+        (root, boundary_at_ms),
+        (child, boundary_at_ms),
+        (grandchild, boundary_at_ms),
+    ]));
+
+    assert_eq!(
+        default_visible_task_run_count(&model, &all_at_boundary, now_ms - 1),
+        3
+    );
+    for run_id in [root, child, grandchild] {
+        assert!(!is_default_visible_task_run(
+            model.task_run(&run_id).unwrap(),
+            &all_at_boundary,
+            &execution_runs,
+            now_ms,
+        ));
+    }
+    assert_eq!(
+        default_visible_task_run_count(&model, &all_at_boundary, now_ms),
+        0
+    );
+
+    let descendant_visible = operator(HashMap::from([
+        (root, boundary_at_ms),
+        (child, boundary_at_ms),
+        (grandchild, boundary_at_ms + 1),
+    ]));
+    assert!(!is_default_visible_task_run(
+        model.task_run(&root).unwrap(),
+        &descendant_visible,
+        &execution_runs,
+        now_ms,
+    ));
+    assert!(!is_default_visible_task_run(
+        model.task_run(&child).unwrap(),
+        &descendant_visible,
+        &execution_runs,
+        now_ms,
+    ));
+    assert!(is_default_visible_task_run(
+        model.task_run(&grandchild).unwrap(),
+        &descendant_visible,
+        &execution_runs,
+        now_ms,
+    ));
+    assert_eq!(
+        default_visible_task_run_count(&model, &descendant_visible, now_ms),
+        3,
+        "expired ancestors must remain as structural rows"
+    );
+}
+
+#[test]
+fn active_time_rate_freezes_while_idle_counts_delayed_tokens_and_resumes() {
+    let run_id = RunId::new();
+    let key = RunKey::Native {
+        provider: Provider::Codex,
+        sid: "rate-contract".to_owned(),
+    };
+    let mut model = DomainModel::default();
+    model.insert_task_run(TaskRun {
+        run_id,
+        key: key.clone(),
+        display_ordinal: DisplayOrdinal::new(1),
+        state: TaskState::Running,
+        has_controller_task_state_event: true,
+        created_at_ms: Some(1),
+        updated_at_ms: Some(1),
+        finished_at_ms: None,
+        subject: None,
+        dismissed_at_ms: None,
+    });
+    let (mut reducer, shared) = Reducer::new(RestoredState {
+        model,
+        next_ordinal: 2,
+        next_ingest_seq: Some(1),
+        event_ledger: Vec::new(),
+    });
+    reducer
+        .reconcile_snapshot(TopologySnapshot {
+            workspaces: vec![Workspace {
+                workspace_id: "rate-workspace".to_owned(),
+            }],
+            tabs: vec![Tab {
+                tab_id: "rate-tab".to_owned(),
+                workspace_id: "rate-workspace".to_owned(),
+                label: None,
+            }],
+            panes: vec![PaneSnapshot {
+                pane_id: "rate-pane".to_owned(),
+                workspace_id: "rate-workspace".to_owned(),
+                tab_id: "rate-tab".to_owned(),
+                terminal_id: "rate-terminal".to_owned(),
+                display_name: None,
+                agent: None,
+                agent_session: None,
+            }],
+        })
+        .unwrap();
+    let mut begin = identity_metadata("rate-begin", "pane_agent_detected");
+    begin.task_run_id = Some(run_id);
+    begin.provider = Some(Provider::Codex);
+    begin.native_session_id = Some("rate-contract".to_owned());
+    reducer
+        .apply(NormalizedEvent::ExecutionBegin {
+            metadata: begin,
+            execution: Execution {
+                execution_id: "rate-execution".to_owned(),
+                pane_id: "rate-pane".to_owned(),
+                terminal_id: "rate-terminal".to_owned(),
+                task_run_id: run_id,
+                state: ExecState::Working,
+            },
+        })
+        .unwrap();
+
+    std::thread::sleep(Duration::from_millis(20));
+    reducer.apply_telemetry_with_breakdown(
+        &key,
+        10,
+        100,
+        TokenBreakdown::default(),
+        TurnAttr {
+            model: None,
+            effort: None,
+            sandbox: None,
+        },
+    );
+    let first = *shared.borrow().run_rate_totals(&run_id).unwrap();
+    assert_eq!(first.output_tokens, 100);
+    assert!(first.working_ms > 0);
+
+    let mut idle = identity_metadata("rate-idle", "pane_agent_status_changed");
+    idle.task_run_id = Some(run_id);
+    reducer
+        .apply(NormalizedEvent::AgentStatusChanged {
+            metadata: idle,
+            execution_id: "rate-execution".to_owned(),
+            state: ExecState::Idle,
+        })
+        .unwrap();
+    let idle_start = *shared.borrow().run_rate_totals(&run_id).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    reducer.apply_telemetry_with_breakdown(
+        &key,
+        20,
+        50,
+        TokenBreakdown::default(),
+        TurnAttr {
+            model: None,
+            effort: None,
+            sandbox: None,
+        },
+    );
+    let after_idle_tokens = *shared.borrow().run_rate_totals(&run_id).unwrap();
+    assert_eq!(
+        after_idle_tokens.output_tokens,
+        idle_start.output_tokens + 50
+    );
+    assert_eq!(after_idle_tokens.working_ms, idle_start.working_ms);
+
+    let mut working = identity_metadata("rate-working", "pane_agent_status_changed");
+    working.task_run_id = Some(run_id);
+    reducer
+        .apply(NormalizedEvent::AgentStatusChanged {
+            metadata: working,
+            execution_id: "rate-execution".to_owned(),
+            state: ExecState::Working,
+        })
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    reducer.apply_telemetry_with_breakdown(
+        &key,
+        30,
+        50,
+        TokenBreakdown::default(),
+        TurnAttr {
+            model: None,
+            effort: None,
+            sandbox: None,
+        },
+    );
+    let resumed = *shared.borrow().run_rate_totals(&run_id).unwrap();
+    assert_eq!(resumed.output_tokens, after_idle_tokens.output_tokens + 50);
+    assert!(resumed.working_ms > after_idle_tokens.working_ms);
 }
 
 #[derive(Clone, Debug)]
@@ -792,6 +1066,74 @@ async fn scoped_subscription_keeps_primary_unscoped_and_enriches_each_snapshot_p
     );
 
     shutdown(handle, lifecycle).await;
+}
+
+#[tokio::test]
+async fn collector_accepts_exact_dotted_and_underscore_pane_status_aliases() {
+    let snapshot = agent_snapshot("alias-session", AgentSessionReferenceKind::Id, "idle");
+    let mock = ScopedHerdr::start(ScopedHerdrConfig::snapshots(vec![snapshot]))
+        .await
+        .unwrap();
+    let (_directory, root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .unwrap();
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    wait_until(|| mock.enrichment_subscriptions() == 1).await;
+
+    mock.push_enrichment(agent_status_alias_push(
+        "pane.agent_status_changed",
+        "w1:p1",
+        "term_6583d08d791e41",
+        "working",
+    ))
+    .await
+    .unwrap();
+    wait_execution_state(&handle, ExecState::Working).await;
+    mock.push_enrichment(agent_status_alias_push(
+        "pane_agent_status_changed",
+        "w1:p1",
+        "term_6583d08d791e41",
+        "idle",
+    ))
+    .await
+    .unwrap();
+    wait_execution_state(&handle, ExecState::Idle).await;
+    mock.push_enrichment(agent_status_alias_push(
+        "pane.agent.status_changed",
+        "w1:p1",
+        "term_6583d08d791e41",
+        "working",
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        handle
+            .model
+            .borrow()
+            .executions()
+            .find(|execution| execution.pane_id == "w1:p1" && !execution.state.is_terminal())
+            .unwrap()
+            .state,
+        ExecState::Idle
+    );
+
+    shutdown(handle, lifecycle).await;
+    let connection = Connection::open(database_path(&root)).unwrap();
+    let rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE source_event_type = 'pane_agent_status_changed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 2);
 }
 
 #[tokio::test]
@@ -2622,20 +2964,19 @@ async fn different_sid_same_terminal_starts_new_run() {
             provider: Provider::Codex,
             sid: "old-sid".to_owned(),
         })
-        .unwrap()
-        .run_id;
+        .unwrap();
     let new_run = model
         .task_run_by_key(&RunKey::Native {
             provider: Provider::Codex,
             sid: "new-sid".to_owned(),
         })
-        .unwrap()
-        .run_id;
-    assert_ne!(old_run, new_run);
+        .unwrap();
+    assert_ne!(old_run.run_id, new_run.run_id);
+    assert!(old_run.display_ordinal < new_run.display_ordinal);
     assert!(
         model
             .executions()
-            .filter(|execution| execution.task_run_id == old_run)
+            .filter(|execution| execution.task_run_id == old_run.run_id)
             .all(|execution| execution.state.is_terminal())
     );
     assert_eq!(
@@ -4193,10 +4534,19 @@ fn push(event: &str, data: Value) -> Value {
 }
 
 fn agent_status_push(pane_id: &str, terminal_id: &str, status: &str) -> Value {
+    agent_status_alias_push("pane_agent_status_changed", pane_id, terminal_id, status)
+}
+
+fn agent_status_alias_push(
+    event_type: &str,
+    pane_id: &str,
+    terminal_id: &str,
+    status: &str,
+) -> Value {
     push(
-        "pane_agent_status_changed",
+        event_type,
         json!({
-            "type": "pane_agent_status_changed",
+            "type": event_type,
             "pane_id": pane_id,
             "terminal_id": terminal_id,
             "agent_status": status,

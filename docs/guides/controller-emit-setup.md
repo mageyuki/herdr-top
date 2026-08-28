@@ -64,7 +64,7 @@ providers use the same case-sensitive PascalCase event names.
 | `SubagentStop` | both | `complete` | subagent run |
 | `TaskCreated` | Claude Code only | `dispatch`, then `progress`; label is the task subject | task run |
 | `TaskCompleted` | Claude Code only | `complete` | task run |
-| `SessionEnd` | both | `dismiss` | session run |
+| `SessionEnd` | both | `session_ended` native lifecycle `Done` | session run |
 | any other event | both | nothing | none |
 
 Codex has no `TaskCreated` or `TaskCompleted` equivalent, so task runs appear
@@ -279,34 +279,34 @@ controller rejects it with reason `stale_event`. The adapter treats that reason
 as benign: it logs it to standard error, continues delivery, and does not count
 it as a delivery failure or a `--strict` failure.
 
-Codex provider-log cancellation and resume use a narrower rule that hooks and
-manual events cannot invoke. A log-lane `turn_aborted` is a truthful terminal
-observation: the existing Task Run becomes `cancelled`, receives its finish
-timestamp, and renders as cancelled until another turn actually starts. A
-provider-log `task_started` may reopen that same run from `completed` or
-`cancelled` only when the previous terminal observation also came from the log
-lane, identity resolution selects the same native session, the start's provider
-timestamp is strictly greater than the stored terminal timestamp, and the
-normal identity, event-ledger, and binding checks succeed. `failed` never
-reopens; equal or older starts and all hook, Controller, or manual starts remain
-stale.
+Semantic Task state, provider-native lifecycle, execution state, pane status,
+and graph relationships are separate evidence axes. A normal `SessionEnd`
+records native lifecycle `Done`; explicit provider abort and failure facts
+record `Cancelled` and `Error`, and disappearance without stronger evidence
+records `Unknown`. None of those facts writes semantic completion,
+cancellation, or failure. Codex turn completion is runtime Idle only.
 
-An accepted log-lane reopen changes the existing run to `running`; it does not
-create another Task Run or physical execution. The run ID, native binding,
-execution lineage, display order, subject, telemetry identity, Controller
-metadata, and relationship edges remain intact, while the obsolete finish time,
-dismissal, and terminal-source marker are cleared. Startup backfill reconstructs
-the lane terminal source before applying this same strict-time rule, so
-historical equal or older starts remain rejected after restart and a genuinely
-later start is accepted. This uses the current event and Task Run data; it needs
-no schema migration or history purge.
+On the separate Herdr event surface, the collector accepts exactly
+`pane.agent_status_changed` and legacy `pane_agent_status_changed` as aliases
+for pane status. Both update the same gauge; other spellings are ignored.
 
-`SessionEnd` maps to the non-terminal `dismiss` event. The session run disappears
-from the default view immediately without changing its task state. If the
-provider later resumes the session, `SessionStart` emits `task_started`; that
-activity clears the dismissal and makes the run visible again. An unknown
-session run is left untouched rather than being created solely for dismissal.
-The decision and rejected terminal-state alternative are documented in
+`session_ended` applies only to an existing run with a matching non-empty
+provider/native-session binding. An unknown or unbound session is a diagnostic
+no-op and creates no forward-reference placeholder. It also does not dismiss
+the run: the terminal-looking lifecycle row remains default-visible for one
+hour, while operator dismissal with `c` stays a separate explicit visibility
+action.
+
+A matching later `task_started`, live execution, or provider liveness fact
+clears native lifecycle evidence on the same Task Run and preserves its run ID
+and display ordinal. It never reopens a semantic terminal Task state. Lifecycle
+ordering compares trustworthy source time, then collector observation time,
+then a stable source or event identity. Repeating the same watermark and status
+is idempotent; an older delayed fact cannot re-close a newer resume after
+delivery delay or restart.
+
+The superseded dismissal behavior and the current lifecycle decision are
+documented in
 [Session end auto-dismiss](../adr/2026-08-22-session-end-auto-dismiss.md).
 
 When no Herdr session can be resolved, the adapter delivers nothing, warns on

@@ -4,7 +4,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use herdr_top::model::{ExecState, Provider};
+use herdr_top::model::{
+    ControllerEventKind, DomainModel, ExecState, NativeSessionEndStatus, Provider, RunKey,
+    TaskState,
+};
 use herdr_top::provider::codex::{CodexAdapter, CodexBootstrapParser};
 use herdr_top::provider::codex_facts::extract_codex_line;
 use herdr_top::provider::facts::{EvidenceId, LogFact, SessionScope};
@@ -13,6 +16,8 @@ use herdr_top::provider::{
     BootstrapParser, DiscoveryIndex, DiscoveryRoot, MergeOutcome, PathInterner, PendingEvents,
     ProviderDiagnostics, ProviderEvent, SourcePosition, TailRecord,
 };
+use herdr_top::reducer::Reducer;
+use herdr_top::store::RestoredState;
 
 use common::flat_jsonl_fixture;
 
@@ -214,6 +219,271 @@ fn parse_inline(
             )
         })
         .collect()
+}
+
+fn apply_synthesized_events(
+    mut restored: RestoredState,
+    events: impl IntoIterator<Item = ProviderEvent>,
+) -> RestoredState {
+    for event in events {
+        let ProviderEvent::Synthesized(controller) = event else {
+            continue;
+        };
+        let (reducer, _) = Reducer::new(restored);
+        let delta = reducer
+            .validate_controller_event(&controller)
+            .expect("provider controller event should validate");
+        restored = RestoredState {
+            model: delta.post_model,
+            next_ordinal: delta.post_next_ordinal,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        };
+    }
+    restored
+}
+
+fn empty_restored() -> RestoredState {
+    RestoredState {
+        model: DomainModel::default(),
+        next_ordinal: 1,
+        next_ingest_seq: Some(1),
+        event_ledger: Vec::new(),
+    }
+}
+
+#[test]
+fn native_root_runtime_lifecycle_and_ordinals_are_resumable_and_append_only() {
+    const NEW_ROOT: &str = "019f7504-83e2-75f0-870d-cc423f88a74c";
+    const FAILED_ROOT: &str = "019f7504-83e2-75f0-870d-cc423f88a75d";
+    const UNKNOWN_ROOT: &str = "019f7504-83e2-75f0-870d-cc423f88a76e";
+    let mut synthesis = Synthesis::with_lifecycle_timing_at(30, 50, 1);
+    let mut admission = Admission::new(0);
+    let discovered = AdmissionIndex::new();
+
+    let started = synthesis.synthesize_batch(
+        Path::new("old-root.jsonl"),
+        [(
+            1,
+            LogFact::CodexTurnStarted {
+                rollout_id: ROOT_ID.to_owned(),
+                at_ms: 100,
+            },
+        )],
+        &mut admission,
+        &discovered,
+    );
+    let mut restored = apply_synthesized_events(empty_restored(), started);
+    let old_key = RunKey::Native {
+        provider: Provider::Codex,
+        sid: ROOT_ID.to_owned(),
+    };
+    let old_run = restored.model.task_run_by_key(&old_key).unwrap().clone();
+
+    let completed_turn = synthesis.synthesize_batch(
+        Path::new("old-root.jsonl"),
+        [(
+            2,
+            LogFact::CodexTurnComplete {
+                rollout_id: ROOT_ID.to_owned(),
+                at_ms: 120,
+            },
+        )],
+        &mut admission,
+        &discovered,
+    );
+    assert!(completed_turn.iter().any(|event| matches!(
+        event,
+        ProviderEvent::AgentUpsert {
+            agent_thread_id,
+            state: Some(ExecState::Idle),
+            ..
+        } if agent_thread_id == ROOT_ID
+    )));
+    assert!(completed_turn.iter().all(|event| !matches!(
+        event,
+        ProviderEvent::Synthesized(controller)
+            if matches!(
+                controller.event,
+                ControllerEventKind::Complete
+                    | ControllerEventKind::Failed
+                    | ControllerEventKind::Cancelled
+            )
+    )));
+
+    let aborted = synthesis.synthesize_batch(
+        Path::new("old-root.jsonl"),
+        [(
+            3,
+            LogFact::CodexTurnAborted {
+                rollout_id: ROOT_ID.to_owned(),
+                at_ms: 130,
+            },
+        )],
+        &mut admission,
+        &discovered,
+    );
+    restored = apply_synthesized_events(restored, aborted);
+    let state = restored.model.task_run_v6_state(&old_run.run_id).unwrap();
+    assert_eq!(
+        restored.model.task_run(&old_run.run_id).unwrap().state,
+        TaskState::Running
+    );
+    assert_eq!(
+        state.native_session_end.as_ref().map(|end| end.status),
+        Some(NativeSessionEndStatus::Cancelled)
+    );
+
+    let resumed = synthesis.synthesize_batch(
+        Path::new("old-root.jsonl"),
+        [(
+            4,
+            LogFact::CodexTurnStarted {
+                rollout_id: ROOT_ID.to_owned(),
+                at_ms: 140,
+            },
+        )],
+        &mut admission,
+        &discovered,
+    );
+    restored = apply_synthesized_events(restored, resumed);
+    let resumed_run = restored.model.task_run_by_key(&old_key).unwrap();
+    assert_eq!(resumed_run.run_id, old_run.run_id);
+    assert_eq!(resumed_run.display_ordinal, old_run.display_ordinal);
+    assert!(
+        restored
+            .model
+            .task_run_v6_state(&old_run.run_id)
+            .unwrap()
+            .native_session_end
+            .is_none()
+    );
+
+    let appended = synthesis.synthesize_batch(
+        Path::new("new-root.jsonl"),
+        [(
+            1,
+            LogFact::CodexTurnStarted {
+                rollout_id: NEW_ROOT.to_owned(),
+                at_ms: 150,
+            },
+        )],
+        &mut admission,
+        &discovered,
+    );
+    restored = apply_synthesized_events(restored, appended);
+    let new_run = restored
+        .model
+        .task_run_by_key(&RunKey::Native {
+            provider: Provider::Codex,
+            sid: NEW_ROOT.to_owned(),
+        })
+        .unwrap();
+    assert!(old_run.display_ordinal < new_run.display_ordinal);
+
+    let branch = |model: &DomainModel, next_ordinal| RestoredState {
+        model: model.clone(),
+        next_ordinal,
+        next_ingest_seq: Some(1),
+        event_ledger: Vec::new(),
+    };
+    let failed_started = synthesis.synthesize_batch(
+        Path::new("failed-root.jsonl"),
+        [(
+            1,
+            LogFact::CodexTurnStarted {
+                rollout_id: FAILED_ROOT.to_owned(),
+                at_ms: 200,
+            },
+        )],
+        &mut admission,
+        &discovered,
+    );
+    let failed_state = apply_synthesized_events(
+        branch(&restored.model, restored.next_ordinal),
+        failed_started,
+    );
+    let failed = synthesis
+        .synthesize_batch(
+            Path::new("failed-root.jsonl"),
+            [(
+                2,
+                LogFact::CodexTurnAborted {
+                    rollout_id: FAILED_ROOT.to_owned(),
+                    at_ms: 210,
+                },
+            )],
+            &mut admission,
+            &discovered,
+        )
+        .into_iter()
+        .map(|event| match event {
+            ProviderEvent::Synthesized(mut controller) => {
+                controller.event = ControllerEventKind::Failed;
+                controller.metadata.event_id =
+                    format!("log:failed-root.jsonl:2:failed:{FAILED_ROOT}");
+                controller.metadata.source_event_type = "failed".to_owned();
+                ProviderEvent::Synthesized(controller)
+            }
+            event => event,
+        });
+    let failed_state = apply_synthesized_events(failed_state, failed);
+    let failed_run = failed_state
+        .model
+        .task_run_by_key(&RunKey::Native {
+            provider: Provider::Codex,
+            sid: FAILED_ROOT.to_owned(),
+        })
+        .unwrap();
+    assert_eq!(failed_run.state, TaskState::Running);
+    assert_eq!(
+        failed_state
+            .model
+            .task_run_v6_state(&failed_run.run_id)
+            .and_then(|state| state.native_session_end.as_ref())
+            .map(|end| end.status),
+        Some(NativeSessionEndStatus::Error)
+    );
+
+    let unknown_started = synthesis.synthesize_batch(
+        Path::new("unknown-root.jsonl"),
+        [(
+            1,
+            LogFact::CodexTurnStarted {
+                rollout_id: UNKNOWN_ROOT.to_owned(),
+                at_ms: 300,
+            },
+        )],
+        &mut admission,
+        &discovered,
+    );
+    let unknown_state = apply_synthesized_events(
+        branch(&restored.model, restored.next_ordinal),
+        unknown_started,
+    );
+    let unknown_key = RunKey::Native {
+        provider: Provider::Codex,
+        sid: UNKNOWN_ROOT.to_owned(),
+    };
+    let unknown_run_id = unknown_state
+        .model
+        .task_run_by_key(&unknown_key)
+        .unwrap()
+        .run_id;
+    let (mut reducer, shared) = Reducer::new(unknown_state);
+    assert!(!reducer.apply_lane_close(&unknown_key, 310).is_empty());
+    assert_eq!(
+        shared.borrow().task_run(&unknown_run_id).unwrap().state,
+        TaskState::Running
+    );
+    assert_eq!(
+        shared
+            .borrow()
+            .task_run_v6_state(&unknown_run_id)
+            .and_then(|state| state.native_session_end.as_ref())
+            .map(|end| end.status),
+        Some(NativeSessionEndStatus::Unknown)
+    );
 }
 
 #[test]

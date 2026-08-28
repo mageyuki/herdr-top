@@ -1116,6 +1116,9 @@ fn help_lines(diagnostics: &RuntimeDiagnosticsSnapshot, setup: &TuiSetup) -> Vec
         "i detail; s summary; w toggles Summary workspace/session scope; ? help".to_owned(),
         "Esc/opening key closes; Up/Down scrolls overlays".to_owned(),
         "Follow pins selection and viewport to newest; manual navigation disables it".to_owned(),
+        "History order: oldest at top; new sessions append below".to_owned(),
+        "Terminal roots and descendants stay 1h; Summary retains older history".to_owned(),
+        "tok/s uses measured Working time; Idle, history, and offline time add none".to_owned(),
         "Recovery: ancestor, stable neighbor, first; reasons are typed".to_owned(),
         "Controller input is optional capability; standalone setup is optional".to_owned(),
     ];
@@ -4999,6 +5002,70 @@ mod tests {
             help.contains("headless rows use task/agent evidence"),
             "{help}"
         );
+    }
+
+    #[test]
+    fn help_explains_append_only_history_visibility_and_active_time_rates() {
+        let help = help_lines(&healthy_runtime_diagnostics(), &TuiSetup::default()).join("\n");
+
+        assert!(
+            help.contains("oldest at top; new sessions append below"),
+            "{help}"
+        );
+        assert!(
+            help.contains("Terminal roots and descendants stay 1h; Summary retains older history"),
+            "{help}"
+        );
+        assert!(
+            help.contains(
+                "tok/s uses measured Working time; Idle, history, and offline time add none"
+            ),
+            "{help}"
+        );
+        assert!(!help.contains("auto-dismiss"), "{help}");
+        assert!(!help.contains("wall-time tok/s"), "{help}");
+    }
+
+    #[test]
+    fn summary_and_rate_use_retained_measured_totals_without_a_cursor() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let run = label_run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "restored-hidden-history".to_owned(),
+            },
+            TaskState::Completed,
+            Some(1_000),
+            Some(2_000),
+            None,
+        );
+        let mut model = DomainModel::default();
+        model.insert_task_run(run.clone());
+        model.set_run_rate_totals(
+            run_id,
+            crate::model::RunRateTotals {
+                output_tokens: 90,
+                working_ms: 3_000,
+            },
+        );
+        assert!(model.run_rate_cursor(&run_id).is_none());
+
+        let metrics = projection::run_metric_inputs(&model, &run);
+        assert_eq!(
+            format_metric_value(MetricColumn::TokPerSecond, &metrics, 99_000),
+            "30/s"
+        );
+        let summary = projection::summary_projection(
+            &model,
+            &[],
+            None,
+            projection::SummaryScope::Session,
+            99_000,
+        );
+        assert_eq!(summary.worker_kinds.len(), 1);
+        assert_eq!(summary.worker_kinds[0].run_count, 1);
+        assert_eq!(summary.worker_kinds[0].mean_tokens_per_second, Some(30.0));
     }
 
     #[test]

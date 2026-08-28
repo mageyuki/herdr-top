@@ -43,6 +43,9 @@ Four overlays can replace the center of the screen:
   marker on a best-effort basis.
 - **Selected detail (`i`).** Shows the selected entity's identifiers and state,
   plus up to 100 recent activity items in its scope. Task Run detail includes
+  `native_lifecycle_end`, `lifecycle_watermark`, `history_ready`,
+  `rate.measured_output_tokens`, `rate.measured_working_ms`, and
+  `rate.cursor_initialized`, as well as
   `tokens.output`, `tokens.input`, `tokens.cached_input`,
   `tokens.cache_write_input`, `tokens.reasoning_output`, `tokens.total`, and
   `tokens.context_window`, relationship lines named `dispatch_parent`,
@@ -52,9 +55,11 @@ Four overlays can replace the center of the screen:
   show per-turn model, effort, and sandbox history.
 - **Summary (`s`).** Groups all Task Runs by worker kind and model. It reports
   run and live counts, valid terminal-run total and mean durations, accumulated
-  output-token totals, and a weighted output-token rate: total rated output
-  tokens divided by total rated elapsed seconds. A token field uses its
-  placeholder only when the required telemetry is unavailable.
+  output-token totals, and a weighted output-token rate: total measured output
+  tokens divided by total measured Working seconds. Summary includes every
+  store-retained run, including terminal history hidden from the default tree.
+  A token field uses its placeholder only when the required telemetry is
+  unavailable.
 - **Help (`?`).** Shows the key map and current runtime diagnostics, including
   persistence, Controller input, source coverage, and the standalone probe.
 
@@ -116,6 +121,19 @@ with the session; reattaching returns to it. Pressing `q` stops only herdr-top,
 never the Claude Code or Codex processes it observes.
 
 ## Reading the execution tree
+
+### Identity, history, and ordering
+
+Herdr Top keeps exactly one Task Run for each `(provider, native session ID)`.
+Resuming the same native session preserves its run ID, row, and immutable
+display ordinal. A different native session observed in the same pane creates a
+new root below the old one instead of replacing it. Task Run and Agent Node
+siblings at every depth sort by ascending display ordinal, so status changes do
+not reorder history.
+
+Follow mode selects and pins the viewport to the last visible row. Manual
+selection, collapse, or a committed filter leaves follow mode; `f` or `End`
+resumes it.
 
 The physical levels use these row prefixes:
 
@@ -186,7 +204,17 @@ Terminal `TaskState` facts win over every runtime observation:
 | `cancelled` | `cancelled` |
 | `ended_unknown` | `unknown` |
 
-Semantic pre-start and block facts are next:
+Persisted native-session lifecycle evidence is next when semantic state is not
+terminal:
+
+| Native lifecycle end | Status |
+| --- | --- |
+| `Done` | `done` |
+| `Error` | `error` |
+| `Cancelled` | `cancelled` |
+| `Unknown` | `unknown` |
+
+Semantic pre-start and block facts follow:
 
 | Semantic `TaskState` | Status |
 | --- | --- |
@@ -204,6 +232,10 @@ pane occurrence. Herdr maps one-to-one:
 | `blocked` | `blocked` |
 | `done` | `done` |
 | `unknown` | `unknown` |
+
+The collector accepts exactly `pane.agent_status_changed` and the legacy
+`pane_agent_status_changed` spelling for pane-status events. They update the
+same pane-status map; other spellings are ignored.
 
 An explicit Herdr `unknown` is evidence, not absence. Only a missing pane
 status falls back to the execution matching that pane:
@@ -281,7 +313,7 @@ row.
 | `MODEL` | 11 | Current model, or an em-dash placeholder when unavailable. |
 | `EFF` | 5 | Current effort, or an em-dash placeholder when unavailable. |
 | `TOK` | 5 | Accumulated output tokens only, or an em-dash placeholder. |
-| `TOK-S` | 5 | Output tokens divided by elapsed seconds, or an em-dash placeholder. |
+| `TOK-S` | 5 | Measured output tokens divided by measured Working seconds, or an em-dash placeholder. |
 | `TIME` | 6 | Run duration. |
 
 When a selected execution-tree band includes `TIME`, the row suppresses the
@@ -289,10 +321,23 @@ label's `· <duration>` suffix so the duration is painted exactly once. Below
 inner width 62 the metric band has no `TIME`, so the suffix remains; dependency
 DAG rows also retain it because that view does not paint metric columns.
 
-For `TOK-S`, elapsed time starts at the run's log-time anchor. It ends at the
-current time for a live run and at `finished_at_ms` for a terminal run, so the
-rate freezes at completion. Tokens, an anchor, and a positive elapsed interval
-are all required.
+For `TOK-S`, the numerator starts after a trustworthy live baseline and counts
+only later positive increases in the cumulative output-token counter. The
+denominator is the union of reliably observed run-level Working intervals:
+multiple pane occurrences are ORed, so concurrent Working observations do not
+double-count time. Idle, blocked, queued, unknown, terminal, historical replay,
+reconnect, reconciliation, and offline intervals add no time. A delayed token
+increase observed after a transition to Idle still enters the numerator once,
+without adding Idle time.
+
+Cold restore, observation gaps, reconciliation, queue-overflow recovery,
+identity-basis changes, historical input, and counter regression discard the
+process-local cursor and establish a new baseline before measurement resumes.
+Missing totals or zero measured Working time render an em dash. Positive
+persisted totals remain renderable after restore even though the rate cursor is
+not restored. `TOK` remains the lifetime total and is separate from this
+measured numerator. Summary divides aggregate measured tokens by aggregate
+measured Working time; it never averages per-run rates.
 
 Column bands are selected from the `Execution tree` pane's inner width, after
 subtracting its two border columns, rather than from raw terminal width:
@@ -345,59 +390,60 @@ rows omit the live line. Across the two views, `[shared]` and
 
 The default view hides a Controller-keyed run with no execution after 24 hours
 without an update. Native-keyed runs and Controller runs that have an execution
-do not use this hook-only expiry. Terminal runs remain in the default view for
-one hour after their first terminal observation, then remain retained and
-available to filtering.
+do not use this hook-only expiry. Terminal Task Runs at root, child, and
+grandchild depth each remain in the default tree for
+exactly `DEFAULT_TERMINAL_VISIBILITY_MS`, currently one hour, after their own
+terminal observation. They then become default-hidden while remaining retained
+in SQLite, filtering, Detail, and Summary until ordinary retention removes
+them. An expired ancestor remains as a structural row whenever an individually
+visible descendant needs it to preserve the tree path.
 
 Pressing `c` persistently dismisses all currently terminal runs and hook-only
 runs that have already reached the 24-hour boundary. It does not delete them,
 and the dismissal survives a restart. A later non-terminal mutation clears the
 dismissal, while a terminal touch retains it.
 
-For Codex, a provider-log `turn_aborted` truthfully changes the Task Run to
-`cancelled`, records its finish time, and temporarily renders the `⊘` cancelled
-row. A later turn does not erase that observation retroactively; a qualifying
-provider-log start reactivates the same run when the new turn is observed.
+Provider-native lifecycle is separate from semantic Task state. A normal
+`SessionEnd` records lifecycle `Done`; an explicit provider abort records
+`Cancelled`, an explicit failure records `Error`, and disappearance without a
+stronger fact records `Unknown`. These facts do not write semantic completion,
+failure, cancellation, or dismissal. In particular, Codex turn completion is
+runtime Idle only. A lifecycle end uses the same one-hour visibility rule as a
+semantic terminal row.
 
-A provider `SessionEnd` hook dismisses its known session run immediately without
-changing the Task Run state or advancing its activity time. The dismissal is
-persisted. If that native session resumes, its `SessionStart` becomes
-`task_started`; ordinary non-terminal bookkeeping clears the dismissal and the
-run returns to the default view. A `SessionEnd` for an unknown run creates
-nothing.
+A later matching `task_started`, live execution, or provider liveness fact can
+clear native lifecycle evidence without reopening a semantic terminal Task.
+Lifecycle ordering compares trustworthy source time, then collector observation
+time, then a stable source or event identity; an older delayed fact cannot
+re-close a newer resume. Repeating the same watermark and status is idempotent.
+A `SessionEnd` for an unknown or unbound native session is a diagnostic no-op.
+Operator dismissal with `c` remains an independent visibility action.
 
 ## Restart and backfill
 
-At startup, herdr-top re-reads every admitted provider artifact selected by the
-backfill window from byte zero; it does not restore a per-file byte offset. The
-selection anchor is the later of the earliest database event and
-`now - HERDR_TOP_BACKFILL_WINDOW_MS`. The window selects files, not records, so
-every selected artifact is read in full and its run totals are complete.
-Pane-root artifacts are exempt from the anchor. Lineage evidence admits only
-artifacts whose mtime satisfies the anchor; an older identity echo is ignored
-entirely.
+At startup, each provider freezes a sorted artifact manifest with stable
+artifact identities, generations, and byte goalposts. Historical events carry
+that drain identity, and run associations spill to SQLite instead of remaining
+in an unbounded in-memory set. A run created solely by history is persisted with
+`history_ready = false`, so intermediate Working states never enter the default
+tree.
 
-Replay is idempotent through the durable event ledger. Token telemetry,
-subjects, run kind, and per-turn context are transient and are recomputed from
-the artifacts rather than restored from SQLite; token totals therefore return
-after startup backfill instead of being persisted.
+After every artifact reaches its frozen goalpost, the provider enqueues one
+ordered barrier behind all pending output and pauses. One SQLite transaction
+marks the drain complete, makes its historical runs ready, and gives otherwise
+non-live, nonterminal history an `Unknown` native lifecycle end. The reducer
+publishes that coalesced page only after the commit is known durable or known
+committed despite a classified degradation. Incomplete, failed, interrupted, or
+durability-unconfirmed drains remain suppressed. Retrying a barrier or replaying
+a completed manifest is idempotent. Old completed history can therefore appear
+in Summary without flashing a stale Working row in the default tree.
 
-A provider-log `task_started` may reopen the same native Task Run from
-`completed` or `cancelled` only when the stored terminal source is also the log
-lane and the start's provider timestamp is strictly greater than the stored
-terminal timestamp. Normal identity, durable-ledger, and binding checks still
-apply. `failed` never reopens; equal or older starts and hook, Controller, or
-manual starts remain stale. A successful reopen preserves the run ID, native
-binding, execution lineage, display order, subject, telemetry identity,
-Controller metadata, and relationship edges, sets the run to `running`, and
-clears the obsolete finish time, dismissal, and terminal-source marker. It does
-not create a duplicate run or execution, and a later terminal fact is accepted
-normally.
-
-Startup reconstructs terminal provenance before backfill, so historical equal
-or older starts remain rejected after restart while a genuinely later start is
-accepted under the same rule. The durable event ledger keeps replay idempotent.
-No schema migration or history purge is required.
+Schema v6 is restored after the mandatory pre-migration SQLite online backup.
+It persists native lifecycle ends and watermarks, history readiness and drain
+associations, and per-run measured token and Working-time totals. Existing runs
+migrate history-ready with no synthetic lifecycle or rate row. Pane status and
+rate cursors remain process-local; a cold restore rebaselines before new accrual,
+while already-persisted positive measured totals remain usable immediately.
 
 ## Liveness watchdog
 

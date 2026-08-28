@@ -6,14 +6,17 @@ use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::mock::{MockConfig, MockHerdr};
+use herdr_top::activity::{OperatorSnapshot, is_default_visible_task_run, runs_with_executions};
 use herdr_top::herdr::collector::{self, CollectorHandle, ObservationQuality};
 use herdr_top::lockfile::{OwnerRecord, StateRoot, state_root_in, try_acquire};
 use herdr_top::model::{
-    DisplayOrdinal, ExecState, Provider, RunId, RunKey, RunRateTotals, TaskRun, TaskRunV6State,
-    TaskState,
+    DisplayOrdinal, ExecState, NativeLifecycleWatermark, NativeSessionEnd, NativeSessionEndStatus,
+    Provider, RunId, RunKey, RunRateTotals, TaskRun, TaskRunV6State, TaskState, TokenBreakdown,
+    TurnAttr,
 };
 use herdr_top::reducer::Reducer;
 use herdr_top::rendezvous::{
@@ -182,6 +185,21 @@ fn cold_restore_keeps_persisted_rate_totals_without_restoring_a_cursor() {
             working_ms: 3_000,
         })
     );
+    let restored_operator = open_reader(&root)
+        .unwrap()
+        .load_restored_operator_state()
+        .unwrap();
+    let operator = OperatorSnapshot {
+        activity: Arc::from(restored_operator.activity),
+        terminal_times: Arc::new(restored_operator.terminal_times),
+    };
+    assert!(!is_default_visible_task_run(
+        restored.model.task_run(&run_id).unwrap(),
+        &operator,
+        &runs_with_executions(&restored.model),
+        2_000 + herdr_top::activity::DEFAULT_TERMINAL_VISIBILITY_MS,
+    ));
+    assert_eq!(restored.model.task_runs().count(), 1);
     let (_reducer, shared) = Reducer::new(restored);
     assert_eq!(
         shared.borrow().run_rate_totals(&run_id),
@@ -189,6 +207,177 @@ fn cold_restore_keeps_persisted_rate_totals_without_restoring_a_cursor() {
             output_tokens: 70,
             working_ms: 3_000,
         })
+    );
+}
+
+#[test]
+fn restored_rate_totals_do_not_bridge_offline_time_before_a_live_epoch() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = StateRoot(directory.path().to_path_buf());
+    let mut store = open_writer(&root).unwrap();
+    let run_id = RunId::new();
+    let key = RunKey::Native {
+        provider: Provider::Codex,
+        sid: "offline-rate".to_owned(),
+    };
+    store
+        .apply_v6_batch(PersistV6Batch {
+            task_runs: vec![PersistTaskRunV6 {
+                task_run: PersistTaskRun {
+                    task_run: TaskRun {
+                        run_id,
+                        key: key.clone(),
+                        display_ordinal: DisplayOrdinal::new(4),
+                        state: TaskState::Running,
+                        has_controller_task_state_event: true,
+                        created_at_ms: Some(1_000),
+                        updated_at_ms: Some(2_000),
+                        finished_at_ms: None,
+                        subject: None,
+                        dismissed_at_ms: None,
+                    },
+                    native_session: Some(NativeSessionBinding {
+                        provider: Provider::Codex,
+                        native_session_id: "offline-rate".to_owned(),
+                    }),
+                    created_at_ms: 1_000,
+                    updated_at_ms: 2_000,
+                    finished_at_ms: None,
+                },
+                state: TaskRunV6State::default(),
+            }],
+            rate_totals: vec![(
+                run_id,
+                RunRateTotals {
+                    output_tokens: 70,
+                    working_ms: 3_000,
+                },
+            )],
+            ..PersistV6Batch::default()
+        })
+        .unwrap();
+    drop(store);
+
+    let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+    let (mut reducer, shared) = Reducer::new(restored);
+    reducer.apply_telemetry_with_breakdown(
+        &key,
+        50_000,
+        30,
+        TokenBreakdown::default(),
+        TurnAttr {
+            model: None,
+            effort: None,
+            sandbox: None,
+        },
+    );
+    assert_eq!(
+        shared.borrow().run_rate_totals(&run_id),
+        Some(&RunRateTotals {
+            output_tokens: 70,
+            working_ms: 3_000,
+        })
+    );
+}
+
+#[test]
+fn lifecycle_watermark_and_ordinal_survive_restore_and_reject_older_liveness() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = StateRoot(directory.path().to_path_buf());
+    let mut store = open_writer(&root).unwrap();
+    let run_id = RunId::new();
+    let key = RunKey::Native {
+        provider: Provider::Codex,
+        sid: "watermarked-session".to_owned(),
+    };
+    let watermark = NativeLifecycleWatermark {
+        source_at_ms: 200,
+        observed_at_ms: 300,
+        source_order: "provider:terminal:z".to_owned(),
+    };
+    store
+        .apply_v6_batch(PersistV6Batch {
+            task_runs: vec![PersistTaskRunV6 {
+                task_run: PersistTaskRun {
+                    task_run: TaskRun {
+                        run_id,
+                        key: key.clone(),
+                        display_ordinal: DisplayOrdinal::new(7),
+                        state: TaskState::Running,
+                        has_controller_task_state_event: true,
+                        created_at_ms: Some(100),
+                        updated_at_ms: Some(200),
+                        finished_at_ms: None,
+                        subject: None,
+                        dismissed_at_ms: None,
+                    },
+                    native_session: Some(NativeSessionBinding {
+                        provider: Provider::Codex,
+                        native_session_id: "watermarked-session".to_owned(),
+                    }),
+                    created_at_ms: 100,
+                    updated_at_ms: 200,
+                    finished_at_ms: None,
+                },
+                state: TaskRunV6State {
+                    native_session_end: Some(NativeSessionEnd {
+                        status: NativeSessionEndStatus::Cancelled,
+                        at_ms: 200,
+                    }),
+                    lifecycle_watermark: Some(watermark.clone()),
+                    ..TaskRunV6State::default()
+                },
+            }],
+            ..PersistV6Batch::default()
+        })
+        .unwrap();
+    drop(store);
+
+    let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+    let restored_run = restored.model.task_run(&run_id).unwrap();
+    assert_eq!(restored_run.display_ordinal, DisplayOrdinal::new(7));
+    assert_eq!(
+        restored.model.task_run_v6_state(&run_id).unwrap(),
+        &TaskRunV6State {
+            native_session_end: Some(NativeSessionEnd {
+                status: NativeSessionEndStatus::Cancelled,
+                at_ms: 200,
+            }),
+            lifecycle_watermark: Some(watermark.clone()),
+            ..TaskRunV6State::default()
+        }
+    );
+
+    let (mut reducer, shared) = Reducer::new(restored);
+    let _ = reducer.touch_run_liveness(&key, 150);
+    assert_eq!(
+        shared
+            .borrow()
+            .task_run_v6_state(&run_id)
+            .and_then(|state| state.native_session_end.as_ref())
+            .map(|end| end.status),
+        Some(NativeSessionEndStatus::Cancelled)
+    );
+    assert_eq!(
+        shared
+            .borrow()
+            .task_run_v6_state(&run_id)
+            .and_then(|state| state.lifecycle_watermark.as_ref()),
+        Some(&watermark)
+    );
+
+    let _ = reducer.touch_run_liveness(&key, 400);
+    let model = shared.borrow();
+    assert!(
+        model
+            .task_run_v6_state(&run_id)
+            .unwrap()
+            .native_session_end
+            .is_none()
+    );
+    assert_eq!(
+        model.task_run(&run_id).unwrap().display_ordinal,
+        DisplayOrdinal::new(7)
     );
 }
 

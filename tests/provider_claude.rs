@@ -3,7 +3,10 @@ mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use herdr_top::model::Provider;
+use herdr_top::model::{
+    ControllerEvent, ControllerEventKind, DomainModel, EventMetadata, NativeSessionEndStatus,
+    Provider, RunKey, TaskState,
+};
 use herdr_top::provider::claude::{ClaudeAdapter, ClaudeBootstrapParser};
 use herdr_top::provider::claude_facts::extract_claude_line;
 use herdr_top::provider::facts::{EvidenceId, SessionScope};
@@ -12,6 +15,8 @@ use herdr_top::provider::{
     DiscoveryIndex, DiscoveryRoot, PathInterner, ProviderDiagnostics, ProviderEvent,
     SourcePosition, TailRecord,
 };
+use herdr_top::reducer::Reducer;
+use herdr_top::store::RestoredState;
 
 use common::flat_jsonl_fixture;
 
@@ -236,6 +241,170 @@ fn parse_inline(
             )
         })
         .collect()
+}
+
+fn apply_synthesized_events(
+    mut restored: RestoredState,
+    events: impl IntoIterator<Item = ProviderEvent>,
+) -> RestoredState {
+    for event in events {
+        let ProviderEvent::Synthesized(controller) = event else {
+            continue;
+        };
+        let (reducer, _) = Reducer::new(restored);
+        let delta = reducer
+            .validate_controller_event(&controller)
+            .expect("provider controller event should validate");
+        restored = RestoredState {
+            model: delta.post_model,
+            next_ordinal: delta.post_next_ordinal,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        };
+    }
+    restored
+}
+
+fn empty_restored() -> RestoredState {
+    RestoredState {
+        model: DomainModel::default(),
+        next_ordinal: 1,
+        next_ingest_seq: Some(1),
+        event_ledger: Vec::new(),
+    }
+}
+
+fn root_session_end(session_id: &str, at_ms: i64) -> ControllerEvent {
+    ControllerEvent {
+        schema_version: 1,
+        task_run_id: format!("hook:claude-code:{session_id}"),
+        metadata: EventMetadata {
+            event_id: format!("hook:claude-code:{session_id}:session-end:{at_ms}"),
+            timestamp_ms: at_ms,
+            receipt_time_ms: at_ms,
+            source: "hook:claude-code".to_owned(),
+            source_event_type: "session_ended".to_owned(),
+            herdr_session: String::new(),
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+            terminal_id: None,
+            provider: Some(Provider::Claude),
+            native_session_id: Some(session_id.to_owned()),
+            task_run_id: None,
+            agent_node_id: None,
+            task_state: None,
+            execution_parent: None,
+            dependency: None,
+            source_coverage: Vec::new(),
+            provider_metadata: None,
+            label: None,
+            reason: None,
+            progress: None,
+            ingest_seq: None,
+        },
+        event: ControllerEventKind::SessionEnded,
+    }
+}
+
+#[test]
+fn native_root_lifecycle_and_ordinals_are_resumable_and_append_only() {
+    const NEW_ROOT: &str = "97099666-7f29-425c-859c-6b95a6dd650b";
+    let mut synthesis = Synthesis::with_lifecycle_timing_at(30, 50, 1);
+    let mut admission = Admission::new(0);
+    let discovered = AdmissionIndex::new();
+    let root_scope = SessionScope::ClaudeRoot(ROOT_ID.to_owned());
+
+    let started = synthesis.synthesize_batch(
+        Path::new("old-root.jsonl"),
+        [(
+            1,
+            herdr_top::provider::facts::LogFact::Append {
+                scope: root_scope.clone(),
+                at_ms: 100,
+            },
+        )],
+        &mut admission,
+        &discovered,
+    );
+    let restored = apply_synthesized_events(empty_restored(), started);
+    let root_key = RunKey::Controller(format!("hook:claude-code:{ROOT_ID}"));
+    let original = restored.model.task_run_by_key(&root_key).unwrap().clone();
+
+    let (reducer, _) = Reducer::new(restored);
+    let ended = reducer
+        .validate_controller_event(&root_session_end(ROOT_ID, 120))
+        .unwrap();
+    let ended_state = RestoredState {
+        model: ended.post_model,
+        next_ordinal: ended.post_next_ordinal,
+        next_ingest_seq: Some(1),
+        event_ledger: Vec::new(),
+    };
+    assert_eq!(
+        ended_state.model.task_run(&original.run_id).unwrap().state,
+        TaskState::Running
+    );
+    assert_eq!(
+        ended_state
+            .model
+            .task_run_v6_state(&original.run_id)
+            .and_then(|state| state.native_session_end.as_ref())
+            .map(|end| end.status),
+        Some(NativeSessionEndStatus::Done)
+    );
+
+    let inactive = synthesis.advance_lifecycle(150);
+    assert!(matches!(
+        inactive.as_slice(),
+        [ProviderEvent::LaneClose { key, at_ms }]
+            if key == &root_key && *at_ms == 100
+    ));
+    let resumed = synthesis.synthesize_batch(
+        Path::new("old-root.jsonl"),
+        [(
+            2,
+            herdr_top::provider::facts::LogFact::Append {
+                scope: root_scope,
+                at_ms: 160,
+            },
+        )],
+        &mut admission,
+        &discovered,
+    );
+    let mut restored = apply_synthesized_events(ended_state, resumed);
+    let resumed = restored.model.task_run_by_key(&root_key).unwrap();
+    assert_eq!(resumed.run_id, original.run_id);
+    assert_eq!(resumed.display_ordinal, original.display_ordinal);
+    assert!(
+        restored
+            .model
+            .task_run_v6_state(&original.run_id)
+            .unwrap()
+            .native_session_end
+            .is_none()
+    );
+
+    let new_scope = SessionScope::ClaudeRoot(NEW_ROOT.to_owned());
+    let appended = synthesis.synthesize_batch(
+        Path::new("new-root.jsonl"),
+        [(
+            1,
+            herdr_top::provider::facts::LogFact::Append {
+                scope: new_scope,
+                at_ms: 170,
+            },
+        )],
+        &mut admission,
+        &discovered,
+    );
+    restored = apply_synthesized_events(restored, appended);
+    let appended = restored
+        .model
+        .task_run_by_key(&RunKey::Controller(format!("hook:claude-code:{NEW_ROOT}")))
+        .unwrap();
+    assert!(original.display_ordinal < appended.display_ordinal);
+    assert_eq!(restored.model.task_runs().count(), 2);
 }
 
 #[test]
