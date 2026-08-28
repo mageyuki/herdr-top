@@ -2479,6 +2479,7 @@ async fn run_collector(
         let reader_report = reader
             .await
             .map_err(|error| CollectorError::Task(error.to_string()))?;
+        begin_rate_gap_if_overflowed(&mut reducer, &overflowed);
         enrichment_reader
             .await
             .map_err(|error| CollectorError::Task(error.to_string()))?;
@@ -3008,6 +3009,7 @@ async fn replay_generation(
 
     loop {
         if cancellation.is_cancelled() {
+            let _ = recover_replay_overflow(reducer, buffered, overflowed, origin);
             return Ok(ReplayOutcome::Cancelled);
         }
         if recover_replay_overflow(reducer, buffered, overflowed, origin) {
@@ -3017,6 +3019,7 @@ async fn replay_generation(
         enrichment.discard_episode_payloads();
         while let Some(admitted) = buffered.pop_front() {
             if cancellation.is_cancelled() {
+                let _ = recover_replay_overflow(reducer, buffered, overflowed, origin);
                 return Ok(ReplayOutcome::Cancelled);
             }
             if recover_replay_overflow(reducer, buffered, overflowed, origin) {
@@ -3060,7 +3063,10 @@ async fn replay_generation(
         }
 
         let next_received = tokio::select! {
-            () = cancellation.cancelled() => return Ok(ReplayOutcome::Cancelled),
+            () = cancellation.cancelled() => {
+                let _ = recover_replay_overflow(reducer, buffered, overflowed, origin);
+                return Ok(ReplayOutcome::Cancelled);
+            }
             request = receive_controller(controller_requests) => {
                 service_controller(
                     request,
@@ -3401,6 +3407,7 @@ async fn monitor_live(
     let mut enrichment_prunes_open = true;
     loop {
         if cancellation.is_cancelled() {
+            begin_rate_gap_if_overflowed(reducer, overflowed);
             return Ok(ReplayOutcome::Cancelled);
         }
         if begin_rate_gap_if_overflowed(reducer, overflowed) {
@@ -3412,7 +3419,10 @@ async fn monitor_live(
         let mut provider_event = None;
         let provider_ingress_open = provider.provider_ingress_open();
         let received = tokio::select! {
-            () = cancellation.cancelled() => return Ok(ReplayOutcome::Cancelled),
+            () = cancellation.cancelled() => {
+                begin_rate_gap_if_overflowed(reducer, overflowed);
+                return Ok(ReplayOutcome::Cancelled);
+            }
             request = receive_controller(controller_requests) => {
                 if begin_rate_gap_if_overflowed(reducer, overflowed) {
                     return Ok(ReplayOutcome::RecoveryRefreshRequired(
@@ -3633,6 +3643,7 @@ async fn monitor_reconciling(
     let mut watchdog_probe: Option<WatchdogProbeFuture<'_>> = None;
     loop {
         if cancellation.is_cancelled() {
+            begin_rate_gap_if_overflowed(reducer, overflowed);
             return Ok(ReconcilingOutcome::Cancelled);
         }
         if begin_rate_gap_if_overflowed(reducer, overflowed) {
@@ -3643,7 +3654,10 @@ async fn monitor_reconciling(
         let mut provider_event = None;
         let provider_ingress_open = provider.provider_ingress_open();
         let received = tokio::select! {
-            () = cancellation.cancelled() => return Ok(ReconcilingOutcome::Cancelled),
+            () = cancellation.cancelled() => {
+                begin_rate_gap_if_overflowed(reducer, overflowed);
+                return Ok(ReconcilingOutcome::Cancelled);
+            }
             request = receive_controller(controller_requests) => {
                 if begin_rate_gap_if_overflowed(reducer, overflowed) {
                     return Ok(ReconcilingOutcome::RestartGeneration(origin));
@@ -9367,6 +9381,113 @@ mod tests {
         provider_thread.stop().await.unwrap();
         drop(persistence);
         lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_cancellation_after_overflow_invalidates_before_graceful_rate_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let mut model =
+            pane_status_test_model(true, ExecState::Working, Some(PaneAgentStatus::Working));
+        let task_run = model.task_runs().next().unwrap().clone();
+        let run_id = task_run.run_id;
+        let execution = model.executions().next().unwrap().clone();
+        let mut store = open_writer(&root).unwrap();
+        store
+            .apply_batch(vec![
+                PersistOp::UpsertTaskRun(PersistTaskRun {
+                    task_run,
+                    native_session: None,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                    finished_at_ms: None,
+                }),
+                PersistOp::UpsertExecution(PersistExecution {
+                    execution,
+                    started_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                    ended_at_ms: None,
+                }),
+            ])
+            .unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let mut persistence =
+            RuntimePersistence::new_for_test(writer, Arc::new(RecordingOccurrenceSink::default()))
+                .0;
+        model
+            .telemetry_entry(run_id, 1_000)
+            .accumulate(100, None, None, None, false);
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model,
+            next_ordinal: 2,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let epoch = reducer.begin_rate_epoch();
+        reducer.activate_rate_epoch(1_000);
+
+        let (performance, _sampler) =
+            performance_tracker(Arc::new(TestPerformanceClock::new(Duration::ZERO)));
+        let (primary_sender, mut primary_events) = admitted_channel(1, performance.clone());
+        let overflowed = AtomicBool::new(true);
+        let (provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+        let (target_publisher, _target_receiver) = watch::channel(BTreeSet::new());
+        let (_enrichment_sender, enrichment_events) = mpsc::channel(1);
+        let (_prune_sender, prune_events) = mpsc::unbounded_channel();
+        let mut enrichment = EnrichmentConverge {
+            target_set: BTreeSet::new(),
+            target_publisher,
+            published: false,
+            events: enrichment_events,
+            prunes: prune_events,
+            diagnostics: EnrichmentDiagnosticsHandle::default(),
+            performance,
+        };
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let outcome = monitor_live(
+            &directory.path().join("unused-herdr.sock"),
+            &mut reducer,
+            &shared,
+            &mut persistence,
+            &mut OwnerTracker::from_environment(),
+            "overflow-cancellation-rate",
+            &mut primary_events,
+            &overflowed,
+            &mut enrichment,
+            &cancellation,
+            &mut PendingTopologyClosures::default(),
+            &mut None,
+            &mut None,
+            &mut provider,
+            LivenessPolicy { timeout_ms: 60_000 },
+            &PrimaryStreamDiagnosticsHandle::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, ReplayOutcome::Cancelled));
+        persist_graceful_rate_checkpoint(&mut persistence, &mut reducer, 3_000)
+            .await
+            .unwrap();
+        let invalidated_epoch = reducer.rate_epoch();
+
+        drop(primary_sender);
+        drop(provider_sender);
+        provider_thread.stop().await.unwrap();
+        drop(persistence);
+        lifecycle.shutdown().await.unwrap();
+        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+        assert_eq!(
+            restored.model.run_rate_totals(&run_id),
+            None,
+            "graceful shutdown must not checkpoint Working time from an overflowed generation"
+        );
+        assert_eq!(
+            invalidated_epoch,
+            epoch.wrapping_add(1),
+            "cancellation must not bypass the overflow epoch invalidation"
+        );
     }
 
     #[tokio::test]

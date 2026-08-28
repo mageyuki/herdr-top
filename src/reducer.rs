@@ -505,19 +505,31 @@ impl Reducer {
     pub(crate) fn activate_rate_epoch(&mut self, observed_at_ms: i64) {
         self.rate_epoch_active = true;
         let statuses = crate::status::StatusReadModel::from_model(&self.model, observed_at_ms);
-        let mut run_ids = self
+        let live_execution_runs = self
+            .model
+            .executions()
+            .filter(|execution| !execution.state.is_terminal())
+            .map(|execution| execution.task_run_id)
+            .collect::<HashSet<_>>();
+        let mut candidates = self
             .model
             .task_runs()
-            .filter(|run| {
-                matches!(
+            .filter_map(|run| {
+                let working = matches!(
                     statuses.run_rate_activity(&self.model, run),
                     crate::status::RunRateActivity::Working
-                )
+                );
+                let live_paused_execution = live_execution_runs.contains(&run.run_id)
+                    && !run.state.is_terminal()
+                    && !self
+                        .model
+                        .task_run_v6_state(&run.run_id)
+                        .is_some_and(|state| state.native_session_end.is_some());
+                (working || live_paused_execution).then_some((run.run_id, working))
             })
-            .map(|run| run.run_id)
             .collect::<Vec<_>>();
-        run_ids.sort_unstable();
-        for run_id in run_ids {
+        candidates.sort_unstable_by_key(|(run_id, _)| *run_id);
+        for (run_id, working) in candidates {
             self.observe_run_rates_with_activity(
                 RateObservation {
                     run_id,
@@ -526,7 +538,7 @@ impl Reducer {
                     },
                     observed_at_ms,
                 },
-                true,
+                working,
             );
         }
     }
@@ -4471,6 +4483,40 @@ mod tests {
             reducer.model.run_rate_totals(&run_id),
             None,
             "pre-snapshot tokens must never enter the measured numerator"
+        );
+    }
+
+    #[test]
+    fn authoritative_idle_reconciliation_baselines_before_delayed_tokens() {
+        let (mut reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let mut snapshot = native_snapshot("idle-reconciliation-rate");
+        snapshot.panes[0].agent.as_mut().unwrap().status = PaneAgentStatus::Idle;
+        reducer.reconcile_snapshot(snapshot).unwrap();
+
+        let key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "idle-reconciliation-rate".to_owned(),
+        };
+        let run_id = reducer.model.task_run_by_key(&key).unwrap().run_id;
+        reducer.apply_telemetry(&key, 10_000, 25, None, None, None);
+        assert_eq!(
+            reducer.model.run_rate_totals(&run_id),
+            Some(&RunRateTotals {
+                output_tokens: 25,
+                working_ms: 0,
+            }),
+            "the first delayed Idle report must be measured from the authoritative baseline"
+        );
+
+        let epoch = reducer.rate_epoch();
+        observe_live_rate(&mut reducer, run_id, epoch, 20_000);
+        assert_eq!(
+            reducer.model.run_rate_totals(&run_id),
+            Some(&RunRateTotals {
+                output_tokens: 25,
+                working_ms: 0,
+            }),
+            "the same cumulative Idle tokens must be counted exactly once"
         );
     }
 
