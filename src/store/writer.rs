@@ -1594,7 +1594,17 @@ fn writer_main(
                         &error,
                     )
                 });
-                let _ = acknowledgement.send(result.map_err(|failure| failure.failure));
+                let result = result.map_err(|store_failure| {
+                    let failure = store_failure.failure;
+                    if matches!(
+                        failure.code,
+                        PersistenceFailureCode::Sqlite | PersistenceFailureCode::Io
+                    ) {
+                        health.publish_failure_with_detail(failure, Some(store_failure.detail));
+                    }
+                    failure
+                });
+                let _ = acknowledgement.send(result);
             }
             WriterCommand::HistoryDrainFinalization {
                 drain_id,
@@ -1610,7 +1620,8 @@ fn writer_main(
                             &error,
                         )
                     });
-                let _ = acknowledgement.send(result.map_err(|failure| failure.failure));
+                let result = publish_store_result(result, &health);
+                let _ = acknowledgement.send(result);
             }
             WriterCommand::Barrier { acknowledgement } => {
                 #[cfg(test)]
@@ -2030,6 +2041,128 @@ mod tests {
         assert!(!subscription.has_changed().unwrap());
 
         lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_history_drain_finalized_is_caller_only_invalid_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let drain_id = HistoryDrainId::new("codex:unknown-writer-drain").unwrap();
+        let expected = expected_failure(
+            PersistenceOperation::Barrier,
+            PersistencePhase::CommandExecution,
+            PersistenceFailureCode::InvalidData,
+            DurabilityDisposition::NotApplicable,
+        );
+
+        assert_persistence_error(writer.history_drain_finalized(&drain_id).await, expected);
+        assert_eq!(
+            writer.health.snapshot(),
+            PersistenceHealthSnapshot::healthy()
+        );
+
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_drain_finalized_backend_read_failure_degrades_with_detail() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        store
+            .connection
+            .execute_batch("ALTER TABLE history_drains RENAME TO unavailable_history_drains;")
+            .unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let drain_id = HistoryDrainId::new("codex:broken-finalized-read").unwrap();
+        let expected = expected_failure(
+            PersistenceOperation::Barrier,
+            PersistencePhase::CommandExecution,
+            PersistenceFailureCode::Sqlite,
+            DurabilityDisposition::NotApplicable,
+        );
+
+        assert_persistence_error(writer.history_drain_finalized(&drain_id).await, expected);
+        assert_backend_history_read_failure(&writer, expected);
+
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_drain_finalization_backend_read_failure_degrades_with_detail() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        store
+            .connection
+            .execute_batch("ALTER TABLE history_drains RENAME TO unavailable_history_drains;")
+            .unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let drain_id = HistoryDrainId::new("codex:broken-finalization-read").unwrap();
+        let expected = expected_failure(
+            PersistenceOperation::Barrier,
+            PersistencePhase::CommandExecution,
+            PersistenceFailureCode::Sqlite,
+            DurabilityDisposition::NotApplicable,
+        );
+
+        assert_persistence_error(writer.history_drain_finalization(&drain_id).await, expected);
+        assert_backend_history_read_failure(&writer, expected);
+
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_only_history_reads_remain_callable_while_health_is_degraded() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let drain_id = HistoryDrainId::new("codex:degraded-response-only").unwrap();
+        let first = expected_failure(
+            PersistenceOperation::Apply,
+            PersistencePhase::CommandExecution,
+            PersistenceFailureCode::Sqlite,
+            DurabilityDisposition::NotCommitted,
+        );
+        let missing = expected_failure(
+            PersistenceOperation::Barrier,
+            PersistencePhase::CommandExecution,
+            PersistenceFailureCode::InvalidData,
+            DurabilityDisposition::NotApplicable,
+        );
+        writer.health.publish_failure(first);
+
+        assert_eq!(
+            writer.history_drain_finalization(&drain_id).await.unwrap(),
+            None
+        );
+        assert_persistence_error(writer.history_drain_finalized(&drain_id).await, missing);
+        assert_eq!(
+            writer.persistence_status(),
+            PersistenceStatus::Degraded { failure: first }
+        );
+
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    fn assert_backend_history_read_failure(writer: &WriterClient, expected: PersistenceFailure) {
+        let snapshot = writer.health.snapshot();
+        assert_eq!(
+            snapshot.status,
+            PersistenceStatus::Degraded { failure: expected }
+        );
+        let detail = snapshot.detail.expect("backend failure must retain detail");
+        assert!(!detail.as_str().is_empty());
+        assert!(detail.as_str().len() <= PERSISTENCE_DETAIL_MAX_BYTES);
+        assert!(std::str::from_utf8(detail.as_str().as_bytes()).is_ok());
+        assert!(
+            detail.as_str().contains("no such table") && detail.as_str().contains("history_drains"),
+            "unexpected backend detail: {}",
+            detail.as_str()
+        );
     }
 
     #[test]
