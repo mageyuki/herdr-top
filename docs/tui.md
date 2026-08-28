@@ -68,8 +68,8 @@ The `/` key opens a footer editor rather than an overlay. Filtering is a
 case-insensitive Unicode-lowercase substring match over safe identity and state
 fields. It deliberately excludes paths, activity, Controller free text,
 content, and raw events. A tree match retains its ancestors; a DAG match retains
-its prerequisite paths. Filtering also reveals retained rows that the default
-visibility rules hide.
+its prerequisite paths. Filtering operates only within the default-visible row
+set and does not restore expired or dismissed retained history.
 
 ## Keybindings
 
