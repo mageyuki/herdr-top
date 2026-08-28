@@ -579,14 +579,14 @@ fn unknown_record_stubs_do_not_stop_known_records_on_both_sides() {
 fn nested_subagent_activity_normalizes_started_and_spawned() {
     let fixtures = FixtureIndex::new(&["codex-depth2-root.jsonl"]);
     let file = fixtures.file("codex-depth2-root.jsonl");
-    let cases: [(&str, &str, &str, &str, i64, &[u8]); 2] = [
+    let cases = [
         (
             "started",
             "d1111111-1111-4111-8111-111111111111",
             "prov:codex:act:item_nested_started",
             "prov:codex:up:item_nested_started",
             1_787_547_610_201,
-            br#"{"timestamp":"2026-08-24T05:00:10.500Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1787547610101,"completed_at_ms":1787547610201,"item":{"type":"SubAgentActivity","id":"item_nested_started","kind":"started","agent_thread_id":"d1111111-1111-4111-8111-111111111111","agent_path":"/root/nested_started"}}}"#,
+            br#"{"timestamp":"2026-08-24T05:00:10.500Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1787547610101,"completed_at_ms":1787547610201,"item":{"type":"SubAgentActivity","id":"item_nested_started","kind":"started","agent_thread_id":"d1111111-1111-4111-8111-111111111111","agent_path":"/root/nested_started"}}}"# as &[u8],
         ),
         (
             "spawned",
@@ -594,7 +594,7 @@ fn nested_subagent_activity_normalizes_started_and_spawned() {
             "prov:codex:act:item_nested_spawned",
             "prov:codex:up:item_nested_spawned",
             1_787_547_611_401,
-            br#"{"timestamp":"2026-08-24T05:00:11.600Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1787547611301,"completed_at_ms":1787547611401,"item":{"type":"SubAgentActivity","id":"item_nested_spawned","kind":"spawned","agent_thread_id":"d2222222-2222-4222-8222-222222222222","agent_path":"/root/nested_spawned"}}}"#,
+            br#"{"timestamp":"2026-08-24T05:00:11.600Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1787547611301,"completed_at_ms":1787547611401,"item":{"type":"SubAgentActivity","id":"item_nested_spawned","kind":"spawned","agent_thread_id":"d2222222-2222-4222-8222-222222222222","agent_path":"/root/nested_spawned"}}}"# as &[u8],
         ),
     ];
 
