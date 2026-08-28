@@ -34,7 +34,7 @@ use crate::store::{
 #[cfg(feature = "workload-harness")]
 use std::cell::RefCell;
 #[cfg(feature = "workload-harness")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Closed workload timing scopes emitted by the real reducer paths.
 #[cfg(feature = "workload-harness")]
@@ -70,7 +70,8 @@ pub type WorkloadTimingObserver = Arc<dyn Fn(WorkloadTimingObservation) + Send +
 struct WorkloadTimingState {
     kind: WorkloadTimingKind,
     sequence: u64,
-    started: Instant,
+    active_started: Option<Instant>,
+    reducer_plus_publish: Duration,
     d4_segment_count: u32,
     d4_analysis_ns: u64,
     model_clone_publish_segment_count: u32,
@@ -95,6 +96,9 @@ pub(crate) struct WorkloadTimingScope {
 }
 
 #[cfg(feature = "workload-harness")]
+struct SuspendedWorkloadTimingState(WorkloadTimingState);
+
+#[cfg(feature = "workload-harness")]
 pub(crate) fn workload_timing_scope(
     kind: WorkloadTimingKind,
     sequence: u64,
@@ -104,7 +108,8 @@ pub(crate) fn workload_timing_scope(
         let previous = slot.replace(Some(WorkloadTimingState {
             kind,
             sequence,
-            started: Instant::now(),
+            active_started: Some(Instant::now()),
+            reducer_plus_publish: Duration::ZERO,
             d4_segment_count: 0,
             d4_analysis_ns: 0,
             model_clone_publish_segment_count: 0,
@@ -123,7 +128,7 @@ pub(crate) fn workload_timing_scope(
 impl WorkloadTimingScope {
     pub(crate) fn finish(mut self) {
         let state = WORKLOAD_TIMING_STATE.with(|slot| slot.borrow_mut().take());
-        let state = state.expect("workload timing scope must remain installed until finish");
+        let mut state = state.expect("workload timing scope must remain installed until finish");
         // ControllerEvent's 2/2 counts are one D4 + clone/publish pair from the
         // validate_controller_event scratch Self::new, then the post-transition
         // D4 analysis and committed model publication.
@@ -141,7 +146,8 @@ impl WorkloadTimingScope {
             state.model_clone_publish_segment_count, expected_segments,
             "workload timing scope observed a missing or duplicate clone/publication segment"
         );
-        let reducer_plus_publish_ns = u64::try_from(state.started.elapsed().as_nanos())
+        state.pause();
+        let reducer_plus_publish_ns = u64::try_from(state.reducer_plus_publish.as_nanos())
             .expect("workload reducer timing exceeded u64 nanoseconds");
         (state.observer)(WorkloadTimingObservation {
             kind: state.kind,
@@ -153,6 +159,45 @@ impl WorkloadTimingScope {
             model_clone_publish_ns: state.model_clone_publish_ns,
         });
         self.active = false;
+    }
+
+    fn suspend(mut self) -> SuspendedWorkloadTimingState {
+        let state = WORKLOAD_TIMING_STATE.with(|slot| slot.borrow_mut().take());
+        let mut state = state.expect("workload timing scope must remain installed until suspend");
+        state.pause();
+        self.active = false;
+        SuspendedWorkloadTimingState(state)
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+impl WorkloadTimingState {
+    fn pause(&mut self) {
+        let started = self
+            .active_started
+            .take()
+            .expect("installed workload timing state must be active");
+        self.reducer_plus_publish = self
+            .reducer_plus_publish
+            .checked_add(started.elapsed())
+            .expect("workload reducer timing overflowed");
+    }
+}
+
+#[cfg(feature = "workload-harness")]
+impl SuspendedWorkloadTimingState {
+    fn resume(mut self) -> WorkloadTimingScope {
+        assert!(
+            self.0.active_started.is_none(),
+            "suspended workload timing state must be inactive"
+        );
+        self.0.active_started = Some(Instant::now());
+        WORKLOAD_TIMING_STATE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            assert!(slot.is_none(), "workload timing scopes must not overlap");
+            *slot = Some(self.0);
+        });
+        WorkloadTimingScope { active: true }
     }
 }
 
@@ -276,7 +321,11 @@ pub(crate) struct StagedHistoryFinalization {
 }
 
 /// One provider submission's publication work, consumed only by its matching acknowledgement.
-pub(crate) struct ProviderSubmissionReceipt(ProviderSubmissionReceiptKind);
+pub(crate) struct ProviderSubmissionReceipt {
+    kind: ProviderSubmissionReceiptKind,
+    #[cfg(feature = "workload-harness")]
+    workload_timing: Option<SuspendedWorkloadTimingState>,
+}
 
 enum ProviderSubmissionReceiptKind {
     Historical,
@@ -285,11 +334,19 @@ enum ProviderSubmissionReceiptKind {
 
 impl ProviderSubmissionReceipt {
     fn historical() -> Self {
-        Self(ProviderSubmissionReceiptKind::Historical)
+        Self {
+            kind: ProviderSubmissionReceiptKind::Historical,
+            #[cfg(feature = "workload-harness")]
+            workload_timing: None,
+        }
     }
 
     fn live(submission_id: Option<u64>) -> Self {
-        Self(ProviderSubmissionReceiptKind::Live { submission_id })
+        Self {
+            kind: ProviderSubmissionReceiptKind::Live { submission_id },
+            #[cfg(feature = "workload-harness")]
+            workload_timing: None,
+        }
     }
 }
 
@@ -390,6 +447,8 @@ pub struct Reducer {
     // increment5-workload-harness: begin reducer timing configuration field
     #[cfg(feature = "workload-harness")]
     workload_observation_timing: Option<WorkloadObservationTiming>,
+    #[cfg(feature = "workload-harness")]
+    pending_workload_timing: Option<SuspendedWorkloadTimingState>,
     // increment5-workload-harness: end reducer timing configuration field
 }
 
@@ -514,6 +573,8 @@ impl Reducer {
                 // increment5-workload-harness: begin reducer timing configuration initialization
                 #[cfg(feature = "workload-harness")]
                 workload_observation_timing: None,
+                #[cfg(feature = "workload-harness")]
+                pending_workload_timing: None,
                 // increment5-workload-harness: end reducer timing configuration initialization
             },
             shared,
@@ -1123,7 +1184,22 @@ impl Reducer {
         } else {
             ProviderSubmissionReceipt::live(None)
         };
+        #[cfg(feature = "workload-harness")]
+        let receipt = if !historical && has_ready_runs {
+            ProviderSubmissionReceipt {
+                workload_timing: self.pending_workload_timing.take(),
+                ..receipt
+            }
+        } else {
+            receipt
+        };
         if !historical && !has_ready_runs {
+            #[cfg(feature = "workload-harness")]
+            {
+                let workload_timing = self.pending_workload_timing.take();
+                self.publish_with_workload_timing(workload_timing);
+            }
+            #[cfg(not(feature = "workload-harness"))]
             self.publish();
         }
         (batch, receipt)
@@ -1137,6 +1213,8 @@ impl Reducer {
         self.deferred_provider_drain = None;
         self.provider_observation_private_run_ids.clear();
         self.rate_observation_context = None;
+        #[cfg(feature = "workload-harness")]
+        self.pending_workload_timing.take();
         if publish {
             self.publish();
         }
@@ -1229,7 +1307,15 @@ impl Reducer {
         // increment5-workload-harness: begin observed apply scope finish
         #[cfg(feature = "workload-harness")]
         if let Some(timing) = workload_timing {
-            timing.finish();
+            if self.provider_model_publication_pending {
+                assert!(
+                    self.pending_workload_timing.is_none(),
+                    "deferred workload timing scopes must not overlap"
+                );
+                self.pending_workload_timing = Some(timing.suspend());
+            } else if !self.defer_provider_publication {
+                timing.finish();
+            }
         }
         // increment5-workload-harness: end observed apply scope finish
         Ok(ApplyOutcome::Applied(persist))
@@ -2311,9 +2397,9 @@ impl Reducer {
         receipt: ProviderSubmissionReceipt,
         outcome: RuntimeWriteOutcome,
     ) {
-        let ProviderSubmissionReceipt(ProviderSubmissionReceiptKind::Live { submission_id }) =
-            receipt
-        else {
+        #[cfg(feature = "workload-harness")]
+        let workload_timing = receipt.workload_timing;
+        let ProviderSubmissionReceiptKind::Live { submission_id } = receipt.kind else {
             self.complete_deferred_operator_submission(outcome);
             return;
         };
@@ -2356,6 +2442,9 @@ impl Reducer {
             }
         }
         if publish {
+            #[cfg(feature = "workload-harness")]
+            self.publish_with_workload_timing(workload_timing);
+            #[cfg(not(feature = "workload-harness"))]
             self.publish();
         }
     }
@@ -3847,6 +3936,18 @@ impl Reducer {
             .set_dangling_announcement_components(count);
     }
 
+    #[cfg(feature = "workload-harness")]
+    fn publish_with_workload_timing(
+        &mut self,
+        workload_timing: Option<SuspendedWorkloadTimingState>,
+    ) {
+        let workload_timing = workload_timing.map(SuspendedWorkloadTimingState::resume);
+        self.publish();
+        if let Some(workload_timing) = workload_timing {
+            workload_timing.finish();
+        }
+    }
+
     fn publish(&mut self) {
         self.apply_pending_telemetry_for_known_runs();
         let (origin, observed_at_ms) = self.rate_observation_context.unwrap_or((
@@ -4347,6 +4448,8 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::path::Path;
     use std::sync::Arc;
+    #[cfg(feature = "workload-harness")]
+    use std::sync::Mutex;
 
     use crate::activity::ActivityDurability;
     use crate::diagnostics::RuntimeWriteOutcome;
@@ -4375,6 +4478,11 @@ mod tests {
     use super::{
         ApplyOutcome, CommitStagedError, ProviderSubmissionReceipt, RateObservation,
         RateObservationOrigin, Reducer, ReducerError, RejectReason, unix_now_ms,
+    };
+    #[cfg(feature = "workload-harness")]
+    use super::{
+        WORKLOAD_TIMING_STATE, WorkloadObservationTiming, WorkloadTimingKind,
+        WorkloadTimingObservation, WorkloadTimingObserver,
     };
 
     fn rate_reducer() -> (Reducer, SharedModel, RunId, RunKey) {
@@ -5647,6 +5755,31 @@ mod tests {
         private: bool,
         include_untouched_private_run: bool,
     ) -> LiveSubmissionFixture {
+        live_submission_fixture_inner(
+            label,
+            private,
+            include_untouched_private_run,
+            #[cfg(feature = "workload-harness")]
+            None,
+        )
+    }
+
+    #[cfg(feature = "workload-harness")]
+    fn workload_timing_live_submission_fixture(
+        label: &str,
+        private: bool,
+        sequence: u64,
+        observer: WorkloadTimingObserver,
+    ) -> LiveSubmissionFixture {
+        live_submission_fixture_inner(label, private, false, Some((sequence, observer)))
+    }
+
+    fn live_submission_fixture_inner(
+        label: &str,
+        private: bool,
+        include_untouched_private_run: bool,
+        #[cfg(feature = "workload-harness")] workload_timing: Option<(u64, WorkloadTimingObserver)>,
+    ) -> LiveSubmissionFixture {
         let run_id = RunId::new();
         let native_session_id = format!("live-submission-{label}");
         let agent_node_id = format!("live-submission-agent-{label}");
@@ -5708,6 +5841,15 @@ mod tests {
                 terminal_times: HashMap::new(),
             },
         );
+        #[cfg(feature = "workload-harness")]
+        if let Some((sequence, observer)) = workload_timing {
+            reducer.workload_observation_timing = Some(WorkloadObservationTiming {
+                kind: WorkloadTimingKind::FallbackNotification,
+                next_sequence: sequence,
+                setup_observations_to_skip: 0,
+                observer,
+            });
+        }
         let origin = crate::model::ObservationOrigin::Live;
         let prior = reducer.begin_provider_observation(&origin, 2_000);
         let mut event_metadata = metadata(&format!("live-submission-event-{label}"), 2_000);
@@ -5744,6 +5886,269 @@ mod tests {
             agent_node_id,
             receipt,
         }
+    }
+
+    #[cfg(feature = "workload-harness")]
+    fn workload_timing_recorder() -> (
+        Arc<Mutex<Vec<WorkloadTimingObservation>>>,
+        WorkloadTimingObserver,
+    ) {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observer: WorkloadTimingObserver = {
+            let observations = Arc::clone(&observations);
+            Arc::new(move |observation| observations.lock().unwrap().push(observation))
+        };
+        (observations, observer)
+    }
+
+    #[cfg(feature = "workload-harness")]
+    fn assert_workload_timing_tls_empty_and_reusable(sequence: u64) {
+        WORKLOAD_TIMING_STATE.with(|slot| {
+            assert!(slot.borrow().is_none(), "workload timing TLS must be empty");
+        });
+        let (observations, observer) = workload_timing_recorder();
+        let _ = Reducer::new_with_operator_observed(
+            restored(DomainModel::default(), 1),
+            crate::activity::RestoredOperatorState {
+                activity: Vec::new(),
+                terminal_times: HashMap::new(),
+            },
+            sequence,
+            observer,
+        );
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].kind, WorkloadTimingKind::StartupRestore);
+        assert_eq!(observations[0].sequence, sequence);
+        assert_eq!(observations[0].d4_segment_count, 1);
+        assert_eq!(observations[0].model_clone_publish_segment_count, 1);
+        drop(observations);
+        WORKLOAD_TIMING_STATE.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "workload timing TLS must be reusable"
+            );
+        });
+    }
+
+    #[cfg(feature = "workload-harness")]
+    #[test]
+    fn workload_timing_live_private_success_waits_for_matching_receipt() {
+        let cases = [
+            ("durable", RuntimeWriteOutcome::Durable),
+            (
+                "committed-but-degraded",
+                RuntimeWriteOutcome::CommittedButDegraded(
+                    crate::store::writer::PersistenceFailure {
+                        operation: crate::store::writer::PersistenceOperation::Apply,
+                        phase: crate::store::writer::PersistencePhase::PostApplyCommit,
+                        code: crate::store::writer::PersistenceFailureCode::Io,
+                        durability: crate::store::writer::DurabilityDisposition::Committed,
+                    },
+                ),
+            ),
+        ];
+        let (observations, observer) = workload_timing_recorder();
+
+        for (index, (label, outcome)) in cases.into_iter().enumerate() {
+            let sequence = u64::try_from(index).unwrap() + 40;
+            let LiveSubmissionFixture {
+                mut reducer,
+                receipt,
+                ..
+            } = workload_timing_live_submission_fixture(
+                label,
+                true,
+                sequence,
+                Arc::clone(&observer),
+            );
+
+            assert_eq!(observations.lock().unwrap().len(), index, "{label}");
+            let suspended = receipt
+                .workload_timing
+                .as_ref()
+                .expect("private readiness must suspend timing on its receipt");
+            assert!(suspended.0.active_started.is_none(), "{label}");
+            let reducer_duration_before_wait = suspended.0.reducer_plus_publish;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert_eq!(
+                suspended.0.reducer_plus_publish, reducer_duration_before_wait,
+                "persistence wait must not accrue reducer duration: {label}"
+            );
+
+            reducer.complete_provider_submission(receipt, outcome);
+
+            let observations = observations.lock().unwrap();
+            assert_eq!(observations.len(), index + 1, "{label}");
+            let observation = &observations[index];
+            assert_eq!(observation.kind, WorkloadTimingKind::FallbackNotification);
+            assert_eq!(observation.sequence, sequence);
+            assert_eq!(observation.d4_segment_count, 1, "{label}");
+            assert_eq!(observation.model_clone_publish_segment_count, 1, "{label}");
+        }
+    }
+
+    #[cfg(feature = "workload-harness")]
+    #[test]
+    fn workload_timing_live_private_failures_emit_nothing_and_leave_tls_reusable() {
+        let cases = [
+            ("not-committed", not_committed_outcome()),
+            (
+                "durability-unknown",
+                RuntimeWriteOutcome::DurabilityUnknown(crate::store::writer::PersistenceFailure {
+                    operation: crate::store::writer::PersistenceOperation::Apply,
+                    phase: crate::store::writer::PersistencePhase::Acknowledgement,
+                    code: crate::store::writer::PersistenceFailureCode::AcknowledgementDropped,
+                    durability: crate::store::writer::DurabilityDisposition::Unknown,
+                }),
+            ),
+            ("skipped", RuntimeWriteOutcome::Skipped),
+        ];
+
+        for (index, (label, outcome)) in cases.into_iter().enumerate() {
+            let (observations, observer) = workload_timing_recorder();
+            let LiveSubmissionFixture {
+                mut reducer,
+                receipt,
+                ..
+            } = workload_timing_live_submission_fixture(
+                label,
+                true,
+                u64::try_from(index).unwrap() + 50,
+                observer,
+            );
+
+            reducer.complete_provider_submission(receipt, outcome);
+
+            assert!(observations.lock().unwrap().is_empty(), "{label}");
+            assert_workload_timing_tls_empty_and_reusable(u64::try_from(index).unwrap() + 60);
+        }
+    }
+
+    #[cfg(feature = "workload-harness")]
+    #[test]
+    fn workload_timing_foreign_receipt_preserves_matching_timed_submission() {
+        let (observations, observer) = workload_timing_recorder();
+        let LiveSubmissionFixture {
+            reducer: _foreign_reducer,
+            receipt: foreign_receipt,
+            ..
+        } = workload_timing_live_submission_fixture(
+            "timed-foreign-source",
+            true,
+            70,
+            Arc::clone(&observer),
+        );
+        let LiveSubmissionFixture {
+            mut reducer,
+            receipt,
+            ..
+        } = workload_timing_live_submission_fixture("timed-foreign-target", true, 71, observer);
+        let pending_submission_id = reducer
+            .pending_live_provider_submission
+            .as_ref()
+            .map(|pending| pending.submission_id);
+
+        reducer.complete_provider_submission(foreign_receipt, RuntimeWriteOutcome::Durable);
+
+        assert!(observations.lock().unwrap().is_empty());
+        assert_eq!(
+            reducer
+                .pending_live_provider_submission
+                .as_ref()
+                .map(|pending| pending.submission_id),
+            pending_submission_id
+        );
+
+        reducer.complete_provider_submission(receipt, RuntimeWriteOutcome::Durable);
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].sequence, 71);
+        assert_eq!(observations[0].d4_segment_count, 1);
+        assert_eq!(observations[0].model_clone_publish_segment_count, 1);
+    }
+
+    #[cfg(feature = "workload-harness")]
+    #[test]
+    fn workload_timing_dropped_receipt_emits_nothing_and_leaves_tls_reusable() {
+        let (observations, observer) = workload_timing_recorder();
+        let LiveSubmissionFixture {
+            reducer, receipt, ..
+        } = workload_timing_live_submission_fixture("timed-drop", true, 80, observer);
+
+        assert!(observations.lock().unwrap().is_empty());
+        drop(receipt);
+
+        assert!(observations.lock().unwrap().is_empty());
+        assert!(
+            reducer.pending_live_provider_submission.is_some(),
+            "dropping the receipt does not complete the pending reducer submission"
+        );
+        assert_workload_timing_tls_empty_and_reusable(81);
+    }
+
+    #[cfg(feature = "workload-harness")]
+    #[test]
+    fn workload_timing_historical_nonpublication_emits_nothing_and_leaves_tls_reusable() {
+        let LiveSubmissionFixture {
+            mut reducer,
+            run_id,
+            agent_node_id,
+            receipt,
+            ..
+        } = live_submission_fixture("timed-historical-seed", false, false);
+        reducer.complete_provider_submission(receipt, RuntimeWriteOutcome::Durable);
+        let (observations, observer) = workload_timing_recorder();
+        reducer.workload_observation_timing = Some(WorkloadObservationTiming {
+            kind: WorkloadTimingKind::FallbackRescan,
+            next_sequence: 90,
+            setup_observations_to_skip: 0,
+            observer,
+        });
+        let drain_id = crate::model::HistoryDrainId::new("codex:timed-historical").unwrap();
+        let origin = crate::model::ObservationOrigin::Historical {
+            drain_id: drain_id.clone(),
+            artifact_id: "timed-historical.jsonl".to_owned(),
+        };
+        let prior = reducer.begin_provider_observation(&origin, 3_000);
+        let mut event_metadata = metadata("timed-historical-event", 3_000);
+        event_metadata.source = "provider".to_owned();
+        event_metadata.source_event_type = "agent.activity".to_owned();
+        event_metadata.provider = Some(Provider::Codex);
+        event_metadata.native_session_id = Some("live-submission-timed-historical-seed".to_owned());
+        event_metadata.task_run_id = Some(run_id);
+        event_metadata.agent_node_id = Some(agent_node_id.clone());
+        let ApplyOutcome::Applied(operations) = reducer
+            .apply(NormalizedEvent::AgentActivity {
+                metadata: event_metadata,
+                agent_node_id,
+                activity: MinimalProviderMetadata {
+                    model_id: Some("historical-private-model".to_owned()),
+                    event_kind: Some("historical-private-event".to_owned()),
+                    ..MinimalProviderMetadata::default()
+                },
+            })
+            .unwrap()
+        else {
+            panic!("historical activity must apply");
+        };
+        let (_batch, receipt) = reducer.finish_provider_observation(
+            prior,
+            operations,
+            &origin,
+            Some(&PersistHistoryDrain {
+                drain_id,
+                provider: Provider::Codex,
+                created_at_ms: 2_000,
+                artifacts: Vec::new(),
+            }),
+            3_000,
+        );
+        reducer.complete_provider_submission(receipt, RuntimeWriteOutcome::Durable);
+
+        assert!(observations.lock().unwrap().is_empty());
+        assert_workload_timing_tls_empty_and_reusable(91);
     }
 
     #[test]
