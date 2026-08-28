@@ -279,10 +279,7 @@ pub(crate) struct StagedHistoryFinalization {
 /// One provider submission's publication work, consumed only by its matching acknowledgement.
 pub(crate) enum ProviderSubmissionReceipt {
     Historical,
-    Live {
-        ready_run_ids: Vec<RunId>,
-        holdback_id: Option<u64>,
-    },
+    Live { submission_id: Option<u64> },
 }
 
 /// Maximum unattributed provider-usage samples retained across all run scopes.
@@ -317,6 +314,13 @@ pub(crate) struct LiveProviderObservationCheckpoint {
     pending_telemetry_count: usize,
     dirty_rate_totals: HashSet<RunId>,
     pending_rate_observation_runs: HashSet<RunId>,
+}
+
+/// One unresolved live provider write and the reducer-owned work its acknowledgement may release.
+struct PendingLiveProviderSubmission {
+    submission_id: u64,
+    checkpoint: Option<Box<LiveProviderObservationCheckpoint>>,
+    ready_run_ids: Vec<RunId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -354,8 +358,8 @@ pub struct Reducer {
     provider_model_publication_pending: bool,
     deferred_provider_drain: Option<crate::model::HistoryDrainId>,
     provider_observation_private_run_ids: HashSet<RunId>,
-    next_provider_holdback_id: u64,
-    provider_submission_holdbacks: HashMap<u64, Box<LiveProviderObservationCheckpoint>>,
+    next_provider_submission_id: u64,
+    pending_live_provider_submission: Option<PendingLiveProviderSubmission>,
     published_history_drains: HashSet<crate::model::HistoryDrainId>,
     #[cfg(test)]
     publish_count: std::cell::Cell<u64>,
@@ -397,6 +401,16 @@ impl LiveProviderObservationCheckpoint {
         reducer.dirty_rate_totals = self.dirty_rate_totals;
         reducer.pending_rate_observation_runs = self.pending_rate_observation_runs;
     }
+}
+
+fn provider_v6_batch_is_empty(batch: &PersistV6Batch) -> bool {
+    batch.operations.is_empty()
+        && batch.task_runs.is_empty()
+        && batch.rate_totals.is_empty()
+        && batch.history_drains.is_empty()
+        && batch.history_associations.is_empty()
+        && batch.history_publications.is_empty()
+        && batch.history_event_drain.is_none()
 }
 
 impl Reducer {
@@ -469,8 +483,8 @@ impl Reducer {
                 provider_model_publication_pending: false,
                 deferred_provider_drain: None,
                 provider_observation_private_run_ids: HashSet::new(),
-                next_provider_holdback_id: 0,
-                provider_submission_holdbacks: HashMap::new(),
+                next_provider_submission_id: 0,
+                pending_live_provider_submission: None,
                 published_history_drains: HashSet::new(),
                 #[cfg(test)]
                 publish_count: std::cell::Cell::new(0),
@@ -834,6 +848,10 @@ impl Reducer {
         origin: &ObservationOrigin,
         observed_at_ms: i64,
     ) -> Option<ProviderObservationPrior> {
+        assert!(
+            self.pending_live_provider_submission.is_none(),
+            "a live provider submission must complete before another provider observation begins"
+        );
         self.rate_observation_context = Some((
             match origin {
                 ObservationOrigin::Historical { .. } => RateObservationOrigin::Historical,
@@ -1038,52 +1056,64 @@ impl Reducer {
         self.provider_model_publication_pending = false;
         self.deferred_provider_drain = None;
         self.rate_observation_context = None;
-        if !historical && live_ready_run_ids.is_empty() {
+        let batch = PersistV6Batch {
+            operations,
+            task_runs,
+            history_drains: if historical {
+                history_manifest.cloned().into_iter().collect()
+            } else {
+                Vec::new()
+            },
+            history_associations: associations,
+            history_publications,
+            history_event_drain: match origin {
+                ObservationOrigin::Historical { drain_id, .. } => Some(drain_id.clone()),
+                ObservationOrigin::Live => None,
+            },
+            ..PersistV6Batch::default()
+        };
+        let requires_persistence_completion = !provider_v6_batch_is_empty(&batch);
+        let has_ready_runs = !live_ready_run_ids.is_empty();
+        let receipt = if historical {
+            ProviderSubmissionReceipt::Historical
+        } else if requires_persistence_completion {
+            let checkpoint = match prior {
+                Some(ProviderObservationPrior::Live(checkpoint)) => Some(checkpoint),
+                Some(ProviderObservationPrior::Historical(_)) => {
+                    panic!("a live observation cannot use a historical checkpoint")
+                }
+                None => None,
+            };
+            assert!(
+                !has_ready_runs || checkpoint.is_some(),
+                "a live observation touching private history must retain its checkpoint"
+            );
+            let submission_id = self.next_provider_submission_id;
+            self.next_provider_submission_id = self
+                .next_provider_submission_id
+                .checked_add(1)
+                .expect("live provider submission IDs are exhausted");
+            assert!(
+                self.pending_live_provider_submission.is_none(),
+                "a live provider submission must complete before another is installed"
+            );
+            self.pending_live_provider_submission = Some(PendingLiveProviderSubmission {
+                submission_id,
+                checkpoint,
+                ready_run_ids: live_ready_run_ids,
+            });
+            ProviderSubmissionReceipt::Live {
+                submission_id: Some(submission_id),
+            }
+        } else {
+            ProviderSubmissionReceipt::Live {
+                submission_id: None,
+            }
+        };
+        if !historical && !has_ready_runs {
             self.publish();
         }
-        (
-            PersistV6Batch {
-                operations,
-                task_runs,
-                history_drains: if historical {
-                    history_manifest.cloned().into_iter().collect()
-                } else {
-                    Vec::new()
-                },
-                history_associations: associations,
-                history_publications,
-                history_event_drain: match origin {
-                    ObservationOrigin::Historical { drain_id, .. } => Some(drain_id.clone()),
-                    ObservationOrigin::Live => None,
-                },
-                ..PersistV6Batch::default()
-            },
-            if historical {
-                ProviderSubmissionReceipt::Historical
-            } else {
-                let holdback_id = (!live_ready_run_ids.is_empty()).then(|| {
-                    let Some(ProviderObservationPrior::Live(before)) = prior else {
-                        panic!(
-                            "a live observation touching private history must retain its checkpoint"
-                        );
-                    };
-                    let holdback_id = self.next_provider_holdback_id;
-                    self.next_provider_holdback_id = self.next_provider_holdback_id.wrapping_add(1);
-                    let replaced = self
-                        .provider_submission_holdbacks
-                        .insert(holdback_id, before);
-                    assert!(
-                        replaced.is_none(),
-                        "provider holdback IDs must not collide while receipts are pending"
-                    );
-                    holdback_id
-                });
-                ProviderSubmissionReceipt::Live {
-                    ready_run_ids: live_ready_run_ids,
-                    holdback_id,
-                }
-            },
-        )
+        (batch, receipt)
     }
 
     pub(crate) fn cancel_provider_observation(&mut self) {
@@ -2268,36 +2298,38 @@ impl Reducer {
         receipt: ProviderSubmissionReceipt,
         outcome: RuntimeWriteOutcome,
     ) {
-        let ProviderSubmissionReceipt::Live {
-            ready_run_ids,
-            holdback_id,
-        } = receipt
-        else {
+        let ProviderSubmissionReceipt::Live { submission_id } = receipt else {
             self.complete_deferred_operator_submission(outcome);
             return;
         };
-        self.complete_operator_submission(outcome);
-        let before = match holdback_id {
-            Some(holdback_id) => {
-                let Some(before) = self.provider_submission_holdbacks.remove(&holdback_id) else {
-                    return;
-                };
-                Some(before)
-            }
-            None => None,
+        let Some(submission_id) = submission_id else {
+            return;
         };
+        if self
+            .pending_live_provider_submission
+            .as_ref()
+            .map(|pending| pending.submission_id)
+            != Some(submission_id)
+        {
+            return;
+        }
+        let pending = self
+            .pending_live_provider_submission
+            .take()
+            .expect("the matching live provider submission must remain pending");
+        self.complete_operator_submission(outcome);
         if !matches!(
             outcome,
             RuntimeWriteOutcome::Durable | RuntimeWriteOutcome::CommittedButDegraded(_)
         ) {
-            if let Some(before) = before {
-                (*before).restore(self);
+            if let Some(checkpoint) = pending.checkpoint {
+                (*checkpoint).restore(self);
             }
             return;
         }
 
-        let mut publish = before.is_some();
-        for run_id in ready_run_ids {
+        let mut publish = pending.checkpoint.is_some();
+        for run_id in pending.ready_run_ids {
             if let Some(mut state) = self.model.task_run_v6_state(&run_id).cloned() {
                 if !state.history_ready {
                     state.history_ready = true;
@@ -3845,7 +3877,11 @@ impl Reducer {
             self.provider_model_publication_pending = true;
             return;
         }
-        if !self.provider_submission_holdbacks.is_empty() {
+        if self
+            .pending_live_provider_submission
+            .as_ref()
+            .is_some_and(|pending| pending.checkpoint.is_some())
+        {
             return;
         }
         #[cfg(test)]
@@ -4297,6 +4333,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
+    use crate::activity::ActivityDurability;
     use crate::diagnostics::RuntimeWriteOutcome;
     use crate::lockfile::StateRoot;
     use crate::model::{
@@ -4321,8 +4358,8 @@ mod tests {
     };
 
     use super::{
-        ApplyOutcome, CommitStagedError, RateObservation, RateObservationOrigin, Reducer,
-        ReducerError, RejectReason, unix_now_ms,
+        ApplyOutcome, CommitStagedError, ProviderSubmissionReceipt, RateObservation,
+        RateObservationOrigin, Reducer, ReducerError, RejectReason, unix_now_ms,
     };
 
     fn rate_reducer() -> (Reducer, SharedModel, RunId, RunKey) {
@@ -5578,6 +5615,559 @@ mod tests {
                 .map(|watermark| watermark.source_at_ms),
             Some(3_000)
         );
+    }
+
+    struct LiveSubmissionFixture {
+        reducer: Reducer,
+        shared: SharedModel,
+        operator: tokio::sync::watch::Receiver<crate::activity::OperatorSnapshot>,
+        run_id: RunId,
+        untouched_private_run_id: Option<RunId>,
+        agent_node_id: String,
+        receipt: ProviderSubmissionReceipt,
+    }
+
+    fn live_submission_fixture(
+        label: &str,
+        private: bool,
+        include_untouched_private_run: bool,
+    ) -> LiveSubmissionFixture {
+        let run_id = RunId::new();
+        let native_session_id = format!("live-submission-{label}");
+        let agent_node_id = format!("live-submission-agent-{label}");
+        let mut model = DomainModel::default();
+        model.insert_task_run(run_with_controller_evidence(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: native_session_id.clone(),
+            },
+            1,
+            TaskState::Running,
+        ));
+        model.set_task_run_v6_state(
+            run_id,
+            TaskRunV6State {
+                history_ready: !private,
+                latest_provider_at_ms: Some(1_000),
+                ..TaskRunV6State::default()
+            },
+        );
+        model.insert_agent_node(AgentNode {
+            agent_node_id: agent_node_id.clone(),
+            provider: Provider::Codex,
+            native_session_id: Some(native_session_id.clone()),
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(2),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Working),
+            model_id: Some("before-submission".to_owned()),
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
+        });
+        let untouched_private_run_id = include_untouched_private_run.then(|| {
+            let untouched_run_id = RunId::new();
+            model.insert_task_run(run_with_controller_evidence(
+                untouched_run_id,
+                RunKey::Controller(format!("live-submission-untouched-{label}")),
+                3,
+                TaskState::Queued,
+            ));
+            model.set_task_run_v6_state(
+                untouched_run_id,
+                TaskRunV6State {
+                    history_ready: false,
+                    ..TaskRunV6State::default()
+                },
+            );
+            untouched_run_id
+        });
+        let (mut reducer, shared, operator) = Reducer::new_with_operator(
+            restored(model, 4),
+            crate::activity::RestoredOperatorState {
+                activity: Vec::new(),
+                terminal_times: HashMap::new(),
+            },
+        );
+        let origin = crate::model::ObservationOrigin::Live;
+        let prior = reducer.begin_provider_observation(&origin, 2_000);
+        let mut event_metadata = metadata(&format!("live-submission-event-{label}"), 2_000);
+        event_metadata.source = "provider".to_owned();
+        event_metadata.source_event_type = "agent.activity".to_owned();
+        event_metadata.provider = Some(Provider::Codex);
+        event_metadata.native_session_id = Some(native_session_id);
+        event_metadata.task_run_id = Some(run_id);
+        event_metadata.agent_node_id = Some(agent_node_id.clone());
+        let ApplyOutcome::Applied(operations) = reducer
+            .apply(NormalizedEvent::AgentActivity {
+                metadata: event_metadata,
+                agent_node_id: agent_node_id.clone(),
+                activity: MinimalProviderMetadata {
+                    model_id: Some("after-submission".to_owned()),
+                    event_kind: Some("live-submission".to_owned()),
+                    ..MinimalProviderMetadata::default()
+                },
+            })
+            .unwrap()
+        else {
+            panic!("the live activity must apply");
+        };
+        let (batch, receipt) =
+            reducer.finish_provider_observation(prior, operations, &origin, None, 2_000);
+        assert!(!batch.operations.is_empty());
+        assert!(!batch.task_runs.is_empty());
+        LiveSubmissionFixture {
+            reducer,
+            shared,
+            operator,
+            run_id,
+            untouched_private_run_id,
+            agent_node_id,
+            receipt,
+        }
+    }
+
+    fn clone_live_receipt(receipt: &ProviderSubmissionReceipt) -> ProviderSubmissionReceipt {
+        match receipt {
+            ProviderSubmissionReceipt::Live { submission_id } => ProviderSubmissionReceipt::Live {
+                submission_id: *submission_id,
+            },
+            ProviderSubmissionReceipt::Historical => {
+                panic!("the fixture must return a live receipt")
+            }
+        }
+    }
+
+    fn live_submission_id(receipt: &ProviderSubmissionReceipt) -> Option<u64> {
+        match receipt {
+            ProviderSubmissionReceipt::Live { submission_id } => *submission_id,
+            ProviderSubmissionReceipt::Historical => {
+                panic!("the fixture must return a live receipt")
+            }
+        }
+    }
+
+    #[test]
+    fn live_provider_submission_rejects_second_begin_before_mutation() {
+        let LiveSubmissionFixture {
+            mut reducer,
+            receipt: _receipt,
+            ..
+        } = live_submission_fixture("overlap", false, false);
+        let before_rate_context = reducer.rate_observation_context;
+        let before_defer_publication = reducer.defer_provider_publication;
+        let before_defer_model_publication = reducer.defer_provider_model_publication;
+        let before_model_publication_pending = reducer.provider_model_publication_pending;
+        let before_deferred_drain = reducer.deferred_provider_drain.clone();
+        let before_private_runs = reducer.provider_observation_private_run_ids.clone();
+        let before_next_submission_id = reducer.next_provider_submission_id;
+        let before_pending_submission =
+            reducer
+                .pending_live_provider_submission
+                .as_ref()
+                .map(|pending| {
+                    (
+                        pending.submission_id,
+                        pending.checkpoint.is_some(),
+                        pending.ready_run_ids.clone(),
+                    )
+                });
+        let second_origin = crate::model::ObservationOrigin::Historical {
+            drain_id: crate::model::HistoryDrainId::new("codex:overlapping-begin").unwrap(),
+            artifact_id: "overlapping-begin.jsonl".to_owned(),
+        };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reducer.begin_provider_observation(&second_origin, 3_000);
+        }));
+
+        assert_eq!(reducer.rate_observation_context, before_rate_context);
+        assert_eq!(reducer.defer_provider_publication, before_defer_publication);
+        assert_eq!(
+            reducer.defer_provider_model_publication,
+            before_defer_model_publication
+        );
+        assert_eq!(
+            reducer.provider_model_publication_pending,
+            before_model_publication_pending
+        );
+        assert_eq!(reducer.deferred_provider_drain, before_deferred_drain);
+        assert_eq!(
+            reducer.provider_observation_private_run_ids,
+            before_private_runs
+        );
+        assert_eq!(
+            reducer.next_provider_submission_id,
+            before_next_submission_id
+        );
+        assert_eq!(
+            reducer
+                .pending_live_provider_submission
+                .as_ref()
+                .map(|pending| {
+                    (
+                        pending.submission_id,
+                        pending.checkpoint.is_some(),
+                        pending.ready_run_ids.clone(),
+                    )
+                }),
+            before_pending_submission
+        );
+        assert!(
+            result.is_err(),
+            "a second begin must reject an unresolved ordinary live submission"
+        );
+    }
+
+    #[test]
+    fn live_provider_submission_unknown_id_is_noop_and_real_receipt_completes() {
+        let LiveSubmissionFixture {
+            mut reducer,
+            operator,
+            run_id,
+            agent_node_id,
+            receipt,
+            ..
+        } = live_submission_fixture("unknown-id", true, false);
+        let submission_id =
+            live_submission_id(&receipt).expect("private work must require completion");
+        let before_activity = operator.borrow().activity.to_vec();
+        let before_pending_submission =
+            reducer
+                .pending_live_provider_submission
+                .as_ref()
+                .map(|pending| {
+                    (
+                        pending.submission_id,
+                        pending.checkpoint.is_some(),
+                        pending.ready_run_ids.clone(),
+                    )
+                });
+        let unknown_receipt = ProviderSubmissionReceipt::Live {
+            submission_id: Some(submission_id.checked_add(1).unwrap()),
+        };
+
+        reducer.complete_provider_submission(unknown_receipt, not_committed_outcome());
+
+        assert_eq!(
+            operator.borrow().activity.as_ref(),
+            before_activity.as_slice()
+        );
+        assert_eq!(
+            reducer
+                .pending_live_provider_submission
+                .as_ref()
+                .map(|pending| {
+                    (
+                        pending.submission_id,
+                        pending.checkpoint.is_some(),
+                        pending.ready_run_ids.clone(),
+                    )
+                }),
+            before_pending_submission
+        );
+        assert_eq!(
+            reducer
+                .model
+                .agent_node(&agent_node_id)
+                .and_then(|node| node.model_id.as_deref()),
+            Some("after-submission")
+        );
+        assert!(
+            !reducer
+                .model
+                .task_run_v6_state(&run_id)
+                .unwrap()
+                .history_ready
+        );
+
+        reducer.complete_provider_submission(receipt, RuntimeWriteOutcome::Durable);
+
+        assert!(
+            reducer
+                .model
+                .task_run_v6_state(&run_id)
+                .unwrap()
+                .history_ready
+        );
+        assert_eq!(
+            operator.borrow().activity[0].durability,
+            ActivityDurability::Durable
+        );
+    }
+
+    #[test]
+    fn live_provider_submission_stale_duplicate_is_noop_against_later_submission() {
+        let LiveSubmissionFixture {
+            mut reducer,
+            operator,
+            run_id,
+            agent_node_id,
+            receipt,
+            ..
+        } = live_submission_fixture("stale-first", false, false);
+        let stale_receipt = clone_live_receipt(&receipt);
+        reducer.complete_provider_submission(receipt, RuntimeWriteOutcome::Durable);
+
+        let origin = crate::model::ObservationOrigin::Live;
+        let prior = reducer.begin_provider_observation(&origin, 3_000);
+        let mut event_metadata = metadata("live-submission-event-stale-second", 3_000);
+        event_metadata.source = "provider".to_owned();
+        event_metadata.source_event_type = "agent.activity".to_owned();
+        event_metadata.provider = Some(Provider::Codex);
+        event_metadata.native_session_id = Some("live-submission-stale-first".to_owned());
+        event_metadata.task_run_id = Some(run_id);
+        event_metadata.agent_node_id = Some(agent_node_id.clone());
+        let ApplyOutcome::Applied(operations) = reducer
+            .apply(NormalizedEvent::AgentActivity {
+                metadata: event_metadata,
+                agent_node_id: agent_node_id.clone(),
+                activity: MinimalProviderMetadata {
+                    model_id: Some("second-submission".to_owned()),
+                    event_kind: Some("live-submission".to_owned()),
+                    ..MinimalProviderMetadata::default()
+                },
+            })
+            .unwrap()
+        else {
+            panic!("the second live activity must apply");
+        };
+        let (_batch, second_receipt) =
+            reducer.finish_provider_observation(prior, operations, &origin, None, 3_000);
+        let before_activity = operator.borrow().activity.to_vec();
+        let before_model_id = reducer
+            .model
+            .agent_node(&agent_node_id)
+            .and_then(|node| node.model_id.clone());
+        let before_pending_submission =
+            reducer
+                .pending_live_provider_submission
+                .as_ref()
+                .map(|pending| {
+                    (
+                        pending.submission_id,
+                        pending.checkpoint.is_some(),
+                        pending.ready_run_ids.clone(),
+                    )
+                });
+
+        reducer.complete_provider_submission(stale_receipt, not_committed_outcome());
+
+        assert_eq!(
+            operator.borrow().activity.as_ref(),
+            before_activity.as_slice()
+        );
+        assert_eq!(
+            reducer
+                .model
+                .agent_node(&agent_node_id)
+                .and_then(|node| node.model_id.clone()),
+            before_model_id
+        );
+        assert_eq!(
+            reducer
+                .pending_live_provider_submission
+                .as_ref()
+                .map(|pending| {
+                    (
+                        pending.submission_id,
+                        pending.checkpoint.is_some(),
+                        pending.ready_run_ids.clone(),
+                    )
+                }),
+            before_pending_submission
+        );
+        reducer.complete_provider_submission(
+            second_receipt,
+            RuntimeWriteOutcome::DurabilityUnknown(crate::store::writer::PersistenceFailure {
+                operation: crate::store::writer::PersistenceOperation::Apply,
+                phase: crate::store::writer::PersistencePhase::Acknowledgement,
+                code: crate::store::writer::PersistenceFailureCode::AcknowledgementDropped,
+                durability: crate::store::writer::DurabilityDisposition::Unknown,
+            }),
+        );
+        assert_eq!(
+            operator
+                .borrow()
+                .activity
+                .iter()
+                .find(|item| item.identity.event_id == "live-submission-event-stale-second")
+                .unwrap()
+                .durability,
+            ActivityDurability::DurabilityUnknown
+        );
+    }
+
+    #[test]
+    fn live_provider_submission_receipt_releases_only_reducer_owned_ready_set() {
+        let LiveSubmissionFixture {
+            mut reducer,
+            run_id,
+            untouched_private_run_id: Some(untouched_run_id),
+            receipt,
+            ..
+        } = live_submission_fixture("owned-ready-set", true, true)
+        else {
+            panic!("the fixture must include an untouched private run");
+        };
+
+        reducer.complete_provider_submission(receipt, RuntimeWriteOutcome::Durable);
+
+        assert!(
+            reducer
+                .model
+                .task_run_v6_state(&run_id)
+                .unwrap()
+                .history_ready,
+            "the reducer-owned touched run must be released"
+        );
+        assert!(
+            !reducer
+                .model
+                .task_run_v6_state(&untouched_run_id)
+                .unwrap()
+                .history_ready,
+            "a receipt must not redirect readiness to an untouched run"
+        );
+    }
+
+    #[test]
+    fn live_provider_submission_assigns_id_to_ordinary_nonempty_batch() {
+        let fixture = live_submission_fixture("ordinary-id", false, false);
+
+        assert!(
+            live_submission_id(&fixture.receipt).is_some(),
+            "ordinary live persistence must also require an opaque completion ID"
+        );
+    }
+
+    #[test]
+    fn live_provider_submission_empty_batch_has_no_completion() {
+        let (mut reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let origin = crate::model::ObservationOrigin::Live;
+        let prior = reducer.begin_provider_observation(&origin, 2_000);
+
+        let (batch, receipt) =
+            reducer.finish_provider_observation(prior, Vec::new(), &origin, None, 2_000);
+
+        assert!(batch.operations.is_empty());
+        assert!(batch.task_runs.is_empty());
+        assert!(batch.rate_totals.is_empty());
+        assert!(batch.history_drains.is_empty());
+        assert!(batch.history_associations.is_empty());
+        assert!(batch.history_publications.is_empty());
+        assert!(batch.history_event_drain.is_none());
+        assert_eq!(live_submission_id(&receipt), None);
+        assert!(reducer.pending_live_provider_submission.is_none());
+        reducer.complete_provider_submission(receipt, not_committed_outcome());
+        assert!(reducer.pending_live_provider_submission.is_none());
+    }
+
+    #[test]
+    fn live_provider_submission_outcome_matrix_preserves_checkpoint_semantics() {
+        let cases = [
+            (
+                "not-committed",
+                not_committed_outcome(),
+                false,
+                ActivityDurability::CurrentOnly,
+            ),
+            (
+                "durability-unknown",
+                RuntimeWriteOutcome::DurabilityUnknown(crate::store::writer::PersistenceFailure {
+                    operation: crate::store::writer::PersistenceOperation::Apply,
+                    phase: crate::store::writer::PersistencePhase::Acknowledgement,
+                    code: crate::store::writer::PersistenceFailureCode::AcknowledgementDropped,
+                    durability: crate::store::writer::DurabilityDisposition::Unknown,
+                }),
+                false,
+                ActivityDurability::DurabilityUnknown,
+            ),
+            (
+                "skipped",
+                RuntimeWriteOutcome::Skipped,
+                false,
+                ActivityDurability::CurrentOnly,
+            ),
+            (
+                "durable",
+                RuntimeWriteOutcome::Durable,
+                true,
+                ActivityDurability::Durable,
+            ),
+            (
+                "committed-but-degraded",
+                RuntimeWriteOutcome::CommittedButDegraded(
+                    crate::store::writer::PersistenceFailure {
+                        operation: crate::store::writer::PersistenceOperation::Apply,
+                        phase: crate::store::writer::PersistencePhase::PostApplyCommit,
+                        code: crate::store::writer::PersistenceFailureCode::Io,
+                        durability: crate::store::writer::DurabilityDisposition::Committed,
+                    },
+                ),
+                true,
+                ActivityDurability::Durable,
+            ),
+        ];
+
+        for (label, outcome, committed, expected_durability) in cases {
+            let LiveSubmissionFixture {
+                mut reducer,
+                shared,
+                operator,
+                run_id,
+                agent_node_id,
+                receipt,
+                ..
+            } = live_submission_fixture(label, true, false);
+
+            reducer.complete_provider_submission(receipt, outcome);
+
+            assert!(
+                reducer.pending_live_provider_submission.is_none(),
+                "{label}"
+            );
+            assert_eq!(
+                reducer
+                    .model
+                    .task_run_v6_state(&run_id)
+                    .unwrap()
+                    .history_ready,
+                committed,
+                "{label}"
+            );
+            assert_eq!(
+                reducer
+                    .model
+                    .agent_node(&agent_node_id)
+                    .and_then(|node| node.model_id.as_deref()),
+                Some(if committed {
+                    "after-submission"
+                } else {
+                    "before-submission"
+                }),
+                "{label}"
+            );
+            assert_eq!(
+                operator.borrow().activity[0].durability,
+                expected_durability,
+                "{label}"
+            );
+            if committed {
+                assert_eq!(
+                    shared
+                        .borrow()
+                        .agent_node(&agent_node_id)
+                        .and_then(|node| node.model_id.as_deref()),
+                    Some("after-submission"),
+                    "{label}"
+                );
+            }
+        }
     }
 
     #[test]
