@@ -137,7 +137,11 @@ An "admitted reducer event" enters the ordered reducer queue. Frames rejected by
 wire validation before queue admission do not enter the performance rate or lag
 metric. Every admitted event, including a semantic no-op or typed reducer
 rejection, reaches one terminal reducer outcome and therefore leaves the pending
-set.
+set. Pending count, sequence high-water marks, and lag include both live and
+historical provider work. Rolling rate windows count live admissions only:
+startup/backfill observations marked `ObservationOrigin::Historical` retain the
+same pending and completion lifecycle but do not describe live throughput and
+therefore add no rate-window timestamp.
 
 The event schedule uses sequence numbers and half-open clock intervals so exact
 boundaries are deterministic. A rate window at time `now` contains admission
