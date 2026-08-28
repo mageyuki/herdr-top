@@ -1505,6 +1505,8 @@ fn merge_slot(
         diagnostics.record_duplicate();
         return MergeOutcome::Duplicate;
     }
+    let retain_live_origin = matches!(&stored.origin, ObservationOrigin::Live)
+        || matches!(&incoming_origin, ObservationOrigin::Live);
 
     let replace = match (&stored.event, &incoming) {
         (
@@ -1530,6 +1532,13 @@ fn merge_slot(
             origin: incoming_origin,
             history_manifest: incoming_manifest,
         });
+        if retain_live_origin {
+            promote_live_origin(
+                slot.as_mut().expect("replacement pending slot exists"),
+                ObservationOrigin::Live,
+                None,
+            );
+        }
     } else {
         promote_live_origin(stored, incoming_origin, incoming_manifest);
     }
@@ -3041,6 +3050,22 @@ mod tests {
         }
     }
 
+    fn historical_observation(drain_id: &str) -> (ObservationOrigin, Arc<PersistHistoryDrain>) {
+        let drain_id = HistoryDrainId::new(drain_id).unwrap();
+        (
+            ObservationOrigin::Historical {
+                drain_id: drain_id.clone(),
+                artifact_id: format!("{}-artifact", drain_id.as_str()),
+            },
+            Arc::new(PersistHistoryDrain {
+                drain_id,
+                provider: Provider::Codex,
+                created_at_ms: 1,
+                artifacts: Vec::new(),
+            }),
+        )
+    }
+
     fn agent_activity(provider: Provider) -> ProviderEvent {
         ProviderEvent::Activity {
             provider,
@@ -3539,6 +3564,148 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    #[test]
+    fn provider_pending_terminal_upsert_preserves_live_provenance() {
+        let assert_retained = |pending: &PendingEvents,
+                               expected_event: &ProviderEvent,
+                               expected_origin: &ObservationOrigin,
+                               expected_manifest: Option<&Arc<PersistHistoryDrain>>,
+                               label: &str| {
+            let retained = pending.originated_events_for_test();
+            assert_eq!(retained.len(), 1, "{label}");
+            let (event, origin, manifest) = retained.into_iter().next().unwrap();
+            assert_eq!(&event, expected_event, "{label}");
+            assert_eq!(&origin, expected_origin, "{label}");
+            match (manifest.as_ref(), expected_manifest) {
+                (None, None) => {}
+                (Some(actual), Some(expected)) => {
+                    assert!(Arc::ptr_eq(actual, expected), "{label}");
+                }
+                _ => panic!("{label}: retained the wrong history manifest"),
+            }
+        };
+
+        let terminal = agent_state_upsert(
+            ExecState::Ended,
+            "historical-terminal-owner",
+            "historical-terminal",
+            100,
+            1,
+        );
+        let live_idle = agent_state_upsert(ExecState::Idle, "live-idle-owner", "live-idle", 200, 2);
+        let (terminal_origin, terminal_manifest) = historical_observation("terminal-then-live");
+        let mut pending = PendingEvents::new(ProviderDiagnostics::default());
+        assert_eq!(
+            pending.merge_with_origin(terminal.clone(), terminal_origin, Some(terminal_manifest)),
+            MergeOutcome::Accepted,
+            "historical terminal then live idle"
+        );
+        assert_eq!(
+            pending.merge_with_origin(live_idle.clone(), ObservationOrigin::Live, None),
+            MergeOutcome::Coalesced,
+            "historical terminal then live idle"
+        );
+        assert_retained(
+            &pending,
+            &terminal,
+            &ObservationOrigin::Live,
+            None,
+            "historical terminal then live idle",
+        );
+
+        for terminal_first in [true, false] {
+            let label = if terminal_first {
+                "historical terminal then historical idle"
+            } else {
+                "historical idle then historical terminal"
+            };
+            let terminal = agent_state_upsert(
+                ExecState::Ended,
+                "historical-terminal-owner",
+                "historical-terminal",
+                100,
+                3,
+            );
+            let historical_idle = agent_state_upsert(
+                ExecState::Idle,
+                "historical-idle-owner",
+                "historical-idle",
+                200,
+                4,
+            );
+            let (terminal_origin, terminal_manifest) =
+                historical_observation(&format!("terminal-{terminal_first}"));
+            let (idle_origin, idle_manifest) =
+                historical_observation(&format!("idle-{terminal_first}"));
+            let mut pending = PendingEvents::new(ProviderDiagnostics::default());
+            let observations = if terminal_first {
+                [
+                    (
+                        terminal.clone(),
+                        terminal_origin.clone(),
+                        terminal_manifest.clone(),
+                    ),
+                    (historical_idle, idle_origin, idle_manifest),
+                ]
+            } else {
+                [
+                    (historical_idle, idle_origin, idle_manifest),
+                    (
+                        terminal.clone(),
+                        terminal_origin.clone(),
+                        terminal_manifest.clone(),
+                    ),
+                ]
+            };
+            for (index, (event, origin, manifest)) in observations.into_iter().enumerate() {
+                assert_eq!(
+                    pending.merge_with_origin(event, origin, Some(manifest)),
+                    if index == 0 {
+                        MergeOutcome::Accepted
+                    } else {
+                        MergeOutcome::Coalesced
+                    },
+                    "{label}"
+                );
+            }
+            assert_retained(
+                &pending,
+                &terminal,
+                &terminal_origin,
+                Some(&terminal_manifest),
+                label,
+            );
+        }
+
+        let terminal = agent_state_upsert(
+            ExecState::Ended,
+            "historical-terminal-owner",
+            "historical-terminal",
+            100,
+            5,
+        );
+        let live_idle = agent_state_upsert(ExecState::Idle, "live-idle-owner", "live-idle", 200, 6);
+        let (terminal_origin, terminal_manifest) = historical_observation("live-then-terminal");
+        let mut pending = PendingEvents::new(ProviderDiagnostics::default());
+        assert_eq!(
+            pending.merge_with_origin(live_idle, ObservationOrigin::Live, None),
+            MergeOutcome::Accepted,
+            "live idle then historical terminal"
+        );
+        assert_eq!(
+            pending.merge_with_origin(terminal.clone(), terminal_origin, Some(terminal_manifest)),
+            MergeOutcome::Coalesced,
+            "live idle then historical terminal"
+        );
+        assert_retained(
+            &pending,
+            &terminal,
+            &ObservationOrigin::Live,
+            None,
+            "live idle then historical terminal",
+        );
     }
 
     #[test]
