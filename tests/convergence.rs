@@ -300,8 +300,8 @@ fn terminal_visibility_is_one_hour_at_every_depth_and_closes_over_ancestors() {
     );
     for run_id in [root, child, grandchild] {
         assert!(!is_default_visible_task_run(
+            &model,
             model.task_run(&run_id).unwrap(),
-            &all_at_boundary,
             &execution_runs,
             now_ms,
         ));
@@ -311,26 +311,30 @@ fn terminal_visibility_is_one_hour_at_every_depth_and_closes_over_ancestors() {
         0
     );
 
+    let mut visible_grandchild = model.task_run(&grandchild).unwrap().clone();
+    visible_grandchild.updated_at_ms = Some(boundary_at_ms + 1);
+    visible_grandchild.finished_at_ms = Some(boundary_at_ms + 1);
+    model.insert_task_run(visible_grandchild);
     let descendant_visible = operator(HashMap::from([
         (root, boundary_at_ms),
         (child, boundary_at_ms),
         (grandchild, boundary_at_ms + 1),
     ]));
     assert!(!is_default_visible_task_run(
+        &model,
         model.task_run(&root).unwrap(),
-        &descendant_visible,
         &execution_runs,
         now_ms,
     ));
     assert!(!is_default_visible_task_run(
+        &model,
         model.task_run(&child).unwrap(),
-        &descendant_visible,
         &execution_runs,
         now_ms,
     ));
     assert!(is_default_visible_task_run(
+        &model,
         model.task_run(&grandchild).unwrap(),
-        &descendant_visible,
         &execution_runs,
         now_ms,
     ));

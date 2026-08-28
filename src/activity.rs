@@ -121,51 +121,31 @@ pub fn is_hook_only_stale_task_run(
 /// `runs_with_executions` must be derived from the same model snapshot as `run`.
 #[must_use]
 pub fn is_default_visible_task_run(
+    model: &crate::model::DomainModel,
     run: &crate::model::TaskRun,
-    operator: &OperatorSnapshot,
     runs_with_executions: &HashSet<RunId>,
     now_ms: i64,
 ) -> bool {
     is_default_visible_task_run_with_ghost_window(
+        model,
         run,
-        operator,
         runs_with_executions,
         now_ms,
         ghost_visibility_ms(),
     )
 }
 
-#[must_use]
-pub(crate) fn is_default_visible_task_run_in_model(
-    model: &crate::model::DomainModel,
-    run: &TaskRun,
-    operator: &OperatorSnapshot,
-    runs_with_executions: &HashSet<RunId>,
-    now_ms: i64,
-) -> bool {
-    if !is_default_visible_task_run(run, operator, runs_with_executions, now_ms) {
-        return false;
-    }
-    run.state.is_terminal()
-        || model
-            .task_run_v6_state(&run.run_id)
-            .and_then(|state| state.native_session_end.as_ref())
-            .is_none_or(|end| now_ms < end.at_ms.saturating_add(DEFAULT_TERMINAL_VISIBILITY_MS))
-}
-
 /// Computes the single default-visible run set and closes it over execution ancestors.
 #[must_use]
 pub(crate) fn default_visible_task_run_ids(
     model: &crate::model::DomainModel,
-    operator: &OperatorSnapshot,
+    _operator: &OperatorSnapshot,
     now_ms: i64,
 ) -> HashSet<RunId> {
     let execution_run_ids = runs_with_executions(model);
     let mut visible = model
         .task_runs()
-        .filter(|run| {
-            is_default_visible_task_run_in_model(model, run, operator, &execution_run_ids, now_ms)
-        })
+        .filter(|run| is_default_visible_task_run(model, run, &execution_run_ids, now_ms))
         .map(|run| run.run_id)
         .collect::<HashSet<_>>();
     loop {
@@ -190,8 +170,8 @@ pub(crate) fn default_visible_task_run_ids(
 /// ordinary terminal and hook-only windows.
 #[must_use]
 pub fn is_default_visible_task_run_with_ghost_window(
+    model: &crate::model::DomainModel,
     run: &crate::model::TaskRun,
-    operator: &OperatorSnapshot,
     runs_with_executions: &HashSet<RunId>,
     now_ms: i64,
     ghost_visibility_ms: i64,
@@ -199,7 +179,8 @@ pub fn is_default_visible_task_run_with_ghost_window(
     if run.dismissed_at_ms.is_some() {
         return false;
     }
-    if !run.state.is_terminal()
+    let lifecycle_end_ms = model.effective_lifecycle_end_ms(run);
+    if lifecycle_end_ms.is_none()
         && let RunKey::Provisional { start_ms, .. } = &run.key
     {
         let last_observed_ms = run.updated_at_ms.or(run.created_at_ms).unwrap_or(*start_ms);
@@ -210,13 +191,8 @@ pub fn is_default_visible_task_run_with_ghost_window(
     if is_hook_only_stale_task_run(run, runs_with_executions, now_ms) {
         return false;
     }
-    !run.state.is_terminal()
-        || operator
-            .terminal_times
-            .get(&run.run_id)
-            .is_none_or(|first_terminal_ms| {
-                now_ms < first_terminal_ms.saturating_add(DEFAULT_TERMINAL_VISIBILITY_MS)
-            })
+    lifecycle_end_ms
+        .is_none_or(|end_ms| now_ms < end_ms.saturating_add(DEFAULT_TERMINAL_VISIBILITY_MS))
 }
 
 #[must_use]
@@ -273,6 +249,11 @@ mod tests {
         ];
         let mut model = DomainModel::default();
         for (index, (run_id, state)) in run_ids.into_iter().zip(states).enumerate() {
+            let finished_at_ms = match index {
+                1 => Some(now_ms - 3_599_999),
+                2 => Some(now_ms - 3_600_000),
+                _ => None,
+            };
             model.insert_task_run(TaskRun {
                 run_id,
                 key: RunKey::Controller(format!("visibility-{index}")),
@@ -281,7 +262,7 @@ mod tests {
                 has_controller_task_state_event: true,
                 created_at_ms: None,
                 updated_at_ms: None,
-                finished_at_ms: None,
+                finished_at_ms,
                 subject: None,
                 dismissed_at_ms: None,
             });
@@ -306,7 +287,8 @@ mod tests {
     #[test]
     fn semantic_terminal_visibility_takes_precedence_over_expired_native_lifecycle() {
         let now_ms = 7_200_000;
-        let run = task_run(
+        let semantic_end_ms = now_ms - DEFAULT_TERMINAL_VISIBILITY_MS + 1;
+        let mut run = task_run(
             RunKey::Native {
                 provider: Provider::Codex,
                 sid: "semantic-terminal".to_owned(),
@@ -314,6 +296,7 @@ mod tests {
             TaskState::Completed,
             Some(now_ms),
         );
+        run.finished_at_ms = Some(semantic_end_ms);
         let mut model = DomainModel::default();
         model.insert_task_run(run.clone());
         model.set_task_run_v6_state(
@@ -326,18 +309,43 @@ mod tests {
                 ..TaskRunV6State::default()
             },
         );
-        let operator = OperatorSnapshot {
-            activity: Arc::from(Vec::new()),
-            terminal_times: Arc::new(HashMap::from([(
-                run.run_id,
-                now_ms - DEFAULT_TERMINAL_VISIBILITY_MS + 1,
-            )])),
-        };
-
-        assert!(is_default_visible_task_run_in_model(
+        assert!(is_default_visible_task_run(
             &model,
             &run,
-            &operator,
+            &HashSet::new(),
+            now_ms,
+        ));
+    }
+
+    #[test]
+    fn model_visibility_uses_effective_endpoint_precedence() {
+        let now_ms = 7_200_000;
+        let semantic_end_ms = now_ms - DEFAULT_TERMINAL_VISIBILITY_MS + 1;
+        let mut run = task_run(
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "effective-endpoint".to_owned(),
+            },
+            TaskState::Running,
+            Some(semantic_end_ms),
+        );
+        run.finished_at_ms = Some(semantic_end_ms);
+        let mut model = DomainModel::default();
+        model.insert_task_run(run.clone());
+        model.set_task_run_v6_state(
+            run.run_id,
+            TaskRunV6State {
+                native_session_end: Some(NativeSessionEnd {
+                    status: NativeSessionEndStatus::Done,
+                    at_ms: now_ms - DEFAULT_TERMINAL_VISIBILITY_MS - 1,
+                }),
+                ..TaskRunV6State::default()
+            },
+        );
+
+        assert!(is_default_visible_task_run(
+            &model,
+            &run,
             &HashSet::new(),
             now_ms,
         ));
@@ -369,13 +377,7 @@ mod tests {
             );
 
             assert!(
-                !is_default_visible_task_run_in_model(
-                    &model,
-                    &run,
-                    &empty_operator(),
-                    &HashSet::new(),
-                    now_ms,
-                ),
+                !is_default_visible_task_run(&model, &run, &HashSet::new(), now_ms,),
                 "{sid} must expire exactly at the one-hour boundary"
             );
         }
@@ -385,16 +387,18 @@ mod tests {
     fn visible_grandchild_keeps_expired_execution_ancestors_as_structure() {
         let now_ms = 7_200_000;
         let mut model = DomainModel::default();
-        let root = task_run(
+        let mut root = task_run(
             RunKey::Controller("root".to_owned()),
             TaskState::Completed,
             None,
         );
-        let child = task_run(
+        root.finished_at_ms = Some(now_ms - DEFAULT_TERMINAL_VISIBILITY_MS);
+        let mut child = task_run(
             RunKey::Controller("child".to_owned()),
             TaskState::Completed,
             None,
         );
+        child.finished_at_ms = Some(now_ms - DEFAULT_TERMINAL_VISIBILITY_MS);
         let grandchild = task_run(
             RunKey::Controller("grandchild".to_owned()),
             TaskState::Running,
@@ -411,16 +415,28 @@ mod tests {
             parent_run_id: child.run_id,
             child_run_id: grandchild.run_id,
         });
-        let operator = OperatorSnapshot {
-            activity: Arc::from(Vec::new()),
-            terminal_times: Arc::new(HashMap::from([
-                (root.run_id, now_ms - DEFAULT_TERMINAL_VISIBILITY_MS),
-                (child.run_id, now_ms - DEFAULT_TERMINAL_VISIBILITY_MS),
-            ])),
-        };
+        let execution_run_ids = runs_with_executions(&model);
+        assert!(!is_default_visible_task_run(
+            &model,
+            &root,
+            &execution_run_ids,
+            now_ms,
+        ));
+        assert!(!is_default_visible_task_run(
+            &model,
+            &child,
+            &execution_run_ids,
+            now_ms,
+        ));
+        assert!(is_default_visible_task_run(
+            &model,
+            &grandchild,
+            &execution_run_ids,
+            now_ms,
+        ));
 
         assert_eq!(
-            default_visible_task_run_ids(&model, &operator, now_ms),
+            default_visible_task_run_ids(&model, &empty_operator(), now_ms),
             HashSet::from([root.run_id, child.run_id, grandchild.run_id])
         );
     }
@@ -460,14 +476,14 @@ mod tests {
         let now_ms = 100 + HOOK_ONLY_STALE_VISIBILITY_MS;
 
         assert!(is_default_visible_task_run(
+            &model,
             &run,
-            &empty_operator(),
             &std::collections::HashSet::from([run.run_id]),
             now_ms,
         ));
         assert!(!is_default_visible_task_run(
+            &model,
             &run,
-            &empty_operator(),
             &std::collections::HashSet::new(),
             now_ms,
         ));
@@ -484,18 +500,17 @@ mod tests {
         );
         let mut model = DomainModel::default();
         model.insert_task_run(run.clone());
-        let operator = empty_operator();
         let execution_run_ids = runs_with_executions(&model);
 
         assert!(is_default_visible_task_run(
+            &model,
             &run,
-            &operator,
             &execution_run_ids,
             updated_at_ms + 86_400_000 - 1,
         ));
         assert!(!is_default_visible_task_run(
+            &model,
             &run,
-            &operator,
             &execution_run_ids,
             updated_at_ms + 86_400_000,
         ));
@@ -504,8 +519,8 @@ mod tests {
         fresh.updated_at_ms = Some(updated_at_ms + 86_400_000);
         model.insert_task_run(fresh.clone());
         assert!(is_default_visible_task_run(
+            &model,
             &fresh,
-            &operator,
             &execution_run_ids,
             updated_at_ms + 86_400_000,
         ));
@@ -526,8 +541,8 @@ mod tests {
         let execution_run_ids = runs_with_executions(&model);
 
         assert!(is_default_visible_task_run(
+            &model,
             &run,
-            &empty_operator(),
             &execution_run_ids,
             86_400_100,
         ));
@@ -552,8 +567,8 @@ mod tests {
         let execution_run_ids = runs_with_executions(&model);
 
         assert!(is_default_visible_task_run(
+            &model,
             &run,
-            &empty_operator(),
             &execution_run_ids,
             i64::MAX,
         ));
@@ -572,8 +587,8 @@ mod tests {
         let execution_run_ids = runs_with_executions(&model);
 
         assert!(!is_default_visible_task_run(
+            &model,
             &run,
-            &empty_operator(),
             &execution_run_ids,
             101,
         ));
@@ -591,8 +606,8 @@ mod tests {
         let execution_run_ids = runs_with_executions(&model);
 
         assert!(is_default_visible_task_run(
+            &model,
             &run,
-            &empty_operator(),
             &execution_run_ids,
             i64::MAX,
         ));
@@ -600,7 +615,7 @@ mod tests {
 
     #[test]
     fn terminal_visibility_remains_one_hour_with_exact_boundary() {
-        let run = task_run(
+        let mut run = task_run(
             RunKey::Native {
                 provider: Provider::Codex,
                 sid: "terminal".to_owned(),
@@ -608,23 +623,20 @@ mod tests {
             TaskState::Completed,
             Some(50),
         );
+        run.finished_at_ms = Some(100);
         let mut model = DomainModel::default();
         model.insert_task_run(run.clone());
-        let operator = OperatorSnapshot {
-            activity: Arc::from(Vec::new()),
-            terminal_times: Arc::new(HashMap::from([(run.run_id, 100)])),
-        };
         let execution_run_ids = runs_with_executions(&model);
 
         assert!(is_default_visible_task_run(
+            &model,
             &run,
-            &operator,
             &execution_run_ids,
             3_600_099,
         ));
         assert!(!is_default_visible_task_run(
+            &model,
             &run,
-            &operator,
             &execution_run_ids,
             3_600_100,
         ));
@@ -650,7 +662,7 @@ mod tests {
             TaskState::Running,
             Some(updated_at_ms),
         );
-        let terminal_ghost = task_run(
+        let mut terminal_ghost = task_run(
             RunKey::Provisional {
                 terminal_id: "completed".to_owned(),
                 start_ms: updated_at_ms,
@@ -659,51 +671,52 @@ mod tests {
             TaskState::Completed,
             Some(updated_at_ms),
         );
+        terminal_ghost.finished_at_ms = Some(updated_at_ms);
         let execution_run_ids =
             HashSet::from([ghost.run_id, ordinary.run_id, terminal_ghost.run_id]);
-        let operator = OperatorSnapshot {
-            activity: Arc::from(Vec::new()),
-            terminal_times: Arc::new(HashMap::from([(terminal_ghost.run_id, updated_at_ms)])),
-        };
+        let mut model = DomainModel::default();
+        for run in [&ghost, &ordinary, &terminal_ghost] {
+            model.insert_task_run(run.clone());
+        }
 
         assert!(is_default_visible_task_run_with_ghost_window(
+            &model,
             &ghost,
-            &operator,
             &execution_run_ids,
             updated_at_ms + DEFAULT_GHOST_VISIBILITY_MS - 1,
             DEFAULT_GHOST_VISIBILITY_MS,
         ));
         assert!(!is_default_visible_task_run_with_ghost_window(
+            &model,
             &ghost,
-            &operator,
             &execution_run_ids,
             updated_at_ms + DEFAULT_GHOST_VISIBILITY_MS,
             DEFAULT_GHOST_VISIBILITY_MS,
         ));
         assert!(is_default_visible_task_run_with_ghost_window(
+            &model,
             &ordinary,
-            &operator,
             &execution_run_ids,
             updated_at_ms + DEFAULT_GHOST_VISIBILITY_MS,
             DEFAULT_GHOST_VISIBILITY_MS,
         ));
         assert!(is_default_visible_task_run_with_ghost_window(
+            &model,
             &terminal_ghost,
-            &operator,
             &execution_run_ids,
             updated_at_ms + DEFAULT_GHOST_VISIBILITY_MS,
             DEFAULT_GHOST_VISIBILITY_MS,
         ));
         assert!(is_default_visible_task_run_with_ghost_window(
+            &model,
             &terminal_ghost,
-            &operator,
             &execution_run_ids,
             updated_at_ms + DEFAULT_TERMINAL_VISIBILITY_MS - 1,
             DEFAULT_GHOST_VISIBILITY_MS,
         ));
         assert!(!is_default_visible_task_run_with_ghost_window(
+            &model,
             &terminal_ghost,
-            &operator,
             &execution_run_ids,
             updated_at_ms + DEFAULT_TERMINAL_VISIBILITY_MS,
             DEFAULT_GHOST_VISIBILITY_MS,

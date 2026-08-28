@@ -37,8 +37,7 @@ pub(crate) struct RunMetricInputs {
     pub(crate) rate_cursor_initialized: bool,
     pub(crate) started_wall_ms: Option<i64>,
     pub(crate) created_at_ms: Option<i64>,
-    pub(crate) finished_at_ms: Option<i64>,
-    pub(crate) terminal: bool,
+    pub(crate) lifecycle_end_at_ms: Option<i64>,
 }
 
 pub(crate) fn run_metric_inputs(model: &DomainModel, run: &TaskRun) -> RunMetricInputs {
@@ -53,8 +52,7 @@ pub(crate) fn run_metric_inputs(model: &DomainModel, run: &TaskRun) -> RunMetric
         rate_cursor_initialized: model.run_rate_cursor(&run.run_id).is_some(),
         started_wall_ms: telemetry.map(|telemetry| telemetry.started_wall_ms),
         created_at_ms: run.created_at_ms,
-        finished_at_ms: run.finished_at_ms,
-        terminal: run.state.is_terminal(),
+        lifecycle_end_at_ms: model.effective_lifecycle_end_ms(run),
     }
 }
 
@@ -176,14 +174,12 @@ fn aggregate_summary_rows(
         let metrics = run_metric_inputs(model, run);
         let group = groups.entry(label(run, &metrics)).or_default();
         group.run_count = group.run_count.saturating_add(1);
-        if !run.state.is_terminal() {
+        let lifecycle_end_ms = model.effective_lifecycle_end_ms(run);
+        if lifecycle_end_ms.is_none() {
             group.live_count = group.live_count.saturating_add(1);
         }
-        if let Some(duration) = run
-            .state
-            .is_terminal()
-            .then(|| run.finished_at_ms.zip(run.created_at_ms))
-            .flatten()
+        if let Some(duration) = lifecycle_end_ms
+            .zip(run.created_at_ms)
             .and_then(|(finished, created)| finished.checked_sub(created))
             .filter(|duration| *duration >= 0)
         {
@@ -321,7 +317,7 @@ pub(crate) fn stalled_run_ids(
 ) -> HashSet<RunId> {
     let active = model
         .task_runs()
-        .filter(|run| !run.state.is_terminal())
+        .filter(|run| model.effective_lifecycle_end_ms(run).is_none())
         .filter(|run| {
             run.updated_at_ms
                 .or(run.created_at_ms)
@@ -345,7 +341,7 @@ pub(crate) fn stalled_run_ids(
 
     model
         .task_runs()
-        .filter(|run| !run.state.is_terminal())
+        .filter(|run| model.effective_lifecycle_end_ms(run).is_none())
         .filter(|run| {
             run.updated_at_ms
                 .or(run.created_at_ms)
@@ -513,7 +509,7 @@ pub(crate) fn project_rows(
 pub(crate) fn project_rows_with_visible(
     model: &DomainModel,
     full_rows: &[TreeRow],
-    operator: &OperatorSnapshot,
+    _operator: &OperatorSnapshot,
     visible_runs: &HashSet<RunId>,
     query: &str,
     collapsed: &HashSet<NodeKey>,
@@ -573,18 +569,16 @@ pub(crate) fn project_rows_with_visible(
             continue;
         };
         if visible_runs.contains(&run_id) {
-            if !run.state.is_terminal()
+            if model.effective_lifecycle_end_ms(run).is_none()
                 && let RunKey::Provisional { start_ms, .. } = &run.key
             {
                 let last_observed_ms = run.updated_at_ms.or(run.created_at_ms).unwrap_or(*start_ms);
                 let expiry = last_observed_ms.saturating_add(ghost_visibility_ms());
                 next_expiry_ms = Some(next_expiry_ms.map_or(expiry, |current| current.min(expiry)));
-            } else if let Some(first_terminal_ms) =
-                authoritative_terminal_visibility_start_ms(model, operator, run)
-                && crate::activity::is_default_visible_task_run_in_model(
+            } else if let Some(first_terminal_ms) = model.effective_lifecycle_end_ms(run)
+                && crate::activity::is_default_visible_task_run(
                     model,
                     run,
-                    operator,
                     &execution_run_ids,
                     now_ms,
                 )
@@ -619,21 +613,6 @@ pub(crate) fn project_rows_with_visible(
     }
 }
 
-fn authoritative_terminal_visibility_start_ms(
-    model: &DomainModel,
-    operator: &OperatorSnapshot,
-    run: &TaskRun,
-) -> Option<i64> {
-    if run.state.is_terminal() {
-        operator.terminal_times.get(&run.run_id).copied()
-    } else {
-        model
-            .task_run_v6_state(&run.run_id)
-            .and_then(|state| state.native_session_end.as_ref())
-            .map(|end| end.at_ms)
-    }
-}
-
 fn min_expiry(left: Option<i64>, right: Option<i64>) -> Option<i64> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.min(right)),
@@ -647,7 +626,7 @@ fn next_live_duration_expiry_ms(model: &DomainModel, rows: &[TreeRow], now_ms: i
         .iter()
         .filter_map(|row| row.key.run_id())
         .filter_map(|run_id| model.task_run(&run_id))
-        .filter(|run| !run.state.is_terminal())
+        .filter(|run| model.effective_lifecycle_end_ms(run).is_none())
         .filter_map(|run| run.created_at_ms)
         .filter_map(|created_at_ms| now_ms.checked_sub(created_at_ms))
         .any(|elapsed_ms| elapsed_ms >= 0);
@@ -1840,6 +1819,42 @@ mod tests {
     }
 
     #[test]
+    fn summary_treats_native_ended_run_as_ended_at_native_timestamp() {
+        let mut ended = run("native-ended-summary", 1, TaskState::Running);
+        ended.created_at_ms = Some(1_000);
+        let mut model = DomainModel::default();
+        model.insert_task_run(ended.clone());
+        model.set_task_run_v6_state(
+            ended.run_id,
+            TaskRunV6State {
+                native_session_end: Some(NativeSessionEnd {
+                    status: NativeSessionEndStatus::Done,
+                    at_ms: 4_000,
+                }),
+                ..TaskRunV6State::default()
+            },
+        );
+
+        let summary = summary_projection(
+            &model,
+            &[],
+            Some(&NodeKey::Session),
+            SummaryScope::Session,
+            50_000,
+        );
+        let row = summary
+            .worker_kinds
+            .iter()
+            .find(|row| row.label == "native-ended-summary")
+            .unwrap();
+
+        assert_eq!(row.run_count, 1);
+        assert_eq!(row.live_count, 0);
+        assert_eq!(row.total_duration_ms, 3_000);
+        assert_eq!(row.mean_duration_ms, Some(3_000));
+    }
+
+    #[test]
     fn restored_rate_totals_drive_run_rate_without_a_cursor_or_wall_time() {
         let mut task_run = run("restored-rate", 1, TaskState::Completed);
         task_run.created_at_ms = Some(0);
@@ -2730,6 +2745,27 @@ mod tests {
         assert!(stalled.contains(&child.run_id));
     }
 
+    #[test]
+    fn native_ended_run_is_not_stalled() {
+        let mut ended = run("native-ended", 1, TaskState::Running);
+        ended.created_at_ms = Some(0);
+        ended.updated_at_ms = Some(0);
+        let mut model = DomainModel::default();
+        model.insert_task_run(ended.clone());
+        model.set_task_run_v6_state(
+            ended.run_id,
+            TaskRunV6State {
+                native_session_end: Some(NativeSessionEnd {
+                    status: NativeSessionEndStatus::Done,
+                    at_ms: 100,
+                }),
+                ..TaskRunV6State::default()
+            },
+        );
+
+        assert!(!stalled_run_ids(&model, 1_000, 500).contains(&ended.run_id));
+    }
+
     fn row(key: NodeKey, depth: usize, label: &str) -> TreeRow {
         TreeRow {
             key,
@@ -3019,7 +3055,10 @@ mod tests {
             provider: Provider::Codex,
             sid: "old-searchable".to_owned(),
         };
-        let fresh = run("fresh", 2, TaskState::Completed);
+        old.finished_at_ms = Some(0);
+        let now = 7_200_000;
+        let mut fresh = run("fresh", 2, TaskState::Completed);
+        fresh.finished_at_ms = Some(now - 3_599_999);
         let live = run("live", 3, TaskState::Running);
         let mut model = DomainModel::default();
         for item in [&old, &fresh, &live] {
@@ -3042,7 +3081,6 @@ mod tests {
             )
         })
         .collect::<Vec<_>>();
-        let now = 7_200_000;
         let terminal_times = HashMap::from([(old.run_id, 0), (fresh.run_id, now - 3_599_999)]);
         let operator = operator(Vec::new(), terminal_times);
 
@@ -3099,6 +3137,7 @@ mod tests {
             provider: Provider::Codex,
             sid: "session-42".to_owned(),
         };
+        terminal.finished_at_ms = Some(semantic_terminal_at_ms);
         let mut model = DomainModel::default();
         model.insert_task_run(terminal.clone());
         model.set_task_run_v6_state(
@@ -3148,6 +3187,7 @@ mod tests {
             provider: Provider::Codex,
             sid: "session-42".to_owned(),
         };
+        ended.created_at_ms = Some(0);
         let mut model = DomainModel::default();
         model.insert_task_run(ended.clone());
         model.set_task_run_v6_state(
@@ -3176,7 +3216,7 @@ mod tests {
             "",
             &HashSet::new(),
             ViewMode::DependencyDag,
-            native_end_at_ms,
+            1_500,
         );
 
         assert_eq!(projection.rows.len(), 1);
@@ -3225,6 +3265,7 @@ mod tests {
             seq: 1,
         };
         terminal.updated_at_ms = Some(updated_at_ms);
+        terminal.finished_at_ms = Some(updated_at_ms);
         let mut model = DomainModel::default();
         model.insert_task_run(terminal.clone());
         let rows = vec![row(

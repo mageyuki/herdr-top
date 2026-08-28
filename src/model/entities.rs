@@ -1200,6 +1200,16 @@ impl DomainModel {
         self.task_run_v6_state.get(run_id)
     }
 
+    /// Returns the endpoint used by lifecycle consumers without changing semantic task state.
+    #[must_use]
+    pub fn effective_lifecycle_end_ms(&self, run: &TaskRun) -> Option<i64> {
+        run.finished_at_ms.or_else(|| {
+            self.task_run_v6_state(&run.run_id)
+                .and_then(|state| state.native_session_end.as_ref())
+                .map(|end| end.at_ms)
+        })
+    }
+
     /// Replaces persisted lifecycle and historical-readiness state for one run.
     pub fn set_task_run_v6_state(
         &mut self,
@@ -1775,7 +1785,58 @@ pub enum AgentSessionReferenceKind {
 mod tests {
     use super::*;
     use crate::model::ids::{DisplayOrdinal, Provider, RunId, RunKey};
-    use crate::model::state::{ExecState, PaneAgentStatus, TaskState};
+    use crate::model::state::{
+        ExecState, NativeSessionEnd, NativeSessionEndStatus, PaneAgentStatus, TaskState,
+    };
+
+    #[test]
+    fn effective_lifecycle_end_prefers_semantic_finish_then_native_end() {
+        let semantic = RunId::new();
+        let native = RunId::new();
+        let live = RunId::new();
+        let mut model = DomainModel::default();
+        for (run_id, ordinal, finished_at_ms) in
+            [(semantic, 1, Some(500)), (native, 2, None), (live, 3, None)]
+        {
+            model.insert_task_run(TaskRun {
+                run_id,
+                key: RunKey::Controller(format!("lifecycle-{ordinal}")),
+                display_ordinal: DisplayOrdinal::new(ordinal),
+                state: TaskState::Running,
+                has_controller_task_state_event: true,
+                created_at_ms: Some(100),
+                updated_at_ms: Some(500),
+                finished_at_ms,
+                subject: None,
+                dismissed_at_ms: None,
+            });
+        }
+        for (run_id, at_ms) in [(semantic, 300), (native, 400)] {
+            model.set_task_run_v6_state(
+                run_id,
+                TaskRunV6State {
+                    native_session_end: Some(NativeSessionEnd {
+                        status: NativeSessionEndStatus::Done,
+                        at_ms,
+                    }),
+                    ..TaskRunV6State::default()
+                },
+            );
+        }
+
+        assert_eq!(
+            model.effective_lifecycle_end_ms(model.task_run(&semantic).unwrap()),
+            Some(500)
+        );
+        assert_eq!(
+            model.effective_lifecycle_end_ms(model.task_run(&native).unwrap()),
+            Some(400)
+        );
+        assert_eq!(
+            model.effective_lifecycle_end_ms(model.task_run(&live).unwrap()),
+            None
+        );
+    }
 
     #[test]
     fn domain_model_construction() {

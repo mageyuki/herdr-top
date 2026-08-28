@@ -1350,27 +1350,26 @@ impl Store {
                  SELECT candidate.run_id \
                  FROM task_runs AS candidate \
                  WHERE candidate.merged_into IS NULL \
-                   AND candidate.task_state IN (\
-                       'completed', 'failed', 'cancelled', 'ended_unknown'\
-                   ) \
-                   AND candidate.finished_at_ms < ?1 \
+                   AND COALESCE(\
+                       candidate.finished_at_ms, candidate.native_session_end_at_ms\
+                   ) < ?1 \
                    AND NOT EXISTS (\
                        SELECT 1 \
                        FROM execution_edges AS edge \
                        JOIN task_runs AS active ON active.run_id = edge.child_run_id \
                        WHERE edge.parent_run_id = candidate.run_id \
-                         AND active.task_state NOT IN (\
-                             'completed', 'failed', 'cancelled', 'ended_unknown'\
-                         )\
+                         AND COALESCE(\
+                             active.finished_at_ms, active.native_session_end_at_ms\
+                         ) IS NULL\
                    ) \
                    AND NOT EXISTS (\
                        SELECT 1 \
                        FROM dependency_edges AS edge \
                        JOIN task_runs AS active ON active.run_id = edge.dependent_run_id \
                        WHERE edge.prerequisite_run_id = candidate.run_id \
-                         AND active.task_state NOT IN (\
-                             'completed', 'failed', 'cancelled', 'ended_unknown'\
-                         )\
+                         AND COALESCE(\
+                             active.finished_at_ms, active.native_session_end_at_ms\
+                         ) IS NULL\
                    ) \
                    AND NOT EXISTS (\
                        SELECT 1 FROM protected \
@@ -5418,15 +5417,16 @@ mod tests {
         let mut store = open_writer(&root).unwrap();
         let run_id = RunId::new();
         let drain_id = HistoryDrainId::new("codex:manifest-001").unwrap();
+        let now = unix_now_ms().unwrap();
         let history_state = TaskRunV6State {
             history_ready: false,
-            latest_provider_at_ms: Some(4_000),
+            latest_provider_at_ms: Some(now - 500),
             ..TaskRunV6State::default()
         };
         store
             .apply_v6_batch(PersistV6Batch {
                 task_runs: vec![PersistTaskRunV6 {
-                    task_run: match run_op(run_id, 1, TaskState::Running, 3_000, false) {
+                    task_run: match run_op(run_id, 1, TaskState::Running, now - 1_500, false) {
                         PersistOp::UpsertTaskRun(task_run) => task_run,
                         _ => unreachable!(),
                     },
@@ -5435,7 +5435,7 @@ mod tests {
                 history_drains: vec![PersistHistoryDrain {
                     drain_id: drain_id.clone(),
                     provider: Provider::Codex,
-                    created_at_ms: 3_500,
+                    created_at_ms: now - 1_000,
                     artifacts: vec![PersistHistoryDrainArtifact {
                         artifact_id: "rollout.jsonl".to_owned(),
                         generation: "dev:42".to_owned(),
@@ -5460,7 +5460,7 @@ mod tests {
         let (lifecycle, mut writer) = writer::spawn_writer_with_dropped_apply_ack(store).unwrap();
         assert!(!writer.history_drain_finalized(&drain_id).await.unwrap());
         let failure = writer
-            .finalize_history_drain(drain_id.clone(), 4_500)
+            .finalize_history_drain(drain_id.clone(), now)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -5480,14 +5480,16 @@ mod tests {
             finalized_state.native_session_end,
             Some(NativeSessionEnd {
                 status: NativeSessionEndStatus::Unknown,
-                at_ms: 4_000,
+                at_ms: now - 500,
             })
         );
         lifecycle.shutdown().await.unwrap();
 
         let mut store = open_writer(&root).unwrap();
-        let repeated = store.finalize_history_drain(&drain_id, 9_000).unwrap();
-        assert_eq!(repeated.finalized_at_ms, 4_500);
+        let repeated = store
+            .finalize_history_drain(&drain_id, now + 4_500)
+            .unwrap();
+        assert_eq!(repeated.finalized_at_ms, now);
         assert_eq!(&repeated.runs[0].state, finalized_state);
     }
 
@@ -6187,6 +6189,90 @@ mod tests {
         assert_eq!(count(&store.connection, "task_runs"), 0);
         assert_eq!(count(&store.connection, "run_rate_totals"), 0);
         assert_eq!(count(&store.connection, "history_drain_runs"), 0);
+    }
+
+    #[test]
+    fn retention_uses_effective_endpoint_boundary_and_semantic_precedence() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let now = 100 * DAY_MS;
+        let cutoff = now - RUN_RETENTION_MS;
+        let native_boundary = RunId::new();
+        let native_old = RunId::new();
+        let semantic_new = RunId::new();
+        let semantic_old = RunId::new();
+        let persisted = |run_id, ordinal, state, finished_at_ms: Option<i64>, native_end_at_ms| {
+            PersistTaskRunV6 {
+                task_run: PersistTaskRun {
+                    task_run: TaskRun {
+                        run_id,
+                        key: RunKey::Native {
+                            provider: Provider::Codex,
+                            sid: format!("retention-{ordinal}"),
+                        },
+                        display_ordinal: DisplayOrdinal::new(ordinal),
+                        state,
+                        has_controller_task_state_event: true,
+                        created_at_ms: Some(native_end_at_ms - 1_000),
+                        updated_at_ms: Some(finished_at_ms.unwrap_or(native_end_at_ms)),
+                        finished_at_ms,
+                        subject: None,
+                        dismissed_at_ms: None,
+                    },
+                    native_session: Some(NativeSessionBinding {
+                        provider: Provider::Codex,
+                        native_session_id: format!("retention-{ordinal}"),
+                    }),
+                    created_at_ms: native_end_at_ms - 1_000,
+                    updated_at_ms: finished_at_ms.unwrap_or(native_end_at_ms),
+                    finished_at_ms,
+                },
+                state: TaskRunV6State {
+                    native_session_end: Some(NativeSessionEnd {
+                        status: NativeSessionEndStatus::Done,
+                        at_ms: native_end_at_ms,
+                    }),
+                    lifecycle_watermark: Some(NativeLifecycleWatermark {
+                        source_at_ms: native_end_at_ms,
+                        observed_at_ms: native_end_at_ms,
+                        source_order: format!("provider:retention-{ordinal}"),
+                    }),
+                    ..TaskRunV6State::default()
+                },
+            }
+        };
+        store
+            .apply_v6_batch(PersistV6Batch {
+                task_runs: vec![
+                    persisted(native_boundary, 1, TaskState::Running, None, cutoff),
+                    persisted(native_old, 2, TaskState::Running, None, cutoff - 1),
+                    persisted(
+                        semantic_new,
+                        3,
+                        TaskState::Completed,
+                        Some(cutoff + 1),
+                        cutoff - 2,
+                    ),
+                    persisted(
+                        semantic_old,
+                        4,
+                        TaskState::Completed,
+                        Some(cutoff - 2),
+                        cutoff + 1,
+                    ),
+                ],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+
+        let stats = store.cleanup_retention(now).unwrap();
+        let restored = store.load_restored_state().unwrap();
+
+        assert_eq!(stats.runs_pruned, 2);
+        assert!(restored.model.task_run(&native_boundary).is_some());
+        assert!(restored.model.task_run(&native_old).is_none());
+        assert!(restored.model.task_run(&semantic_new).is_some());
+        assert!(restored.model.task_run(&semantic_old).is_none());
     }
 
     #[test]
@@ -7442,6 +7528,68 @@ mod tests {
         assert!(restored.model.task_run(&prerequisite).is_some());
         assert!(restored.model.task_run(&active).is_some());
         assert!(restored.model.task_run(&unreferenced).is_none());
+    }
+
+    #[test]
+    fn native_ended_references_do_not_delay_retention() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let now = unix_now_ms().unwrap();
+        let old = now - 31 * DAY_MS;
+        let parent = RunId::new();
+        let prerequisite = RunId::new();
+        let native_ended = RunId::new();
+        store
+            .apply_v6_batch(PersistV6Batch {
+                task_runs: vec![PersistTaskRunV6 {
+                    task_run: match run_op(native_ended, 3, TaskState::Running, old, false) {
+                        PersistOp::UpsertTaskRun(task_run) => task_run,
+                        _ => unreachable!(),
+                    },
+                    state: TaskRunV6State {
+                        native_session_end: Some(NativeSessionEnd {
+                            status: NativeSessionEndStatus::Done,
+                            at_ms: old,
+                        }),
+                        lifecycle_watermark: Some(NativeLifecycleWatermark {
+                            source_at_ms: old,
+                            observed_at_ms: old,
+                            source_order: "provider:retention-native-ended".to_owned(),
+                        }),
+                        ..TaskRunV6State::default()
+                    },
+                }],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+        store
+            .apply_batch(vec![
+                run_op(parent, 1, TaskState::Completed, old, false),
+                run_op(prerequisite, 2, TaskState::Completed, old, false),
+                PersistOp::UpsertExecutionEdge {
+                    edge: ExecutionEdge {
+                        parent_run_id: parent,
+                        child_run_id: native_ended,
+                    },
+                    created_at_ms: old,
+                },
+                PersistOp::UpsertDependencyEdge {
+                    edge: DependencyEdge {
+                        prerequisite_run_id: prerequisite,
+                        dependent_run_id: native_ended,
+                    },
+                    created_at_ms: old,
+                },
+            ])
+            .unwrap();
+
+        let stats = store.cleanup_retention(now).unwrap();
+        let restored = store.load_restored_state().unwrap();
+
+        assert_eq!(stats.runs_pruned, 3);
+        assert!(restored.model.task_run(&parent).is_none());
+        assert!(restored.model.task_run(&prerequisite).is_none());
+        assert!(restored.model.task_run(&native_ended).is_none());
     }
 
     #[test]

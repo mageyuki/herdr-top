@@ -6,11 +6,10 @@ use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::mock::{MockConfig, MockHerdr};
-use herdr_top::activity::{OperatorSnapshot, is_default_visible_task_run, runs_with_executions};
+use herdr_top::activity::{is_default_visible_task_run, runs_with_executions};
 use herdr_top::herdr::collector::{self, CollectorHandle, ObservationQuality};
 use herdr_top::lockfile::{OwnerRecord, StateRoot, state_root_in, try_acquire};
 use herdr_top::model::{
@@ -186,17 +185,9 @@ fn cold_restore_keeps_persisted_rate_totals_without_restoring_a_cursor() {
             working_ms: 3_000,
         })
     );
-    let restored_operator = open_reader(&root)
-        .unwrap()
-        .load_restored_operator_state()
-        .unwrap();
-    let operator = OperatorSnapshot {
-        activity: Arc::from(restored_operator.activity),
-        terminal_times: Arc::new(restored_operator.terminal_times),
-    };
     assert!(!is_default_visible_task_run(
+        &restored.model,
         restored.model.task_run(&run_id).unwrap(),
-        &operator,
         &runs_with_executions(&restored.model),
         2_000 + herdr_top::activity::DEFAULT_TERMINAL_VISIBILITY_MS,
     ));
@@ -398,6 +389,10 @@ fn lifecycle_watermark_and_ordinal_survive_restore_and_reject_older_liveness() {
     let restored_run = restored.model.task_run(&run_id).unwrap();
     assert_eq!(restored_run.display_ordinal, DisplayOrdinal::new(7));
     assert_eq!(
+        restored.model.effective_lifecycle_end_ms(restored_run),
+        Some(200)
+    );
+    assert_eq!(
         restored.model.task_run_v6_state(&run_id).unwrap(),
         &TaskRunV6State {
             native_session_end: Some(NativeSessionEnd {
@@ -426,8 +421,14 @@ fn lifecycle_watermark_and_ordinal_survive_restore_and_reject_older_liveness() {
             .and_then(|state| state.lifecycle_watermark.as_ref()),
         Some(&watermark)
     );
+    assert_eq!(
+        shared
+            .borrow()
+            .effective_lifecycle_end_ms(shared.borrow().task_run(&run_id).unwrap()),
+        Some(200)
+    );
 
-    let _ = reducer.touch_run_liveness(&key, 400);
+    let resume_operations = reducer.touch_run_liveness(&key, 400);
     let model = shared.borrow();
     assert!(
         model
@@ -439,6 +440,60 @@ fn lifecycle_watermark_and_ordinal_survive_restore_and_reject_older_liveness() {
     assert_eq!(
         model.task_run(&run_id).unwrap().display_ordinal,
         DisplayOrdinal::new(7)
+    );
+    assert_eq!(
+        model.task_run(&run_id).unwrap().run_id,
+        run_id,
+        "resume must preserve run identity"
+    );
+    assert_eq!(
+        model.effective_lifecycle_end_ms(model.task_run(&run_id).unwrap()),
+        None
+    );
+    let resume_task_run = resume_operations
+        .iter()
+        .find_map(|operation| match operation {
+            PersistOp::UpsertTaskRun(task_run) if task_run.task_run.run_id == run_id => {
+                Some(task_run.clone())
+            }
+            PersistOp::PromoteTaskRunKey { promoted, .. } if promoted.task_run.run_id == run_id => {
+                Some(promoted.clone())
+            }
+            _ => None,
+        })
+        .expect("newer liveness must persist the resumed run");
+    let resume_state = model.task_run_v6_state(&run_id).unwrap().clone();
+    drop(model);
+
+    let mut store = open_writer(&root).unwrap();
+    store
+        .apply_v6_batch(PersistV6Batch {
+            operations: resume_operations,
+            task_runs: vec![PersistTaskRunV6 {
+                task_run: resume_task_run,
+                state: resume_state,
+            }],
+            ..PersistV6Batch::default()
+        })
+        .unwrap();
+    drop(store);
+
+    let reopened = open_reader(&root).unwrap().load_restored_state().unwrap();
+    let reopened_run = reopened.model.task_run(&run_id).unwrap();
+    assert_eq!(reopened_run.run_id, run_id);
+    assert_eq!(reopened_run.display_ordinal, DisplayOrdinal::new(7));
+    assert!(
+        reopened
+            .model
+            .task_run_v6_state(&run_id)
+            .unwrap()
+            .native_session_end
+            .is_none(),
+        "newer liveness must durably clear the native lifecycle end"
+    );
+    assert_eq!(
+        reopened.model.effective_lifecycle_end_ms(reopened_run),
+        None
     );
 }
 

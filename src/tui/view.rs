@@ -352,11 +352,7 @@ fn format_time_value(metrics: &projection::RunMetricInputs, now_ms: i64) -> Stri
 }
 
 fn metric_end_ms(metrics: &projection::RunMetricInputs, now_ms: i64) -> Option<i64> {
-    if metrics.terminal {
-        metrics.finished_at_ms
-    } else {
-        Some(now_ms)
-    }
+    Some(metrics.lifecycle_end_at_ms.unwrap_or(now_ms))
 }
 
 #[derive(Clone, Copy)]
@@ -2113,7 +2109,7 @@ pub(crate) fn task_run_label(
 ) -> String {
     let mut label = run_row_head(model, run, display_status);
     if show_duration_suffix {
-        append_run_duration(&mut label, run, now_ms);
+        append_run_duration(&mut label, model, run, now_ms);
     }
     append_task_run_annotations(model, run, label, shared, true)
 }
@@ -2243,18 +2239,14 @@ fn run_row_label_with_agent(
                 line
             })
     });
-    let has_native_session_end = model
-        .task_run_v6_state(&run.run_id)
-        .is_some_and(|state| state.native_session_end.is_some());
-    if !run.state.is_terminal()
-        && !has_native_session_end
+    if model.effective_lifecycle_end_ms(run).is_none()
         && let Some(live_line) = live_line
     {
         label.push_str(" — ");
         label.push_str(&live_line);
     }
     if show_duration_suffix {
-        append_run_duration(&mut label, run, now_ms);
+        append_run_duration(&mut label, model, run, now_ms);
     }
     label
 }
@@ -2281,13 +2273,9 @@ fn run_row_head(model: &DomainModel, run: &TaskRun, display_status: DisplayStatu
     label
 }
 
-fn append_run_duration(label: &mut String, run: &TaskRun, now_ms: i64) {
+fn append_run_duration(label: &mut String, model: &DomainModel, run: &TaskRun, now_ms: i64) {
     let elapsed_ms = run.created_at_ms.and_then(|created_at_ms| {
-        let end_ms = if run.state.is_terminal() {
-            run.finished_at_ms?
-        } else {
-            now_ms
-        };
+        let end_ms = model.effective_lifecycle_end_ms(run).unwrap_or(now_ms);
         end_ms
             .checked_sub(created_at_ms)
             .filter(|elapsed_ms| *elapsed_ms >= 0)
@@ -3132,6 +3120,54 @@ mod tests {
     }
 
     #[test]
+    fn native_session_end_freezes_time_metric_and_duration_suffix() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let run = label_run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "frozen-duration".to_owned(),
+            },
+            TaskState::Running,
+            Some(1_000),
+            None,
+            Some("subject"),
+        );
+        let mut model = DomainModel::default();
+        model.insert_task_run(run.clone());
+        model.set_task_run_v6_state(
+            run_id,
+            TaskRunV6State {
+                native_session_end: Some(NativeSessionEnd {
+                    status: NativeSessionEndStatus::Done,
+                    at_ms: 4_000,
+                }),
+                ..TaskRunV6State::default()
+            },
+        );
+
+        assert_eq!(
+            format_time_value(&projection::run_metric_inputs(&model, &run), 10_000),
+            "03s"
+        );
+        assert_eq!(
+            run_row_label_with_agent(
+                &model,
+                &run,
+                None,
+                10_000,
+                &LiveLineReadModel::default(),
+                projection::DisplayStatus::new(
+                    projection::TaskDisplayStatus::Done,
+                    projection::StatusSource::NativeSessionLifecycle,
+                ),
+                true,
+            ),
+            "✓ done Codex subject · 03s"
+        );
+    }
+
+    #[test]
     fn build_rows_marks_quiet_run_stalled() {
         let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let now_ms = SystemClock.now_ms();
@@ -3230,7 +3266,7 @@ mod tests {
     }
 
     #[test]
-    fn summary_rows_group_all_runs_and_count_only_valid_terminal_durations() {
+    fn summary_rows_group_all_runs_by_effective_endpoint() {
         let mut model = DomainModel::default();
         let fixtures = [
             (
@@ -3246,7 +3282,7 @@ mod tests {
                 RunKey::Controller("hook:claude-code:S:task:B".to_owned()),
                 TaskState::Running,
                 Some(2_000),
-                Some(99_000),
+                None,
                 Some("model-a"),
             ),
             (
@@ -3254,7 +3290,7 @@ mod tests {
                 RunKey::Controller("hook:claude-code:S:task:C".to_owned()),
                 TaskState::Failed,
                 None,
-                None,
+                Some(12_000),
                 Some("model-a"),
             ),
             (
@@ -3295,7 +3331,7 @@ mod tests {
                 },
                 TaskState::Blocked,
                 Some(2_000),
-                Some(90_000),
+                None,
                 Some("model-a"),
             ),
             (
