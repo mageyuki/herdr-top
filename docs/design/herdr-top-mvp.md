@@ -475,25 +475,30 @@ Initial tables:
 - `execution_edges` and `dependency_edges`;
 - `display_ordinals`;
 - `history_drains`, `history_drain_artifacts`, `history_drain_runs`, and `run_rate_totals`;
+- `history_run_publications` and `history_event_before_images`;
 - `events`, `event_ledger`, `meta`, `owner`, and `schema_migrations`.
 
-The provider-facing columns are fixed as follows. `agent_nodes` stores `agent_node_id`, `provider`, the node's own `native_session_id`, owning `task_run_id`, logical nullable `parent_agent_node_id` (indexed without a foreign key), nullable provider-restricted `state`, `model_id`, `last_event_kind`, `last_tool_name`, `last_item_count`, `last_byte_count`, `last_activity_at_ms`, and the operational `session_file`; its row ordinal is stored separately in `display_ordinals` with `entity_kind = 'agent_node'`. `events` additionally stores nullable `provider_agent_id`, `provider_parent_agent_id`, and JSON-text `source_coverage`; provider rows populate these allowlisted fields while Herdr rows retain `NULL` coverage in this increment.
+The provider-facing columns are fixed as follows. `agent_nodes` stores `agent_node_id`, `provider`, the node's own `native_session_id`, owning `task_run_id`, logical nullable `parent_agent_node_id` (indexed without a foreign key), nullable provider-restricted `state`, `model_id`, `last_event_kind`, `last_tool_name`, `last_item_count`, `last_byte_count`, `last_activity_at_ms`, and the operational `session_file`; its row ordinal is stored separately in `display_ordinals` with `entity_kind = 'agent_node'`. `events` additionally stores nullable `provider_agent_id`, `provider_parent_agent_id`, JSON-text `source_coverage`, and `history_drain_id`; provider rows populate the allowlisted provider fields while Herdr rows retain `NULL` coverage in this increment. `history_drains.completed_by_drain_id` records the drain barrier that completed a drain.
 
-The current schema version is 6. In addition to the v5 display fields, it adds
-nullable native-session end and lifecycle-watermark columns, `history_ready`
-and latest-provider-timestamp columns on `task_runs`; durable history manifest,
-artifact, and run-association tables; and non-negative per-run measured token
-and Working-millisecond totals. Existing Task Runs migrate as history-ready with
-no synthesized lifecycle evidence and no rate row. Restored positive rate
-totals are usable without restoring a process-local cursor. Startup restoration
-also retains existing Task Run timing and dismissal fields.
+The current schema version is 7. Schema v6 added nullable native-session end
+and lifecycle-watermark columns, `history_ready` and latest-provider-timestamp
+columns on `task_runs`; durable history manifest, artifact, and run-association
+tables; and non-negative per-run measured token and Working-millisecond totals.
+Schema v7 adds durable publication quarantine in `history_run_publications`,
+event before-images in `history_event_before_images`, and drain provenance in
+`history_drains.completed_by_drain_id` and `events.history_drain_id`. The v5-to-v6
+migration marks existing Task Runs history-ready without synthesizing lifecycle
+evidence or rate rows. The v6-to-v7 migration preserves existing public rows and
+backfills private-event drain associations where derivable. Restored positive
+rate totals are usable without restoring a process-local cursor. Startup
+restoration also retains existing Task Run timing and dismissal fields.
 
 Migration is upgrade-only and the SQLite online backup precedes every migration.
 Schema preflight classifies any version above the binary's
 `CURRENT_SCHEMA_VERSION` as newer and refuses it before writer startup, WAL or
 shared-memory sidecar creation, or backup, with `database schema version <found>
 is newer than supported version <supported>; upgrade Herdr Top before opening
-this database`. A pre-v6 binary therefore cannot open a v6 database.
+this database`. A pre-v7 binary therefore cannot open a v7 database.
 
 SQLite runs through bundled `rusqlite` with WAL enabled explicitly, `synchronous=FULL` so a flushed batch survives OS crashes and power loss, foreign keys on, and a busy timeout. The single writer batches work in transactions flushed at least once per second — the durability bound the Controller ack in section 7.3 states — and checkpoints the WAL periodically and at shutdown. While persistence is unhealthy the responder stops returning `accepted` and answers `retryable` with reason `persistence_unavailable`. A full disk or runtime write failure surfaces as a persistence diagnostic and degrades to in-memory monitoring, never silently; migration or backup failure stops startup, as section 14 states.
 

@@ -1,4 +1,4 @@
-//! SQLite schema v6, read-only preflight, online backup, and migration support.
+//! SQLite schema v7, read-only preflight, online backup, and migration support.
 
 use std::ffi::OsString;
 use std::fs::{self, Metadata, OpenOptions, Permissions};

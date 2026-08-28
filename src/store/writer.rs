@@ -754,7 +754,8 @@ impl EnqueuePermit<'_> {
         PendingEnqueue { waiter }
     }
 
-    /// Consumes the permit and enqueues one schema-v6 batch without another channel operation.
+    /// Consumes the permit and enqueues one versioned persistence batch, including v7 publication
+    /// and provenance state, without another channel operation.
     #[must_use]
     pub fn enqueue_v6(self, batch: PersistV6Batch) -> PendingEnqueue {
         for entry in ledger_entries(&batch.operations) {

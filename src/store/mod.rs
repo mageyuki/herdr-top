@@ -186,7 +186,8 @@ pub struct PersistHistoryDrainRun {
     pub run_id: RunId,
 }
 
-/// Schema-v6 additions committed in one transaction without widening the stable `PersistOp` enum.
+/// Versioned persistence additions, including v7 publication and provenance state, committed in
+/// one transaction without widening the stable `PersistOp` enum.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PersistV6Batch {
     pub operations: PersistBatch,
@@ -830,7 +831,8 @@ impl Store {
         Ok(())
     }
 
-    /// Applies core and schema-v6 operations in exactly one SQLite transaction.
+    /// Applies core and versioned persistence operations, including v7 publication and provenance
+    /// state, in exactly one SQLite transaction.
     pub fn apply_v6_batch(&mut self, batch: PersistV6Batch) -> Result<(), StoreError> {
         let transaction = self.connection.transaction()?;
         if exact_v6_replay_is_already_durable(&transaction, &batch)? {
@@ -4572,7 +4574,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_to_v6_migration() {
+    fn schema_v1_to_current_migration() {
         let (_directory, root) = test_root();
         let database = database_path(&root);
         {
@@ -4614,7 +4616,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v2_to_v6_backfills_agent_ordinals_by_run_ordinal_then_node_id() {
+    fn schema_v2_to_current_backfills_agent_ordinals_by_run_ordinal_then_node_id() {
         let (_directory, root) = test_root();
         let database = database_path(&root);
         let first_run = RunId::new();
