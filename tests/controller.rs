@@ -823,10 +823,11 @@ async fn duplicate_event_id_is_duplicate() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn session_end_is_durable_and_same_session_start_reopens_without_reordering() {
     let running = RunningController::start().await;
+    let event_base_ms = unix_now_ms();
     let mut start = envelope("native-start", "task_started", "native-root");
     start["provider"] = json!("codex");
     start["native_session_id"] = json!("session-1");
-    start["emitted_at_ms"] = json!(100);
+    start["emitted_at_ms"] = json!(event_base_ms + 100);
     assert_eq!(running.send(&start).await, ControllerResponse::Accepted);
 
     let before = running
@@ -842,7 +843,7 @@ async fn session_end_is_durable_and_same_session_start_reopens_without_reorderin
     let mut end = envelope("native-end", "session_ended", "native-root");
     end["provider"] = json!("codex");
     end["native_session_id"] = json!("session-1");
-    end["emitted_at_ms"] = json!(200);
+    end["emitted_at_ms"] = json!(event_base_ms + 200);
     assert_eq!(running.send(&end).await, ControllerResponse::Accepted);
     let ended = running.collector.model.borrow();
     assert_eq!(
@@ -863,7 +864,7 @@ async fn session_end_is_durable_and_same_session_start_reopens_without_reorderin
 
     let mut resumed = start.clone();
     resumed["event_id"] = json!("native-resume");
-    resumed["emitted_at_ms"] = json!(300);
+    resumed["emitted_at_ms"] = json!(event_base_ms + 300);
     assert_eq!(running.send(&resumed).await, ControllerResponse::Accepted);
     let resumed_model = running.collector.model.borrow();
     assert!(
@@ -884,7 +885,7 @@ async fn session_end_is_durable_and_same_session_start_reopens_without_reorderin
 
     let mut delayed_end = end.clone();
     delayed_end["event_id"] = json!("native-delayed-end");
-    delayed_end["emitted_at_ms"] = json!(250);
+    delayed_end["emitted_at_ms"] = json!(event_base_ms + 250);
     assert_eq!(
         running.send(&delayed_end).await,
         ControllerResponse::Accepted
@@ -902,7 +903,7 @@ async fn session_end_is_durable_and_same_session_start_reopens_without_reorderin
 
     let mut final_end = end;
     final_end["event_id"] = json!("native-final-end");
-    final_end["emitted_at_ms"] = json!(400);
+    final_end["emitted_at_ms"] = json!(event_base_ms + 400);
     assert_eq!(running.send(&final_end).await, ControllerResponse::Accepted);
 
     let (_state, reopened) = running.stop_and_reopen().await;
