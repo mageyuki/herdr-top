@@ -27666,6 +27666,93 @@ mod provider_integration_tests {
         );
     }
 
+    #[test]
+    fn provider_child_owner_upsert_keeps_existing_root_owned_node() {
+        let root_run_id = RunId::new();
+        let child_run_id = RunId::new();
+        let mut model = DomainModel::default();
+        for (run_id, sid, ordinal) in [
+            (root_run_id, "root-session", 1),
+            (child_run_id, "child-owner", 2),
+        ] {
+            model.insert_task_run(TaskRun {
+                run_id,
+                key: RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: sid.to_owned(),
+                },
+                display_ordinal: DisplayOrdinal::new(ordinal),
+                state: TaskState::Running,
+                has_controller_task_state_event: true,
+                created_at_ms: Some(10),
+                updated_at_ms: Some(20),
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
+            });
+        }
+        let original_node = AgentNode {
+            agent_node_id: "agent:codex:child-thread".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some("child-thread".to_owned()),
+            task_run_id: root_run_id,
+            display_ordinal: DisplayOrdinal::new(3),
+            parent_agent_node_id: Some("agent:codex:root-session".to_owned()),
+            state: Some(ExecState::Working),
+            model_id: Some("gpt-owner".to_owned()),
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: Some("/root/child-thread.jsonl".to_owned()),
+        };
+        model.insert_agent_node(original_node.clone());
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model,
+            next_ordinal: 4,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let event = ProviderEvent::AgentUpsert {
+            provider: Provider::Codex,
+            agent_thread_id: "child-thread".to_owned(),
+            owner_session_id: Some("child-owner".to_owned()),
+            parent_thread_id: Some("root-session".to_owned()),
+            state: Some(ExecState::Working),
+            model_id: None,
+            depth: Some(1),
+            event_id: "prov:codex:up:child-owner".to_owned(),
+            observed_at_ms: 100,
+            position: SourcePosition {
+                path_id: 2,
+                generation: 0,
+                offset: 1,
+            },
+        };
+        let coverage = SourceCoverageRegistry::new(SourceAvailability::Available);
+
+        let normalized = normalize_provider_event(&shared, "session", event, &coverage);
+
+        assert_eq!(normalized.events.len(), 1);
+        let NormalizedEvent::AgentNodeUpsert { node, .. } = &normalized.events[0] else {
+            panic!("agent upsert must normalize to an Agent Node observation");
+        };
+        assert_eq!(node.task_run_id, child_run_id);
+        assert_eq!(node.agent_node_id, "agent:codex:child-thread");
+
+        apply_collector_observation(&mut reducer, normalized.events)
+            .unwrap()
+            .expect("the normalized child-owner upsert must apply");
+
+        let model = shared.borrow();
+        assert_eq!(model.agent_nodes().count(), 1);
+        assert_eq!(
+            model.agent_node("agent:codex:child-thread"),
+            Some(&original_node)
+        );
+    }
+
     struct DropObservedWorker(Arc<AtomicBool>);
 
     impl ProviderWorker for DropObservedWorker {

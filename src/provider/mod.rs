@@ -1506,11 +1506,22 @@ fn merge_slot(
         return MergeOutcome::Duplicate;
     }
 
-    let replace = if stored_position.path_id == incoming_position.path_id {
-        (incoming_position.generation, incoming_position.offset)
-            >= (stored_position.generation, stored_position.offset)
-    } else {
-        incoming_time > stored_time
+    let replace = match (&stored.event, &incoming) {
+        (
+            ProviderEvent::AgentUpsert { state: stored, .. },
+            ProviderEvent::AgentUpsert {
+                state: incoming, ..
+            },
+        ) if stored.as_ref().is_some_and(ExecState::is_terminal)
+            != incoming.as_ref().is_some_and(ExecState::is_terminal) =>
+        {
+            incoming.as_ref().is_some_and(ExecState::is_terminal)
+        }
+        _ if stored_position.path_id == incoming_position.path_id => {
+            (incoming_position.generation, incoming_position.offset)
+                >= (stored_position.generation, stored_position.offset)
+        }
+        _ => incoming_time > stored_time,
     };
     diagnostics.record_coalesced();
     if replace {
@@ -3009,6 +3020,27 @@ mod tests {
         }
     }
 
+    fn agent_state_upsert(
+        state: ExecState,
+        owner_session_id: &str,
+        event_id: &str,
+        observed_at_ms: i64,
+        path_id: u32,
+    ) -> ProviderEvent {
+        ProviderEvent::AgentUpsert {
+            provider: Provider::Codex,
+            agent_thread_id: "terminal-child".to_owned(),
+            owner_session_id: Some(owner_session_id.to_owned()),
+            parent_thread_id: Some("root-parent".to_owned()),
+            state: Some(state),
+            model_id: None,
+            depth: Some(1),
+            event_id: event_id.to_owned(),
+            observed_at_ms,
+            position: position(path_id, 0, 1),
+        }
+    }
+
     fn agent_activity(provider: Provider) -> ProviderEvent {
         ProviderEvent::Activity {
             provider,
@@ -3460,6 +3492,53 @@ mod tests {
         pending.flush_to(&sender);
 
         assert_eq!(event_kind(receiver.try_recv().unwrap()), "newest");
+    }
+
+    #[test]
+    fn provider_pending_agent_upsert_ended_is_terminal() {
+        let cases = [
+            (
+                "ended-then-later-child-idle",
+                agent_state_upsert(ExecState::Ended, "root-owner", "root-ended", 100, 1),
+                agent_state_upsert(ExecState::Idle, "child-owner", "child-idle", 200, 2),
+            ),
+            (
+                "later-child-idle-then-ended",
+                agent_state_upsert(ExecState::Idle, "child-owner", "child-idle", 200, 2),
+                agent_state_upsert(ExecState::Ended, "root-owner", "root-ended", 100, 1),
+            ),
+            (
+                "ended-then-later-working",
+                agent_state_upsert(ExecState::Ended, "root-owner", "root-ended", 300, 3),
+                agent_state_upsert(ExecState::Working, "child-owner", "child-working", 400, 4),
+            ),
+            (
+                "later-working-then-ended",
+                agent_state_upsert(ExecState::Working, "child-owner", "child-working", 400, 4),
+                agent_state_upsert(ExecState::Ended, "root-owner", "root-ended", 300, 3),
+            ),
+        ];
+
+        for (label, first, second) in cases {
+            let mut pending = PendingEvents::new(ProviderDiagnostics::default());
+            assert_eq!(pending.merge(first), MergeOutcome::Accepted, "{label}");
+            assert_eq!(pending.merge(second), MergeOutcome::Coalesced, "{label}");
+            let (sender, mut receiver) = tokio_mpsc::channel(1);
+
+            pending.flush_to(&sender);
+
+            assert!(
+                matches!(
+                    receiver.try_recv().unwrap(),
+                    ProviderEvent::AgentUpsert {
+                        state: Some(ExecState::Ended),
+                        owner_session_id: Some(owner_session_id),
+                        ..
+                    } if owner_session_id == "root-owner"
+                ),
+                "{label}"
+            );
+        }
     }
 
     #[test]

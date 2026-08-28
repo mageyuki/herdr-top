@@ -3089,8 +3089,12 @@ impl Reducer {
         if let Some(native_session_id) = &observed.native_session_id {
             node.native_session_id = Some(native_session_id.clone());
         }
-        if observed.state == Some(ExecState::Working) {
-            node.state = Some(ExecState::Working);
+        match observed.state.as_ref() {
+            Some(ExecState::Ended) => node.state = Some(ExecState::Ended),
+            Some(ExecState::Working) if node.state != Some(ExecState::Ended) => {
+                node.state = Some(ExecState::Working);
+            }
+            _ => {}
         }
         if let Some(model_id) = &observed.model_id {
             node.model_id = Some(model_id.clone());
@@ -10691,6 +10695,115 @@ mod tests {
     }
 
     #[test]
+    fn provider_ended_agent_node_is_terminal_and_keeps_ownership() {
+        let root_run_id = RunId::new();
+        let child_run_id = RunId::new();
+        let mut root_run = run_with_controller_evidence(
+            root_run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "root-session".to_owned(),
+            },
+            1,
+            TaskState::Running,
+        );
+        root_run.created_at_ms = Some(10);
+        root_run.updated_at_ms = Some(20);
+        root_run.subject = Some("root lifecycle".to_owned());
+        let mut child_run = run_with_controller_evidence(
+            child_run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "child-session".to_owned(),
+            },
+            2,
+            TaskState::Running,
+        );
+        child_run.created_at_ms = Some(30);
+        child_run.updated_at_ms = Some(40);
+        child_run.subject = Some("child lifecycle".to_owned());
+        let mut model = DomainModel::default();
+        model.insert_task_run(root_run.clone());
+        model.insert_task_run(child_run.clone());
+        let root_v6 = TaskRunV6State {
+            latest_provider_at_ms: Some(50),
+            ..TaskRunV6State::default()
+        };
+        let child_v6 = TaskRunV6State {
+            latest_provider_at_ms: Some(60),
+            ..TaskRunV6State::default()
+        };
+        model.set_task_run_v6_state(root_run_id, root_v6.clone());
+        model.set_task_run_v6_state(child_run_id, child_v6.clone());
+        let original_node = AgentNode {
+            agent_node_id: "agent:codex:child-session".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some("child-session".to_owned()),
+            task_run_id: root_run_id,
+            display_ordinal: DisplayOrdinal::new(3),
+            parent_agent_node_id: Some("agent:codex:root-session".to_owned()),
+            state: Some(ExecState::Working),
+            model_id: Some("gpt-terminal".to_owned()),
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: Some("/root/child-session.jsonl".to_owned()),
+        };
+        model.insert_agent_node(original_node.clone());
+        let (mut reducer, shared) = Reducer::new(restored(model, 4));
+
+        let mut ended = provider_node_event(
+            "prov:codex:up:ended",
+            root_run_id,
+            "child-session",
+            Some(ExecState::Ended),
+            None,
+            Some("agent:codex:root-session"),
+        );
+        let NormalizedEvent::AgentNodeUpsert { metadata, .. } = &mut ended else {
+            unreachable!();
+        };
+        metadata.timestamp_ms = 100;
+        metadata.receipt_time_ms = 100;
+        reducer.apply(ended).unwrap();
+
+        for (event_id, state, observed_at_ms) in [
+            ("prov:codex:up:idle", ExecState::Idle, 200),
+            ("prov:codex:up:working", ExecState::Working, 300),
+        ] {
+            let mut observation = provider_node_event(
+                event_id,
+                child_run_id,
+                "child-session",
+                Some(state),
+                None,
+                Some("agent:codex:root-session"),
+            );
+            let NormalizedEvent::AgentNodeUpsert { metadata, .. } = &mut observation else {
+                unreachable!();
+            };
+            metadata.timestamp_ms = observed_at_ms;
+            metadata.receipt_time_ms = observed_at_ms;
+            reducer.apply(observation).unwrap();
+        }
+
+        let model = shared.borrow();
+        let mut expected_node = original_node;
+        expected_node.state = Some(ExecState::Ended);
+        assert_eq!(model.agent_nodes().count(), 1);
+        assert_eq!(
+            model.agent_node("agent:codex:child-session"),
+            Some(&expected_node)
+        );
+        assert_eq!(model.task_run(&root_run_id), Some(&root_run));
+        assert_eq!(model.task_run(&child_run_id), Some(&child_run));
+        assert_eq!(model.task_run_v6_state(&root_run_id), Some(&root_v6));
+        assert_eq!(model.task_run_v6_state(&child_run_id), Some(&child_v6));
+    }
+
+    #[test]
     fn provider_upsert_mints_the_frozen_deterministic_node_id() {
         let run_id = RunId::new();
         let mut model = DomainModel::default();
@@ -10743,7 +10856,7 @@ mod tests {
                 .agent_node("agent:codex:child-1")
                 .unwrap()
                 .state,
-            None
+            Some(ExecState::Ended)
         );
     }
 

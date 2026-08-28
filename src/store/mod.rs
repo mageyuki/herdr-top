@@ -4330,10 +4330,11 @@ fn parse_exec_state(value: &str, stale_since_ms: Option<i64>) -> Result<ExecStat
 fn agent_node_state_text(state: &ExecState) -> Result<&'static str, StoreError> {
     match state {
         ExecState::Working => Ok("working"),
+        ExecState::Ended => Ok("ended"),
         _ => Err(StoreError::invalid(
             "agent_nodes.state",
             format!("{state:?}"),
-            "provider agent nodes may persist only the working state",
+            "provider agent nodes may persist only working or ended states",
         )),
     }
 }
@@ -4342,6 +4343,7 @@ fn parse_agent_node_state(value: Option<String>) -> Result<Option<ExecState>, St
     match value.as_deref() {
         None => Ok(None),
         Some("working") => Ok(Some(ExecState::Working)),
+        Some("ended") => Ok(Some(ExecState::Ended)),
         Some(value) => Err(StoreError::invalid(
             "agent_nodes.state",
             value,
@@ -4428,7 +4430,7 @@ mod tests {
 
         assert!(database_path(&root).is_file());
         assert!(backup_files(directory.path()).is_empty());
-        assert_eq!(schema_version(&store.connection), 7);
+        assert_eq!(schema_version(&store.connection), 8);
         for (table, column) in [
             ("agent_nodes", "parent_agent_node_id"),
             ("agent_nodes", "state"),
@@ -4497,7 +4499,7 @@ mod tests {
                     "CREATE TABLE schema_migrations(\
                          version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL\
                      );\
-                     INSERT INTO schema_migrations(version, applied_at_ms) VALUES (8, 0);",
+                     INSERT INTO schema_migrations(version, applied_at_ms) VALUES (9, 0);",
                 )
                 .unwrap();
         }
@@ -4506,15 +4508,15 @@ mod tests {
         assert!(matches!(
             preflight_schema(&root),
             Err(StoreError::NewerSchema {
-                found: 8,
-                supported: 7
+                found: 9,
+                supported: 8
             })
         ));
         assert!(matches!(
             open_writer(&root),
             Err(StoreError::NewerSchema {
-                found: 8,
-                supported: 7
+                found: 9,
+                supported: 8
             })
         ));
 
@@ -4543,7 +4545,7 @@ mod tests {
         let backups = backup_files(directory.path());
 
         assert_eq!(backups.len(), 1);
-        assert_eq!(schema_version(&store.connection), 7);
+        assert_eq!(schema_version(&store.connection), 8);
         let backup = Connection::open_with_flags(
             &backups[0],
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -4590,7 +4592,7 @@ mod tests {
 
         assert_eq!(preflight_schema(&root).unwrap(), SchemaVerdict::Migratable);
         let store = open_writer(&root).unwrap();
-        assert_eq!(schema_version(&store.connection), 7);
+        assert_eq!(schema_version(&store.connection), 8);
         let has_ingest_seq: bool = store
             .connection
             .query_row(
@@ -4654,7 +4656,7 @@ mod tests {
         }
 
         let store = open_writer(&root).unwrap();
-        assert_eq!(schema_version(&store.connection), 7);
+        assert_eq!(schema_version(&store.connection), 8);
         let ordinals = ["gap-agent-m", "gap-agent-a", "gap-agent-z"].map(|node_id| {
             store
                 .connection
@@ -4717,7 +4719,7 @@ mod tests {
         }
 
         let mut store = open_writer(&root).unwrap();
-        assert_eq!(schema_version(&store.connection), 7);
+        assert_eq!(schema_version(&store.connection), 8);
         let topology_ordinals = [
             ("workspace", "workspace-a", 21),
             ("workspace", "workspace-z", 22),
@@ -4808,7 +4810,7 @@ mod tests {
         }
 
         let store = open_writer(&root).unwrap();
-        assert_eq!(schema_version(&store.connection), 7);
+        assert_eq!(schema_version(&store.connection), 8);
         let restored = store.load_restored_state().unwrap();
         let run = restored.model.task_run(&run_id).unwrap();
         assert_eq!(run.created_at_ms, Some(10));
@@ -4860,7 +4862,7 @@ mod tests {
         }
 
         let store = open_writer(&root).unwrap();
-        assert_eq!(schema_version(&store.connection), 7);
+        assert_eq!(schema_version(&store.connection), 8);
         assert_eq!(backup_files(directory.path()).len(), 1);
         let restored = store.load_restored_state().unwrap();
         assert_eq!(
@@ -4974,7 +4976,7 @@ mod tests {
         }
 
         let mut store = open_writer(&root).unwrap();
-        assert_eq!(schema_version(&store.connection), 7);
+        assert_eq!(schema_version(&store.connection), 8);
         let migrated = store.load_restored_state().unwrap();
         assert!(
             migrated
@@ -5040,6 +5042,206 @@ mod tests {
         assert!(!reducer.apply_history_finalization(&page));
         assert!(!operator.has_changed().unwrap());
         assert_eq!(operator.borrow().activity.len(), 2);
+    }
+
+    #[test]
+    fn schema_v7_to_v8_preserves_agent_nodes_and_allows_ended() {
+        let (_directory, root) = test_root();
+        let database = database_path(&root);
+        let run_id = RunId::new();
+        let before_rows;
+        {
+            let connection = Connection::open(&database).unwrap();
+            for schema in [
+                schema::SCHEMA_V1,
+                schema::SCHEMA_V2,
+                schema::SCHEMA_V3,
+                schema::SCHEMA_V4,
+                schema::SCHEMA_V5,
+                schema::SCHEMA_V6,
+                schema::SCHEMA_V7,
+            ] {
+                connection.execute_batch(schema).unwrap();
+            }
+            for version in 1..=7 {
+                connection
+                    .execute(
+                        "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (?1, ?1)",
+                        [version],
+                    )
+                    .unwrap();
+            }
+            connection
+                .execute(
+                    "INSERT INTO display_ordinals(entity_kind, entity_id, ordinal) VALUES \
+                         ('task_run', ?1, 1), \
+                         ('agent_node', 'agent-null', 2), \
+                         ('agent_node', 'agent-working', 3)",
+                    [run_id.to_string()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO task_runs(\
+                         run_id, key_kind, key_controller_id, display_ordinal, task_state, \
+                         has_controller_task_state_event, created_at_ms, updated_at_ms, \
+                         history_ready\
+                     ) VALUES (?1, 'controller', 'schema-v7-agent-owner', 1, 'running', 1, \
+                               10, 20, 1)",
+                    [run_id.to_string()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO native_agent_sessions(provider, native_session_id) \
+                     VALUES ('codex', 'working-native')",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO agent_nodes(\
+                         agent_node_id, provider, native_session_id, task_run_id, \
+                         parent_agent_node_id, state, model_id, last_event_kind, last_tool_name, \
+                         last_item_count, last_byte_count, last_activity_at_ms, session_file\
+                     ) VALUES \
+                         ('agent-null', 'claude', NULL, ?1, NULL, NULL, NULL, NULL, NULL, \
+                          NULL, NULL, NULL, NULL), \
+                         ('agent-working', 'codex', 'working-native', ?1, 'agent-null', \
+                          'working', 'gpt-v7', 'tool_use', 'read', 7, 11, 19, \
+                          '/tmp/working.jsonl')",
+                    [run_id.to_string()],
+                )
+                .unwrap();
+            before_rows = agent_node_rows(&connection);
+        }
+
+        assert_eq!(preflight_schema(&root).unwrap(), SchemaVerdict::Migratable);
+        let mut store = open_writer(&root).unwrap();
+        assert_eq!(schema_version(&store.connection), 8);
+        assert_eq!(agent_node_rows(&store.connection), before_rows);
+        let parent_indexed: bool = store
+            .connection
+            .query_row(
+                "SELECT EXISTS(\
+                     SELECT 1 FROM pragma_index_list('agent_nodes') \
+                     WHERE name = 'agent_nodes_parent_idx'\
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(parent_indexed);
+        let mut foreign_key_columns = store
+            .connection
+            .prepare("SELECT \"from\" FROM pragma_foreign_key_list('agent_nodes')")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        foreign_key_columns.sort();
+        assert_eq!(
+            foreign_key_columns,
+            ["native_session_id", "provider", "task_run_id"]
+        );
+        assert!(
+            store
+                .connection
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query([])
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_none()
+        );
+
+        let ended = AgentNode {
+            agent_node_id: "agent-null".to_owned(),
+            provider: Provider::Claude,
+            native_session_id: None,
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(2),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Ended),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
+        };
+        store
+            .apply_batch(vec![PersistOp::UpsertAgentNode(ended.clone())])
+            .unwrap();
+        schema::migrate(&mut store.connection, 999).unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 8",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        drop(store);
+
+        assert_eq!(preflight_schema(&root).unwrap(), SchemaVerdict::Current);
+        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+        assert_eq!(restored.model.agent_node("agent-null"), Some(&ended));
+        assert_eq!(
+            restored.model.agent_node("agent-working").unwrap().state,
+            Some(ExecState::Working)
+        );
+    }
+
+    #[test]
+    fn agent_node_ended_state_round_trips() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let run_id = RunId::new();
+        let ended = AgentNode {
+            agent_node_id: "agent-ended".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some("ended-native".to_owned()),
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(2),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Ended),
+            model_id: Some("gpt-ended".to_owned()),
+            last_event_kind: Some("completed".to_owned()),
+            last_tool_name: None,
+            last_item_count: Some(5),
+            last_byte_count: Some(8),
+            last_activity_at_ms: Some(100),
+            session_file: Some("/tmp/ended.jsonl".to_owned()),
+        };
+
+        store
+            .apply_batch(vec![
+                run_op(run_id, 1, TaskState::Running, 10, true),
+                PersistOp::UpsertAgentNode(ended.clone()),
+            ])
+            .unwrap();
+        let unsupported = AgentNode {
+            state: Some(ExecState::Idle),
+            ..ended.clone()
+        };
+        assert!(matches!(
+            store.apply_batch(vec![PersistOp::UpsertAgentNode(unsupported)]),
+            Err(StoreError::InvalidData {
+                field: "agent_nodes.state",
+                ..
+            })
+        ));
+        drop(store);
+
+        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+        assert_eq!(restored.model.agent_node("agent-ended"), Some(&ended));
     }
 
     #[test]
@@ -6381,7 +6583,7 @@ mod tests {
 
         let store = open_writer(&root).unwrap();
 
-        assert_eq!(schema_version(&store.connection), 7);
+        assert_eq!(schema_version(&store.connection), 8);
         for (table, column) in [
             ("task_runs", "subject"),
             ("task_runs", "dismissed_at_ms"),
@@ -9330,6 +9532,50 @@ mod tests {
                 row.get::<_, Option<i64>>(0)
             })
             .unwrap()
+            .unwrap()
+    }
+
+    type AgentNodeRow = (
+        (String, String, Option<String>, String),
+        (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+        (
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        ),
+    );
+
+    fn agent_node_rows(connection: &Connection) -> Vec<AgentNodeRow> {
+        connection
+            .prepare(
+                "SELECT agent_node_id, provider, native_session_id, task_run_id, \
+                        parent_agent_node_id, state, model_id, last_event_kind, last_tool_name, \
+                        last_item_count, last_byte_count, last_activity_at_ms, session_file \
+                 FROM agent_nodes ORDER BY agent_node_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?),
+                    (row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?),
+                    (
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                    ),
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
             .unwrap()
     }
 

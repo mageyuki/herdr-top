@@ -1,4 +1,4 @@
-//! SQLite schema v7, read-only preflight, online backup, and migration support.
+//! SQLite schema v8, read-only preflight, online backup, and migration support.
 
 use std::ffi::OsString;
 use std::fs::{self, Metadata, OpenOptions, Permissions};
@@ -14,7 +14,7 @@ use rusqlite::{Connection, MAIN_DB, OpenFlags, OptionalExtension, params};
 use super::StoreError;
 use crate::lockfile::StateRoot;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 7;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 8;
 pub(super) const DATABASE_FILE: &str = "herdr-top.sqlite3";
 const FILE_MODE: u32 = 0o600;
 
@@ -379,6 +379,14 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), St
         )?;
         version = 7;
     }
+    if version < 8 {
+        transaction.execute_batch(SCHEMA_V8)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (8, ?1)",
+            [now_ms],
+        )?;
+        version = 8;
+    }
     debug_assert_eq!(version, CURRENT_SCHEMA_VERSION);
     transaction.commit()?;
     Ok(())
@@ -568,6 +576,42 @@ WHERE history_drain_id IS NULL
       WHERE association.run_id = events.task_run_id
         AND drain.finalized_at_ms IS NULL
   );
+"#;
+
+pub(super) const SCHEMA_V8: &str = r#"
+CREATE TABLE agent_nodes_v8 (
+    agent_node_id       TEXT PRIMARY KEY,
+    provider            TEXT NOT NULL,
+    native_session_id   TEXT,
+    task_run_id         TEXT NOT NULL,
+    parent_agent_node_id TEXT,
+    state               TEXT CHECK (state IS NULL OR state IN ('working', 'ended')),
+    model_id             TEXT,
+    last_event_kind      TEXT,
+    last_tool_name       TEXT,
+    last_item_count      INTEGER,
+    last_byte_count      INTEGER,
+    last_activity_at_ms  INTEGER,
+    session_file         TEXT,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(run_id) ON DELETE CASCADE,
+    FOREIGN KEY (provider, native_session_id)
+        REFERENCES native_agent_sessions(provider, native_session_id)
+);
+
+INSERT INTO agent_nodes_v8(
+    agent_node_id, provider, native_session_id, task_run_id, parent_agent_node_id,
+    state, model_id, last_event_kind, last_tool_name, last_item_count,
+    last_byte_count, last_activity_at_ms, session_file
+)
+SELECT
+    agent_node_id, provider, native_session_id, task_run_id, parent_agent_node_id,
+    state, model_id, last_event_kind, last_tool_name, last_item_count,
+    last_byte_count, last_activity_at_ms, session_file
+FROM agent_nodes;
+
+DROP TABLE agent_nodes;
+ALTER TABLE agent_nodes_v8 RENAME TO agent_nodes;
+CREATE INDEX agent_nodes_parent_idx ON agent_nodes(parent_agent_node_id);
 "#;
 
 pub(super) const SCHEMA_V1: &str = r#"
