@@ -381,7 +381,10 @@ impl ProviderEventSender {
                         return Err(tokio::sync::mpsc::error::TrySendError::Closed(event));
                     }
                 };
-                let admission = event.requires_admission().then(|| ingress.admit());
+                let admission = event.requires_admission().then(|| match &origin {
+                    ObservationOrigin::Live => ingress.admit(),
+                    ObservationOrigin::Historical { .. } => ingress.admit_unrated(),
+                });
                 permit.send(ProviderIngressEvent {
                     event,
                     admission,
@@ -3600,6 +3603,151 @@ mod tests {
             pending.next_event(),
             Some((PendingToken::Activity(_), _))
         ));
+    }
+
+    #[test]
+    fn historical_provider_delivery_is_unrated_but_live_delivery_is_rated() {
+        let clock = Arc::new(TestPerformanceClock::new(Duration::ZERO));
+        let (ingress, mut sampler) = performance_tracker(clock);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let tracked = ProviderEventSender::Tracked { sender, ingress };
+        let historical_origin = ObservationOrigin::Historical {
+            drain_id: HistoryDrainId::new("codex:historical-provider-rate").unwrap(),
+            artifact_id: "historical-provider-rate.jsonl".to_owned(),
+        };
+        let (model, operator) = empty_performance_inputs();
+
+        tracked
+            .try_send(
+                agent_upsert(Provider::Codex),
+                historical_origin.clone(),
+                None,
+            )
+            .unwrap();
+        let historical = sampler.sample(&model, &operator, 0);
+        assert_eq!(
+            (
+                historical.pending_events,
+                historical.admission_high_water,
+                historical.completion_high_water,
+                historical.events_one_second,
+                historical.events_ten_seconds,
+                historical.events_sixty_seconds,
+            ),
+            (1, 1, 0, 0, 0, 0)
+        );
+        let historical = receiver.blocking_recv().unwrap();
+        assert_eq!(historical.origin, historical_origin);
+        historical.admission.unwrap().complete();
+
+        tracked
+            .try_send(
+                agent_activity(Provider::Codex),
+                ObservationOrigin::Live,
+                None,
+            )
+            .unwrap();
+        let live = sampler.sample(&model, &operator, 0);
+        assert_eq!(
+            (
+                live.pending_events,
+                live.admission_high_water,
+                live.completion_high_water,
+                live.events_one_second,
+                live.events_ten_seconds,
+                live.events_sixty_seconds,
+            ),
+            (1, 2, 1, 1, 1, 1)
+        );
+        receiver
+            .blocking_recv()
+            .unwrap()
+            .admission
+            .unwrap()
+            .complete();
+        let completed = sampler.sample(&model, &operator, 0);
+        assert_eq!(
+            (
+                completed.pending_events,
+                completed.admission_high_water,
+                completed.completion_high_water,
+                completed.events_one_second,
+                completed.events_ten_seconds,
+                completed.events_sixty_seconds,
+            ),
+            (0, 2, 2, 1, 1, 1)
+        );
+    }
+
+    #[test]
+    fn historical_provider_reservation_failure_allocates_no_admission() {
+        #[derive(Clone, Copy, Debug)]
+        enum QueueState {
+            Full,
+            Closed,
+        }
+
+        for queue_state in [QueueState::Full, QueueState::Closed] {
+            let clock = Arc::new(TestPerformanceClock::new(Duration::ZERO));
+            let (ingress, mut sampler) = performance_tracker(clock);
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            let mut receiver = Some(receiver);
+            match queue_state {
+                QueueState::Full => sender
+                    .try_send(ProviderIngressEvent {
+                        event: source_state(Provider::Codex),
+                        admission: None,
+                        origin: ObservationOrigin::Live,
+                        history_manifest: None,
+                    })
+                    .unwrap(),
+                QueueState::Closed => drop(receiver.take()),
+            }
+            let tracked = ProviderEventSender::Tracked { sender, ingress };
+            let historical_origin = ObservationOrigin::Historical {
+                drain_id: HistoryDrainId::new("codex:historical-reservation-failure").unwrap(),
+                artifact_id: "historical-reservation-failure.jsonl".to_owned(),
+            };
+
+            let result = tracked.try_send(agent_upsert(Provider::Codex), historical_origin, None);
+            match (queue_state, result) {
+                (
+                    QueueState::Full,
+                    Err(tokio_mpsc::error::TrySendError::Full(ProviderEvent::AgentUpsert {
+                        ..
+                    })),
+                )
+                | (
+                    QueueState::Closed,
+                    Err(tokio_mpsc::error::TrySendError::Closed(ProviderEvent::AgentUpsert {
+                        ..
+                    })),
+                ) => {}
+                (_, unexpected) => {
+                    panic!("historical {queue_state:?} reservation result: {unexpected:?}")
+                }
+            }
+
+            let (model, operator) = empty_performance_inputs();
+            let snapshot = sampler.sample(&model, &operator, 0);
+            assert_eq!(
+                (
+                    snapshot.pending_events,
+                    snapshot.admission_high_water,
+                    snapshot.completion_high_water,
+                    snapshot.events_one_second,
+                    snapshot.events_ten_seconds,
+                    snapshot.events_sixty_seconds,
+                ),
+                (0, 0, 0, 0, 0, 0),
+                "historical {queue_state:?} reservation allocated performance state"
+            );
+            assert_eq!(
+                snapshot.event_lag,
+                Duration::ZERO,
+                "historical {queue_state:?} reservation changed event lag"
+            );
+        }
     }
 
     #[test]
