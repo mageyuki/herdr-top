@@ -1550,7 +1550,9 @@ fn promote_live_origin(
     incoming_origin: ObservationOrigin,
     incoming_manifest: Option<Arc<PersistHistoryDrain>>,
 ) {
-    if matches!(incoming_origin, ObservationOrigin::Live) {
+    if matches!(&stored.origin, ObservationOrigin::Live)
+        || matches!(incoming_origin, ObservationOrigin::Live)
+    {
         stored.origin = ObservationOrigin::Live;
         stored.history_manifest = None;
     } else if stored.history_manifest.is_none() {
@@ -3705,6 +3707,73 @@ mod tests {
             &ObservationOrigin::Live,
             None,
             "live idle then historical terminal",
+        );
+
+        let live_terminal = agent_state_upsert(
+            ExecState::Ended,
+            "live-terminal-owner",
+            "live-terminal",
+            100,
+            7,
+        );
+        let historical_idle = agent_state_upsert(
+            ExecState::Idle,
+            "historical-idle-owner",
+            "historical-idle",
+            200,
+            8,
+        );
+        let (idle_origin, idle_manifest) =
+            historical_observation("live-terminal-then-historical-idle");
+        let mut pending = PendingEvents::new(ProviderDiagnostics::default());
+        assert_eq!(
+            pending.merge_with_origin(live_terminal.clone(), ObservationOrigin::Live, None),
+            MergeOutcome::Accepted,
+            "live terminal then historical idle"
+        );
+        assert_eq!(
+            pending.merge_with_origin(historical_idle, idle_origin, Some(idle_manifest)),
+            MergeOutcome::Coalesced,
+            "live terminal then historical idle"
+        );
+        assert_retained(
+            &pending,
+            &live_terminal,
+            &ObservationOrigin::Live,
+            None,
+            "live terminal then historical idle",
+        );
+
+        let live_terminal = agent_state_upsert(
+            ExecState::Ended,
+            "live-duplicate-owner",
+            "live-duplicate-terminal",
+            300,
+            9,
+        );
+        let (duplicate_origin, duplicate_manifest) =
+            historical_observation("live-terminal-then-historical-duplicate");
+        let mut pending = PendingEvents::new(ProviderDiagnostics::default());
+        assert_eq!(
+            pending.merge_with_origin(live_terminal.clone(), ObservationOrigin::Live, None),
+            MergeOutcome::Accepted,
+            "live terminal then historical duplicate"
+        );
+        assert_eq!(
+            pending.merge_with_origin(
+                live_terminal.clone(),
+                duplicate_origin,
+                Some(duplicate_manifest),
+            ),
+            MergeOutcome::Duplicate,
+            "live terminal then historical duplicate"
+        );
+        assert_retained(
+            &pending,
+            &live_terminal,
+            &ObservationOrigin::Live,
+            None,
+            "live terminal then historical duplicate",
         );
     }
 
