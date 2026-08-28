@@ -368,6 +368,7 @@ impl Reducer {
         model
             .controller_diagnostics_mut()
             .set_dangling_announcement_components(dangling_components);
+        let deferred_history_activity = model.take_deferred_history_activity();
         // increment5-workload-harness: begin startup clone publication timing start
         #[cfg(feature = "workload-harness")]
         let workload_publish_started = Instant::now();
@@ -380,7 +381,8 @@ impl Reducer {
             workload_publish_started.elapsed(),
         );
         // increment5-workload-harness: end startup clone publication timing finish
-        let (operator, operator_receiver) = OperatorProjection::new(restored_operator);
+        let (mut operator, operator_receiver) = OperatorProjection::new(restored_operator);
+        operator.restore_deferred_history(deferred_history_activity, &model);
         (
             Self {
                 model,
@@ -727,6 +729,8 @@ impl Reducer {
         {
             return false;
         }
+        self.published_history_drains
+            .extend(finalization.completed_drains.iter().cloned());
         for finalized in &finalization.runs {
             if self.model.task_run(&finalized.run_id).is_none() {
                 continue;
@@ -735,9 +739,17 @@ impl Reducer {
                 self.model
                     .set_task_run_v6_state(finalized.run_id, finalized.state.clone());
             }
+            if finalized.state.history_ready {
+                self.model.release_history_publications(finalized.run_id);
+            }
             self.pending_rate_observation_runs.insert(finalized.run_id);
         }
-        self.operator.publish_accumulated(&finalization.drain_id);
+        let published_model = self.model.publication_snapshot();
+        self.operator.publish_accumulated(
+            &finalization.completed_drains,
+            &finalization.runs,
+            &published_model,
+        );
         let prior_rate_context = self.rate_observation_context.replace((
             RateObservationOrigin::Historical,
             finalization.finalized_at_ms,
@@ -781,54 +793,70 @@ impl Reducer {
         provider_at_ms: i64,
     ) -> PersistV6Batch {
         let historical = matches!(origin, ObservationOrigin::Historical { .. });
-        let mut touched = operations
-            .iter()
-            .filter_map(|operation| match operation {
-                PersistOp::UpsertTaskRun(task_run) => Some(task_run.task_run.run_id),
-                PersistOp::PromoteTaskRunKey { promoted, .. } => Some(promoted.task_run.run_id),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let changed = prior.as_ref().map_or_else(HashSet::new, |before| {
+            self.model.changed_task_run_ids_since(before)
+        });
+        let mut touched = Vec::new();
+        for operation in &operations {
+            match operation {
+                PersistOp::UpsertTaskRun(task_run) => touched.push(task_run.task_run.run_id),
+                PersistOp::PromoteTaskRunKey { promoted, .. } => {
+                    touched.push(promoted.task_run.run_id);
+                }
+                PersistOp::MergeTaskRuns { survivor, absorbed } => {
+                    touched.extend([*survivor, *absorbed]);
+                }
+                PersistOp::UpsertExecution(value) => {
+                    touched.push(value.execution.task_run_id);
+                }
+                PersistOp::UpsertAgentNode(node) => touched.push(node.task_run_id),
+                PersistOp::UpsertExecutionEdge { edge, .. } => {
+                    touched.extend([edge.parent_run_id, edge.child_run_id]);
+                }
+                PersistOp::UpsertDependencyEdge { edge, .. } => {
+                    touched.extend([edge.prerequisite_run_id, edge.dependent_run_id]);
+                }
+                PersistOp::RecordEvent { event, .. } => {
+                    touched.extend(event_metadata(event).task_run_id);
+                }
+                _ => {}
+            }
+        }
+        touched.extend(changed.iter().copied());
         touched.sort_unstable();
         touched.dedup();
+
+        let mut history_publications = Vec::new();
+        if historical && let Some(before) = prior.as_ref() {
+            for run_id in &touched {
+                if before
+                    .task_run_v6_state(run_id)
+                    .is_some_and(|state| state.history_ready)
+                    && let Some(mut publication) = before.capture_history_publication(*run_id)
+                {
+                    publication.canonical_run_id = canonical_run_after_batch(*run_id, &operations);
+                    if self.model.install_history_publication(publication.clone()) {
+                        history_publications.push(publication);
+                    }
+                }
+            }
+        }
 
         let mut task_runs = Vec::with_capacity(touched.len());
         let mut associations = Vec::with_capacity(touched.len());
         for run_id in touched {
-            let Some(mut current) = self.model.task_run(&run_id).cloned() else {
+            let canonical_run_id = canonical_run_after_batch(run_id, &operations);
+            let Some(current) = self.model.task_run(&canonical_run_id).cloned() else {
                 continue;
             };
-            let prior_run = prior.as_ref().and_then(|model| model.task_run(&run_id));
-            let prior_state = prior
-                .as_ref()
-                .and_then(|model| model.task_run_v6_state(&run_id));
             let mut state = self
                 .model
-                .task_run_v6_state(&run_id)
+                .task_run_v6_state(&canonical_run_id)
                 .cloned()
                 .unwrap_or_default();
 
             if historical {
-                if prior_state.is_some_and(|state| state.history_ready) {
-                    let prior_run = prior_run.expect("a ready v6 row must have a task run");
-                    current.state = prior_run.state;
-                    current.has_controller_task_state_event =
-                        prior_run.has_controller_task_state_event;
-                    current.updated_at_ms = prior_run.updated_at_ms;
-                    current.finished_at_ms = prior_run.finished_at_ms;
-                    current.dismissed_at_ms = prior_run.dismissed_at_ms;
-                    current.subject = prior_run.subject.clone().or(current.subject);
-                    current.created_at_ms = match (prior_run.created_at_ms, current.created_at_ms) {
-                        (Some(left), Some(right)) => Some(left.min(right)),
-                        (left @ Some(_), None) => left,
-                        (None, right) => right,
-                    };
-                    state = prior_state.cloned().expect("checked above");
-                } else {
-                    state.history_ready = false;
-                }
-            } else {
-                state.history_ready = true;
+                state.history_ready = false;
             }
             state.latest_provider_at_ms = Some(
                 state
@@ -836,34 +864,44 @@ impl Reducer {
                     .map_or(provider_at_ms, |stored| stored.max(provider_at_ms)),
             );
             self.model.insert_task_run(current.clone());
-            self.model.set_task_run_v6_state(run_id, state.clone());
+            self.model
+                .set_task_run_v6_state(canonical_run_id, state.clone());
 
             let mut persisted = operations
                 .iter()
                 .filter_map(|operation| match operation {
-                    PersistOp::UpsertTaskRun(task_run) if task_run.task_run.run_id == run_id => {
+                    PersistOp::UpsertTaskRun(task_run)
+                        if task_run.task_run.run_id == canonical_run_id =>
+                    {
                         Some(task_run.clone())
                     }
                     PersistOp::PromoteTaskRunKey { promoted, .. }
-                        if promoted.task_run.run_id == run_id =>
+                        if promoted.task_run.run_id == canonical_run_id =>
                     {
                         Some(promoted.clone())
                     }
                     _ => None,
                 })
                 .next_back()
-                .expect("a touched run must have an upsert or promotion");
+                .unwrap_or_else(
+                    || match self.persist_task_run(current.clone(), provider_at_ms) {
+                        PersistOp::UpsertTaskRun(task_run) => task_run,
+                        _ => unreachable!("persist_task_run always returns an upsert"),
+                    },
+                );
             persisted.task_run = current.clone();
             persisted.created_at_ms = current.created_at_ms.unwrap_or(persisted.created_at_ms);
             persisted.updated_at_ms = current.updated_at_ms.unwrap_or(persisted.updated_at_ms);
             persisted.finished_at_ms = current.finished_at_ms;
             for operation in &mut operations {
                 match operation {
-                    PersistOp::UpsertTaskRun(task_run) if task_run.task_run.run_id == run_id => {
+                    PersistOp::UpsertTaskRun(task_run)
+                        if task_run.task_run.run_id == canonical_run_id =>
+                    {
                         *task_run = persisted.clone();
                     }
                     PersistOp::PromoteTaskRunKey { promoted, .. }
-                        if promoted.task_run.run_id == run_id =>
+                        if promoted.task_run.run_id == canonical_run_id =>
                     {
                         *promoted = persisted.clone();
                     }
@@ -877,10 +915,14 @@ impl Reducer {
             if let ObservationOrigin::Historical { drain_id, .. } = origin {
                 associations.push(PersistHistoryDrainRun {
                     drain_id: drain_id.clone(),
-                    run_id,
+                    run_id: canonical_run_id,
                 });
             }
         }
+        task_runs.sort_by_key(|run| run.task_run.task_run.run_id);
+        task_runs.dedup_by_key(|run| run.task_run.task_run.run_id);
+        associations.sort_by_key(|association| association.run_id);
+        associations.dedup_by_key(|association| association.run_id);
         self.defer_provider_publication = false;
         self.deferred_provider_drain = None;
         self.rate_observation_context = None;
@@ -893,6 +935,11 @@ impl Reducer {
                 Vec::new()
             },
             history_associations: associations,
+            history_publications,
+            history_event_drain: match origin {
+                ObservationOrigin::Historical { drain_id, .. } => Some(drain_id.clone()),
+                ObservationOrigin::Live => None,
+            },
             ..PersistV6Batch::default()
         }
     }
@@ -3776,6 +3823,17 @@ fn normalize_persist_batch_lineage(batch: &mut PersistBatch) {
     }
 }
 
+fn canonical_run_after_batch(mut run_id: RunId, batch: &[PersistOp]) -> RunId {
+    for operation in batch {
+        if let PersistOp::MergeTaskRuns { survivor, absorbed } = operation
+            && *absorbed == run_id
+        {
+            run_id = *survivor;
+        }
+    }
+    run_id
+}
+
 fn deterministic_agent_node_id(provider: Provider, sid: &str) -> String {
     let provider = match provider {
         Provider::Claude => "claude",
@@ -4553,6 +4611,7 @@ mod tests {
         let drain_id = crate::model::HistoryDrainId::new("codex:rate-finalization").unwrap();
         assert!(
             reducer.apply_history_finalization(&crate::store::HistoryDrainFinalization {
+                completed_drains: vec![drain_id.clone()],
                 drain_id,
                 finalized_at_ms,
                 runs: vec![crate::store::FinalizedHistoryRun {
@@ -4885,6 +4944,254 @@ mod tests {
                 "historical-sibling-run".to_owned(),
             ])
         );
+    }
+
+    #[test]
+    fn historical_agent_mutation_of_ready_run_stays_at_published_before_image() {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run_with_controller_evidence(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "ready-before-image".to_owned(),
+            },
+            1,
+            TaskState::Running,
+        ));
+        model.set_task_run_v6_state(run_id, TaskRunV6State::default());
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+        let drain_id = crate::model::HistoryDrainId::new("codex:ready-before-image").unwrap();
+        let origin = crate::model::ObservationOrigin::Historical {
+            drain_id: drain_id.clone(),
+            artifact_id: "ready.jsonl".to_owned(),
+        };
+        let manifest = PersistHistoryDrain {
+            drain_id,
+            provider: Provider::Codex,
+            created_at_ms: 1_000,
+            artifacts: Vec::new(),
+        };
+        let prior = reducer.begin_provider_observation(&origin, 2_000);
+        let outcome = reducer
+            .apply(NormalizedEvent::AgentNodeUpsert {
+                metadata: EventMetadata {
+                    event_id: "historical-ready-agent".to_owned(),
+                    timestamp_ms: 2_000,
+                    receipt_time_ms: 2_000,
+                    source: "provider".to_owned(),
+                    source_event_type: "agent.updated".to_owned(),
+                    herdr_session: "history-test".to_owned(),
+                    workspace_id: None,
+                    tab_id: None,
+                    pane_id: None,
+                    terminal_id: None,
+                    provider: Some(Provider::Codex),
+                    native_session_id: Some("ready-before-image".to_owned()),
+                    task_run_id: Some(run_id),
+                    agent_node_id: Some("historical-ready-agent".to_owned()),
+                    task_state: None,
+                    execution_parent: None,
+                    dependency: None,
+                    source_coverage: Vec::new(),
+                    provider_metadata: None,
+                    label: None,
+                    reason: None,
+                    progress: None,
+                    ingest_seq: None,
+                },
+                node: AgentNodeObservation {
+                    agent_node_id: "historical-ready-agent".to_owned(),
+                    provider: Provider::Codex,
+                    native_session_id: Some("ready-before-image".to_owned()),
+                    task_run_id: run_id,
+                    parent_agent_node_id: None,
+                    state: Some(ExecState::Working),
+                    model_id: Some("historical-model".to_owned()),
+                    session_file: None,
+                },
+            })
+            .unwrap();
+        let ApplyOutcome::Applied(operations) = outcome else {
+            panic!("historical agent observation must apply");
+        };
+        let _batch =
+            reducer.finish_provider_observation(prior, operations, &origin, Some(&manifest), 2_000);
+        reducer.complete_deferred_operator_submission(RuntimeWriteOutcome::Durable);
+
+        assert!(
+            shared
+                .borrow()
+                .agent_nodes()
+                .all(|node| node.model_id.as_deref() != Some("historical-model"))
+        );
+        reducer.record_provider_identity_disagreement();
+        assert!(
+            shared
+                .borrow()
+                .agent_nodes()
+                .all(|node| node.model_id.as_deref() != Some("historical-model")),
+            "an ordinary publication exposed a historical Agent projection before finalization"
+        );
+    }
+
+    #[test]
+    fn historical_activity_only_record_preserves_the_ready_run_before_image() {
+        let run_id = RunId::new();
+        let mut model = DomainModel::default();
+        model.insert_task_run(run_with_controller_evidence(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "ready-activity-only".to_owned(),
+            },
+            1,
+            TaskState::Running,
+        ));
+        model.set_task_run_v6_state(run_id, TaskRunV6State::default());
+        let (mut reducer, shared) = Reducer::new(restored(model, 2));
+        let drain_id = crate::model::HistoryDrainId::new("codex:ready-activity-only").unwrap();
+        let origin = crate::model::ObservationOrigin::Historical {
+            drain_id: drain_id.clone(),
+            artifact_id: "activity-only.jsonl".to_owned(),
+        };
+        let prior = reducer.begin_provider_observation(&origin, 2_000);
+        let mut event_metadata = metadata("ready-activity-only-event", 2_000);
+        event_metadata.task_run_id = Some(run_id);
+        let batch = reducer.finish_provider_observation(
+            prior,
+            vec![PersistOp::RecordEvent {
+                event: Box::new(NormalizedEvent::AgentActivity {
+                    metadata: event_metadata,
+                    agent_node_id: "activity-only-agent".to_owned(),
+                    activity: MinimalProviderMetadata::default(),
+                }),
+                seen_at_ms: 2_000,
+            }],
+            &origin,
+            Some(&PersistHistoryDrain {
+                drain_id,
+                provider: Provider::Codex,
+                created_at_ms: 1_000,
+                artifacts: Vec::new(),
+            }),
+            2_000,
+        );
+
+        assert_eq!(batch.history_publications.len(), 1);
+        reducer.record_provider_identity_disagreement();
+        assert!(shared.borrow().task_run(&run_id).is_some());
+    }
+
+    #[test]
+    fn not_committed_historical_write_leaves_published_model_and_activity_unchanged() {
+        let run_id = RunId::new();
+        let key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "not-committed-history".to_owned(),
+        };
+        let agent_node_id = "not-committed-agent";
+        let mut model = DomainModel::default();
+        model.insert_task_run(run_with_controller_evidence(
+            run_id,
+            key,
+            1,
+            TaskState::Running,
+        ));
+        model.insert_agent_node(AgentNode {
+            agent_node_id: agent_node_id.to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some("not-committed-history".to_owned()),
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(2),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Working),
+            model_id: Some("published-model".to_owned()),
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
+        });
+        let (mut reducer, shared, operator) = Reducer::new_with_operator(
+            restored(model, 3),
+            crate::activity::RestoredOperatorState {
+                activity: Vec::new(),
+                terminal_times: HashMap::new(),
+            },
+        );
+        let drain_id = crate::model::HistoryDrainId::new("codex:not-committed-history").unwrap();
+        let origin = crate::model::ObservationOrigin::Historical {
+            drain_id: drain_id.clone(),
+            artifact_id: "not-committed.jsonl".to_owned(),
+        };
+        let prior = reducer.begin_provider_observation(&origin, 2_000);
+        let outcome = reducer
+            .apply(NormalizedEvent::AgentActivity {
+                metadata: EventMetadata {
+                    event_id: "not-committed-history-event".to_owned(),
+                    timestamp_ms: 2_000,
+                    receipt_time_ms: 2_000,
+                    source: "provider".to_owned(),
+                    source_event_type: "agent.activity".to_owned(),
+                    herdr_session: "history-test".to_owned(),
+                    workspace_id: None,
+                    tab_id: None,
+                    pane_id: None,
+                    terminal_id: None,
+                    provider: Some(Provider::Codex),
+                    native_session_id: Some("not-committed-history".to_owned()),
+                    task_run_id: Some(run_id),
+                    agent_node_id: Some(agent_node_id.to_owned()),
+                    task_state: None,
+                    execution_parent: None,
+                    dependency: None,
+                    source_coverage: Vec::new(),
+                    provider_metadata: None,
+                    label: None,
+                    reason: None,
+                    progress: None,
+                    ingest_seq: None,
+                },
+                agent_node_id: agent_node_id.to_owned(),
+                activity: MinimalProviderMetadata {
+                    event_kind: Some("historical-private-kind".to_owned()),
+                    model_id: Some("historical-private-model".to_owned()),
+                    ..MinimalProviderMetadata::default()
+                },
+            })
+            .unwrap();
+        let ApplyOutcome::Applied(operations) = outcome else {
+            panic!("historical activity must apply");
+        };
+        let _batch = reducer.finish_provider_observation(
+            prior,
+            operations,
+            &origin,
+            Some(&PersistHistoryDrain {
+                drain_id,
+                provider: Provider::Codex,
+                created_at_ms: 1_000,
+                artifacts: Vec::new(),
+            }),
+            2_000,
+        );
+        reducer.complete_deferred_operator_submission(RuntimeWriteOutcome::NotCommitted(
+            crate::store::writer::PersistenceFailure {
+                operation: crate::store::writer::PersistenceOperation::Apply,
+                phase: crate::store::writer::PersistencePhase::CommandExecution,
+                code: crate::store::writer::PersistenceFailureCode::Sqlite,
+                durability: crate::store::writer::DurabilityDisposition::NotCommitted,
+            },
+        ));
+
+        reducer.record_provider_identity_disagreement();
+        let snapshot = shared.borrow();
+        let published = snapshot.agent_node(agent_node_id).unwrap();
+        assert_eq!(published.model_id.as_deref(), Some("published-model"));
+        assert_eq!(published.last_event_kind, None);
+        assert!(operator.borrow().activity.is_empty());
     }
 
     #[test]

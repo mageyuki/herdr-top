@@ -14,7 +14,7 @@ use rusqlite::{Connection, MAIN_DB, OpenFlags, OptionalExtension, params};
 use super::StoreError;
 use crate::lockfile::StateRoot;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 6;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 7;
 pub(super) const DATABASE_FILE: &str = "herdr-top.sqlite3";
 const FILE_MODE: u32 = 0o600;
 
@@ -371,6 +371,14 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), St
         )?;
         version = 6;
     }
+    if version < 7 {
+        transaction.execute_batch(SCHEMA_V7)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (7, ?1)",
+            [now_ms],
+        )?;
+        version = 7;
+    }
     debug_assert_eq!(version, CURRENT_SCHEMA_VERSION);
     transaction.commit()?;
     Ok(())
@@ -508,6 +516,44 @@ CREATE TABLE history_drain_runs (
     FOREIGN KEY (run_id) REFERENCES task_runs(run_id) ON DELETE CASCADE
 );
 CREATE INDEX history_drain_runs_run_idx ON history_drain_runs(run_id);
+"#;
+
+pub(super) const SCHEMA_V7: &str = r#"
+ALTER TABLE history_drains ADD COLUMN completed_by_drain_id TEXT;
+UPDATE history_drains
+SET completed_by_drain_id = drain_id
+WHERE finalized_at_ms IS NOT NULL;
+
+ALTER TABLE events ADD COLUMN history_drain_id TEXT;
+CREATE INDEX events_history_drain_idx ON events(history_drain_id, event_row_id);
+
+CREATE TABLE history_run_publications (
+    published_run_id TEXT PRIMARY KEY,
+    canonical_run_id TEXT NOT NULL,
+    payload          TEXT NOT NULL,
+    FOREIGN KEY (canonical_run_id) REFERENCES task_runs(run_id) ON DELETE CASCADE
+);
+CREATE INDEX history_run_publications_canonical_idx
+    ON history_run_publications(canonical_run_id);
+
+CREATE TABLE history_event_before_images (
+    drain_id   TEXT NOT NULL,
+    event_id   TEXT NOT NULL,
+    task_run_id TEXT,
+    PRIMARY KEY (drain_id, event_id),
+    FOREIGN KEY (drain_id) REFERENCES history_drains(drain_id) ON DELETE CASCADE,
+    FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE
+);
+
+UPDATE task_runs AS run
+SET history_ready = 0
+WHERE EXISTS (
+    SELECT 1
+    FROM history_drain_runs AS association
+    JOIN history_drains AS drain ON drain.drain_id = association.drain_id
+    WHERE association.run_id = run.run_id
+      AND drain.finalized_at_ms IS NULL
+);
 "#;
 
 pub(super) const SCHEMA_V1: &str = r#"

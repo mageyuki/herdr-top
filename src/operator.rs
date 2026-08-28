@@ -12,9 +12,9 @@ use crate::activity::{
 };
 use crate::diagnostics::RuntimeWriteOutcome;
 use crate::model::{
-    EventMetadata, HistoryDrainId, NormalizedEvent, RunId, sanitize_controller_text,
+    DomainModel, EventMetadata, HistoryDrainId, NormalizedEvent, RunId, sanitize_controller_text,
 };
-use crate::store::{PersistOp, PersistTaskRun};
+use crate::store::{FinalizedHistoryRun, PersistOp, PersistTaskRun};
 
 const ACTIVITY_LIMIT: usize = 10_000;
 
@@ -30,7 +30,7 @@ pub(crate) struct OperatorProjection {
     pending_identities: HashSet<ActivityIdentity>,
     deferred_pending_identities: HashSet<ActivityIdentity>,
     deferred_activity: HashMap<HistoryDrainId, HashSet<ActivityIdentity>>,
-    deferred_terminal_runs: HashMap<HistoryDrainId, HashSet<RunId>>,
+    blocked_history_runs: HashSet<RunId>,
     published_activity: Vec<ActivityItem>,
     published_terminal_times: HashMap<RunId, i64>,
     published_pending_identities: HashSet<ActivityIdentity>,
@@ -58,12 +58,46 @@ impl OperatorProjection {
                 pending_identities: HashSet::new(),
                 deferred_pending_identities: HashSet::new(),
                 deferred_activity: HashMap::new(),
-                deferred_terminal_runs: HashMap::new(),
+                blocked_history_runs: HashSet::new(),
                 published_pending_identities: HashSet::new(),
                 publisher,
             },
             receiver,
         )
+    }
+
+    /// Restores bounded private Activity pages and canonical terminal state after a cold start.
+    pub(crate) fn restore_deferred_history(
+        &mut self,
+        deferred: HashMap<HistoryDrainId, Vec<ActivityItem>>,
+        model: &DomainModel,
+    ) {
+        self.blocked_history_runs = model
+            .task_runs()
+            .filter_map(|run| {
+                model
+                    .task_run_v6_state(&run.run_id)
+                    .is_some_and(|state| !state.history_ready)
+                    .then_some(run.run_id)
+            })
+            .collect();
+        self.terminal_times.clear();
+        for run in model.task_runs() {
+            if let Some(finished_at_ms) = run.finished_at_ms {
+                self.terminal_times.insert(run.run_id, finished_at_ms);
+            }
+        }
+        for (drain_id, items) in deferred {
+            let identities = items
+                .iter()
+                .map(|item| item.identity.clone())
+                .collect::<HashSet<_>>();
+            self.activity
+                .retain(|item| !identities.contains(&item.identity));
+            self.activity.extend(items);
+            self.deferred_activity.insert(drain_id, identities);
+        }
+        normalize_activity(&mut self.activity);
     }
 
     /// Optimistically applies one complete reducer submission as durable.
@@ -103,12 +137,16 @@ impl OperatorProjection {
             .entry(drain_id.clone())
             .or_default()
             .extend(pending);
-        self.deferred_terminal_runs
-            .entry(drain_id.clone())
-            .or_default()
-            .extend(touched_terminal_runs(batch));
         if changed {
             normalize_activity(&mut self.activity);
+            let retained = self
+                .activity
+                .iter()
+                .map(|item| &item.identity)
+                .collect::<HashSet<_>>();
+            for identities in self.deferred_activity.values_mut() {
+                identities.retain(|identity| retained.contains(identity));
+            }
         }
     }
 
@@ -145,21 +183,34 @@ impl OperatorProjection {
     }
 
     /// Publishes the private coalesced state after its history drain is durably finalized.
-    pub(crate) fn publish_accumulated(&mut self, drain_id: &HistoryDrainId) {
-        self.deferred_activity.remove(drain_id);
-        self.deferred_terminal_runs.remove(drain_id);
+    pub(crate) fn publish_accumulated(
+        &mut self,
+        completed_drains: &[HistoryDrainId],
+        finalized_runs: &[FinalizedHistoryRun],
+        published_model: &DomainModel,
+    ) {
+        for drain_id in completed_drains {
+            self.deferred_activity.remove(drain_id);
+        }
+        for finalized in finalized_runs {
+            if finalized.state.history_ready {
+                self.blocked_history_runs.remove(&finalized.run_id);
+            } else {
+                self.blocked_history_runs.insert(finalized.run_id);
+            }
+        }
         let hidden_activity = self
             .deferred_activity
             .values()
             .flatten()
             .cloned()
             .collect::<HashSet<_>>();
-        let hidden_terminal_runs = self
-            .deferred_terminal_runs
-            .values()
-            .flatten()
-            .copied()
-            .collect::<HashSet<_>>();
+        let mut hidden_activity = hidden_activity;
+        hidden_activity.extend(self.activity.iter().filter_map(|item| {
+            item.task_run_id
+                .is_some_and(|run_id| self.blocked_history_runs.contains(&run_id))
+                .then_some(item.identity.clone())
+        }));
 
         let mut next_activity = self
             .activity
@@ -176,15 +227,10 @@ impl OperatorProjection {
         normalize_activity(&mut next_activity);
         self.published_activity = next_activity;
 
-        let mut next_terminal_times = self.terminal_times.clone();
-        for run_id in hidden_terminal_runs {
-            if let Some(published) = self.published_terminal_times.get(&run_id) {
-                next_terminal_times.insert(run_id, *published);
-            } else {
-                next_terminal_times.remove(&run_id);
-            }
-        }
-        self.published_terminal_times = next_terminal_times;
+        self.published_terminal_times = published_model
+            .task_runs()
+            .filter_map(|run| run.finished_at_ms.map(|finished| (run.run_id, finished)))
+            .collect();
         self.published_pending_identities.clear();
         self.publish();
     }
@@ -278,18 +324,6 @@ fn apply_terminal_time(
     } else {
         terminal_times.remove(&run_id).is_some()
     }
-}
-
-fn touched_terminal_runs(batch: &[PersistOp]) -> HashSet<RunId> {
-    batch
-        .iter()
-        .flat_map(|operation| match operation {
-            PersistOp::UpsertTaskRun(task_run) => vec![task_run.task_run.run_id],
-            PersistOp::PromoteTaskRunKey { promoted, .. } => vec![promoted.task_run.run_id],
-            PersistOp::MergeTaskRuns { survivor, absorbed } => vec![*survivor, *absorbed],
-            _ => Vec::new(),
-        })
-        .collect()
 }
 
 fn merge_terminal_times(

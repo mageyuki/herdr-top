@@ -6762,6 +6762,8 @@ fn v6_batch_is_empty(batch: &PersistV6Batch) -> bool {
         && batch.rate_totals.is_empty()
         && batch.history_drains.is_empty()
         && batch.history_associations.is_empty()
+        && batch.history_publications.is_empty()
+        && batch.history_event_drain.is_none()
 }
 
 async fn persist_provider_v6_submission(

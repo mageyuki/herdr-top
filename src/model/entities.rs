@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use super::ids::{DisplayOrdinal, Provider, RunId, RunKey};
-use super::state::{ExecState, PaneAgentStatus, RunRateTotals, TaskRunV6State, TaskState};
+use super::state::{
+    ExecState, HistoryDrainId, PaneAgentStatus, RunRateTotals, TaskRunV6State, TaskState,
+};
+use crate::activity::ActivityItem;
 
 /// Operator intent delivered to the collector-owned reducer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -241,6 +244,29 @@ pub struct ExecutionEdge {
 pub struct DependencyEdge {
     pub prerequisite_run_id: RunId,
     pub dependent_run_id: RunId,
+}
+
+/// The last published state of one run while canonical history remains quarantined.
+///
+/// Persistent fields are serialized into SQLite. Process-local telemetry, kind, and rate cursor
+/// are retained only by the live reducer and intentionally deserialize as absent after restart.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HistoryRunPublication {
+    pub canonical_run_id: RunId,
+    pub task_run: TaskRun,
+    pub state: TaskRunV6State,
+    pub aliases: Vec<RunKey>,
+    pub rate_totals: Option<RunRateTotals>,
+    pub executions: Vec<Execution>,
+    pub agent_nodes: Vec<AgentNode>,
+    pub execution_edges: Vec<ExecutionEdge>,
+    pub dependency_edges: Vec<DependencyEdge>,
+    #[serde(skip)]
+    telemetry: Option<RunTelemetry>,
+    #[serde(skip)]
+    run_kind: Option<RunKind>,
+    #[serde(skip)]
+    rate_cursor: Option<RunRateCursor>,
 }
 
 /// Counters maintained by the serialized reducer for Controller-input diagnostics.
@@ -732,6 +758,10 @@ pub struct DomainModel {
     agent_nodes: HashMap<String, AgentNode>,
     execution_edges: HashSet<ExecutionEdge>,
     dependency_edges: HashSet<DependencyEdge>,
+    /// One bounded before-image per previously published run, spilled durably by the store.
+    history_run_publications: HashMap<RunId, HistoryRunPublication>,
+    /// Bounded restored Activity pages for unfinished drains; never included in model snapshots.
+    deferred_history_activity: HashMap<HistoryDrainId, Vec<ActivityItem>>,
     controller_diagnostics: ControllerDiagnostics,
     provider_diagnostics: ProviderDiagnostics,
 }
@@ -750,46 +780,82 @@ impl DomainModel {
     /// keyed projection becomes visible until the matching drain finalization flips readiness.
     pub(crate) fn publication_snapshot(&self) -> Self {
         let mut snapshot = self.clone();
-        let suppressed = snapshot
+        let blocked = snapshot
             .task_run_v6_state
             .iter()
             .filter_map(|(run_id, state)| (!state.history_ready).then_some(*run_id))
             .collect::<HashSet<_>>();
-        if suppressed.is_empty() {
+        if blocked.is_empty() {
+            snapshot.history_run_publications.clear();
+            snapshot.deferred_history_activity.clear();
             return snapshot;
         }
+        for run_id in &blocked {
+            snapshot.remove_task_run_projection(run_id);
+        }
+        let publications = snapshot
+            .history_run_publications
+            .values()
+            .filter(|publication| blocked.contains(&publication.canonical_run_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for publication in publications {
+            snapshot.restore_history_publication(publication);
+        }
+        let dangling = super::graph::dangling_announcement_components(&snapshot);
         snapshot
-            .task_runs
-            .retain(|run_id, _| !suppressed.contains(run_id));
+            .controller_diagnostics
+            .set_dangling_announcement_components(dangling);
+        snapshot.history_run_publications.clear();
+        snapshot.deferred_history_activity.clear();
         snapshot
-            .run_ids_by_key
-            .retain(|_, run_id| !suppressed.contains(run_id));
-        snapshot
-            .task_run_v6_state
-            .retain(|run_id, _| !suppressed.contains(run_id));
-        snapshot
-            .run_rate_totals
-            .retain(|run_id, _| !suppressed.contains(run_id));
-        snapshot
-            .telemetry
-            .retain(|run_id, _| !suppressed.contains(run_id));
-        snapshot
-            .run_kinds
-            .retain(|run_id, _| !suppressed.contains(run_id));
-        snapshot
-            .executions
-            .retain(|_, execution| !suppressed.contains(&execution.task_run_id));
-        snapshot
-            .agent_nodes
-            .retain(|_, node| !suppressed.contains(&node.task_run_id));
-        snapshot.execution_edges.retain(|edge| {
-            !suppressed.contains(&edge.parent_run_id) && !suppressed.contains(&edge.child_run_id)
-        });
-        snapshot.dependency_edges.retain(|edge| {
-            !suppressed.contains(&edge.prerequisite_run_id)
-                && !suppressed.contains(&edge.dependent_run_id)
-        });
-        snapshot
+    }
+
+    fn remove_task_run_projection(&mut self, run_id: &RunId) {
+        self.task_runs.remove(run_id);
+        self.run_ids_by_key.retain(|_, owner| owner != run_id);
+        self.task_run_v6_state.remove(run_id);
+        self.run_rate_totals.remove(run_id);
+        self.run_rate_cursors.remove(run_id);
+        self.telemetry.remove(run_id);
+        self.run_kinds.remove(run_id);
+        self.executions
+            .retain(|_, execution| &execution.task_run_id != run_id);
+        self.agent_nodes
+            .retain(|_, node| &node.task_run_id != run_id);
+        self.execution_edges
+            .retain(|edge| &edge.parent_run_id != run_id && &edge.child_run_id != run_id);
+        self.dependency_edges
+            .retain(|edge| &edge.prerequisite_run_id != run_id && &edge.dependent_run_id != run_id);
+    }
+
+    fn restore_history_publication(&mut self, publication: HistoryRunPublication) {
+        let run_id = publication.task_run.run_id;
+        self.insert_task_run(publication.task_run);
+        self.set_task_run_v6_state(run_id, publication.state);
+        for alias in publication.aliases {
+            self.insert_task_run_alias(alias, run_id);
+        }
+        if let Some(totals) = publication.rate_totals {
+            self.set_run_rate_totals(run_id, totals);
+        }
+        if let Some(cursor) = publication.rate_cursor {
+            self.set_run_rate_cursor(run_id, cursor);
+        }
+        if let Some(telemetry) = publication.telemetry {
+            self.telemetry.insert(run_id, telemetry);
+        }
+        if let Some(kind) = publication.run_kind {
+            self.run_kinds.insert(run_id, kind);
+        }
+        for execution in publication.executions {
+            self.insert_execution(execution);
+        }
+        for node in publication.agent_nodes {
+            self.insert_agent_node(node);
+        }
+        self.execution_edges.extend(publication.execution_edges);
+        self.dependency_edges.extend(publication.dependency_edges);
     }
 
     /// Returns the reducer-owned Controller diagnostic counters.
@@ -977,6 +1043,155 @@ impl DomainModel {
         self.task_runs.values()
     }
 
+    /// Captures every task-run-keyed projection currently visible for one run.
+    pub(crate) fn capture_history_publication(
+        &self,
+        run_id: RunId,
+    ) -> Option<HistoryRunPublication> {
+        let task_run = self.task_run(&run_id)?.clone();
+        let mut aliases = self
+            .run_ids_by_key
+            .iter()
+            .filter_map(|(key, owner)| (*owner == run_id).then_some(key.clone()))
+            .collect::<Vec<_>>();
+        aliases.sort_by_key(stable_run_key_identity);
+        let mut executions = self
+            .executions
+            .values()
+            .filter(|execution| execution.task_run_id == run_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        executions.sort_by(|left, right| left.execution_id.cmp(&right.execution_id));
+        let mut agent_nodes = self
+            .agent_nodes
+            .values()
+            .filter(|node| node.task_run_id == run_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        agent_nodes.sort_by(|left, right| left.agent_node_id.cmp(&right.agent_node_id));
+        let mut execution_edges = self
+            .execution_edges
+            .iter()
+            .filter(|edge| edge.parent_run_id == run_id || edge.child_run_id == run_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        execution_edges.sort_by_key(|edge| (edge.parent_run_id, edge.child_run_id));
+        let mut dependency_edges = self
+            .dependency_edges
+            .iter()
+            .filter(|edge| edge.prerequisite_run_id == run_id || edge.dependent_run_id == run_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        dependency_edges.sort_by_key(|edge| (edge.prerequisite_run_id, edge.dependent_run_id));
+        Some(HistoryRunPublication {
+            canonical_run_id: run_id,
+            task_run,
+            state: self.task_run_v6_state(&run_id).cloned().unwrap_or_default(),
+            aliases,
+            rate_totals: self.run_rate_totals(&run_id).copied(),
+            executions,
+            agent_nodes,
+            execution_edges,
+            dependency_edges,
+            telemetry: self.telemetry.get(&run_id).cloned(),
+            run_kind: self.run_kinds.get(&run_id).cloned(),
+            rate_cursor: self.run_rate_cursors.get(&run_id).cloned(),
+        })
+    }
+
+    pub(crate) fn install_history_publication(
+        &mut self,
+        publication: HistoryRunPublication,
+    ) -> bool {
+        let published_run_id = publication.task_run.run_id;
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            self.history_run_publications.entry(published_run_id)
+        {
+            entry.insert(publication);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn release_history_publications(&mut self, canonical_run_id: RunId) {
+        self.history_run_publications
+            .retain(|_, publication| publication.canonical_run_id != canonical_run_id);
+    }
+
+    pub(crate) fn set_deferred_history_activity(
+        &mut self,
+        activity: HashMap<HistoryDrainId, Vec<ActivityItem>>,
+    ) {
+        self.deferred_history_activity = activity;
+    }
+
+    pub(crate) fn take_deferred_history_activity(
+        &mut self,
+    ) -> HashMap<HistoryDrainId, Vec<ActivityItem>> {
+        std::mem::take(&mut self.deferred_history_activity)
+    }
+
+    /// Returns every run whose task-run-keyed projection differs from a before-image.
+    pub(crate) fn changed_task_run_ids_since(&self, before: &Self) -> HashSet<RunId> {
+        let mut changed = HashSet::new();
+        collect_changed_map_keys(&self.task_runs, &before.task_runs, &mut changed);
+        collect_changed_map_keys(
+            &self.task_run_v6_state,
+            &before.task_run_v6_state,
+            &mut changed,
+        );
+        collect_changed_map_keys(&self.run_rate_totals, &before.run_rate_totals, &mut changed);
+        collect_changed_map_keys(
+            &self.run_rate_cursors,
+            &before.run_rate_cursors,
+            &mut changed,
+        );
+        collect_changed_map_keys(&self.telemetry, &before.telemetry, &mut changed);
+        collect_changed_map_keys(&self.run_kinds, &before.run_kinds, &mut changed);
+
+        collect_changed_owned_rows(
+            &self.executions,
+            &before.executions,
+            |execution| execution.task_run_id,
+            &mut changed,
+        );
+        collect_changed_owned_rows(
+            &self.agent_nodes,
+            &before.agent_nodes,
+            |node| node.task_run_id,
+            &mut changed,
+        );
+        for edge in self
+            .execution_edges
+            .symmetric_difference(&before.execution_edges)
+        {
+            changed.insert(edge.parent_run_id);
+            changed.insert(edge.child_run_id);
+        }
+        for edge in self
+            .dependency_edges
+            .symmetric_difference(&before.dependency_edges)
+        {
+            changed.insert(edge.prerequisite_run_id);
+            changed.insert(edge.dependent_run_id);
+        }
+        for (key, owner) in &self.run_ids_by_key {
+            if before.run_ids_by_key.get(key) != Some(owner) {
+                changed.insert(*owner);
+                if let Some(previous) = before.run_ids_by_key.get(key) {
+                    changed.insert(*previous);
+                }
+            }
+        }
+        for (key, owner) in &before.run_ids_by_key {
+            if self.run_ids_by_key.get(key) != Some(owner) {
+                changed.insert(*owner);
+            }
+        }
+        changed
+    }
+
     /// Returns persisted lifecycle and historical-readiness state for one run.
     #[must_use]
     pub fn task_run_v6_state(&self, run_id: &RunId) -> Option<&TaskRunV6State> {
@@ -1065,6 +1280,11 @@ impl DomainModel {
         if absorbed_state.lifecycle_watermark > survivor_state.lifecycle_watermark {
             survivor_state.lifecycle_watermark = absorbed_state.lifecycle_watermark;
             survivor_state.native_session_end = absorbed_state.native_session_end;
+        }
+        for publication in self.history_run_publications.values_mut() {
+            if publication.canonical_run_id == absorbed {
+                publication.canonical_run_id = survivor;
+            }
         }
     }
 
@@ -1259,6 +1479,64 @@ impl DomainModel {
     pub fn remove_pane(&mut self, pane_id: &str) -> Option<Pane> {
         self.remove_pane_agent_status(pane_id);
         self.panes.remove(pane_id)
+    }
+}
+
+fn stable_run_key_identity(key: &RunKey) -> String {
+    match key {
+        RunKey::Controller(value) => format!("controller:{}:{value}", value.len()),
+        RunKey::Native { provider, sid } => {
+            format!("native:{provider:?}:{}:{sid}", sid.len())
+        }
+        RunKey::NativePath { provider, path } => {
+            format!("native-path:{provider:?}:{}:{path}", path.len())
+        }
+        RunKey::Provisional {
+            terminal_id,
+            start_ms,
+            seq,
+        } => format!(
+            "provisional:{}:{terminal_id}:{start_ms}:{seq}",
+            terminal_id.len()
+        ),
+    }
+}
+
+fn collect_changed_map_keys<V: PartialEq>(
+    current: &HashMap<RunId, V>,
+    before: &HashMap<RunId, V>,
+    changed: &mut HashSet<RunId>,
+) {
+    for (run_id, value) in current {
+        if before.get(run_id) != Some(value) {
+            changed.insert(*run_id);
+        }
+    }
+    for run_id in before.keys() {
+        if !current.contains_key(run_id) {
+            changed.insert(*run_id);
+        }
+    }
+}
+
+fn collect_changed_owned_rows<V: PartialEq, F: Fn(&V) -> RunId>(
+    current: &HashMap<String, V>,
+    before: &HashMap<String, V>,
+    owner: F,
+    changed: &mut HashSet<RunId>,
+) {
+    for (id, value) in current {
+        if before.get(id) != Some(value) {
+            changed.insert(owner(value));
+            if let Some(previous) = before.get(id) {
+                changed.insert(owner(previous));
+            }
+        }
+    }
+    for (id, value) in before {
+        if !current.contains_key(id) {
+            changed.insert(owner(value));
+        }
     }
 }
 
