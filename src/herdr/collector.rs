@@ -58,7 +58,9 @@ use crate::provider::{
     ProviderThreadError, ProviderThreadHandle, ProviderWorker, RecommendedNotifyFactory, TailFile,
     TargetSet, spawn_provider_thread_with_diagnostics_and_performance, stable_history_drain_id,
 };
-use crate::reducer::{ApplyOutcome, CommitStagedError, Reducer, ReducerError};
+use crate::reducer::{
+    ApplyOutcome, CommitStagedError, ProviderObservationPrior, Reducer, ReducerError,
+};
 use crate::store::writer::{
     BoundedDetail, DurabilityDisposition, PendingEnqueue, PersistenceFailure,
     PersistenceHealthSnapshot, PersistenceStatus, WriterClient, WriterError,
@@ -7145,7 +7147,7 @@ async fn apply_heuristic_bindings(
 async fn apply_normalized_provider_event(
     event: ProviderEvent,
     mut admission: Option<Admission>,
-    prior: Option<DomainModel>,
+    prior: Option<ProviderObservationPrior>,
     origin: crate::model::ObservationOrigin,
     history_manifest: Option<Arc<crate::store::PersistHistoryDrain>>,
     provider_at_ms: i64,
@@ -9909,9 +9911,9 @@ mod tests {
 
     #[tokio::test]
     async fn live_readiness_waits_for_durable_ack_on_both_provider_write_paths() {
-        for (route, outcome, expect_ready) in [
+        let outcomes = [
             (
-                "staged-synthesized",
+                "not-committed",
                 RuntimeWriteOutcome::NotCommitted(failure(
                     PersistenceOperation::Apply,
                     PersistencePhase::CommandExecution,
@@ -9921,25 +9923,43 @@ mod tests {
                 false,
             ),
             (
-                "ordinary-v6",
-                RuntimeWriteOutcome::NotCommitted(failure(
+                "durability-unknown",
+                RuntimeWriteOutcome::DurabilityUnknown(failure(
                     PersistenceOperation::Apply,
-                    PersistencePhase::CommandExecution,
-                    PersistenceFailureCode::Sqlite,
-                    DurabilityDisposition::NotCommitted,
+                    PersistencePhase::Acknowledgement,
+                    PersistenceFailureCode::AcknowledgementDropped,
+                    DurabilityDisposition::Unknown,
                 )),
                 false,
             ),
-            ("staged-synthesized", RuntimeWriteOutcome::Durable, true),
-            ("ordinary-v6", RuntimeWriteOutcome::Durable, true),
-        ] {
+            ("skipped", RuntimeWriteOutcome::Skipped, false),
+            ("durable", RuntimeWriteOutcome::Durable, true),
+            (
+                "committed-but-degraded",
+                RuntimeWriteOutcome::CommittedButDegraded(failure(
+                    PersistenceOperation::Apply,
+                    PersistencePhase::PostApplyCommit,
+                    PersistenceFailureCode::Io,
+                    DurabilityDisposition::Committed,
+                )),
+                true,
+            ),
+        ];
+        for (route, outcome_label, outcome, expect_ready) in ["staged-synthesized", "ordinary-v6"]
+            .into_iter()
+            .flat_map(|route| {
+                outcomes
+                    .into_iter()
+                    .map(move |(label, outcome, ready)| (route, label, outcome, ready))
+            })
+        {
             let directory = tempfile::tempdir().unwrap();
             let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
             let mut store = open_writer(&root).unwrap();
 
             let run_id = RunId::new();
-            let native_session_id = format!("live-ready-{route}-{expect_ready}");
-            let agent_node_id = format!("agent-{route}-{expect_ready}");
+            let native_session_id = format!("live-ready-{route}-{outcome_label}");
+            let agent_node_id = format!("agent-{route}-{outcome_label}");
             let key = if route == "staged-synthesized" {
                 RunKey::Controller(native_session_id.clone())
             } else {
@@ -10022,14 +10042,14 @@ mod tests {
                 event_ledger: Vec::new(),
             });
             let drain_id =
-                HistoryDrainId::new(format!("codex:private-{route}-{expect_ready}")).unwrap();
+                HistoryDrainId::new(format!("codex:private-{route}-{outcome_label}")).unwrap();
             let historical_origin = crate::model::ObservationOrigin::Historical {
                 drain_id: drain_id.clone(),
                 artifact_id: "private.jsonl".to_owned(),
             };
             let prior = reducer.begin_provider_observation(&historical_origin, 2_000);
             let mut historical_metadata = metadata("live-ready", "agent.activity");
-            historical_metadata.event_id = format!("private-{route}-{expect_ready}");
+            historical_metadata.event_id = format!("private-{route}-{outcome_label}");
             historical_metadata.timestamp_ms = 2_000;
             historical_metadata.receipt_time_ms = 2_000;
             historical_metadata.provider = Some(Provider::Codex);
@@ -10088,7 +10108,7 @@ mod tests {
 
             let live_event = if route == "staged-synthesized" {
                 let mut live_metadata = metadata("live-ready", "provider-lifecycle");
-                live_metadata.event_id = format!("live-{route}-{expect_ready}");
+                live_metadata.event_id = format!("live-{route}-{outcome_label}");
                 live_metadata.source = crate::provider::lane::SOURCE_LOG_LANE.to_owned();
                 live_metadata.source_event_type = "progress".to_owned();
                 live_metadata.timestamp_ms = 3_000;
@@ -10125,6 +10145,7 @@ mod tests {
             )
             .await
             .unwrap();
+            reducer.record_provider_identity_disagreement();
 
             let published = shared.borrow();
             assert!(
@@ -10144,7 +10165,7 @@ mod tests {
                 } else {
                     "public-model"
                 }),
-                "{route}: publication did not follow the matching durability outcome"
+                "{route}/{outcome_label}: publication did not follow the matching durability outcome"
             );
 
             drop(published);
