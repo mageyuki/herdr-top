@@ -823,7 +823,7 @@ async fn duplicate_event_id_is_duplicate() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn session_end_is_durable_and_same_session_start_reopens_without_reordering() {
     let running = RunningController::start().await;
-    let event_base_ms = unix_now_ms();
+    let event_base_ms = unix_now_ms().saturating_sub(400);
     let mut start = envelope("native-start", "task_started", "native-root");
     start["provider"] = json!("codex");
     start["native_session_id"] = json!("session-1");
