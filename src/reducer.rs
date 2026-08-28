@@ -844,6 +844,7 @@ impl Reducer {
 
         let mut task_runs = Vec::with_capacity(touched.len());
         let mut associations = Vec::with_capacity(touched.len());
+        let mut publish_live_readiness = false;
         for run_id in touched {
             let canonical_run_id = canonical_run_after_batch(run_id, &operations);
             let Some(current) = self.model.task_run(&canonical_run_id).cloned() else {
@@ -857,6 +858,10 @@ impl Reducer {
 
             if historical {
                 state.history_ready = false;
+            } else {
+                publish_live_readiness |= !state.history_ready;
+                state.history_ready = true;
+                publish_live_readiness |= self.model.release_history_publications(canonical_run_id);
             }
             state.latest_provider_at_ms = Some(
                 state
@@ -926,6 +931,9 @@ impl Reducer {
         self.defer_provider_publication = false;
         self.deferred_provider_drain = None;
         self.rate_observation_context = None;
+        if publish_live_readiness {
+            self.publish();
+        }
         PersistV6Batch {
             operations,
             task_runs,
@@ -5081,6 +5089,296 @@ mod tests {
         assert_eq!(batch.history_publications.len(), 1);
         reducer.record_provider_identity_disagreement();
         assert!(shared.borrow().task_run(&run_id).is_some());
+    }
+
+    #[test]
+    fn live_provider_start_readies_history_created_run_and_survives_finalization() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let drain_id = crate::model::HistoryDrainId::new("codex:history-live-start").unwrap();
+        let manifest = PersistHistoryDrain {
+            drain_id: drain_id.clone(),
+            provider: Provider::Codex,
+            created_at_ms: 1_000,
+            artifacts: Vec::new(),
+        };
+        store
+            .apply_v6_batch(PersistV6Batch {
+                history_drains: vec![manifest.clone()],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+        let (mut reducer, shared) = Reducer::new(store.load_restored_state().unwrap());
+        let historical_origin = crate::model::ObservationOrigin::Historical {
+            drain_id: drain_id.clone(),
+            artifact_id: "history-live-start.jsonl".to_owned(),
+        };
+        let mut historical = provider_lane_event(
+            "history-live-start-historical",
+            "history-live-start",
+            ControllerEventKind::TaskStarted,
+            2_000,
+            2_100,
+        );
+        historical.metadata.provider = Some(Provider::Codex);
+        historical.metadata.native_session_id = Some("history-live-start".to_owned());
+        let prior = reducer.begin_provider_observation(&historical_origin, 2_100);
+        let delta = reducer.validate_controller_event(&historical).unwrap();
+        let operations = reducer.commit_staged_unqueued(delta).unwrap();
+        let historical_batch = reducer.finish_provider_observation(
+            prior,
+            operations,
+            &historical_origin,
+            Some(&manifest),
+            2_000,
+        );
+        let run_id = historical_batch.history_associations[0].run_id;
+        store.apply_v6_batch(historical_batch).unwrap();
+        reducer.complete_deferred_operator_submission(RuntimeWriteOutcome::Durable);
+        assert!(shared.borrow().task_run(&run_id).is_none());
+
+        let mut live = provider_lane_event(
+            "history-live-start-current",
+            "history-live-start",
+            ControllerEventKind::TaskStarted,
+            3_000,
+            3_100,
+        );
+        live.metadata.provider = Some(Provider::Codex);
+        live.metadata.native_session_id = Some("history-live-start".to_owned());
+        let live_origin = crate::model::ObservationOrigin::Live;
+        let prior = reducer.begin_provider_observation(&live_origin, 3_100);
+        let delta = reducer.validate_controller_event(&live).unwrap();
+        let operations = reducer.commit_staged_unqueued(delta).unwrap();
+        let live_batch =
+            reducer.finish_provider_observation(prior, operations, &live_origin, None, 3_000);
+        assert!(
+            live_batch
+                .task_runs
+                .iter()
+                .find(|persisted| persisted.task_run.task_run.run_id == run_id)
+                .unwrap()
+                .state
+                .history_ready
+        );
+        store.apply_v6_batch(live_batch).unwrap();
+        reducer.complete_operator_submission(RuntimeWriteOutcome::Durable);
+        let current = shared.borrow();
+        assert_eq!(current.task_run(&run_id).unwrap().state, TaskState::Running);
+        let current_state = current.task_run_v6_state(&run_id).unwrap();
+        assert!(current_state.history_ready);
+        assert_eq!(current_state.native_session_end, None);
+        assert_eq!(
+            current_state
+                .lifecycle_watermark
+                .as_ref()
+                .map(|watermark| watermark.source_at_ms),
+            Some(3_000)
+        );
+        drop(current);
+
+        let cold = store.load_restored_state().unwrap();
+        let (_cold_reducer, cold_shared) = Reducer::new(cold);
+        assert!(cold_shared.borrow().task_run(&run_id).is_some());
+        assert_eq!(
+            cold_shared
+                .borrow()
+                .task_run_v6_state(&run_id)
+                .unwrap()
+                .native_session_end,
+            None
+        );
+
+        store.finalize_history_drain(&drain_id, 4_000).unwrap();
+        let finalized = store.load_restored_state().unwrap();
+        let state = finalized.model.task_run_v6_state(&run_id).unwrap();
+        assert!(state.history_ready);
+        assert_eq!(state.native_session_end, None);
+        assert_eq!(
+            state
+                .lifecycle_watermark
+                .as_ref()
+                .map(|watermark| watermark.source_at_ms),
+            Some(3_000)
+        );
+    }
+
+    #[test]
+    fn live_identity_merge_releases_ready_run_before_image_without_lifecycle_regression() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let survivor = RunId::new();
+        let absorbed = RunId::new();
+        let native_key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "ready-live-merge".to_owned(),
+        };
+        let provisional_key = RunKey::Provisional {
+            terminal_id: "ready-live-merge-terminal".to_owned(),
+            start_ms: 1_000,
+            seq: 1,
+        };
+        let mut ready_run = run(survivor, native_key.clone(), 1, TaskState::Running);
+        ready_run.has_controller_task_state_event = true;
+        ready_run.created_at_ms = Some(500);
+        ready_run.updated_at_ms = Some(1_000);
+        let mut provisional_run = run(absorbed, provisional_key, 2, TaskState::Queued);
+        provisional_run.created_at_ms = Some(1_000);
+        provisional_run.updated_at_ms = Some(1_000);
+        let ready_state = TaskRunV6State {
+            native_session_end: Some(crate::model::NativeSessionEnd {
+                status: NativeSessionEndStatus::Done,
+                at_ms: 1_000,
+            }),
+            lifecycle_watermark: Some(NativeLifecycleWatermark {
+                source_at_ms: 1_000,
+                observed_at_ms: 1_000,
+                source_order: "live:terminal-before-history".to_owned(),
+            }),
+            history_ready: true,
+            latest_provider_at_ms: Some(1_000),
+        };
+        store
+            .apply_v6_batch(PersistV6Batch {
+                task_runs: vec![
+                    PersistTaskRunV6 {
+                        task_run: PersistTaskRun {
+                            task_run: ready_run,
+                            native_session: Some(NativeSessionBinding {
+                                provider: Provider::Codex,
+                                native_session_id: "ready-live-merge".to_owned(),
+                            }),
+                            created_at_ms: 500,
+                            updated_at_ms: 1_000,
+                            finished_at_ms: None,
+                        },
+                        state: ready_state,
+                    },
+                    PersistTaskRunV6 {
+                        task_run: PersistTaskRun {
+                            task_run: provisional_run,
+                            native_session: None,
+                            created_at_ms: 1_000,
+                            updated_at_ms: 1_000,
+                            finished_at_ms: None,
+                        },
+                        state: TaskRunV6State::default(),
+                    },
+                ],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+        let drain_id = crate::model::HistoryDrainId::new("codex:ready-live-merge").unwrap();
+        let manifest = PersistHistoryDrain {
+            drain_id: drain_id.clone(),
+            provider: Provider::Codex,
+            created_at_ms: 1_500,
+            artifacts: Vec::new(),
+        };
+        store
+            .apply_v6_batch(PersistV6Batch {
+                history_drains: vec![manifest.clone()],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+        let (mut reducer, shared) = Reducer::new(store.load_restored_state().unwrap());
+        let historical_origin = crate::model::ObservationOrigin::Historical {
+            drain_id: drain_id.clone(),
+            artifact_id: "ready-live-merge.jsonl".to_owned(),
+        };
+        let prior = reducer.begin_provider_observation(&historical_origin, 2_000);
+        let historical_operations = reducer.touch_run_liveness_observed(&native_key, 2_000, 2_000);
+        let historical_batch = reducer.finish_provider_observation(
+            prior,
+            historical_operations,
+            &historical_origin,
+            Some(&manifest),
+            2_000,
+        );
+        store.apply_v6_batch(historical_batch).unwrap();
+        reducer.complete_deferred_operator_submission(RuntimeWriteOutcome::Durable);
+        reducer.record_provider_identity_disagreement();
+        let before_live = shared.borrow();
+        assert_eq!(
+            before_live.task_run(&survivor).unwrap().state,
+            TaskState::Running
+        );
+        assert_eq!(
+            before_live
+                .task_run_v6_state(&survivor)
+                .unwrap()
+                .native_session_end
+                .as_ref()
+                .map(|end| (end.status, end.at_ms)),
+            Some((NativeSessionEndStatus::Done, 1_000))
+        );
+        drop(before_live);
+
+        let mut live_metadata = metadata("ready-live-merge-current", 3_000);
+        live_metadata.source = "provider".to_owned();
+        live_metadata.source_event_type = "execution.begin".to_owned();
+        live_metadata.provider = Some(Provider::Codex);
+        live_metadata.native_session_id = Some("ready-live-merge".to_owned());
+        live_metadata.task_run_id = Some(absorbed);
+        let live_origin = crate::model::ObservationOrigin::Live;
+        let prior = reducer.begin_provider_observation(&live_origin, 3_000);
+        let ApplyOutcome::Applied(operations) = reducer
+            .apply(NormalizedEvent::ExecutionBegin {
+                metadata: live_metadata,
+                execution: Execution {
+                    execution_id: "ready-live-merge-current".to_owned(),
+                    pane_id: "ready-live-merge-pane".to_owned(),
+                    terminal_id: "ready-live-merge-terminal".to_owned(),
+                    task_run_id: absorbed,
+                    state: ExecState::Working,
+                },
+            })
+            .unwrap()
+        else {
+            panic!("live identity evidence must merge into the native run");
+        };
+        assert!(operations.iter().any(|operation| matches!(
+            operation,
+            PersistOp::MergeTaskRuns {
+                survivor: actual_survivor,
+                absorbed: actual_absorbed,
+            } if *actual_survivor == survivor && *actual_absorbed == absorbed
+        )));
+        let live_batch =
+            reducer.finish_provider_observation(prior, operations, &live_origin, None, 3_000);
+        store.apply_v6_batch(live_batch).unwrap();
+        reducer.complete_operator_submission(RuntimeWriteOutcome::Durable);
+        let current = shared.borrow();
+        assert!(current.task_run(&absorbed).is_none());
+        assert!(current.task_run_v6_state(&survivor).unwrap().history_ready);
+        assert_eq!(
+            current
+                .task_run_v6_state(&survivor)
+                .unwrap()
+                .native_session_end,
+            None
+        );
+        assert!(current.executions().any(|execution| {
+            execution.execution_id == "ready-live-merge-current"
+                && execution.task_run_id == survivor
+                && !execution.state.is_terminal()
+        }));
+        drop(current);
+
+        store.finalize_history_drain(&drain_id, 4_000).unwrap();
+        let restored = store.load_restored_state().unwrap();
+        let restored_state = restored.model.task_run_v6_state(&survivor).unwrap();
+        assert!(restored_state.history_ready);
+        assert_eq!(restored_state.native_session_end, None);
+        assert_eq!(
+            restored_state
+                .lifecycle_watermark
+                .as_ref()
+                .map(|watermark| watermark.source_at_ms),
+            Some(3_000)
+        );
     }
 
     #[test]

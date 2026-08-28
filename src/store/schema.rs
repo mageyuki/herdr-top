@@ -545,15 +545,29 @@ CREATE TABLE history_event_before_images (
     FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE
 );
 
-UPDATE task_runs AS run
-SET history_ready = 0
-WHERE EXISTS (
-    SELECT 1
+UPDATE events
+SET history_drain_id = (
+    SELECT association.drain_id
     FROM history_drain_runs AS association
     JOIN history_drains AS drain ON drain.drain_id = association.drain_id
-    WHERE association.run_id = run.run_id
+    WHERE association.run_id = events.task_run_id
       AND drain.finalized_at_ms IS NULL
-);
+    ORDER BY drain.created_at_ms, association.drain_id
+    LIMIT 1
+)
+WHERE history_drain_id IS NULL
+  AND EXISTS (
+      SELECT 1 FROM task_runs AS run
+      WHERE run.run_id = events.task_run_id
+        AND run.history_ready = 0
+  )
+  AND EXISTS (
+      SELECT 1
+      FROM history_drain_runs AS association
+      JOIN history_drains AS drain ON drain.drain_id = association.drain_id
+      WHERE association.run_id = events.task_run_id
+        AND drain.finalized_at_ms IS NULL
+  );
 "#;
 
 pub(super) const SCHEMA_V1: &str = r#"

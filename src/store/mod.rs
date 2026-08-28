@@ -837,6 +837,16 @@ impl Store {
             return Ok(());
         }
         let history_event_drain = batch.history_event_drain.clone();
+        let live_ready_run_ids = if history_event_drain.is_none() {
+            batch
+                .task_runs
+                .iter()
+                .filter(|task_run| task_run.state.history_ready)
+                .map(|task_run| task_run.task_run.task_run.run_id)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         // Reducer batches may contain agent/event rows before their run upsert. Seed only missing
         // v6 runs first so those foreign keys are valid, then replay the original core order and
         // finish with the authoritative v6 state. Existing rows are deliberately not pre-upserted:
@@ -908,6 +918,12 @@ impl Store {
         }
         for task_run in batch.task_runs {
             upsert_task_run_v6(&transaction, &task_run)?;
+        }
+        for run_id in live_ready_run_ids {
+            transaction.execute(
+                "DELETE FROM history_run_publications WHERE canonical_run_id = ?1",
+                [run_id.to_string()],
+            )?;
         }
         for (run_id, totals) in batch.rate_totals {
             upsert_run_rate_totals(&transaction, run_id, totals)?;
@@ -1128,27 +1144,11 @@ impl Store {
                  WHERE drain_id = ?1 AND finalized_at_ms IS NULL",
                 params![drain_id.as_str(), observed_at_ms],
             )?;
-            transaction.execute(
-                "UPDATE task_runs AS run \
-                 SET history_ready = NOT EXISTS (\
-                     SELECT 1 FROM history_drain_runs AS association \
-                     JOIN history_drains AS blocker ON blocker.drain_id = association.drain_id \
-                     WHERE association.run_id = run.run_id \
-                       AND blocker.finalized_at_ms IS NULL\
-                 ) \
-                 WHERE run.merged_into IS NULL \
-                   AND EXISTS (\
-                       SELECT 1 FROM history_drain_runs AS association \
-                       WHERE association.drain_id = ?1 \
-                         AND association.run_id = run.run_id\
-                   )",
-                [drain_id.as_str()],
-            )?;
             let source_order_prefix = format!("history-drain:{}:", drain_id.as_str());
             transaction.execute(
                 "UPDATE task_runs AS run \
                  SET native_session_end_status = CASE \
-                         WHEN run.history_ready = 1 \
+                         WHEN run.history_ready = 0 \
                           AND run.task_state NOT IN (\
                               'completed', 'failed', 'cancelled', 'ended_unknown'\
                           ) \
@@ -1165,7 +1165,7 @@ impl Store {
                           ) \
                          THEN 'unknown' ELSE run.native_session_end_status END, \
                      native_session_end_at_ms = CASE \
-                         WHEN run.history_ready = 1 \
+                         WHEN run.history_ready = 0 \
                           AND run.task_state NOT IN (\
                               'completed', 'failed', 'cancelled', 'ended_unknown'\
                           ) \
@@ -1182,7 +1182,7 @@ impl Store {
                           ) \
                          THEN run.latest_provider_at_ms ELSE run.native_session_end_at_ms END, \
                      lifecycle_source_at_ms = CASE \
-                         WHEN run.history_ready = 1 \
+                         WHEN run.history_ready = 0 \
                           AND run.task_state NOT IN (\
                               'completed', 'failed', 'cancelled', 'ended_unknown'\
                           ) \
@@ -1199,7 +1199,7 @@ impl Store {
                           ) \
                          THEN run.latest_provider_at_ms ELSE run.lifecycle_source_at_ms END, \
                      lifecycle_observed_at_ms = CASE \
-                         WHEN run.history_ready = 1 \
+                         WHEN run.history_ready = 0 \
                           AND run.task_state NOT IN (\
                               'completed', 'failed', 'cancelled', 'ended_unknown'\
                           ) \
@@ -1216,7 +1216,7 @@ impl Store {
                           ) \
                          THEN ?2 ELSE run.lifecycle_observed_at_ms END, \
                      lifecycle_source_order = CASE \
-                         WHEN run.history_ready = 1 \
+                         WHEN run.history_ready = 0 \
                           AND run.task_state NOT IN (\
                               'completed', 'failed', 'cancelled', 'ended_unknown'\
                           ) \
@@ -1237,8 +1237,30 @@ impl Store {
                        SELECT 1 FROM history_drain_runs AS association \
                        WHERE association.drain_id = ?1 \
                          AND association.run_id = run.run_id\
+                   ) \
+                   AND NOT EXISTS (\
+                       SELECT 1 FROM history_drain_runs AS association \
+                       JOIN history_drains AS blocker ON blocker.drain_id = association.drain_id \
+                       WHERE association.run_id = run.run_id \
+                         AND blocker.finalized_at_ms IS NULL\
                    )",
                 params![drain_id.as_str(), observed_at_ms, source_order_prefix],
+            )?;
+            transaction.execute(
+                "UPDATE task_runs AS run \
+                 SET history_ready = NOT EXISTS (\
+                     SELECT 1 FROM history_drain_runs AS association \
+                     JOIN history_drains AS blocker ON blocker.drain_id = association.drain_id \
+                     WHERE association.run_id = run.run_id \
+                       AND blocker.finalized_at_ms IS NULL\
+                 ) \
+                 WHERE run.merged_into IS NULL \
+                   AND EXISTS (\
+                       SELECT 1 FROM history_drain_runs AS association \
+                       WHERE association.drain_id = ?1 \
+                         AND association.run_id = run.run_id\
+                   )",
+                [drain_id.as_str()],
             )?;
             transaction.execute(
                 "DELETE FROM history_run_publications \
@@ -2215,7 +2237,7 @@ fn exact_v6_replay_is_already_durable(
     batch: &PersistV6Batch,
 ) -> Result<bool, StoreError> {
     let Some(PersistOp::AdvanceIngestSequence { ingest_seq }) = batch.operations.first() else {
-        return Ok(false);
+        return exact_non_ingest_identity_replay_is_already_durable(transaction, batch);
     };
     if batch
         .operations
@@ -2260,6 +2282,458 @@ fn exact_v6_replay_is_already_durable(
         .query_map([ingest_seq], |row| row.get::<_, String>(0))?
         .collect::<Result<HashSet<_>, _>>()?;
     Ok(durable_event_ids == expected_event_ids)
+}
+
+fn exact_non_ingest_identity_replay_is_already_durable(
+    transaction: &Transaction<'_>,
+    batch: &PersistV6Batch,
+) -> Result<bool, StoreError> {
+    if batch
+        .operations
+        .iter()
+        .any(|operation| matches!(operation, PersistOp::AdvanceIngestSequence { .. }))
+    {
+        return Ok(false);
+    }
+
+    let mut has_identity_operation = false;
+    let mut expected_event_ids = HashSet::new();
+    let mut expected_agent_nodes = HashMap::new();
+    let expected_task_run_ids = batch
+        .task_runs
+        .iter()
+        .map(|task_run| task_run.task_run.task_run.run_id)
+        .collect::<HashSet<_>>();
+    for operation in &batch.operations {
+        match operation {
+            PersistOp::MergeTaskRuns { survivor, absorbed } => {
+                if !expected_task_run_ids.contains(survivor) {
+                    return Ok(false);
+                }
+                has_identity_operation = true;
+                let absorbed_target = transaction
+                    .query_row(
+                        "SELECT merged_into FROM task_runs WHERE run_id = ?1",
+                        [absorbed.to_string()],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .flatten();
+                let survivor_is_canonical: bool = transaction.query_row(
+                    "SELECT EXISTS(\
+                         SELECT 1 FROM task_runs WHERE run_id = ?1 AND merged_into IS NULL\
+                     )",
+                    [survivor.to_string()],
+                    |row| row.get(0),
+                )?;
+                if absorbed_target.as_deref() != Some(survivor.to_string().as_str())
+                    || !survivor_is_canonical
+                {
+                    return Ok(false);
+                }
+            }
+            PersistOp::PromoteTaskRunKey {
+                promoted,
+                old_key,
+                alias_run_id,
+            } => {
+                if !expected_task_run_ids.contains(&promoted.task_run.run_id) {
+                    return Ok(false);
+                }
+                has_identity_operation = true;
+                let Some((canonical_key, canonical_target)) =
+                    durable_run_key_and_target(transaction, promoted.task_run.run_id)?
+                else {
+                    return Ok(false);
+                };
+                let Some((alias_key, alias_target)) =
+                    durable_run_key_and_target(transaction, *alias_run_id)?
+                else {
+                    return Ok(false);
+                };
+                if canonical_key != promoted.task_run.key
+                    || canonical_target.is_some()
+                    || alias_key != *old_key
+                    || alias_target != Some(promoted.task_run.run_id)
+                {
+                    return Ok(false);
+                }
+            }
+            PersistOp::RecordEvent { event, .. } => {
+                let metadata = event_metadata(event).0;
+                if !expected_event_ids.insert(metadata.event_id.clone()) {
+                    return Ok(false);
+                }
+            }
+            PersistOp::UpsertAgentNode(node) => {
+                expected_agent_nodes.insert(node.agent_node_id.clone(), node.clone());
+            }
+            PersistOp::UpsertTaskRun(task_run)
+                if expected_task_run_ids.contains(&task_run.task_run.run_id) => {}
+            _ => return Ok(false),
+        }
+    }
+    if !has_identity_operation {
+        return Ok(false);
+    }
+
+    for mut expected_node in expected_agent_nodes.into_values() {
+        expected_node.task_run_id =
+            canonical_run_after_operations(expected_node.task_run_id, &batch.operations);
+        if !expected_task_run_ids.contains(&expected_node.task_run_id)
+            || !durable_agent_node_matches(transaction, &expected_node)?
+        {
+            return Ok(false);
+        }
+    }
+    for event_id in expected_event_ids {
+        let durable_drain = transaction
+            .query_row(
+                "SELECT history_drain_id FROM events WHERE event_id = ?1",
+                [&event_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        if durable_drain
+            != Some(
+                batch
+                    .history_event_drain
+                    .as_ref()
+                    .map(|drain_id| drain_id.as_str().to_owned()),
+            )
+        {
+            return Ok(false);
+        }
+    }
+    for task_run in &batch.task_runs {
+        if !durable_task_run_v6_matches(transaction, task_run)? {
+            return Ok(false);
+        }
+    }
+    for drain in &batch.history_drains {
+        if !durable_history_drain_matches(transaction, drain)? {
+            return Ok(false);
+        }
+    }
+    for association in &batch.history_associations {
+        let durable: bool = transaction.query_row(
+            "SELECT EXISTS(\
+                 SELECT 1 FROM history_drain_runs WHERE drain_id = ?1 AND run_id = ?2\
+             )",
+            params![
+                association.drain_id.as_str(),
+                association.run_id.to_string()
+            ],
+            |row| row.get(0),
+        )?;
+        if !durable {
+            return Ok(false);
+        }
+    }
+    for publication in &batch.history_publications {
+        let expected_payload = serde_json::to_string(publication).map_err(|error| {
+            StoreError::invalid(
+                "history_run_publications.payload",
+                publication.task_run.run_id.to_string(),
+                error.to_string(),
+            )
+        })?;
+        let durable = transaction
+            .query_row(
+                "SELECT canonical_run_id, payload FROM history_run_publications \
+                 WHERE published_run_id = ?1",
+                [publication.task_run.run_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if durable != Some((publication.canonical_run_id.to_string(), expected_payload)) {
+            return Ok(false);
+        }
+    }
+    for (run_id, totals) in &batch.rate_totals {
+        let (expected, _) = totals.clamped();
+        let expected_output = i64::try_from(expected.output_tokens).expect("clamped to i64::MAX");
+        let durable = transaction
+            .query_row(
+                "SELECT output_tokens, working_ms FROM run_rate_totals WHERE run_id = ?1",
+                [run_id.to_string()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        if durable != Some((expected_output, expected.working_ms)) {
+            return Ok(false);
+        }
+    }
+    if let Some(drain_id) = batch.history_event_drain.as_ref() {
+        let durable: bool = transaction.query_row(
+            "SELECT EXISTS(\
+                 SELECT 1 FROM history_drains \
+                 WHERE drain_id = ?1 AND finalized_at_ms IS NULL\
+             )",
+            [drain_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if !durable {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn canonical_run_after_operations(mut run_id: RunId, operations: &[PersistOp]) -> RunId {
+    for operation in operations {
+        if let PersistOp::MergeTaskRuns { survivor, absorbed } = operation
+            && *absorbed == run_id
+        {
+            run_id = *survivor;
+        }
+    }
+    run_id
+}
+
+fn durable_agent_node_matches(
+    transaction: &Transaction<'_>,
+    expected: &AgentNode,
+) -> Result<bool, StoreError> {
+    let stored = transaction
+        .query_row(
+            "SELECT node.provider, node.native_session_id, node.task_run_id, ordinal.ordinal, \
+                    node.parent_agent_node_id, node.state, node.model_id, node.last_event_kind, \
+                    node.last_tool_name, node.last_item_count, node.last_byte_count, \
+                    node.last_activity_at_ms, node.session_file \
+             FROM agent_nodes AS node \
+             JOIN display_ordinals AS ordinal \
+               ON ordinal.entity_kind = 'agent_node' \
+              AND ordinal.entity_id = node.agent_node_id \
+             WHERE node.agent_node_id = ?1",
+            [&expected.agent_node_id],
+            |row| {
+                Ok((
+                    (
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ),
+                    (
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
+                        row.get::<_, Option<i64>>(10)?,
+                        row.get::<_, Option<i64>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                    ),
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        (provider, native_session_id, task_run_id, display_ordinal, parent, state, model_id),
+        (last_event_kind, last_tool_name, last_item_count, last_byte_count, activity, session_file),
+    )) = stored
+    else {
+        return Ok(false);
+    };
+    let durable = AgentNode {
+        agent_node_id: expected.agent_node_id.clone(),
+        provider: parse_provider(&provider)?,
+        native_session_id,
+        task_run_id: parse_run_id(&task_run_id)?,
+        display_ordinal: DisplayOrdinal::new(display_ordinal),
+        parent_agent_node_id: parent,
+        state: parse_agent_node_state(state)?,
+        model_id,
+        last_event_kind,
+        last_tool_name,
+        last_item_count: optional_unsigned_count("agent_nodes.last_item_count", last_item_count)?,
+        last_byte_count: optional_unsigned_count("agent_nodes.last_byte_count", last_byte_count)?,
+        last_activity_at_ms: activity,
+        session_file,
+    };
+    Ok(durable == *expected)
+}
+
+fn durable_run_key_and_target(
+    transaction: &Transaction<'_>,
+    run_id: RunId,
+) -> Result<Option<(RunKey, Option<RunId>)>, StoreError> {
+    let stored = transaction
+        .query_row(
+            "SELECT key_kind, key_controller_id, key_provider, key_native_sid, \
+                    key_native_path, key_terminal_id, key_start_ms, key_seq, merged_into \
+             FROM task_runs WHERE run_id = ?1",
+            [run_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((kind, controller, provider, sid, path, terminal, start, seq, target)) = stored else {
+        return Ok(None);
+    };
+    Ok(Some((
+        decode_run_key(&kind, controller, provider, sid, path, terminal, start, seq)?,
+        target.as_deref().map(parse_run_id).transpose()?,
+    )))
+}
+
+fn durable_task_run_v6_matches(
+    transaction: &Transaction<'_>,
+    expected: &PersistTaskRunV6,
+) -> Result<bool, StoreError> {
+    let run_id = expected.task_run.task_run.run_id;
+    let Some((key, target)) = durable_run_key_and_target(transaction, run_id)? else {
+        return Ok(false);
+    };
+    if key != expected.task_run.task_run.key || target.is_some() {
+        return Ok(false);
+    }
+    let core = transaction.query_row(
+        "SELECT display_ordinal, task_state, has_controller_task_state_event, \
+                native_provider, native_session_id, created_at_ms, updated_at_ms, \
+                finished_at_ms, subject, dismissed_at_ms \
+         FROM task_runs WHERE run_id = ?1",
+        [run_id.to_string()],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+            ))
+        },
+    )?;
+    let binding = expected.task_run.native_session.as_ref();
+    let expected_finished = if expected.task_run.task_run.state.is_terminal() {
+        expected
+            .task_run
+            .finished_at_ms
+            .or(Some(expected.task_run.updated_at_ms))
+    } else {
+        None
+    };
+    if core
+        != (
+            expected.task_run.task_run.display_ordinal.get(),
+            task_state_text(expected.task_run.task_run.state).to_owned(),
+            i64::from(expected.task_run.task_run.has_controller_task_state_event),
+            binding.map(|binding| provider_text(binding.provider).to_owned()),
+            binding.map(|binding| binding.native_session_id.clone()),
+            expected.task_run.created_at_ms,
+            expected.task_run.updated_at_ms,
+            expected_finished,
+            expected.task_run.task_run.subject.clone(),
+            expected.task_run.task_run.dismissed_at_ms,
+        )
+    {
+        return Ok(false);
+    }
+    let lifecycle = transaction.query_row(
+        "SELECT native_session_end_status, native_session_end_at_ms, \
+                lifecycle_source_at_ms, lifecycle_observed_at_ms, \
+                lifecycle_source_order, history_ready, latest_provider_at_ms \
+         FROM task_runs WHERE run_id = ?1",
+        [run_id.to_string()],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        },
+    )?;
+    let end = expected.state.native_session_end.as_ref();
+    let watermark = expected.state.lifecycle_watermark.as_ref();
+    Ok(lifecycle
+        == (
+            end.map(|end| native_session_end_status_text(end.status).to_owned()),
+            end.map(|end| end.at_ms),
+            watermark.map(|watermark| watermark.source_at_ms),
+            watermark.map(|watermark| watermark.observed_at_ms),
+            watermark.map(|watermark| watermark.source_order.clone()),
+            i64::from(expected.state.history_ready),
+            expected.state.latest_provider_at_ms,
+        ))
+}
+
+fn durable_history_drain_matches(
+    transaction: &Transaction<'_>,
+    expected: &PersistHistoryDrain,
+) -> Result<bool, StoreError> {
+    let durable = transaction
+        .query_row(
+            "SELECT provider, created_at_ms, finalized_at_ms \
+             FROM history_drains WHERE drain_id = ?1",
+            [expected.drain_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    if durable
+        != Some((
+            provider_text(expected.provider).to_owned(),
+            expected.created_at_ms,
+            None,
+        ))
+    {
+        return Ok(false);
+    }
+    let mut expected_artifacts = expected
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            i64::try_from(artifact.goalpost)
+                .map(|goalpost| {
+                    (
+                        artifact.artifact_id.clone(),
+                        artifact.generation.clone(),
+                        goalpost,
+                    )
+                })
+                .map_err(|_: TryFromIntError| StoreError::IntegerOutOfRange {
+                    field: "history_drain_artifacts.goalpost",
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    expected_artifacts.sort_unstable();
+    let mut statement = transaction.prepare(
+        "SELECT artifact_id, generation, goalpost FROM history_drain_artifacts \
+         WHERE drain_id = ?1 ORDER BY artifact_id",
+    )?;
+    let durable_artifacts = statement
+        .query_map([expected.drain_id.as_str()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(durable_artifacts == expected_artifacts)
 }
 
 fn promote_task_run_key(
@@ -4284,6 +4758,171 @@ mod tests {
     }
 
     #[test]
+    fn schema_v6_to_v7_preserves_public_rows_and_backfills_private_activity() {
+        let (_directory, root) = test_root();
+        let database = database_path(&root);
+        let ready_run = RunId::new();
+        let private_run = RunId::new();
+        let now = unix_now_ms().unwrap();
+        let older_drain = HistoryDrainId::new("codex:v6-migration-older").unwrap();
+        let newer_drain = HistoryDrainId::new("codex:v6-migration-newer").unwrap();
+        {
+            let connection = Connection::open(&database).unwrap();
+            for schema in [
+                schema::SCHEMA_V1,
+                schema::SCHEMA_V2,
+                schema::SCHEMA_V3,
+                schema::SCHEMA_V4,
+                schema::SCHEMA_V5,
+                schema::SCHEMA_V6,
+            ] {
+                connection.execute_batch(schema).unwrap();
+            }
+            for version in 1..=6 {
+                connection
+                    .execute(
+                        "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (?1, ?1)",
+                        [version],
+                    )
+                    .unwrap();
+            }
+            for (run_id, ordinal, history_ready, controller_id) in [
+                (ready_run, 1, 1, "v6-ready"),
+                (private_run, 2, 0, "v6-private"),
+            ] {
+                connection
+                    .execute(
+                        "INSERT INTO display_ordinals(entity_kind, entity_id, ordinal) \
+                         VALUES ('task_run', ?1, ?2)",
+                        params![run_id.to_string(), ordinal],
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO task_runs(\
+                             run_id, key_kind, key_controller_id, display_ordinal, task_state, \
+                             has_controller_task_state_event, created_at_ms, updated_at_ms, \
+                             history_ready, latest_provider_at_ms\
+                         ) VALUES (?1, 'controller', ?2, ?3, 'running', 1, 100, 200, ?4, 200)",
+                        params![run_id.to_string(), controller_id, ordinal, history_ready],
+                    )
+                    .unwrap();
+            }
+            for (drain_id, created_at_ms) in [(&older_drain, now - 200), (&newer_drain, now - 100)]
+            {
+                connection
+                    .execute(
+                        "INSERT INTO history_drains(drain_id, provider, created_at_ms) \
+                         VALUES (?1, 'codex', ?2)",
+                        params![drain_id.as_str(), created_at_ms],
+                    )
+                    .unwrap();
+            }
+            for (drain_id, run_id) in [
+                (&older_drain, ready_run),
+                (&older_drain, private_run),
+                (&newer_drain, private_run),
+            ] {
+                connection
+                    .execute(
+                        "INSERT INTO history_drain_runs(drain_id, run_id) VALUES (?1, ?2)",
+                        params![drain_id.as_str(), run_id.to_string()],
+                    )
+                    .unwrap();
+            }
+            for (event_id, run_id, at_ms) in [
+                ("v6-ready-activity", ready_run, now - 50),
+                ("v6-private-activity", private_run, now - 49),
+            ] {
+                connection
+                    .execute(
+                        "INSERT INTO events(\
+                             event_id, seen_at_ms, event_timestamp_ms, herdr_session, source, \
+                             normalized_kind, source_event_type, task_run_id\
+                         ) VALUES (?1, ?3, ?3, 'v6-migration', 'provider', \
+                                   'execution_end', 'execution.end', ?2)",
+                        params![event_id, run_id.to_string(), at_ms],
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO event_ledger(event_id, seen_at_ms) VALUES (?1, ?2)",
+                        params![event_id, at_ms],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let mut store = open_writer(&root).unwrap();
+        assert_eq!(schema_version(&store.connection), 7);
+        let migrated = store.load_restored_state().unwrap();
+        assert!(
+            migrated
+                .model
+                .task_run_v6_state(&ready_run)
+                .unwrap()
+                .history_ready,
+            "an already-public v6 row must remain public without a reconstructable before-image"
+        );
+        assert!(
+            !migrated
+                .model
+                .task_run_v6_state(&private_run)
+                .unwrap()
+                .history_ready
+        );
+        let private_event_drain: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT history_drain_id FROM events WHERE event_id = 'v6-private-activity'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(private_event_drain.as_deref(), Some(older_drain.as_str()));
+        let ready_event_drain: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT history_drain_id FROM events WHERE event_id = 'v6-ready-activity'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ready_event_drain, None);
+
+        let restored_operator = store.load_restored_operator_state().unwrap();
+        assert_eq!(restored_operator.activity.len(), 1);
+        assert_eq!(
+            restored_operator.activity[0].identity.event_id,
+            "v6-ready-activity"
+        );
+        let (mut reducer, shared, mut operator) =
+            Reducer::new_with_operator(migrated, restored_operator);
+        assert!(shared.borrow().task_run(&ready_run).is_some());
+        assert!(shared.borrow().task_run(&private_run).is_none());
+
+        let page = store.finalize_history_drain(&newer_drain, now).unwrap();
+        assert!(reducer.apply_history_finalization(&page));
+        assert!(shared.borrow().task_run(&ready_run).is_some());
+        assert!(shared.borrow().task_run(&private_run).is_some());
+        let published = operator.borrow();
+        let event_ids = published
+            .activity
+            .iter()
+            .map(|item| item.identity.event_id.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            event_ids,
+            HashSet::from(["v6-ready-activity", "v6-private-activity"])
+        );
+        drop(published);
+        operator.borrow_and_update();
+        assert!(!reducer.apply_history_finalization(&page));
+        assert!(!operator.has_changed().unwrap());
+        assert_eq!(operator.borrow().activity.len(), 2);
+    }
+
+    #[test]
     fn task_run_v6_state_and_totals_round_trip() {
         let (_directory, root) = test_root();
         let mut store = open_writer(&root).unwrap();
@@ -4992,6 +5631,7 @@ mod tests {
                     drain_id: drain_id.clone(),
                     run_id,
                 }],
+                history_event_drain: Some(drain_id.clone()),
                 ..PersistV6Batch::default()
             })
             .unwrap();
@@ -5858,6 +6498,406 @@ mod tests {
                 ),
                 "sequence {ingest_seq} without matching durable event evidence was accepted: {result:?}"
             );
+        }
+    }
+
+    #[test]
+    fn schema_v7_exact_non_ingest_identity_replay_requires_matching_durable_state() {
+        let persisted = |run_id: RunId,
+                         key: RunKey,
+                         ordinal: i64,
+                         native_session: Option<NativeSessionBinding>,
+                         history_ready: bool| {
+            PersistTaskRunV6 {
+                task_run: PersistTaskRun {
+                    task_run: TaskRun {
+                        run_id,
+                        key,
+                        display_ordinal: DisplayOrdinal::new(ordinal),
+                        state: TaskState::Running,
+                        has_controller_task_state_event: false,
+                        created_at_ms: Some(100),
+                        updated_at_ms: Some(200),
+                        finished_at_ms: None,
+                        subject: None,
+                        dismissed_at_ms: None,
+                    },
+                    native_session,
+                    created_at_ms: 100,
+                    updated_at_ms: 200,
+                    finished_at_ms: None,
+                },
+                state: TaskRunV6State {
+                    history_ready,
+                    latest_provider_at_ms: Some(200),
+                    ..TaskRunV6State::default()
+                },
+            }
+        };
+
+        {
+            let (_directory, root) = test_root();
+            let mut store = open_writer(&root).unwrap();
+            let run_id = RunId::new();
+            let alias_run_id = RunId::new();
+            let old_key = RunKey::NativePath {
+                provider: Provider::Codex,
+                path: "/tmp/v7-replay-promotion.jsonl".to_owned(),
+            };
+            let promoted_key = RunKey::Native {
+                provider: Provider::Codex,
+                sid: "v7-replay-promotion".to_owned(),
+            };
+            store
+                .apply_v6_batch(PersistV6Batch {
+                    task_runs: vec![persisted(run_id, old_key.clone(), 1, None, true)],
+                    ..PersistV6Batch::default()
+                })
+                .unwrap();
+            let promoted = persisted(
+                run_id,
+                promoted_key,
+                1,
+                Some(NativeSessionBinding {
+                    provider: Provider::Codex,
+                    native_session_id: "v7-replay-promotion".to_owned(),
+                }),
+                false,
+            );
+            let drain_id = HistoryDrainId::new("codex:v7-replay-promotion").unwrap();
+            let batch = PersistV6Batch {
+                operations: vec![PersistOp::PromoteTaskRunKey {
+                    promoted: promoted.task_run.clone(),
+                    old_key: old_key.clone(),
+                    alias_run_id,
+                }],
+                task_runs: vec![promoted],
+                history_drains: vec![PersistHistoryDrain {
+                    drain_id: drain_id.clone(),
+                    provider: Provider::Codex,
+                    created_at_ms: 100,
+                    artifacts: Vec::new(),
+                }],
+                history_associations: vec![PersistHistoryDrainRun {
+                    drain_id: drain_id.clone(),
+                    run_id,
+                }],
+                history_event_drain: Some(drain_id.clone()),
+                ..PersistV6Batch::default()
+            };
+            store.apply_v6_batch(batch.clone()).unwrap();
+            store.apply_v6_batch(batch.clone()).unwrap();
+            assert_eq!(merged_into(&store.connection, alias_run_id), Some(run_id));
+            assert_eq!(
+                store.history_drain_run_ids(&drain_id).unwrap(),
+                vec![run_id]
+            );
+
+            let mut conflicting = batch;
+            let PersistOp::PromoteTaskRunKey {
+                alias_run_id: conflicting_alias,
+                ..
+            } = &mut conflicting.operations[0]
+            else {
+                unreachable!();
+            };
+            *conflicting_alias = RunId::new();
+            assert!(store.apply_v6_batch(conflicting).is_err());
+            assert!(store.finalize_history_drain(&drain_id, 300).is_ok());
+        }
+
+        {
+            let (_directory, root) = test_root();
+            let mut store = open_writer(&root).unwrap();
+            let survivor = RunId::new();
+            let absorbed = RunId::new();
+            let conflicting_survivor = RunId::new();
+            let survivor_run = persisted(
+                survivor,
+                RunKey::Controller("v7-replay-merge-survivor".to_owned()),
+                1,
+                None,
+                true,
+            );
+            let absorbed_run = persisted(
+                absorbed,
+                RunKey::NativePath {
+                    provider: Provider::Codex,
+                    path: "/tmp/v7-replay-merge.jsonl".to_owned(),
+                },
+                2,
+                None,
+                true,
+            );
+            let conflict_run = persisted(
+                conflicting_survivor,
+                RunKey::Controller("v7-replay-merge-conflict".to_owned()),
+                3,
+                None,
+                true,
+            );
+            store
+                .apply_v6_batch(PersistV6Batch {
+                    task_runs: vec![survivor_run.clone(), absorbed_run, conflict_run],
+                    ..PersistV6Batch::default()
+                })
+                .unwrap();
+            let mut finalized_survivor = survivor_run;
+            finalized_survivor.state.history_ready = false;
+            let drain_id = HistoryDrainId::new("codex:v7-replay-merge").unwrap();
+            let batch = PersistV6Batch {
+                operations: vec![
+                    PersistOp::MergeTaskRuns { survivor, absorbed },
+                    PersistOp::UpsertTaskRun(finalized_survivor.task_run.clone()),
+                ],
+                task_runs: vec![finalized_survivor],
+                history_drains: vec![PersistHistoryDrain {
+                    drain_id: drain_id.clone(),
+                    provider: Provider::Codex,
+                    created_at_ms: 100,
+                    artifacts: Vec::new(),
+                }],
+                history_associations: vec![PersistHistoryDrainRun {
+                    drain_id: drain_id.clone(),
+                    run_id: survivor,
+                }],
+                history_event_drain: Some(drain_id.clone()),
+                ..PersistV6Batch::default()
+            };
+            store.apply_v6_batch(batch.clone()).unwrap();
+            store.apply_v6_batch(batch.clone()).unwrap();
+            assert_eq!(merged_into(&store.connection, absorbed), Some(survivor));
+            assert_eq!(
+                store.history_drain_run_ids(&drain_id).unwrap(),
+                vec![survivor]
+            );
+
+            let mut conflicting = batch;
+            conflicting.operations[0] = PersistOp::MergeTaskRuns {
+                survivor: conflicting_survivor,
+                absorbed,
+            };
+            assert!(store.apply_v6_batch(conflicting).is_err());
+            assert!(store.finalize_history_drain(&drain_id, 300).is_ok());
+        }
+    }
+
+    #[test]
+    fn schema_v7_exact_non_ingest_identity_replay_requires_matching_agent_node() {
+        let persisted = |run_id: RunId,
+                         key: RunKey,
+                         ordinal: i64,
+                         native_session: Option<NativeSessionBinding>| {
+            PersistTaskRunV6 {
+                task_run: PersistTaskRun {
+                    task_run: TaskRun {
+                        run_id,
+                        key,
+                        display_ordinal: DisplayOrdinal::new(ordinal),
+                        state: TaskState::Running,
+                        has_controller_task_state_event: false,
+                        created_at_ms: Some(100),
+                        updated_at_ms: Some(200),
+                        finished_at_ms: None,
+                        subject: None,
+                        dismissed_at_ms: None,
+                    },
+                    native_session,
+                    created_at_ms: 100,
+                    updated_at_ms: 200,
+                    finished_at_ms: None,
+                },
+                state: TaskRunV6State {
+                    history_ready: false,
+                    latest_provider_at_ms: Some(200),
+                    ..TaskRunV6State::default()
+                },
+            }
+        };
+
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let run_id = RunId::new();
+        let other_run_id = RunId::new();
+        let alias_run_id = RunId::new();
+        let old_key = RunKey::NativePath {
+            provider: Provider::Codex,
+            path: "/tmp/v7-replay-agent.jsonl".to_owned(),
+        };
+        store
+            .apply_v6_batch(PersistV6Batch {
+                task_runs: vec![
+                    persisted(run_id, old_key.clone(), 1, None),
+                    persisted(
+                        other_run_id,
+                        RunKey::Controller("v7-replay-agent-other".to_owned()),
+                        2,
+                        None,
+                    ),
+                ],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+
+        let promoted = persisted(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "v7-replay-agent-owner".to_owned(),
+            },
+            1,
+            Some(NativeSessionBinding {
+                provider: Provider::Codex,
+                native_session_id: "v7-replay-agent-owner".to_owned(),
+            }),
+        );
+        let agent_node = AgentNode {
+            agent_node_id: "agent:codex:v7-replay-agent".to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some("v7-replay-agent-thread".to_owned()),
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(10),
+            parent_agent_node_id: Some("agent:codex:v7-replay-parent".to_owned()),
+            state: Some(ExecState::Working),
+            model_id: Some("gpt-v7-replay".to_owned()),
+            last_event_kind: Some("session_resolved".to_owned()),
+            last_tool_name: Some("read".to_owned()),
+            last_item_count: Some(7),
+            last_byte_count: Some(11),
+            last_activity_at_ms: Some(190),
+            session_file: Some("/tmp/v7-replay-agent.jsonl".to_owned()),
+        };
+        let drain_id = HistoryDrainId::new("codex:v7-replay-agent").unwrap();
+        let batch = PersistV6Batch {
+            operations: vec![
+                PersistOp::UpsertAgentNode(agent_node.clone()),
+                PersistOp::PromoteTaskRunKey {
+                    promoted: promoted.task_run.clone(),
+                    old_key,
+                    alias_run_id,
+                },
+                PersistOp::RecordEvent {
+                    event: Box::new(run_event("v7-replay-agent-event", run_id, 200)),
+                    seen_at_ms: 200,
+                },
+            ],
+            task_runs: vec![promoted],
+            history_drains: vec![PersistHistoryDrain {
+                drain_id: drain_id.clone(),
+                provider: Provider::Codex,
+                created_at_ms: 100,
+                artifacts: Vec::new(),
+            }],
+            history_associations: vec![PersistHistoryDrainRun {
+                drain_id: drain_id.clone(),
+                run_id,
+            }],
+            history_event_drain: Some(drain_id),
+            ..PersistV6Batch::default()
+        };
+        store.apply_v6_batch(batch.clone()).unwrap();
+
+        {
+            let transaction = store.connection.transaction().unwrap();
+            assert!(
+                exact_non_ingest_identity_replay_is_already_durable(&transaction, &batch).unwrap(),
+                "the exact durable agent node must be replay-safe"
+            );
+            transaction.rollback().unwrap();
+        }
+
+        for column in [
+            "native_session_id",
+            "parent_agent_node_id",
+            "state",
+            "model_id",
+            "last_event_kind",
+            "last_tool_name",
+            "last_item_count",
+            "last_byte_count",
+            "last_activity_at_ms",
+            "session_file",
+        ] {
+            let transaction = store.connection.transaction().unwrap();
+            transaction
+                .execute(
+                    &format!("UPDATE agent_nodes SET {column} = NULL WHERE agent_node_id = ?1"),
+                    [&agent_node.agent_node_id],
+                )
+                .unwrap();
+            assert!(
+                !exact_non_ingest_identity_replay_is_already_durable(&transaction, &batch).unwrap(),
+                "changed nullable column {column} was accepted"
+            );
+            transaction.rollback().unwrap();
+        }
+
+        {
+            let transaction = store.connection.transaction().unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO native_agent_sessions(provider, native_session_id) \
+                     VALUES ('claude', ?1)",
+                    ["v7-replay-agent-thread"],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "UPDATE agent_nodes SET provider = 'claude' WHERE agent_node_id = ?1",
+                    [&agent_node.agent_node_id],
+                )
+                .unwrap();
+            assert!(
+                !exact_non_ingest_identity_replay_is_already_durable(&transaction, &batch).unwrap(),
+                "changed provider was accepted"
+            );
+            transaction.rollback().unwrap();
+        }
+
+        {
+            let transaction = store.connection.transaction().unwrap();
+            transaction
+                .execute(
+                    "UPDATE agent_nodes SET task_run_id = ?1 WHERE agent_node_id = ?2",
+                    params![other_run_id.to_string(), &agent_node.agent_node_id],
+                )
+                .unwrap();
+            assert!(
+                !exact_non_ingest_identity_replay_is_already_durable(&transaction, &batch).unwrap(),
+                "changed task-run lineage was accepted"
+            );
+            transaction.rollback().unwrap();
+        }
+
+        {
+            let transaction = store.connection.transaction().unwrap();
+            transaction
+                .execute(
+                    "UPDATE display_ordinals SET ordinal = ?1 \
+                     WHERE entity_kind = 'agent_node' AND entity_id = ?2",
+                    params![11, &agent_node.agent_node_id],
+                )
+                .unwrap();
+            assert!(
+                !exact_non_ingest_identity_replay_is_already_durable(&transaction, &batch).unwrap(),
+                "changed display ordinal was accepted"
+            );
+            transaction.rollback().unwrap();
+        }
+
+        {
+            let mut conflicting = batch.clone();
+            let PersistOp::UpsertAgentNode(node) = &mut conflicting.operations[0] else {
+                unreachable!();
+            };
+            node.agent_node_id = "agent:codex:v7-replay-missing".to_owned();
+            let transaction = store.connection.transaction().unwrap();
+            assert!(
+                !exact_non_ingest_identity_replay_is_already_durable(&transaction, &conflicting,)
+                    .unwrap(),
+                "missing durable agent node was accepted"
+            );
+            transaction.rollback().unwrap();
         }
     }
 

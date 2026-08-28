@@ -1114,9 +1114,11 @@ impl DomainModel {
         }
     }
 
-    pub(crate) fn release_history_publications(&mut self, canonical_run_id: RunId) {
+    pub(crate) fn release_history_publications(&mut self, canonical_run_id: RunId) -> bool {
+        let prior_len = self.history_run_publications.len();
         self.history_run_publications
             .retain(|_, publication| publication.canonical_run_id != canonical_run_id);
+        self.history_run_publications.len() != prior_len
     }
 
     pub(crate) fn set_deferred_history_activity(

@@ -6831,7 +6831,7 @@ async fn apply_provider_event_with_admission(
         crate::model::ObservationOrigin::Historical { .. } => provider_at_ms,
         crate::model::ObservationOrigin::Live => unix_now_ms(),
     };
-    let mut prior = reducer.begin_provider_observation(&origin, observed_at_ms);
+    let prior = reducer.begin_provider_observation(&origin, observed_at_ms);
     match event {
         ProviderEvent::Synthesized(mut event) => {
             event.metadata.herdr_session = session.to_owned();
@@ -6849,7 +6849,7 @@ async fn apply_provider_event_with_admission(
             }
             if matches!(&origin, crate::model::ObservationOrigin::Historical { .. })
                 && matches!(event.event, crate::model::ControllerEventKind::TaskStarted)
-                && let Some((run_id, stored_watermark)) = event
+                && let Some(stored_watermark) = event
                     .metadata
                     .provider
                     .zip(event.metadata.native_session_id.as_deref())
@@ -6865,7 +6865,6 @@ async fn apply_provider_event_with_admission(
                             .task_run_v6_state(&run_id)
                             .and_then(|state| state.lifecycle_watermark.as_ref())
                             .cloned()
-                            .map(|watermark| (run_id, watermark))
                     })
             {
                 let candidate = NativeLifecycleWatermark {
@@ -6879,16 +6878,6 @@ async fn apply_provider_event_with_admission(
                         admission.complete();
                     }
                     return Ok(());
-                }
-                // Historical reconciliation freezes ready rows at `prior`; advance that
-                // baseline after the complete watermark admits a later native resume.
-                if let Some(prior) = prior.as_mut()
-                    && let Some(mut state) = prior.task_run_v6_state(&run_id).cloned()
-                    && state.history_ready
-                {
-                    state.native_session_end = None;
-                    state.lifecycle_watermark = Some(candidate);
-                    prior.set_task_run_v6_state(run_id, state);
                 }
             }
             let delta = match reducer.validate_controller_event(&event) {
@@ -9051,6 +9040,7 @@ mod tests {
         PerformanceDegradationReason, PerformanceSampler, PerformanceSnapshot,
         TestPerformanceClock, performance_tracker,
     };
+    use crate::provider::SourcePosition;
     use crate::store::writer::{
         DurabilityDisposition, PersistenceFailure, PersistenceFailureCode, PersistenceOperation,
         PersistencePhase,
@@ -9769,6 +9759,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn historical_task_started_keeps_terminal_before_image_until_finalization() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let run_id = RunId::new();
+        let drain_id = HistoryDrainId::new("codex:task-started-before-image").unwrap();
+        let manifest = PersistHistoryDrain {
+            drain_id: drain_id.clone(),
+            provider: Provider::Codex,
+            created_at_ms: 1_500,
+            artifacts: Vec::new(),
+        };
+        store
+            .apply_v6_batch(PersistV6Batch {
+                task_runs: vec![PersistTaskRunV6 {
+                    task_run: PersistTaskRun {
+                        task_run: TaskRun {
+                            run_id,
+                            key: RunKey::Controller("task-started-before-image".to_owned()),
+                            display_ordinal: DisplayOrdinal::new(1),
+                            state: TaskState::Running,
+                            has_controller_task_state_event: true,
+                            created_at_ms: Some(500),
+                            updated_at_ms: Some(1_000),
+                            finished_at_ms: None,
+                            subject: None,
+                            dismissed_at_ms: None,
+                        },
+                        native_session: Some(crate::store::NativeSessionBinding {
+                            provider: Provider::Codex,
+                            native_session_id: "task-started-before-image".to_owned(),
+                        }),
+                        created_at_ms: 500,
+                        updated_at_ms: 1_000,
+                        finished_at_ms: None,
+                    },
+                    state: TaskRunV6State {
+                        native_session_end: Some(crate::model::NativeSessionEnd {
+                            status: NativeSessionEndStatus::Done,
+                            at_ms: 1_000,
+                        }),
+                        lifecycle_watermark: Some(NativeLifecycleWatermark {
+                            source_at_ms: 1_000,
+                            observed_at_ms: 1_000,
+                            source_order: "live:terminal-before-history".to_owned(),
+                        }),
+                        history_ready: true,
+                        latest_provider_at_ms: Some(1_000),
+                    },
+                }],
+                history_drains: vec![manifest.clone()],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+        let restored = store.load_restored_state().unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut persistence, _diagnostics) =
+            RuntimePersistence::new_for_test(writer, Arc::new(RecordingOccurrenceSink::default()));
+        let (mut reducer, shared) = Reducer::new(restored);
+        let (_provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+        let (performance, _sampler) = performance_tracker(Arc::new(SystemPerformanceClock::new()));
+        let mut event_metadata = metadata("task-started-before-image", "provider-lifecycle");
+        event_metadata.event_id = "task-started-before-image-historical".to_owned();
+        event_metadata.source = crate::provider::lane::SOURCE_LOG_LANE.to_owned();
+        event_metadata.source_event_type = "task_started".to_owned();
+        event_metadata.timestamp_ms = 2_000;
+        event_metadata.receipt_time_ms = 2_100;
+        event_metadata.provider = Some(Provider::Codex);
+        event_metadata.native_session_id = Some("task-started-before-image".to_owned());
+        let historical = ProviderEvent::Synthesized(crate::model::ControllerEvent {
+            schema_version: 1,
+            task_run_id: "task-started-before-image".to_owned(),
+            metadata: event_metadata,
+            event: ControllerEventKind::TaskStarted,
+        });
+
+        service_provider_event(
+            Some(ProviderIngressEvent {
+                admission: Some(performance.admit()),
+                event: historical,
+                origin: crate::model::ObservationOrigin::Historical {
+                    drain_id: drain_id.clone(),
+                    artifact_id: "task-started-before-image.jsonl".to_owned(),
+                },
+                history_manifest: Some(Arc::new(manifest)),
+            }),
+            &mut provider,
+            "task-started-before-image",
+            &mut reducer,
+            &shared,
+            &mut persistence,
+        )
+        .await
+        .unwrap();
+
+        reducer.record_provider_identity_disagreement();
+        assert_eq!(
+            shared
+                .borrow()
+                .task_run_v6_state(&run_id)
+                .unwrap()
+                .native_session_end
+                .as_ref()
+                .map(|end| (end.status, end.at_ms)),
+            Some((NativeSessionEndStatus::Done, 1_000)),
+            "an unrelated publication must retain the exact pre-drain terminal projection"
+        );
+
+        let barrier = HistoryDrainBarrier::new(drain_id, 3_000);
+        let acknowledgement = barrier.acknowledgement();
+        service_provider_event(
+            Some(ProviderIngressEvent {
+                event: ProviderEvent::SourceState {
+                    provider: Provider::Codex,
+                    state: ProviderSourceState::HistoryDrainBarrier(barrier),
+                },
+                admission: None,
+                origin: crate::model::ObservationOrigin::Live,
+                history_manifest: None,
+            }),
+            &mut provider,
+            "task-started-before-image",
+            &mut reducer,
+            &shared,
+            &mut persistence,
+        )
+        .await
+        .unwrap();
+        assert!(acknowledgement.is_committed());
+        let finalized = shared.borrow();
+        let finalized_state = finalized.task_run_v6_state(&run_id).unwrap();
+        assert!(finalized_state.history_ready);
+        assert_eq!(
+            finalized_state.native_session_end,
+            Some(crate::model::NativeSessionEnd {
+                status: NativeSessionEndStatus::Unknown,
+                at_ms: 2_000,
+            })
+        );
+
+        drop(finalized);
+        drop(persistence);
+        lifecycle.shutdown().await.unwrap();
+        provider_thread.stop().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn successful_probe_retries_retained_history_before_later_ingest_sequence() {
         let (_directory, root, lifecycle, mut persistence, _diagnostics) =
             recoverable_runtime(Duration::from_secs(30));
@@ -10194,6 +10331,272 @@ mod tests {
                             .is_some_and(|state| state.history_ready)
                     }),
                 "{label}: barrier did not durably publish the recovered run"
+            );
+
+            drop(persistence);
+            lifecycle.shutdown().await.unwrap();
+            provider_thread.stop().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_non_ingest_identity_replays_clear_pending_gate_and_finalize() {
+        fn persisted_run(
+            run_id: RunId,
+            key: RunKey,
+            ordinal: i64,
+            native_session: Option<crate::store::NativeSessionBinding>,
+            history_ready: bool,
+        ) -> PersistTaskRunV6 {
+            PersistTaskRunV6 {
+                task_run: PersistTaskRun {
+                    task_run: TaskRun {
+                        run_id,
+                        key,
+                        display_ordinal: DisplayOrdinal::new(ordinal),
+                        state: TaskState::Queued,
+                        has_controller_task_state_event: false,
+                        created_at_ms: Some(100),
+                        updated_at_ms: Some(200),
+                        finished_at_ms: None,
+                        subject: None,
+                        dismissed_at_ms: None,
+                    },
+                    native_session,
+                    created_at_ms: 100,
+                    updated_at_ms: 200,
+                    finished_at_ms: None,
+                },
+                state: TaskRunV6State {
+                    history_ready,
+                    latest_provider_at_ms: Some(200),
+                    ..TaskRunV6State::default()
+                },
+            }
+        }
+
+        for label in ["promotion", "merge"] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+            let mut store = open_writer(&root).unwrap();
+            let drain_id = HistoryDrainId::new(format!("codex:lost-ack-{label}")).unwrap();
+            let path_run_id = RunId::new();
+            let path = directory.path().join(format!("lost-ack-{label}.jsonl"));
+            let path_key = RunKey::NativePath {
+                provider: Provider::Codex,
+                path: path.to_string_lossy().into_owned(),
+            };
+            let owner_session_id = format!("lost-ack-{label}");
+            let (canonical_run_id, initial_runs) = if label == "promotion" {
+                (
+                    path_run_id,
+                    vec![persisted_run(path_run_id, path_key, 1, None, true)],
+                )
+            } else {
+                let survivor = RunId::new();
+                (
+                    survivor,
+                    vec![
+                        persisted_run(
+                            survivor,
+                            RunKey::Native {
+                                provider: Provider::Codex,
+                                sid: owner_session_id.clone(),
+                            },
+                            1,
+                            Some(crate::store::NativeSessionBinding {
+                                provider: Provider::Codex,
+                                native_session_id: owner_session_id.clone(),
+                            }),
+                            true,
+                        ),
+                        persisted_run(path_run_id, path_key, 2, None, true),
+                    ],
+                )
+            };
+            store
+                .apply_v6_batch(PersistV6Batch {
+                    task_runs: initial_runs,
+                    ..PersistV6Batch::default()
+                })
+                .unwrap();
+
+            let manifest = PersistHistoryDrain {
+                drain_id: drain_id.clone(),
+                provider: Provider::Codex,
+                created_at_ms: 100,
+                artifacts: Vec::new(),
+            };
+            let origin = crate::model::ObservationOrigin::Historical {
+                drain_id: drain_id.clone(),
+                artifact_id: format!("lost-ack-{label}.jsonl"),
+            };
+            let (mut batch_reducer, batch_shared) =
+                Reducer::new(store.load_restored_state().unwrap());
+            let prior = batch_reducer.begin_provider_observation(&origin, 200);
+            let agent_thread_id = format!("lost-ack-agent-{label}");
+            let parent_thread_id = format!("lost-ack-parent-{label}");
+            let normalized = normalize_provider_event(
+                &batch_shared,
+                "lost-ack-identity",
+                ProviderEvent::SessionResolved {
+                    provider: Provider::Codex,
+                    agent_thread_id: agent_thread_id.clone(),
+                    owner_session_id: Some(owner_session_id),
+                    parent_thread_id: Some(parent_thread_id.clone()),
+                    path: path.clone(),
+                    model_id: Some(format!("model-{label}")),
+                    depth: Some(1),
+                    event_id: format!("prov:codex:meta:{agent_thread_id}"),
+                    observed_at_ms: 200,
+                    position: SourcePosition {
+                        path_id: 1,
+                        generation: 0,
+                        offset: 1,
+                    },
+                },
+                &SourceCoverageRegistry::new(SourceAvailability::Available),
+            );
+            assert!(!normalized.identity_disagreement, "{label}: identity");
+            let operations = apply_collector_observation(&mut batch_reducer, normalized.events)
+                .unwrap()
+                .expect("session_resolved must produce a persistent observation");
+            let batch = batch_reducer.finish_provider_observation(
+                prior,
+                operations,
+                &origin,
+                Some(&manifest),
+                200,
+            );
+
+            assert_eq!(
+                batch
+                    .operations
+                    .iter()
+                    .filter(|operation| matches!(operation, PersistOp::UpsertAgentNode(_)))
+                    .count(),
+                3,
+                "{label}: agent projections"
+            );
+            assert_eq!(
+                batch
+                    .operations
+                    .iter()
+                    .filter(|operation| matches!(operation, PersistOp::RecordEvent { .. }))
+                    .count(),
+                3,
+                "{label}: event projections"
+            );
+            assert_eq!(
+                batch
+                    .operations
+                    .iter()
+                    .any(|operation| matches!(operation, PersistOp::PromoteTaskRunKey { .. })),
+                label == "promotion",
+                "{label}: promotion shape"
+            );
+            assert_eq!(
+                batch
+                    .operations
+                    .iter()
+                    .any(|operation| matches!(operation, PersistOp::MergeTaskRuns { .. })),
+                label == "merge",
+                "{label}: merge shape"
+            );
+            assert!(batch.operations.iter().all(|operation| matches!(
+                operation,
+                PersistOp::UpsertAgentNode(_)
+                    | PersistOp::PromoteTaskRunKey { .. }
+                    | PersistOp::MergeTaskRuns { .. }
+                    | PersistOp::UpsertTaskRun(_)
+                    | PersistOp::RecordEvent { .. }
+            )));
+            let expected_node_id = format!("agent:codex:{agent_thread_id}");
+            let final_node = batch
+                .operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    PersistOp::UpsertAgentNode(node) => Some(node),
+                    _ => None,
+                })
+                .next_back()
+                .unwrap();
+            assert_eq!(final_node.agent_node_id, expected_node_id);
+            assert_eq!(final_node.task_run_id, path_run_id);
+            assert_eq!(
+                final_node.parent_agent_node_id.as_deref(),
+                Some(format!("agent:codex:{parent_thread_id}").as_str())
+            );
+            assert_eq!(
+                final_node.model_id.as_deref(),
+                Some(format!("model-{label}").as_str())
+            );
+            assert_eq!(final_node.session_file.as_deref(), path.to_str());
+
+            store.apply_v6_batch(batch.clone()).unwrap();
+            let restored = store.load_restored_state().unwrap();
+            assert_eq!(
+                restored
+                    .model
+                    .agent_node(&expected_node_id)
+                    .unwrap()
+                    .task_run_id,
+                canonical_run_id,
+                "{label}: durable node lineage"
+            );
+            let (lifecycle, writer) = spawn_writer(store).unwrap();
+            let (mut persistence, _diagnostics) = RuntimePersistence::new_for_test(
+                writer,
+                Arc::new(RecordingOccurrenceSink::default()),
+            );
+            let (mut reducer, shared) = Reducer::new(restored);
+            let (_provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+            provider.pending_history_mutation = Some(PendingHistoryMutation {
+                drain_id: drain_id.clone(),
+                batch,
+            });
+            assert!(!provider.provider_ingress_open(), "{label}: pending gate");
+
+            assert!(
+                retry_pending_history_mutation(&mut provider, &mut reducer, &mut persistence)
+                    .await
+                    .unwrap(),
+                "{label}: exact committed replay was not recognized"
+            );
+            assert!(
+                provider.pending_history_mutation.is_none(),
+                "{label}: pending"
+            );
+            assert!(provider.provider_ingress_open(), "{label}: ingress");
+
+            let barrier = HistoryDrainBarrier::new(drain_id.clone(), 300);
+            let acknowledgement = barrier.acknowledgement();
+            service_provider_event(
+                Some(ProviderIngressEvent {
+                    event: ProviderEvent::SourceState {
+                        provider: Provider::Codex,
+                        state: ProviderSourceState::HistoryDrainBarrier(barrier),
+                    },
+                    admission: None,
+                    origin: crate::model::ObservationOrigin::Live,
+                    history_manifest: None,
+                }),
+                &mut provider,
+                "lost-ack-identity",
+                &mut reducer,
+                &shared,
+                &mut persistence,
+            )
+            .await
+            .unwrap();
+            assert!(acknowledgement.is_committed(), "{label}: barrier");
+            assert!(
+                shared
+                    .borrow()
+                    .task_run_v6_state(&canonical_run_id)
+                    .unwrap()
+                    .history_ready,
+                "{label}: readiness"
             );
 
             drop(persistence);
