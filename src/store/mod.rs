@@ -1248,7 +1248,7 @@ impl Store {
             )?;
             transaction.execute(
                 "UPDATE task_runs AS run \
-                 SET history_ready = NOT EXISTS (\
+                 SET history_ready = run.history_ready OR NOT EXISTS (\
                      SELECT 1 FROM history_drain_runs AS association \
                      JOIN history_drains AS blocker ON blocker.drain_id = association.drain_id \
                      WHERE association.run_id = run.run_id \
@@ -2298,38 +2298,37 @@ fn exact_non_ingest_identity_replay_is_already_durable(
 
     let mut has_identity_operation = false;
     let mut expected_event_ids = HashSet::new();
+    let mut expected_events = Vec::new();
     let mut expected_agent_nodes = HashMap::new();
     let expected_task_run_ids = batch
         .task_runs
         .iter()
         .map(|task_run| task_run.task_run.task_run.run_id)
         .collect::<HashSet<_>>();
+    if expected_task_run_ids.len() != batch.task_runs.len() {
+        return Ok(false);
+    }
     for operation in &batch.operations {
         match operation {
             PersistOp::MergeTaskRuns { survivor, absorbed } => {
-                if !expected_task_run_ids.contains(survivor) {
+                let final_survivor = canonical_run_after_operations(*survivor, &batch.operations);
+                if !expected_task_run_ids.contains(&final_survivor)
+                    || canonical_run_after_operations(*absorbed, &batch.operations)
+                        != final_survivor
+                {
                     return Ok(false);
                 }
                 has_identity_operation = true;
-                let absorbed_target = transaction
-                    .query_row(
-                        "SELECT merged_into FROM task_runs WHERE run_id = ?1",
-                        [absorbed.to_string()],
-                        |row| row.get::<_, Option<String>>(0),
-                    )
-                    .optional()?
-                    .flatten();
-                let survivor_is_canonical: bool = transaction.query_row(
-                    "SELECT EXISTS(\
-                         SELECT 1 FROM task_runs WHERE run_id = ?1 AND merged_into IS NULL\
-                     )",
-                    [survivor.to_string()],
-                    |row| row.get(0),
-                )?;
-                if absorbed_target.as_deref() != Some(survivor.to_string().as_str())
-                    || !survivor_is_canonical
-                {
-                    return Ok(false);
+                for party in [*survivor, *absorbed] {
+                    let Some((_key, durable_target)) =
+                        durable_run_key_and_target(transaction, party)?
+                    else {
+                        return Ok(false);
+                    };
+                    let expected_target = (party != final_survivor).then_some(final_survivor);
+                    if durable_target != expected_target {
+                        return Ok(false);
+                    }
                 }
             }
             PersistOp::PromoteTaskRunKey {
@@ -2359,17 +2358,29 @@ fn exact_non_ingest_identity_replay_is_already_durable(
                     return Ok(false);
                 }
             }
-            PersistOp::RecordEvent { event, .. } => {
+            PersistOp::RecordEvent { event, seen_at_ms } => {
                 let metadata = event_metadata(event).0;
                 if !expected_event_ids.insert(metadata.event_id.clone()) {
                     return Ok(false);
                 }
+                let canonical_run_id = metadata
+                    .task_run_id
+                    .map(|run_id| canonical_run_after_operations(run_id, &batch.operations));
+                expected_events.push(relational_event_projection(
+                    event,
+                    *seen_at_ms,
+                    batch.history_event_drain.as_ref(),
+                    canonical_run_id,
+                )?);
             }
             PersistOp::UpsertAgentNode(node) => {
                 expected_agent_nodes.insert(node.agent_node_id.clone(), node.clone());
             }
             PersistOp::UpsertTaskRun(task_run)
-                if expected_task_run_ids.contains(&task_run.task_run.run_id) => {}
+                if expected_task_run_ids.contains(&canonical_run_after_operations(
+                    task_run.task_run.run_id,
+                    &batch.operations,
+                )) => {}
             _ => return Ok(false),
         }
     }
@@ -2386,22 +2397,8 @@ fn exact_non_ingest_identity_replay_is_already_durable(
             return Ok(false);
         }
     }
-    for event_id in expected_event_ids {
-        let durable_drain = transaction
-            .query_row(
-                "SELECT history_drain_id FROM events WHERE event_id = ?1",
-                [&event_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?;
-        if durable_drain
-            != Some(
-                batch
-                    .history_event_drain
-                    .as_ref()
-                    .map(|drain_id| drain_id.as_str().to_owned()),
-            )
-        {
+    for expected_event in expected_events {
+        if !durable_event_projection_matches(transaction, &expected_event)? {
             return Ok(false);
         }
     }
@@ -2489,6 +2486,155 @@ fn canonical_run_after_operations(mut run_id: RunId, operations: &[PersistOp]) -
         }
     }
     run_id
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RelationalEventProjection {
+    event_id: String,
+    seen_at_ms: i64,
+    event_timestamp_ms: i64,
+    herdr_session: String,
+    source: String,
+    normalized_kind: String,
+    source_event_type: String,
+    workspace_id: Option<String>,
+    tab_id: Option<String>,
+    pane_id: Option<String>,
+    terminal_id: Option<String>,
+    provider: Option<String>,
+    native_session_id: Option<String>,
+    task_run_id: Option<String>,
+    agent_node_id: Option<String>,
+    task_state: Option<String>,
+    model_id: Option<String>,
+    provider_event_kind: Option<String>,
+    tool_name: Option<String>,
+    item_count: Option<i64>,
+    byte_count: Option<i64>,
+    gap_kind: Option<String>,
+    ingest_seq: Option<i64>,
+    provider_agent_id: Option<String>,
+    provider_parent_agent_id: Option<String>,
+    source_coverage: Option<String>,
+    history_drain_id: Option<String>,
+}
+
+fn relational_event_projection(
+    event: &NormalizedEvent,
+    seen_at_ms: i64,
+    history_drain_id: Option<&HistoryDrainId>,
+    task_run_id: Option<RunId>,
+) -> Result<RelationalEventProjection, StoreError> {
+    let (metadata, normalized_kind) = event_metadata(event);
+    let provider_metadata = metadata.provider_metadata.as_ref();
+    let item_count = provider_metadata
+        .and_then(|value| value.item_count)
+        .map(|value| signed_count("event.item_count", value))
+        .transpose()?;
+    let byte_count = provider_metadata
+        .and_then(|value| value.byte_count)
+        .map(|value| signed_count("event.byte_count", value))
+        .transpose()?;
+    let ingest_seq = metadata
+        .ingest_seq
+        .map(|value| {
+            i64::try_from(value).map_err(|_| StoreError::IntegerOutOfRange {
+                field: "event.ingest_seq",
+            })
+        })
+        .transpose()?;
+    let source_coverage = if metadata.source == "provider" {
+        Some(
+            serde_json::to_string(&metadata.source_coverage).map_err(|error| {
+                StoreError::invalid("event.source_coverage", "provider", error.to_string())
+            })?,
+        )
+    } else {
+        None
+    };
+    Ok(RelationalEventProjection {
+        event_id: metadata.event_id.clone(),
+        seen_at_ms,
+        event_timestamp_ms: metadata.timestamp_ms,
+        herdr_session: metadata.herdr_session.clone(),
+        source: metadata.source.clone(),
+        normalized_kind: normalized_kind.to_owned(),
+        source_event_type: metadata.source_event_type.clone(),
+        workspace_id: metadata.workspace_id.clone(),
+        tab_id: metadata.tab_id.clone(),
+        pane_id: metadata.pane_id.clone(),
+        terminal_id: metadata.terminal_id.clone(),
+        provider: metadata
+            .provider
+            .map(|provider| provider_text(provider).to_owned()),
+        native_session_id: metadata.native_session_id.clone(),
+        task_run_id: task_run_id.map(|run_id| run_id.to_string()),
+        agent_node_id: metadata.agent_node_id.clone(),
+        task_state: metadata
+            .task_state
+            .map(|state| task_state_text(state).to_owned()),
+        model_id: provider_metadata.and_then(|value| value.model_id.clone()),
+        provider_event_kind: provider_metadata.and_then(|value| value.event_kind.clone()),
+        tool_name: provider_metadata.and_then(|value| value.tool_name.clone()),
+        item_count,
+        byte_count,
+        gap_kind: None,
+        ingest_seq,
+        provider_agent_id: provider_metadata.and_then(|value| value.agent_id.clone()),
+        provider_parent_agent_id: provider_metadata.and_then(|value| value.parent_agent_id.clone()),
+        source_coverage,
+        history_drain_id: history_drain_id.map(|drain_id| drain_id.as_str().to_owned()),
+    })
+}
+
+fn durable_event_projection_matches(
+    transaction: &Transaction<'_>,
+    expected: &RelationalEventProjection,
+) -> Result<bool, StoreError> {
+    let durable = transaction
+        .query_row(
+            "SELECT event_id, seen_at_ms, event_timestamp_ms, herdr_session, source, \
+                    normalized_kind, source_event_type, workspace_id, tab_id, pane_id, \
+                    terminal_id, provider, native_session_id, task_run_id, agent_node_id, \
+                    task_state, model_id, provider_event_kind, tool_name, item_count, byte_count, \
+                    gap_kind, ingest_seq, provider_agent_id, provider_parent_agent_id, \
+                    source_coverage, history_drain_id \
+             FROM events WHERE event_id = ?1",
+            [&expected.event_id],
+            |row| {
+                Ok(RelationalEventProjection {
+                    event_id: row.get(0)?,
+                    seen_at_ms: row.get(1)?,
+                    event_timestamp_ms: row.get(2)?,
+                    herdr_session: row.get(3)?,
+                    source: row.get(4)?,
+                    normalized_kind: row.get(5)?,
+                    source_event_type: row.get(6)?,
+                    workspace_id: row.get(7)?,
+                    tab_id: row.get(8)?,
+                    pane_id: row.get(9)?,
+                    terminal_id: row.get(10)?,
+                    provider: row.get(11)?,
+                    native_session_id: row.get(12)?,
+                    task_run_id: row.get(13)?,
+                    agent_node_id: row.get(14)?,
+                    task_state: row.get(15)?,
+                    model_id: row.get(16)?,
+                    provider_event_kind: row.get(17)?,
+                    tool_name: row.get(18)?,
+                    item_count: row.get(19)?,
+                    byte_count: row.get(20)?,
+                    gap_kind: row.get(21)?,
+                    ingest_seq: row.get(22)?,
+                    provider_agent_id: row.get(23)?,
+                    provider_parent_agent_id: row.get(24)?,
+                    source_coverage: row.get(25)?,
+                    history_drain_id: row.get(26)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(durable.as_ref() == Some(expected))
 }
 
 fn durable_agent_node_matches(
@@ -3866,7 +4012,7 @@ fn record_event(
     seen_at_ms: i64,
     history_drain_id: Option<&HistoryDrainId>,
 ) -> Result<(), StoreError> {
-    let (metadata, normalized_kind) = event_metadata(event);
+    let metadata = event_metadata(event).0;
     let inserted = insert_ledger(transaction, &metadata.event_id, seen_at_ms)?;
     if !inserted {
         return Ok(());
@@ -3880,35 +4026,8 @@ fn record_event(
         (&metadata.herdr_session, seen_at_ms),
     )?;
 
-    let provider_metadata = metadata.provider_metadata.as_ref();
-    let item_count = provider_metadata
-        .and_then(|value| value.item_count)
-        .map(|value| signed_count("event.item_count", value))
-        .transpose()?;
-    let byte_count = provider_metadata
-        .and_then(|value| value.byte_count)
-        .map(|value| signed_count("event.byte_count", value))
-        .transpose()?;
-    let ingest_seq = metadata
-        .ingest_seq
-        .map(|value| {
-            i64::try_from(value).map_err(|_| StoreError::IntegerOutOfRange {
-                field: "event.ingest_seq",
-            })
-        })
-        .transpose()?;
-    let provider_agent_id = provider_metadata.and_then(|value| value.agent_id.as_deref());
-    let provider_parent_agent_id =
-        provider_metadata.and_then(|value| value.parent_agent_id.as_deref());
-    let source_coverage = if metadata.source == "provider" {
-        Some(
-            serde_json::to_string(&metadata.source_coverage).map_err(|error| {
-                StoreError::invalid("event.source_coverage", "provider", error.to_string())
-            })?,
-        )
-    } else {
-        None
-    };
+    let projection =
+        relational_event_projection(event, seen_at_ms, history_drain_id, metadata.task_run_id)?;
     transaction.execute(
         "INSERT INTO events(\
              event_id, seen_at_ms, event_timestamp_ms, herdr_session, source, normalized_kind, \
@@ -3919,34 +4038,34 @@ fn record_event(
          ) VALUES (\
              ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
              ?16, ?17, ?18, ?19, ?20, ?21, NULL, ?22, ?23, ?24, ?25, ?26\
-         )",
+        )",
         params![
-            metadata.event_id,
-            seen_at_ms,
-            metadata.timestamp_ms,
-            metadata.herdr_session,
-            metadata.source,
-            normalized_kind,
-            metadata.source_event_type,
-            metadata.workspace_id,
-            metadata.tab_id,
-            metadata.pane_id,
-            metadata.terminal_id,
-            metadata.provider.map(provider_text),
-            metadata.native_session_id,
-            metadata.task_run_id.map(|value| value.to_string()),
-            metadata.agent_node_id,
-            metadata.task_state.map(task_state_text),
-            provider_metadata.and_then(|value| value.model_id.as_deref()),
-            provider_metadata.and_then(|value| value.event_kind.as_deref()),
-            provider_metadata.and_then(|value| value.tool_name.as_deref()),
-            item_count,
-            byte_count,
-            ingest_seq,
-            provider_agent_id,
-            provider_parent_agent_id,
-            source_coverage,
-            history_drain_id.map(HistoryDrainId::as_str),
+            &projection.event_id,
+            projection.seen_at_ms,
+            projection.event_timestamp_ms,
+            &projection.herdr_session,
+            &projection.source,
+            &projection.normalized_kind,
+            &projection.source_event_type,
+            projection.workspace_id.as_deref(),
+            projection.tab_id.as_deref(),
+            projection.pane_id.as_deref(),
+            projection.terminal_id.as_deref(),
+            projection.provider.as_deref(),
+            projection.native_session_id.as_deref(),
+            projection.task_run_id.as_deref(),
+            projection.agent_node_id.as_deref(),
+            projection.task_state.as_deref(),
+            projection.model_id.as_deref(),
+            projection.provider_event_kind.as_deref(),
+            projection.tool_name.as_deref(),
+            projection.item_count,
+            projection.byte_count,
+            projection.ingest_seq,
+            projection.provider_agent_id.as_deref(),
+            projection.provider_parent_agent_id.as_deref(),
+            projection.source_coverage.as_deref(),
+            projection.history_drain_id.as_deref(),
         ],
     )?;
     Ok(())
@@ -5603,6 +5722,99 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_drain_finalization_never_revokes_committed_live_readiness() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let run_id = RunId::new();
+        let first = HistoryDrainId::new("codex:overlap-live-ready-a").unwrap();
+        let second = HistoryDrainId::new("codex:overlap-live-ready-b").unwrap();
+        let artifact = |artifact_id: &str| PersistHistoryDrainArtifact {
+            artifact_id: artifact_id.to_owned(),
+            generation: "dev:overlap-live-ready".to_owned(),
+            goalpost: 100,
+        };
+        let mut private = match run_op(run_id, 1, TaskState::Running, 1_000, false) {
+            PersistOp::UpsertTaskRun(task_run) => task_run,
+            _ => unreachable!(),
+        };
+        private.task_run.created_at_ms = Some(1_000);
+        private.task_run.updated_at_ms = Some(1_000);
+        store
+            .apply_v6_batch(PersistV6Batch {
+                task_runs: vec![PersistTaskRunV6 {
+                    task_run: private.clone(),
+                    state: TaskRunV6State {
+                        history_ready: false,
+                        latest_provider_at_ms: Some(4_000),
+                        ..TaskRunV6State::default()
+                    },
+                }],
+                history_drains: vec![
+                    PersistHistoryDrain {
+                        drain_id: first.clone(),
+                        provider: Provider::Codex,
+                        created_at_ms: 1_000,
+                        artifacts: vec![artifact("first.jsonl")],
+                    },
+                    PersistHistoryDrain {
+                        drain_id: second.clone(),
+                        provider: Provider::Codex,
+                        created_at_ms: 2_000,
+                        artifacts: vec![artifact("second.jsonl")],
+                    },
+                ],
+                history_associations: vec![
+                    PersistHistoryDrainRun {
+                        drain_id: first.clone(),
+                        run_id,
+                    },
+                    PersistHistoryDrainRun {
+                        drain_id: second.clone(),
+                        run_id,
+                    },
+                ],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+        let live_state = TaskRunV6State {
+            native_session_end: None,
+            lifecycle_watermark: Some(NativeLifecycleWatermark {
+                source_at_ms: 4_000,
+                observed_at_ms: 4_000,
+                source_order: "live:committed-overlap".to_owned(),
+            }),
+            history_ready: true,
+            latest_provider_at_ms: Some(4_000),
+        };
+        store
+            .apply_v6_batch(PersistV6Batch {
+                task_runs: vec![PersistTaskRunV6 {
+                    task_run: private,
+                    state: live_state.clone(),
+                }],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+
+        let first_page = store.finalize_history_drain(&first, 5_000).unwrap();
+        assert_eq!(first_page.runs.len(), 1);
+        assert_eq!(first_page.runs[0].state, live_state);
+        assert!(!store.history_drain_finalized(&second).unwrap());
+
+        let second_page = store.finalize_history_drain(&second, 6_000).unwrap();
+        assert_eq!(second_page.runs.len(), 1);
+        assert_eq!(second_page.runs[0].state, live_state);
+        assert_eq!(
+            store
+                .load_restored_state()
+                .unwrap()
+                .model
+                .task_run_v6_state(&run_id),
+            Some(&live_state)
+        );
+    }
+
+    #[test]
     fn ready_run_history_resume_without_terminal_fact_finalizes_unknown_once() {
         let (_directory, root) = test_root();
         let mut store = open_writer(&root).unwrap();
@@ -6683,6 +6895,108 @@ mod tests {
     }
 
     #[test]
+    fn schema_v7_exact_non_ingest_identity_replay_accepts_complete_merge_chain_only() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let first = RunId::new();
+        let intermediate = RunId::new();
+        let final_survivor = RunId::new();
+        let persisted = |run_id: RunId, ordinal: i64| PersistTaskRunV6 {
+            task_run: match run_op(run_id, ordinal, TaskState::Running, 200, false) {
+                PersistOp::UpsertTaskRun(task_run) => task_run,
+                _ => unreachable!(),
+            },
+            state: TaskRunV6State {
+                history_ready: false,
+                latest_provider_at_ms: Some(200),
+                ..TaskRunV6State::default()
+            },
+        };
+        let first_run = persisted(first, 1);
+        let intermediate_run = persisted(intermediate, 2);
+        let final_run = persisted(final_survivor, 3);
+        store
+            .apply_v6_batch(PersistV6Batch {
+                task_runs: vec![
+                    first_run.clone(),
+                    intermediate_run.clone(),
+                    final_run.clone(),
+                ],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+        let drain_id = HistoryDrainId::new("codex:v7-replay-merge-chain").unwrap();
+        let batch = PersistV6Batch {
+            operations: vec![
+                PersistOp::MergeTaskRuns {
+                    survivor: intermediate,
+                    absorbed: first,
+                },
+                PersistOp::UpsertTaskRun(intermediate_run.task_run),
+                PersistOp::MergeTaskRuns {
+                    survivor: final_survivor,
+                    absorbed: intermediate,
+                },
+                PersistOp::UpsertTaskRun(final_run.task_run.clone()),
+            ],
+            task_runs: vec![final_run],
+            history_drains: vec![PersistHistoryDrain {
+                drain_id: drain_id.clone(),
+                provider: Provider::Codex,
+                created_at_ms: 100,
+                artifacts: Vec::new(),
+            }],
+            history_associations: vec![PersistHistoryDrainRun {
+                drain_id: drain_id.clone(),
+                run_id: final_survivor,
+            }],
+            history_event_drain: Some(drain_id),
+            ..PersistV6Batch::default()
+        };
+        store.apply_v6_batch(batch.clone()).unwrap();
+
+        {
+            let transaction = store.connection.transaction().unwrap();
+            assert!(
+                exact_non_ingest_identity_replay_is_already_durable(&transaction, &batch).unwrap(),
+                "a fully committed A -> B -> C chain must be recognized as durable"
+            );
+            transaction.rollback().unwrap();
+        }
+        store.apply_v6_batch(batch.clone()).unwrap();
+
+        {
+            let transaction = store.connection.transaction().unwrap();
+            transaction
+                .execute(
+                    "UPDATE task_runs SET merged_into = ?1 WHERE run_id = ?2",
+                    params![intermediate.to_string(), first.to_string()],
+                )
+                .unwrap();
+            assert!(
+                !exact_non_ingest_identity_replay_is_already_durable(&transaction, &batch).unwrap(),
+                "an alias targeting an intermediate survivor must fail closed"
+            );
+            transaction.rollback().unwrap();
+        }
+
+        {
+            let transaction = store.connection.transaction().unwrap();
+            transaction
+                .execute(
+                    "UPDATE task_runs SET subject = 'mismatched-final' WHERE run_id = ?1",
+                    [final_survivor.to_string()],
+                )
+                .unwrap();
+            assert!(
+                !exact_non_ingest_identity_replay_is_already_durable(&transaction, &batch).unwrap(),
+                "a mismatched final V6 projection must fail closed"
+            );
+            transaction.rollback().unwrap();
+        }
+    }
+
+    #[test]
     fn schema_v7_exact_non_ingest_identity_replay_requires_matching_agent_node() {
         let persisted = |run_id: RunId,
                          key: RunKey,
@@ -6802,6 +7116,37 @@ mod tests {
             assert!(
                 exact_non_ingest_identity_replay_is_already_durable(&transaction, &batch).unwrap(),
                 "the exact durable agent node must be replay-safe"
+            );
+            transaction.rollback().unwrap();
+        }
+
+        {
+            let transaction = store.connection.transaction().unwrap();
+            transaction
+                .execute(
+                    "UPDATE events SET seen_at_ms = seen_at_ms + 1 WHERE event_id = ?1",
+                    ["v7-replay-agent-event"],
+                )
+                .unwrap();
+            assert!(
+                !exact_non_ingest_identity_replay_is_already_durable(&transaction, &batch).unwrap(),
+                "a mismatched seen_at_ms must fail closed"
+            );
+            transaction.rollback().unwrap();
+        }
+
+        {
+            let transaction = store.connection.transaction().unwrap();
+            transaction
+                .execute(
+                    "UPDATE events SET source_event_type = 'mismatched-projection' \
+                     WHERE event_id = ?1",
+                    ["v7-replay-agent-event"],
+                )
+                .unwrap();
+            assert!(
+                !exact_non_ingest_identity_replay_is_already_durable(&transaction, &batch).unwrap(),
+                "a mismatched event projection column must fail closed"
             );
             transaction.rollback().unwrap();
         }

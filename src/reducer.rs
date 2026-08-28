@@ -18,12 +18,12 @@ use crate::identity::{
 use crate::model::{
     AgentNode, AgentNodeObservation, AgentSessionReferenceKind, ControllerDiagnosticsHandle,
     ControllerEvent, ControllerEventKind, DependencyEdge, DisplayOrdinal, DomainModel,
-    EventMetadata, ExecState, Execution, ExecutionEdge, MinimalProviderMetadata,
-    NativeLifecycleWatermark, NativeSessionEnd, NativeSessionEndStatus, NormalizedEvent,
-    ObservationOrigin, OperatorCommand, Pane, PaneAgentStatusObservation, Provider,
-    ProviderDiagnosticsHandle, ReconcileBatch, RunId, RunKey, RunRateCursor, RunRateTotals,
-    SharedModel, TaskRun, TaskRunV6State, TaskState, TopologyAuthority, TopologyEntity,
-    TopologyEntityId, TopologySnapshot, sanitize_controller_text,
+    EventMetadata, ExecState, Execution, ExecutionEdge, HistoryRunPublication,
+    MinimalProviderMetadata, NativeLifecycleWatermark, NativeSessionEnd, NativeSessionEndStatus,
+    NormalizedEvent, ObservationOrigin, OperatorCommand, Pane, PaneAgentStatusObservation,
+    Provider, ProviderDiagnosticsHandle, ReconcileBatch, RunId, RunKey, RunRateCursor,
+    RunRateTotals, SharedModel, TaskRun, TaskRunV6State, TaskState, TopologyAuthority,
+    TopologyEntity, TopologyEntityId, TopologySnapshot, sanitize_controller_text,
 };
 use crate::operator::OperatorProjection;
 use crate::store::{
@@ -276,6 +276,12 @@ pub(crate) struct StagedHistoryFinalization {
     pub observed_at_ms: i64,
 }
 
+/// One provider submission's publication work, consumed only by its matching acknowledgement.
+pub(crate) enum ProviderSubmissionReceipt {
+    Historical,
+    Live { ready_run_ids: Vec<RunId> },
+}
+
 /// Maximum unattributed provider-usage samples retained across all run scopes.
 ///
 /// The reducer evicts the globally oldest sample first. Since each retained sample has exactly
@@ -321,7 +327,11 @@ pub struct Reducer {
     publisher: watch::Sender<Arc<DomainModel>>,
     operator: OperatorProjection,
     defer_provider_publication: bool,
+    defer_provider_model_publication: bool,
+    provider_model_publication_pending: bool,
     deferred_provider_drain: Option<crate::model::HistoryDrainId>,
+    provider_observation_private_run_ids: HashSet<RunId>,
+    provider_observation_publications: Vec<HistoryRunPublication>,
     published_history_drains: HashSet<crate::model::HistoryDrainId>,
     #[cfg(test)]
     publish_count: std::cell::Cell<u64>,
@@ -401,7 +411,11 @@ impl Reducer {
                 publisher,
                 operator,
                 defer_provider_publication: false,
+                defer_provider_model_publication: false,
+                provider_model_publication_pending: false,
                 deferred_provider_drain: None,
+                provider_observation_private_run_ids: HashSet::new(),
+                provider_observation_publications: Vec::new(),
                 published_history_drains: HashSet::new(),
                 #[cfg(test)]
                 publish_count: std::cell::Cell::new(0),
@@ -759,7 +773,7 @@ impl Reducer {
         true
     }
 
-    /// Captures pre-observation state and suppresses the intermediate historical publication.
+    /// Captures publication state and suppresses the intermediate historical publication.
     pub(crate) fn begin_provider_observation(
         &mut self,
         origin: &ObservationOrigin,
@@ -776,9 +790,31 @@ impl Reducer {
         ));
         if let ObservationOrigin::Historical { drain_id, .. } = origin {
             self.defer_provider_publication = true;
+            self.defer_provider_model_publication = false;
+            self.provider_model_publication_pending = false;
             self.deferred_provider_drain = Some(drain_id.clone());
+            self.provider_observation_private_run_ids.clear();
+            self.provider_observation_publications.clear();
             Some(self.model.clone())
         } else {
+            self.defer_provider_model_publication = true;
+            self.provider_model_publication_pending = false;
+            self.provider_observation_private_run_ids = self
+                .model
+                .task_runs()
+                .filter_map(|run| {
+                    self.model
+                        .task_run_v6_state(&run.run_id)
+                        .is_some_and(|state| !state.history_ready)
+                        .then_some(run.run_id)
+                })
+                .collect();
+            let published = self.model.publication_snapshot();
+            self.provider_observation_publications = self
+                .provider_observation_private_run_ids
+                .iter()
+                .filter_map(|run_id| published.capture_history_publication(*run_id))
+                .collect();
             None
         }
     }
@@ -791,7 +827,7 @@ impl Reducer {
         origin: &ObservationOrigin,
         history_manifest: Option<&PersistHistoryDrain>,
         provider_at_ms: i64,
-    ) -> PersistV6Batch {
+    ) -> (PersistV6Batch, ProviderSubmissionReceipt) {
         let historical = matches!(origin, ObservationOrigin::Historical { .. });
         let changed = prior.as_ref().map_or_else(HashSet::new, |before| {
             self.model.changed_task_run_ids_since(before)
@@ -825,6 +861,20 @@ impl Reducer {
         touched.extend(changed.iter().copied());
         touched.sort_unstable();
         touched.dedup();
+        let private_live_run_ids = self
+            .provider_observation_private_run_ids
+            .drain()
+            .map(|run_id| canonical_run_after_batch(run_id, &operations))
+            .collect::<HashSet<_>>();
+        for mut publication in self.provider_observation_publications.drain(..) {
+            let prior_canonical = publication.canonical_run_id;
+            publication.canonical_run_id =
+                canonical_run_after_batch(publication.canonical_run_id, &operations);
+            self.model.release_history_publications(prior_canonical);
+            self.model
+                .release_history_publications(publication.canonical_run_id);
+            self.model.install_history_publication(publication);
+        }
 
         let mut history_publications = Vec::new();
         if historical && let Some(before) = prior.as_ref() {
@@ -844,7 +894,7 @@ impl Reducer {
 
         let mut task_runs = Vec::with_capacity(touched.len());
         let mut associations = Vec::with_capacity(touched.len());
-        let mut publish_live_readiness = false;
+        let mut live_ready_run_ids = Vec::new();
         for run_id in touched {
             let canonical_run_id = canonical_run_after_batch(run_id, &operations);
             let Some(current) = self.model.task_run(&canonical_run_id).cloned() else {
@@ -856,18 +906,23 @@ impl Reducer {
                 .cloned()
                 .unwrap_or_default();
 
+            let mut persisted_state = state.clone();
             if historical {
                 state.history_ready = false;
+                persisted_state.history_ready = false;
             } else {
-                publish_live_readiness |= !state.history_ready;
-                state.history_ready = true;
-                publish_live_readiness |= self.model.release_history_publications(canonical_run_id);
+                if private_live_run_ids.contains(&canonical_run_id) {
+                    state.history_ready = false;
+                    live_ready_run_ids.push(canonical_run_id);
+                }
+                persisted_state.history_ready = true;
             }
             state.latest_provider_at_ms = Some(
                 state
                     .latest_provider_at_ms
                     .map_or(provider_at_ms, |stored| stored.max(provider_at_ms)),
             );
+            persisted_state.latest_provider_at_ms = state.latest_provider_at_ms;
             self.model.insert_task_run(current.clone());
             self.model
                 .set_task_run_v6_state(canonical_run_id, state.clone());
@@ -915,7 +970,7 @@ impl Reducer {
             }
             task_runs.push(PersistTaskRunV6 {
                 task_run: persisted,
-                state,
+                state: persisted_state,
             });
             if let ObservationOrigin::Historical { drain_id, .. } = origin {
                 associations.push(PersistHistoryDrainRun {
@@ -929,33 +984,52 @@ impl Reducer {
         associations.sort_by_key(|association| association.run_id);
         associations.dedup_by_key(|association| association.run_id);
         self.defer_provider_publication = false;
+        self.defer_provider_model_publication = false;
+        self.provider_model_publication_pending = false;
         self.deferred_provider_drain = None;
         self.rate_observation_context = None;
-        if publish_live_readiness {
+        if !historical && live_ready_run_ids.is_empty() {
             self.publish();
         }
-        PersistV6Batch {
-            operations,
-            task_runs,
-            history_drains: if historical {
-                history_manifest.cloned().into_iter().collect()
+        (
+            PersistV6Batch {
+                operations,
+                task_runs,
+                history_drains: if historical {
+                    history_manifest.cloned().into_iter().collect()
+                } else {
+                    Vec::new()
+                },
+                history_associations: associations,
+                history_publications,
+                history_event_drain: match origin {
+                    ObservationOrigin::Historical { drain_id, .. } => Some(drain_id.clone()),
+                    ObservationOrigin::Live => None,
+                },
+                ..PersistV6Batch::default()
+            },
+            if historical {
+                ProviderSubmissionReceipt::Historical
             } else {
-                Vec::new()
+                ProviderSubmissionReceipt::Live {
+                    ready_run_ids: live_ready_run_ids,
+                }
             },
-            history_associations: associations,
-            history_publications,
-            history_event_drain: match origin {
-                ObservationOrigin::Historical { drain_id, .. } => Some(drain_id.clone()),
-                ObservationOrigin::Live => None,
-            },
-            ..PersistV6Batch::default()
-        }
+        )
     }
 
     pub(crate) fn cancel_provider_observation(&mut self) {
+        let publish = self.provider_model_publication_pending;
         self.defer_provider_publication = false;
+        self.defer_provider_model_publication = false;
+        self.provider_model_publication_pending = false;
         self.deferred_provider_drain = None;
+        self.provider_observation_private_run_ids.clear();
+        self.provider_observation_publications.clear();
         self.rate_observation_context = None;
+        if publish {
+            self.publish();
+        }
     }
 
     pub(crate) fn apply_pane_agent_observation(
@@ -2119,6 +2193,41 @@ impl Reducer {
     /// Applies the runtime durability truth to the preceding operator submission.
     pub(crate) fn complete_operator_submission(&mut self, outcome: RuntimeWriteOutcome) {
         self.operator.complete_submission(outcome);
+    }
+
+    /// Applies one provider acknowledgement to only the readiness transitions it submitted.
+    pub(crate) fn complete_provider_submission(
+        &mut self,
+        receipt: ProviderSubmissionReceipt,
+        outcome: RuntimeWriteOutcome,
+    ) {
+        let ProviderSubmissionReceipt::Live { ready_run_ids } = receipt else {
+            self.complete_deferred_operator_submission(outcome);
+            return;
+        };
+        self.complete_operator_submission(outcome);
+        if !matches!(
+            outcome,
+            RuntimeWriteOutcome::Durable | RuntimeWriteOutcome::CommittedButDegraded(_)
+        ) {
+            return;
+        }
+
+        let mut publish = false;
+        for run_id in ready_run_ids {
+            if let Some(mut state) = self.model.task_run_v6_state(&run_id).cloned() {
+                if !state.history_ready {
+                    state.history_ready = true;
+                    self.model.set_task_run_v6_state(run_id, state);
+                    publish = true;
+                }
+                let released = self.model.release_history_publications(run_id);
+                publish |= released;
+            }
+        }
+        if publish {
+            self.publish();
+        }
     }
 
     /// Applies durability truth to a historical provider submission without publishing it.
@@ -3649,6 +3758,10 @@ impl Reducer {
         if self.defer_provider_publication {
             return;
         }
+        if self.defer_provider_model_publication {
+            self.provider_model_publication_pending = true;
+            return;
+        }
         #[cfg(test)]
         {
             self.publish_count.set(self.publish_count.get() + 1);
@@ -4869,11 +4982,11 @@ mod tests {
         let prior = reducer.begin_provider_observation(&origin, 2_000);
         let delta = reducer.validate_controller_event(&controller).unwrap();
         let operations = reducer.commit_staged_unqueued(delta).unwrap();
-        let batch =
+        let (batch, receipt) =
             reducer.finish_provider_observation(prior, operations, &origin, Some(&manifest), 2_000);
         assert_eq!(batch.history_associations.len(), 1);
         store.apply_v6_batch(batch).unwrap();
-        reducer.complete_deferred_operator_submission(RuntimeWriteOutcome::Durable);
+        reducer.complete_provider_submission(receipt, RuntimeWriteOutcome::Durable);
 
         let sibling_origin = crate::model::ObservationOrigin::Historical {
             drain_id: sibling_drain_id.clone(),
@@ -4893,7 +5006,7 @@ mod tests {
             .validate_controller_event(&sibling_controller)
             .unwrap();
         let sibling_operations = reducer.commit_staged_unqueued(sibling_delta).unwrap();
-        let sibling_batch = reducer.finish_provider_observation(
+        let (sibling_batch, sibling_receipt) = reducer.finish_provider_observation(
             sibling_prior,
             sibling_operations,
             &sibling_origin,
@@ -4902,7 +5015,7 @@ mod tests {
         );
         assert_eq!(sibling_batch.history_associations.len(), 1);
         store.apply_v6_batch(sibling_batch).unwrap();
-        reducer.complete_deferred_operator_submission(RuntimeWriteOutcome::Durable);
+        reducer.complete_provider_submission(sibling_receipt, RuntimeWriteOutcome::Durable);
 
         assert!(shared.borrow().task_runs().next().is_none());
         assert!(
@@ -5066,7 +5179,7 @@ mod tests {
         let prior = reducer.begin_provider_observation(&origin, 2_000);
         let mut event_metadata = metadata("ready-activity-only-event", 2_000);
         event_metadata.task_run_id = Some(run_id);
-        let batch = reducer.finish_provider_observation(
+        let (batch, _receipt) = reducer.finish_provider_observation(
             prior,
             vec![PersistOp::RecordEvent {
                 event: Box::new(NormalizedEvent::AgentActivity {
@@ -5126,7 +5239,7 @@ mod tests {
         let prior = reducer.begin_provider_observation(&historical_origin, 2_100);
         let delta = reducer.validate_controller_event(&historical).unwrap();
         let operations = reducer.commit_staged_unqueued(delta).unwrap();
-        let historical_batch = reducer.finish_provider_observation(
+        let (historical_batch, historical_receipt) = reducer.finish_provider_observation(
             prior,
             operations,
             &historical_origin,
@@ -5135,7 +5248,7 @@ mod tests {
         );
         let run_id = historical_batch.history_associations[0].run_id;
         store.apply_v6_batch(historical_batch).unwrap();
-        reducer.complete_deferred_operator_submission(RuntimeWriteOutcome::Durable);
+        reducer.complete_provider_submission(historical_receipt, RuntimeWriteOutcome::Durable);
         assert!(shared.borrow().task_run(&run_id).is_none());
 
         let mut live = provider_lane_event(
@@ -5151,7 +5264,7 @@ mod tests {
         let prior = reducer.begin_provider_observation(&live_origin, 3_100);
         let delta = reducer.validate_controller_event(&live).unwrap();
         let operations = reducer.commit_staged_unqueued(delta).unwrap();
-        let live_batch =
+        let (live_batch, live_receipt) =
             reducer.finish_provider_observation(prior, operations, &live_origin, None, 3_000);
         assert!(
             live_batch
@@ -5163,7 +5276,7 @@ mod tests {
                 .history_ready
         );
         store.apply_v6_batch(live_batch).unwrap();
-        reducer.complete_operator_submission(RuntimeWriteOutcome::Durable);
+        reducer.complete_provider_submission(live_receipt, RuntimeWriteOutcome::Durable);
         let current = shared.borrow();
         assert_eq!(current.task_run(&run_id).unwrap().state, TaskState::Running);
         let current_state = current.task_run_v6_state(&run_id).unwrap();
@@ -5290,7 +5403,7 @@ mod tests {
         };
         let prior = reducer.begin_provider_observation(&historical_origin, 2_000);
         let historical_operations = reducer.touch_run_liveness_observed(&native_key, 2_000, 2_000);
-        let historical_batch = reducer.finish_provider_observation(
+        let (historical_batch, historical_receipt) = reducer.finish_provider_observation(
             prior,
             historical_operations,
             &historical_origin,
@@ -5298,7 +5411,7 @@ mod tests {
             2_000,
         );
         store.apply_v6_batch(historical_batch).unwrap();
-        reducer.complete_deferred_operator_submission(RuntimeWriteOutcome::Durable);
+        reducer.complete_provider_submission(historical_receipt, RuntimeWriteOutcome::Durable);
         reducer.record_provider_identity_disagreement();
         let before_live = shared.borrow();
         assert_eq!(
@@ -5346,10 +5459,10 @@ mod tests {
                 absorbed: actual_absorbed,
             } if *actual_survivor == survivor && *actual_absorbed == absorbed
         )));
-        let live_batch =
+        let (live_batch, live_receipt) =
             reducer.finish_provider_observation(prior, operations, &live_origin, None, 3_000);
         store.apply_v6_batch(live_batch).unwrap();
-        reducer.complete_operator_submission(RuntimeWriteOutcome::Durable);
+        reducer.complete_provider_submission(live_receipt, RuntimeWriteOutcome::Durable);
         let current = shared.borrow();
         assert!(current.task_run(&absorbed).is_none());
         assert!(current.task_run_v6_state(&survivor).unwrap().history_ready);

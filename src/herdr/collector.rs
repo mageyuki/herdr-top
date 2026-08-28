@@ -6770,6 +6770,7 @@ async fn persist_provider_v6_submission(
     persistence: &mut RuntimePersistence,
     reducer: &mut Reducer,
     batch: PersistV6Batch,
+    receipt: crate::reducer::ProviderSubmissionReceipt,
     origin: &crate::model::ObservationOrigin,
     pending_history_mutation: &mut Option<PendingHistoryMutation>,
 ) -> Result<RuntimeWriteOutcome, WriterError> {
@@ -6779,11 +6780,7 @@ async fn persist_provider_v6_submission(
     };
     let retry_batch = historical_drain.as_ref().map(|_| batch.clone());
     let outcome = persistence.apply_v6(batch).await?;
-    if historical_drain.is_some() {
-        reducer.complete_deferred_operator_submission(outcome);
-    } else {
-        reducer.complete_operator_submission(outcome);
-    }
+    reducer.complete_provider_submission(receipt, outcome);
     if let Some(drain_id) = historical_drain {
         if matches!(
             outcome,
@@ -6914,7 +6911,7 @@ async fn apply_provider_event_with_admission(
                         return Ok(());
                     }
                 };
-                let batch = reducer.finish_provider_observation(
+                let (batch, receipt) = reducer.finish_provider_observation(
                     prior,
                     operations,
                     &origin,
@@ -6926,7 +6923,7 @@ async fn apply_provider_event_with_admission(
                     admission.complete();
                 }
                 let outcome = persistence.finish_pending(pending).await?;
-                reducer.complete_operator_submission(outcome);
+                reducer.complete_provider_submission(receipt, outcome);
                 if matches!(
                     outcome,
                     RuntimeWriteOutcome::Durable | RuntimeWriteOutcome::CommittedButDegraded(_)
@@ -6945,7 +6942,7 @@ async fn apply_provider_event_with_admission(
                     return Ok(());
                 }
             };
-            let batch = reducer.finish_provider_observation(
+            let (batch, receipt) = reducer.finish_provider_observation(
                 prior,
                 operations,
                 &origin,
@@ -6959,6 +6956,7 @@ async fn apply_provider_event_with_admission(
                 persistence,
                 reducer,
                 batch,
+                receipt,
                 &origin,
                 pending_history_mutation,
             )
@@ -6971,7 +6969,7 @@ async fn apply_provider_event_with_admission(
                 crate::model::ObservationOrigin::Live => unix_now_ms(),
             };
             let persist = reducer.touch_run_liveness_observed(&key, at_ms, observed_at_ms);
-            let persist = reducer.finish_provider_observation(
+            let (persist, receipt) = reducer.finish_provider_observation(
                 prior,
                 persist,
                 &origin,
@@ -6986,6 +6984,7 @@ async fn apply_provider_event_with_admission(
                     persistence,
                     reducer,
                     persist,
+                    receipt,
                     &origin,
                     pending_history_mutation,
                 )
@@ -7000,7 +6999,7 @@ async fn apply_provider_event_with_admission(
                 crate::model::ObservationOrigin::Live => unix_now_ms(),
             };
             let persist = reducer.apply_lane_close_observed(&key, at_ms, observed_at_ms);
-            let persist = reducer.finish_provider_observation(
+            let (persist, receipt) = reducer.finish_provider_observation(
                 prior,
                 persist,
                 &origin,
@@ -7015,6 +7014,7 @@ async fn apply_provider_event_with_admission(
                     persistence,
                     reducer,
                     persist,
+                    receipt,
                     &origin,
                     pending_history_mutation,
                 )
@@ -7044,7 +7044,7 @@ async fn apply_provider_event_with_admission(
                 },
             );
             debug_assert!(persist.is_empty(), "telemetry must remain transient");
-            let persist = reducer.finish_provider_observation(
+            let (persist, receipt) = reducer.finish_provider_observation(
                 prior,
                 persist,
                 &origin,
@@ -7059,6 +7059,7 @@ async fn apply_provider_event_with_admission(
                     persistence,
                     reducer,
                     persist,
+                    receipt,
                     &origin,
                     pending_history_mutation,
                 )
@@ -7187,7 +7188,7 @@ async fn apply_normalized_provider_event(
         admission.complete();
     }
     if let Some(persist) = outcome {
-        let persist = reducer.finish_provider_observation(
+        let (persist, receipt) = reducer.finish_provider_observation(
             prior,
             persist,
             &origin,
@@ -7199,6 +7200,7 @@ async fn apply_normalized_provider_event(
                 persistence,
                 reducer,
                 persist,
+                receipt,
                 &origin,
                 pending_history_mutation,
             )
@@ -9906,6 +9908,253 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_readiness_waits_for_durable_ack_on_both_provider_write_paths() {
+        for (route, outcome, expect_ready) in [
+            (
+                "staged-synthesized",
+                RuntimeWriteOutcome::NotCommitted(failure(
+                    PersistenceOperation::Apply,
+                    PersistencePhase::CommandExecution,
+                    PersistenceFailureCode::Sqlite,
+                    DurabilityDisposition::NotCommitted,
+                )),
+                false,
+            ),
+            (
+                "ordinary-v6",
+                RuntimeWriteOutcome::NotCommitted(failure(
+                    PersistenceOperation::Apply,
+                    PersistencePhase::CommandExecution,
+                    PersistenceFailureCode::Sqlite,
+                    DurabilityDisposition::NotCommitted,
+                )),
+                false,
+            ),
+            ("staged-synthesized", RuntimeWriteOutcome::Durable, true),
+            ("ordinary-v6", RuntimeWriteOutcome::Durable, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+            let mut store = open_writer(&root).unwrap();
+
+            let run_id = RunId::new();
+            let native_session_id = format!("live-ready-{route}-{expect_ready}");
+            let agent_node_id = format!("agent-{route}-{expect_ready}");
+            let key = if route == "staged-synthesized" {
+                RunKey::Controller(native_session_id.clone())
+            } else {
+                RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: native_session_id.clone(),
+                }
+            };
+            let task_run = TaskRun {
+                run_id,
+                key: key.clone(),
+                display_ordinal: DisplayOrdinal::new(1),
+                state: TaskState::Running,
+                has_controller_task_state_event: true,
+                created_at_ms: Some(1_000),
+                updated_at_ms: Some(1_000),
+                finished_at_ms: None,
+                subject: None,
+                dismissed_at_ms: None,
+            };
+            let initial_v6_state = TaskRunV6State {
+                history_ready: true,
+                latest_provider_at_ms: Some(1_000),
+                ..TaskRunV6State::default()
+            };
+            let agent_node = AgentNode {
+                agent_node_id: agent_node_id.clone(),
+                provider: Provider::Codex,
+                native_session_id: Some(native_session_id.clone()),
+                task_run_id: run_id,
+                display_ordinal: DisplayOrdinal::new(2),
+                parent_agent_node_id: None,
+                state: Some(ExecState::Working),
+                model_id: Some("public-model".to_owned()),
+                last_event_kind: None,
+                last_tool_name: None,
+                last_item_count: None,
+                last_byte_count: None,
+                last_activity_at_ms: None,
+                session_file: None,
+            };
+            let mut model = DomainModel::default();
+            model.insert_task_run(task_run.clone());
+            model.set_task_run_v6_state(run_id, initial_v6_state.clone());
+            model.insert_agent_node(agent_node.clone());
+            if route == "staged-synthesized" {
+                let stored_run_id = if expect_ready { run_id } else { RunId::new() };
+                let mut stored_task_run = task_run.clone();
+                stored_task_run.run_id = stored_run_id;
+                store
+                    .apply_v6_batch(PersistV6Batch {
+                        operations: if expect_ready {
+                            vec![PersistOp::UpsertAgentNode(agent_node)]
+                        } else {
+                            Vec::new()
+                        },
+                        task_runs: vec![PersistTaskRunV6 {
+                            task_run: PersistTaskRun {
+                                task_run: stored_task_run,
+                                native_session: expect_ready.then(|| {
+                                    crate::store::NativeSessionBinding {
+                                        provider: Provider::Codex,
+                                        native_session_id: native_session_id.clone(),
+                                    }
+                                }),
+                                created_at_ms: 1_000,
+                                updated_at_ms: 1_000,
+                                finished_at_ms: None,
+                            },
+                            state: initial_v6_state,
+                        }],
+                        ..PersistV6Batch::default()
+                    })
+                    .unwrap();
+            }
+            let (mut reducer, shared) = Reducer::new(RestoredState {
+                model,
+                next_ordinal: 3,
+                next_ingest_seq: Some(1),
+                event_ledger: Vec::new(),
+            });
+            let drain_id =
+                HistoryDrainId::new(format!("codex:private-{route}-{expect_ready}")).unwrap();
+            let historical_origin = crate::model::ObservationOrigin::Historical {
+                drain_id: drain_id.clone(),
+                artifact_id: "private.jsonl".to_owned(),
+            };
+            let prior = reducer.begin_provider_observation(&historical_origin, 2_000);
+            let mut historical_metadata = metadata("live-ready", "agent.activity");
+            historical_metadata.event_id = format!("private-{route}-{expect_ready}");
+            historical_metadata.timestamp_ms = 2_000;
+            historical_metadata.receipt_time_ms = 2_000;
+            historical_metadata.provider = Some(Provider::Codex);
+            historical_metadata.native_session_id = Some(native_session_id.clone());
+            historical_metadata.task_run_id = Some(run_id);
+            historical_metadata.agent_node_id = Some(agent_node_id.clone());
+            let ApplyOutcome::Applied(operations) = reducer
+                .apply(NormalizedEvent::AgentActivity {
+                    metadata: historical_metadata,
+                    agent_node_id: agent_node_id.clone(),
+                    activity: MinimalProviderMetadata {
+                        model_id: Some("history-private-model".to_owned()),
+                        event_kind: Some("history-private-kind".to_owned()),
+                        ..MinimalProviderMetadata::default()
+                    },
+                })
+                .unwrap()
+            else {
+                panic!("historical activity must apply");
+            };
+            let _historical_submission = reducer.finish_provider_observation(
+                prior,
+                operations,
+                &historical_origin,
+                Some(&PersistHistoryDrain {
+                    drain_id,
+                    provider: Provider::Codex,
+                    created_at_ms: 1_500,
+                    artifacts: Vec::new(),
+                }),
+                2_000,
+            );
+            reducer.complete_deferred_operator_submission(RuntimeWriteOutcome::Durable);
+            reducer.record_provider_identity_disagreement();
+            assert_eq!(
+                shared
+                    .borrow()
+                    .agent_node(&agent_node_id)
+                    .unwrap()
+                    .model_id
+                    .as_deref(),
+                Some("public-model"),
+                "{route}: historical projection escaped before the live observation"
+            );
+
+            let (lifecycle, writer) = spawn_writer(store).unwrap();
+            let (mut persistence, _diagnostics) = RuntimePersistence::new_for_test(
+                writer,
+                Arc::new(RecordingOccurrenceSink::default()),
+            );
+            persistence.inject_write_result(TestWriteInjection {
+                class: RuntimeCommandClass::Batch,
+                successes_before_failure: 0,
+                result: TestWriteResult::Classified(outcome),
+            });
+
+            let live_event = if route == "staged-synthesized" {
+                let mut live_metadata = metadata("live-ready", "provider-lifecycle");
+                live_metadata.event_id = format!("live-{route}-{expect_ready}");
+                live_metadata.source = crate::provider::lane::SOURCE_LOG_LANE.to_owned();
+                live_metadata.source_event_type = "progress".to_owned();
+                live_metadata.timestamp_ms = 3_000;
+                live_metadata.receipt_time_ms = 3_000;
+                live_metadata.provider = Some(Provider::Codex);
+                live_metadata.native_session_id = Some(native_session_id.clone());
+                ProviderEvent::Synthesized(crate::model::ControllerEvent {
+                    schema_version: 1,
+                    task_run_id: native_session_id.clone(),
+                    metadata: live_metadata,
+                    event: ControllerEventKind::Progress,
+                })
+            } else {
+                ProviderEvent::RunLiveness {
+                    key: key.clone(),
+                    at_ms: 3_000,
+                }
+            };
+            let (_provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+            let (performance, _sampler) =
+                performance_tracker(Arc::new(SystemPerformanceClock::new()));
+            service_provider_event(
+                Some(ProviderIngressEvent {
+                    admission: Some(performance.admit()),
+                    event: live_event,
+                    origin: crate::model::ObservationOrigin::Live,
+                    history_manifest: None,
+                }),
+                &mut provider,
+                "live-ready",
+                &mut reducer,
+                &shared,
+                &mut persistence,
+            )
+            .await
+            .unwrap();
+
+            let published = shared.borrow();
+            assert!(
+                published.task_runs().all(|run| published
+                    .task_run_v6_state(&run.run_id)
+                    .is_some_and(|state| state.history_ready)),
+                "{route}: the public snapshot must remain a ready projection"
+            );
+            assert_eq!(
+                published
+                    .agent_node(&agent_node_id)
+                    .unwrap()
+                    .model_id
+                    .as_deref(),
+                Some(if expect_ready {
+                    "history-private-model"
+                } else {
+                    "public-model"
+                }),
+                "{route}: publication did not follow the matching durability outcome"
+            );
+
+            drop(published);
+            drop(persistence);
+            lifecycle.shutdown().await.unwrap();
+            provider_thread.stop().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn successful_probe_retries_retained_history_before_later_ingest_sequence() {
         let (_directory, root, lifecycle, mut persistence, _diagnostics) =
             recoverable_runtime(Duration::from_secs(30));
@@ -10461,7 +10710,7 @@ mod tests {
             let operations = apply_collector_observation(&mut batch_reducer, normalized.events)
                 .unwrap()
                 .expect("session_resolved must produce a persistent observation");
-            let batch = batch_reducer.finish_provider_observation(
+            let (batch, _receipt) = batch_reducer.finish_provider_observation(
                 prior,
                 operations,
                 &origin,
@@ -10603,6 +10852,89 @@ mod tests {
             lifecycle.shutdown().await.unwrap();
             provider_thread.stop().await.unwrap();
         }
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let first = RunId::new();
+        let intermediate = RunId::new();
+        let final_survivor = RunId::new();
+        let first_run = persisted_run(
+            first,
+            RunKey::Controller("lost-ack-chain-a".to_owned()),
+            1,
+            None,
+            false,
+        );
+        let intermediate_run = persisted_run(
+            intermediate,
+            RunKey::Controller("lost-ack-chain-b".to_owned()),
+            2,
+            None,
+            false,
+        );
+        let final_run = persisted_run(
+            final_survivor,
+            RunKey::Controller("lost-ack-chain-c".to_owned()),
+            3,
+            None,
+            false,
+        );
+        store
+            .apply_v6_batch(PersistV6Batch {
+                task_runs: vec![first_run, intermediate_run.clone(), final_run.clone()],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+        let drain_id = HistoryDrainId::new("codex:lost-ack-merge-chain").unwrap();
+        let batch = PersistV6Batch {
+            operations: vec![
+                PersistOp::MergeTaskRuns {
+                    survivor: intermediate,
+                    absorbed: first,
+                },
+                PersistOp::UpsertTaskRun(intermediate_run.task_run),
+                PersistOp::MergeTaskRuns {
+                    survivor: final_survivor,
+                    absorbed: intermediate,
+                },
+                PersistOp::UpsertTaskRun(final_run.task_run.clone()),
+            ],
+            task_runs: vec![final_run],
+            history_drains: vec![PersistHistoryDrain {
+                drain_id: drain_id.clone(),
+                provider: Provider::Codex,
+                created_at_ms: 100,
+                artifacts: Vec::new(),
+            }],
+            history_associations: vec![PersistHistoryDrainRun {
+                drain_id: drain_id.clone(),
+                run_id: final_survivor,
+            }],
+            history_event_drain: Some(drain_id.clone()),
+            ..PersistV6Batch::default()
+        };
+        store.apply_v6_batch(batch.clone()).unwrap();
+        let restored = store.load_restored_state().unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut persistence, _diagnostics) =
+            RuntimePersistence::new_for_test(writer, Arc::new(RecordingOccurrenceSink::default()));
+        let (mut reducer, _shared) = Reducer::new(restored);
+        let (_provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+        provider.pending_history_mutation = Some(PendingHistoryMutation { drain_id, batch });
+        assert!(!provider.provider_ingress_open());
+        assert!(
+            retry_pending_history_mutation(&mut provider, &mut reducer, &mut persistence)
+                .await
+                .unwrap(),
+            "the production retry route must recognize a fully committed merge chain"
+        );
+        assert!(provider.pending_history_mutation.is_none());
+        assert!(provider.provider_ingress_open());
+
+        drop(persistence);
+        lifecycle.shutdown().await.unwrap();
+        provider_thread.stop().await.unwrap();
     }
 
     fn provider_target_task_run(run_id: RunId, key: RunKey, ordinal: i64) -> TaskRun {
