@@ -576,6 +576,99 @@ fn unknown_record_stubs_do_not_stop_known_records_on_both_sides() {
 }
 
 #[test]
+fn nested_subagent_activity_normalizes_started_and_spawned() {
+    let fixtures = FixtureIndex::new(&["codex-depth2-root.jsonl"]);
+    let file = fixtures.file("codex-depth2-root.jsonl");
+    let cases: [(&str, &str, &str, &str, i64, &[u8]); 2] = [
+        (
+            "started",
+            "d1111111-1111-4111-8111-111111111111",
+            "prov:codex:act:item_nested_started",
+            "prov:codex:up:item_nested_started",
+            1_787_547_610_201,
+            br#"{"timestamp":"2026-08-24T05:00:10.500Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1787547610101,"completed_at_ms":1787547610201,"item":{"type":"SubAgentActivity","id":"item_nested_started","kind":"started","agent_thread_id":"d1111111-1111-4111-8111-111111111111","agent_path":"/root/nested_started"}}}"#,
+        ),
+        (
+            "spawned",
+            "d2222222-2222-4222-8222-222222222222",
+            "prov:codex:act:item_nested_spawned",
+            "prov:codex:up:item_nested_spawned",
+            1_787_547_611_401,
+            br#"{"timestamp":"2026-08-24T05:00:11.600Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1787547611301,"completed_at_ms":1787547611401,"item":{"type":"SubAgentActivity","id":"item_nested_spawned","kind":"spawned","agent_thread_id":"d2222222-2222-4222-8222-222222222222","agent_path":"/root/nested_spawned"}}}"#,
+        ),
+    ];
+
+    for (kind, child_id, activity_id, upsert_id, completed_at_ms, record) in cases {
+        let events = parse_inline(&fixtures.index, file, 0, &[(7, record)]);
+
+        assert_eq!(events.len(), 2, "{kind}");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::Activity {
+                agent_thread_id,
+                activity,
+                event_id,
+                observed_at_ms,
+                ..
+            } if agent_thread_id == child_id
+                && activity.event_kind.as_deref() == Some(kind)
+                && event_id == activity_id
+                && *observed_at_ms == completed_at_ms
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::AgentUpsert {
+                agent_thread_id,
+                state: Some(ExecState::Working),
+                event_id,
+                observed_at_ms,
+                ..
+            } if agent_thread_id == child_id
+                && event_id == upsert_id
+                && *observed_at_ms == completed_at_ms
+        )));
+    }
+
+    let unrelated = br#"{"timestamp":"2026-08-24T05:00:12.700Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1787547612501,"completed_at_ms":1787547612601,"item":{"type":"CollabAgentToolCall","id":"item_unrelated","kind":"spawned","agent_thread_id":"d3333333-3333-4333-8333-333333333333","agent_path":"/root/unrelated"}}}"#;
+    assert!(
+        parse_inline(&fixtures.index, file, 0, &[(8, unrelated)]).is_empty(),
+        "unrelated item_completed item must produce zero provider events"
+    );
+}
+
+#[test]
+fn malformed_nested_subagent_activity_does_not_stop_later_records() {
+    let fixtures = FixtureIndex::new(&["codex-depth2-root.jsonl"]);
+    let file = fixtures.file("codex-depth2-root.jsonl");
+    let expected_path = fixtures.relative_path("codex-depth2-root.jsonl");
+    let malformed = br#"{"timestamp":"2026-08-24T05:00:13.000Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1787547612900,"completed_at_ms":1787547613000,"item":{"type":"SubAgentActivity","id":"item_malformed_nested","kind":"spawned","agent_thread_id":"d4444444-4444-4444-8444-444444444444"}}}"#;
+    let good = br#"{"timestamp":"2026-08-24T05:00:14.000Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1787547613900,"completed_at_ms":1787547614000,"item":{"type":"SubAgentActivity","id":"item_after_malformed_nested","kind":"started","agent_thread_id":"d5555555-5555-4555-8555-555555555555","agent_path":"/root/after_malformed_nested"}}}"#;
+
+    let events = parse_inline(&fixtures.index, file, 7, &[(100, malformed), (300, good)]);
+
+    assert!(matches!(
+        events.first(),
+        Some(ProviderEvent::Malformed {
+            provider: Provider::Codex,
+            path_display,
+            generation: 7,
+            byte_offset: 100,
+            error_code: "codex_activity_shape",
+        }) if path_display == expected_path
+    ));
+    assert!(
+        events
+            .iter()
+            .any(|event| { event_id(event) == Some("prov:codex:act:item_after_malformed_nested") })
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| { event_id(event) == Some("prov:codex:up:item_after_malformed_nested") })
+    );
+}
+
+#[test]
 fn unknown_fields_are_ignored_and_unknown_kind_never_changes_state() {
     let fixtures = FixtureIndex::new(&["codex-depth2-root.jsonl"]);
     let file = fixtures.file("codex-depth2-root.jsonl");
