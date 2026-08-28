@@ -2,7 +2,6 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -294,6 +293,16 @@ impl ProviderSubmissionReceipt {
     }
 }
 
+static NEXT_PROVIDER_SUBMISSION_TOKEN: AtomicU64 = AtomicU64::new(0);
+
+fn allocate_provider_submission_token() -> u64 {
+    NEXT_PROVIDER_SUBMISSION_TOKEN
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
+            token.checked_add(1)
+        })
+        .expect("live provider submission tokens are exhausted")
+}
+
 /// Maximum unattributed provider-usage samples retained across all run scopes.
 ///
 /// The reducer evicts the globally oldest sample first. Since each retained sample has exactly
@@ -370,7 +379,6 @@ pub struct Reducer {
     provider_model_publication_pending: bool,
     deferred_provider_drain: Option<crate::model::HistoryDrainId>,
     provider_observation_private_run_ids: HashSet<RunId>,
-    next_provider_submission_id: u64,
     pending_live_provider_submission: Option<PendingLiveProviderSubmission>,
     published_history_drains: HashSet<crate::model::HistoryDrainId>,
     #[cfg(test)]
@@ -495,7 +503,6 @@ impl Reducer {
                 provider_model_publication_pending: false,
                 deferred_provider_drain: None,
                 provider_observation_private_run_ids: HashSet::new(),
-                next_provider_submission_id: 0,
                 pending_live_provider_submission: None,
                 published_history_drains: HashSet::new(),
                 #[cfg(test)]
@@ -1102,11 +1109,7 @@ impl Reducer {
                 !has_ready_runs || checkpoint.is_some(),
                 "a live observation touching private history must retain its checkpoint"
             );
-            let submission_id = self.next_provider_submission_id;
-            self.next_provider_submission_id = self
-                .next_provider_submission_id
-                .checked_add(1)
-                .expect("live provider submission IDs are exhausted");
+            let submission_id = allocate_provider_submission_token();
             assert!(
                 self.pending_live_provider_submission.is_none(),
                 "a live provider submission must complete before another is installed"
@@ -5756,7 +5759,6 @@ mod tests {
         let before_model_publication_pending = reducer.provider_model_publication_pending;
         let before_deferred_drain = reducer.deferred_provider_drain.clone();
         let before_private_runs = reducer.provider_observation_private_run_ids.clone();
-        let before_next_submission_id = reducer.next_provider_submission_id;
         let before_pending_submission =
             reducer
                 .pending_live_provider_submission
@@ -5793,10 +5795,6 @@ mod tests {
             before_private_runs
         );
         assert_eq!(
-            reducer.next_provider_submission_id,
-            before_next_submission_id
-        );
-        assert_eq!(
             reducer
                 .pending_live_provider_submission
                 .as_ref()
@@ -5813,6 +5811,120 @@ mod tests {
             result.is_err(),
             "a second begin must reject an unresolved ordinary live submission"
         );
+    }
+
+    #[test]
+    fn live_provider_submission_receipt_is_bound_across_reducers() {
+        let LiveSubmissionFixture {
+            receipt: foreign_receipt,
+            ..
+        } = live_submission_fixture("foreign-receipt-a", false, false);
+        let LiveSubmissionFixture {
+            mut reducer,
+            shared,
+            operator,
+            run_id,
+            agent_node_id,
+            receipt,
+            ..
+        } = live_submission_fixture("foreign-receipt-b", true, false);
+        let before_pending_submission =
+            reducer
+                .pending_live_provider_submission
+                .as_ref()
+                .map(|pending| {
+                    (
+                        pending.submission_id,
+                        pending.checkpoint.is_some(),
+                        pending.ready_run_ids.clone(),
+                    )
+                });
+        let before_activity = operator.borrow().activity.to_vec();
+        let before_model_id = reducer
+            .model
+            .agent_node(&agent_node_id)
+            .and_then(|node| node.model_id.clone());
+        let before_history_ready = reducer
+            .model
+            .task_run_v6_state(&run_id)
+            .unwrap()
+            .history_ready;
+        let before_published_model_id = shared
+            .borrow()
+            .agent_node(&agent_node_id)
+            .and_then(|node| node.model_id.clone());
+        let before_publish_count = reducer.publish_count.get();
+
+        reducer.complete_provider_submission(foreign_receipt, RuntimeWriteOutcome::Durable);
+
+        assert_eq!(
+            reducer
+                .pending_live_provider_submission
+                .as_ref()
+                .map(|pending| {
+                    (
+                        pending.submission_id,
+                        pending.checkpoint.is_some(),
+                        pending.ready_run_ids.clone(),
+                    )
+                }),
+            before_pending_submission,
+            "a receipt from another reducer must not consume the pending slot"
+        );
+        assert_eq!(
+            operator.borrow().activity.as_ref(),
+            before_activity.as_slice(),
+            "a receipt from another reducer must not complete operator state"
+        );
+        assert_eq!(
+            reducer
+                .model
+                .agent_node(&agent_node_id)
+                .and_then(|node| node.model_id.clone()),
+            before_model_id,
+            "a receipt from another reducer must not roll back or publish model state"
+        );
+        assert_eq!(
+            reducer
+                .model
+                .task_run_v6_state(&run_id)
+                .unwrap()
+                .history_ready,
+            before_history_ready,
+            "a receipt from another reducer must not release private readiness"
+        );
+        assert_eq!(
+            shared
+                .borrow()
+                .agent_node(&agent_node_id)
+                .and_then(|node| node.model_id.clone()),
+            before_published_model_id,
+            "a receipt from another reducer must not publish a model snapshot"
+        );
+        assert_eq!(reducer.publish_count.get(), before_publish_count);
+
+        reducer.complete_provider_submission(receipt, RuntimeWriteOutcome::Durable);
+
+        assert!(reducer.pending_live_provider_submission.is_none());
+        assert_eq!(
+            operator.borrow().activity[0].durability,
+            ActivityDurability::Durable
+        );
+        assert!(
+            reducer
+                .model
+                .task_run_v6_state(&run_id)
+                .unwrap()
+                .history_ready
+        );
+        assert_eq!(
+            shared
+                .borrow()
+                .agent_node(&agent_node_id)
+                .and_then(|node| node.model_id.as_deref()),
+            Some("after-submission")
+        );
+        assert_eq!(reducer.publish_count.get(), before_publish_count + 1);
     }
 
     #[test]
