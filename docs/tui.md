@@ -53,13 +53,14 @@ Four overlays can replace the center of the screen:
   `scope: semantic run and agent descendants`. Unreported fields use a
   not-reported-style placeholder rather than zero. Resumed Codex rollouts also
   show per-turn model, effort, and sandbox history.
-- **Summary (`s`).** Groups all Task Runs by worker kind and model. It reports
+- **Summary (`s`).** Groups published, history-ready Task Runs by worker kind
+  and model. It reports
   run and live counts, valid terminal-run total and mean durations, accumulated
   output-token totals, and a weighted output-token rate: total measured output
   tokens divided by total measured Working seconds. Summary includes every
-  store-retained run, including terminal history hidden from the default tree.
-  A token field uses its placeholder only when the required telemetry is
-  unavailable.
+  published, history-ready run still retained by the store, including terminal
+  history hidden from the default tree. A token field uses its placeholder only
+  when the required telemetry is unavailable.
 - **Help (`?`).** Shows the key map and current runtime diagnostics, including
   persistence, Controller input, source coverage, and the standalone probe.
 
@@ -394,14 +395,19 @@ do not use this hook-only expiry. Terminal Task Runs at root, child, and
 grandchild depth each remain in the default tree for
 exactly `DEFAULT_TERMINAL_VISIBILITY_MS`, currently one hour, after their own
 terminal observation. They then become default-hidden while remaining retained
-in SQLite, filtering, Detail, and Summary until ordinary retention removes
-them. An expired ancestor remains as a structural row whenever an individually
+in SQLite. Row projection chooses the default-visible IDs before applying a
+filter, so filtering does not restore an expired row and Detail cannot directly
+select a row absent from that projection. Once the row is published and
+history-ready, Summary continues to include it until ordinary retention removes
+it. An expired ancestor remains as a structural row whenever an individually
 visible descendant needs it to preserve the tree path.
 
 Pressing `c` persistently dismisses all currently terminal runs and hook-only
 runs that have already reached the 24-hour boundary. It does not delete them,
 and the dismissal survives a restart. A later non-terminal mutation clears the
-dismissal, while a terminal touch retains it.
+dismissal, while a terminal touch retains it. A dismissed row likewise remains
+in SQLite and, when published and history-ready, Summary, but filtering does not
+restore it for direct selection or Detail.
 
 Provider-native lifecycle is separate from semantic Task state. A normal
 `SessionEnd` records lifecycle `Done`; an explicit provider abort records

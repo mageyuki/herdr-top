@@ -1117,7 +1117,7 @@ fn help_lines(diagnostics: &RuntimeDiagnosticsSnapshot, setup: &TuiSetup) -> Vec
         "Esc/opening key closes; Up/Down scrolls overlays".to_owned(),
         "Follow pins selection and viewport to newest; manual navigation disables it".to_owned(),
         "History order: oldest at top; new sessions append below".to_owned(),
-        "Terminal roots and descendants stay 1h; Summary retains older history".to_owned(),
+        "Terminal roots and descendants stay 1h; Summary retains published history".to_owned(),
         "tok/s uses measured Working time; Idle, history, and offline time add none".to_owned(),
         "Recovery: ancestor, stable neighbor, first; reasons are typed".to_owned(),
         "Controller input is optional capability; standalone setup is optional".to_owned(),
@@ -2453,11 +2453,13 @@ mod tests {
     };
     use crate::model::{
         AgentNode, DependencyEdge, DisplayOrdinal, DomainModel, ExecState, Execution,
-        ExecutionEdge, NativeSessionEnd, NativeSessionEndStatus, Pane, PaneAgentStatus, Provider,
-        RunId, RunKey, Tab, TaskRun, TaskRunV6State, TaskState, Workspace,
+        ExecutionEdge, NativeSessionEnd, NativeSessionEndStatus, ObservationOrigin, Pane,
+        PaneAgentStatus, PaneAgentStatusObservation, Provider, RunId, RunKey, RunRateTotals, Tab,
+        TaskRun, TaskRunV6State, TaskState, TokenBreakdown, TurnAttr, Workspace,
     };
     use crate::performance::{PerformanceDegradationReason, PerformanceSnapshot};
-    use crate::store::writer::PersistenceStatus;
+    use crate::reducer::Reducer;
+    use crate::store::{RestoredState, writer::PersistenceStatus};
     use crate::tui::app::{App, AppState, Clock, HeaderInputs, SystemClock, TuiSetup};
 
     fn run_id(value: &str) -> RunId {
@@ -5013,7 +5015,9 @@ mod tests {
             "{help}"
         );
         assert!(
-            help.contains("Terminal roots and descendants stay 1h; Summary retains older history"),
+            help.contains(
+                "Terminal roots and descendants stay 1h; Summary retains published history"
+            ),
             "{help}"
         );
         assert!(
@@ -5066,6 +5070,168 @@ mod tests {
         assert_eq!(summary.worker_kinds.len(), 1);
         assert_eq!(summary.worker_kinds[0].run_count, 1);
         assert_eq!(summary.worker_kinds[0].mean_tokens_per_second, Some(30.0));
+    }
+
+    #[test]
+    fn restored_rate_epoch_uses_exact_live_observation_times_and_never_bridges_offline_time() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "deterministic-rate".to_owned(),
+        };
+        let mut model = placement_model(&["pane-rate"]);
+        model.insert_task_run(TaskRun {
+            run_id,
+            key: key.clone(),
+            display_ordinal: DisplayOrdinal::new(10),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+            created_at_ms: Some(1_000),
+            updated_at_ms: Some(2_000),
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        model.insert_execution(Execution {
+            execution_id: "rate-execution".to_owned(),
+            pane_id: "pane-rate".to_owned(),
+            terminal_id: "terminal-pane-rate".to_owned(),
+            task_run_id: run_id,
+            state: ExecState::Working,
+        });
+        model
+            .telemetry_entry(run_id, 2_000)
+            .accumulate(100, None, None, None, false);
+        model.set_run_rate_totals(
+            run_id,
+            RunRateTotals {
+                output_tokens: 70,
+                working_ms: 3_000,
+            },
+        );
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model,
+            next_ordinal: 11,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+
+        let epoch = reducer.begin_rate_epoch();
+        reducer.activate_rate_epoch(50_000);
+        let live = ObservationOrigin::Live;
+        reducer.begin_provider_observation(&live, 50_000);
+        reducer
+            .apply_pane_agent_observation(
+                Vec::new(),
+                PaneAgentStatusObservation {
+                    pane_id: "pane-rate".to_owned(),
+                    status: PaneAgentStatus::Working,
+                },
+            )
+            .unwrap();
+        reducer.finish_provider_observation(None, Vec::new(), &live, None, 50_000);
+        let baseline = shared.borrow();
+        assert_eq!(
+            baseline.run_rate_totals(&run_id),
+            Some(&RunRateTotals {
+                output_tokens: 70,
+                working_ms: 3_000,
+            })
+        );
+        let cursor = baseline.run_rate_cursor(&run_id).unwrap();
+        assert_eq!(cursor.measurement_epoch, epoch);
+        assert_eq!(cursor.baseline_output_tokens, 100);
+        assert_eq!(cursor.last_observed_at_ms, 50_000);
+        assert!(cursor.working);
+        drop(baseline);
+
+        reducer.begin_provider_observation(&live, 52_000);
+        reducer.apply_telemetry_with_breakdown(
+            &key,
+            52_000,
+            40,
+            TokenBreakdown::default(),
+            TurnAttr {
+                model: None,
+                effort: None,
+                sandbox: None,
+            },
+        );
+        reducer.finish_provider_observation(None, Vec::new(), &live, None, 52_000);
+        assert_eq!(
+            shared.borrow().run_rate_totals(&run_id),
+            Some(&RunRateTotals {
+                output_tokens: 110,
+                working_ms: 5_000,
+            })
+        );
+
+        reducer.begin_provider_observation(&live, 52_000);
+        reducer
+            .apply_pane_agent_observation(
+                Vec::new(),
+                PaneAgentStatusObservation {
+                    pane_id: "pane-rate".to_owned(),
+                    status: PaneAgentStatus::Idle,
+                },
+            )
+            .unwrap();
+        reducer.finish_provider_observation(None, Vec::new(), &live, None, 52_000);
+        let idle_start = *shared.borrow().run_rate_totals(&run_id).unwrap();
+
+        reducer.begin_provider_observation(&live, 62_000);
+        reducer.apply_telemetry_with_breakdown(
+            &key,
+            62_000,
+            10,
+            TokenBreakdown::default(),
+            TurnAttr {
+                model: None,
+                effort: None,
+                sandbox: None,
+            },
+        );
+        reducer.finish_provider_observation(None, Vec::new(), &live, None, 62_000);
+        assert_eq!(
+            shared.borrow().run_rate_totals(&run_id),
+            Some(&RunRateTotals {
+                output_tokens: idle_start.output_tokens + 10,
+                working_ms: idle_start.working_ms,
+            })
+        );
+
+        reducer.begin_provider_observation(&live, 62_000);
+        reducer
+            .apply_pane_agent_observation(
+                Vec::new(),
+                PaneAgentStatusObservation {
+                    pane_id: "pane-rate".to_owned(),
+                    status: PaneAgentStatus::Working,
+                },
+            )
+            .unwrap();
+        reducer.finish_provider_observation(None, Vec::new(), &live, None, 62_000);
+
+        reducer.begin_provider_observation(&live, 63_000);
+        reducer.apply_telemetry_with_breakdown(
+            &key,
+            63_000,
+            20,
+            TokenBreakdown::default(),
+            TurnAttr {
+                model: None,
+                effort: None,
+                sandbox: None,
+            },
+        );
+        reducer.finish_provider_observation(None, Vec::new(), &live, None, 63_000);
+        assert_eq!(
+            shared.borrow().run_rate_totals(&run_id),
+            Some(&RunRateTotals {
+                output_tokens: 140,
+                working_ms: 6_000,
+            })
+        );
     }
 
     #[test]
@@ -5770,6 +5936,121 @@ mod tests {
         assert_eq!(
             run_rows,
             [(parent, 4), (dispatch_first, 5), (run_id_first, 5),]
+        );
+    }
+
+    #[test]
+    fn task_run_siblings_at_three_depths_follow_immutable_oldest_first_ordinals() {
+        let root_old = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAZ");
+        let root_new = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAY");
+        let child_old = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        let child_new = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let grandchild_old = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let grandchild_new = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAT");
+        let mut model = placement_model(&["pane-roots"]);
+
+        for (run_id, label, ordinal) in [
+            (grandchild_new, "grandchild-new", 60),
+            (grandchild_old, "grandchild-old", 50),
+            (child_new, "child-new", 40),
+            (child_old, "child-old", 30),
+            (root_new, "root-new", 20),
+            (root_old, "root-old", 10),
+        ] {
+            insert_placement_run(&mut model, run_id, label, ordinal);
+        }
+        for (run_id, label) in [(root_new, "root-new"), (root_old, "root-old")] {
+            insert_placement_execution(
+                &mut model,
+                run_id,
+                &format!("{label}-execution"),
+                "pane-roots",
+                ExecState::Working,
+            );
+        }
+        for (parent_run_id, child_run_id) in [
+            (root_old, child_new),
+            (root_old, child_old),
+            (child_old, grandchild_new),
+            (child_old, grandchild_old),
+        ] {
+            model.insert_execution_edge(ExecutionEdge {
+                parent_run_id,
+                child_run_id,
+            });
+        }
+
+        let state = AppState::default();
+        let expected_keys = vec![
+            (root_old, 4),
+            (child_old, 5),
+            (grandchild_old, 6),
+            (grandchild_new, 6),
+            (child_new, 5),
+            (root_new, 4),
+        ];
+        let expected_labels = vec![
+            "● working root-old root-old",
+            "● working child-old child-old",
+            "● working grandchild-old grandchild-old",
+            "● working grandchild-new grandchild-new",
+            "● working child-new child-new",
+            "● working root-new root-new",
+        ];
+        let run_keys = |rows: &[TreeRow]| {
+            rows.iter()
+                .filter_map(|row| row.key.run_id().map(|run_id| (run_id, row.depth)))
+                .collect::<Vec<_>>()
+        };
+        let run_labels = |rows: &[TreeRow]| {
+            rows.iter()
+                .filter(|row| row.key.run_id().is_some())
+                .map(|row| row.label.clone())
+                .collect::<Vec<_>>()
+        };
+        let visible = crate::activity::default_visible_task_run_ids(
+            &model,
+            &state.operator_snapshot(),
+            state.now_ms(),
+        );
+        let full_rows = build_full_rows(&model, &state, &visible);
+        let projected = build_projection(&model, &state);
+        assert_eq!(run_keys(&full_rows), expected_keys);
+        assert_eq!(run_keys(&projected.rows), expected_keys);
+        assert_eq!(run_labels(&projected.rows), expected_labels);
+
+        for run_id in [child_new, grandchild_new] {
+            let mut run = model.task_run(&run_id).unwrap().clone();
+            run.state = TaskState::Blocked;
+            model.insert_task_run(run);
+        }
+        model.insert_execution(Execution {
+            execution_id: "root-old-execution".to_owned(),
+            pane_id: "pane-roots".to_owned(),
+            terminal_id: "terminal-pane-roots".to_owned(),
+            task_run_id: root_old,
+            state: ExecState::Idle,
+        });
+
+        let visible = crate::activity::default_visible_task_run_ids(
+            &model,
+            &state.operator_snapshot(),
+            state.now_ms(),
+        );
+        let full_rows_after_status = build_full_rows(&model, &state, &visible);
+        let projected_after_status = build_projection(&model, &state);
+        assert_eq!(run_keys(&full_rows_after_status), expected_keys);
+        assert_eq!(run_keys(&projected_after_status.rows), expected_keys);
+        assert_eq!(
+            run_labels(&projected_after_status.rows),
+            vec![
+                "○ idle root-old root-old",
+                "● working child-old child-old",
+                "● working grandchild-old grandchild-old",
+                "● blocked grandchild-new grandchild-new",
+                "● blocked child-new child-new",
+                "● working root-new root-new",
+            ]
         );
     }
 

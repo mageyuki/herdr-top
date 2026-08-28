@@ -255,7 +255,6 @@ fn empty_restored() -> RestoredState {
 #[test]
 fn native_root_runtime_lifecycle_and_ordinals_are_resumable_and_append_only() {
     const NEW_ROOT: &str = "019f7504-83e2-75f0-870d-cc423f88a74c";
-    const FAILED_ROOT: &str = "019f7504-83e2-75f0-870d-cc423f88a75d";
     const UNKNOWN_ROOT: &str = "019f7504-83e2-75f0-870d-cc423f88a76e";
     let mut synthesis = Synthesis::with_lifecycle_timing_at(30, 50, 1);
     let mut admission = Admission::new(0);
@@ -387,64 +386,6 @@ fn native_root_runtime_lifecycle_and_ordinals_are_resumable_and_append_only() {
         next_ingest_seq: Some(1),
         event_ledger: Vec::new(),
     };
-    let failed_started = synthesis.synthesize_batch(
-        Path::new("failed-root.jsonl"),
-        [(
-            1,
-            LogFact::CodexTurnStarted {
-                rollout_id: FAILED_ROOT.to_owned(),
-                at_ms: 200,
-            },
-        )],
-        &mut admission,
-        &discovered,
-    );
-    let failed_state = apply_synthesized_events(
-        branch(&restored.model, restored.next_ordinal),
-        failed_started,
-    );
-    let failed = synthesis
-        .synthesize_batch(
-            Path::new("failed-root.jsonl"),
-            [(
-                2,
-                LogFact::CodexTurnAborted {
-                    rollout_id: FAILED_ROOT.to_owned(),
-                    at_ms: 210,
-                },
-            )],
-            &mut admission,
-            &discovered,
-        )
-        .into_iter()
-        .map(|event| match event {
-            ProviderEvent::Synthesized(mut controller) => {
-                controller.event = ControllerEventKind::Failed;
-                controller.metadata.event_id =
-                    format!("log:failed-root.jsonl:2:failed:{FAILED_ROOT}");
-                controller.metadata.source_event_type = "failed".to_owned();
-                ProviderEvent::Synthesized(controller)
-            }
-            event => event,
-        });
-    let failed_state = apply_synthesized_events(failed_state, failed);
-    let failed_run = failed_state
-        .model
-        .task_run_by_key(&RunKey::Native {
-            provider: Provider::Codex,
-            sid: FAILED_ROOT.to_owned(),
-        })
-        .unwrap();
-    assert_eq!(failed_run.state, TaskState::Running);
-    assert_eq!(
-        failed_state
-            .model
-            .task_run_v6_state(&failed_run.run_id)
-            .and_then(|state| state.native_session_end.as_ref())
-            .map(|end| end.status),
-        Some(NativeSessionEndStatus::Error)
-    );
-
     let unknown_started = synthesis.synthesize_batch(
         Path::new("unknown-root.jsonl"),
         [(

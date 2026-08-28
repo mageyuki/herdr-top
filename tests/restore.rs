@@ -14,9 +14,10 @@ use herdr_top::activity::{OperatorSnapshot, is_default_visible_task_run, runs_wi
 use herdr_top::herdr::collector::{self, CollectorHandle, ObservationQuality};
 use herdr_top::lockfile::{OwnerRecord, StateRoot, state_root_in, try_acquire};
 use herdr_top::model::{
-    DisplayOrdinal, ExecState, NativeLifecycleWatermark, NativeSessionEnd, NativeSessionEndStatus,
-    Provider, RunId, RunKey, RunRateTotals, TaskRun, TaskRunV6State, TaskState, TokenBreakdown,
-    TurnAttr,
+    AgentSessionReference, AgentSessionReferenceKind, DisplayOrdinal, ExecState, GapKind,
+    NativeLifecycleWatermark, NativeSessionEnd, NativeSessionEndStatus, PaneAgentStatus,
+    PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, RunRateTotals, SnapshotAgent, Tab,
+    TaskRun, TaskRunV6State, TaskState, TokenBreakdown, TopologySnapshot, TurnAttr, Workspace,
 };
 use herdr_top::reducer::Reducer;
 use herdr_top::rendezvous::{
@@ -211,7 +212,7 @@ fn cold_restore_keeps_persisted_rate_totals_without_restoring_a_cursor() {
 }
 
 #[test]
-fn restored_rate_totals_do_not_bridge_offline_time_before_a_live_epoch() {
+fn restored_rate_totals_rebaseline_at_live_reconciliation_without_offline_bridge() {
     let directory = tempfile::tempdir().unwrap();
     let root = StateRoot(directory.path().to_path_buf());
     let mut store = open_writer(&root).unwrap();
@@ -262,7 +263,7 @@ fn restored_rate_totals_do_not_bridge_offline_time_before_a_live_epoch() {
     let (mut reducer, shared) = Reducer::new(restored);
     reducer.apply_telemetry_with_breakdown(
         &key,
-        50_000,
+        40_000,
         30,
         TokenBreakdown::default(),
         TurnAttr {
@@ -278,6 +279,66 @@ fn restored_rate_totals_do_not_bridge_offline_time_before_a_live_epoch() {
             working_ms: 3_000,
         })
     );
+
+    reducer
+        .reconcile_gap(ReconcileBatch {
+            topology: TopologySnapshot {
+                workspaces: vec![Workspace {
+                    workspace_id: "offline-workspace".to_owned(),
+                }],
+                tabs: vec![Tab {
+                    tab_id: "offline-tab".to_owned(),
+                    workspace_id: "offline-workspace".to_owned(),
+                    label: None,
+                }],
+                panes: vec![PaneSnapshot {
+                    pane_id: "offline-pane".to_owned(),
+                    workspace_id: "offline-workspace".to_owned(),
+                    tab_id: "offline-tab".to_owned(),
+                    terminal_id: "offline-terminal".to_owned(),
+                    display_name: None,
+                    agent: Some(SnapshotAgent {
+                        agent_name: "codex".to_owned(),
+                        status: PaneAgentStatus::Working,
+                    }),
+                    agent_session: Some(AgentSessionReference {
+                        source: "herdr:codex".to_owned(),
+                        agent: "codex".to_owned(),
+                        kind: AgentSessionReferenceKind::Id,
+                        value: "offline-rate".to_owned(),
+                    }),
+                }],
+            },
+            gap_kind: GapKind::Startup,
+        })
+        .unwrap();
+
+    assert_eq!(
+        shared.borrow().run_rate_totals(&run_id),
+        Some(&RunRateTotals {
+            output_tokens: 70,
+            working_ms: 3_000,
+        }),
+        "the restart and offline interval must add neither tokens nor Working time"
+    );
+
+    reducer.apply_telemetry_with_breakdown(
+        &key,
+        50_000,
+        10,
+        TokenBreakdown::default(),
+        TurnAttr {
+            model: None,
+            effort: None,
+            sandbox: None,
+        },
+    );
+    let after_live_observation = *shared.borrow().run_rate_totals(&run_id).unwrap();
+    assert_eq!(
+        after_live_observation.output_tokens, 80,
+        "only the post-reconciliation token delta may enter the measured numerator"
+    );
+    assert!(after_live_observation.working_ms >= 3_000);
 }
 
 #[test]

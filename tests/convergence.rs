@@ -23,8 +23,7 @@ use herdr_top::model::{
     DisplayOrdinal, DomainModel, EventMetadata, ExecState, Execution, ExecutionEdge, GapKind,
     NativeLifecycleWatermark, NativeSessionEndStatus, NormalizedEvent, Pane, PaneAgentStatus,
     PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SnapshotAgent, Tab, TaskRun,
-    TaskRunV6State, TaskState, TokenBreakdown, TopologyAuthority, TopologySnapshot, TurnAttr,
-    Workspace,
+    TaskRunV6State, TaskState, TopologyAuthority, TopologySnapshot, Workspace,
 };
 use herdr_top::reducer::{ApplyOutcome, Reducer};
 use herdr_top::session_key;
@@ -144,41 +143,107 @@ fn historical_enrichment_never_regresses_live_state_or_watermark() {
 }
 
 #[test]
-fn history_readiness_gate_suppresses_intermediate_working_state() {
+fn historical_working_state_is_not_published_before_durable_finalization() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = StateRoot(directory.path().to_path_buf());
+    let mut store = open_writer(&root).unwrap();
     let run_id = RunId::new();
-    let mut model = DomainModel::default();
-    model.insert_task_run(TaskRun {
-        run_id,
-        key: RunKey::Native {
-            provider: Provider::Codex,
-            sid: "incomplete-history".to_owned(),
-        },
-        display_ordinal: DisplayOrdinal::new(1),
-        state: TaskState::Running,
-        has_controller_task_state_event: true,
-        created_at_ms: Some(1_000),
-        updated_at_ms: Some(2_000),
-        finished_at_ms: None,
-        subject: None,
-        dismissed_at_ms: None,
-    });
-    model.set_task_run_v6_state(
-        run_id,
-        TaskRunV6State {
-            history_ready: false,
-            latest_provider_at_ms: Some(2_000),
-            ..TaskRunV6State::default()
-        },
+    let drain_id = herdr_top::model::HistoryDrainId::new("codex:no-working-flash").unwrap();
+    store
+        .apply_v6_batch(PersistV6Batch {
+            task_runs: vec![PersistTaskRunV6 {
+                task_run: PersistTaskRun {
+                    task_run: TaskRun {
+                        run_id,
+                        key: RunKey::Native {
+                            provider: Provider::Codex,
+                            sid: "historical-working".to_owned(),
+                        },
+                        display_ordinal: DisplayOrdinal::new(1),
+                        state: TaskState::Running,
+                        has_controller_task_state_event: true,
+                        created_at_ms: Some(1_000),
+                        updated_at_ms: Some(2_000),
+                        finished_at_ms: None,
+                        subject: None,
+                        dismissed_at_ms: None,
+                    },
+                    native_session: Some(NativeSessionBinding {
+                        provider: Provider::Codex,
+                        native_session_id: "historical-working".to_owned(),
+                    }),
+                    created_at_ms: 1_000,
+                    updated_at_ms: 2_000,
+                    finished_at_ms: None,
+                },
+                state: TaskRunV6State {
+                    history_ready: false,
+                    latest_provider_at_ms: Some(2_000),
+                    ..TaskRunV6State::default()
+                },
+            }],
+            history_drains: vec![PersistHistoryDrain {
+                drain_id: drain_id.clone(),
+                provider: Provider::Codex,
+                created_at_ms: 2_500,
+                artifacts: Vec::new(),
+            }],
+            history_associations: vec![PersistHistoryDrainRun {
+                drain_id: drain_id.clone(),
+                run_id,
+            }],
+            ..PersistV6Batch::default()
+        })
+        .unwrap();
+
+    let staged = store.load_restored_state().unwrap();
+    assert_eq!(
+        staged.model.task_run(&run_id).unwrap().state,
+        TaskState::Running
+    );
+    assert!(
+        !staged
+            .model
+            .task_run_v6_state(&run_id)
+            .unwrap()
+            .history_ready
+    );
+    let (_before_commit, published_before_commit) = Reducer::new(staged);
+    assert!(
+        published_before_commit.borrow().task_run(&run_id).is_none(),
+        "historical Working must not enter a published snapshot before finalization commits"
     );
 
-    assert!(model.task_run(&run_id).is_some());
-    let (_reducer, shared) = Reducer::new(RestoredState {
-        model,
-        next_ordinal: 2,
-        next_ingest_seq: Some(1),
-        event_ledger: Vec::new(),
-    });
-    assert!(shared.borrow().task_run(&run_id).is_none());
+    let finalization = store.finalize_history_drain(&drain_id, 3_000).unwrap();
+    assert_eq!(finalization.finalized_at_ms, 3_000);
+    assert_eq!(finalization.runs.len(), 1);
+    assert_eq!(finalization.runs[0].run_id, run_id);
+    assert!(finalization.runs[0].state.history_ready);
+    assert_eq!(
+        finalization.runs[0]
+            .state
+            .native_session_end
+            .as_ref()
+            .map(|end| end.status),
+        Some(NativeSessionEndStatus::Unknown)
+    );
+
+    let finalized = store.load_restored_state().unwrap();
+    let (_after_commit, published_after_commit) = Reducer::new(finalized);
+    let published = published_after_commit.borrow();
+    assert_eq!(
+        published.task_run(&run_id).unwrap().state,
+        TaskState::Running
+    );
+    assert!(published.task_run_v6_state(&run_id).unwrap().history_ready);
+    assert_eq!(
+        published
+            .task_run_v6_state(&run_id)
+            .and_then(|state| state.native_session_end.as_ref())
+            .map(|end| end.status),
+        Some(NativeSessionEndStatus::Unknown),
+        "the first published historical state must be the finalized native outcome"
+    );
 }
 
 #[test]
@@ -274,141 +339,6 @@ fn terminal_visibility_is_one_hour_at_every_depth_and_closes_over_ancestors() {
         3,
         "expired ancestors must remain as structural rows"
     );
-}
-
-#[test]
-fn active_time_rate_freezes_while_idle_counts_delayed_tokens_and_resumes() {
-    let run_id = RunId::new();
-    let key = RunKey::Native {
-        provider: Provider::Codex,
-        sid: "rate-contract".to_owned(),
-    };
-    let mut model = DomainModel::default();
-    model.insert_task_run(TaskRun {
-        run_id,
-        key: key.clone(),
-        display_ordinal: DisplayOrdinal::new(1),
-        state: TaskState::Running,
-        has_controller_task_state_event: true,
-        created_at_ms: Some(1),
-        updated_at_ms: Some(1),
-        finished_at_ms: None,
-        subject: None,
-        dismissed_at_ms: None,
-    });
-    let (mut reducer, shared) = Reducer::new(RestoredState {
-        model,
-        next_ordinal: 2,
-        next_ingest_seq: Some(1),
-        event_ledger: Vec::new(),
-    });
-    reducer
-        .reconcile_snapshot(TopologySnapshot {
-            workspaces: vec![Workspace {
-                workspace_id: "rate-workspace".to_owned(),
-            }],
-            tabs: vec![Tab {
-                tab_id: "rate-tab".to_owned(),
-                workspace_id: "rate-workspace".to_owned(),
-                label: None,
-            }],
-            panes: vec![PaneSnapshot {
-                pane_id: "rate-pane".to_owned(),
-                workspace_id: "rate-workspace".to_owned(),
-                tab_id: "rate-tab".to_owned(),
-                terminal_id: "rate-terminal".to_owned(),
-                display_name: None,
-                agent: None,
-                agent_session: None,
-            }],
-        })
-        .unwrap();
-    let mut begin = identity_metadata("rate-begin", "pane_agent_detected");
-    begin.task_run_id = Some(run_id);
-    begin.provider = Some(Provider::Codex);
-    begin.native_session_id = Some("rate-contract".to_owned());
-    reducer
-        .apply(NormalizedEvent::ExecutionBegin {
-            metadata: begin,
-            execution: Execution {
-                execution_id: "rate-execution".to_owned(),
-                pane_id: "rate-pane".to_owned(),
-                terminal_id: "rate-terminal".to_owned(),
-                task_run_id: run_id,
-                state: ExecState::Working,
-            },
-        })
-        .unwrap();
-
-    std::thread::sleep(Duration::from_millis(20));
-    reducer.apply_telemetry_with_breakdown(
-        &key,
-        10,
-        100,
-        TokenBreakdown::default(),
-        TurnAttr {
-            model: None,
-            effort: None,
-            sandbox: None,
-        },
-    );
-    let first = *shared.borrow().run_rate_totals(&run_id).unwrap();
-    assert_eq!(first.output_tokens, 100);
-    assert!(first.working_ms > 0);
-
-    let mut idle = identity_metadata("rate-idle", "pane_agent_status_changed");
-    idle.task_run_id = Some(run_id);
-    reducer
-        .apply(NormalizedEvent::AgentStatusChanged {
-            metadata: idle,
-            execution_id: "rate-execution".to_owned(),
-            state: ExecState::Idle,
-        })
-        .unwrap();
-    let idle_start = *shared.borrow().run_rate_totals(&run_id).unwrap();
-    std::thread::sleep(Duration::from_millis(20));
-    reducer.apply_telemetry_with_breakdown(
-        &key,
-        20,
-        50,
-        TokenBreakdown::default(),
-        TurnAttr {
-            model: None,
-            effort: None,
-            sandbox: None,
-        },
-    );
-    let after_idle_tokens = *shared.borrow().run_rate_totals(&run_id).unwrap();
-    assert_eq!(
-        after_idle_tokens.output_tokens,
-        idle_start.output_tokens + 50
-    );
-    assert_eq!(after_idle_tokens.working_ms, idle_start.working_ms);
-
-    let mut working = identity_metadata("rate-working", "pane_agent_status_changed");
-    working.task_run_id = Some(run_id);
-    reducer
-        .apply(NormalizedEvent::AgentStatusChanged {
-            metadata: working,
-            execution_id: "rate-execution".to_owned(),
-            state: ExecState::Working,
-        })
-        .unwrap();
-    std::thread::sleep(Duration::from_millis(20));
-    reducer.apply_telemetry_with_breakdown(
-        &key,
-        30,
-        50,
-        TokenBreakdown::default(),
-        TurnAttr {
-            model: None,
-            effort: None,
-            sandbox: None,
-        },
-    );
-    let resumed = *shared.borrow().run_rate_totals(&run_id).unwrap();
-    assert_eq!(resumed.output_tokens, after_idle_tokens.output_tokens + 50);
-    assert!(resumed.working_ms > after_idle_tokens.working_ms);
 }
 
 #[derive(Clone, Debug)]
@@ -1070,7 +1000,17 @@ async fn scoped_subscription_keeps_primary_unscoped_and_enriches_each_snapshot_p
 
 #[tokio::test]
 async fn collector_accepts_exact_dotted_and_underscore_pane_status_aliases() {
-    let snapshot = agent_snapshot("alias-session", AgentSessionReferenceKind::Id, "idle");
+    let mut snapshot = agent_snapshot("alias-session", AgentSessionReferenceKind::Id, "idle");
+    snapshot["panes"]
+        .as_array_mut()
+        .unwrap()
+        .push(agent_pane_value(
+            "w1:p2",
+            "alias-sentinel-terminal",
+            "w1",
+            "w1:t1",
+            "alias-sentinel-session",
+        ));
     let mock = ScopedHerdr::start(ScopedHerdrConfig::snapshots(vec![snapshot]))
         .await
         .unwrap();
@@ -1112,7 +1052,15 @@ async fn collector_accepts_exact_dotted_and_underscore_pane_status_aliases() {
     ))
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    mock.push_enrichment(agent_status_alias_push(
+        "pane_agent_status_changed",
+        "w1:p2",
+        "alias-sentinel-terminal",
+        "idle",
+    ))
+    .await
+    .unwrap();
+    wait_until(|| pane_status_event_count(&root) >= 3).await;
     assert_eq!(
         handle
             .model
@@ -1133,7 +1081,7 @@ async fn collector_accepts_exact_dotted_and_underscore_pane_status_aliases() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(rows, 2);
+    assert_eq!(rows, 3);
 }
 
 #[tokio::test]
@@ -4756,4 +4704,15 @@ fn event_count(root: &StateRoot) -> i64 {
     connection
         .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
         .expect("event count should query")
+}
+
+fn pane_status_event_count(root: &StateRoot) -> i64 {
+    let connection = Connection::open(database_path(root)).expect("database should open");
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE source_event_type = 'pane_agent_status_changed'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("pane status event count should query")
 }

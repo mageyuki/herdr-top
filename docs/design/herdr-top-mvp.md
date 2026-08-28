@@ -566,16 +566,20 @@ The default TUI shows non-dismissed, non-expired Task Runs. Every semantic
 terminal or native-lifecycle-ended Task Run uses the same exact
 `DEFAULT_TERMINAL_VISIBILITY_MS` boundary, currently one hour, at root, child,
 and grandchild depth. After the boundary it is default-hidden but retained in
-SQLite, filtering, Detail, and Summary until ordinary retention removes it. The
-visible set is closed over execution ancestors, so an expired ancestor remains
-as a structural row while an individually visible descendant needs its path.
+SQLite. The TUI chooses default-visible IDs before applying a filter, so neither
+filtering nor direct Detail selection restores an expired row. Once published
+and history-ready, the retained row remains in Summary until ordinary retention
+removes it. The visible set is closed over execution ancestors, so an expired
+ancestor remains as a structural row while an individually visible descendant
+needs its path.
 
 Pressing `c` sets `dismissed_at_ms` on every currently semantic-terminal run and
 every hook-only run that has reached the 24-hour boundary. A Controller
 `dismiss` sets the same field on a known run without changing state. Provider
 `SessionEnd` no longer dismisses. Dismissal changes visibility only: it performs
-no deletion, survives restart, and leaves the run filterable. Older retained
-and dismissed runs remain filterable and remain part of Summary.
+no deletion and survives restart. It does not make a row filterable after the
+row leaves the default-visible set or directly selectable for Detail. Published,
+history-ready dismissed runs remain part of Summary while retained.
 
 Prompts, responses, terminal scrollback, and raw provider payloads are not retained.
 
@@ -601,12 +605,12 @@ Required behavior:
 - internal scrolling and lower selected-item activity;
 - stable oldest-first ordering and selection during updates: one Task Run exists per provider/native-session identity; resuming it preserves the row and ordinal, while a different session in the same pane appends a new root below it; Task Runs, Agent Nodes, and topology rows receive unique, persisted, immutable display ordinals on first entry into the model and siblings at every depth sort by them, never by an identity-key component; execution placement order remains in-session; a state refresh never reorders rows, and after a merge the merged-in rows vanish while the survivor keeps its own ordinal and relative position;
 - follow selects the last visible row; manual scroll, collapse, or committed filtering disables follow, and `f` or End resumes it;
-- expand/collapse and filtering that retains matching ancestors — in the dependency view, every prerequisite path to a matching run;
+- expand/collapse and filtering within the default-visible row set that retains matching ancestors — in the dependency view, every prerequisite path to a matching run;
 - execution-tree and dependency-DAG toggle; the dependency view renders the conceptual DAG of section 6.2 as a stable topologically sorted list with prerequisite and dependent columns per run — prerequisites precede dependents, the display ordinal breaks topological ties, state refreshes preserve order, and only dependency-edge changes may reorder, minimally — so 1,000 edges stay scrollable and scannable;
 - Detail distinguishes no recorded task relationships from operational statuses such as `blocked`, stale evidence, execution `ended`, `ended_unknown`, and other terminal task states, and exposes native lifecycle end/time, lifecycle watermark, history readiness, measured rate totals, and rate-cursor initialization;
 - selection moves to a surviving ancestor or neighbor when its node closes, and follows the surviving run through an identity merge, with the reason shown;
 - with no overlay or filter draft active, unmodified `s` opens the Summary overlay and unmodified `c` sends one non-blocking clear command; modifier-bearing `s` and `c` do neither. `Esc` or any `s` key code closes an already-open Summary overlay, because overlay-local closing is deliberately modifier-blind;
-- the Summary overlay prints a `scope:` line, then groups every store-retained run, including default-hidden terminal history, by worker kind and model in two separate tables headed `per worker kind` and `per model`; their exact header lines are `worker kind | runs | live | total | mean | tok | mean tok/s` and `model | runs | live | total | mean | tok | mean tok/s`; `runs` and `live` count all group members, `total` and `mean` use only terminal runs with valid timing, `tok` is accumulated lifetime output tokens, and `mean tok/s` is aggregate measured output tokens divided by aggregate measured Working seconds rather than an unweighted mean of per-run rates; either token field renders `-` only when the required telemetry is unavailable;
+- the Summary overlay prints a `scope:` line, then groups every published, history-ready run still retained by the store, including default-hidden terminal history, by worker kind and model in two separate tables headed `per worker kind` and `per model`; their exact header lines are `worker kind | runs | live | total | mean | tok | mean tok/s` and `model | runs | live | total | mean | tok | mean tok/s`; `runs` and `live` count all group members, `total` and `mean` use only terminal runs with valid timing, `tok` is accumulated lifetime output tokens, and `mean tok/s` is aggregate measured output tokens divided by aggregate measured Working seconds rather than an unweighted mean of per-run rates; either token field renders `-` only when the required telemetry is unavailable;
 - per-run `TOK-S` uses post-baseline measured output tokens divided by the union of reliably observed Working intervals across pane occurrences; Idle, blocked, queued, unknown, terminal, history, reconnect, reconciliation, and offline intervals add no time, while a delayed cumulative token increase after Idle still enters the numerator once without Idle time; missing totals or zero Working time render an em dash, and positive persisted totals remain usable without a restored cursor;
 - a wall-aligned once-per-second paint tick redraws clock-derived surfaces without rebuilding the row projection. Projection rebuilding remains separately gated by model/operator changes and cached visibility or visible-live-duration deadlines, so elapsed Task Run labels advance only when their projected row actually requires that refresh;
 - `?` opens key help and setup guidance;
@@ -841,7 +845,7 @@ Herdr Top's differentiating combination is:
 9. Non-authoritative disappearance during live observation is `stale` for 30 seconds before `ended`; across an observation gap executions retire immediately.
 10. Execution end never implies semantic completion.
 11. Runs without semantic terminal or native lifecycle-end evidence remain visible regardless of age except that Controller-keyed runs with no execution leave the default view 24 hours after their last update and explicitly dismissed runs are hidden.
-12. Semantic-terminal and native-lifecycle-ended Task Runs at root, child, and grandchild depth remain default-visible for exactly one hour; expired ancestors remain structurally visible while needed by a visible descendant, and default-hidden history remains filterable and included in Summary until retention removes it.
+12. Semantic-terminal and native-lifecycle-ended Task Runs at root, child, and grandchild depth remain default-visible for exactly one hour; expired ancestors remain structurally visible while needed by a visible descendant, and published, history-ready default-hidden history remains included in Summary but is not restored by filtering or directly selectable for Detail.
 13. Activity events are ring-bounded to 100,000 per named session and seven days; the `event_id` ledger is retained independently for seven days; no semantic state depends on event retention.
 14. The fixed TUI supports scroll, stable selection, activity, follow, help, and narrow panes.
 15. At or above the standard width of 100 columns the header shows host, session, session elapsed time (`up:`), workspace count, quality, lag, and coverage; below it, down to the minimum supported width of 48 columns, fields truncate in the fixed order coverage, lag, workspace count, host — session, `up:`, and quality are never dropped.

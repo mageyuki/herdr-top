@@ -330,6 +330,12 @@ fn native_root_lifecycle_and_ordinals_are_resumable_and_append_only() {
     let restored = apply_synthesized_events(empty_restored(), started);
     let root_key = RunKey::Controller(format!("hook:claude-code:{ROOT_ID}"));
     let original = restored.model.task_run_by_key(&root_key).unwrap().clone();
+    let lane_close_state = RestoredState {
+        model: restored.model.clone(),
+        next_ordinal: restored.next_ordinal,
+        next_ingest_seq: restored.next_ingest_seq,
+        event_ledger: Vec::new(),
+    };
 
     let (reducer, _) = Reducer::new(restored);
     let ended = reducer
@@ -360,6 +366,27 @@ fn native_root_lifecycle_and_ordinals_are_resumable_and_append_only() {
         [ProviderEvent::LaneClose { key, at_ms }]
             if key == &root_key && *at_ms == 100
     ));
+    let [ProviderEvent::LaneClose { key, at_ms }] = inactive.as_slice() else {
+        unreachable!("lane-close shape was asserted above")
+    };
+    let (mut lane_close_reducer, lane_close_model) = Reducer::new(lane_close_state);
+    assert!(!lane_close_reducer.apply_lane_close(key, *at_ms).is_empty());
+    assert_eq!(
+        lane_close_model
+            .borrow()
+            .task_run(&original.run_id)
+            .unwrap()
+            .state,
+        TaskState::Running
+    );
+    assert_eq!(
+        lane_close_model
+            .borrow()
+            .task_run_v6_state(&original.run_id)
+            .and_then(|state| state.native_session_end.as_ref())
+            .map(|end| end.status),
+        Some(NativeSessionEndStatus::Unknown)
+    );
     let resumed = synthesis.synthesize_batch(
         Path::new("old-root.jsonl"),
         [(
