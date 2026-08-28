@@ -3435,6 +3435,41 @@ mod tests {
     }
 
     #[test]
+    fn filtered_native_terminal_run_expires_from_cached_deadline_without_event() {
+        let terminal = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let terminal_at_ms = 1_000;
+        let boundary = terminal_at_ms + activity::DEFAULT_TERMINAL_VISIBILITY_MS;
+        let mut model = model_with_runs(&[(terminal, "terminal", 1, TaskState::Completed)]);
+        let mut searchable = model.task_run(&terminal).unwrap().clone();
+        searchable.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "searchable-terminal".to_owned(),
+        };
+        searchable.updated_at_ms = Some(terminal_at_ms);
+        searchable.finished_at_ms = Some(terminal_at_ms);
+        model.insert_task_run(searchable);
+        let clock = TestClock::at(boundary - 1);
+        let (mut app, _senders) = app_with_runtime(
+            model,
+            empty_operator(HashMap::from([(terminal, terminal_at_ms)])),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        type_text(&mut app, "searchable-terminal");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(displayed_run_names(&app), ["searchable-terminal"]);
+        assert_eq!(app.next_expiry_ms(), Some(boundary));
+
+        clock.set(boundary);
+        assert!(app.refresh_if_changed().unwrap());
+        assert!(displayed_run_names(&app).is_empty());
+        assert_eq!(app.next_expiry_ms(), None);
+    }
+
+    #[test]
     fn native_ended_selected_run_ages_out_at_exact_visibility_boundary() {
         let selected = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let survivor = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");

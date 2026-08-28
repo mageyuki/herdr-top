@@ -154,6 +154,9 @@ pub(crate) fn default_visible_task_run_ids(
             .filter(|edge| visible.contains(&edge.child_run_id))
             .map(|edge| edge.parent_run_id)
             .filter(|run_id| !visible.contains(run_id))
+            .filter_map(|run_id| model.task_run(&run_id))
+            .filter(|run| is_expired_lifecycle_ancestor(model, run, &execution_run_ids, now_ms))
+            .map(|run| run.run_id)
             .collect::<Vec<_>>();
         if ancestors.is_empty() {
             break;
@@ -176,10 +179,47 @@ pub fn is_default_visible_task_run_with_ghost_window(
     now_ms: i64,
     ghost_visibility_ms: i64,
 ) -> bool {
+    let lifecycle_end_ms = model.effective_lifecycle_end_ms(run);
+    if !is_default_visibility_policy_eligible(
+        run,
+        runs_with_executions,
+        lifecycle_end_ms,
+        now_ms,
+        ghost_visibility_ms,
+    ) {
+        return false;
+    }
+    lifecycle_end_ms
+        .is_none_or(|end_ms| now_ms < end_ms.saturating_add(DEFAULT_TERMINAL_VISIBILITY_MS))
+}
+
+fn is_expired_lifecycle_ancestor(
+    model: &crate::model::DomainModel,
+    run: &TaskRun,
+    runs_with_executions: &HashSet<RunId>,
+    now_ms: i64,
+) -> bool {
+    let lifecycle_end_ms = model.effective_lifecycle_end_ms(run);
+    is_default_visibility_policy_eligible(
+        run,
+        runs_with_executions,
+        lifecycle_end_ms,
+        now_ms,
+        ghost_visibility_ms(),
+    ) && lifecycle_end_ms
+        .is_some_and(|end_ms| now_ms >= end_ms.saturating_add(DEFAULT_TERMINAL_VISIBILITY_MS))
+}
+
+fn is_default_visibility_policy_eligible(
+    run: &TaskRun,
+    runs_with_executions: &HashSet<RunId>,
+    lifecycle_end_ms: Option<i64>,
+    now_ms: i64,
+    ghost_visibility_ms: i64,
+) -> bool {
     if run.dismissed_at_ms.is_some() {
         return false;
     }
-    let lifecycle_end_ms = model.effective_lifecycle_end_ms(run);
     if lifecycle_end_ms.is_none()
         && let RunKey::Provisional { start_ms, .. } = &run.key
     {
@@ -191,8 +231,7 @@ pub fn is_default_visible_task_run_with_ghost_window(
     if is_hook_only_stale_task_run(run, runs_with_executions, now_ms) {
         return false;
     }
-    lifecycle_end_ms
-        .is_none_or(|end_ms| now_ms < end_ms.saturating_add(DEFAULT_TERMINAL_VISIBILITY_MS))
+    true
 }
 
 #[must_use]
@@ -438,6 +477,88 @@ mod tests {
         assert_eq!(
             default_visible_task_run_ids(&model, &empty_operator(), now_ms),
             HashSet::from([root.run_id, child.run_id, grandchild.run_id])
+        );
+    }
+
+    #[test]
+    fn dismissed_execution_parent_is_not_retained_for_visible_child() {
+        let now_ms = 7_200_000;
+        let mut model = DomainModel::default();
+        let mut parent = task_run(
+            RunKey::Controller("dismissed-parent".to_owned()),
+            TaskState::Running,
+            Some(now_ms),
+        );
+        parent.dismissed_at_ms = Some(now_ms);
+        let child = task_run(
+            RunKey::Controller("visible-child".to_owned()),
+            TaskState::Running,
+            Some(now_ms),
+        );
+        for run in [&parent, &child] {
+            model.insert_task_run(run.clone());
+        }
+        model.insert_execution_edge(ExecutionEdge {
+            parent_run_id: parent.run_id,
+            child_run_id: child.run_id,
+        });
+
+        assert_eq!(
+            default_visible_task_run_ids(&model, &empty_operator(), now_ms),
+            HashSet::from([child.run_id])
+        );
+    }
+
+    #[test]
+    fn stale_hook_and_expired_ghost_parents_are_not_retained() {
+        let now_ms = 100_000_000;
+        let mut model = DomainModel::default();
+        let stale_hook_parent = task_run(
+            RunKey::Controller("stale-hook-parent".to_owned()),
+            TaskState::Running,
+            Some(now_ms - HOOK_ONLY_STALE_VISIBILITY_MS),
+        );
+        let ghost_observed_ms = now_ms - ghost_visibility_ms();
+        let expired_ghost_parent = task_run(
+            RunKey::Provisional {
+                terminal_id: "ghost-terminal".to_owned(),
+                start_ms: ghost_observed_ms,
+                seq: 1,
+            },
+            TaskState::Running,
+            Some(ghost_observed_ms),
+        );
+        let hook_child = task_run(
+            RunKey::Controller("hook-child".to_owned()),
+            TaskState::Running,
+            Some(now_ms),
+        );
+        let ghost_child = task_run(
+            RunKey::Controller("ghost-child".to_owned()),
+            TaskState::Running,
+            Some(now_ms),
+        );
+        for run in [
+            &stale_hook_parent,
+            &expired_ghost_parent,
+            &hook_child,
+            &ghost_child,
+        ] {
+            model.insert_task_run(run.clone());
+        }
+        for (parent_run_id, child_run_id) in [
+            (stale_hook_parent.run_id, hook_child.run_id),
+            (expired_ghost_parent.run_id, ghost_child.run_id),
+        ] {
+            model.insert_execution_edge(ExecutionEdge {
+                parent_run_id,
+                child_run_id,
+            });
+        }
+
+        assert_eq!(
+            default_visible_task_run_ids(&model, &empty_operator(), now_ms),
+            HashSet::from([hook_child.run_id, ghost_child.run_id])
         );
     }
 

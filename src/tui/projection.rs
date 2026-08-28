@@ -521,10 +521,13 @@ pub(crate) fn project_rows_with_visible(
         let direct = full_rows
             .iter()
             .enumerate()
-            .filter_map(|(index, row)| row_matches(model, row, query).then_some(index))
+            .filter_map(|(index, row)| {
+                (row_is_filter_eligible(model, row, visible_runs) && row_matches(model, row, query))
+                    .then_some(index)
+            })
             .collect::<Vec<_>>();
         let rows = match mode {
-            ViewMode::ExecutionTree => retain_tree_matches(full_rows, &direct),
+            ViewMode::ExecutionTree => retain_tree_matches(model, full_rows, &direct, visible_runs),
             ViewMode::DependencyDag => {
                 let matches = direct
                     .into_iter()
@@ -533,16 +536,22 @@ pub(crate) fn project_rows_with_visible(
                 let order = full_rows
                     .iter()
                     .filter_map(|row| row.key.run_id())
+                    .filter(|run_id| visible_runs.contains(run_id))
                     .collect::<Vec<_>>();
-                let retained = dag::retain_matches_with_prerequisites(model, &order, &matches)
-                    .into_iter()
-                    .collect::<HashSet<_>>();
+                let retained = retain_visible_dag_matches_with_prerequisites(
+                    model,
+                    &order,
+                    &matches,
+                    visible_runs,
+                )
+                .into_iter()
+                .collect::<HashSet<_>>();
                 full_rows
                     .iter()
                     .filter(|row| {
-                        row.key
-                            .run_id()
-                            .is_some_and(|run_id| retained.contains(&run_id))
+                        row.key.run_id().is_some_and(|run_id| {
+                            visible_runs.contains(&run_id) && retained.contains(&run_id)
+                        })
                     })
                     .cloned()
                     .collect()
@@ -550,7 +559,10 @@ pub(crate) fn project_rows_with_visible(
         };
         return RowProjection {
             next_expiry_ms: min_expiry(
-                agent_expiry_ms,
+                min_expiry(
+                    agent_expiry_ms,
+                    next_run_visibility_expiry_ms(model, &rows, now_ms),
+                ),
                 next_live_duration_expiry_ms(model, &rows, now_ms),
             ),
             rows,
@@ -558,45 +570,23 @@ pub(crate) fn project_rows_with_visible(
     }
 
     let mut visible = Vec::with_capacity(full_rows.len());
-    let mut next_expiry_ms = agent_expiry_ms;
-    let execution_run_ids = runs_with_executions(model);
     for row in full_rows {
         let Some(run_id) = row.key.run_id() else {
             visible.push(row.clone());
             continue;
         };
-        let Some(run) = model.task_run(&run_id) else {
+        if model.task_run(&run_id).is_none() {
             continue;
-        };
+        }
         if visible_runs.contains(&run_id) {
-            if model.effective_lifecycle_end_ms(run).is_none()
-                && let RunKey::Provisional { start_ms, .. } = &run.key
-            {
-                let last_observed_ms = run.updated_at_ms.or(run.created_at_ms).unwrap_or(*start_ms);
-                let expiry = last_observed_ms.saturating_add(ghost_visibility_ms());
-                next_expiry_ms = Some(next_expiry_ms.map_or(expiry, |current| current.min(expiry)));
-            } else if let Some(first_terminal_ms) = model.effective_lifecycle_end_ms(run)
-                && crate::activity::is_default_visible_task_run(
-                    model,
-                    run,
-                    &execution_run_ids,
-                    now_ms,
-                )
-            {
-                let expiry = first_terminal_ms.saturating_add(DEFAULT_TERMINAL_VISIBILITY_MS);
-                next_expiry_ms = Some(next_expiry_ms.map_or(expiry, |current| current.min(expiry)));
-            }
-            if matches!(run.key, RunKey::Controller(_))
-                && !execution_run_ids.contains(&run.run_id)
-                && let Some(updated_at_ms) = run.updated_at_ms
-            {
-                let expiry = updated_at_ms.saturating_add(HOOK_ONLY_STALE_VISIBILITY_MS);
-                next_expiry_ms = Some(next_expiry_ms.map_or(expiry, |current| current.min(expiry)));
-            }
             visible.push(row.clone());
         }
     }
 
+    let mut next_expiry_ms = min_expiry(
+        agent_expiry_ms,
+        next_run_visibility_expiry_ms(model, &visible, now_ms),
+    );
     let rows = if mode == ViewMode::ExecutionTree {
         apply_collapse(&visible, collapsed)
     } else {
@@ -621,6 +611,47 @@ fn min_expiry(left: Option<i64>, right: Option<i64>) -> Option<i64> {
     }
 }
 
+fn next_run_visibility_expiry_ms(
+    model: &DomainModel,
+    rows: &[TreeRow],
+    now_ms: i64,
+) -> Option<i64> {
+    let execution_run_ids = runs_with_executions(model);
+    rows.iter()
+        .filter_map(|row| row.key.run_id())
+        .filter_map(|run_id| model.task_run(&run_id))
+        .filter_map(|run| {
+            let lifecycle_expiry_ms = if model.effective_lifecycle_end_ms(run).is_none()
+                && let RunKey::Provisional { start_ms, .. } = &run.key
+            {
+                let last_observed_ms = run.updated_at_ms.or(run.created_at_ms).unwrap_or(*start_ms);
+                Some(last_observed_ms.saturating_add(ghost_visibility_ms()))
+            } else if let Some(first_terminal_ms) = model.effective_lifecycle_end_ms(run)
+                && crate::activity::is_default_visible_task_run(
+                    model,
+                    run,
+                    &execution_run_ids,
+                    now_ms,
+                )
+            {
+                Some(first_terminal_ms.saturating_add(DEFAULT_TERMINAL_VISIBILITY_MS))
+            } else {
+                None
+            };
+            let hook_only_expiry_ms = if matches!(run.key, RunKey::Controller(_))
+                && !execution_run_ids.contains(&run.run_id)
+            {
+                run.updated_at_ms.map(|updated_at_ms| {
+                    updated_at_ms.saturating_add(HOOK_ONLY_STALE_VISIBILITY_MS)
+                })
+            } else {
+                None
+            };
+            min_expiry(lifecycle_expiry_ms, hook_only_expiry_ms)
+        })
+        .min()
+}
+
 fn next_live_duration_expiry_ms(model: &DomainModel, rows: &[TreeRow], now_ms: i64) -> Option<i64> {
     let renders_live_duration = rows
         .iter()
@@ -639,15 +670,36 @@ fn next_live_duration_expiry_ms(model: &DomainModel, rows: &[TreeRow], now_ms: i
         .checked_add(1_000)
 }
 
-fn retain_tree_matches(rows: &[TreeRow], direct: &[usize]) -> Vec<TreeRow> {
+fn row_is_filter_eligible(
+    model: &DomainModel,
+    row: &TreeRow,
+    visible_runs: &HashSet<RunId>,
+) -> bool {
+    match &row.key {
+        NodeKey::Run { run_id, .. } => visible_runs.contains(run_id),
+        NodeKey::Agent { agent_node_id, .. } => model
+            .agent_node(agent_node_id)
+            .is_none_or(|agent| visible_runs.contains(&agent.task_run_id)),
+        _ => true,
+    }
+}
+
+fn retain_tree_matches(
+    model: &DomainModel,
+    rows: &[TreeRow],
+    direct: &[usize],
+    visible_runs: &HashSet<RunId>,
+) -> Vec<TreeRow> {
     let mut retained = HashSet::new();
     for &index in direct {
         retained.insert(index);
         let mut target_depth = rows[index].depth;
         for ancestor in (0..index).rev() {
             if rows[ancestor].depth < target_depth {
-                retained.insert(ancestor);
                 target_depth = rows[ancestor].depth;
+                if row_is_filter_eligible(model, &rows[ancestor], visible_runs) {
+                    retained.insert(ancestor);
+                }
                 if target_depth == 0 {
                     break;
                 }
@@ -658,6 +710,47 @@ fn retain_tree_matches(rows: &[TreeRow], direct: &[usize]) -> Vec<TreeRow> {
         .enumerate()
         .filter(|(index, _)| retained.contains(index))
         .map(|(_, row)| row.clone())
+        .collect()
+}
+
+fn retain_visible_dag_matches_with_prerequisites(
+    model: &DomainModel,
+    stable_order: &[RunId],
+    direct_matches: &HashSet<RunId>,
+    visible_runs: &HashSet<RunId>,
+) -> Vec<RunId> {
+    if model
+        .task_runs()
+        .all(|run| visible_runs.contains(&run.run_id))
+    {
+        return dag::retain_matches_with_prerequisites(model, stable_order, direct_matches);
+    }
+    let mut reverse = HashMap::<RunId, Vec<RunId>>::new();
+    for edge in model.dependency_edges() {
+        if visible_runs.contains(&edge.prerequisite_run_id)
+            && visible_runs.contains(&edge.dependent_run_id)
+            && model.task_run(&edge.prerequisite_run_id).is_some()
+            && model.task_run(&edge.dependent_run_id).is_some()
+        {
+            reverse
+                .entry(edge.dependent_run_id)
+                .or_default()
+                .push(edge.prerequisite_run_id);
+        }
+    }
+    let mut retained = direct_matches.clone();
+    let mut pending = direct_matches.iter().copied().collect::<Vec<_>>();
+    while let Some(dependent) = pending.pop() {
+        for prerequisite in reverse.get(&dependent).into_iter().flatten() {
+            if retained.insert(*prerequisite) {
+                pending.push(*prerequisite);
+            }
+        }
+    }
+    stable_order
+        .iter()
+        .copied()
+        .filter(|run_id| visible_runs.contains(run_id) && retained.contains(run_id))
         .collect()
 }
 
@@ -3049,7 +3142,150 @@ mod tests {
     }
 
     #[test]
-    fn i4_terminal_expiry_filter_restore_and_no_event_wakeup() {
+    fn filtered_tree_excludes_hidden_runs_and_agents_but_keeps_topology() {
+        let mut hidden = run("hidden", 1, TaskState::Running);
+        hidden.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "needle-hidden".to_owned(),
+        };
+        hidden.dismissed_at_ms = Some(1);
+        let mut visible = run("visible", 2, TaskState::Running);
+        visible.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "needle-visible".to_owned(),
+        };
+        let mut model = DomainModel::default();
+        model.insert_task_run(hidden.clone());
+        model.insert_task_run(visible.clone());
+        model.insert_agent_node(status_agent(
+            hidden.run_id,
+            "needle-hidden-agent",
+            Provider::Codex,
+            Some("provider-root"),
+            Some(ExecState::Working),
+            10,
+        ));
+        let rows = vec![
+            row(NodeKey::Session, 0, "Session: demo"),
+            row(
+                NodeKey::Workspace("workspace".into()),
+                1,
+                "Workspace: workspace",
+            ),
+            row(NodeKey::Tab("tab".into()), 2, "Tab: tab"),
+            row(NodeKey::Pane("pane".into()), 3, "Pane: pane"),
+            row(
+                NodeKey::Run {
+                    run_id: hidden.run_id,
+                    pane_id: Some("pane".into()),
+                },
+                4,
+                "Task Run: needle-hidden",
+            ),
+            row(
+                NodeKey::Agent {
+                    agent_node_id: "needle-hidden-agent".into(),
+                    pane_id: Some("pane".into()),
+                },
+                5,
+                "Codex native agent: needle-hidden-agent",
+            ),
+            row(
+                NodeKey::Run {
+                    run_id: visible.run_id,
+                    pane_id: Some("pane".into()),
+                },
+                5,
+                "Task Run: needle-visible",
+            ),
+        ];
+
+        let projected = project_rows(
+            &model,
+            &rows,
+            &operator(Vec::new(), HashMap::new()),
+            "needle",
+            &HashSet::new(),
+            ViewMode::ExecutionTree,
+            10,
+        );
+
+        assert_eq!(
+            projected
+                .rows
+                .iter()
+                .map(|item| &item.key)
+                .collect::<Vec<_>>(),
+            vec![
+                &rows[0].key,
+                &rows[1].key,
+                &rows[2].key,
+                &rows[3].key,
+                &rows[6].key,
+            ]
+        );
+    }
+
+    #[test]
+    fn filtered_dag_excludes_hidden_prerequisite_chain() {
+        let mut visible_prerequisite = run("visible-prerequisite", 1, TaskState::Running);
+        visible_prerequisite.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "visible-prerequisite".to_owned(),
+        };
+        let mut hidden_prerequisite = run("hidden-prerequisite", 2, TaskState::Running);
+        hidden_prerequisite.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "hidden-prerequisite".to_owned(),
+        };
+        hidden_prerequisite.dismissed_at_ms = Some(1);
+        let mut dependent = run("dependent", 3, TaskState::Running);
+        dependent.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "needle-dependent".to_owned(),
+        };
+        let mut model = DomainModel::default();
+        for task_run in [&visible_prerequisite, &hidden_prerequisite, &dependent] {
+            model.insert_task_run(task_run.clone());
+        }
+        model.insert_dependency_edge(DependencyEdge {
+            prerequisite_run_id: visible_prerequisite.run_id,
+            dependent_run_id: hidden_prerequisite.run_id,
+        });
+        model.insert_dependency_edge(DependencyEdge {
+            prerequisite_run_id: hidden_prerequisite.run_id,
+            dependent_run_id: dependent.run_id,
+        });
+        let rows = [&visible_prerequisite, &hidden_prerequisite, &dependent]
+            .into_iter()
+            .map(|task_run| {
+                row(
+                    NodeKey::Run {
+                        run_id: task_run.run_id,
+                        pane_id: None,
+                    },
+                    0,
+                    "Task Run",
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let projected = project_rows(
+            &model,
+            &rows,
+            &operator(Vec::new(), HashMap::new()),
+            "needle-dependent",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            10,
+        );
+
+        assert_eq!(projected.rows.len(), 1);
+        assert_eq!(projected.rows[0].key.run_id(), Some(dependent.run_id));
+    }
+
+    #[test]
+    fn i4_terminal_expiry_query_narrows_and_no_event_wakeup() {
         let mut old = run("controller-private", 1, TaskState::Completed);
         old.key = RunKey::Native {
             provider: Provider::Codex,
@@ -3114,8 +3350,7 @@ mod tests {
             ViewMode::DependencyDag,
             now + 1,
         );
-        assert_eq!(filtered.rows.len(), 1);
-        assert_eq!(filtered.rows[0].key.run_id(), Some(old.run_id));
+        assert!(filtered.rows.is_empty());
         let restored = project_rows(
             &model,
             &rows,
@@ -3126,6 +3361,45 @@ mod tests {
             now + 1,
         );
         assert_eq!(restored.rows[0].key.run_id(), Some(live.run_id));
+    }
+
+    #[test]
+    fn filtered_terminal_run_preserves_visibility_deadline() {
+        let terminal_at_ms = 1_000;
+        let boundary = terminal_at_ms + DEFAULT_TERMINAL_VISIBILITY_MS;
+        let mut terminal = run("terminal", 1, TaskState::Completed);
+        terminal.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "searchable-terminal".to_owned(),
+        };
+        terminal.updated_at_ms = Some(terminal_at_ms);
+        terminal.finished_at_ms = Some(terminal_at_ms);
+        let mut model = DomainModel::default();
+        model.insert_task_run(terminal.clone());
+        let rows = vec![row(
+            NodeKey::Run {
+                run_id: terminal.run_id,
+                pane_id: None,
+            },
+            0,
+            "Task Run: searchable-terminal [completed]",
+        )];
+
+        let projected = project_rows(
+            &model,
+            &rows,
+            &operator(
+                Vec::new(),
+                HashMap::from([(terminal.run_id, terminal_at_ms)]),
+            ),
+            "searchable-terminal",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            boundary - 1,
+        );
+
+        assert_eq!(projected.rows.len(), 1);
+        assert_eq!(projected.next_expiry_ms, Some(boundary));
     }
 
     #[test]

@@ -5851,7 +5851,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_parent_remains_structural_for_visible_grandchild() {
+    fn dismissed_parent_is_absent_and_visible_grandchild_becomes_unattached() {
         let root = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let hidden_middle = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
         let visible_grandchild = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
@@ -5887,10 +5887,12 @@ mod tests {
         }
 
         let rows = build_uncollapsed_rows(&model, &AppState::default());
-        let middle_row = only_run_row(&rows, hidden_middle);
         let grandchild_row = only_run_row(&rows, visible_grandchild);
-        assert_eq!(middle_row.depth, 5);
-        assert_eq!(grandchild_row.depth, 6);
+        assert!(
+            rows.iter()
+                .all(|row| row.key.run_id() != Some(hidden_middle))
+        );
+        assert_eq!(grandchild_row.depth, 2);
         assert_eq!(
             grandchild_row.key,
             NodeKey::Run {
@@ -5899,9 +5901,12 @@ mod tests {
             }
         );
         assert!(!grandchild_row.label.contains("[dispatched by:"));
-        let middle_index = rows.iter().position(|row| row == middle_row).unwrap();
+        let unattached_index = rows
+            .iter()
+            .position(|row| row.key == NodeKey::UnattachedGroup)
+            .unwrap();
         let grandchild_index = rows.iter().position(|row| row == grandchild_row).unwrap();
-        assert!(middle_index < grandchild_index);
+        assert!(unattached_index < grandchild_index);
     }
 
     #[test]
