@@ -975,7 +975,7 @@ impl Reducer {
     pub(crate) fn finish_provider_observation(
         &mut self,
         prior: Option<ProviderObservationPrior>,
-        mut operations: PersistBatch,
+        operations: PersistBatch,
         origin: &ObservationOrigin,
         history_manifest: Option<&PersistHistoryDrain>,
         provider_at_ms: i64,
@@ -1099,21 +1099,6 @@ impl Reducer {
             persisted.created_at_ms = current.created_at_ms.unwrap_or(persisted.created_at_ms);
             persisted.updated_at_ms = current.updated_at_ms.unwrap_or(persisted.updated_at_ms);
             persisted.finished_at_ms = current.finished_at_ms;
-            for operation in &mut operations {
-                match operation {
-                    PersistOp::UpsertTaskRun(task_run)
-                        if task_run.task_run.run_id == canonical_run_id =>
-                    {
-                        *task_run = persisted.clone();
-                    }
-                    PersistOp::PromoteTaskRunKey { promoted, .. }
-                        if promoted.task_run.run_id == canonical_run_id =>
-                    {
-                        *promoted = persisted.clone();
-                    }
-                    _ => {}
-                }
-            }
             task_runs.push(PersistTaskRunV6 {
                 task_run: persisted,
                 state: persisted_state,
@@ -5747,6 +5732,174 @@ mod tests {
                 .map(|watermark| watermark.source_at_ms),
             Some(3_000)
         );
+    }
+
+    #[test]
+    fn provider_observation_keeps_pre_merge_survivor_upsert_unbound() {
+        let survivor = RunId::new();
+        let absorbed = RunId::new();
+        let sid = "binding-order-sid";
+        let native_key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: sid.to_owned(),
+        };
+        let mut model = DomainModel::default();
+        let mut final_survivor = run_with_controller_evidence(
+            survivor,
+            RunKey::Controller("binding-order-controller".to_owned()),
+            1,
+            TaskState::Running,
+        );
+        final_survivor.created_at_ms = Some(1_000);
+        final_survivor.updated_at_ms = Some(1_200);
+        model.insert_task_run(final_survivor);
+        model.insert_task_run_alias(native_key.clone(), survivor);
+        model.set_task_run_v6_state(survivor, TaskRunV6State::default());
+        let (mut reducer, _shared) = Reducer::new(restored(model, 3));
+
+        let upsert = |run_id, key, ordinal, at_ms, controller_evidence, native_session| {
+            let mut task_run = run(run_id, key, ordinal, TaskState::Running);
+            task_run.has_controller_task_state_event = controller_evidence;
+            task_run.created_at_ms = Some(at_ms);
+            task_run.updated_at_ms = Some(at_ms);
+            PersistOp::UpsertTaskRun(PersistTaskRun {
+                task_run,
+                native_session,
+                created_at_ms: at_ms,
+                updated_at_ms: at_ms,
+                finished_at_ms: None,
+            })
+        };
+        let operations = vec![
+            upsert(
+                survivor,
+                RunKey::Controller("binding-order-controller".to_owned()),
+                1,
+                1_000,
+                true,
+                None,
+            ),
+            upsert(
+                absorbed,
+                native_key.clone(),
+                2,
+                1_100,
+                false,
+                Some(NativeSessionBinding {
+                    provider: Provider::Codex,
+                    native_session_id: sid.to_owned(),
+                }),
+            ),
+            PersistOp::MergeTaskRuns { survivor, absorbed },
+            upsert(
+                survivor,
+                RunKey::Controller("binding-order-controller".to_owned()),
+                1,
+                1_200,
+                true,
+                Some(NativeSessionBinding {
+                    provider: Provider::Codex,
+                    native_session_id: sid.to_owned(),
+                }),
+            ),
+        ];
+
+        let drain_id = crate::model::HistoryDrainId::new("codex:binding-order").unwrap();
+        let origin = crate::model::ObservationOrigin::Historical {
+            drain_id: drain_id.clone(),
+            artifact_id: "binding-order.jsonl".to_owned(),
+        };
+        let manifest = PersistHistoryDrain {
+            drain_id,
+            provider: Provider::Codex,
+            created_at_ms: 1_000,
+            artifacts: Vec::new(),
+        };
+        let prior = reducer.begin_provider_observation(&origin, 1_200);
+        let (batch, _receipt) =
+            reducer.finish_provider_observation(prior, operations, &origin, Some(&manifest), 1_200);
+
+        assert_eq!(batch.operations.len(), 4);
+        assert!(matches!(
+            &batch.operations[0],
+            PersistOp::UpsertTaskRun(value) if value.task_run.run_id == survivor
+        ));
+        assert!(matches!(
+            &batch.operations[1],
+            PersistOp::UpsertTaskRun(value)
+                if value.task_run.run_id == absorbed
+                    && value.task_run.key == native_key
+                    && value
+                        .native_session
+                        .as_ref()
+                        .map(|binding| binding.native_session_id.as_str())
+                        == Some(sid)
+        ));
+        assert!(matches!(
+            &batch.operations[2],
+            PersistOp::MergeTaskRuns {
+                survivor: actual_survivor,
+                absorbed: actual_absorbed,
+            } if *actual_survivor == survivor && *actual_absorbed == absorbed
+        ));
+        assert!(matches!(
+            &batch.operations[3],
+            PersistOp::UpsertTaskRun(value) if value.task_run.run_id == survivor
+        ));
+
+        let survivor_upserts = batch
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                PersistOp::UpsertTaskRun(value) if value.task_run.run_id == survivor => Some(value),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(survivor_upserts.len(), 2);
+        assert!(matches!(
+            survivor_upserts[0].task_run.key,
+            RunKey::Controller(ref controller) if controller == "binding-order-controller"
+        ));
+        assert_eq!(survivor_upserts[0].native_session, None);
+        assert!(matches!(
+            survivor_upserts[1].task_run.key,
+            RunKey::Controller(ref controller) if controller == "binding-order-controller"
+        ));
+        assert_eq!(
+            survivor_upserts[1]
+                .native_session
+                .as_ref()
+                .map(|binding| binding.native_session_id.as_str()),
+            Some(sid)
+        );
+        assert_eq!(
+            batch
+                .operations
+                .iter()
+                .filter(|operation| matches!(operation, PersistOp::MergeTaskRuns { .. }))
+                .count(),
+            1
+        );
+
+        assert_eq!(batch.task_runs.len(), 1);
+        let final_run = batch
+            .task_runs
+            .iter()
+            .find(|value| value.task_run.task_run.run_id == survivor)
+            .unwrap();
+        assert_eq!(
+            final_run
+                .task_run
+                .native_session
+                .as_ref()
+                .map(|binding| binding.native_session_id.as_str()),
+            Some(sid)
+        );
+        assert!(matches!(
+            final_run.task_run.task_run.key,
+            RunKey::Controller(ref controller) if controller == "binding-order-controller"
+        ));
+        assert!(!final_run.state.history_ready);
     }
 
     struct LiveSubmissionFixture {

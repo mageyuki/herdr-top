@@ -853,6 +853,19 @@ impl Store {
         // v6 runs first so those foreign keys are valid, then replay the original core order and
         // finish with the authoritative v6 state. Existing rows are deliberately not pre-upserted:
         // historical enrichment must compare against their unmodified readiness and watermarks.
+        // A missing final merge survivor is seeded without its native binding: the absorbed row
+        // may still own that binding until the ordered `MergeTaskRuns` transfers it, and the
+        // final v6 upsert below applies the already-valid bound projection afterwards.
+        let final_merge_survivors = batch
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                PersistOp::MergeTaskRuns { survivor, .. } => {
+                    Some(canonical_run_after_operations(*survivor, &batch.operations))
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
         for task_run in &batch.task_runs {
             let exists: bool = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM task_runs WHERE run_id = ?1)",
@@ -873,6 +886,9 @@ impl Store {
                     }
                 }) {
                     seed.task_run.task_run.key = old_key.clone();
+                    seed.task_run.native_session = None;
+                }
+                if final_merge_survivors.contains(&task_run.task_run.task_run.run_id) {
                     seed.task_run.native_session = None;
                 }
                 upsert_task_run_v6(&transaction, &seed)?;
@@ -7287,6 +7303,536 @@ mod tests {
     }
 
     #[test]
+    fn v6_merge_survivor_preseed_is_binding_neutral() {
+        let sid = "merge-preseed-sid";
+        let survivor = RunId::new();
+        let absorbed = RunId::new();
+        let drain_id = HistoryDrainId::new("codex:merge-preseed").unwrap();
+        let native_key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: sid.to_owned(),
+        };
+        let controller_key = RunKey::Controller("merge-preseed-controller".to_owned());
+        // Durable starting point: only the native row owns the SID, and it is already associated
+        // with a non-finalized drain so the merge exercises the production association repoint.
+        let seed_store = || {
+            let (directory, root) = test_root();
+            let mut store = open_writer(&root).unwrap();
+            store
+                .apply_v6_batch(PersistV6Batch {
+                    task_runs: vec![PersistTaskRunV6 {
+                        task_run: match run_op_with_key(
+                            absorbed,
+                            native_key.clone(),
+                            2,
+                            TaskState::Running,
+                            1_900,
+                            false,
+                            Some(NativeSessionBinding {
+                                provider: Provider::Codex,
+                                native_session_id: sid.to_owned(),
+                            }),
+                        ) {
+                            PersistOp::UpsertTaskRun(task_run) => task_run,
+                            _ => unreachable!("run_op_with_key returns an upsert"),
+                        },
+                        state: TaskRunV6State {
+                            history_ready: false,
+                            latest_provider_at_ms: Some(1_900),
+                            ..TaskRunV6State::default()
+                        },
+                    }],
+                    history_drains: vec![PersistHistoryDrain {
+                        drain_id: drain_id.clone(),
+                        provider: Provider::Codex,
+                        created_at_ms: 1_800,
+                        artifacts: Vec::new(),
+                    }],
+                    history_associations: vec![PersistHistoryDrainRun {
+                        drain_id: drain_id.clone(),
+                        run_id: absorbed,
+                    }],
+                    ..PersistV6Batch::default()
+                })
+                .unwrap();
+            assert_eq!(binding(&store.connection, absorbed), codex_binding(sid));
+            assert_eq!(
+                store.history_drain_run_ids(&drain_id).unwrap(),
+                vec![absorbed]
+            );
+            (directory, store)
+        };
+
+        let mut final_task_run = match run_op_with_key(
+            survivor,
+            controller_key.clone(),
+            1,
+            TaskState::Running,
+            2_100,
+            true,
+            Some(NativeSessionBinding {
+                provider: Provider::Codex,
+                native_session_id: sid.to_owned(),
+            }),
+        ) {
+            PersistOp::UpsertTaskRun(task_run) => PersistTaskRunV6 {
+                task_run,
+                state: TaskRunV6State {
+                    history_ready: false,
+                    latest_provider_at_ms: Some(2_100),
+                    ..TaskRunV6State::default()
+                },
+            },
+            _ => unreachable!("run_op_with_key returns an upsert"),
+        };
+        final_task_run.task_run.created_at_ms = 2_000;
+        let batch = PersistV6Batch {
+            operations: vec![
+                run_op_with_key(
+                    survivor,
+                    controller_key.clone(),
+                    1,
+                    TaskState::Running,
+                    2_000,
+                    true,
+                    None,
+                ),
+                PersistOp::UpsertAgentNode(AgentNode {
+                    agent_node_id: "merge-preseed-agent".to_owned(),
+                    provider: Provider::Codex,
+                    native_session_id: Some(sid.to_owned()),
+                    task_run_id: absorbed,
+                    display_ordinal: DisplayOrdinal::new(3),
+                    parent_agent_node_id: None,
+                    state: None,
+                    model_id: None,
+                    last_event_kind: None,
+                    last_tool_name: None,
+                    last_item_count: None,
+                    last_byte_count: None,
+                    last_activity_at_ms: None,
+                    session_file: None,
+                }),
+                PersistOp::RecordEvent {
+                    event: Box::new(run_event("merge-preseed-event", absorbed, 2_050)),
+                    seen_at_ms: 2_050,
+                },
+                PersistOp::MergeTaskRuns { survivor, absorbed },
+                PersistOp::UpsertTaskRun(final_task_run.task_run.clone()),
+            ],
+            task_runs: vec![final_task_run],
+            history_event_drain: Some(drain_id.clone()),
+            ..PersistV6Batch::default()
+        };
+
+        let (_directory, mut store) = seed_store();
+        store.apply_v6_batch(batch.clone()).unwrap();
+
+        assert_eq!(binding(&store.connection, survivor), codex_binding(sid));
+        assert_eq!(binding(&store.connection, absorbed), (None, None));
+        assert_eq!(merged_into(&store.connection, absorbed), Some(survivor));
+        assert_eq!(
+            durable_key(&mut store, survivor),
+            (controller_key.clone(), None)
+        );
+        assert_eq!(
+            durable_key(&mut store, absorbed),
+            (native_key.clone(), Some(survivor))
+        );
+        assert_eq!(
+            count_where(
+                &store.connection,
+                "task_runs",
+                &format!("native_provider = 'codex' AND native_session_id = '{sid}'"),
+            ),
+            1
+        );
+        assert_eq!(
+            referenced_run(&store.connection, "agent_nodes", "merge-preseed-agent"),
+            survivor
+        );
+        assert_eq!(
+            referenced_run(&store.connection, "events", "merge-preseed-event"),
+            survivor
+        );
+        assert_eq!(
+            store.history_drain_run_ids(&drain_id).unwrap(),
+            vec![survivor]
+        );
+        let restored = store.load_restored_state().unwrap();
+        assert_eq!(restored.model.task_runs().count(), 1);
+        assert_eq!(
+            restored.model.task_run(&survivor).map(|run| &run.key),
+            Some(&controller_key)
+        );
+        assert!(restored.model.task_run(&absorbed).is_none());
+        let restored_state = restored.model.task_run_v6_state(&survivor).unwrap();
+        assert!(!restored_state.history_ready);
+        assert_eq!(restored_state.latest_provider_at_ms, Some(2_100));
+        assert_eq!(
+            restored
+                .model
+                .task_run_by_key(&native_key)
+                .map(|run| run.run_id),
+            Some(survivor)
+        );
+
+        let projection = |connection: &Connection| {
+            [
+                "task_runs",
+                "agent_nodes",
+                "events",
+                "history_drain_runs",
+                "history_event_before_images",
+            ]
+            .map(|table| table_rows(connection, table))
+        };
+        let before_replay = projection(&store.connection);
+        {
+            let transaction = store.connection.transaction().unwrap();
+            assert!(
+                exact_non_ingest_identity_replay_is_already_durable(&transaction, &batch).unwrap(),
+                "the committed merge batch must be recognized as an exact non-ingest replay"
+            );
+            transaction.rollback().unwrap();
+        }
+        store.apply_v6_batch(batch.clone()).unwrap();
+        assert_eq!(projection(&store.connection), before_replay);
+
+        // Atomic-rollback control: the same batch plus a deterministic failing self-merge must
+        // leave none of the preseed, core, event, agent-node, or before-image rows behind.
+        let (_control_directory, mut control) = seed_store();
+        let mut failing = batch.clone();
+        failing.operations.push(PersistOp::MergeTaskRuns {
+            survivor,
+            absorbed: survivor,
+        });
+        let result = control.apply_v6_batch(failing);
+        assert!(
+            matches!(result, Err(StoreError::InvalidData { .. })),
+            "self-merge must fail the transaction: {result:?}"
+        );
+        assert_eq!(
+            count_where(
+                &control.connection,
+                "task_runs",
+                &format!("run_id = '{survivor}'"),
+            ),
+            0
+        );
+        assert_eq!(count(&control.connection, "task_runs"), 1);
+        assert_eq!(
+            count_where(
+                &control.connection,
+                "agent_nodes",
+                "agent_node_id = 'merge-preseed-agent'",
+            ),
+            0
+        );
+        assert_eq!(
+            count_where(
+                &control.connection,
+                "events",
+                "event_id = 'merge-preseed-event'",
+            ),
+            0
+        );
+        assert_eq!(count(&control.connection, "history_event_before_images"), 0);
+        assert_eq!(binding(&control.connection, absorbed), codex_binding(sid));
+        assert_eq!(merged_into(&control.connection, absorbed), None);
+        assert_eq!(
+            control.history_drain_run_ids(&drain_id).unwrap(),
+            vec![absorbed]
+        );
+    }
+
+    #[test]
+    fn v6_missing_promotion_preseed_uses_old_key_before_promotion() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let run_id = RunId::new();
+        let alias_run_id = RunId::new();
+        let sid = "missing-promotion-sid";
+        let old_key = RunKey::NativePath {
+            provider: Provider::Codex,
+            path: "/tmp/missing-promotion.jsonl".to_owned(),
+        };
+        let promoted_key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: sid.to_owned(),
+        };
+        let promoted = match run_op_with_key(
+            run_id,
+            promoted_key.clone(),
+            1,
+            TaskState::Running,
+            2_000,
+            false,
+            Some(NativeSessionBinding {
+                provider: Provider::Codex,
+                native_session_id: sid.to_owned(),
+            }),
+        ) {
+            PersistOp::UpsertTaskRun(task_run) => PersistTaskRunV6 {
+                task_run,
+                state: TaskRunV6State {
+                    history_ready: false,
+                    latest_provider_at_ms: Some(2_000),
+                    ..TaskRunV6State::default()
+                },
+            },
+            _ => unreachable!("run_op_with_key returns an upsert"),
+        };
+        assert_eq!(count(&store.connection, "task_runs"), 0);
+
+        store
+            .apply_v6_batch(PersistV6Batch {
+                operations: vec![PersistOp::PromoteTaskRunKey {
+                    promoted: promoted.task_run.clone(),
+                    old_key: old_key.clone(),
+                    alias_run_id,
+                }],
+                task_runs: vec![promoted],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+
+        assert_eq!(count(&store.connection, "task_runs"), 2);
+        assert_eq!(
+            durable_key(&mut store, run_id),
+            (promoted_key.clone(), None)
+        );
+        assert_eq!(binding(&store.connection, run_id), codex_binding(sid));
+        assert_eq!(
+            count_where(
+                &store.connection,
+                "task_runs",
+                &format!("native_provider = 'codex' AND native_session_id = '{sid}'"),
+            ),
+            1
+        );
+        assert_eq!(
+            durable_key(&mut store, alias_run_id),
+            (old_key.clone(), Some(run_id))
+        );
+        assert_eq!(binding(&store.connection, alias_run_id), (None, None));
+        assert_eq!(
+            count_where(
+                &store.connection,
+                "task_runs",
+                "key_kind = 'native_path' AND merged_into IS NULL",
+            ),
+            0
+        );
+        let restored = store.load_restored_state().unwrap();
+        assert_eq!(
+            restored.model.task_run(&run_id).map(|run| &run.key),
+            Some(&promoted_key)
+        );
+        assert!(restored.model.task_run(&alias_run_id).is_none());
+        assert_eq!(
+            restored
+                .model
+                .task_run_by_key(&old_key)
+                .map(|run| run.run_id),
+            Some(run_id)
+        );
+        assert_eq!(
+            restored
+                .model
+                .task_run_by_key(&promoted_key)
+                .map(|run| run.run_id),
+            Some(run_id)
+        );
+    }
+
+    #[test]
+    fn v6_chained_merge_preseed_transfers_binding_once_and_replays() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let sid = "chained-merge-sid";
+        let first = RunId::new();
+        let intermediate = RunId::new();
+        let final_survivor = RunId::new();
+        let native_key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: sid.to_owned(),
+        };
+        let intermediate_key = RunKey::Controller("chained-merge-intermediate".to_owned());
+        let final_key = RunKey::Controller("chained-merge-final".to_owned());
+        let codex_session = || NativeSessionBinding {
+            provider: Provider::Codex,
+            native_session_id: sid.to_owned(),
+        };
+        store
+            .apply_v6_batch(PersistV6Batch {
+                task_runs: vec![PersistTaskRunV6 {
+                    task_run: match run_op_with_key(
+                        first,
+                        native_key.clone(),
+                        1,
+                        TaskState::Running,
+                        1_900,
+                        false,
+                        Some(codex_session()),
+                    ) {
+                        PersistOp::UpsertTaskRun(task_run) => task_run,
+                        _ => unreachable!("run_op_with_key returns an upsert"),
+                    },
+                    state: TaskRunV6State {
+                        latest_provider_at_ms: Some(1_900),
+                        ..TaskRunV6State::default()
+                    },
+                }],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+        assert_eq!(binding(&store.connection, first), codex_binding(sid));
+
+        let mut event = run_event("chained-merge-event", first, 1_950);
+        let NormalizedEvent::ExecutionEnd { metadata, .. } = &mut event else {
+            unreachable!("run_event returns an execution end");
+        };
+        metadata.ingest_seq = Some(41);
+        let mut final_task_run = match run_op_with_key(
+            final_survivor,
+            final_key.clone(),
+            3,
+            TaskState::Running,
+            2_200,
+            true,
+            Some(codex_session()),
+        ) {
+            PersistOp::UpsertTaskRun(task_run) => PersistTaskRunV6 {
+                task_run,
+                state: TaskRunV6State {
+                    history_ready: true,
+                    latest_provider_at_ms: Some(2_200),
+                    ..TaskRunV6State::default()
+                },
+            },
+            _ => unreachable!("run_op_with_key returns an upsert"),
+        };
+        final_task_run.task_run.created_at_ms = 2_100;
+        let batch = PersistV6Batch {
+            operations: vec![
+                PersistOp::AdvanceIngestSequence { ingest_seq: 41 },
+                PersistOp::RecordEvent {
+                    event: Box::new(event),
+                    seen_at_ms: 1_950,
+                },
+                run_op_with_key(
+                    intermediate,
+                    intermediate_key.clone(),
+                    2,
+                    TaskState::Running,
+                    2_000,
+                    true,
+                    None,
+                ),
+                PersistOp::MergeTaskRuns {
+                    survivor: intermediate,
+                    absorbed: first,
+                },
+                run_op_with_key(
+                    final_survivor,
+                    final_key.clone(),
+                    3,
+                    TaskState::Running,
+                    2_100,
+                    true,
+                    None,
+                ),
+                PersistOp::MergeTaskRuns {
+                    survivor: final_survivor,
+                    absorbed: intermediate,
+                },
+                PersistOp::UpsertTaskRun(final_task_run.task_run.clone()),
+            ],
+            task_runs: vec![final_task_run],
+            ..PersistV6Batch::default()
+        };
+
+        store.apply_v6_batch(batch.clone()).unwrap();
+
+        assert_eq!(
+            binding(&store.connection, final_survivor),
+            codex_binding(sid)
+        );
+        assert_eq!(binding(&store.connection, intermediate), (None, None));
+        assert_eq!(binding(&store.connection, first), (None, None));
+        assert_eq!(
+            count_where(
+                &store.connection,
+                "task_runs",
+                &format!("native_provider = 'codex' AND native_session_id = '{sid}'"),
+            ),
+            1
+        );
+        assert_eq!(
+            durable_key(&mut store, final_survivor),
+            (final_key.clone(), None)
+        );
+        assert_eq!(
+            durable_key(&mut store, intermediate),
+            (intermediate_key.clone(), Some(final_survivor))
+        );
+        assert_eq!(
+            durable_key(&mut store, first),
+            (native_key.clone(), Some(final_survivor))
+        );
+        assert_eq!(
+            referenced_run(&store.connection, "events", "chained-merge-event"),
+            final_survivor
+        );
+        let restored = store.load_restored_state().unwrap();
+        assert_eq!(restored.model.task_runs().count(), 1);
+        assert_eq!(
+            restored.model.task_run(&final_survivor).map(|run| &run.key),
+            Some(&final_key)
+        );
+        let restored_state = restored.model.task_run_v6_state(&final_survivor).unwrap();
+        assert!(restored_state.history_ready);
+        assert_eq!(restored_state.latest_provider_at_ms, Some(2_200));
+        assert_eq!(
+            restored
+                .model
+                .task_run_by_key(&native_key)
+                .map(|run| run.run_id),
+            Some(final_survivor)
+        );
+        assert_eq!(restored.next_ingest_seq, Some(42));
+
+        let projection = |connection: &Connection| {
+            ["task_runs", "events", "event_ledger"].map(|table| table_rows(connection, table))
+        };
+        let before_replay = projection(&store.connection);
+        {
+            let transaction = store.connection.transaction().unwrap();
+            assert!(
+                !exact_non_ingest_identity_replay_is_already_durable(&transaction, &batch).unwrap(),
+                "an ingest batch must not be recognized by the non-ingest identity replay path"
+            );
+            assert!(
+                exact_v6_replay_is_already_durable(&transaction, &batch).unwrap(),
+                "the committed ingest batch must be recognized as an exact ingest replay"
+            );
+            transaction.rollback().unwrap();
+        }
+        store.apply_v6_batch(batch.clone()).unwrap();
+        assert_eq!(projection(&store.connection), before_replay);
+        assert_eq!(
+            binding(&store.connection, final_survivor),
+            codex_binding(sid)
+        );
+        assert_eq!(merged_into(&store.connection, first), Some(final_survivor));
+        assert_eq!(
+            merged_into(&store.connection, intermediate),
+            Some(final_survivor)
+        );
+    }
+
+    #[test]
     fn schema_v7_exact_non_ingest_identity_replay_requires_matching_agent_node() {
         let persisted = |run_id: RunId,
                          key: RunKey,
@@ -9595,6 +10141,38 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    /// Reads the durable run key and direct merge target through the production decoder.
+    fn durable_key(store: &mut Store, run_id: RunId) -> (RunKey, Option<RunId>) {
+        let transaction = store.connection.transaction().unwrap();
+        let durable = durable_run_key_and_target(&transaction, run_id)
+            .unwrap()
+            .unwrap_or_else(|| panic!("task run {run_id} must be durable"));
+        transaction.rollback().unwrap();
+        durable
+    }
+
+    /// Captures every column of every row in one table as a sorted logical projection.
+    fn table_rows(connection: &Connection, table: &str) -> Vec<Vec<String>> {
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM {table}"))
+            .unwrap();
+        let column_count = statement.column_count();
+        let mut rows = statement
+            .query_map([], |row| {
+                (0..column_count)
+                    .map(|index| {
+                        row.get::<_, rusqlite::types::Value>(index)
+                            .map(|value| format!("{value:?}"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows.sort();
+        rows
     }
 
     fn history_drain_manifest(
