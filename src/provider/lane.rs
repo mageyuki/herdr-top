@@ -972,22 +972,20 @@ fn root_runtime_state_event(
         .file_name()
         .unwrap_or_else(|| OsStr::new("artifact"))
         .to_string_lossy();
+    let suffix = match &state {
+        ExecState::Working => "working",
+        ExecState::Idle => "idle",
+        _ => unreachable!("only live Codex runtime states are emitted"),
+    };
     ProviderEvent::AgentUpsert {
         provider: Provider::Codex,
         agent_thread_id: rollout_id.clone(),
         owner_session_id: Some(rollout_id.clone()),
         parent_thread_id: None,
-        state: Some(state.clone()),
+        state: Some(state),
         model_id: None,
         depth: Some(0),
-        event_id: format!(
-            "prov:codex:runtime:{basename}:{ordinal}:{sequence}:{}",
-            match state {
-                ExecState::Working => "working",
-                ExecState::Idle => "idle",
-                _ => unreachable!("only live Codex runtime states are emitted"),
-            }
-        ),
+        event_id: format!("prov:codex:runtime:{basename}:{ordinal}:{sequence}:{suffix}"),
         observed_at_ms: at_ms,
         position: SourcePosition {
             path_id: u32::MAX,
@@ -5343,5 +5341,30 @@ mod tests {
             ))),
             None
         );
+    }
+
+    #[test]
+    fn root_runtime_state_event_preserves_state_and_suffix() {
+        let artifact = Path::new("rollout-runtime.jsonl");
+        let scope = SessionScope::Codex {
+            rollout_id: "runtime-root".to_owned(),
+        };
+        for (state, suffix) in [(ExecState::Working, "working"), (ExecState::Idle, "idle")] {
+            let event = root_runtime_state_event(artifact, 7, 3, &scope, 11_000, state.clone());
+            match event {
+                ProviderEvent::AgentUpsert {
+                    state: observed,
+                    event_id,
+                    ..
+                } => {
+                    assert_eq!(observed, Some(state));
+                    assert_eq!(
+                        event_id,
+                        format!("prov:codex:runtime:rollout-runtime.jsonl:7:3:{suffix}")
+                    );
+                }
+                event => panic!("unexpected runtime event: {event:?}"),
+            }
+        }
     }
 }
