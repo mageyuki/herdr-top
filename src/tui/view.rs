@@ -6235,6 +6235,99 @@ mod tests {
     }
 
     #[test]
+    fn display_stale_parented_ended_agent_refines_exact_bound_child_run() {
+        let root_run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let child_run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        for (child_state, native_end) in [
+            (TaskState::EndedUnknown, None),
+            (TaskState::Running, Some(NativeSessionEndStatus::Unknown)),
+        ] {
+            let mut model = placement_model(&["pane-root"]);
+            insert_placement_run(&mut model, root_run_id, "hook:codex:controller-root", 1);
+            insert_placement_execution(
+                &mut model,
+                root_run_id,
+                "root-execution",
+                "pane-root",
+                ExecState::Working,
+            );
+            model.insert_task_run(TaskRun {
+                run_id: child_run_id,
+                key: RunKey::Controller("hook:codex:child-sid".to_owned()),
+                display_ordinal: DisplayOrdinal::new(2),
+                state: child_state,
+                has_controller_task_state_event: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: (child_state == TaskState::EndedUnknown).then_some(0),
+                subject: Some("Durable child".to_owned()),
+                dismissed_at_ms: None,
+            });
+            model.insert_task_run_alias(
+                RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: "child-sid".to_owned(),
+                },
+                child_run_id,
+            );
+            if let Some(status) = native_end {
+                model.set_task_run_v6_state(
+                    child_run_id,
+                    TaskRunV6State {
+                        native_session_end: Some(NativeSessionEnd { status, at_ms: 0 }),
+                        ..TaskRunV6State::default()
+                    },
+                );
+            }
+            model.insert_execution_edge(ExecutionEdge {
+                parent_run_id: root_run_id,
+                child_run_id,
+            });
+            // The ended child Agent Node is owned by the controller/root run and parented, as in
+            // the persisted production topology; only its exact native alias binds it to the
+            // child Task Run. Its activity sits exactly at the display-staleness boundary.
+            model.insert_agent_node(AgentNode {
+                agent_node_id: "durable-ended-child".to_owned(),
+                provider: Provider::Codex,
+                native_session_id: Some("child-sid".to_owned()),
+                task_run_id: root_run_id,
+                display_ordinal: DisplayOrdinal::new(3),
+                parent_agent_node_id: Some("provider-root".to_owned()),
+                state: Some(ExecState::Ended),
+                model_id: None,
+                last_event_kind: None,
+                last_tool_name: None,
+                last_item_count: None,
+                last_byte_count: None,
+                last_activity_at_ms: Some(-crate::provider::lane::DEFAULT_HEADLESS_INACTIVITY_MS),
+                session_file: None,
+            });
+
+            let rows = build_rows(&model, &AppState::default());
+
+            assert_eq!(
+                only_run_row(&rows, child_run_id).display_status,
+                Some(projection::DisplayStatus::new(
+                    projection::TaskDisplayStatus::Done,
+                    projection::StatusSource::AgentNodeState,
+                )),
+                "child {child_state:?} with native end {native_end:?}"
+            );
+            assert!(
+                only_run_row(&rows, child_run_id)
+                    .label
+                    .starts_with("✓ done "),
+                "child {child_state:?} label: {}",
+                only_run_row(&rows, child_run_id).label
+            );
+            assert!(
+                !has_agent_row(&rows, "durable-ended-child"),
+                "the display-stale ended Agent row must stay hidden"
+            );
+        }
+    }
+
+    #[test]
     fn unknown_without_activity_and_old_stale_agent_remain_in_tree_rows() {
         let mut model = populated_model();
         let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");

@@ -145,6 +145,33 @@ pub(crate) fn rate_pane_execution_candidate_visits() -> usize {
 pub(crate) struct StatusReadModel {
     pane_executions: HashMap<RunId, HashMap<String, ExecState>>,
     root_agents: HashMap<RunId, AgentStatusEvidence>,
+    /// Presentation-only newest Agent Node per Task Run exact `RunKey::Native` alias.
+    ///
+    /// Ownership, parentage, and display staleness are deliberately ignored: a real child
+    /// completion stays parented and owned by its controller/root run, while the child Task Run
+    /// is only addressable through its exact provider-and-session alias. This map never makes
+    /// an Agent row visible and never feeds `run_rate_activity`.
+    durable_native_agents: HashMap<RunId, AgentStatusEvidence>,
+}
+
+fn insert_newest_agent_evidence(
+    selected: &mut HashMap<RunId, AgentStatusEvidence>,
+    run_id: RunId,
+    candidate: AgentStatusEvidence,
+) {
+    selected
+        .entry(run_id)
+        .and_modify(|current| {
+            if (current.last_activity_at_ms, current.agent_node_id.as_str())
+                < (
+                    candidate.last_activity_at_ms,
+                    candidate.agent_node_id.as_str(),
+                )
+            {
+                current.clone_from(&candidate);
+            }
+        })
+        .or_insert(candidate);
 }
 
 impl StatusReadModel {
@@ -183,16 +210,50 @@ impl StatusReadModel {
                 .insert(pane_id, state);
         }
 
+        // The exact-native alias lookup exists only for the full display projection. The
+        // filtered rate-only projection never builds or consults durable presentation evidence.
+        let native_aliases = run_id.is_none().then(|| {
+            model
+                .task_run_bindings()
+                .filter_map(|(key, run_id)| match key {
+                    RunKey::Native { provider, sid } => Some(((*provider, sid.as_str()), *run_id)),
+                    RunKey::NativePath { .. }
+                    | RunKey::Controller(_)
+                    | RunKey::Provisional { .. } => None,
+                })
+                .collect::<HashMap<(Provider, &str), RunId>>()
+        });
+
         let mut root_agents = HashMap::<RunId, AgentStatusEvidence>::new();
+        let mut durable_native_agents = HashMap::<RunId, AgentStatusEvidence>::new();
         for agent in model.agent_nodes() {
             #[cfg(test)]
             RATE_STATUS_EVIDENCE_VISITS.set(RATE_STATUS_EVIDENCE_VISITS.get() + 1);
+            let is_live_line = agent.last_event_kind.as_deref()
+                == Some(crate::provider::lane::LIVE_LINE_EVENT_KIND);
+            if let Some(native_aliases) = native_aliases.as_ref()
+                && !is_live_line
+                && let Some(sid) = agent
+                    .native_session_id
+                    .as_deref()
+                    .filter(|sid| !sid.is_empty())
+                && let Some(target_run_id) = native_aliases.get(&(agent.provider, sid))
+            {
+                insert_newest_agent_evidence(
+                    &mut durable_native_agents,
+                    *target_run_id,
+                    AgentStatusEvidence {
+                        state: agent.state.clone(),
+                        last_activity_at_ms: agent.last_activity_at_ms,
+                        agent_node_id: agent.agent_node_id.clone(),
+                    },
+                );
+            }
             if run_id.is_some_and(|run_id| agent.task_run_id != run_id) {
                 continue;
             }
             if agent.parent_agent_node_id.is_some()
-                || agent.last_event_kind.as_deref()
-                    == Some(crate::provider::lane::LIVE_LINE_EVENT_KIND)
+                || is_live_line
                 || agent_node_is_display_stale(agent, now_ms)
                 || model
                     .task_run(&agent.task_run_id)
@@ -201,31 +262,34 @@ impl StatusReadModel {
             {
                 continue;
             }
-            let candidate = AgentStatusEvidence {
-                state: agent.state.clone(),
-                last_activity_at_ms: agent.last_activity_at_ms,
-                agent_node_id: agent.agent_node_id.clone(),
-            };
-            root_agents
-                .entry(agent.task_run_id)
-                .and_modify(|selected| {
-                    if (
-                        selected.last_activity_at_ms,
-                        selected.agent_node_id.as_str(),
-                    ) < (
-                        candidate.last_activity_at_ms,
-                        candidate.agent_node_id.as_str(),
-                    ) {
-                        selected.clone_from(&candidate);
-                    }
-                })
-                .or_insert(candidate);
+            insert_newest_agent_evidence(
+                &mut root_agents,
+                agent.task_run_id,
+                AgentStatusEvidence {
+                    state: agent.state.clone(),
+                    last_activity_at_ms: agent.last_activity_at_ms,
+                    agent_node_id: agent.agent_node_id.clone(),
+                },
+            );
         }
 
         Self {
             pane_executions,
             root_agents,
+            durable_native_agents,
         }
+    }
+
+    /// Returns Agent-Node-sourced `done` only when the newest exact-native evidence is ended.
+    fn durable_ended_status(&self, run_id: RunId, inactive: bool) -> Option<DisplayStatus> {
+        self.durable_native_agents
+            .get(&run_id)
+            .and_then(|evidence| {
+                matches!(evidence.state.as_ref(), Some(ExecState::Ended)).then_some(
+                    DisplayStatus::new(TaskDisplayStatus::Done, StatusSource::AgentNodeState)
+                        .with_stalled(inactive),
+                )
+            })
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -244,17 +308,26 @@ impl StatusReadModel {
         pane_id: Option<&str>,
         inactive: bool,
     ) -> DisplayStatus {
+        // Semantic Completed, Failed, and Cancelled stay authoritative. Only EndedUnknown may be
+        // refined by durable exact-native ended evidence; otherwise it stays Task-State unknown.
         let terminal = match run.state {
             TaskState::Completed => Some(TaskDisplayStatus::Done),
             TaskState::Failed => Some(TaskDisplayStatus::Error),
             TaskState::Cancelled => Some(TaskDisplayStatus::Cancelled),
-            TaskState::EndedUnknown => Some(TaskDisplayStatus::Unknown),
+            TaskState::EndedUnknown => {
+                if let Some(status) = self.durable_ended_status(run.run_id, inactive) {
+                    return status;
+                }
+                Some(TaskDisplayStatus::Unknown)
+            }
             TaskState::Queued | TaskState::Blocked | TaskState::Running => None,
         };
         if let Some(status) = terminal {
             return DisplayStatus::new(status, StatusSource::TaskState).with_stalled(inactive);
         }
 
+        // Native Done, Error, and Cancelled stay authoritative. Only native Unknown may be
+        // refined by durable exact-native ended evidence; otherwise it stays lifecycle unknown.
         if let Some(end) = model
             .task_run_v6_state(&run.run_id)
             .and_then(|state| state.native_session_end.as_ref())
@@ -263,7 +336,12 @@ impl StatusReadModel {
                 NativeSessionEndStatus::Done => TaskDisplayStatus::Done,
                 NativeSessionEndStatus::Error => TaskDisplayStatus::Error,
                 NativeSessionEndStatus::Cancelled => TaskDisplayStatus::Cancelled,
-                NativeSessionEndStatus::Unknown => TaskDisplayStatus::Unknown,
+                NativeSessionEndStatus::Unknown => {
+                    if let Some(status) = self.durable_ended_status(run.run_id, inactive) {
+                        return status;
+                    }
+                    TaskDisplayStatus::Unknown
+                }
             };
             return DisplayStatus::new(status, StatusSource::NativeSessionLifecycle)
                 .with_stalled(inactive);
@@ -636,6 +714,348 @@ mod tests {
                 exact_activity, full_activity,
                 "projection mismatch for {:?}",
                 run.key
+            );
+        }
+    }
+
+    // Durable child-status projection fixtures.
+    //
+    // The target Task Run is Controller-keyed and independently addressable through an exact
+    // `RunKey::Native` alias. Agent Nodes are owned by a *different* controller/root Task Run and
+    // are parented, matching the persisted production topology of a real Codex child.
+
+    const CHILD_SID: &str = "child-sid";
+    const ROOT_AGENT_ID: &str = "root-agent";
+
+    fn durable_target_run(state: TaskState) -> TaskRun {
+        TaskRun {
+            run_id: RunId::new(),
+            key: RunKey::Controller(format!("hook:codex:{CHILD_SID}")),
+            display_ordinal: DisplayOrdinal::new(2),
+            state,
+            has_controller_task_state_event: true,
+            created_at_ms: Some(1),
+            updated_at_ms: Some(1),
+            finished_at_ms: state.is_terminal().then_some(2),
+            subject: None,
+            dismissed_at_ms: None,
+        }
+    }
+
+    /// Returns a model holding the target run, its exact native alias, and a separate owner run.
+    fn durable_model(target: &TaskRun) -> (DomainModel, RunId) {
+        let owner = TaskRun {
+            run_id: RunId::new(),
+            key: RunKey::Controller("hook:codex:controller-root".to_owned()),
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+            created_at_ms: Some(1),
+            updated_at_ms: Some(1),
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        };
+        let mut model = DomainModel::default();
+        model.insert_task_run(owner.clone());
+        model.insert_task_run(target.clone());
+        assert_eq!(
+            model.insert_task_run_alias(
+                RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: CHILD_SID.to_owned(),
+                },
+                target.run_id,
+            ),
+            None
+        );
+        (model, owner.run_id)
+    }
+
+    fn parented_agent(
+        agent_node_id: &str,
+        owner_run_id: RunId,
+        provider: Provider,
+        native_session_id: Option<&str>,
+        state: ExecState,
+        last_event_kind: Option<&str>,
+        last_activity_at_ms: i64,
+    ) -> AgentNode {
+        AgentNode {
+            agent_node_id: agent_node_id.to_owned(),
+            provider,
+            native_session_id: native_session_id.map(str::to_owned),
+            task_run_id: owner_run_id,
+            display_ordinal: DisplayOrdinal::new(last_activity_at_ms),
+            parent_agent_node_id: Some(ROOT_AGENT_ID.to_owned()),
+            state: Some(state),
+            model_id: None,
+            last_event_kind: last_event_kind.map(str::to_owned),
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: Some(last_activity_at_ms),
+            session_file: None,
+        }
+    }
+
+    fn exact_ended_agent(owner_run_id: RunId, last_activity_at_ms: i64) -> AgentNode {
+        parented_agent(
+            "exact-ended-child",
+            owner_run_id,
+            Provider::Codex,
+            Some(CHILD_SID),
+            ExecState::Ended,
+            None,
+            last_activity_at_ms,
+        )
+    }
+
+    fn display_status_at(model: &DomainModel, run: &TaskRun, now_ms: i64) -> DisplayStatus {
+        StatusReadModel::from_model(model, now_ms).task_display_status(model, run, None, false)
+    }
+
+    fn agent_done() -> DisplayStatus {
+        DisplayStatus::new(TaskDisplayStatus::Done, StatusSource::AgentNodeState)
+    }
+
+    fn task_state_unknown() -> DisplayStatus {
+        DisplayStatus::new(TaskDisplayStatus::Unknown, StatusSource::TaskState)
+    }
+
+    fn set_native_end(model: &mut DomainModel, run_id: RunId, status: NativeSessionEndStatus) {
+        model.set_task_run_v6_state(
+            run_id,
+            crate::model::TaskRunV6State {
+                native_session_end: Some(crate::model::NativeSessionEnd { status, at_ms: 100 }),
+                ..crate::model::TaskRunV6State::default()
+            },
+        );
+    }
+
+    #[test]
+    fn ended_unknown_uses_exact_native_ended_agent_across_staleness() {
+        let target = durable_target_run(TaskState::EndedUnknown);
+        let (mut model, owner) = durable_model(&target);
+        model.insert_agent_node(exact_ended_agent(owner, 100));
+        let staleness_deadline_ms = 100 + crate::activity::headless_inactivity_ms();
+
+        assert_eq!(
+            display_status_at(&model, &target, staleness_deadline_ms - 1),
+            agent_done(),
+            "immediately before the Agent row staleness boundary"
+        );
+        assert_eq!(
+            display_status_at(&model, &target, staleness_deadline_ms),
+            agent_done(),
+            "exactly at the Agent row staleness boundary"
+        );
+    }
+
+    #[test]
+    fn unknown_refinement_requires_exact_native_binding() {
+        let now_ms = 100 + crate::activity::headless_inactivity_ms();
+
+        // Negative control 1: same provider, different SID.
+        let target = durable_target_run(TaskState::EndedUnknown);
+        let (mut model, owner) = durable_model(&target);
+        model.insert_agent_node(parented_agent(
+            "different-sid",
+            owner,
+            Provider::Codex,
+            Some("other-sid"),
+            ExecState::Ended,
+            None,
+            100,
+        ));
+        assert_eq!(
+            display_status_at(&model, &target, now_ms),
+            task_state_unknown(),
+            "a different SID must not refine unknown"
+        );
+
+        // Negative control 2: foreign provider with the same SID.
+        let target = durable_target_run(TaskState::EndedUnknown);
+        let (mut model, owner) = durable_model(&target);
+        model.insert_agent_node(parented_agent(
+            "foreign-provider",
+            owner,
+            Provider::Claude,
+            Some(CHILD_SID),
+            ExecState::Ended,
+            None,
+            100,
+        ));
+        assert_eq!(
+            display_status_at(&model, &target, now_ms),
+            task_state_unknown(),
+            "a foreign provider must not refine unknown"
+        );
+
+        // Negative control 3: exact binding, but a synthetic live-line node.
+        let target = durable_target_run(TaskState::EndedUnknown);
+        let (mut model, owner) = durable_model(&target);
+        model.insert_agent_node(parented_agent(
+            "live-line-exact",
+            owner,
+            Provider::Codex,
+            Some(CHILD_SID),
+            ExecState::Ended,
+            Some(crate::provider::lane::LIVE_LINE_EVENT_KIND),
+            100,
+        ));
+        assert_eq!(
+            display_status_at(&model, &target, now_ms),
+            task_state_unknown(),
+            "a synthetic live-line node must not refine unknown"
+        );
+
+        // Positive control: exact provider and SID, non-live-line, ended.
+        let target = durable_target_run(TaskState::EndedUnknown);
+        let (mut model, owner) = durable_model(&target);
+        model.insert_agent_node(exact_ended_agent(owner, 100));
+        assert_eq!(
+            display_status_at(&model, &target, now_ms),
+            agent_done(),
+            "an exact ended binding must refine unknown to Agent-Node-sourced done"
+        );
+    }
+
+    #[test]
+    fn newest_exact_native_agent_must_be_ended() {
+        fn model_with(ended_at_ms: i64, working_at_ms: i64) -> (DomainModel, TaskRun) {
+            let target = durable_target_run(TaskState::EndedUnknown);
+            let (mut model, owner) = durable_model(&target);
+            model.insert_agent_node(parented_agent(
+                "exact-ended",
+                owner,
+                Provider::Codex,
+                Some(CHILD_SID),
+                ExecState::Ended,
+                None,
+                ended_at_ms,
+            ));
+            model.insert_agent_node(parented_agent(
+                "exact-working",
+                owner,
+                Provider::Codex,
+                Some(CHILD_SID),
+                ExecState::Working,
+                None,
+                working_at_ms,
+            ));
+            (model, target)
+        }
+        let now_ms = 20 + crate::activity::headless_inactivity_ms();
+
+        let (model, target) = model_with(10, 20);
+        assert_eq!(
+            display_status_at(&model, &target, now_ms),
+            task_state_unknown(),
+            "an older ended node must not override a newer working exact node"
+        );
+
+        let (model, target) = model_with(20, 10);
+        assert_eq!(
+            display_status_at(&model, &target, now_ms),
+            agent_done(),
+            "the newest exact node being ended must refine unknown"
+        );
+    }
+
+    #[test]
+    fn native_unknown_uses_exact_native_ended_agent_but_definitive_outcomes_win() {
+        let target = durable_target_run(TaskState::Running);
+        let (mut model, owner) = durable_model(&target);
+        model.insert_agent_node(exact_ended_agent(owner, 100));
+        let now_ms = 100 + crate::activity::headless_inactivity_ms();
+
+        set_native_end(&mut model, target.run_id, NativeSessionEndStatus::Unknown);
+        assert_eq!(
+            display_status_at(&model, &target, now_ms),
+            agent_done(),
+            "native Unknown must use durable exact ended evidence"
+        );
+
+        for (status, expected) in [
+            (NativeSessionEndStatus::Done, TaskDisplayStatus::Done),
+            (NativeSessionEndStatus::Error, TaskDisplayStatus::Error),
+            (
+                NativeSessionEndStatus::Cancelled,
+                TaskDisplayStatus::Cancelled,
+            ),
+        ] {
+            set_native_end(&mut model, target.run_id, status);
+            assert_eq!(
+                display_status_at(&model, &target, now_ms),
+                DisplayStatus::new(expected, StatusSource::NativeSessionLifecycle),
+                "native {status:?} must stay authoritative"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_definitive_outcomes_override_exact_native_ended_agent() {
+        let now_ms = 100 + crate::activity::headless_inactivity_ms();
+        for (state, expected) in [
+            (TaskState::Completed, TaskDisplayStatus::Done),
+            (TaskState::Failed, TaskDisplayStatus::Error),
+            (TaskState::Cancelled, TaskDisplayStatus::Cancelled),
+        ] {
+            let target = durable_target_run(state);
+            let (mut model, owner) = durable_model(&target);
+            model.insert_agent_node(exact_ended_agent(owner, 100));
+            assert_eq!(
+                display_status_at(&model, &target, now_ms),
+                DisplayStatus::new(expected, StatusSource::TaskState),
+                "semantic {state:?} must stay authoritative"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_native_projection_does_not_change_run_rate_activity() {
+        let now_ms = 100 + crate::activity::headless_inactivity_ms();
+        for (state, expected) in [
+            (TaskState::Running, RunRateActivity::Working),
+            (TaskState::EndedUnknown, RunRateActivity::Paused),
+        ] {
+            let target = durable_target_run(state);
+            let (mut model, owner) = durable_model(&target);
+            model.insert_agent_node(exact_ended_agent(owner, 100));
+            let owner_run = model.task_run(&owner).cloned().unwrap();
+
+            let full = StatusReadModel::from_model(&model, now_ms);
+            assert_eq!(
+                full.run_rate_activity(&model, &target),
+                expected,
+                "full projection for {state:?}"
+            );
+            assert_eq!(
+                full.run_rate_activity(&model, &owner_run),
+                RunRateActivity::Working,
+                "full projection for the owner run"
+            );
+
+            reset_rate_status_evidence_visits();
+            assert_eq!(
+                StatusReadModel::run_rate_activity_from_model(&model, &target, now_ms),
+                expected,
+                "exact projection for {state:?}"
+            );
+            assert_eq!(
+                rate_status_evidence_visits(),
+                1,
+                "the rate-only projection visits each Agent Node exactly once"
+            );
+            assert_eq!(rate_pane_execution_candidate_visits(), 0);
+
+            reset_rate_status_evidence_visits();
+            let _ = StatusReadModel::from_model(&model, now_ms);
+            assert_eq!(
+                rate_status_evidence_visits(),
+                1,
+                "the full projection visits each Agent Node exactly once"
             );
         }
     }

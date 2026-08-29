@@ -203,7 +203,7 @@ Terminal `TaskState` facts win over every runtime observation:
 | `completed` | `done` |
 | `failed` | `error` |
 | `cancelled` | `cancelled` |
-| `ended_unknown` | `unknown` |
+| `ended_unknown` | `done` from durable exact-native ended evidence, otherwise `unknown` |
 
 Persisted native-session lifecycle evidence is next when semantic state is not
 terminal:
@@ -213,7 +213,24 @@ terminal:
 | `Done` | `done` |
 | `Error` | `error` |
 | `Cancelled` | `cancelled` |
-| `Unknown` | `unknown` |
+| `Unknown` | `done` from durable exact-native ended evidence, otherwise `unknown` |
+
+Durable exact-native ended evidence is presentation-only. Only an Agent Node
+whose provider and nonempty native session ID both exactly match one of the
+Task Run's `RunKey::Native` aliases can supply it, and only when it is the
+newest such node by `(last_activity_at_ms, agent_node_id)` and its state is
+exactly `ended`. Agent ownership and `parent_agent_node_id` do not identify
+the target Task Run: a real Codex child completion remains a parented Agent
+Node owned by its controller/root run. A synthetic live-line node, a foreign
+provider, a different session ID, or an older ended node followed by a newer
+non-ended exact node cannot refine `unknown`. The refinement applies only to
+semantic `ended_unknown` and nonterminal native lifecycle `Unknown`; it
+reports `done` with source `agent_node_state`. Definitive semantic
+`completed`, `failed`, and `cancelled` and native `Done`, `Error`, and
+`Cancelled` keep their existing status and source, and a still-running Task
+Run never becomes `done` from this evidence. No semantic or native lifecycle
+record is changed, and the Agent Node row and live-line fallback still
+disappear at the existing staleness deadline.
 
 Semantic pre-start and block facts follow:
 
@@ -379,7 +396,11 @@ activity has been silent for `HERDR_TOP_HEADLESS_INACTIVITY_MS`; a node without
 an activity timestamp remains visible, as do known states such as `stale` and
 `working`. A visible child of any display-stale parent is re-parented beneath
 the owning Task Run. These display rules remove no model or SQLite data, and
-the Task Run live-line fallback also ignores display-stale Agent Nodes.
+the Task Run live-line fallback also ignores display-stale Agent Nodes. A
+display-stale ended Agent Node nevertheless remains durable exact-native
+evidence for the Task Run bound to its exact provider and native session, so
+that Task Run's otherwise-unknown row can stay `done` after the Agent row and
+its live line are hidden.
 
 The dependency view remains separate: it lists each Task Run with its explicit
 prerequisites and dependents, or displays `no dependency edges recorded` when

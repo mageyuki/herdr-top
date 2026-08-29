@@ -373,7 +373,18 @@ Task state.
 
 Effective TUI status precedence is semantic terminal Task state, native
 lifecycle end, semantic queued/blocked, exact-pane status, matching execution,
-the run's own newest provider root Agent Node, then running/fallback.
+the run's own newest provider root Agent Node, then running/fallback. Two
+narrow presentation-only refinements apply to otherwise-unknown outcomes:
+semantic `ended_unknown` and nonterminal native lifecycle `Unknown` each
+display `done` sourced from Agent Node state only when the newest Agent Node
+whose provider and native session ID exactly match one of the run's
+`RunKey::Native` aliases is `ended`. Ownership and parentage do not identify
+the target run; a foreign provider, a different session ID, a synthetic
+live-line node, or an older ended node superseded by a newer non-ended exact
+node supplies no evidence. Definitive semantic `completed`/`failed`/`cancelled`
+and native `Done`/`Error`/`Cancelled` outcomes are preserved, the
+running/fallback path is excluded, and no Task Run, native lifecycle, Agent
+Node, persistence, visibility, duration, or retention state is mutated.
 
 ### 8.3 Relationship state
 
