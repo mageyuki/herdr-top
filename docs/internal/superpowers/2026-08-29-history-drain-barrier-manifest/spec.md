@@ -85,8 +85,9 @@ backfill test.
 1. A frozen history manifest is immutable. Reusing its drain ID with a
    different provider, artifact identity, digest, byte count, or ordering is a
    hard persistence error.
-2. The barrier's drain ID equals its manifest's drain ID before it can enter the
-   pending queue or writer.
+2. The barrier has no independent drain-ID field or constructor argument; every
+   downstream drain ID is obtained from its manifest, so a mismatching pair is
+   unrepresentable before it enters the pending queue or writer.
 3. Manifest upsert and drain finalization commit together or neither commits.
 4. A finalization retry after a known or unknown acknowledgement returns the
    same finalized page and does not duplicate artifacts, associations, events,
@@ -96,8 +97,10 @@ backfill test.
 6. A history drain containing no novel provider events is still durably
    represented and finalized.
 7. Provider ingress reopens only after durable finalization acknowledgement.
-8. Existing strict read and query APIs continue to reject a nonexistent drain;
-   only the barrier-owned finalization transaction may create its missing row.
+8. Existing query behavior for an absent drain remains exact:
+   `history_drain_finalized` rejects it and `history_drain_finalization` returns
+   `None`. Only the barrier-owned finalization transaction may create its
+   missing row.
 9. Transaction failure leaves the previous durable state unchanged.
 
 ## Design
@@ -105,10 +108,9 @@ backfill test.
 ### Barrier-owned manifest
 
 `HistoryDrainBarrier` will own an `Arc<PersistHistoryDrain>` in addition to the
-observation time and acknowledgement state. Construction validates that the
-manifest identity is internally consistent and makes the manifest's drain ID
-the single source of truth; callers cannot independently supply a mismatching
-ID.
+observation time and acknowledgement state. Its constructor accepts the
+manifest, not a separate drain ID, and makes the manifest's drain ID the single
+source of truth; callers cannot independently supply a mismatching ID.
 
 The collector obtains this value from the already-frozen provider manifest when
 it enqueues the barrier. Pending-queue merge, hold, retry, and acknowledgement
@@ -184,7 +186,7 @@ acknowledgement, and no event is synthesized merely to persist the manifest.
 
 Update barrier constructor and pending-queue coverage to prove that ordinary
 slots cannot overtake a barrier, queue merge retains one byte-identical
-manifest, and a mismatching identity is rejected before persistence.
+manifest, and no independent drain ID exists to disagree with it.
 
 ### 4. Provider-lane characterization
 
@@ -246,8 +248,9 @@ live state database.
 
 The run must:
 
-1. complete every frozen history drain, including providers with no novel
-   events;
+1. complete every non-abandoned frozen history drain, including providers with
+   no novel events; any deliberately abandoned malformed-input drain must have
+   matching failure evidence and no held barrier or pending mutation;
 2. return to and remain in healthy live collection without the missing-manifest
    error or periodic re-degradation;
 3. drain the persistence queue with no skipped updates or duplicate native
@@ -263,8 +266,11 @@ The run must:
 The implementation plan must preserve these two serial integration units:
 
 1. History-drain correctness: `src/provider/mod.rs`,
-   `src/herdr/collector.rs`, `src/reducer.rs`, `src/store/writer.rs`, and
-   `src/store/mod.rs`.
+   `src/herdr/collector.rs`, `src/reducer.rs`, `src/store/writer.rs`,
+   `src/store/mod.rs`, `src/identity.rs`, `tests/restore.rs`, and
+   `tests/convergence.rs`. The last three files migrate existing direct Store
+   finalization callers to the manifest-bearing interface; they add no new
+   production behavior.
 2. Provider-lane characterization and clone cleanup: `src/provider/lane.rs`.
 
 The two implementation tasks have disjoint declared file sets and may be
