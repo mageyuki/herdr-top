@@ -995,6 +995,36 @@ mod tests {
     }
 
     #[test]
+    fn durable_ended_evidence_refines_only_unknown_outcomes() {
+        let now_ms = 100 + crate::activity::headless_inactivity_ms();
+
+        // A running target with exact durable ended evidence but no native lifecycle end keeps
+        // the running fallback: durable evidence must never turn running into done.
+        let target = durable_target_run(TaskState::Running);
+        let (mut model, owner) = durable_model(&target);
+        model.insert_agent_node(exact_ended_agent(owner, 100));
+        assert_eq!(
+            display_status_at(&model, &target, now_ms),
+            DisplayStatus::new(TaskDisplayStatus::Working, StatusSource::TaskState),
+            "durable ended evidence must not refine the running fallback"
+        );
+
+        // A running target with native Unknown but no exact ended evidence stays lifecycle
+        // unknown.
+        let target = durable_target_run(TaskState::Running);
+        let (mut model, _owner) = durable_model(&target);
+        set_native_end(&mut model, target.run_id, NativeSessionEndStatus::Unknown);
+        assert_eq!(
+            display_status_at(&model, &target, now_ms),
+            DisplayStatus::new(
+                TaskDisplayStatus::Unknown,
+                StatusSource::NativeSessionLifecycle
+            ),
+            "native Unknown without exact ended evidence must stay lifecycle unknown"
+        );
+    }
+
+    #[test]
     fn semantic_definitive_outcomes_override_exact_native_ended_agent() {
         let now_ms = 100 + crate::activity::headless_inactivity_ms();
         for (state, expected) in [
