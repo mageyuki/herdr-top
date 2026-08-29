@@ -5,8 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use herdr_top::model::{
-    ControllerEventKind, DomainModel, ExecState, NativeSessionEndStatus, Provider, RunKey,
-    TaskState,
+    ControllerEventKind, DomainModel, ExecState, MinimalProviderMetadata, NativeSessionEndStatus,
+    Provider, RunKey, TaskState,
 };
 use herdr_top::provider::codex::{CodexAdapter, CodexBootstrapParser};
 use herdr_top::provider::codex_facts::extract_codex_line;
@@ -634,6 +634,150 @@ fn nested_subagent_activity_normalizes_started_and_spawned() {
         parse_inline(&fixtures.index, file, 0, &[(8, unrelated)]).is_empty(),
         "unrelated item_completed item must produce zero provider events"
     );
+}
+
+#[test]
+fn subagent_activity_completed_ends_only_the_child_agent_node() {
+    let fixtures = FixtureIndex::new(&["codex-depth2-root.jsonl"]);
+    let file = fixtures.file("codex-depth2-root.jsonl");
+    let cases = [
+        (
+            "legacy interacted",
+            110,
+            br#"{"type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"call_legacy_interacted","occurred_at_ms":1787547620101,"agent_thread_id":"e1111111-1111-4111-8111-111111111111","agent_path":"/root/legacy_interacted","kind":"interacted"}}"# as &[u8],
+            vec![ProviderEvent::Activity {
+                provider: Provider::Codex,
+                agent_thread_id: "e1111111-1111-4111-8111-111111111111".to_owned(),
+                activity: MinimalProviderMetadata {
+                    agent_id: Some("e1111111-1111-4111-8111-111111111111".to_owned()),
+                    parent_agent_id: Some(ROOT_ID.to_owned()),
+                    event_kind: Some("interacted".to_owned()),
+                    ..MinimalProviderMetadata::default()
+                },
+                depth: Some(1),
+                event_id: "prov:codex:act:call_legacy_interacted".to_owned(),
+                observed_at_ms: 1_787_547_620_101,
+                position: SourcePosition {
+                    path_id: file.path_id,
+                    generation: 7,
+                    offset: 110,
+                },
+            }],
+        ),
+        (
+            "nested interacted",
+            120,
+            br#"{"timestamp":"2026-08-24T05:00:21.500Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1787547621101,"completed_at_ms":1787547621201,"item":{"type":"SubAgentActivity","id":"item_nested_interacted","kind":"interacted","agent_thread_id":"e2222222-2222-4222-8222-222222222222","agent_path":"/root/nested_interacted"}}}"# as &[u8],
+            vec![ProviderEvent::Activity {
+                provider: Provider::Codex,
+                agent_thread_id: "e2222222-2222-4222-8222-222222222222".to_owned(),
+                activity: MinimalProviderMetadata {
+                    agent_id: Some("e2222222-2222-4222-8222-222222222222".to_owned()),
+                    parent_agent_id: Some(ROOT_ID.to_owned()),
+                    event_kind: Some("interacted".to_owned()),
+                    ..MinimalProviderMetadata::default()
+                },
+                depth: Some(1),
+                event_id: "prov:codex:act:item_nested_interacted".to_owned(),
+                observed_at_ms: 1_787_547_621_201,
+                position: SourcePosition {
+                    path_id: file.path_id,
+                    generation: 7,
+                    offset: 120,
+                },
+            }],
+        ),
+        (
+            "legacy completed",
+            130,
+            br#"{"type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"call_legacy_completed","occurred_at_ms":1787547622101,"agent_thread_id":"e3333333-3333-4333-8333-333333333333","agent_path":"/root/legacy_completed","kind":"completed"}}"# as &[u8],
+            vec![
+                ProviderEvent::Activity {
+                    provider: Provider::Codex,
+                    agent_thread_id: "e3333333-3333-4333-8333-333333333333".to_owned(),
+                    activity: MinimalProviderMetadata {
+                        agent_id: Some("e3333333-3333-4333-8333-333333333333".to_owned()),
+                        parent_agent_id: Some(ROOT_ID.to_owned()),
+                        event_kind: Some("completed".to_owned()),
+                        ..MinimalProviderMetadata::default()
+                    },
+                    depth: Some(1),
+                    event_id: "prov:codex:act:call_legacy_completed".to_owned(),
+                    observed_at_ms: 1_787_547_622_101,
+                    position: SourcePosition {
+                        path_id: file.path_id,
+                        generation: 7,
+                        offset: 130,
+                    },
+                },
+                ProviderEvent::AgentUpsert {
+                    provider: Provider::Codex,
+                    agent_thread_id: "e3333333-3333-4333-8333-333333333333".to_owned(),
+                    owner_session_id: Some(ROOT_ID.to_owned()),
+                    parent_thread_id: Some(ROOT_ID.to_owned()),
+                    state: Some(ExecState::Ended),
+                    model_id: None,
+                    depth: Some(1),
+                    event_id: "prov:codex:up:call_legacy_completed".to_owned(),
+                    observed_at_ms: 1_787_547_622_101,
+                    position: SourcePosition {
+                        path_id: file.path_id,
+                        generation: 7,
+                        offset: 130,
+                    },
+                },
+            ],
+        ),
+        (
+            "nested completed",
+            140,
+            br#"{"timestamp":"2026-08-24T05:00:23.500Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1787547623101,"completed_at_ms":1787547623201,"item":{"type":"SubAgentActivity","id":"item_nested_completed","kind":"completed","agent_thread_id":"e4444444-4444-4444-8444-444444444444","agent_path":"/root/nested_completed"}}}"# as &[u8],
+            vec![
+                ProviderEvent::Activity {
+                    provider: Provider::Codex,
+                    agent_thread_id: "e4444444-4444-4444-8444-444444444444".to_owned(),
+                    activity: MinimalProviderMetadata {
+                        agent_id: Some("e4444444-4444-4444-8444-444444444444".to_owned()),
+                        parent_agent_id: Some(ROOT_ID.to_owned()),
+                        event_kind: Some("completed".to_owned()),
+                        ..MinimalProviderMetadata::default()
+                    },
+                    depth: Some(1),
+                    event_id: "prov:codex:act:item_nested_completed".to_owned(),
+                    observed_at_ms: 1_787_547_623_201,
+                    position: SourcePosition {
+                        path_id: file.path_id,
+                        generation: 7,
+                        offset: 140,
+                    },
+                },
+                ProviderEvent::AgentUpsert {
+                    provider: Provider::Codex,
+                    agent_thread_id: "e4444444-4444-4444-8444-444444444444".to_owned(),
+                    owner_session_id: Some(ROOT_ID.to_owned()),
+                    parent_thread_id: Some(ROOT_ID.to_owned()),
+                    state: Some(ExecState::Ended),
+                    model_id: None,
+                    depth: Some(1),
+                    event_id: "prov:codex:up:item_nested_completed".to_owned(),
+                    observed_at_ms: 1_787_547_623_201,
+                    position: SourcePosition {
+                        path_id: file.path_id,
+                        generation: 7,
+                        offset: 140,
+                    },
+                },
+            ],
+        ),
+    ];
+
+    for (case, offset, record, expected) in cases {
+        assert_eq!(
+            parse_inline(&fixtures.index, file, 7, &[(offset, record)]),
+            expected,
+            "{case}"
+        );
+    }
 }
 
 #[test]

@@ -390,13 +390,18 @@ fn activity_events(
         observed_at_ms,
         position,
     }];
-    if matches!(kind.as_str(), "started" | "spawned") {
+    let observed_state = match kind.as_str() {
+        "started" | "spawned" => Some(ExecState::Working),
+        "completed" => Some(ExecState::Ended),
+        _ => None,
+    };
+    if let Some(state) = observed_state {
         events.push(ProviderEvent::AgentUpsert {
             provider: Provider::Codex,
             agent_thread_id,
             owner_session_id: owner_session_id.map(str::to_owned),
             parent_thread_id,
-            state: Some(ExecState::Working),
+            state: Some(state),
             model_id: None,
             depth,
             event_id: format!("prov:codex:up:{event_id}"),
