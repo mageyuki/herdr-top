@@ -122,11 +122,13 @@ struct AgentStatusEvidence {
 #[cfg(test)]
 thread_local! {
     static RATE_STATUS_EVIDENCE_VISITS: Cell<usize> = const { Cell::new(0) };
+    static RATE_PANE_EXECUTION_CANDIDATE_VISITS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
 pub(crate) fn reset_rate_status_evidence_visits() {
     RATE_STATUS_EVIDENCE_VISITS.set(0);
+    RATE_PANE_EXECUTION_CANDIDATE_VISITS.set(0);
 }
 
 #[cfg(test)]
@@ -134,9 +136,14 @@ pub(crate) fn rate_status_evidence_visits() -> usize {
     RATE_STATUS_EVIDENCE_VISITS.get()
 }
 
+#[cfg(test)]
+pub(crate) fn rate_pane_execution_candidate_visits() -> usize {
+    RATE_PANE_EXECUTION_CANDIDATE_VISITS.get()
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StatusReadModel {
-    pane_executions: HashMap<(RunId, String), ExecState>,
+    pane_executions: HashMap<RunId, HashMap<String, ExecState>>,
     root_agents: HashMap<RunId, AgentStatusEvidence>,
 }
 
@@ -168,10 +175,13 @@ impl StatusReadModel {
                 })
                 .or_insert(candidate);
         }
-        let pane_executions = selected_executions
-            .into_iter()
-            .map(|(key, (_, _, state))| (key, state))
-            .collect();
+        let mut pane_executions = HashMap::<RunId, HashMap<String, ExecState>>::new();
+        for ((run_id, pane_id), (_, _, state)) in selected_executions {
+            pane_executions
+                .entry(run_id)
+                .or_default()
+                .insert(pane_id, state);
+        }
 
         let mut root_agents = HashMap::<RunId, AgentStatusEvidence>::new();
         for agent in model.agent_nodes() {
@@ -269,7 +279,10 @@ impl StatusReadModel {
         }
 
         if let Some(pane_id) = pane_id
-            && let Some(execution) = self.pane_executions.get(&(run.run_id, pane_id.to_owned()))
+            && let Some(execution) = self
+                .pane_executions
+                .get(&run.run_id)
+                .and_then(|executions| executions.get(pane_id))
         {
             if !execution.is_terminal()
                 && let Some(status) = model.pane_agent_status(pane_id)
@@ -300,25 +313,23 @@ impl StatusReadModel {
         {
             return RunRateActivity::Paused;
         }
-        let mut has_pane_occurrence = false;
-        for ((run_id, pane_id), execution) in &self.pane_executions {
-            if *run_id != run.run_id {
-                continue;
-            }
-            has_pane_occurrence = true;
-            if execution.is_terminal() {
-                continue;
-            }
-            match model.pane_agent_status(pane_id) {
-                Some(PaneAgentStatus::Working) => return RunRateActivity::Working,
-                Some(_) => {}
-                None if matches!(execution, ExecState::Working) => {
-                    return RunRateActivity::Working;
+        if let Some(executions) = self.pane_executions.get(&run.run_id) {
+            for (pane_id, execution) in executions {
+                #[cfg(test)]
+                RATE_PANE_EXECUTION_CANDIDATE_VISITS
+                    .set(RATE_PANE_EXECUTION_CANDIDATE_VISITS.get() + 1);
+                if execution.is_terminal() {
+                    continue;
                 }
-                None => {}
+                match model.pane_agent_status(pane_id) {
+                    Some(PaneAgentStatus::Working) => return RunRateActivity::Working,
+                    Some(_) => {}
+                    None if matches!(execution, ExecState::Working) => {
+                        return RunRateActivity::Working;
+                    }
+                    None => {}
+                }
             }
-        }
-        if has_pane_occurrence {
             return RunRateActivity::Paused;
         }
         if let Some(evidence) = self.root_agents.get(&run.run_id) {

@@ -5103,6 +5103,11 @@ mod tests {
             64,
             "two touched runs must share one 64-execution status derivation"
         );
+        assert_eq!(
+            crate::status::rate_pane_execution_candidate_visits(),
+            2,
+            "each touched run must inspect only its own execution evidence"
+        );
     }
 
     #[test]
