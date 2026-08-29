@@ -444,14 +444,16 @@ durability-unconfirmed drains remain suppressed. Retrying a barrier or replaying
 a completed manifest is idempotent. Old completed history can therefore appear
 in Summary without flashing a stale Working row in the default tree.
 
-Schema v7 is restored after the mandatory pre-migration SQLite online backup.
+Schema v8 is restored after the mandatory pre-migration SQLite online backup.
 Schema v6 persists native lifecycle ends and watermarks, history readiness and
 drain associations, and per-run measured token and Working-time totals. Schema
 v7 adds durable publication state, event before-images, and drain provenance.
-Existing runs migrate history-ready with no synthetic lifecycle or rate row.
-Pane status and rate cursors remain process-local; a cold restore rebaselines
-before new accrual, while already-persisted positive measured totals remain
-usable immediately.
+Schema v8 rebuilds `agent_nodes` so an agent node's `ended` state is persisted
+and restored alongside `working` and `NULL`, preserving existing rows and
+fields, both foreign keys, and the parent index. Existing runs migrate
+history-ready with no synthetic lifecycle or rate row. Pane status and rate
+cursors remain process-local; a cold restore rebaselines before new accrual,
+while already-persisted positive measured totals remain usable immediately.
 
 ## Liveness watchdog
 
