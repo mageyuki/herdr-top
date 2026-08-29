@@ -46,6 +46,12 @@ fn incomplete_history_stays_suppressed_and_completed_drain_restores() {
         herdr_top::model::HistoryDrainId::new("codex:restore-incomplete").unwrap();
     let completed_drain =
         herdr_top::model::HistoryDrainId::new("claude:restore-completed").unwrap();
+    let completed_manifest = PersistHistoryDrain {
+        drain_id: completed_drain.clone(),
+        provider: Provider::Claude,
+        created_at_ms: 1_000,
+        artifacts: Vec::new(),
+    };
     let persisted = |run_id, provider, sid: &str, ordinal| PersistTaskRunV6 {
         task_run: PersistTaskRun {
             task_run: TaskRun {
@@ -90,12 +96,7 @@ fn incomplete_history_stays_suppressed_and_completed_drain_restores() {
                     created_at_ms: 1_000,
                     artifacts: Vec::new(),
                 },
-                PersistHistoryDrain {
-                    drain_id: completed_drain.clone(),
-                    provider: Provider::Claude,
-                    created_at_ms: 1_000,
-                    artifacts: Vec::new(),
-                },
+                completed_manifest.clone(),
             ],
             history_associations: vec![
                 PersistHistoryDrainRun {
@@ -111,7 +112,7 @@ fn incomplete_history_stays_suppressed_and_completed_drain_restores() {
         })
         .unwrap();
     store
-        .finalize_history_drain(&completed_drain, 3_000)
+        .finalize_history_drain(&completed_manifest, 3_000)
         .unwrap();
     drop(store);
 

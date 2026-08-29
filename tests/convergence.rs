@@ -149,6 +149,12 @@ fn historical_working_state_is_not_published_before_durable_finalization() {
     let mut store = open_writer(&root).unwrap();
     let run_id = RunId::new();
     let drain_id = herdr_top::model::HistoryDrainId::new("codex:no-working-flash").unwrap();
+    let manifest = PersistHistoryDrain {
+        drain_id: drain_id.clone(),
+        provider: Provider::Codex,
+        created_at_ms: 2_500,
+        artifacts: Vec::new(),
+    };
     store
         .apply_v6_batch(PersistV6Batch {
             task_runs: vec![PersistTaskRunV6 {
@@ -182,12 +188,7 @@ fn historical_working_state_is_not_published_before_durable_finalization() {
                     ..TaskRunV6State::default()
                 },
             }],
-            history_drains: vec![PersistHistoryDrain {
-                drain_id: drain_id.clone(),
-                provider: Provider::Codex,
-                created_at_ms: 2_500,
-                artifacts: Vec::new(),
-            }],
+            history_drains: vec![manifest.clone()],
             history_associations: vec![PersistHistoryDrainRun {
                 drain_id: drain_id.clone(),
                 run_id,
@@ -214,7 +215,7 @@ fn historical_working_state_is_not_published_before_durable_finalization() {
         "historical Working must not enter a published snapshot before finalization commits"
     );
 
-    let finalization = store.finalize_history_drain(&drain_id, 3_000).unwrap();
+    let finalization = store.finalize_history_drain(&manifest, 3_000).unwrap();
     assert_eq!(finalization.finalized_at_ms, 3_000);
     assert_eq!(finalization.runs.len(), 1);
     assert_eq!(finalization.runs[0].run_id, run_id);

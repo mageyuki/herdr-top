@@ -1,8 +1,9 @@
 //! T9 dedicated writer thread, `WriterClient`, and `WriterLifecycle`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 #[cfg(test)]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 
 use thiserror::Error;
@@ -12,8 +13,8 @@ use crate::lockfile::OwnerRecord;
 use crate::model::HistoryDrainId;
 
 use super::{
-    CleanupStats, HistoryDrainFinalization, LedgerEntry, PersistBatch, PersistOp, PersistV6Batch,
-    Store, StoreError,
+    CleanupStats, HistoryDrainFinalization, LedgerEntry, PersistBatch, PersistHistoryDrain,
+    PersistOp, PersistV6Batch, Store, StoreError,
 };
 
 const WRITER_QUEUE_CAPACITY: usize = 256;
@@ -962,10 +963,10 @@ impl WriterClient {
         .await
     }
 
-    /// Atomically finalizes one history drain on the dedicated writer thread.
+    /// Atomically upserts the frozen manifest and finalizes its drain on the writer thread.
     pub async fn finalize_history_drain(
         &mut self,
-        drain_id: HistoryDrainId,
+        manifest: Arc<PersistHistoryDrain>,
         observed_at_ms: i64,
     ) -> Result<HistoryDrainFinalization, WriterError> {
         let operation = PersistenceOperation::Apply;
@@ -974,7 +975,7 @@ impl WriterClient {
         if self
             .sender
             .send(WriterCommand::FinalizeHistoryDrain {
-                drain_id,
+                manifest,
                 observed_at_ms,
                 acknowledgement,
             })
@@ -1295,7 +1296,7 @@ enum WriterCommand {
         acknowledgement: oneshot::Sender<Result<(), PersistenceFailure>>,
     },
     FinalizeHistoryDrain {
-        drain_id: HistoryDrainId,
+        manifest: Arc<PersistHistoryDrain>,
         observed_at_ms: i64,
         acknowledgement: oneshot::Sender<Result<HistoryDrainFinalization, PersistenceFailure>>,
     },
@@ -1544,7 +1545,7 @@ fn writer_main(
                 }
             }
             WriterCommand::FinalizeHistoryDrain {
-                drain_id,
+                manifest,
                 observed_at_ms,
                 acknowledgement,
             } => {
@@ -1556,7 +1557,7 @@ fn writer_main(
                     WriterOperationGuard::new(health.clone(), PersistenceOperation::Apply);
                 operation_guard.arm();
                 let result = store
-                    .finalize_history_drain(&drain_id, observed_at_ms)
+                    .finalize_history_drain(manifest.as_ref(), observed_at_ms)
                     .map_err(|error| {
                         store_failure(
                             PersistenceOperation::Apply,

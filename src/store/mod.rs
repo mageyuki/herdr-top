@@ -1077,13 +1077,20 @@ impl Store {
             .collect()
     }
 
-    /// Atomically completes a drain, readies its rows, and closes still-historical live states.
+    /// Atomically upserts the supplied frozen manifest, completes the drain, readies its rows, and
+    /// closes still-historical live states in one transaction.
+    ///
+    /// The manifest upsert runs first so a drain with zero novel events (one that never reached
+    /// the store through a V6 batch) still finalizes; immutable provider and artifact conflicts
+    /// fail the whole transaction before any finalization state changes.
     pub fn finalize_history_drain(
         &mut self,
-        drain_id: &HistoryDrainId,
+        manifest: &PersistHistoryDrain,
         observed_at_ms: i64,
     ) -> Result<HistoryDrainFinalization, StoreError> {
         let transaction = self.connection.transaction()?;
+        upsert_history_drain(&transaction, manifest)?;
+        let drain_id = &manifest.drain_id;
         let (provider, created_at_ms, finalized_at_ms) = transaction
             .query_row(
                 "SELECT provider, created_at_ms, finalized_at_ms \
@@ -5039,7 +5046,13 @@ mod tests {
         assert!(shared.borrow().task_run(&ready_run).is_some());
         assert!(shared.borrow().task_run(&private_run).is_none());
 
-        let page = store.finalize_history_drain(&newer_drain, now).unwrap();
+        let newer_manifest = PersistHistoryDrain {
+            drain_id: newer_drain.clone(),
+            provider: Provider::Codex,
+            created_at_ms: now - 100,
+            artifacts: Vec::new(),
+        };
+        let page = store.finalize_history_drain(&newer_manifest, now).unwrap();
         assert!(reducer.apply_history_finalization(&page));
         assert!(shared.borrow().task_run(&ready_run).is_some());
         assert!(shared.borrow().task_run(&private_run).is_some());
@@ -5474,6 +5487,12 @@ mod tests {
         let unassociated_run_id = RunId::new();
         let drain_id = HistoryDrainId::new("codex:finalized-associations").unwrap();
         let rollback_drain_id = HistoryDrainId::new("codex:rollback-sentinel").unwrap();
+        let manifest = PersistHistoryDrain {
+            drain_id: drain_id.clone(),
+            provider: Provider::Codex,
+            created_at_ms: 3_500,
+            artifacts: Vec::new(),
+        };
 
         store
             .apply_v6_batch(PersistV6Batch {
@@ -5513,12 +5532,7 @@ mod tests {
                         },
                     },
                 ],
-                history_drains: vec![PersistHistoryDrain {
-                    drain_id: drain_id.clone(),
-                    provider: Provider::Codex,
-                    created_at_ms: 3_500,
-                    artifacts: Vec::new(),
-                }],
+                history_drains: vec![manifest.clone()],
                 history_associations: vec![PersistHistoryDrainRun {
                     drain_id: drain_id.clone(),
                     run_id: associated_run_id,
@@ -5538,7 +5552,7 @@ mod tests {
             .unwrap();
         assert_eq!(count(&store.connection, "history_drain_runs"), 1);
 
-        store.finalize_history_drain(&drain_id, 5_000).unwrap();
+        store.finalize_history_drain(&manifest, 5_000).unwrap();
         store
             .apply_v6_batch(PersistV6Batch {
                 history_associations: vec![PersistHistoryDrainRun {
@@ -5638,6 +5652,16 @@ mod tests {
         let run_id = RunId::new();
         let drain_id = HistoryDrainId::new("codex:manifest-001").unwrap();
         let now = unix_now_ms().unwrap();
+        let manifest = std::sync::Arc::new(PersistHistoryDrain {
+            drain_id: drain_id.clone(),
+            provider: Provider::Codex,
+            created_at_ms: now - 1_000,
+            artifacts: vec![PersistHistoryDrainArtifact {
+                artifact_id: "rollout.jsonl".to_owned(),
+                generation: "dev:42".to_owned(),
+                goalpost: 8_192,
+            }],
+        });
         let history_state = TaskRunV6State {
             history_ready: false,
             latest_provider_at_ms: Some(now - 500),
@@ -5652,16 +5676,7 @@ mod tests {
                     },
                     state: history_state,
                 }],
-                history_drains: vec![PersistHistoryDrain {
-                    drain_id: drain_id.clone(),
-                    provider: Provider::Codex,
-                    created_at_ms: now - 1_000,
-                    artifacts: vec![PersistHistoryDrainArtifact {
-                        artifact_id: "rollout.jsonl".to_owned(),
-                        generation: "dev:42".to_owned(),
-                        goalpost: 8_192,
-                    }],
-                }],
+                history_drains: vec![manifest.as_ref().clone()],
                 history_associations: vec![
                     PersistHistoryDrainRun {
                         drain_id: drain_id.clone(),
@@ -5680,7 +5695,7 @@ mod tests {
         let (lifecycle, mut writer) = writer::spawn_writer_with_dropped_apply_ack(store).unwrap();
         assert!(!writer.history_drain_finalized(&drain_id).await.unwrap());
         let failure = writer
-            .finalize_history_drain(drain_id.clone(), now)
+            .finalize_history_drain(std::sync::Arc::clone(&manifest), now)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -5707,10 +5722,268 @@ mod tests {
 
         let mut store = open_writer(&root).unwrap();
         let repeated = store
-            .finalize_history_drain(&drain_id, now + 4_500)
+            .finalize_history_drain(manifest.as_ref(), now + 4_500)
             .unwrap();
         assert_eq!(repeated.finalized_at_ms, now);
         assert_eq!(&repeated.runs[0].state, finalized_state);
+    }
+
+    #[test]
+    fn finalize_history_drain_upserts_missing_manifest_atomically() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let manifest = PersistHistoryDrain {
+            drain_id: HistoryDrainId::new("codex:barrier-owned-empty").unwrap(),
+            provider: Provider::Codex,
+            created_at_ms: 1_000,
+            artifacts: Vec::new(),
+        };
+        assert!(matches!(
+            store.history_drain_finalized(&manifest.drain_id),
+            Err(StoreError::InvalidData { .. })
+        ));
+        assert_eq!(
+            store
+                .history_drain_finalization(&manifest.drain_id)
+                .unwrap(),
+            None
+        );
+
+        let page = store.finalize_history_drain(&manifest, 2_000).unwrap();
+
+        let expected = HistoryDrainFinalization {
+            drain_id: manifest.drain_id.clone(),
+            finalized_at_ms: 2_000,
+            completed_drains: vec![manifest.drain_id.clone()],
+            runs: Vec::new(),
+        };
+        assert_eq!(page, expected);
+        let row: (String, i64, Option<i64>, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT provider, created_at_ms, finalized_at_ms, completed_by_drain_id \
+                 FROM history_drains WHERE drain_id = ?1",
+                [manifest.drain_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                provider_text(Provider::Codex).to_owned(),
+                1_000,
+                Some(2_000),
+                Some(manifest.drain_id.as_str().to_owned()),
+            )
+        );
+        assert!(history_drain_manifest(&store.connection, &manifest.drain_id).is_empty());
+        assert!(store.history_drain_finalized(&manifest.drain_id).unwrap());
+        assert_eq!(
+            store
+                .history_drain_finalization(&manifest.drain_id)
+                .unwrap(),
+            Some(expected.clone())
+        );
+        drop(store);
+        assert_eq!(
+            open_reader(&root)
+                .unwrap()
+                .history_drain_finalization(&manifest.drain_id)
+                .unwrap(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn finalize_history_drain_conflict_preserves_committed_manifest() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let drain_id = HistoryDrainId::new("codex:barrier-owned-conflict").unwrap();
+        let artifact =
+            |artifact_id: &str, generation: &str, goalpost: u64| PersistHistoryDrainArtifact {
+                artifact_id: artifact_id.to_owned(),
+                generation: generation.to_owned(),
+                goalpost,
+            };
+        let first = PersistHistoryDrain {
+            drain_id: drain_id.clone(),
+            provider: Provider::Codex,
+            created_at_ms: 1_000,
+            artifacts: vec![artifact("a.jsonl", "dev:1", 100)],
+        };
+        let first_page = store.finalize_history_drain(&first, 2_000).unwrap();
+        assert_eq!(
+            first_page,
+            HistoryDrainFinalization {
+                drain_id: drain_id.clone(),
+                finalized_at_ms: 2_000,
+                completed_drains: vec![drain_id.clone()],
+                runs: Vec::new(),
+            }
+        );
+        let committed_manifest = history_drain_manifest(&store.connection, &drain_id);
+        assert_eq!(
+            committed_manifest,
+            vec![("a.jsonl".to_owned(), "dev:1".to_owned(), 100)]
+        );
+
+        let conflicting_artifacts = PersistHistoryDrain {
+            drain_id: drain_id.clone(),
+            provider: Provider::Codex,
+            created_at_ms: 1_000,
+            artifacts: vec![artifact("b.jsonl", "dev:2", 200)],
+        };
+        let result = store.finalize_history_drain(&conflicting_artifacts, 3_000);
+        assert!(
+            matches!(result, Err(StoreError::InvalidData { .. })),
+            "conflicting artifact set unexpectedly finalized: {result:?}"
+        );
+        assert_eq!(
+            history_drain_manifest(&store.connection, &drain_id),
+            committed_manifest
+        );
+        assert_eq!(
+            store.history_drain_finalization(&drain_id).unwrap(),
+            Some(first_page.clone())
+        );
+
+        let conflicting_provider = PersistHistoryDrain {
+            provider: Provider::Claude,
+            ..first.clone()
+        };
+        let result = store.finalize_history_drain(&conflicting_provider, 3_000);
+        assert!(
+            matches!(result, Err(StoreError::InvalidData { .. })),
+            "conflicting provider unexpectedly finalized: {result:?}"
+        );
+        assert_eq!(
+            history_drain_manifest(&store.connection, &drain_id),
+            committed_manifest
+        );
+        assert_eq!(
+            store.history_drain_finalization(&drain_id).unwrap(),
+            Some(first_page.clone())
+        );
+        assert_eq!(
+            store.finalize_history_drain(&first, 9_000).unwrap(),
+            first_page
+        );
+    }
+
+    #[test]
+    fn finalize_history_drain_rolls_back_new_manifest_when_finalize_fails() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let manifest = PersistHistoryDrain {
+            drain_id: HistoryDrainId::new("codex:forced-finalize-rollback").unwrap(),
+            provider: Provider::Codex,
+            created_at_ms: 1_000,
+            artifacts: vec![PersistHistoryDrainArtifact {
+                artifact_id: "rollback.jsonl".to_owned(),
+                generation: "dev:rollback".to_owned(),
+                goalpost: 100,
+            }],
+        };
+        store
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER force_finalize_rollback \
+                 BEFORE UPDATE OF finalized_at_ms ON history_drains \
+                 WHEN NEW.drain_id = 'codex:forced-finalize-rollback' \
+                 BEGIN SELECT RAISE(ABORT, 'forced finalization failure'); END;",
+            )
+            .unwrap();
+
+        let result = store.finalize_history_drain(&manifest, 2_000);
+
+        assert!(
+            result.is_err(),
+            "forced finalization failure unexpectedly committed: {result:?}"
+        );
+        assert_eq!(
+            store
+                .history_drain_finalization(&manifest.drain_id)
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            store.history_drain_finalized(&manifest.drain_id),
+            Err(StoreError::InvalidData { .. })
+        ));
+        assert_eq!(
+            count_where(
+                &store.connection,
+                "history_drains",
+                "drain_id = 'codex:forced-finalize-rollback'"
+            ),
+            0
+        );
+        assert!(history_drain_manifest(&store.connection, &manifest.drain_id).is_empty());
+    }
+
+    #[tokio::test]
+    async fn writer_finalization_of_missing_manifest_survives_lost_ack() {
+        let (_directory, root) = test_root();
+        let store = open_writer(&root).unwrap();
+        let manifest = std::sync::Arc::new(PersistHistoryDrain {
+            drain_id: HistoryDrainId::new("codex:barrier-lost-ack").unwrap(),
+            provider: Provider::Codex,
+            created_at_ms: 1_000,
+            artifacts: Vec::new(),
+        });
+        let (lifecycle, mut writer) = writer::spawn_writer_with_dropped_apply_ack(store).unwrap();
+        assert_eq!(
+            writer
+                .history_drain_finalization(&manifest.drain_id)
+                .await
+                .unwrap(),
+            None
+        );
+
+        let failure = writer
+            .finalize_history_drain(std::sync::Arc::clone(&manifest), 2_000)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                failure,
+                WriterError::Persistence(PersistenceFailure {
+                    operation: PersistenceOperation::Apply,
+                    phase: PersistencePhase::Acknowledgement,
+                    durability: DurabilityDisposition::Unknown,
+                    ..
+                })
+            ),
+            "unexpected lost-acknowledgement classification: {failure:?}"
+        );
+        let first = writer
+            .history_drain_finalization(&manifest.drain_id)
+            .await
+            .unwrap()
+            .expect("the committed first page must be readable after a lost acknowledgement");
+        assert_eq!(
+            first,
+            HistoryDrainFinalization {
+                drain_id: manifest.drain_id.clone(),
+                finalized_at_ms: 2_000,
+                completed_drains: vec![manifest.drain_id.clone()],
+                runs: Vec::new(),
+            }
+        );
+        assert!(
+            writer
+                .history_drain_finalized(&manifest.drain_id)
+                .await
+                .unwrap()
+        );
+        lifecycle.shutdown().await.unwrap();
+
+        let mut store = open_writer(&root).unwrap();
+        let replay = store
+            .finalize_history_drain(manifest.as_ref(), 9_000)
+            .unwrap();
+        assert_eq!(replay, first);
     }
 
     #[test]
@@ -5729,6 +6002,15 @@ mod tests {
                 generation: generation.to_owned(),
                 goalpost,
             };
+        let current_manifest = PersistHistoryDrain {
+            drain_id: current_drain.clone(),
+            provider: Provider::Codex,
+            created_at_ms: 2_000,
+            artifacts: vec![
+                artifact("b.jsonl", "dev:2", 200),
+                artifact("a.jsonl", "dev:1", 150),
+            ],
+        };
         let persisted_run = |run_id, ordinal| PersistTaskRunV6 {
             task_run: match run_op(run_id, ordinal, TaskState::Queued, 3_000, false) {
                 PersistOp::UpsertTaskRun(task_run) => task_run,
@@ -5767,15 +6049,7 @@ mod tests {
                             artifact("c.jsonl", "dev:3", 50),
                         ],
                     },
-                    PersistHistoryDrain {
-                        drain_id: current_drain.clone(),
-                        provider: Provider::Codex,
-                        created_at_ms: 2_000,
-                        artifacts: vec![
-                            artifact("b.jsonl", "dev:2", 200),
-                            artifact("a.jsonl", "dev:1", 150),
-                        ],
-                    },
+                    current_manifest.clone(),
                 ],
                 history_associations: vec![
                     PersistHistoryDrainRun {
@@ -5817,7 +6091,9 @@ mod tests {
             Reducer::new_with_operator(restored_before, operator_before);
         assert!(operator.borrow().activity.is_empty());
 
-        let finalized = store.finalize_history_drain(&current_drain, 5_000).unwrap();
+        let finalized = store
+            .finalize_history_drain(&current_manifest, 5_000)
+            .unwrap();
         assert!(reducer.apply_history_finalization(&finalized));
         let published_event_ids = operator
             .borrow()
@@ -5883,6 +6159,12 @@ mod tests {
             generation: "dev:shared".to_owned(),
             goalpost,
         };
+        let newer_manifest = PersistHistoryDrain {
+            drain_id: newer.clone(),
+            provider: Provider::Codex,
+            created_at_ms: 2_000,
+            artifacts: vec![artifact("newer-only.jsonl", 100)],
+        };
         store
             .apply_v6_batch(PersistV6Batch {
                 task_runs: vec![PersistTaskRunV6 {
@@ -5903,12 +6185,7 @@ mod tests {
                         created_at_ms: 1_000,
                         artifacts: vec![artifact("older-only.jsonl", 100)],
                     },
-                    PersistHistoryDrain {
-                        drain_id: newer.clone(),
-                        provider: Provider::Codex,
-                        created_at_ms: 2_000,
-                        artifacts: vec![artifact("newer-only.jsonl", 100)],
-                    },
+                    newer_manifest.clone(),
                 ],
                 history_associations: vec![
                     PersistHistoryDrainRun {
@@ -5924,7 +6201,9 @@ mod tests {
             })
             .unwrap();
 
-        let page = store.finalize_history_drain(&newer, 5_000).unwrap();
+        let page = store
+            .finalize_history_drain(&newer_manifest, 5_000)
+            .unwrap();
 
         assert!(!store.history_drain_finalized(&older).unwrap());
         assert_eq!(page.runs.len(), 1);
@@ -5955,6 +6234,18 @@ mod tests {
             generation: "dev:overlap-live-ready".to_owned(),
             goalpost: 100,
         };
+        let first_manifest = PersistHistoryDrain {
+            drain_id: first.clone(),
+            provider: Provider::Codex,
+            created_at_ms: 1_000,
+            artifacts: vec![artifact("first.jsonl")],
+        };
+        let second_manifest = PersistHistoryDrain {
+            drain_id: second.clone(),
+            provider: Provider::Codex,
+            created_at_ms: 2_000,
+            artifacts: vec![artifact("second.jsonl")],
+        };
         let mut private = match run_op(run_id, 1, TaskState::Running, 1_000, false) {
             PersistOp::UpsertTaskRun(task_run) => task_run,
             _ => unreachable!(),
@@ -5971,20 +6262,7 @@ mod tests {
                         ..TaskRunV6State::default()
                     },
                 }],
-                history_drains: vec![
-                    PersistHistoryDrain {
-                        drain_id: first.clone(),
-                        provider: Provider::Codex,
-                        created_at_ms: 1_000,
-                        artifacts: vec![artifact("first.jsonl")],
-                    },
-                    PersistHistoryDrain {
-                        drain_id: second.clone(),
-                        provider: Provider::Codex,
-                        created_at_ms: 2_000,
-                        artifacts: vec![artifact("second.jsonl")],
-                    },
-                ],
+                history_drains: vec![first_manifest.clone(), second_manifest.clone()],
                 history_associations: vec![
                     PersistHistoryDrainRun {
                         drain_id: first.clone(),
@@ -6018,12 +6296,16 @@ mod tests {
             })
             .unwrap();
 
-        let first_page = store.finalize_history_drain(&first, 5_000).unwrap();
+        let first_page = store
+            .finalize_history_drain(&first_manifest, 5_000)
+            .unwrap();
         assert_eq!(first_page.runs.len(), 1);
         assert_eq!(first_page.runs[0].state, live_state);
         assert!(!store.history_drain_finalized(&second).unwrap());
 
-        let second_page = store.finalize_history_drain(&second, 6_000).unwrap();
+        let second_page = store
+            .finalize_history_drain(&second_manifest, 6_000)
+            .unwrap();
         assert_eq!(second_page.runs.len(), 1);
         assert_eq!(second_page.runs[0].state, live_state);
         assert_eq!(
@@ -6042,6 +6324,12 @@ mod tests {
         let mut store = open_writer(&root).unwrap();
         let run_id = RunId::new();
         let drain_id = HistoryDrainId::new("codex:ready-resume-unknown").unwrap();
+        let manifest = PersistHistoryDrain {
+            drain_id: drain_id.clone(),
+            provider: Provider::Codex,
+            created_at_ms: 1_000,
+            artifacts: Vec::new(),
+        };
         store
             .apply_v6_batch(PersistV6Batch {
                 task_runs: vec![PersistTaskRunV6 {
@@ -6055,12 +6343,7 @@ mod tests {
                         ..TaskRunV6State::default()
                     },
                 }],
-                history_drains: vec![PersistHistoryDrain {
-                    drain_id: drain_id.clone(),
-                    provider: Provider::Codex,
-                    created_at_ms: 1_000,
-                    artifacts: Vec::new(),
-                }],
+                history_drains: vec![manifest.clone()],
                 history_associations: vec![PersistHistoryDrainRun {
                     drain_id: drain_id.clone(),
                     run_id,
@@ -6070,8 +6353,8 @@ mod tests {
             })
             .unwrap();
 
-        let first = store.finalize_history_drain(&drain_id, 5_000).unwrap();
-        let replay = store.finalize_history_drain(&drain_id, 9_000).unwrap();
+        let first = store.finalize_history_drain(&manifest, 5_000).unwrap();
+        let replay = store.finalize_history_drain(&manifest, 9_000).unwrap();
 
         assert_eq!(first, replay);
         assert_eq!(first.finalized_at_ms, 5_000);
@@ -6099,6 +6382,12 @@ mod tests {
         let mut store = open_writer(&root).unwrap();
         let run_id = RunId::new();
         let drain_id = HistoryDrainId::new("codex:cold-private-activity").unwrap();
+        let manifest = PersistHistoryDrain {
+            drain_id: drain_id.clone(),
+            provider: Provider::Codex,
+            created_at_ms: 1_000,
+            artifacts: Vec::new(),
+        };
         let event_id = "cold-private-history-event";
         store
             .apply_v6_batch(PersistV6Batch {
@@ -6117,12 +6406,7 @@ mod tests {
                         ..TaskRunV6State::default()
                     },
                 }],
-                history_drains: vec![PersistHistoryDrain {
-                    drain_id: drain_id.clone(),
-                    provider: Provider::Codex,
-                    created_at_ms: 1_000,
-                    artifacts: Vec::new(),
-                }],
+                history_drains: vec![manifest.clone()],
                 history_associations: vec![PersistHistoryDrainRun {
                     drain_id: drain_id.clone(),
                     run_id,
@@ -6144,7 +6428,7 @@ mod tests {
         assert!(shared.borrow().task_run(&run_id).is_none());
 
         let mut store = open_writer(&root).unwrap();
-        let page = store.finalize_history_drain(&drain_id, 5_000).unwrap();
+        let page = store.finalize_history_drain(&manifest, 5_000).unwrap();
         assert!(reducer.apply_history_finalization(&page));
         assert_eq!(operator.borrow().activity.len(), 1);
         assert_eq!(operator.borrow().activity[0].identity.event_id, event_id);
@@ -6163,6 +6447,12 @@ mod tests {
         let survivor = RunId::new();
         let absorbed = RunId::new();
         let drain_id = HistoryDrainId::new("codex:alias-private-activity").unwrap();
+        let manifest = PersistHistoryDrain {
+            drain_id: drain_id.clone(),
+            provider: Provider::Codex,
+            created_at_ms: 1_000,
+            artifacts: Vec::new(),
+        };
         let event_id = "alias-private-history-event";
         let published_event_id = "alias-published-before-history";
         store
@@ -6188,12 +6478,7 @@ mod tests {
                         state: TaskRunV6State::default(),
                     })
                     .collect(),
-                history_drains: vec![PersistHistoryDrain {
-                    drain_id: drain_id.clone(),
-                    provider: Provider::Codex,
-                    created_at_ms: 1_000,
-                    artifacts: Vec::new(),
-                }],
+                history_drains: vec![manifest.clone()],
                 ..PersistV6Batch::default()
             })
             .unwrap();
@@ -6233,7 +6518,7 @@ mod tests {
         let restored_operator = store.load_restored_operator_state().unwrap();
         let (mut reducer, _shared, mut operator) =
             Reducer::new_with_operator(restored, restored_operator);
-        let page = store.finalize_history_drain(&drain_id, 5_000).unwrap();
+        let page = store.finalize_history_drain(&manifest, 5_000).unwrap();
         assert!(reducer.apply_history_finalization(&page));
         assert_eq!(operator.borrow().activity.len(), 2);
         assert!(
@@ -6273,6 +6558,16 @@ mod tests {
                 ..TaskRunV6State::default()
             },
         };
+        let manifest = PersistHistoryDrain {
+            drain_id: drain_id.clone(),
+            provider: Provider::Codex,
+            created_at_ms: 2_000,
+            artifacts: vec![PersistHistoryDrainArtifact {
+                artifact_id: "events.jsonl".to_owned(),
+                generation: "dev:1".to_owned(),
+                goalpost: 100,
+            }],
+        };
         store
             .apply_v6_batch(PersistV6Batch {
                 task_runs: vec![
@@ -6304,16 +6599,7 @@ mod tests {
                         },
                     ),
                 ],
-                history_drains: vec![PersistHistoryDrain {
-                    drain_id: drain_id.clone(),
-                    provider: Provider::Codex,
-                    created_at_ms: 2_000,
-                    artifacts: vec![PersistHistoryDrainArtifact {
-                        artifact_id: "events.jsonl".to_owned(),
-                        generation: "dev:1".to_owned(),
-                        goalpost: 100,
-                    }],
-                }],
+                history_drains: vec![manifest.clone()],
                 history_associations: [older, newer, equal_newer_order]
                     .into_iter()
                     .map(|run_id| PersistHistoryDrainRun {
@@ -6326,7 +6612,7 @@ mod tests {
             .unwrap();
 
         store
-            .finalize_history_drain(&drain_id, barrier_at_ms)
+            .finalize_history_drain(&manifest, barrier_at_ms)
             .unwrap();
         let readback = store
             .history_drain_finalization(&drain_id)
@@ -6370,6 +6656,12 @@ mod tests {
         let now = unix_now_ms().unwrap();
         let run_id = RunId::new();
         let drain_id = HistoryDrainId::new("claude:retention").unwrap();
+        let manifest = PersistHistoryDrain {
+            drain_id: drain_id.clone(),
+            provider: Provider::Claude,
+            created_at_ms: now - 32 * DAY_MS,
+            artifacts: Vec::new(),
+        };
         store
             .apply_v6_batch(PersistV6Batch {
                 operations: vec![run_op(
@@ -6386,12 +6678,7 @@ mod tests {
                         working_ms: 1_500,
                     },
                 )],
-                history_drains: vec![PersistHistoryDrain {
-                    drain_id: drain_id.clone(),
-                    provider: Provider::Claude,
-                    created_at_ms: now - 32 * DAY_MS,
-                    artifacts: Vec::new(),
-                }],
+                history_drains: vec![manifest.clone()],
                 history_associations: vec![PersistHistoryDrainRun {
                     drain_id: drain_id.clone(),
                     run_id,
@@ -6400,7 +6687,7 @@ mod tests {
             })
             .unwrap();
         store
-            .finalize_history_drain(&drain_id, now - 31 * DAY_MS)
+            .finalize_history_drain(&manifest, now - 31 * DAY_MS)
             .unwrap();
 
         let stats = store.cleanup_retention(now).unwrap();
@@ -6540,14 +6827,15 @@ mod tests {
                 },
             ])
             .unwrap();
+        let manifest = PersistHistoryDrain {
+            drain_id: drain_id.clone(),
+            provider: Provider::Codex,
+            created_at_ms: old,
+            artifacts: Vec::new(),
+        };
         store
             .apply_v6_batch(PersistV6Batch {
-                history_drains: vec![PersistHistoryDrain {
-                    drain_id: drain_id.clone(),
-                    provider: Provider::Codex,
-                    created_at_ms: old,
-                    artifacts: Vec::new(),
-                }],
+                history_drains: vec![manifest.clone()],
                 history_associations: vec![PersistHistoryDrainRun {
                     drain_id: drain_id.clone(),
                     run_id: protected,
@@ -6578,7 +6866,7 @@ mod tests {
                 .is_none()
         );
 
-        let page = store.finalize_history_drain(&drain_id, now).unwrap();
+        let page = store.finalize_history_drain(&manifest, now).unwrap();
         assert_eq!(page.runs.len(), 1);
         assert_eq!(page.runs[0].run_id, protected);
         assert!(page.runs[0].state.history_ready);
@@ -7083,6 +7371,12 @@ mod tests {
                 false,
             );
             let drain_id = HistoryDrainId::new("codex:v7-replay-promotion").unwrap();
+            let manifest = PersistHistoryDrain {
+                drain_id: drain_id.clone(),
+                provider: Provider::Codex,
+                created_at_ms: 100,
+                artifacts: Vec::new(),
+            };
             let batch = PersistV6Batch {
                 operations: vec![PersistOp::PromoteTaskRunKey {
                     promoted: promoted.task_run.clone(),
@@ -7090,12 +7384,7 @@ mod tests {
                     alias_run_id,
                 }],
                 task_runs: vec![promoted],
-                history_drains: vec![PersistHistoryDrain {
-                    drain_id: drain_id.clone(),
-                    provider: Provider::Codex,
-                    created_at_ms: 100,
-                    artifacts: Vec::new(),
-                }],
+                history_drains: vec![manifest.clone()],
                 history_associations: vec![PersistHistoryDrainRun {
                     drain_id: drain_id.clone(),
                     run_id,
@@ -7121,7 +7410,7 @@ mod tests {
             };
             *conflicting_alias = RunId::new();
             assert!(store.apply_v6_batch(conflicting).is_err());
-            assert!(store.finalize_history_drain(&drain_id, 300).is_ok());
+            assert!(store.finalize_history_drain(&manifest, 300).is_ok());
         }
 
         {
@@ -7163,18 +7452,19 @@ mod tests {
             let mut finalized_survivor = survivor_run;
             finalized_survivor.state.history_ready = false;
             let drain_id = HistoryDrainId::new("codex:v7-replay-merge").unwrap();
+            let manifest = PersistHistoryDrain {
+                drain_id: drain_id.clone(),
+                provider: Provider::Codex,
+                created_at_ms: 100,
+                artifacts: Vec::new(),
+            };
             let batch = PersistV6Batch {
                 operations: vec![
                     PersistOp::MergeTaskRuns { survivor, absorbed },
                     PersistOp::UpsertTaskRun(finalized_survivor.task_run.clone()),
                 ],
                 task_runs: vec![finalized_survivor],
-                history_drains: vec![PersistHistoryDrain {
-                    drain_id: drain_id.clone(),
-                    provider: Provider::Codex,
-                    created_at_ms: 100,
-                    artifacts: Vec::new(),
-                }],
+                history_drains: vec![manifest.clone()],
                 history_associations: vec![PersistHistoryDrainRun {
                     drain_id: drain_id.clone(),
                     run_id: survivor,
@@ -7196,7 +7486,7 @@ mod tests {
                 absorbed,
             };
             assert!(store.apply_v6_batch(conflicting).is_err());
-            assert!(store.finalize_history_drain(&drain_id, 300).is_ok());
+            assert!(store.finalize_history_drain(&manifest, 300).is_ok());
         }
     }
 

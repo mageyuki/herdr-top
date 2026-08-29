@@ -2017,6 +2017,12 @@ mod tests {
         let absorbed = RunId::new();
         let outstanding = HistoryDrainId::new("codex:outstanding").unwrap();
         let completed = HistoryDrainId::new("codex:completed").unwrap();
+        let completed_manifest = PersistHistoryDrain {
+            drain_id: completed.clone(),
+            provider: Provider::Codex,
+            created_at_ms: 925,
+            artifacts: Vec::new(),
+        };
         let survivor_run = TaskRun {
             run_id: survivor,
             key: RunKey::Controller("v6-survivor".to_owned()),
@@ -2110,12 +2116,7 @@ mod tests {
                         created_at_ms: 900,
                         artifacts: Vec::new(),
                     },
-                    PersistHistoryDrain {
-                        drain_id: completed.clone(),
-                        provider: Provider::Codex,
-                        created_at_ms: 925,
-                        artifacts: Vec::new(),
-                    },
+                    completed_manifest.clone(),
                 ],
                 history_associations: vec![
                     PersistHistoryDrainRun {
@@ -2130,7 +2131,9 @@ mod tests {
                 ..PersistV6Batch::default()
             })
             .unwrap();
-        let completed_result = store.finalize_history_drain(&completed, 1_700).unwrap();
+        let completed_result = store
+            .finalize_history_drain(&completed_manifest, 1_700)
+            .unwrap();
         absorbed_state = completed_result.runs[0].state.clone();
         assert!(absorbed_state.history_ready);
 

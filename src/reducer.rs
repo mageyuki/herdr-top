@@ -314,9 +314,12 @@ pub enum CommitStagedError {
 }
 
 /// Immutable request staged before the writer decides whether finalization committed.
+///
+/// The staged request retains the barrier's exact frozen manifest allocation so the writer can
+/// upsert and finalize it in one transaction; its identity is `manifest.drain_id`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StagedHistoryFinalization {
-    pub drain_id: crate::model::HistoryDrainId,
+    pub manifest: Arc<PersistHistoryDrain>,
     pub observed_at_ms: i64,
 }
 
@@ -874,7 +877,7 @@ impl Reducer {
         barrier: &crate::provider::HistoryDrainBarrier,
     ) -> StagedHistoryFinalization {
         StagedHistoryFinalization {
-            drain_id: barrier.drain_id.clone(),
+            manifest: Arc::clone(&barrier.manifest),
             observed_at_ms: barrier.observed_at_ms,
         }
     }
@@ -5102,6 +5105,12 @@ mod tests {
         let mut store = open_writer(&root).unwrap();
         let run_id = RunId::new();
         let drain_id = crate::model::HistoryDrainId::new("codex:reducer-finalize").unwrap();
+        let manifest = Arc::new(PersistHistoryDrain {
+            drain_id: drain_id.clone(),
+            provider: Provider::Codex,
+            created_at_ms: 1_000,
+            artifacts: Vec::new(),
+        });
         let task_run = run(
             run_id,
             RunKey::Native {
@@ -5130,12 +5139,7 @@ mod tests {
                         ..TaskRunV6State::default()
                     },
                 }],
-                history_drains: vec![PersistHistoryDrain {
-                    drain_id: drain_id.clone(),
-                    provider: Provider::Codex,
-                    created_at_ms: 1_000,
-                    artifacts: Vec::new(),
-                }],
+                history_drains: vec![manifest.as_ref().clone()],
                 history_associations: vec![PersistHistoryDrainRun {
                     drain_id: drain_id.clone(),
                     run_id,
@@ -5146,16 +5150,17 @@ mod tests {
         let restored = store.load_restored_state().unwrap();
         let (mut reducer, shared) = Reducer::new(restored);
         let publish_count = reducer.shared_publish_count();
-        let barrier = HistoryDrainBarrier::new(drain_id.clone(), 5_000);
+        let barrier = HistoryDrainBarrier::new(Arc::clone(&manifest), 5_000);
 
         let staged = reducer.stage_history_finalization(&barrier);
 
-        assert_eq!(staged.drain_id, drain_id);
+        assert!(Arc::ptr_eq(&staged.manifest, &manifest));
+        assert_eq!(staged.manifest.drain_id, drain_id);
         assert_eq!(publish_count.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert!(shared.borrow().task_run(&run_id).is_none());
 
         let durable_page = store
-            .finalize_history_drain(&staged.drain_id, staged.observed_at_ms)
+            .finalize_history_drain(staged.manifest.as_ref(), staged.observed_at_ms)
             .unwrap();
         assert!(reducer.apply_history_finalization(&durable_page));
         assert_eq!(publish_count.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -5172,28 +5177,46 @@ mod tests {
     }
 
     #[test]
+    fn staged_history_finalization_retains_barrier_manifest() {
+        let (reducer, _shared) = Reducer::new(restored(DomainModel::default(), 1));
+        let manifest = std::sync::Arc::new(PersistHistoryDrain {
+            drain_id: crate::model::HistoryDrainId::new("codex:staged-manifest").unwrap(),
+            provider: Provider::Codex,
+            created_at_ms: 1_000,
+            artifacts: Vec::new(),
+        });
+        let barrier = HistoryDrainBarrier::new(std::sync::Arc::clone(&manifest), 2_000);
+
+        let staged = reducer.stage_history_finalization(&barrier);
+
+        assert!(std::sync::Arc::ptr_eq(&staged.manifest, &manifest));
+        assert!(std::sync::Arc::ptr_eq(&staged.manifest, &barrier.manifest));
+        assert_eq!(staged.observed_at_ms, 2_000);
+    }
+
+    #[test]
     fn historical_activity_publishes_model_and_operator_only_at_durable_finalization() {
         let directory = tempfile::tempdir().unwrap();
         let root = StateRoot(directory.path().to_path_buf());
         let mut store = open_writer(&root).unwrap();
         let drain_id = crate::model::HistoryDrainId::new("codex:deferred-operator").unwrap();
-        let manifest = PersistHistoryDrain {
+        let manifest = Arc::new(PersistHistoryDrain {
             drain_id: drain_id.clone(),
             provider: Provider::Codex,
             created_at_ms: 1_000,
             artifacts: Vec::new(),
-        };
+        });
         let sibling_drain_id =
             crate::model::HistoryDrainId::new("claude:deferred-operator").unwrap();
-        let sibling_manifest = PersistHistoryDrain {
+        let sibling_manifest = Arc::new(PersistHistoryDrain {
             drain_id: sibling_drain_id.clone(),
             provider: Provider::Claude,
             created_at_ms: 1_000,
             artifacts: Vec::new(),
-        };
+        });
         store
             .apply_v6_batch(PersistV6Batch {
-                history_drains: vec![manifest.clone(), sibling_manifest.clone()],
+                history_drains: vec![manifest.as_ref().clone(), sibling_manifest.as_ref().clone()],
                 ..PersistV6Batch::default()
             })
             .unwrap();
@@ -5222,8 +5245,13 @@ mod tests {
         let prior = reducer.begin_provider_observation(&origin, 2_000);
         let delta = reducer.validate_controller_event(&controller).unwrap();
         let operations = reducer.commit_staged_unqueued(delta).unwrap();
-        let (batch, receipt) =
-            reducer.finish_provider_observation(prior, operations, &origin, Some(&manifest), 2_000);
+        let (batch, receipt) = reducer.finish_provider_observation(
+            prior,
+            operations,
+            &origin,
+            Some(manifest.as_ref()),
+            2_000,
+        );
         assert_eq!(batch.history_associations.len(), 1);
         store.apply_v6_batch(batch).unwrap();
         reducer.complete_provider_submission(receipt, RuntimeWriteOutcome::Durable);
@@ -5250,7 +5278,7 @@ mod tests {
             sibling_prior,
             sibling_operations,
             &sibling_origin,
-            Some(&sibling_manifest),
+            Some(sibling_manifest.as_ref()),
             2_200,
         );
         assert_eq!(sibling_batch.history_associations.len(), 1);
@@ -5265,10 +5293,10 @@ mod tests {
 
         assert!(operator.borrow().activity.is_empty());
 
-        let barrier = HistoryDrainBarrier::new(drain_id.clone(), 3_000);
+        let barrier = HistoryDrainBarrier::new(Arc::clone(&manifest), 3_000);
         let staged = reducer.stage_history_finalization(&barrier);
         let page = store
-            .finalize_history_drain(&staged.drain_id, staged.observed_at_ms)
+            .finalize_history_drain(staged.manifest.as_ref(), staged.observed_at_ms)
             .unwrap();
         assert_eq!(page.runs.len(), 1);
         assert!(reducer.apply_history_finalization(&page));
@@ -5285,10 +5313,13 @@ mod tests {
         assert_eq!(shared.borrow().task_runs().count(), 1);
         assert_eq!(operator.borrow().activity.len(), 1);
 
-        let sibling_barrier = HistoryDrainBarrier::new(sibling_drain_id, 3_100);
+        let sibling_barrier = HistoryDrainBarrier::new(Arc::clone(&sibling_manifest), 3_100);
         let sibling_staged = reducer.stage_history_finalization(&sibling_barrier);
         let sibling_page = store
-            .finalize_history_drain(&sibling_staged.drain_id, sibling_staged.observed_at_ms)
+            .finalize_history_drain(
+                sibling_staged.manifest.as_ref(),
+                sibling_staged.observed_at_ms,
+            )
             .unwrap();
         assert!(reducer.apply_history_finalization(&sibling_page));
         assert_eq!(shared.borrow().task_runs().count(), 2);
@@ -5543,7 +5574,7 @@ mod tests {
             None
         );
 
-        store.finalize_history_drain(&drain_id, 4_000).unwrap();
+        store.finalize_history_drain(&manifest, 4_000).unwrap();
         let finalized = store.load_restored_state().unwrap();
         let state = finalized.model.task_run_v6_state(&run_id).unwrap();
         assert!(state.history_ready);
@@ -5720,7 +5751,7 @@ mod tests {
         }));
         drop(current);
 
-        store.finalize_history_drain(&drain_id, 4_000).unwrap();
+        store.finalize_history_drain(&manifest, 4_000).unwrap();
         let restored = store.load_restored_state().unwrap();
         let restored_state = restored.model.task_run_v6_state(&survivor).unwrap();
         assert!(restored_state.history_ready);

@@ -149,18 +149,22 @@ impl PartialEq for HistoryDrainAcknowledgement {
 impl Eq for HistoryDrainAcknowledgement {}
 
 /// Final ordered token for one frozen historical drain.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// The barrier owns the exact frozen manifest allocation so durable finalization can upsert the
+/// manifest itself, even when the drain produced zero novel events. Identity is derived from the
+/// manifest's drain ID; no independent copy is kept.
+#[derive(Clone)]
 pub struct HistoryDrainBarrier {
-    pub drain_id: HistoryDrainId,
+    pub manifest: Arc<PersistHistoryDrain>,
     pub observed_at_ms: i64,
     acknowledgement: HistoryDrainAcknowledgement,
 }
 
 impl HistoryDrainBarrier {
     #[must_use]
-    pub fn new(drain_id: HistoryDrainId, observed_at_ms: i64) -> Self {
+    pub fn new(manifest: Arc<PersistHistoryDrain>, observed_at_ms: i64) -> Self {
         Self {
-            drain_id,
+            manifest,
             observed_at_ms,
             acknowledgement: HistoryDrainAcknowledgement(Arc::new(AtomicU8::new(
                 HISTORY_BARRIER_PENDING,
@@ -168,9 +172,36 @@ impl HistoryDrainBarrier {
         }
     }
 
+    /// Stable drain identity, derived from the owned frozen manifest.
+    #[must_use]
+    pub fn drain_id(&self) -> &HistoryDrainId {
+        &self.manifest.drain_id
+    }
+
     #[must_use]
     pub fn acknowledgement(&self) -> HistoryDrainAcknowledgement {
         self.acknowledgement.clone()
+    }
+}
+
+impl PartialEq for HistoryDrainBarrier {
+    fn eq(&self, other: &Self) -> bool {
+        self.drain_id() == other.drain_id()
+            && self.observed_at_ms == other.observed_at_ms
+            && self.acknowledgement == other.acknowledgement
+    }
+}
+
+impl Eq for HistoryDrainBarrier {}
+
+impl std::fmt::Debug for HistoryDrainBarrier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HistoryDrainBarrier")
+            .field("drain_id", self.drain_id())
+            .field("observed_at_ms", &self.observed_at_ms)
+            .field("acknowledgement", &self.acknowledgement)
+            .finish()
     }
 }
 
@@ -3262,10 +3293,13 @@ mod tests {
             }),
             MergeOutcome::Accepted
         );
-        let barrier = HistoryDrainBarrier::new(
-            crate::model::HistoryDrainId::new("history:v1:barrier-order").unwrap(),
-            15,
-        );
+        let manifest = Arc::new(PersistHistoryDrain {
+            drain_id: crate::model::HistoryDrainId::new("history:v1:barrier-order").unwrap(),
+            provider: Provider::Codex,
+            created_at_ms: 1,
+            artifacts: Vec::new(),
+        });
+        let barrier = HistoryDrainBarrier::new(Arc::clone(&manifest), 15);
         assert_eq!(
             pending.merge(ProviderEvent::SourceState {
                 provider: Provider::Codex,
@@ -3281,6 +3315,34 @@ mod tests {
             MergeOutcome::Duplicate,
             "replaying the held barrier must not allocate a second slot"
         );
+
+        let queued = pending.originated_events_for_test();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|(event, _, _)| event_kind(event.clone()))
+                .collect::<Vec<_>>(),
+            [
+                "liveness",
+                "identity:entity",
+                "new",
+                "malformed",
+                "history-barrier"
+            ]
+        );
+        match &queued.last().unwrap().0 {
+            ProviderEvent::SourceState {
+                state: ProviderSourceState::HistoryDrainBarrier(queued_barrier),
+                ..
+            } => {
+                assert!(
+                    Arc::ptr_eq(&queued_barrier.manifest, &manifest),
+                    "the queued barrier must carry the exact frozen manifest allocation"
+                );
+                assert_eq!(queued_barrier, &barrier);
+            }
+            other => panic!("expected the queued history barrier, found {other:?}"),
+        }
 
         let (sender, mut receiver) = tokio_mpsc::channel(16);
         pending.flush_to(&sender);
@@ -3298,6 +3360,23 @@ mod tests {
                 "history-barrier"
             ]
         );
+        assert!(!barrier.acknowledgement().is_committed());
+    }
+
+    #[test]
+    fn history_barrier_owns_frozen_manifest_identity() {
+        let manifest = Arc::new(PersistHistoryDrain {
+            drain_id: crate::model::HistoryDrainId::new("codex:owned-barrier").unwrap(),
+            provider: Provider::Codex,
+            created_at_ms: 1_000,
+            artifacts: Vec::new(),
+        });
+
+        let barrier = HistoryDrainBarrier::new(Arc::clone(&manifest), 2_000);
+
+        assert!(Arc::ptr_eq(&barrier.manifest, &manifest));
+        assert_eq!(barrier.drain_id(), &manifest.drain_id);
+        assert_eq!(barrier.observed_at_ms, 2_000);
         assert!(!barrier.acknowledgement().is_committed());
     }
 

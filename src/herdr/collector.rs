@@ -888,7 +888,7 @@ impl RuntimePersistence {
                     | RuntimeWriteOutcome::DurabilityUnknown(_)
             ) {
                 self.writer
-                    .history_drain_finalization(&staged.drain_id)
+                    .history_drain_finalization(&staged.manifest.drain_id)
                     .await
                     .ok()
                     .flatten()
@@ -905,7 +905,7 @@ impl RuntimePersistence {
         }
         match self
             .writer
-            .finalize_history_drain(staged.drain_id.clone(), staged.observed_at_ms)
+            .finalize_history_drain(Arc::clone(&staged.manifest), staged.observed_at_ms)
             .await
         {
             Ok(page) => Ok((RuntimeWriteOutcome::Durable, Some(page))),
@@ -918,7 +918,7 @@ impl RuntimePersistence {
                 ) {
                     // Response-only readback deliberately remains available while degraded.
                     self.writer
-                        .history_drain_finalization(&staged.drain_id)
+                        .history_drain_finalization(&staged.manifest.drain_id)
                         .await
                         .ok()
                         .flatten()
@@ -4746,14 +4746,10 @@ impl AdapterProviderWorker {
     }
 
     fn enqueue_history_barrier(&mut self, provider: Provider, pending: &mut PendingEvents) {
-        let Some(drain_id) = self
-            .history_manifests
-            .get(&provider)
-            .map(|manifest| manifest.drain_id.clone())
-        else {
+        let Some(manifest) = self.history_manifests.get(&provider).map(Arc::clone) else {
             return;
         };
-        let barrier = HistoryDrainBarrier::new(drain_id, unix_now_ms());
+        let barrier = HistoryDrainBarrier::new(manifest, unix_now_ms());
         match pending.merge(ProviderEvent::SourceState {
             provider,
             state: ProviderSourceState::HistoryDrainBarrier(barrier.clone()),
@@ -9651,12 +9647,12 @@ mod tests {
                 subject: None,
                 dismissed_at_ms: None,
             };
-            let manifest = PersistHistoryDrain {
+            let manifest = Arc::new(PersistHistoryDrain {
                 drain_id: drain_id.clone(),
                 provider: Provider::Codex,
                 created_at_ms: 1_000,
                 artifacts: Vec::new(),
-            };
+            });
             store
                 .apply_v6_batch(PersistV6Batch {
                     task_runs: vec![PersistTaskRunV6 {
@@ -9676,7 +9672,7 @@ mod tests {
                             ..TaskRunV6State::default()
                         },
                     }],
-                    history_drains: vec![manifest.clone()],
+                    history_drains: vec![manifest.as_ref().clone()],
                     history_associations: vec![PersistHistoryDrainRun {
                         drain_id: drain_id.clone(),
                         run_id,
@@ -9686,7 +9682,9 @@ mod tests {
                 .unwrap();
             let precommit_model = store.load_restored_state().unwrap();
             if prefinalized {
-                store.finalize_history_drain(&drain_id, 5_000).unwrap();
+                store
+                    .finalize_history_drain(manifest.as_ref(), 5_000)
+                    .unwrap();
             }
             let (lifecycle, writer) = spawn_writer(store).unwrap();
             let (mut persistence, _diagnostics) = RuntimePersistence::new_for_test(
@@ -9703,7 +9701,7 @@ mod tests {
             let (mut reducer, shared) = Reducer::new(precommit_model);
             let publish_count = reducer.shared_publish_count();
             let (_provider_sender, mut provider, provider_thread) = inactive_provider_integration();
-            let barrier = HistoryDrainBarrier::new(manifest.drain_id.clone(), 5_000);
+            let barrier = HistoryDrainBarrier::new(Arc::clone(&manifest), 5_000);
             let acknowledgement = barrier.acknowledgement();
             provider.held_history_barrier = Some(barrier);
 
@@ -9769,12 +9767,12 @@ mod tests {
         let mut store = open_writer(&root).unwrap();
         let run_id = RunId::new();
         let drain_id = HistoryDrainId::new("codex:task-started-before-image").unwrap();
-        let manifest = PersistHistoryDrain {
+        let manifest = Arc::new(PersistHistoryDrain {
             drain_id: drain_id.clone(),
             provider: Provider::Codex,
             created_at_ms: 1_500,
             artifacts: Vec::new(),
-        };
+        });
         store
             .apply_v6_batch(PersistV6Batch {
                 task_runs: vec![PersistTaskRunV6 {
@@ -9813,7 +9811,7 @@ mod tests {
                         latest_provider_at_ms: Some(1_000),
                     },
                 }],
-                history_drains: vec![manifest.clone()],
+                history_drains: vec![manifest.as_ref().clone()],
                 ..PersistV6Batch::default()
             })
             .unwrap();
@@ -9847,7 +9845,7 @@ mod tests {
                     drain_id: drain_id.clone(),
                     artifact_id: "task-started-before-image.jsonl".to_owned(),
                 },
-                history_manifest: Some(Arc::new(manifest)),
+                history_manifest: Some(Arc::clone(&manifest)),
             }),
             &mut provider,
             "task-started-before-image",
@@ -9871,7 +9869,7 @@ mod tests {
             "an unrelated publication must retain the exact pre-drain terminal projection"
         );
 
-        let barrier = HistoryDrainBarrier::new(drain_id, 3_000);
+        let barrier = HistoryDrainBarrier::new(Arc::clone(&manifest), 3_000);
         let acknowledgement = barrier.acknowledgement();
         service_provider_event(
             Some(ProviderIngressEvent {
@@ -9904,6 +9902,230 @@ mod tests {
         );
 
         drop(finalized);
+        drop(persistence);
+        lifecycle.shutdown().await.unwrap();
+        provider_thread.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn zero_event_history_barrier_persists_and_finalizes_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut persistence, diagnostics) =
+            RuntimePersistence::new_for_test(writer, Arc::new(RecordingOccurrenceSink::default()));
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let (_provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+        let manifest = Arc::new(PersistHistoryDrain {
+            drain_id: HistoryDrainId::new("codex:zero-event-barrier").unwrap(),
+            provider: Provider::Codex,
+            created_at_ms: 1_000,
+            artifacts: Vec::new(),
+        });
+        let barrier = HistoryDrainBarrier::new(Arc::clone(&manifest), 2_000);
+        let acknowledgement = barrier.acknowledgement();
+
+        service_provider_event(
+            Some(ProviderIngressEvent {
+                event: ProviderEvent::SourceState {
+                    provider: Provider::Codex,
+                    state: ProviderSourceState::HistoryDrainBarrier(barrier),
+                },
+                admission: None,
+                origin: crate::model::ObservationOrigin::Live,
+                history_manifest: None,
+            }),
+            &mut provider,
+            "zero-event-barrier",
+            &mut reducer,
+            &shared,
+            &mut persistence,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            acknowledgement.is_committed(),
+            "a zero-event drain barrier must commit its frozen manifest: persistence={:?} detail={:?}",
+            diagnostics.borrow().persistence,
+            diagnostics.borrow().persistence_detail
+        );
+        assert!(provider.held_history_barrier.is_none());
+        let page = persistence
+            .writer
+            .history_drain_finalization(&manifest.drain_id)
+            .await
+            .unwrap()
+            .expect("a committed zero-event drain must expose its exact finalization page");
+        assert_eq!(
+            page,
+            HistoryDrainFinalization {
+                drain_id: manifest.drain_id.clone(),
+                finalized_at_ms: 2_000,
+                completed_drains: vec![manifest.drain_id.clone()],
+                runs: Vec::new(),
+            }
+        );
+        assert_eq!(diagnostics.borrow().persistence, PersistenceStatus::Healthy);
+
+        drop(persistence);
+        lifecycle.shutdown().await.unwrap();
+        provider_thread.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_only_history_barrier_persists_and_finalizes_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let (mut persistence, diagnostics) =
+            RuntimePersistence::new_for_test(writer, Arc::new(RecordingOccurrenceSink::default()));
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model: DomainModel::default(),
+            next_ordinal: 1,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+        let (_provider_sender, mut provider, provider_thread) = inactive_provider_integration();
+        let (performance, _sampler) = performance_tracker(Arc::new(SystemPerformanceClock::new()));
+        let manifest = Arc::new(PersistHistoryDrain {
+            drain_id: HistoryDrainId::new("codex:duplicate-only-barrier").unwrap(),
+            provider: Provider::Codex,
+            created_at_ms: 1_000,
+            artifacts: Vec::new(),
+        });
+        let synthesized = || {
+            let mut event_metadata = metadata("duplicate-only", "provider-lifecycle");
+            event_metadata.event_id = "duplicate-only-synthesized".to_owned();
+            event_metadata.source = crate::provider::lane::SOURCE_LOG_LANE.to_owned();
+            event_metadata.source_event_type = "task_started".to_owned();
+            event_metadata.timestamp_ms = 1_500;
+            event_metadata.receipt_time_ms = 1_600;
+            event_metadata.provider = Some(Provider::Codex);
+            event_metadata.native_session_id = Some("duplicate-only-native".to_owned());
+            ProviderEvent::Synthesized(crate::model::ControllerEvent {
+                schema_version: 1,
+                task_run_id: "duplicate-only-run".to_owned(),
+                metadata: event_metadata,
+                event: ControllerEventKind::TaskStarted,
+            })
+        };
+
+        service_provider_event(
+            Some(ProviderIngressEvent {
+                admission: Some(performance.admit()),
+                event: synthesized(),
+                origin: crate::model::ObservationOrigin::Live,
+                history_manifest: None,
+            }),
+            &mut provider,
+            "duplicate-only",
+            &mut reducer,
+            &shared,
+            &mut persistence,
+        )
+        .await
+        .unwrap();
+        persistence.writer.barrier().await.unwrap();
+        assert!(
+            persistence.is_duplicate("duplicate-only-synthesized"),
+            "the live copy must be durable before its historical replay"
+        );
+
+        service_provider_event(
+            Some(ProviderIngressEvent {
+                admission: Some(performance.admit()),
+                event: synthesized(),
+                origin: crate::model::ObservationOrigin::Historical {
+                    drain_id: manifest.drain_id.clone(),
+                    artifact_id: "duplicate-only.jsonl".to_owned(),
+                },
+                history_manifest: Some(Arc::clone(&manifest)),
+            }),
+            &mut provider,
+            "duplicate-only",
+            &mut reducer,
+            &shared,
+            &mut persistence,
+        )
+        .await
+        .unwrap();
+        assert!(provider.pending_history_mutation.is_none());
+        assert_eq!(
+            persistence
+                .writer
+                .history_drain_finalization(&manifest.drain_id)
+                .await
+                .unwrap(),
+            None,
+            "an all-duplicate drain must not be finalized before its barrier"
+        );
+
+        let barrier = HistoryDrainBarrier::new(Arc::clone(&manifest), 2_000);
+        let acknowledgement = barrier.acknowledgement();
+        service_provider_event(
+            Some(ProviderIngressEvent {
+                event: ProviderEvent::SourceState {
+                    provider: Provider::Codex,
+                    state: ProviderSourceState::HistoryDrainBarrier(barrier),
+                },
+                admission: None,
+                origin: crate::model::ObservationOrigin::Live,
+                history_manifest: None,
+            }),
+            &mut provider,
+            "duplicate-only",
+            &mut reducer,
+            &shared,
+            &mut persistence,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            acknowledgement.is_committed(),
+            "an all-duplicate drain barrier must commit its frozen manifest: persistence={:?} detail={:?}",
+            diagnostics.borrow().persistence,
+            diagnostics.borrow().persistence_detail
+        );
+        assert!(provider.held_history_barrier.is_none());
+        let page = persistence
+            .writer
+            .history_drain_finalization(&manifest.drain_id)
+            .await
+            .unwrap()
+            .expect("a committed all-duplicate drain must expose its exact finalization page");
+        assert_eq!(
+            page,
+            HistoryDrainFinalization {
+                drain_id: manifest.drain_id.clone(),
+                finalized_at_ms: 2_000,
+                completed_drains: vec![manifest.drain_id.clone()],
+                runs: Vec::new(),
+            }
+        );
+        assert_eq!(diagnostics.borrow().persistence, PersistenceStatus::Healthy);
+        let connection = rusqlite::Connection::open(crate::store::database_path(&root)).unwrap();
+        let rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_id = 'duplicate-only-synthesized'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 1,
+            "the duplicate replay must not add a second durable row"
+        );
+
+        drop(connection);
         drop(persistence);
         lifecycle.shutdown().await.unwrap();
         provider_thread.stop().await.unwrap();
@@ -10426,14 +10648,15 @@ mod tests {
             let root = crate::lockfile::StateRoot(directory.path().to_path_buf());
             let mut store = open_writer(&root).unwrap();
             let drain_id = HistoryDrainId::new(format!("codex:mutation-retry:{label}")).unwrap();
+            let manifest = Arc::new(PersistHistoryDrain {
+                drain_id: drain_id.clone(),
+                provider: Provider::Codex,
+                created_at_ms: 1_000,
+                artifacts: Vec::new(),
+            });
             store
                 .apply_v6_batch(PersistV6Batch {
-                    history_drains: vec![PersistHistoryDrain {
-                        drain_id: drain_id.clone(),
-                        provider: Provider::Codex,
-                        created_at_ms: 1_000,
-                        artifacts: Vec::new(),
-                    }],
+                    history_drains: vec![manifest.as_ref().clone()],
                     ..PersistV6Batch::default()
                 })
                 .unwrap();
@@ -10524,7 +10747,7 @@ mod tests {
             assert!(provider.pending_history_mutation.is_none());
             assert!(provider.provider_ingress_open());
 
-            let barrier = HistoryDrainBarrier::new(drain_id.clone(), 3_000);
+            let barrier = HistoryDrainBarrier::new(Arc::clone(&manifest), 3_000);
             let acknowledgement = barrier.acknowledgement();
             service_provider_event(
                 Some(ProviderIngressEvent {
@@ -10691,12 +10914,12 @@ mod tests {
                 })
                 .unwrap();
 
-            let manifest = PersistHistoryDrain {
+            let manifest = Arc::new(PersistHistoryDrain {
                 drain_id: drain_id.clone(),
                 provider: Provider::Codex,
                 created_at_ms: 100,
                 artifacts: Vec::new(),
-            };
+            });
             let origin = crate::model::ObservationOrigin::Historical {
                 drain_id: drain_id.clone(),
                 artifact_id: format!("lost-ack-{label}.jsonl"),
@@ -10735,7 +10958,7 @@ mod tests {
                 prior,
                 operations,
                 &origin,
-                Some(&manifest),
+                Some(manifest.as_ref()),
                 200,
             );
 
@@ -10839,7 +11062,7 @@ mod tests {
             );
             assert!(provider.provider_ingress_open(), "{label}: ingress");
 
-            let barrier = HistoryDrainBarrier::new(drain_id.clone(), 300);
+            let barrier = HistoryDrainBarrier::new(Arc::clone(&manifest), 300);
             let acknowledgement = barrier.acknowledgement();
             service_provider_event(
                 Some(ProviderIngressEvent {
@@ -21077,12 +21300,12 @@ mod provider_integration_tests {
         let store = open_writer(&root).unwrap();
         let (lifecycle, mut writer) = spawn_writer(store).unwrap();
         let drain_id = crate::model::HistoryDrainId::new("codex:spill-4097").unwrap();
-        let manifest = PersistHistoryDrain {
+        let manifest = Arc::new(PersistHistoryDrain {
             drain_id: drain_id.clone(),
             provider: Provider::Codex,
             created_at_ms: 1_000,
             artifacts: Vec::new(),
-        };
+        });
         let diagnostics = crate::provider::ProviderDiagnostics::default();
         let mut pending = PendingEvents::with_capacity(PENDING_CAPACITY, diagnostics);
         let (sender, mut receiver) = mpsc::channel(PENDING_CAPACITY);
@@ -21168,7 +21391,7 @@ mod provider_integration_tests {
                 .apply_v6(PersistV6Batch {
                     task_runs,
                     history_drains: (cycle_start == 0)
-                        .then(|| manifest.clone())
+                        .then(|| manifest.as_ref().clone())
                         .into_iter()
                         .collect(),
                     history_associations: associations,
@@ -21180,7 +21403,7 @@ mod provider_integration_tests {
             while receiver.try_recv().is_ok() {}
         }
 
-        let barrier = HistoryDrainBarrier::new(manifest.drain_id.clone(), 3_000);
+        let barrier = HistoryDrainBarrier::new(Arc::clone(&manifest), 3_000);
         assert!(matches!(
             pending.merge(ProviderEvent::SourceState {
                 provider: Provider::Codex,
@@ -21205,7 +21428,7 @@ mod provider_integration_tests {
         assert_eq!(shared.borrow().task_runs().count(), 0);
 
         let page = writer
-            .finalize_history_drain(drain_id, 3_000)
+            .finalize_history_drain(Arc::clone(&manifest), 3_000)
             .await
             .unwrap();
         assert_eq!(page.runs.len(), RUNS);
