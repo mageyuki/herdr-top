@@ -446,6 +446,110 @@ Report the characterization command before and after cleanup, exact diff, actual
 
 ---
 
+## Approved Bounded Cell 3 Hook Correction
+
+This acceptance-discovered correction is a bounded post-plan task, not a new
+subsystem or lifecycle design. The approved behavior is to ignore only a
+Claude `SubagentStop` whose `agent_type` field is explicitly present and empty.
+Absent and non-empty types retain the current complete-envelope mapping and
+lost-start recovery; Codex hooks and the reducer remain unchanged.
+
+One fresh `claude-implementer` works on branch
+`agent/pr21-claude-empty-stop-filter` in the dedicated linked worktree
+`/home/mageyuki/git/mageyuki/herdr-top/.worktrees/pr21-claude-empty-stop-filter`
+at base `2e27e1cbbb50399fe06ecafde390fb5e7d2a4ca0` and may change only:
+
+```bash
+git worktree add -b agent/pr21-claude-empty-stop-filter \
+  /home/mageyuki/git/mageyuki/herdr-top/.worktrees/pr21-claude-empty-stop-filter \
+  2e27e1cbbb50399fe06ecafde390fb5e7d2a4ca0
+```
+
+The Controller has already executed this preparation command; it is recorded
+for reproducibility and must not be executed a second time.
+
+```text
+src/hook_adapter.rs
+tests/controller.rs
+docs/guides/controller-emit-setup.md
+docs/design/herdr-top-mvp.md
+```
+
+The implementation uses TDD in this order:
+
+1. Add unit test
+   `claude_explicit_empty_subagent_stop_maps_to_empty` and integration test
+   `emit_from_hook_ignores_redacted_claude_explicit_empty_stop_without_delivery`.
+   The integration fixture preserves every captured structural key but replaces
+   every identifier, path, CWD, prompt ID, message, and nested background-task
+   value with synthetic redacted sentinels. Assert those sentinels never reach
+   the socket. Require RED because the current adapter emits `complete` and
+   creates a terminal forward reference.
+2. Add or retain exact controls
+   `subagent_stop_maps_to_exact_complete_envelope` for absent type,
+   `claude_null_subagent_type_stop_retains_complete_envelope`,
+   `claude_nonempty_subagent_type_stop_retains_complete_envelope`, and
+   `codex_explicit_empty_subagent_stop_retains_complete_envelope`. Add a
+   non-empty type to the stop payload in
+   `emit_from_hook_treats_terminal_before_start_stale_event_as_benign` so it
+   pins the typed Claude stop-before-start and forward-reference path.
+3. Filter only `HookProvider::ClaudeCode` with
+   `payload.agent_type.as_deref() == Some("")` before constructing the terminal
+   envelope. Do not inspect transcript paths, change
+   reducer semantics, or add a schema or counter.
+4. Update the two declared normative documents to explain the discriminator
+   and retained lost-start behavior.
+5. Run the new RED test names exactly before production, then run these exact
+   GREEN and compatibility gates:
+
+```bash
+cargo test --locked --lib hook_adapter::tests::claude_explicit_empty_subagent_stop_maps_to_empty -- --exact --nocapture
+cargo test --locked --test controller emit_from_hook_ignores_redacted_claude_explicit_empty_stop_without_delivery -- --exact --nocapture
+cargo test --locked --lib hook_adapter::tests::subagent_stop_maps_to_exact_complete_envelope -- --exact --nocapture
+cargo test --locked --lib hook_adapter::tests::claude_null_subagent_type_stop_retains_complete_envelope -- --exact --nocapture
+cargo test --locked --lib hook_adapter::tests::claude_nonempty_subagent_type_stop_retains_complete_envelope -- --exact --nocapture
+cargo test --locked --lib hook_adapter::tests::codex_explicit_empty_subagent_stop_retains_complete_envelope -- --exact --nocapture
+cargo test --locked --test controller emit_from_hook_treats_terminal_before_start_stale_event_as_benign -- --exact --nocapture
+cargo test --locked --test controller terminal_forward_reference_flagged -- --exact --nocapture
+cargo test --locked --test controller task_started_stale_on_terminal -- --exact --nocapture
+cargo test --locked --lib hook_adapter::tests -- --nocapture
+cargo test --locked --test controller -- --nocapture
+cargo fmt --all -- --check
+git diff --check
+git status --short
+```
+
+The actual changed-file set must be a subset of the four declared paths. The
+worker returns an uncommitted diff and exact RED/GREEN evidence without staging,
+committing, pushing, merging, rebasing, or delegating. Codex performs task
+review and reruns every command. After successful review, Codex executes:
+
+```bash
+git add src/hook_adapter.rs tests/controller.rs docs/guides/controller-emit-setup.md docs/design/herdr-top-mvp.md
+git commit -m "fix: ignore internal empty-type Claude stops" \
+  -m "Co-Authored-By: OpenAI Codex <codex@openai.com>"
+```
+
+Codex then cherry-picks that exact commit serially onto
+`agent/stable-task-history-rates` and reruns:
+
+```bash
+HOOK_FILTER_COMMIT=$(git -C /home/mageyuki/git/mageyuki/herdr-top/.worktrees/pr21-claude-empty-stop-filter rev-parse HEAD)
+git -C /home/mageyuki/git/mageyuki/herdr-top/.worktrees/stable-task-history-rates cherry-pick "$HOOK_FILTER_COMMIT"
+cargo test --locked --lib hook_adapter::tests -- --nocapture
+cargo test --locked --test controller -- --nocapture
+cargo fmt --all -- --check
+make test
+make lint
+make build
+git diff --check origin/main...HEAD
+git status --short
+```
+
+Only after these post-integration gates pass may Cell 3 repeat.
+
+---
+
 ## Controller Task Review and Serial Integration
 
 - [ ] **Step 1: Independently review Task 1**
@@ -598,7 +702,40 @@ Record the child provider-native session ID from the subagent result. Capture th
 
 ### Cell 2: Codex Controller to Claude child
 
-From this Codex Controller, dispatch one fresh read-only `claude-reviewer` custom agent. Freeze the cell marker in its inline dispatch and ask the one direct Claude CLI run to verify byte equality and return it. The brief prohibits edits and re-delegation and records this as an acceptance probe rather than a mandatory review gate. Record the inner Claude session ID from the wrapper report. Capture the intended Claude child; record the expected outer wrapper row separately.
+From this Codex Controller, dispatch one fresh read-only `claude-reviewer`
+custom agent. Freeze the cell marker in its inline dispatch and ask the one
+direct Claude CLI run to verify byte equality and return it. The brief prohibits
+edits and re-delegation and records this as an acceptance probe rather than a
+mandatory review gate. Derive the outer wrapper rollout ID from the linked
+`task_runs.native_session_id`, and verify the same ID in its rollout filename.
+Take only the inner Claude session ID, model, and exit statuses from the
+validated wrapper report. Capture the managed outer wrapper row and the
+validated inner result as separate evidence.
+
+Production `claude-reviewer` runs its inner CLI with both `--safe-mode` and
+`--no-session-persistence`. The inner process therefore emits neither hooks nor
+a Claude transcript and is not itself a Herdr task. Do not remove either flag,
+change live agent configuration, or infer lifecycle from the wrapper's
+free-form command bytes. For this cell the managed target is the outer Codex
+wrapper: capture its linked working-to-done transition, exact native binding,
+Task Run, Agent Node, edge, stale-boundary result, and cold-restore result.
+Independently retain and validate the wrapper's structured report, including
+inner Claude exit `0`, validator exit `0`, exact marker equality, model, and
+inner Claude session ID. Save and require a single zero row from this
+provider-agnostic reference query; any partial or unattached inner reference
+fails the cell:
+
+```sql
+SELECT
+  (SELECT COUNT(*) FROM task_runs
+   WHERE native_session_id = ?1 OR key_native_sid = ?1) AS task_run_refs,
+  (SELECT COUNT(*) FROM agent_nodes
+   WHERE native_session_id = ?1) AS agent_node_refs,
+  (SELECT COUNT(*) FROM native_agent_sessions
+   WHERE native_session_id = ?1) AS native_session_refs;
+```
+
+Required result: `0|0|0` for the validated inner Claude SID.
 
 ### Claude hook capture for Cells 3 and 4
 
@@ -637,7 +774,51 @@ Send the Claude Controller this exact request:
 Acceptance probe only. As Controller, dispatch exactly one installed codex-reviewer agent to compare the supplied marker with itself and return it. Wait for that child, print the marker, edit nothing, and perform no other delegation. The codex-reviewer must execute its received role directly and must not delegate.
 ```
 
-The target is the inner Codex session. Record the expected wrapper child separately, capture working then done under the Claude controller, and retain every raw hook payload.
+The managed and checked target is the Claude `codex-reviewer` wrapper. Capture
+its exact Claude Controller-to-wrapper edge and working-to-done transition, and
+retain every raw hook payload. Production `codex-reviewer` starts a new bare
+`codex exec`: the Claude hooks do not carry its Codex session ID, its Codex
+session metadata has no parent session, and the safe lineage grammar only
+admits a known ID from `codex exec resume`. Therefore do not fabricate a
+wrapper-to-inner edge or infer lifecycle from free-form Bash command bytes.
+Instead, validate the wrapper's structured report and matching Codex rollout,
+including inner exit `0`, exact marker equality, model, reasoning effort, and
+inner Codex session ID. Apply the provider-agnostic reference query from Cell 2
+to that inner SID and require `0|0|0`.
+
+Immediately after the controller is linkable but before dispatch, save Doctor
+JSON as `doctor-before-child.json` and require
+`terminal_forward_reference_creations == 0`. After the wrapper completes but
+before stopping the scratch TUI, save `doctor-after-child.json` and require the
+same zero value. Then extract every raw stop whose `agent_type` is the exact
+JSON string `""`. The count must be greater than zero; zero means the
+discriminator was not live-exercised and the cell is inconclusive rather than
+passed. Preserve the private raw bytes only in the owner-only evidence root;
+do not copy them into the repository.
+
+For every observed `(session_id, agent_id)` pair, construct the exact Task Run
+key and hook event-ID prefix, bind them as `?1` through `?4`, and require one
+row containing `0|0|0|0`:
+
+```sql
+SELECT
+  (SELECT COUNT(*) FROM task_runs
+   WHERE key_controller_id = ?1) AS task_run_refs,
+  (SELECT COUNT(*) FROM events
+   WHERE substr(event_id, 1, length(?2)) = ?2) AS event_refs,
+  (SELECT COUNT(*) FROM agent_nodes
+   WHERE provider = 'claude' AND native_session_id = ?3) AS agent_refs,
+  (SELECT COUNT(*) FROM native_agent_sessions
+   WHERE provider = 'claude' AND native_session_id = ?4) AS native_refs;
+```
+
+Here `?1` is
+`hook:claude-code:<session_id>:agent:<agent_id>`, `?2` is
+`hook:claude-code:<session_id>:SubagentStop:<agent_id>:`, and `?3` and `?4`
+are the exact agent ID. Separately require that every non-empty or absent-type
+stop in the cell either has its matching start and normal managed identity or
+remains a failed-cell lost-start forward reference; the explicit-empty
+exception must not waive any other stop-only row.
 
 ### Cell 4: Claude Controller to Claude child
 
@@ -651,7 +832,8 @@ Capture working then done under the Claude controller and retain every raw hook 
 
 ### Per-cell durable checks
 
-For each target provider/native session ID, run and save these read-only SQL results:
+For the Codex-managed targets in Cells 1 and 2, run and save these read-only
+SQL results for the exact provider/native session ID:
 
 ```sql
 PRAGMA quick_check;
@@ -680,7 +862,55 @@ GROUP BY native_provider, native_session_id
 HAVING COUNT(*) > 1;
 ```
 
-Required: quick check is `ok`; foreign-key and duplicate queries return zero rows; exactly one canonical child Task Run and exact Agent Node exist; the expected parent edge exists; Agent state is `ended`; and the Task Run renders done through the approved exact-native fallback.
+For the Claude-managed targets in Cells 3 and 4, use the exact controller SID
+and hook agent ID from the raw matching `SubagentStart`/`SubagentStop` pair.
+The production hook shape deliberately keys the child Task Run by the compound
+controller identity while its Agent Node and `native_agent_sessions` entry use
+the agent ID. Run and save:
+
+```sql
+SELECT run_id, key_kind, key_controller_id, task_state, finished_at_ms,
+       history_ready
+FROM task_runs
+WHERE key_kind = 'controller'
+  AND key_controller_id =
+      'hook:claude-code:' || ?1 || ':agent:' || ?2;
+
+SELECT child.agent_node_id, child.provider, child.native_session_id,
+       child.task_run_id, child.parent_agent_node_id, child.state,
+       child.last_activity_at_ms, parent.native_session_id AS parent_native_sid
+FROM agent_nodes AS child
+JOIN agent_nodes AS parent
+  ON parent.agent_node_id = child.parent_agent_node_id
+WHERE child.provider = 'claude'
+  AND child.native_session_id = ?2
+  AND parent.provider = 'claude'
+  AND parent.native_session_id = ?1;
+
+SELECT provider, native_session_id
+FROM native_agent_sessions
+WHERE provider = 'claude' AND native_session_id = ?2;
+
+SELECT edge.parent_run_id, edge.child_run_id
+FROM execution_edges AS edge
+JOIN task_runs AS parent ON parent.run_id = edge.parent_run_id
+JOIN task_runs AS child ON child.run_id = edge.child_run_id
+WHERE parent.native_provider = 'claude'
+  AND parent.native_session_id = ?1
+  AND child.key_controller_id =
+      'hook:claude-code:' || ?1 || ':agent:' || ?2;
+```
+
+Required for every cell: quick check is `ok`; foreign-key and duplicate queries
+return zero rows; exactly one managed-target Task Run, exact child Agent Node,
+and expected parent edge exist; and the Task Run renders done after the stale
+boundary and cold restart. For Cells 1 and 2, additionally require the exact
+native-bound Task Run, Agent state `ended`, and approved exact-native fallback.
+For Cells 3 and 4, require the exact compound hook key, child Agent parent link,
+one native-agent-session entry, Task state `completed`, and non-null
+`finished_at_ms`; the Claude hook lifecycle does not require the Agent Node's
+optional state column to be `ended`. In Cells 2 and 3, follow the outer-wrapper
+checks with the separate `0|0|0` reference check for the validated inner SID.
 
 Wait beyond the configured positive 30,000 ms staleness threshold, capture the TUI again, and require the child Task Run to remain done when the ended Agent row is no longer a visible tree row. Stop only the scratch TUI:
 
@@ -725,15 +955,21 @@ jq -e '
   .controller.runtime.observed.persistence_counters.skipped_owner_updates == 0 and
   .controller.runtime.observed.persistence_counters.skipped_enqueues == 0 and
   .controller.runtime.observed.controller_counters.binding_conflicts == 0 and
+  .controller.runtime.observed.controller_counters.terminal_forward_reference_creations == 0 and
   .controller.runtime.observed.controller_counters.provider_identity_disagreements == 0
 ' "$CELL_ROOT/evidence/doctor-after-restart.json"
 ```
 
 Search the scratch log for `history drain does not exist`, native-session `UNIQUE constraint failed`, `persistence_degraded`, and skipped-update occurrences; any match fails the cell.
 
-Diff pre-dispatch and post-restart Task Run IDs. Every new row must be the controller, target child, or explicitly expected wrapper. A new parentless or subjectless row fails until event rows, provider artifact, and, for Claude, raw hook bytes identify its source. A stop-only Claude identity without a matching start remains a blocker.
+Diff pre-dispatch and post-restart Task Run IDs. Every new row must be the controller, managed target, planned direct child, or explicitly expected wrapper. A new parentless or subjectless row fails until event rows, provider artifact, and, for Claude, raw hook bytes identify its source. A stop-only Claude identity without a matching start remains a blocker unless it has the exact explicit-empty Cell 3 shape and all four zero-reference checks above; in that case no Task Run exists to waive. The validated but intentionally unpersisted inner SID in Cell 2 or Cell 3 is not an expected row.
 
-Record a four-row ledger with controller, child, marker, native session ID, time to controller link, time to child done, stale-display result, restart result, doctor result, integrity result, and unattached-row result. All four rows must pass.
+Record a four-row ledger with controller, requested child engine, managed
+target, marker, managed native session ID, validated inner session ID when
+applicable, exact controller-to-managed-target edge, time to controller link,
+time to managed target done,
+stale-display result, restart result, inner-result validation, doctor result,
+integrity result, and unattached-row result. All four rows must pass.
 
 ---
 

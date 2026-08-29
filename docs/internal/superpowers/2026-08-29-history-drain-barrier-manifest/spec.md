@@ -64,6 +64,10 @@ backfill test.
 7. Prove that a production-shaped shared provider-history replay completes
    without a missing manifest, persistence degradation, duplicate native
    binding, or unexplained new Unattached Task Run.
+8. Reject the exact Claude Code internal stop shape discovered during Cell 3:
+   a `SubagentStop` whose `agent_type` field is present as the JSON string `""`.
+   Preserve existing lost-start recovery for absent, JSON `null`, and non-empty
+   types.
 
 ## Non-goals
 
@@ -153,6 +157,29 @@ characterization test must first prove both emitted state and exact event-ID
 suffix for `Working` and `Idle`. The change must not add `Copy` to `ExecState`
 or alter any provider-lane decision.
 
+### Explicit-empty Claude stop discrimination
+
+Claude Code 2.1.251 emitted two `SubagentStop` payloads during the Cell 3
+wrapper run with distinct agent IDs, an explicitly empty `agent_type`, no
+matching `SubagentStart`, nonexistent transcript paths, and no occurrence in
+the controller or wrapper transcripts. Their progress-like final messages
+matched activity within the one real wrapper. The raw bytes prove this shape;
+the precise Claude-internal producer, such as summary or side-query work,
+remains an inference. The hook adapter mapped each payload to `complete`, after
+which the reducer correctly applied its documented terminal forward-reference
+rule and the TUI honestly displayed the two subjectless, parentless rows as
+Unattached Task Runs.
+
+The adapter will ignore only Claude `SubagentStop` payloads for which
+`agent_type == Some("")`. A non-empty type remains a structurally identified
+Claude subagent stop. An absent field or JSON `null` both deserialize as `None`
+and retain the existing forward-reference mapping for compatibility and
+lost-start recovery. Codex hook mapping, including an explicit-empty type, is
+unchanged. The reducer, Task Run lifecycle, schema, diagnostic
+forward-reference counter, provider artifact lane, and Unattached presentation
+are unchanged. This boundary removes the provider-internal over-admission
+without hiding or deleting any admitted Task Run.
+
 ## Automated test strategy
 
 ### 1. Store transaction tests
@@ -199,28 +226,58 @@ Run targeted Store, reducer, collector, provider, restore, status, and
 convergence tests. Then run `cargo fmt --check`, `make test`, `make lint`,
 `make build`, and `git diff --check`.
 
+### 6. Hook-boundary regressions
+
+Pin four Claude stop shapes before changing the adapter: explicit-empty,
+absent, JSON `null`, and non-empty `agent_type`. Pin a fifth Codex
+explicit-empty control. The Claude explicit-empty test must be RED because the
+current adapter emits `complete`; after the correction it produces no envelope
+and the CLI makes no Controller delivery. Every control must continue to emit
+the exact existing terminal envelope, including the typed Claude
+stop-before-start integration path and its forward-reference counter. Use a
+structurally exact but fully redacted fixture with synthetic identifiers,
+paths, messages, CWD, and prompt ID; private captured payload bytes never enter
+the repository. Its sentinels must never reach the Controller socket.
+
 ## Four-cell cold-pane acceptance
 
-The four required cells are:
+The four required production routes are:
 
-| Controller | Child | Required result |
-| --- | --- | --- |
-| Codex | Codex | linked working to done, then linked done after restart |
-| Codex | Claude | linked working to done, then linked done after restart |
-| Claude | Codex | linked working to done, then linked done after restart |
-| Claude | Claude | linked working to done, then linked done after restart |
+| Controller | Requested child engine | Managed target | Required result |
+| --- | --- | --- | --- |
+| Codex | Codex | direct Codex child | linked working to done, then linked done after restart |
+| Codex | Claude | Codex `claude-reviewer` wrapper | linked wrapper working to done and a successful one-shot inner Claude result, then linked wrapper done after restart |
+| Claude | Codex | Claude `codex-reviewer` wrapper | linked wrapper working to done and a successful one-shot inner Codex result, then linked wrapper done after restart |
+| Claude | Claude | direct Claude child | linked working to done, then linked done after restart |
 
 Each cell uses a fresh private state database and cell-specific runtime and
 evidence roots. It starts the newest integrated binary in a real Herdr pane,
 waits for persistence and provider sources to report ready, establishes the
-controller row, and only then starts one bounded child carrying a unique marker.
-The child performs no repository mutation and does not delegate further.
+controller row, and only then starts one bounded child route carrying a unique
+marker. The child performs no repository mutation and does not delegate beyond
+the one inner CLI run required by a production cross-model wrapper.
+
+The acceptance distinguishes the managed task from a cross-model wrapper's
+inner model execution. In the Codex-to-Claude route, production
+`claude-reviewer` invokes Claude with `--safe-mode --no-session-persistence`.
+Hooks and a Claude transcript are therefore intentionally absent. In the
+Claude-to-Codex route, production `codex-reviewer` invokes a new `codex exec`
+without a previously known resumable Codex session ID; Claude hooks and Codex
+session metadata carry no safe parent-link fact for that inner process. In both
+routes the inner process is not a Herdr task and must not be fabricated as one.
+The durable managed child is the outer wrapper; its validated report and the
+matching inner rollout are evidence that the one inner run succeeded. Changing
+the production wrapper contract or deriving lifecycle from free-form nested
+command bytes is outside this increment.
 
 For every cell, capture and verify:
 
-1. the pane transition from working to done under the exact controller;
-2. the exact parent edge, provider/native session ID, Task Run, and Agent Node
-   in SQLite;
+1. the managed target's pane transition from working to done under the exact
+   controller;
+2. the exact parent edge and route-native identity in SQLite: provider/native
+   session binding for a Codex-managed target, or the Claude agent ID in the
+   hook Task Run key, Agent Node, and native-agent-session table for a
+   Claude-managed target;
 3. terminal display after Agent Node evidence crosses the production staleness
    boundary, with the automated clock-boundary test as the deterministic
    assertion and the pane/database evidence as the real-process assertion;
@@ -233,11 +290,15 @@ For every cell, capture and verify:
 7. no unexplained Unattached Task Run first observed during that cell's time
    interval.
 
-For Claude controller or child cells, retain the raw hook payloads in a bounded
-temporary evidence directory. A stop-only extra Task Run or delayed controller
-link is a failed cell until those payloads and provider artifacts identify its
-source; elapsed startup time and the point at which the controller becomes
-linkable are recorded for every cell.
+For Claude controller or direct-child cells, retain the raw hook payloads in a
+bounded temporary evidence directory. For each cross-model wrapper route,
+retain the exact wrapper report and independently validate its structured inner
+result and matching rollout; require zero references to the reported inner
+session ID across Task Runs, Agent Nodes, and native-agent-session bindings,
+consistent with that route's production observability contract. A stop-only
+extra Task Run or delayed controller link is a failed cell until those payloads
+and provider artifacts identify its source; elapsed startup time and the point
+at which the controller becomes linkable are recorded for every cell.
 
 ## Shared-history cold acceptance
 
