@@ -1769,13 +1769,235 @@ async fn emit_from_hook_malformed_or_oversized_input_is_ignored_without_delivery
     }
 }
 
+const REDACTED_EXPLICIT_EMPTY_STOP_SENTINEL: &str = "redacted-explicit-empty-stop-sentinel";
+
+/// Fully synthetic, redacted fixture that preserves only the observed
+/// structural shape of a provider-internal Claude Code `SubagentStop` hook
+/// payload: an explicitly present empty `agent_type` string beside the other
+/// observed top-level keys. No value is a captured private value; every
+/// content-bearing field carries the sentinel so any leak is detectable.
+fn redacted_claude_explicit_empty_stop_fixture() -> Value {
+    let sentinel = REDACTED_EXPLICIT_EMPTY_STOP_SENTINEL;
+    json!({
+        "agent_id": format!("agent-{sentinel}"),
+        "agent_transcript_path": format!("/{sentinel}/agent-transcript.jsonl"),
+        "agent_type": "",
+        "background_tasks": [{
+            "agent_type": format!("background-agent-type-{sentinel}"),
+            "description": format!("background-description-{sentinel}"),
+            "id": format!("background-id-{sentinel}"),
+            "status": "synthetic-status",
+            "type": "synthetic-type"
+        }],
+        "cwd": format!("/{sentinel}/cwd"),
+        "effort": {"level": "synthetic-level"},
+        "hook_event_name": "SubagentStop",
+        "last_assistant_message": format!("last-assistant-message-{sentinel}"),
+        "permission_mode": "auto",
+        "prompt_id": format!("prompt-{sentinel}"),
+        "session_crons": [],
+        "session_id": format!("session-{sentinel}"),
+        "stop_hook_active": false,
+        "transcript_path": format!("/{sentinel}/transcript.jsonl")
+    })
+}
+
+/// Fixture-integrity check: a missing or renamed top-level key, or a wrong
+/// nested key or type shape, fails here before the adapter is exercised.
+fn assert_redacted_claude_explicit_empty_stop_shape(fixture: &Value) {
+    let object = fixture.as_object().expect("fixture must be a JSON object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "agent_id",
+            "agent_transcript_path",
+            "agent_type",
+            "background_tasks",
+            "cwd",
+            "effort",
+            "hook_event_name",
+            "last_assistant_message",
+            "permission_mode",
+            "prompt_id",
+            "session_crons",
+            "session_id",
+            "stop_hook_active",
+            "transcript_path",
+        ]
+    );
+    for key in [
+        "agent_id",
+        "agent_transcript_path",
+        "agent_type",
+        "cwd",
+        "hook_event_name",
+        "last_assistant_message",
+        "permission_mode",
+        "prompt_id",
+        "session_id",
+        "transcript_path",
+    ] {
+        assert!(object[key].is_string(), "top-level {key} must be a string");
+    }
+    assert!(
+        object["stop_hook_active"].is_boolean(),
+        "stop_hook_active must be a boolean"
+    );
+    let effort = object["effort"]
+        .as_object()
+        .expect("effort must be an object");
+    assert_eq!(
+        effort.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["level"]
+    );
+    assert!(effort["level"].is_string(), "effort.level must be a string");
+    let background_tasks = object["background_tasks"]
+        .as_array()
+        .expect("background_tasks must be an array");
+    assert_eq!(background_tasks.len(), 1);
+    let background_task = background_tasks[0]
+        .as_object()
+        .expect("background_tasks[0] must be an object");
+    let mut background_task_keys: Vec<&str> = background_task.keys().map(String::as_str).collect();
+    background_task_keys.sort_unstable();
+    assert_eq!(
+        background_task_keys,
+        ["agent_type", "description", "id", "status", "type"]
+    );
+    for key in background_task_keys {
+        assert!(
+            background_task[key].is_string(),
+            "background_tasks[0].{key} must be a string"
+        );
+    }
+    assert_eq!(object["session_crons"], json!([]));
+    assert_eq!(object["hook_event_name"], "SubagentStop");
+    assert_eq!(object["agent_type"], "");
+    assert_eq!(object["permission_mode"], "auto");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn emit_from_hook_ignores_redacted_claude_explicit_empty_stop_without_delivery() {
+    let fixture = redacted_claude_explicit_empty_stop_fixture();
+    assert_redacted_claude_explicit_empty_stop_shape(&fixture);
+    let sentinel = REDACTED_EXPLICIT_EMPTY_STOP_SENTINEL;
+    let payload = serde_json::to_vec(&fixture).unwrap();
+    let session_run_id = format!("hook:claude-code:session-{sentinel}");
+    let agent_run_id = format!("{session_run_id}:agent:agent-{sentinel}");
+
+    for strict in [false, true] {
+        let (runtime_base, _runtime, listener) = scripted_emit_listener();
+        let runtime_path = runtime_base.path().to_path_buf();
+        let payload = payload.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            hook_emit_command(&runtime_path, strict, "claude-code", payload)
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            output.status.success(),
+            "strict={strict}: {}",
+            output_text(&output)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "strict={strict}: adapter stdout must be zero bytes"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "strict={strict}: explicit-empty stop must emit no output: {}",
+            output_text(&output)
+        );
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "strict={strict}: explicit-empty stop must not connect to the Controller"
+        );
+    }
+
+    let running = RendezvousController::start().await;
+    let (task_count_before, forward_references_before) = {
+        let model = running.collector.model.borrow();
+        (
+            model.task_runs().count(),
+            model
+                .controller_diagnostics()
+                .terminal_forward_reference_creations(),
+        )
+    };
+    for strict in [false, true] {
+        let runtime_path = running.runtime_base.path().to_path_buf();
+        let payload = payload.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            hook_emit_command(&runtime_path, strict, "claude-code", payload)
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            output.status.success(),
+            "strict={strict}: {}",
+            output_text(&output)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "strict={strict}: adapter stdout must be zero bytes"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "strict={strict}: explicit-empty stop must emit no output: {}",
+            output_text(&output)
+        );
+        assert!(
+            !output_text(&output).contains(sentinel),
+            "strict={strict}: sentinel leaked into adapter output"
+        );
+    }
+
+    let model = running.collector.model.borrow();
+    assert!(
+        model
+            .task_run_by_key(&RunKey::Controller(agent_run_id))
+            .is_none(),
+        "explicit-empty stop must not create a Task Run"
+    );
+    assert!(
+        model
+            .task_run_by_key(&RunKey::Controller(session_run_id))
+            .is_none(),
+        "explicit-empty stop must not create a controller-session run"
+    );
+    assert_eq!(model.task_runs().count(), task_count_before);
+    assert_eq!(
+        model
+            .controller_diagnostics()
+            .terminal_forward_reference_creations(),
+        forward_references_before
+    );
+    let state = format!("{:?}", *model);
+    assert!(
+        !state.contains(sentinel),
+        "sentinel leaked into reducer state"
+    );
+    let diagnostics = format!("{:?}", *running.collector.diagnostics.borrow());
+    assert!(
+        !diagnostics.contains(sentinel),
+        "sentinel leaked into runtime diagnostics"
+    );
+    drop(model);
+    running.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn emit_from_hook_treats_terminal_before_start_stale_event_as_benign() {
     let running = RendezvousController::start().await;
     let stop_payload = serde_json::to_vec(&json!({
         "hook_event_name": "SubagentStop",
         "session_id": "race-session",
-        "agent_id": "agent-7"
+        "agent_id": "agent-7",
+        "agent_type": "researcher"
     }))
     .unwrap();
     let runtime_path = running.runtime_base.path().to_path_buf();

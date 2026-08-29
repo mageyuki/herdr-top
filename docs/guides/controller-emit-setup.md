@@ -61,7 +61,7 @@ providers use the same case-sensitive PascalCase event names.
 | --- | --- | --- | --- |
 | `SessionStart` | both | `task_started` with binding identity | session run |
 | `SubagentStart` | both | `dispatch`, then `task_started`; label is the agent type | subagent run |
-| `SubagentStop` | both | `complete` | subagent run |
+| `SubagentStop` | both | `complete`; for Claude Code only, an explicitly present empty `agent_type` string maps to nothing | subagent run |
 | `TaskCreated` | Claude Code only | `dispatch`, then `progress`; label is the task subject | task run |
 | `TaskCompleted` | Claude Code only | `complete` | task run |
 | `SessionEnd` | both | `session_ended` native lifecycle `Done` | session run |
@@ -272,6 +272,20 @@ If an earlier hook is lost, a later terminal event can still create a
 forward-referenced terminal run. Herdr Top flags that degraded outcome in
 diagnostics; it is not database or execution-tree corruption. Inspect hook
 standard error to find the earlier delivery failure.
+
+Claude Code also emits `SubagentStop` hooks whose payload carries an explicitly
+present but empty `agent_type` string (`""`). The observed payloads of that
+shape arrived with no preceding `SubagentStart`, so mapping them to `complete`
+would create diagnostic-flagged terminal forward-reference runs. Attributing
+that shape to provider-internal agents is an inference; the adapter's actual
+discriminator is structural. For the `claude-code` provider only, a
+`SubagentStop` whose `agent_type` is present and equal to `""` maps to nothing:
+it is not delivered, writes nothing to standard output or standard error, and
+cannot fail `--strict`. The adapter never inspects transcript paths to make
+that decision. A `SubagentStop` with an absent `agent_type`, a JSON `null`, or
+a non-empty string keeps the `complete` mapping and the lost-start recovery
+described here. Codex stops are unchanged, including one with an explicit
+empty type.
 
 Because hooks run in parallel, a terminal hook can occasionally deliver before
 its start hook. When the delayed start later delivers `task_started`, the
