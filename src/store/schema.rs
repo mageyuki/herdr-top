@@ -1,4 +1,4 @@
-//! SQLite schema v5, read-only preflight, online backup, and migration support.
+//! SQLite schema v8, read-only preflight, online backup, and migration support.
 
 use std::ffi::OsString;
 use std::fs::{self, Metadata, OpenOptions, Permissions};
@@ -14,7 +14,7 @@ use rusqlite::{Connection, MAIN_DB, OpenFlags, OptionalExtension, params};
 use super::StoreError;
 use crate::lockfile::StateRoot;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 5;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 8;
 pub(super) const DATABASE_FILE: &str = "herdr-top.sqlite3";
 const FILE_MODE: u32 = 0o600;
 
@@ -363,6 +363,30 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), St
         )?;
         version = 5;
     }
+    if version < 6 {
+        transaction.execute_batch(SCHEMA_V6)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (6, ?1)",
+            [now_ms],
+        )?;
+        version = 6;
+    }
+    if version < 7 {
+        transaction.execute_batch(SCHEMA_V7)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (7, ?1)",
+            [now_ms],
+        )?;
+        version = 7;
+    }
+    if version < 8 {
+        transaction.execute_batch(SCHEMA_V8)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (8, ?1)",
+            [now_ms],
+        )?;
+        version = 8;
+    }
     debug_assert_eq!(version, CURRENT_SCHEMA_VERSION);
     transaction.commit()?;
     Ok(())
@@ -448,11 +472,146 @@ FROM (
 ) AS ordered;
 "#;
 
-const SCHEMA_V5: &str = r#"
+pub(super) const SCHEMA_V5: &str = r#"
 ALTER TABLE task_runs ADD COLUMN subject TEXT;
 ALTER TABLE task_runs ADD COLUMN dismissed_at_ms INTEGER;
 ALTER TABLE tabs ADD COLUMN label TEXT;
 ALTER TABLE panes ADD COLUMN display_name TEXT;
+"#;
+
+pub(super) const SCHEMA_V6: &str = r#"
+ALTER TABLE task_runs ADD COLUMN native_session_end_status TEXT
+    CHECK (native_session_end_status IS NULL OR native_session_end_status IN (
+        'done', 'error', 'cancelled', 'unknown'
+    ));
+ALTER TABLE task_runs ADD COLUMN native_session_end_at_ms INTEGER;
+ALTER TABLE task_runs ADD COLUMN lifecycle_source_at_ms INTEGER;
+ALTER TABLE task_runs ADD COLUMN lifecycle_observed_at_ms INTEGER;
+ALTER TABLE task_runs ADD COLUMN lifecycle_source_order TEXT;
+ALTER TABLE task_runs ADD COLUMN history_ready INTEGER NOT NULL DEFAULT 1
+    CHECK (history_ready IN (0, 1));
+ALTER TABLE task_runs ADD COLUMN latest_provider_at_ms INTEGER;
+
+CREATE TABLE run_rate_totals (
+    run_id       TEXT PRIMARY KEY,
+    output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+    working_ms    INTEGER NOT NULL CHECK (working_ms >= 0),
+    FOREIGN KEY (run_id) REFERENCES task_runs(run_id) ON DELETE CASCADE
+);
+
+CREATE TABLE history_drains (
+    drain_id        TEXT PRIMARY KEY
+                        CHECK (length(drain_id) BETWEEN 1 AND 160),
+    provider        TEXT NOT NULL CHECK (provider IN ('claude', 'codex')),
+    created_at_ms   INTEGER NOT NULL,
+    finalized_at_ms INTEGER
+);
+
+CREATE TABLE history_drain_artifacts (
+    drain_id    TEXT NOT NULL,
+    artifact_id TEXT NOT NULL CHECK (length(artifact_id) > 0),
+    generation  TEXT NOT NULL CHECK (length(generation) > 0),
+    goalpost    INTEGER NOT NULL CHECK (goalpost >= 0),
+    PRIMARY KEY (drain_id, artifact_id),
+    FOREIGN KEY (drain_id) REFERENCES history_drains(drain_id) ON DELETE CASCADE
+);
+
+CREATE TABLE history_drain_runs (
+    drain_id TEXT NOT NULL,
+    run_id   TEXT NOT NULL,
+    PRIMARY KEY (drain_id, run_id),
+    FOREIGN KEY (drain_id) REFERENCES history_drains(drain_id) ON DELETE CASCADE,
+    FOREIGN KEY (run_id) REFERENCES task_runs(run_id) ON DELETE CASCADE
+);
+CREATE INDEX history_drain_runs_run_idx ON history_drain_runs(run_id);
+"#;
+
+pub(super) const SCHEMA_V7: &str = r#"
+ALTER TABLE history_drains ADD COLUMN completed_by_drain_id TEXT;
+UPDATE history_drains
+SET completed_by_drain_id = drain_id
+WHERE finalized_at_ms IS NOT NULL;
+
+ALTER TABLE events ADD COLUMN history_drain_id TEXT;
+CREATE INDEX events_history_drain_idx ON events(history_drain_id, event_row_id);
+
+CREATE TABLE history_run_publications (
+    published_run_id TEXT PRIMARY KEY,
+    canonical_run_id TEXT NOT NULL,
+    payload          TEXT NOT NULL,
+    FOREIGN KEY (canonical_run_id) REFERENCES task_runs(run_id) ON DELETE CASCADE
+);
+CREATE INDEX history_run_publications_canonical_idx
+    ON history_run_publications(canonical_run_id);
+
+CREATE TABLE history_event_before_images (
+    drain_id   TEXT NOT NULL,
+    event_id   TEXT NOT NULL,
+    task_run_id TEXT,
+    PRIMARY KEY (drain_id, event_id),
+    FOREIGN KEY (drain_id) REFERENCES history_drains(drain_id) ON DELETE CASCADE,
+    FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE
+);
+
+UPDATE events
+SET history_drain_id = (
+    SELECT association.drain_id
+    FROM history_drain_runs AS association
+    JOIN history_drains AS drain ON drain.drain_id = association.drain_id
+    WHERE association.run_id = events.task_run_id
+      AND drain.finalized_at_ms IS NULL
+    ORDER BY drain.created_at_ms, association.drain_id
+    LIMIT 1
+)
+WHERE history_drain_id IS NULL
+  AND EXISTS (
+      SELECT 1 FROM task_runs AS run
+      WHERE run.run_id = events.task_run_id
+        AND run.history_ready = 0
+  )
+  AND EXISTS (
+      SELECT 1
+      FROM history_drain_runs AS association
+      JOIN history_drains AS drain ON drain.drain_id = association.drain_id
+      WHERE association.run_id = events.task_run_id
+        AND drain.finalized_at_ms IS NULL
+  );
+"#;
+
+pub(super) const SCHEMA_V8: &str = r#"
+CREATE TABLE agent_nodes_v8 (
+    agent_node_id       TEXT PRIMARY KEY,
+    provider            TEXT NOT NULL,
+    native_session_id   TEXT,
+    task_run_id         TEXT NOT NULL,
+    parent_agent_node_id TEXT,
+    state               TEXT CHECK (state IS NULL OR state IN ('working', 'ended')),
+    model_id             TEXT,
+    last_event_kind      TEXT,
+    last_tool_name       TEXT,
+    last_item_count      INTEGER,
+    last_byte_count      INTEGER,
+    last_activity_at_ms  INTEGER,
+    session_file         TEXT,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(run_id) ON DELETE CASCADE,
+    FOREIGN KEY (provider, native_session_id)
+        REFERENCES native_agent_sessions(provider, native_session_id)
+);
+
+INSERT INTO agent_nodes_v8(
+    agent_node_id, provider, native_session_id, task_run_id, parent_agent_node_id,
+    state, model_id, last_event_kind, last_tool_name, last_item_count,
+    last_byte_count, last_activity_at_ms, session_file
+)
+SELECT
+    agent_node_id, provider, native_session_id, task_run_id, parent_agent_node_id,
+    state, model_id, last_event_kind, last_tool_name, last_item_count,
+    last_byte_count, last_activity_at_ms, session_file
+FROM agent_nodes;
+
+DROP TABLE agent_nodes;
+ALTER TABLE agent_nodes_v8 RENAME TO agent_nodes;
+CREATE INDEX agent_nodes_parent_idx ON agent_nodes(parent_agent_node_id);
 "#;
 
 pub(super) const SCHEMA_V1: &str = r#"

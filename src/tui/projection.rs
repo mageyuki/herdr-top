@@ -7,14 +7,13 @@ use std::path::Path;
 
 use crate::activity::{
     ActivityDurability, ActivityItem, DEFAULT_TERMINAL_VISIBILITY_MS,
-    HOOK_ONLY_STALE_VISIBILITY_MS, OperatorSnapshot, ghost_visibility_ms,
-    is_default_visible_task_run, runs_with_executions,
+    HOOK_ONLY_STALE_VISIBILITY_MS, OperatorSnapshot, ghost_visibility_ms, runs_with_executions,
 };
 use crate::diagnostics::{ControllerInputStatus, RuntimeDiagnosticsSnapshot};
 use crate::herdr::collector::ObservationQuality;
 use crate::model::{
-    AgentNode, DomainModel, ExecState, PaneAgentStatus, Provider, RunId, RunKey, TaskRun,
-    TaskState, TokenBreakdown, TurnAttr,
+    AgentNode, DomainModel, ExecState, Provider, RunId, RunKey, TaskRun, TaskState, TokenBreakdown,
+    TurnAttr,
 };
 use crate::store::writer::PersistenceStatus;
 
@@ -23,267 +22,10 @@ use super::dag;
 use super::view::TreeRow;
 
 pub(crate) const DETAIL_ACTIVITY_LIMIT: usize = 100;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TaskDisplayStatus {
-    Queued,
-    Working,
-    Idle,
-    Blocked,
-    Done,
-    Error,
-    Cancelled,
-    Unknown,
-}
-
-impl TaskDisplayStatus {
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::Queued => "queued",
-            Self::Working => "working",
-            Self::Idle => "idle",
-            Self::Blocked => "blocked",
-            Self::Done => "done",
-            Self::Error => "error",
-            Self::Cancelled => "cancelled",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StatusSource {
-    TaskState,
-    PaneAgentStatus,
-    ExecutionState,
-    AgentNodeState,
-    Fallback,
-}
-
-impl StatusSource {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::TaskState => "task_state",
-            Self::PaneAgentStatus => "pane_agent_status",
-            Self::ExecutionState => "execution_state",
-            Self::AgentNodeState => "agent_node_state",
-            Self::Fallback => "fallback",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DisplayStatus {
-    pub(crate) status: TaskDisplayStatus,
-    pub(crate) source: StatusSource,
-    pub(crate) stalled: bool,
-}
-
-impl DisplayStatus {
-    pub(crate) const fn new(status: TaskDisplayStatus, source: StatusSource) -> Self {
-        Self {
-            status,
-            source,
-            stalled: false,
-        }
-    }
-
-    fn with_stalled(mut self, stalled: bool) -> Self {
-        if !matches!(
-            self.status,
-            TaskDisplayStatus::Done | TaskDisplayStatus::Error | TaskDisplayStatus::Cancelled
-        ) {
-            self.stalled |= stalled;
-        }
-        self
-    }
-
-    pub(crate) const fn glyph(self) -> &'static str {
-        if self.stalled {
-            return "⚠";
-        }
-        match self.status {
-            TaskDisplayStatus::Queued => "◌",
-            TaskDisplayStatus::Working | TaskDisplayStatus::Blocked => "●",
-            TaskDisplayStatus::Idle => "○",
-            TaskDisplayStatus::Done => "✓",
-            TaskDisplayStatus::Error => "✗",
-            TaskDisplayStatus::Cancelled => "⊘",
-            TaskDisplayStatus::Unknown => "?",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct AgentStatusEvidence {
-    state: Option<ExecState>,
-    last_activity_at_ms: Option<i64>,
-    agent_node_id: String,
-}
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct StatusReadModel {
-    pane_executions: HashMap<(RunId, String), ExecState>,
-    root_agents: HashMap<RunId, AgentStatusEvidence>,
-}
-
-impl StatusReadModel {
-    pub(crate) fn from_model(model: &DomainModel, now_ms: i64) -> Self {
-        let mut selected_executions = HashMap::<(RunId, String), (bool, String, ExecState)>::new();
-        for execution in model.executions() {
-            let key = (execution.task_run_id, execution.pane_id.clone());
-            let candidate = (
-                execution.state.is_terminal(),
-                execution.execution_id.clone(),
-                execution.state.clone(),
-            );
-            selected_executions
-                .entry(key)
-                .and_modify(|selected| {
-                    if (candidate.0, candidate.1.as_str()) < (selected.0, selected.1.as_str()) {
-                        selected.clone_from(&candidate);
-                    }
-                })
-                .or_insert(candidate);
-        }
-        let pane_executions = selected_executions
-            .into_iter()
-            .map(|(key, (_, _, state))| (key, state))
-            .collect();
-
-        let mut root_agents = HashMap::<RunId, AgentStatusEvidence>::new();
-        for agent in model.agent_nodes() {
-            if agent.parent_agent_node_id.is_some()
-                || agent.last_event_kind.as_deref()
-                    == Some(crate::provider::lane::LIVE_LINE_EVENT_KIND)
-                || agent_node_is_display_stale(agent, now_ms)
-                || model
-                    .task_run(&agent.task_run_id)
-                    .and_then(task_run_provider)
-                    .is_some_and(|provider| provider != agent.provider)
-            {
-                continue;
-            }
-            let candidate = AgentStatusEvidence {
-                state: agent.state.clone(),
-                last_activity_at_ms: agent.last_activity_at_ms,
-                agent_node_id: agent.agent_node_id.clone(),
-            };
-            root_agents
-                .entry(agent.task_run_id)
-                .and_modify(|selected| {
-                    if (
-                        selected.last_activity_at_ms,
-                        selected.agent_node_id.as_str(),
-                    ) < (
-                        candidate.last_activity_at_ms,
-                        candidate.agent_node_id.as_str(),
-                    ) {
-                        selected.clone_from(&candidate);
-                    }
-                })
-                .or_insert(candidate);
-        }
-
-        Self {
-            pane_executions,
-            root_agents,
-        }
-    }
-
-    pub(crate) fn task_display_status(
-        &self,
-        model: &DomainModel,
-        run: &TaskRun,
-        pane_id: Option<&str>,
-        inactive: bool,
-    ) -> DisplayStatus {
-        let semantic = match run.state {
-            TaskState::Completed => Some(TaskDisplayStatus::Done),
-            TaskState::Failed => Some(TaskDisplayStatus::Error),
-            TaskState::Cancelled => Some(TaskDisplayStatus::Cancelled),
-            TaskState::EndedUnknown => Some(TaskDisplayStatus::Unknown),
-            TaskState::Queued => Some(TaskDisplayStatus::Queued),
-            TaskState::Blocked => Some(TaskDisplayStatus::Blocked),
-            TaskState::Running => None,
-        };
-        if let Some(status) = semantic {
-            return DisplayStatus::new(status, StatusSource::TaskState).with_stalled(inactive);
-        }
-
-        if let Some(pane_id) = pane_id
-            && let Some(execution) = self.pane_executions.get(&(run.run_id, pane_id.to_owned()))
-        {
-            if !execution.is_terminal()
-                && let Some(status) = model.pane_agent_status(pane_id)
-            {
-                return pane_agent_display_status(status).with_stalled(inactive);
-            }
-            return execution_display_status(execution, false).with_stalled(inactive);
-        }
-
-        if let Some(evidence) = self.root_agents.get(&run.run_id)
-            && let Some(state) = evidence.state.as_ref()
-            && !matches!(state, ExecState::Unknown)
-        {
-            return execution_display_status(state, false)
-                .with_source(StatusSource::AgentNodeState)
-                .with_stalled(inactive);
-        }
-
-        DisplayStatus::new(TaskDisplayStatus::Working, StatusSource::TaskState)
-            .with_stalled(inactive)
-    }
-}
-
-impl DisplayStatus {
-    const fn with_source(mut self, source: StatusSource) -> Self {
-        self.source = source;
-        self
-    }
-}
-
-fn task_run_provider(run: &TaskRun) -> Option<Provider> {
-    match &run.key {
-        RunKey::Native { provider, .. } | RunKey::NativePath { provider, .. } => Some(*provider),
-        RunKey::Controller(_) | RunKey::Provisional { .. } => None,
-    }
-}
-
-fn pane_agent_display_status(status: PaneAgentStatus) -> DisplayStatus {
-    let status = match status {
-        PaneAgentStatus::Idle => TaskDisplayStatus::Idle,
-        PaneAgentStatus::Working => TaskDisplayStatus::Working,
-        PaneAgentStatus::Blocked => TaskDisplayStatus::Blocked,
-        PaneAgentStatus::Done => TaskDisplayStatus::Done,
-        PaneAgentStatus::Unknown => TaskDisplayStatus::Unknown,
-    };
-    DisplayStatus::new(status, StatusSource::PaneAgentStatus)
-}
-
-fn execution_display_status(state: &ExecState, ended_is_done: bool) -> DisplayStatus {
-    let (status, stalled) = match state {
-        ExecState::Unknown => (TaskDisplayStatus::Unknown, false),
-        ExecState::Idle => (TaskDisplayStatus::Idle, false),
-        ExecState::Working => (TaskDisplayStatus::Working, false),
-        ExecState::Blocked => (TaskDisplayStatus::Blocked, false),
-        ExecState::Stale { .. } => (TaskDisplayStatus::Unknown, true),
-        ExecState::Ended if ended_is_done => (TaskDisplayStatus::Done, false),
-        ExecState::Ended => (TaskDisplayStatus::Unknown, false),
-    };
-    DisplayStatus {
-        status,
-        source: StatusSource::ExecutionState,
-        stalled,
-    }
-}
-
-pub(crate) fn native_agent_display_status(agent: &AgentNode) -> DisplayStatus {
-    agent.state.as_ref().map_or_else(
-        || DisplayStatus::new(TaskDisplayStatus::Unknown, StatusSource::Fallback),
-        |state| execution_display_status(state, true).with_source(StatusSource::AgentNodeState),
-    )
-}
+pub(crate) use crate::status::{
+    DisplayStatus, StatusReadModel, StatusSource, TaskDisplayStatus, agent_node_is_display_stale,
+    native_agent_display_status,
+};
 
 /// Raw run-scoped inputs gathered during paint so elapsed values follow the paint clock.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -291,38 +33,37 @@ pub(crate) struct RunMetricInputs {
     pub(crate) model: Option<String>,
     pub(crate) effort: Option<String>,
     pub(crate) output_tokens: Option<u64>,
+    pub(crate) measured_output_tokens: Option<u64>,
+    pub(crate) measured_working_ms: Option<i64>,
+    pub(crate) rate_cursor_initialized: bool,
     pub(crate) started_wall_ms: Option<i64>,
     pub(crate) created_at_ms: Option<i64>,
-    pub(crate) finished_at_ms: Option<i64>,
-    pub(crate) terminal: bool,
+    pub(crate) lifecycle_end_at_ms: Option<i64>,
 }
 
 pub(crate) fn run_metric_inputs(model: &DomainModel, run: &TaskRun) -> RunMetricInputs {
     let telemetry = model.telemetry(&run.run_id);
+    let rate_totals = model.run_rate_totals(&run.run_id);
     RunMetricInputs {
         model: telemetry.and_then(|telemetry| telemetry.model.clone()),
         effort: telemetry.and_then(|telemetry| telemetry.effort.clone()),
         output_tokens: telemetry.map(|telemetry| telemetry.output_tokens),
+        measured_output_tokens: rate_totals.map(|totals| totals.output_tokens),
+        measured_working_ms: rate_totals.map(|totals| totals.working_ms),
+        rate_cursor_initialized: model.run_rate_cursor(&run.run_id).is_some(),
         started_wall_ms: telemetry.map(|telemetry| telemetry.started_wall_ms),
         created_at_ms: run.created_at_ms,
-        finished_at_ms: run.finished_at_ms,
-        terminal: run.state.is_terminal(),
+        lifecycle_end_at_ms: model.effective_lifecycle_end_ms(run),
     }
 }
 
-fn run_rate_terms(metrics: &RunMetricInputs, now_ms: i64) -> Option<(u64, i64)> {
-    let output_tokens = metrics.output_tokens?;
-    let started_wall_ms = metrics.started_wall_ms?;
-    let end_ms = if metrics.terminal {
-        metrics.finished_at_ms?
-    } else {
-        now_ms
-    };
-    let elapsed_ms = end_ms.checked_sub(started_wall_ms)?;
-    if elapsed_ms <= 0 {
+fn run_rate_terms(metrics: &RunMetricInputs, _now_ms: i64) -> Option<(u64, i64)> {
+    let output_tokens = metrics.measured_output_tokens?;
+    let working_ms = metrics.measured_working_ms?;
+    if working_ms <= 0 {
         return None;
     }
-    Some((output_tokens, elapsed_ms))
+    Some((output_tokens, working_ms))
 }
 
 pub(crate) fn run_token_rate(metrics: &RunMetricInputs, now_ms: i64) -> Option<f64> {
@@ -434,14 +175,12 @@ fn aggregate_summary_rows(
         let metrics = run_metric_inputs(model, run);
         let group = groups.entry(label(run, &metrics)).or_default();
         group.run_count = group.run_count.saturating_add(1);
-        if !run.state.is_terminal() {
+        let lifecycle_end_ms = model.effective_lifecycle_end_ms(run);
+        if lifecycle_end_ms.is_none() {
             group.live_count = group.live_count.saturating_add(1);
         }
-        if let Some(duration) = run
-            .state
-            .is_terminal()
-            .then(|| run.finished_at_ms.zip(run.created_at_ms))
-            .flatten()
+        if let Some(duration) = lifecycle_end_ms
+            .zip(run.created_at_ms)
             .and_then(|(finished, created)| finished.checked_sub(created))
             .filter(|duration| *duration >= 0)
         {
@@ -559,11 +298,118 @@ pub(crate) fn worker_kind_label(run: &TaskRun) -> String {
     }
 }
 
-pub(crate) fn run_kind_label(model: &DomainModel, run: &TaskRun) -> String {
+/// Returns the sanitized stable run kind, or `None` when no nonempty kind was published.
+pub(crate) fn stable_run_kind(model: &DomainModel, run_id: RunId) -> Option<String> {
     model
-        .run_kind(&run.run_id)
+        .run_kind(&run_id)
         .filter(|kind| !kind.is_empty())
-        .map_or_else(|| worker_kind_label(run), escape_controls)
+        .map(escape_controls)
+}
+
+pub(crate) fn run_kind_label(model: &DomainModel, run: &TaskRun) -> String {
+    stable_run_kind(model, run.run_id).unwrap_or_else(|| worker_kind_label(run))
+}
+
+fn key_provider(key: &RunKey) -> Option<Provider> {
+    match key {
+        RunKey::Native { provider, .. } | RunKey::NativePath { provider, .. } => Some(*provider),
+        RunKey::Controller(_) | RunKey::Provisional { .. } => None,
+    }
+}
+
+/// Maps the recognized hook selector of a hook-backed Controller key to its provider.
+fn hook_selector_provider(key: &RunKey) -> Option<Provider> {
+    let RunKey::Controller(name) = key else {
+        return None;
+    };
+    let (selector, _) = name.strip_prefix("hook:")?.split_once(':')?;
+    match selector {
+        "claude-code" => Some(Provider::Claude),
+        "codex" => Some(Provider::Codex),
+        _ => None,
+    }
+}
+
+/// Returns the provider that backs a Task Run.
+///
+/// Detection follows the primary key, then a recognized hook selector, then an exact native or
+/// native-path entry in the task-run bindings, so a Controller-primary run keeps its provider
+/// after Controller/native identity convergence.
+pub(crate) fn provider_backed_provider(model: &DomainModel, run: &TaskRun) -> Option<Provider> {
+    key_provider(&run.key)
+        .or_else(|| hook_selector_provider(&run.key))
+        .or_else(|| {
+            model
+                .task_run_bindings()
+                .filter(|(_, run_id)| **run_id == run.run_id)
+                .find_map(|(key, _)| key_provider(key))
+        })
+}
+
+/// A Codex-backed run below an execution edge is a Codex child whose row renders the kind alone.
+pub(crate) fn is_codex_child(model: &DomainModel, run: &TaskRun) -> bool {
+    provider_backed_provider(model, run) == Some(Provider::Codex)
+        && model
+            .execution_edges()
+            .any(|edge| edge.child_run_id == run.run_id)
+}
+
+/// Exact native-session aliases indexed once per frame for Agent-row role resolution.
+#[derive(Debug, Default)]
+pub(crate) struct NativeAliasIndex {
+    runs_by_session: HashMap<(Provider, String), RunId>,
+    natively_bound_runs: HashSet<RunId>,
+}
+
+impl NativeAliasIndex {
+    pub(crate) fn from_model(model: &DomainModel) -> Self {
+        let mut index = Self::default();
+        for (key, run_id) in model.task_run_bindings() {
+            match key {
+                RunKey::Native { provider, sid } => {
+                    index
+                        .runs_by_session
+                        .insert((*provider, sid.clone()), *run_id);
+                    index.natively_bound_runs.insert(*run_id);
+                }
+                RunKey::NativePath { .. } => {
+                    index.natively_bound_runs.insert(*run_id);
+                }
+                RunKey::Controller(_) | RunKey::Provisional { .. } => {}
+            }
+        }
+        index
+    }
+
+    /// Resolves the Task Run whose kind an Agent Node represents.
+    ///
+    /// An exact `(provider, native session)` alias wins, so a Codex child Agent Node owned by
+    /// its root run reports the child's role. Otherwise the owning run applies only when it has
+    /// no native binding of its own: a Controller-keyed Claude subagent run is that Agent Node's
+    /// run, while a natively bound owner would lend a sibling session an unrelated kind.
+    pub(crate) fn agent_kind_run(&self, agent: &AgentNode) -> Option<RunId> {
+        agent
+            .native_session_id
+            .as_deref()
+            .filter(|sid| !sid.is_empty())
+            .and_then(|sid| self.runs_by_session.get(&(agent.provider, sid.to_owned())))
+            .copied()
+            .or_else(|| {
+                (!self.natively_bound_runs.contains(&agent.task_run_id))
+                    .then_some(agent.task_run_id)
+            })
+    }
+}
+
+/// Returns the sanitized role rendered on an Agent row, if any.
+pub(crate) fn agent_role_label(
+    model: &DomainModel,
+    aliases: &NativeAliasIndex,
+    agent: &AgentNode,
+) -> Option<String> {
+    let run_id = aliases.agent_kind_run(agent)?;
+    model.task_run(&run_id)?;
+    stable_run_kind(model, run_id)
 }
 
 #[derive(Debug)]
@@ -579,7 +425,7 @@ pub(crate) fn stalled_run_ids(
 ) -> HashSet<RunId> {
     let active = model
         .task_runs()
-        .filter(|run| !run.state.is_terminal())
+        .filter(|run| model.effective_lifecycle_end_ms(run).is_none())
         .filter(|run| {
             run.updated_at_ms
                 .or(run.created_at_ms)
@@ -603,7 +449,7 @@ pub(crate) fn stalled_run_ids(
 
     model
         .task_runs()
-        .filter(|run| !run.state.is_terminal())
+        .filter(|run| model.effective_lifecycle_end_ms(run).is_none())
         .filter(|run| {
             run.updated_at_ms
                 .or(run.created_at_ms)
@@ -622,17 +468,6 @@ pub(crate) fn stalled_run_ids(
 /// crossed the inactivity interval; this also prevents a just-created node from disappearing
 /// before its first timestamped event. `ExecState::Stale` remains visible because it is a known
 /// state, while the display rule deliberately applies only when state is absent, unknown, or ended.
-pub(crate) fn agent_node_is_display_stale(agent: &AgentNode, now_ms: i64) -> bool {
-    matches!(
-        agent.state.as_ref(),
-        None | Some(ExecState::Unknown) | Some(ExecState::Ended)
-    ) && agent
-        .last_activity_at_ms
-        .is_some_and(|last_activity_at_ms| {
-            now_ms.saturating_sub(last_activity_at_ms) >= crate::activity::headless_inactivity_ms()
-        })
-}
-
 fn next_agent_visibility_expiry_ms(model: &DomainModel, now_ms: i64) -> Option<i64> {
     model
         .agent_nodes()
@@ -672,6 +507,9 @@ fn has_active_descendant(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+// Detail projection materializes one selected entity at a time; keeping the run fields together
+// avoids allocation-only indirection in this private, short-lived read model.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum DetailEntity {
     Session,
     Workspace {
@@ -691,6 +529,9 @@ pub(crate) enum DetailEntity {
         key: String,
         name: String,
         native_session_id: Option<String>,
+        native_lifecycle_end: Option<String>,
+        lifecycle_watermark: Option<String>,
+        history_ready: bool,
         state: TaskState,
         display_status: DisplayStatus,
         dispatch_parent: Option<String>,
@@ -707,6 +548,9 @@ pub(crate) enum DetailEntity {
         evidence_paths: Vec<String>,
         per_turn: Box<[TurnAttr]>,
         output_tokens: Option<u64>,
+        measured_output_tokens: Option<u64>,
+        measured_working_ms: Option<i64>,
+        rate_cursor_initialized: bool,
         token_breakdown: Option<Box<TokenBreakdown>>,
     },
     Agent {
@@ -746,10 +590,35 @@ pub(crate) struct RuntimeStrip {
     pub(crate) d4: u64,
 }
 
+#[cfg(test)]
 pub(crate) fn project_rows(
     model: &DomainModel,
     full_rows: &[TreeRow],
     operator: &OperatorSnapshot,
+    query: &str,
+    collapsed: &HashSet<NodeKey>,
+    mode: ViewMode,
+    now_ms: i64,
+) -> RowProjection {
+    let visible_runs = crate::activity::default_visible_task_run_ids(model, operator, now_ms);
+    project_rows_with_visible(
+        model,
+        full_rows,
+        operator,
+        &visible_runs,
+        query,
+        collapsed,
+        mode,
+        now_ms,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn project_rows_with_visible(
+    model: &DomainModel,
+    full_rows: &[TreeRow],
+    _operator: &OperatorSnapshot,
+    visible_runs: &HashSet<RunId>,
     query: &str,
     collapsed: &HashSet<NodeKey>,
     mode: ViewMode,
@@ -760,10 +629,13 @@ pub(crate) fn project_rows(
         let direct = full_rows
             .iter()
             .enumerate()
-            .filter_map(|(index, row)| row_matches(model, row, query).then_some(index))
+            .filter_map(|(index, row)| {
+                (row_is_filter_eligible(model, row, visible_runs) && row_matches(model, row, query))
+                    .then_some(index)
+            })
             .collect::<Vec<_>>();
         let rows = match mode {
-            ViewMode::ExecutionTree => retain_tree_matches(full_rows, &direct),
+            ViewMode::ExecutionTree => retain_tree_matches(model, full_rows, &direct, visible_runs),
             ViewMode::DependencyDag => {
                 let matches = direct
                     .into_iter()
@@ -772,16 +644,22 @@ pub(crate) fn project_rows(
                 let order = full_rows
                     .iter()
                     .filter_map(|row| row.key.run_id())
+                    .filter(|run_id| visible_runs.contains(run_id))
                     .collect::<Vec<_>>();
-                let retained = dag::retain_matches_with_prerequisites(model, &order, &matches)
-                    .into_iter()
-                    .collect::<HashSet<_>>();
+                let retained = retain_visible_dag_matches_with_prerequisites(
+                    model,
+                    &order,
+                    &matches,
+                    visible_runs,
+                )
+                .into_iter()
+                .collect::<HashSet<_>>();
                 full_rows
                     .iter()
                     .filter(|row| {
-                        row.key
-                            .run_id()
-                            .is_some_and(|run_id| retained.contains(&run_id))
+                        row.key.run_id().is_some_and(|run_id| {
+                            visible_runs.contains(&run_id) && retained.contains(&run_id)
+                        })
                     })
                     .cloned()
                     .collect()
@@ -789,7 +667,10 @@ pub(crate) fn project_rows(
         };
         return RowProjection {
             next_expiry_ms: min_expiry(
-                agent_expiry_ms,
+                min_expiry(
+                    agent_expiry_ms,
+                    next_run_visibility_expiry_ms(model, &rows, now_ms),
+                ),
                 next_live_duration_expiry_ms(model, &rows, now_ms),
             ),
             rows,
@@ -797,47 +678,23 @@ pub(crate) fn project_rows(
     }
 
     let mut visible = Vec::with_capacity(full_rows.len());
-    let mut hidden_subtree_depth = None;
-    let mut next_expiry_ms = agent_expiry_ms;
-    let execution_run_ids = runs_with_executions(model);
     for row in full_rows {
-        if hidden_subtree_depth.is_some_and(|depth| row.depth > depth) {
-            continue;
-        }
-        hidden_subtree_depth = None;
         let Some(run_id) = row.key.run_id() else {
             visible.push(row.clone());
             continue;
         };
-        let Some(run) = model.task_run(&run_id) else {
+        if model.task_run(&run_id).is_none() {
             continue;
-        };
-        if is_default_visible_task_run(run, operator, &execution_run_ids, now_ms) {
-            if !run.state.is_terminal()
-                && let RunKey::Provisional { start_ms, .. } = &run.key
-            {
-                let last_observed_ms = run.updated_at_ms.or(run.created_at_ms).unwrap_or(*start_ms);
-                let expiry = last_observed_ms.saturating_add(ghost_visibility_ms());
-                next_expiry_ms = Some(next_expiry_ms.map_or(expiry, |current| current.min(expiry)));
-            } else if run.state.is_terminal()
-                && let Some(first_terminal_ms) = operator.terminal_times.get(&run_id).copied()
-            {
-                let expiry = first_terminal_ms.saturating_add(DEFAULT_TERMINAL_VISIBILITY_MS);
-                next_expiry_ms = Some(next_expiry_ms.map_or(expiry, |current| current.min(expiry)));
-            }
-            if matches!(run.key, RunKey::Controller(_))
-                && !execution_run_ids.contains(&run.run_id)
-                && let Some(updated_at_ms) = run.updated_at_ms
-            {
-                let expiry = updated_at_ms.saturating_add(HOOK_ONLY_STALE_VISIBILITY_MS);
-                next_expiry_ms = Some(next_expiry_ms.map_or(expiry, |current| current.min(expiry)));
-            }
+        }
+        if visible_runs.contains(&run_id) {
             visible.push(row.clone());
-        } else if mode == ViewMode::ExecutionTree {
-            hidden_subtree_depth = Some(row.depth);
         }
     }
 
+    let mut next_expiry_ms = min_expiry(
+        agent_expiry_ms,
+        next_run_visibility_expiry_ms(model, &visible, now_ms),
+    );
     let rows = if mode == ViewMode::ExecutionTree {
         apply_collapse(&visible, collapsed)
     } else {
@@ -862,12 +719,53 @@ fn min_expiry(left: Option<i64>, right: Option<i64>) -> Option<i64> {
     }
 }
 
+fn next_run_visibility_expiry_ms(
+    model: &DomainModel,
+    rows: &[TreeRow],
+    now_ms: i64,
+) -> Option<i64> {
+    let execution_run_ids = runs_with_executions(model);
+    rows.iter()
+        .filter_map(|row| row.key.run_id())
+        .filter_map(|run_id| model.task_run(&run_id))
+        .filter_map(|run| {
+            let lifecycle_expiry_ms = if model.effective_lifecycle_end_ms(run).is_none()
+                && let RunKey::Provisional { start_ms, .. } = &run.key
+            {
+                let last_observed_ms = run.updated_at_ms.or(run.created_at_ms).unwrap_or(*start_ms);
+                Some(last_observed_ms.saturating_add(ghost_visibility_ms()))
+            } else if let Some(first_terminal_ms) = model.effective_lifecycle_end_ms(run)
+                && crate::activity::is_default_visible_task_run(
+                    model,
+                    run,
+                    &execution_run_ids,
+                    now_ms,
+                )
+            {
+                Some(first_terminal_ms.saturating_add(DEFAULT_TERMINAL_VISIBILITY_MS))
+            } else {
+                None
+            };
+            let hook_only_expiry_ms = if matches!(run.key, RunKey::Controller(_))
+                && !execution_run_ids.contains(&run.run_id)
+            {
+                run.updated_at_ms.map(|updated_at_ms| {
+                    updated_at_ms.saturating_add(HOOK_ONLY_STALE_VISIBILITY_MS)
+                })
+            } else {
+                None
+            };
+            min_expiry(lifecycle_expiry_ms, hook_only_expiry_ms)
+        })
+        .min()
+}
+
 fn next_live_duration_expiry_ms(model: &DomainModel, rows: &[TreeRow], now_ms: i64) -> Option<i64> {
     let renders_live_duration = rows
         .iter()
         .filter_map(|row| row.key.run_id())
         .filter_map(|run_id| model.task_run(&run_id))
-        .filter(|run| !run.state.is_terminal())
+        .filter(|run| model.effective_lifecycle_end_ms(run).is_none())
         .filter_map(|run| run.created_at_ms)
         .filter_map(|created_at_ms| now_ms.checked_sub(created_at_ms))
         .any(|elapsed_ms| elapsed_ms >= 0);
@@ -880,15 +778,36 @@ fn next_live_duration_expiry_ms(model: &DomainModel, rows: &[TreeRow], now_ms: i
         .checked_add(1_000)
 }
 
-fn retain_tree_matches(rows: &[TreeRow], direct: &[usize]) -> Vec<TreeRow> {
+fn row_is_filter_eligible(
+    model: &DomainModel,
+    row: &TreeRow,
+    visible_runs: &HashSet<RunId>,
+) -> bool {
+    match &row.key {
+        NodeKey::Run { run_id, .. } => visible_runs.contains(run_id),
+        NodeKey::Agent { agent_node_id, .. } => model
+            .agent_node(agent_node_id)
+            .is_none_or(|agent| visible_runs.contains(&agent.task_run_id)),
+        _ => true,
+    }
+}
+
+fn retain_tree_matches(
+    model: &DomainModel,
+    rows: &[TreeRow],
+    direct: &[usize],
+    visible_runs: &HashSet<RunId>,
+) -> Vec<TreeRow> {
     let mut retained = HashSet::new();
     for &index in direct {
         retained.insert(index);
         let mut target_depth = rows[index].depth;
         for ancestor in (0..index).rev() {
             if rows[ancestor].depth < target_depth {
-                retained.insert(ancestor);
                 target_depth = rows[ancestor].depth;
+                if row_is_filter_eligible(model, &rows[ancestor], visible_runs) {
+                    retained.insert(ancestor);
+                }
                 if target_depth == 0 {
                     break;
                 }
@@ -899,6 +818,47 @@ fn retain_tree_matches(rows: &[TreeRow], direct: &[usize]) -> Vec<TreeRow> {
         .enumerate()
         .filter(|(index, _)| retained.contains(index))
         .map(|(_, row)| row.clone())
+        .collect()
+}
+
+fn retain_visible_dag_matches_with_prerequisites(
+    model: &DomainModel,
+    stable_order: &[RunId],
+    direct_matches: &HashSet<RunId>,
+    visible_runs: &HashSet<RunId>,
+) -> Vec<RunId> {
+    if model
+        .task_runs()
+        .all(|run| visible_runs.contains(&run.run_id))
+    {
+        return dag::retain_matches_with_prerequisites(model, stable_order, direct_matches);
+    }
+    let mut reverse = HashMap::<RunId, Vec<RunId>>::new();
+    for edge in model.dependency_edges() {
+        if visible_runs.contains(&edge.prerequisite_run_id)
+            && visible_runs.contains(&edge.dependent_run_id)
+            && model.task_run(&edge.prerequisite_run_id).is_some()
+            && model.task_run(&edge.dependent_run_id).is_some()
+        {
+            reverse
+                .entry(edge.dependent_run_id)
+                .or_default()
+                .push(edge.prerequisite_run_id);
+        }
+    }
+    let mut retained = direct_matches.clone();
+    let mut pending = direct_matches.iter().copied().collect::<Vec<_>>();
+    while let Some(dependent) = pending.pop() {
+        for prerequisite in reverse.get(&dependent).into_iter().flatten() {
+            if retained.insert(*prerequisite) {
+                pending.push(*prerequisite);
+            }
+        }
+    }
+    stable_order
+        .iter()
+        .copied()
+        .filter(|run_id| visible_runs.contains(run_id) && retained.contains(run_id))
         .collect()
 }
 
@@ -1144,11 +1104,25 @@ fn detail_entity(
                     .collect::<Vec<_>>();
                 evidence_paths.sort();
                 evidence_paths.dedup();
+                let v6 = model.task_run_v6_state(run_id).cloned().unwrap_or_default();
                 DetailEntity::Run {
                     run_id: *run_id,
                     key: detail_run_key(run_id, &run.key),
                     name: safe_run_name(run_id, &run.key),
                     native_session_id: bound_native_session_id(model, run_id, &run.key),
+                    native_lifecycle_end: v6
+                        .native_session_end
+                        .as_ref()
+                        .map(|end| format!("{:?}@{}", end.status, end.at_ms)),
+                    lifecycle_watermark: v6.lifecycle_watermark.as_ref().map(|watermark| {
+                        format!(
+                            "{}/{}/{}",
+                            watermark.source_at_ms,
+                            watermark.observed_at_ms,
+                            escape_controls(&watermark.source_order)
+                        )
+                    }),
+                    history_ready: v6.history_ready,
                     state: run.state,
                     display_status,
                     dispatch_parent,
@@ -1168,6 +1142,13 @@ fn detail_entity(
                         .unwrap_or_default()
                         .into_boxed_slice(),
                     output_tokens: telemetry.map(|telemetry| telemetry.output_tokens),
+                    measured_output_tokens: model
+                        .run_rate_totals(run_id)
+                        .map(|totals| totals.output_tokens),
+                    measured_working_ms: model
+                        .run_rate_totals(run_id)
+                        .map(|totals| totals.working_ms),
+                    rate_cursor_initialized: model.run_rate_cursor(run_id).is_some(),
                     token_breakdown: telemetry
                         .map(|telemetry| Box::new(telemetry.token_breakdown.clone())),
                 }
@@ -1353,6 +1334,9 @@ fn entity_lines(entity: &DetailEntity) -> Vec<String> {
             key,
             name,
             native_session_id,
+            native_lifecycle_end,
+            lifecycle_watermark,
+            history_ready,
             state,
             display_status,
             dispatch_parent,
@@ -1369,6 +1353,9 @@ fn entity_lines(entity: &DetailEntity) -> Vec<String> {
             evidence_paths,
             per_turn,
             output_tokens,
+            measured_output_tokens,
+            measured_working_ms,
+            rate_cursor_initialized,
             token_breakdown,
         } => {
             let mut lines = vec![
@@ -1380,6 +1367,15 @@ fn entity_lines(entity: &DetailEntity) -> Vec<String> {
                     "native_session_id: {}",
                     native_session_id.as_deref().unwrap_or("unknown")
                 ),
+                format!(
+                    "native_lifecycle_end: {}",
+                    native_lifecycle_end.as_deref().unwrap_or("none")
+                ),
+                format!(
+                    "lifecycle_watermark: {}",
+                    lifecycle_watermark.as_deref().unwrap_or("none")
+                ),
+                format!("history_ready: {history_ready}"),
                 format!("state: {}", task_state_name(*state)),
                 format!("effective_status: {}", display_status.status.label()),
                 format!("status_source: {}", display_status.source.label()),
@@ -1447,6 +1443,21 @@ fn entity_lines(entity: &DetailEntity) -> Vec<String> {
                 "tokens.output: {}",
                 output_tokens
                     .map_or_else(|| "not retained".to_owned(), |tokens| tokens.to_string())
+            ));
+            lines.push(format!(
+                "rate.measured_output_tokens: {}",
+                measured_output_tokens
+                    .map_or_else(|| "not retained".to_owned(), |tokens| tokens.to_string())
+            ));
+            lines.push(format!(
+                "rate.measured_working_ms: {}",
+                measured_working_ms.map_or_else(
+                    || "not retained".to_owned(),
+                    |working_ms| working_ms.to_string()
+                )
+            ));
+            lines.push(format!(
+                "rate.cursor_initialized: {rate_cursor_initialized}"
             ));
             let token_breakdown = token_breakdown.as_ref();
             lines.push(format!(
@@ -1691,8 +1702,8 @@ mod tests {
     use crate::lockfile::StateRoot;
     use crate::model::{
         AgentNode, DependencyEdge, DisplayOrdinal, DomainModel, ExecState, Execution,
-        ExecutionEdge, Pane, PaneAgentStatus, Provider, RunId, RunKey, TaskRun, TaskState,
-        Workspace,
+        ExecutionEdge, NativeSessionEnd, NativeSessionEndStatus, Pane, PaneAgentStatus, Provider,
+        RunId, RunKey, RunRateTotals, TaskRun, TaskRunV6State, TaskState, Workspace,
     };
     use crate::provider::ProviderEvent;
     use crate::provider::claude_facts::extract_claude_line;
@@ -1939,14 +1950,15 @@ mod tests {
             summary
                 .worker_kinds
                 .iter()
-                .all(|row| row.mean_tokens_per_second.is_some())
+                .all(|row| row.mean_tokens_per_second.is_none()),
+            "artifact replay without authoritative live reconciliation has lifetime tokens but no measured rate"
         );
         drop(model);
         lifecycle.shutdown().await.unwrap();
     }
 
     #[test]
-    fn summary_mean_token_rate_weights_tokens_by_elapsed_time() {
+    fn summary_mean_token_rate_weights_tokens_by_measured_working_time() {
         let mut fast = run(
             "hook:claude-code:session:task:fast",
             1,
@@ -1968,6 +1980,20 @@ mod tests {
         model
             .telemetry_entry(slow.run_id, 0)
             .accumulate(1_000, None, None, None, false);
+        model.set_run_rate_totals(
+            fast.run_id,
+            crate::model::RunRateTotals {
+                output_tokens: 100,
+                working_ms: 1_000,
+            },
+        );
+        model.set_run_rate_totals(
+            slow.run_id,
+            crate::model::RunRateTotals {
+                output_tokens: 1_000,
+                working_ms: 1_000_000,
+            },
+        );
 
         let summary = summary_projection(
             &model,
@@ -1991,6 +2017,159 @@ mod tests {
             (rate - 50.5).abs() > 1e-12,
             "aggregate rate must not be the arithmetic mean 50.5"
         );
+    }
+
+    #[test]
+    fn summary_treats_native_ended_run_as_ended_at_native_timestamp() {
+        let mut ended = run("native-ended-summary", 1, TaskState::Running);
+        ended.created_at_ms = Some(1_000);
+        let mut model = DomainModel::default();
+        model.insert_task_run(ended.clone());
+        model.set_task_run_v6_state(
+            ended.run_id,
+            TaskRunV6State {
+                native_session_end: Some(NativeSessionEnd {
+                    status: NativeSessionEndStatus::Done,
+                    at_ms: 4_000,
+                }),
+                ..TaskRunV6State::default()
+            },
+        );
+
+        let summary = summary_projection(
+            &model,
+            &[],
+            Some(&NodeKey::Session),
+            SummaryScope::Session,
+            50_000,
+        );
+        let row = summary
+            .worker_kinds
+            .iter()
+            .find(|row| row.label == "native-ended-summary")
+            .unwrap();
+
+        assert_eq!(row.run_count, 1);
+        assert_eq!(row.live_count, 0);
+        assert_eq!(row.total_duration_ms, 3_000);
+        assert_eq!(row.mean_duration_ms, Some(3_000));
+    }
+
+    #[test]
+    fn restored_rate_totals_drive_run_rate_without_a_cursor_or_wall_time() {
+        let mut task_run = run("restored-rate", 1, TaskState::Completed);
+        task_run.created_at_ms = Some(0);
+        task_run.finished_at_ms = Some(1_000_000);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run.clone());
+        model
+            .telemetry_entry(task_run.run_id, 0)
+            .accumulate(1_000, None, None, None, false);
+        model.set_run_rate_totals(
+            task_run.run_id,
+            RunRateTotals {
+                output_tokens: 70,
+                working_ms: 3_000,
+            },
+        );
+
+        let metrics = run_metric_inputs(&model, &task_run);
+        assert_eq!(metrics.output_tokens, Some(1_000));
+        let rate = run_token_rate(&metrics, 9_000_000)
+            .expect("positive restored working duration must remain rateable without a cursor");
+        assert!((rate - (70.0 / 3.0)).abs() < 1e-12, "rate={rate}");
+
+        model.set_run_rate_totals(
+            task_run.run_id,
+            RunRateTotals {
+                output_tokens: 70,
+                working_ms: 0,
+            },
+        );
+        assert_eq!(
+            run_token_rate(&run_metric_inputs(&model, &task_run), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn summary_uses_measured_sums_and_includes_hidden_terminal_history() {
+        let mut first = run("hook:claude-code:hidden-first", 1, TaskState::Completed);
+        first.created_at_ms = Some(0);
+        first.finished_at_ms = Some(1);
+        let mut second = run("hook:claude-code:hidden-second", 2, TaskState::Completed);
+        second.created_at_ms = Some(0);
+        second.finished_at_ms = Some(1);
+        let mut model = DomainModel::default();
+        model.insert_task_run(first.clone());
+        model.insert_task_run(second.clone());
+        model
+            .telemetry_entry(first.run_id, 0)
+            .accumulate(1_000, None, None, None, false);
+        model
+            .telemetry_entry(second.run_id, 0)
+            .accumulate(500, None, None, None, false);
+        model.set_run_rate_totals(
+            first.run_id,
+            RunRateTotals {
+                output_tokens: 70,
+                working_ms: 3_000,
+            },
+        );
+        model.set_run_rate_totals(
+            second.run_id,
+            RunRateTotals {
+                output_tokens: 30,
+                working_ms: 1_000,
+            },
+        );
+
+        let summary = summary_projection(
+            &model,
+            &[],
+            Some(&NodeKey::Session),
+            SummaryScope::Session,
+            crate::activity::DEFAULT_TERMINAL_VISIBILITY_MS + 1,
+        );
+        let row = summary
+            .worker_kinds
+            .iter()
+            .find(|row| row.label == "claude-code")
+            .expect("both hidden retained rows must remain in Summary");
+        assert_eq!(row.run_count, 2);
+        assert_eq!(row.total_output_tokens, Some(1_500));
+        assert_eq!(row.mean_tokens_per_second, Some(25.0));
+    }
+
+    #[test]
+    fn detail_reports_measured_totals_working_time_and_cursor_absence() {
+        let task_run = run("rate-detail", 1, TaskState::Completed);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run.clone());
+        model.set_run_rate_totals(
+            task_run.run_id,
+            RunRateTotals {
+                output_tokens: 70,
+                working_ms: 3_000,
+            },
+        );
+        let selected = NodeKey::Run {
+            run_id: task_run.run_id,
+            pane_id: None,
+        };
+
+        let lines = detail_lines(&detail_projection(
+            &model,
+            &[],
+            &operator(Vec::new(), HashMap::new()),
+            &selected,
+            ViewMode::DependencyDag,
+            None,
+        ));
+
+        assert!(lines.contains(&"rate.measured_output_tokens: 70".to_owned()));
+        assert!(lines.contains(&"rate.measured_working_ms: 3000".to_owned()));
+        assert!(lines.contains(&"rate.cursor_initialized: false".to_owned()));
     }
 
     #[test]
@@ -2370,6 +2549,38 @@ mod tests {
     }
 
     #[test]
+    fn native_lifecycle_end_precedes_runtime_activity_without_overwriting_semantics() {
+        let task_run = run("native-end", 1, TaskState::Running);
+        let mut model = DomainModel::default();
+        model.insert_task_run(task_run.clone());
+        model.insert_execution(execution(
+            task_run.run_id,
+            "pane",
+            "execution",
+            ExecState::Working,
+        ));
+        model.set_task_run_v6_state(
+            task_run.run_id,
+            TaskRunV6State {
+                native_session_end: Some(NativeSessionEnd {
+                    status: NativeSessionEndStatus::Done,
+                    at_ms: 100,
+                }),
+                ..TaskRunV6State::default()
+            },
+        );
+        let statuses = StatusReadModel::from_model(&model, 200);
+
+        let status = statuses.task_display_status(&model, &task_run, Some("pane"), false);
+        assert_eq!(status.status, TaskDisplayStatus::Done);
+        assert_eq!(status.source.label(), "native_session_lifecycle");
+        assert_eq!(
+            model.task_run(&task_run.run_id).unwrap().state,
+            TaskState::Running
+        );
+    }
+
+    #[test]
     fn pane_display_status_preserves_each_shared_occurrence() {
         let task_run = run("shared", 1, TaskState::Running);
         let mut model = DomainModel::default();
@@ -2735,6 +2946,27 @@ mod tests {
         assert!(stalled.contains(&child.run_id));
     }
 
+    #[test]
+    fn native_ended_run_is_not_stalled() {
+        let mut ended = run("native-ended", 1, TaskState::Running);
+        ended.created_at_ms = Some(0);
+        ended.updated_at_ms = Some(0);
+        let mut model = DomainModel::default();
+        model.insert_task_run(ended.clone());
+        model.set_task_run_v6_state(
+            ended.run_id,
+            TaskRunV6State {
+                native_session_end: Some(NativeSessionEnd {
+                    status: NativeSessionEndStatus::Done,
+                    at_ms: 100,
+                }),
+                ..TaskRunV6State::default()
+            },
+        );
+
+        assert!(!stalled_run_ids(&model, 1_000, 500).contains(&ended.run_id));
+    }
+
     fn row(key: NodeKey, depth: usize, label: &str) -> TreeRow {
         TreeRow {
             key,
@@ -3018,13 +3250,159 @@ mod tests {
     }
 
     #[test]
-    fn i4_terminal_expiry_filter_restore_and_no_event_wakeup() {
+    fn filtered_tree_excludes_hidden_runs_and_agents_but_keeps_topology() {
+        let mut hidden = run("hidden", 1, TaskState::Running);
+        hidden.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "needle-hidden".to_owned(),
+        };
+        hidden.dismissed_at_ms = Some(1);
+        let mut visible = run("visible", 2, TaskState::Running);
+        visible.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "needle-visible".to_owned(),
+        };
+        let mut model = DomainModel::default();
+        model.insert_task_run(hidden.clone());
+        model.insert_task_run(visible.clone());
+        model.insert_agent_node(status_agent(
+            hidden.run_id,
+            "needle-hidden-agent",
+            Provider::Codex,
+            Some("provider-root"),
+            Some(ExecState::Working),
+            10,
+        ));
+        let rows = vec![
+            row(NodeKey::Session, 0, "Session: demo"),
+            row(
+                NodeKey::Workspace("workspace".into()),
+                1,
+                "Workspace: workspace",
+            ),
+            row(NodeKey::Tab("tab".into()), 2, "Tab: tab"),
+            row(NodeKey::Pane("pane".into()), 3, "Pane: pane"),
+            row(
+                NodeKey::Run {
+                    run_id: hidden.run_id,
+                    pane_id: Some("pane".into()),
+                },
+                4,
+                "Task Run: needle-hidden",
+            ),
+            row(
+                NodeKey::Agent {
+                    agent_node_id: "needle-hidden-agent".into(),
+                    pane_id: Some("pane".into()),
+                },
+                5,
+                "Codex native agent: needle-hidden-agent",
+            ),
+            row(
+                NodeKey::Run {
+                    run_id: visible.run_id,
+                    pane_id: Some("pane".into()),
+                },
+                5,
+                "Task Run: needle-visible",
+            ),
+        ];
+
+        let projected = project_rows(
+            &model,
+            &rows,
+            &operator(Vec::new(), HashMap::new()),
+            "needle",
+            &HashSet::new(),
+            ViewMode::ExecutionTree,
+            10,
+        );
+
+        assert_eq!(
+            projected
+                .rows
+                .iter()
+                .map(|item| &item.key)
+                .collect::<Vec<_>>(),
+            vec![
+                &rows[0].key,
+                &rows[1].key,
+                &rows[2].key,
+                &rows[3].key,
+                &rows[6].key,
+            ]
+        );
+    }
+
+    #[test]
+    fn filtered_dag_excludes_hidden_prerequisite_chain() {
+        let mut visible_prerequisite = run("visible-prerequisite", 1, TaskState::Running);
+        visible_prerequisite.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "visible-prerequisite".to_owned(),
+        };
+        let mut hidden_prerequisite = run("hidden-prerequisite", 2, TaskState::Running);
+        hidden_prerequisite.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "hidden-prerequisite".to_owned(),
+        };
+        hidden_prerequisite.dismissed_at_ms = Some(1);
+        let mut dependent = run("dependent", 3, TaskState::Running);
+        dependent.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "needle-dependent".to_owned(),
+        };
+        let mut model = DomainModel::default();
+        for task_run in [&visible_prerequisite, &hidden_prerequisite, &dependent] {
+            model.insert_task_run(task_run.clone());
+        }
+        model.insert_dependency_edge(DependencyEdge {
+            prerequisite_run_id: visible_prerequisite.run_id,
+            dependent_run_id: hidden_prerequisite.run_id,
+        });
+        model.insert_dependency_edge(DependencyEdge {
+            prerequisite_run_id: hidden_prerequisite.run_id,
+            dependent_run_id: dependent.run_id,
+        });
+        let rows = [&visible_prerequisite, &hidden_prerequisite, &dependent]
+            .into_iter()
+            .map(|task_run| {
+                row(
+                    NodeKey::Run {
+                        run_id: task_run.run_id,
+                        pane_id: None,
+                    },
+                    0,
+                    "Task Run",
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let projected = project_rows(
+            &model,
+            &rows,
+            &operator(Vec::new(), HashMap::new()),
+            "needle-dependent",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            10,
+        );
+
+        assert_eq!(projected.rows.len(), 1);
+        assert_eq!(projected.rows[0].key.run_id(), Some(dependent.run_id));
+    }
+
+    #[test]
+    fn i4_terminal_expiry_query_narrows_and_no_event_wakeup() {
         let mut old = run("controller-private", 1, TaskState::Completed);
         old.key = RunKey::Native {
             provider: Provider::Codex,
             sid: "old-searchable".to_owned(),
         };
-        let fresh = run("fresh", 2, TaskState::Completed);
+        old.finished_at_ms = Some(0);
+        let now = 7_200_000;
+        let mut fresh = run("fresh", 2, TaskState::Completed);
+        fresh.finished_at_ms = Some(now - 3_599_999);
         let live = run("live", 3, TaskState::Running);
         let mut model = DomainModel::default();
         for item in [&old, &fresh, &live] {
@@ -3047,7 +3425,6 @@ mod tests {
             )
         })
         .collect::<Vec<_>>();
-        let now = 7_200_000;
         let terminal_times = HashMap::from([(old.run_id, 0), (fresh.run_id, now - 3_599_999)]);
         let operator = operator(Vec::new(), terminal_times);
 
@@ -3081,8 +3458,7 @@ mod tests {
             ViewMode::DependencyDag,
             now + 1,
         );
-        assert_eq!(filtered.rows.len(), 1);
-        assert_eq!(filtered.rows[0].key.run_id(), Some(old.run_id));
+        assert!(filtered.rows.is_empty());
         let restored = project_rows(
             &model,
             &rows,
@@ -3093,6 +3469,143 @@ mod tests {
             now + 1,
         );
         assert_eq!(restored.rows[0].key.run_id(), Some(live.run_id));
+    }
+
+    #[test]
+    fn filtered_terminal_run_preserves_visibility_deadline() {
+        let terminal_at_ms = 1_000;
+        let boundary = terminal_at_ms + DEFAULT_TERMINAL_VISIBILITY_MS;
+        let mut terminal = run("terminal", 1, TaskState::Completed);
+        terminal.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "searchable-terminal".to_owned(),
+        };
+        terminal.updated_at_ms = Some(terminal_at_ms);
+        terminal.finished_at_ms = Some(terminal_at_ms);
+        let mut model = DomainModel::default();
+        model.insert_task_run(terminal.clone());
+        let rows = vec![row(
+            NodeKey::Run {
+                run_id: terminal.run_id,
+                pane_id: None,
+            },
+            0,
+            "Task Run: searchable-terminal [completed]",
+        )];
+
+        let projected = project_rows(
+            &model,
+            &rows,
+            &operator(
+                Vec::new(),
+                HashMap::from([(terminal.run_id, terminal_at_ms)]),
+            ),
+            "searchable-terminal",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            boundary - 1,
+        );
+
+        assert_eq!(projected.rows.len(), 1);
+        assert_eq!(projected.next_expiry_ms, Some(boundary));
+    }
+
+    #[test]
+    fn semantic_terminal_projection_deadline_uses_semantic_terminal_time() {
+        let now_ms = 7_200_000;
+        let semantic_terminal_at_ms = now_ms - DEFAULT_TERMINAL_VISIBILITY_MS + 1;
+        let mut terminal = run("semantic-terminal", 1, TaskState::Completed);
+        terminal.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "session-42".to_owned(),
+        };
+        terminal.finished_at_ms = Some(semantic_terminal_at_ms);
+        let mut model = DomainModel::default();
+        model.insert_task_run(terminal.clone());
+        model.set_task_run_v6_state(
+            terminal.run_id,
+            TaskRunV6State {
+                native_session_end: Some(NativeSessionEnd {
+                    status: NativeSessionEndStatus::Done,
+                    at_ms: now_ms - DEFAULT_TERMINAL_VISIBILITY_MS - 1,
+                }),
+                ..TaskRunV6State::default()
+            },
+        );
+        let rows = vec![row(
+            NodeKey::Run {
+                run_id: terminal.run_id,
+                pane_id: None,
+            },
+            0,
+            "semantic terminal",
+        )];
+
+        let projection = project_rows(
+            &model,
+            &rows,
+            &operator(
+                Vec::new(),
+                HashMap::from([(terminal.run_id, semantic_terminal_at_ms)]),
+            ),
+            "",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            now_ms,
+        );
+
+        assert_eq!(projection.rows.len(), 1);
+        assert_eq!(
+            projection.next_expiry_ms,
+            Some(semantic_terminal_at_ms + DEFAULT_TERMINAL_VISIBILITY_MS)
+        );
+    }
+
+    #[test]
+    fn running_native_lifecycle_projection_deadline_uses_native_end_time() {
+        let native_end_at_ms = 1_000;
+        let mut ended = run("native-ended", 1, TaskState::Running);
+        ended.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "session-42".to_owned(),
+        };
+        ended.created_at_ms = Some(0);
+        let mut model = DomainModel::default();
+        model.insert_task_run(ended.clone());
+        model.set_task_run_v6_state(
+            ended.run_id,
+            TaskRunV6State {
+                native_session_end: Some(NativeSessionEnd {
+                    status: NativeSessionEndStatus::Done,
+                    at_ms: native_end_at_ms,
+                }),
+                ..TaskRunV6State::default()
+            },
+        );
+        let rows = vec![row(
+            NodeKey::Run {
+                run_id: ended.run_id,
+                pane_id: None,
+            },
+            0,
+            "native ended",
+        )];
+
+        let projection = project_rows(
+            &model,
+            &rows,
+            &operator(Vec::new(), HashMap::new()),
+            "",
+            &HashSet::new(),
+            ViewMode::DependencyDag,
+            1_500,
+        );
+
+        assert_eq!(projection.rows.len(), 1);
+        assert_eq!(
+            projection.next_expiry_ms,
+            Some(native_end_at_ms + DEFAULT_TERMINAL_VISIBILITY_MS)
+        );
     }
 
     #[test]
@@ -3134,6 +3647,7 @@ mod tests {
             seq: 1,
         };
         terminal.updated_at_ms = Some(updated_at_ms);
+        terminal.finished_at_ms = Some(updated_at_ms);
         let mut model = DomainModel::default();
         model.insert_task_run(terminal.clone());
         let rows = vec![row(
@@ -3812,7 +4326,13 @@ mod tests {
         );
         let mut dag_order = crate::tui::dag::DagOrder::default();
         dag_order.recompute(&model);
-        let dag_text = crate::tui::dag::build_rows(&model, &dag_order, 0)
+        let dag_rows = crate::tui::dag::build_rows(&model, &dag_order, 0);
+        let dag_labels = dag_rows
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let dag_text = dag_rows
             .into_iter()
             .flat_map(|row| {
                 std::iter::once(row.label)
@@ -3824,8 +4344,13 @@ mod tests {
         for rendered in [&tree_label, &dag_text] {
             assert!(!rendered.contains(NATIVE_PATH));
             assert!(!rendered.contains("NATIVE_PATH_FORBIDDEN_I4_A2.jsonl"));
-            assert!(rendered.contains(&parent.run_id.to_string()));
         }
+        // Primary Task and dispatched-by labels stay UUID-free for the path-keyed native run;
+        // the DAG neighbor columns keep their identity names.
+        for rendered in [&tree_label, &dag_labels] {
+            assert!(!rendered.contains(&parent.run_id.to_string()));
+        }
+        assert!(tree_label.contains("[dispatched by: Codex]"));
 
         let child_row = row(
             NodeKey::Run {

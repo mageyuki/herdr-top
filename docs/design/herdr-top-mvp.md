@@ -29,7 +29,7 @@ Repository: [mageyuki/herdr-top](https://github.com/mageyuki/herdr-top)
 | Provider fallback | Two-second rescan when file watching is unavailable; no terminal-output scraping |
 | Task Run identity | Explicit `task_run_id`, then native session reference with Herdr-reported identity preferred, then provisional `terminal_id + start time + collector sequence` |
 | Controller protocol | Versioned JSON over a session-scoped Unix domain socket through `herdr-top emit` |
-| Persistence | Session-scoped SQLite for the durable semantic model and event ledger; provider telemetry and turn context are recomputed transiently |
+| Persistence | Session-scoped SQLite for the durable semantic model, event ledger, native lifecycle watermarks, history-drain readiness, and active-time rate totals; pane status, rate cursors, and turn context are process-local |
 | State root | `${XDG_STATE_HOME:-$HOME/.local/state}/herdr-top/sessions/<session-key>`, keyed by the resolved session name; the collector socket lives in a runtime directory to respect socket-path length limits |
 | Retention | Finished Task Runs 30 days; activity events ring-bounded at 100,000 per session and 7 days; `event_id` dedup ledger 7 days |
 | Process model | One collector, reducer, SQLite writer, event socket, and TUI process per Herdr session |
@@ -129,10 +129,10 @@ Rules:
 
 - Provisional identity is scoped to one collector run because `terminal_id` does not survive a cold server restart and physical executions are never continued across an observation gap.
 - A different native session in the same pane creates a new Task Run.
-- Resuming the same native session reactivates the existing Task Run.
-- A Codex log-lane `turn_aborted` truthfully puts the run in `cancelled`, stamps its terminal time, and renders it as cancelled until a later turn is observed.
-- A provider-log `task_started` can reopen an existing `completed` or `cancelled` run only when the prior terminal source is also the provider log lane, the incoming fact resolves to that same native run, its provider timestamp is strictly greater than the stored terminal timestamp, and ordinary identity, event-ledger, and binding-conflict checks succeed. `failed`, equal or older starts, and Controller, hook, or manual starts do not gain this authority.
-- Reopening mutates that run to `running`, clears `finished_at_ms`, `dismissed_at_ms`, and terminal-source bookkeeping, and preserves the run ID, native key, display ordinal, executions, Agent Nodes, subject, telemetry identity, Controller metadata, and execution and dependency edges. It never mints a second run or execution.
+- Resuming the same native session reuses the existing Task Run, preserves its immutable display ordinal, and clears only older native lifecycle evidence.
+- Semantic Task state, native-session lifecycle, execution state, pane status, and graph relationships are separate axes. Semantic terminal state is never reopened by runtime liveness.
+- A normal provider `SessionEnd` records native lifecycle `Done`; explicit abort, failure, and disappearance facts record `Cancelled`, `Error`, and `Unknown`. Codex turn completion is runtime Idle only.
+- Native lifecycle facts are ordered by trustworthy source time, collector observation time, and stable source/event identity. A later matching start or liveness fact clears lifecycle evidence; an older delayed fact cannot re-close the run.
 - Moving the same terminal or native session does not create a new Task Run.
 - A provisional Task Run merges into the resolved identity when the native session ID appears.
 - Multiple prompts inside one native session are not automatically split.
@@ -184,11 +184,11 @@ Session
 
 The physical hierarchy is rendered with computed Unicode box-drawing connectors: `├── ` for a non-final child, `└── ` for a final child, and `│   ` while an ancestor has later siblings. `HERDR_TOP_ASCII_TREE=1` selects the corresponding `|-- `, `` `-- ``, and `|   ` forms; every other value leaves Unicode enabled. The environment variable is read once while constructing the TUI at startup, never during a frame render.
 
-Each Task Run row has the shipped grammar `<glyph> <status> <worker-kind>[ <subject>][ — <live line>][ · <duration>][ relationship annotations]`; for example, `● working Claude Implement wire tolerance — tool_use: Bash · 17m03s`. The status mapping is `queued ◌`, `working ●`, `idle ○`, `blocked ●`, `done ✓`, `error ✗`, `cancelled ⊘`, and `unknown ?`. A stalled non-terminal row retains that written base status and uses the orthogonal `⚠` glyph; terminal rows are never stalled. Worker kind comes from the projected run kind and falls back to the run key. A missing captured subject falls back to the key-derived name rather than leaving an empty segment, except that a native or native-path Codex run below an execution edge renders the kind alone. The live line appears only for a non-terminal run, from the lane live-line read model or, for a Claude-flavoured run, from the newest non-display-stale Agent Node's `last_event_kind` with a `: tool` suffix when `last_tool_name` is present. Duration appears only when the available start and live-or-finished end timestamps produce a non-negative interval. Existing `[shared]` and `[dispatched by: …]` annotations remain appended in that order when applicable; absence of relationships is reported in Detail as `task_relationships: none`, not appended to a row. Model, effort, output tokens, output-token rate, and time render in separate right-aligned metric columns rather than inside the row label, while the status remains explicit at the left edge. A captured subject keeps the UUID and run key out of the row, while the no-subject fallback can still be identity-shaped — a Controller key, native session ID, or UUID for a path-keyed native run; the Detail overlay is the complete identity surface and always shows the full key, `run_id`, bound native session ID, lifecycle timestamps, and relationship lines.
+Each Task Run row has the shipped grammar `<glyph> <status> <worker-kind>[ <subject>][ — <live line>][ · <duration>][ relationship annotations]`; for example, `● working Claude Implement wire tolerance — tool_use: Bash · 17m03s`. The status mapping is `queued ◌`, `working ●`, `idle ○`, `blocked ●`, `done ✓`, `error ✗`, `cancelled ⊘`, and `unknown ?`. A stalled non-terminal row retains that written base status and uses the orthogonal `⚠` glyph; terminal rows are never stalled. Worker kind comes from the projected run kind and falls back to the run key. The run kind is the first nonempty value published for a run and is never persisted; for a Codex rollout the log lane selects the `ThreadSpawn` agent role, then a provider-defined internal-agent name, then the rollout originator, skipping blank values so an empty role or name never publishes an empty kind, and never using the `ThreadSpawn` nickname as a kind or subject. The rollout `agent_role` field is read from an unstable external format and is not a stable public Codex API. A run is provider-backed when its primary key is native or native-path, when its Controller key carries a recognized hook selector (`hook:claude-code:` or `hook:codex:`), or when an exact native binding in the task-run bindings resolves to it; the binding rule keeps a Controller-primary run provider-backed after Controller/native alias convergence. A provider-backed run with no captured subject renders the kind alone and never falls back to a native session ID, hook session ID, or path-derived run UUID; a Codex child — a Codex-backed run below an execution edge, before or after convergence — renders the kind alone even with a captured subject; only a run with no provider backing still uses its key-derived fallback rather than leaving an empty segment. The live line appears only for a non-terminal run, from the lane live-line read model or, for a Claude-flavoured run, from the newest non-display-stale Agent Node's `last_event_kind` with a `: tool` suffix when `last_tool_name` is present. Duration appears only when the available start and live-or-finished end timestamps produce a non-negative interval. Existing `[shared]` and `[dispatched by: …]` annotations remain appended in that order when applicable; `[dispatched by: …]` names the parent by its stable run kind, then its captured subject, then its key-derived worker kind, never by a session, run, or path identity. Absence of relationships is reported in Detail as `task_relationships: none`, not appended to a row. Model, effort, output tokens, output-token rate, and time render in separate right-aligned metric columns rather than inside the row label, while the status remains explicit at the left edge. The primary surface — Task Run rows, Agent rows, and dispatched-by annotations — carries no provider session ID, hook session ID, run UUID, or Agent Node ID; the Detail overlay is the only identity surface and always shows the full key, `run_id`, bound native session ID, lifecycle timestamps, and relationship lines unchanged.
 
 Tab and pane rows retain their stable IDs and append a display name in parentheses only when a non-empty sanitized Herdr `label` is present. A terminal title is never a pane display name. The exact grammar is `Tab: <tab-id> (<label>)` and `Pane: <pane-id> (<label>)` when present, or `Tab: <tab-id>` and `Pane: <pane-id>` when absent; absence never renders empty parentheses. Labels are escaped and truncated UTF-8-safely at capture to the same 256-byte limit as Controller display text.
 
-Native sub-agent nesting appears only beneath a Task Run of the same provider, because provider metadata is the only source of native parent-child edges and no provider's metadata can establish a cross-provider edge. The provider-native root Agent that duplicates its owning Task Run is hidden; visible descendants attach directly beneath the Task Run when that root is hidden, retain model and Detail data, and use `<glyph> <status> <provider> native agent: ...` with their own evidence. Run placement is ordered: every pane hosting a live execution; otherwise the pane of the latest ended execution; otherwise, for a run with no execution history, its default-visible dispatch parent; otherwise `Unattached`. A dispatch-nested child shows parentage by position and carries no `[dispatched by: …]` text; that annotation appears only on pane-placed runs. A dismissed or expired parent never hides its children, which fall back to `Unattached` for that frame, and a malformed parent cycle does the same. A run with concurrent live executions appears under each hosting pane with `[shared]`, but its descendants expand only on the first occurrence.
+Native sub-agent nesting appears only beneath a Task Run of the same provider, because provider metadata is the only source of native parent-child edges and no provider's metadata can establish a cross-provider edge. The provider-native root Agent that duplicates its owning Task Run is hidden; visible descendants attach directly beneath the Task Run when that root is hidden, retain model and Detail data, and use `<glyph> <status> <provider> native agent[: <role>] [model:…] [last:…ms]` with their own evidence. The role is the sanitized stable run kind of the Task Run the Agent Node represents, resolved by exact native alias first — an Agent Node whose provider and nonempty native session ID exactly match a `RunKey::Native` binding renders that run's kind, so a Codex child Agent Node owned by its root run renders `Codex native agent: worker` — and otherwise by the owning Task Run only when that owner has no native binding of its own, so a Controller-keyed Claude subagent run renders `Claude native agent: reviewer` while an unmatched Agent Node under a natively bound owner renders `Codex native agent` with no colon. The native session ID and Agent Node ID never appear in the row and remain Detail-only. Run placement is ordered: every pane hosting a live execution; otherwise the pane of the latest ended execution; otherwise, for a run with no execution history, its default-visible dispatch parent; otherwise `Unattached`. A dispatch-nested child shows parentage by position and carries no `[dispatched by: …]` text; that annotation appears only on pane-placed runs. A dismissed or expired parent never hides its children, which fall back to `Unattached` for that frame, and a malformed parent cycle does the same. A run with concurrent live executions appears under each hosting pane with `[shared]`, but its descendants expand only on the first occurrence.
 
 ### 6.2 Task dependency DAG
 
@@ -239,7 +239,7 @@ Herdr is authoritative for:
 - active and focused pane metadata;
 - plugin paths and invocation context.
 
-The collector connects through `HERDR_SOCKET_PATH` and converges in a fixed order: subscribe first, buffer pushed frames, request one complete `session.snapshot`, install that snapshot atomically, drain the immediately available buffer, request another snapshot only if the drain admitted a topology hint or detected an overflow discontinuity, and enter `LIVE` only at a quiet drain boundary with no pending refresh. A primary topology frame is an invalidation hint only. Its admission is completed and its raw payload is discarded; it never updates topology, owner location, enrichment targets, sessionless-Codex observations, or provider targets. The subscribed topology-hint set covers workspace create/update/metadata-update/rename/move/reorder/close, tab create/rename/move/close, and pane create/close/update/move/exit/agent-detected. Focus and layout frames are no-ops, `pane_agent_status_changed` remains an enrichment gauge for a pane already admitted by a snapshot, and output/worktree events are intentionally unsubscribed no-ops.
+The collector connects through `HERDR_SOCKET_PATH` and converges in a fixed order: subscribe first, buffer pushed frames, request one complete `session.snapshot`, install that snapshot atomically, drain the immediately available buffer, request another snapshot only if the drain admitted a topology hint or detected an overflow discontinuity, and enter `LIVE` only at a quiet drain boundary with no pending refresh. A primary topology frame is an invalidation hint only. Its admission is completed and its raw payload is discarded; it never updates topology, owner location, enrichment targets, sessionless-Codex observations, or provider targets. The subscribed topology-hint set covers workspace create/update/metadata-update/rename/move/reorder/close, tab create/rename/move/close, and pane create/close/update/move/exit/agent-detected. Focus and layout frames are no-ops. Exactly `pane.agent_status_changed` and the legacy `pane_agent_status_changed` alias update the same enrichment gauge for a pane already admitted by a snapshot; every other spelling is ignored. Output and worktree events are intentionally unsubscribed no-ops.
 
 Hints that arrive while a snapshot request is in flight remain buffered because the primary receiver stays active alongside the request. A completed snapshot is installed first, then the drain coalesces buffered dirtiness into at most one follow-up request. Cancellation or clean primary-stream EOF while the request is pending ends that generation immediately, without waiting for the request timeout or classifying a refresh failure; buffered admissions are completed by replay or their fail-safe drop. One catch-up or live-refresh episode permits three immediate post-dirty requests in total, whether each request is caused by a topology hint or an overflow discontinuity; only the hint-caused subset increments `event_triggered_topology_refreshes`. If every permitted response is accompanied by another hint or overflow, the collector stays `RECONCILING` without issuing a fourth immediate request. Topology hints in this quiescence monitor are completed and discarded and reset its liveness deadline, but cannot mutate topology or start a request. After one full quiet watchdog interval, a healthy canonical topology probe resets the immediate budget and authorizes one recovery snapshot; neither the probe nor that recovery request is event-triggered. Probe failure or divergence reconnects. The episode retains its `CatchUp` or `LiveRefresh` origin until a quiet replay reaches `LIVE` or the subscription reconnects.
 
@@ -271,7 +271,7 @@ Provider activity content is built from an explicit field allowlist and nothing 
 
 Agent Nodes form a recursive tree rather than a fixed one-level list, and deeper structures are tolerated wherever metadata establishes them. A native parent-child edge is created only when provider metadata or admitted identifier evidence establishes it. If an agent is observable but its immediate parent is not, it remains directly under the Task Run without an inferred Agent Node parent.
 
-Claude Code and Codex hooks are an optional precision layer. They add explicit lifecycle transitions, Controller-authored subjects, and dispatch edges that do not depend on session-ID evidence; manual Controller events also add explicit dependencies. Core monitoring must not require provider settings mutation, `emit` wiring, an OTLP exporter, or beta telemetry.
+Claude Code and Codex hooks are an optional precision layer. They add explicit lifecycle transitions, Controller-authored subjects, and dispatch edges that do not depend on session-ID evidence; manual Controller events also add explicit dependencies. Core monitoring must not require provider settings mutation, `emit` wiring, an OTLP exporter, or beta telemetry. The Claude Code hook mapping applies one structural filter: a `SubagentStop` whose payload carries an explicitly present empty `agent_type` string maps to no Controller event. The observed payloads of that shape had no preceding `SubagentStart`, so mapping them would create diagnostic-flagged terminal forward references; attributing the shape to provider-internal agents is an inference, and the discriminator is the present-and-empty string itself, never transcript content or producer identity. Absent, null, and non-empty agent types keep the `complete` mapping, and Codex stops are unaffected.
 
 Provider formats are unstable external formats. Adapters accept optional and unknown fields, isolate parsing failures, and expose source coverage. If an adapter cannot read its source, the TUI remains usable in `DEGRADED / Herdr-only` mode.
 
@@ -291,7 +291,7 @@ A Controller or custom orchestrator can publish:
 - `cancelled`;
 - `dismiss`.
 
-`dispatch` records an execution parent-child relationship. `depends_on` records a dependency DAG edge. Neither implies the other. `dismiss` changes visibility without changing task state or advancing the run's activity timestamp; a dismiss naming an unknown run is a true no-op rather than a forward-reference creation. Provider `SessionEnd` hooks map to this event so ended sessions leave the default view without becoming terminal, while a resumed `SessionStart` maps to `task_started` and clears the dismissal through ordinary non-terminal bookkeeping. This accepted choice and its rejected terminal-state and expiry-only alternatives are recorded in the [session-end auto-dismiss ADR](../adr/2026-08-22-session-end-auto-dismiss.md).
+`dispatch` records an execution parent-child relationship. `depends_on` records a dependency DAG edge. Neither implies the other. `dismiss` changes visibility without changing task state or advancing the run's activity timestamp; a dismiss naming an unknown run is a true no-op rather than a forward-reference creation. Provider `SessionEnd` hooks instead emit `session_ended`, which records resumable native lifecycle `Done` only for a known matching provider/native-session binding. The hook does not dismiss or semantically complete the run. A resumed `SessionStart` maps to `task_started` and may clear older native lifecycle evidence. The superseded dismissal choice and current lifecycle decision are recorded in the [session-end auto-dismiss ADR](../adr/2026-08-22-session-end-auto-dismiss.md).
 
 The collector owns the session-scoped Controller-socket responsibility at its resolved runtime-directory path (section 10) with current-user-only permissions. `herdr-top emit` sends one versioned JSON event and waits for `accepted`, `duplicate`, `rejected`, or `retryable`.
 
@@ -316,13 +316,14 @@ The reducer assigns every accepted event a global monotonic ingest sequence afte
 
 Controller task-state events are `task_started`, `blocked`, `progress`, `complete`, `failed`, and `cancelled`; `dispatch` and `depends_on` are relationship events and `dismiss` is a visibility event, so none of those three make a run Controller-owned. Task-state transitions are fixed. `task_started`: from `queued`, `blocked`, or `ended_unknown` to `running`; in `running` it is an `accepted` no-op; on another terminal state it is rejected as `stale_event`. `blocked`: from `queued`, `running`, or `ended_unknown` to `blocked`; in `blocked` it is an `accepted` no-op. `progress`: accepted in `queued`, `running`, or `blocked` without changing state; on `ended_unknown` it reactivates the run to `running`. `blocked` and `progress` on `completed`, `failed`, or `cancelled` are `accepted` no-ops that increment a diagnostic counter. `complete`, `failed`, `cancelled`: from any non-terminal state to the corresponding terminal state; any of the three refines `ended_unknown` because the Controller outcome is authoritative; the same terminal type on the same terminal state is an `accepted` no-op, and a different terminal type on `completed`, `failed`, or `cancelled` is rejected as `conflict`. `depends_on`: accepted until the subject is terminal, except that re-stating an existing resolved edge is an `accepted` no-op in any state; a cycle is rejected as `cycle`. `dispatch`: rejects self-parenting and any edge whose parent chain reaches the subject as `cycle`; otherwise accepted at any time; re-stating the same parent is an `accepted` no-op, and naming a different parent for a run that already has one is rejected as `conflict`.
 
-Relationship-only placeholder runs — runs with no execution and no task-state event — never close automatically: edges never propagate terminality, and closing announced work without evidence would be inference. They stay `queued` until a task-state event or an execution bound under the section 5.4 rules arrives. A maximal weakly connected component of such runs across execution and dependency edges is a dangling announcement when it has no non-terminal outside neighbor, surfaced through a diagnostic counter. A run in `ended_unknown` that gains a new execution — the same native session resuming — reactivates to `running`.
+Relationship-only placeholder runs — runs with no execution and no task-state event — never close automatically: edges never propagate terminality, and closing announced work without evidence would be inference. They stay `queued` until a task-state event or an execution bound under the section 5.4 rules arrives. A maximal weakly connected component of such runs across execution and dependency edges is a dangling announcement when it has no non-terminal outside neighbor, surfaced through a diagnostic counter. A resumed execution can clear native lifecycle evidence but never changes semantic terminal state.
 
 Controller events are optional for the orchestration-visibility core. They sharpen log-derived state with explicit lifecycle transitions, Controller-authored subjects, dispatch edges that do not depend on identifier evidence, and task-DAG edges.
 
 ## 8. State model
 
-Execution state, task state, relationship state, and observation quality are separate.
+Execution state, pane status, semantic Task state, native-session lifecycle,
+relationship state, history readiness, and observation quality are separate.
 
 ### 8.1 Execution state
 
@@ -349,7 +350,41 @@ Herdr's five reported agent states map onto execution state as: `working` to `wo
 
 Activity, stale timeout, pane closure, and process exit do not mark a Task Run completed or infer a percentage. A Controller Task Run still marked `running` or `blocked` remains visible even with no live execution.
 
-`ended_unknown` is the terminal state for closure with unknown outcome. It is entered automatically only by a Task Run that has never received a Controller task-state event, when its last execution reaches `ended`. It never claims success or failure — execution end still never implies semantic completion. A Task Run that has received any Controller task-state event never enters `ended_unknown` automatically; a Controller run still marked `running` or `blocked` remains visible with no live execution, as above. A later Controller terminal event refines `ended_unknown` into the reported outcome, any other Controller task-state event reactivates it, and a resumed execution reactivates the run, as defined in section 7.3.
+`ended_unknown` is an explicit semantic terminal state for closure with unknown
+outcome. Provider session end, abort, failure, disappearance, pane closure, and
+execution end do not enter it. A later Controller terminal event can refine an
+explicit `ended_unknown` into the reported semantic outcome; runtime liveness
+cannot reopen semantic terminal state.
+
+#### 8.2.1 Native-session lifecycle
+
+A Task Run may persist one resumable lifecycle end: `Done`, `Error`,
+`Cancelled`, or `Unknown`, plus its end time. The persisted lifecycle watermark
+orders evidence by trustworthy source time, collector observation time, then
+stable source/event identity. A repeated watermark and status is idempotent; a
+stale or unknown/unbound observation is a diagnostic no-op.
+
+`SessionEnd` records `Done`, explicit provider abort records `Cancelled`,
+explicit failure records `Error`, and disappearance without stronger evidence
+records `Unknown`. Codex turn completion is execution Idle only. A later
+matching `task_started`, live execution, or provider liveness fact clears the
+lifecycle end and advances the watermark. It never changes semantic terminal
+Task state.
+
+Effective TUI status precedence is semantic terminal Task state, native
+lifecycle end, semantic queued/blocked, exact-pane status, matching execution,
+the run's own newest provider root Agent Node, then running/fallback. Two
+narrow presentation-only refinements apply to otherwise-unknown outcomes:
+semantic `ended_unknown` and nonterminal native lifecycle `Unknown` each
+display `done` sourced from Agent Node state only when the newest Agent Node
+whose provider and native session ID exactly match one of the run's
+`RunKey::Native` aliases is `ended`. Ownership and parentage do not identify
+the target run; a foreign provider, a different session ID, a synthetic
+live-line node, or an older ended node superseded by a newer non-ended exact
+node supplies no evidence. Definitive semantic `completed`/`failed`/`cancelled`
+and native `Done`/`Error`/`Cancelled` outcomes are preserved, the
+running/fallback path is excluded, and no Task Run, native lifecycle, Agent
+Node, persistence, visibility, duration, or retention state is mutated.
 
 ### 8.3 Relationship state
 
@@ -450,11 +485,33 @@ Initial tables:
 - `native_agent_sessions`, `task_runs`, `executions`, and `agent_nodes`;
 - `execution_edges` and `dependency_edges`;
 - `display_ordinals`;
+- `history_drains`, `history_drain_artifacts`, `history_drain_runs`, and `run_rate_totals`;
+- `history_run_publications` and `history_event_before_images`;
 - `events`, `event_ledger`, `meta`, `owner`, and `schema_migrations`.
 
-The provider-facing columns are fixed as follows. `agent_nodes` stores `agent_node_id`, `provider`, the node's own `native_session_id`, owning `task_run_id`, logical nullable `parent_agent_node_id` (indexed without a foreign key), nullable provider-restricted `state`, `model_id`, `last_event_kind`, `last_tool_name`, `last_item_count`, `last_byte_count`, `last_activity_at_ms`, and the operational `session_file`; its row ordinal is stored separately in `display_ordinals` with `entity_kind = 'agent_node'`. `events` additionally stores nullable `provider_agent_id`, `provider_parent_agent_id`, and JSON-text `source_coverage`; provider rows populate these allowlisted fields while Herdr rows retain `NULL` coverage in this increment.
+The provider-facing columns are fixed as follows. `agent_nodes` stores `agent_node_id`, `provider`, the node's own `native_session_id`, owning `task_run_id`, logical nullable `parent_agent_node_id` (indexed without a foreign key), nullable provider-restricted `state`, `model_id`, `last_event_kind`, `last_tool_name`, `last_item_count`, `last_byte_count`, `last_activity_at_ms`, and the operational `session_file`; its row ordinal is stored separately in `display_ordinals` with `entity_kind = 'agent_node'`. `events` additionally stores nullable `provider_agent_id`, `provider_parent_agent_id`, JSON-text `source_coverage`, and `history_drain_id`; provider rows populate the allowlisted provider fields while Herdr rows retain `NULL` coverage in this increment. `history_drains.completed_by_drain_id` records the drain barrier that completed a drain.
 
-The current schema version is 5. Its additive columns are `task_runs.subject`, `task_runs.dismissed_at_ms`, `tabs.label`, and `panes.display_name`. Startup restoration reads those values together with the already-persisted Task Run timing columns `created_at_ms`, `updated_at_ms`, and `finished_at_ms` back into the in-memory model. Migration is upgrade-only: schema preflight classifies any version above the binary's `CURRENT_SCHEMA_VERSION` as newer and refuses it before writer startup, WAL or shared-memory sidecar creation, or backup, with `database schema version <found> is newer than supported version <supported>; upgrade Herdr Top before opening this database`. A pre-v5 binary therefore cannot open a v5 database.
+The current schema version is 8. Schema v6 added nullable native-session end
+and lifecycle-watermark columns, `history_ready` and latest-provider-timestamp
+columns on `task_runs`; durable history manifest, artifact, and run-association
+tables; and non-negative per-run measured token and Working-millisecond totals.
+Schema v7 adds durable publication quarantine in `history_run_publications`,
+event before-images in `history_event_before_images`, and drain provenance in
+`history_drains.completed_by_drain_id` and `events.history_drain_id`. The v5-to-v6
+migration marks existing Task Runs history-ready without synthesizing lifecycle
+evidence or rate rows. The v6-to-v7 migration preserves existing public rows and
+backfills private-event drain associations where derivable. Restored positive
+rate totals are usable without restoring a process-local cursor. Startup
+restoration also retains existing Task Run timing and dismissal fields. The
+v7-to-v8 migration rebuilds `agent_nodes` so `ended` can be stored alongside
+`working` and `NULL`, while preserving existing rows, foreign keys, and indexes.
+
+Migration is upgrade-only and the SQLite online backup precedes every migration.
+Schema preflight classifies any version above the binary's
+`CURRENT_SCHEMA_VERSION` as newer and refuses it before writer startup, WAL or
+shared-memory sidecar creation, or backup, with `database schema version <found>
+is newer than supported version <supported>; upgrade Herdr Top before opening
+this database`. A pre-v8 binary therefore cannot open a v8 database.
 
 SQLite runs through bundled `rusqlite` with WAL enabled explicitly, `synchronous=FULL` so a flushed batch survives OS crashes and power loss, foreign keys on, and a busy timeout. The single writer batches work in transactions flushed at least once per second — the durability bound the Controller ack in section 7.3 states — and checkpoints the WAL periodically and at shutdown. While persistence is unhealthy the responder stops returning `accepted` and answers `retryable` with reason `persistence_unavailable`. A full disk or runtime write failure surfaces as a persistence diagnostic and degrades to in-memory monitoring, never silently; migration or backup failure stops startup, as section 14 states.
 
@@ -472,9 +529,31 @@ After every successful owner launch:
 8. Reconcile: physical executions never survive an observation gap. Every persisted execution is retired as `ended`, and fresh executions are constructed from the snapshot. Corroborated identity preserves the Task Run, not the execution record: a fresh execution attaches to an existing Task Run only when both sides carry equal, non-empty native session identities — the live side preferring Herdr's reported `agent_session` and falling back to the provider adapter's resolved identity. A disagreement between those two sources is not corroboration and is surfaced as a diagnostic, a kind-`path` reference that has not resolved to an ID never corroborates, and provisional runs from before the gap gain no new execution because they carry no identity to match. Retirement and attachment are evaluated together: automatic closure per section 8.2 applies only to runs left with no live execution after reconciliation. Semantic nodes reconcile only by the identity rules in sections 5.3 and 5.4.
 9. Replay the buffered Herdr events idempotently, start provider backfill and live watching, and enter the TUI.
 
-Provider backfill re-reads every admitted artifact selected by the window from byte zero; no per-file byte offset is persisted. Its hard anchor is `max(earliest database event, now - HERDR_TOP_BACKFILL_WINDOW_MS)`. The anchor bounds file selection, not record selection, so an admitted in-window file is read in full and contributes complete run totals. Pane-root artifacts are exempt from the anchor. Lineage evidence admits only artifacts whose mtime satisfies the anchor; an older identity echo is ignored entirely. Replay converges idempotently through the durable event ledger. Token telemetry, subjects, run kind, and turn context are transient and are recomputed from artifacts rather than restored from SQLite.
+Provider history remains bounded and incremental. Each pass freezes a sorted
+artifact manifest containing stable artifact identities, generations, and byte
+goalposts, and derives one stable drain ID from the provider and manifest
+digest. Historical events and their run associations persist transactionally;
+the provider does not retain a drain-wide run-key set in memory. A run created
+solely by history starts with `history_ready = false`. Live Controller,
+execution, or post-goalpost provider evidence makes it ready immediately, and
+later historical enrichment cannot regress newer live state or lifecycle.
 
-Provider-log terminal provenance is reconstructed from the durable event read model before startup backfill is applied. Log-lane lifecycle bookkeeping uses provider source time, so a historical `task_started` at or before a restored `completed` or `cancelled` timestamp remains stale, while a strictly later start reopens the same native Task Run and a later terminal event is accepted normally. Replay remains event-ledger idempotent and does not duplicate the run, its execution lineage, or its events. This convergence uses the existing schema and retained history; no schema migration or history purge is required.
+Parsing advances only after an event enters the bounded pending buffer. Once
+every artifact reaches its frozen goalpost, one barrier is enqueued behind all
+ordinary and coalesced output, and the provider pauses. A single SQLite
+transaction completes the drain, makes remaining historical runs ready, and
+closes ready non-live, nonterminal runs with native lifecycle `Unknown` at their
+latest trustworthy provider timestamp. Only known committed durability permits
+one in-memory application and publication. Incomplete, failed, interrupted, or
+durability-unconfirmed finalization leaves affected rows suppressed. Barrier
+retry and completed-manifest replay are idempotent; superseding an incomplete
+manifest requires proven coverage of every old goalpost.
+
+Historical rate observations update lifetime telemetry but only rebaseline the
+process-local measurement cursor. Cold start, observation gaps, reconnect,
+reconciliation, queue-overflow recovery, and identity-basis changes also clear
+the cursor before any time accrues. Persisted measured totals survive; offline
+time and pre-baseline tokens do not enter a new measurement epoch.
 
 A second invocation does not reconcile because it does not acquire the lock.
 
@@ -486,7 +565,10 @@ A second invocation does not reconcile because it does not acquire the lock.
 - Live Herdr handoff or socket replacement: enter `RECONCILING`, reconnect with the subscribe-buffer-snapshot sequence, record a collector-attested event gap for the disconnected interval, and apply section 10.1 step 8's retirement and attachment rule before replay; server-side continuity is never assumed.
 - Provider source loss: retain Herdr topology in `DEGRADED / Herdr-only` mode.
 
-Herdr restores its own topology and supported agent sessions. Herdr Top restores its durable semantic model and reconstructs transient provider-derived state through backfill.
+Herdr restores its own topology and supported agent sessions. Herdr Top restores
+its durable semantic model, native lifecycle watermarks, history readiness, and
+measured rate totals. Backfill reconstructs artifact-derived detail while pane
+status and rate cursors begin as process-local state.
 
 ### 10.3 Retention and default visibility
 
@@ -498,7 +580,24 @@ Herdr restores its own topology and supported agent sessions. Herdr Top restores
 - Parents or dependencies referenced by active Task Runs are not pruned.
 - Cleanup runs at startup, after ingestion, and on a collector-driven periodic tick.
 
-The default TUI shows non-dismissed, non-expired Task Runs plus runs that entered a terminal state — `completed`, `failed`, `cancelled`, or `ended_unknown` — during the last hour. Pressing `c` sets `dismissed_at_ms` on every currently terminal run and every hook-only run that has reached the 24-hour boundary; a known-run `dismiss`, including the event produced by `SessionEnd`, sets the same field without changing state. Dismissal changes visibility only: it performs no deletion, survives restart, and leaves the run filterable. A later non-terminal Task Run mutation that passes through `TaskRun::touch` clears the field — notably a resumed `task_started` or live-execution reactivation — while a terminal touch retains it. Older retained and dismissed runs remain filterable.
+The default TUI shows non-dismissed, non-expired Task Runs. Every semantic
+terminal or native-lifecycle-ended Task Run uses the same exact
+`DEFAULT_TERMINAL_VISIBILITY_MS` boundary, currently one hour, at root, child,
+and grandchild depth. After the boundary it is default-hidden but retained in
+SQLite. The TUI chooses default-visible IDs before applying a filter, so neither
+filtering nor direct Detail selection restores an expired row. Once published
+and history-ready, the retained row remains in Summary until ordinary retention
+removes it. The visible set is closed over execution ancestors, so an expired
+ancestor remains as a structural row while an individually visible descendant
+needs its path.
+
+Pressing `c` sets `dismissed_at_ms` on every currently semantic-terminal run and
+every hook-only run that has reached the 24-hour boundary. A Controller
+`dismiss` sets the same field on a known run without changing state. Provider
+`SessionEnd` no longer dismisses. Dismissal changes visibility only: it performs
+no deletion and survives restart. It does not make a row filterable after the
+row leaves the default-visible set or directly selectable for Detail. Published,
+history-ready dismissed runs remain part of Summary while retained.
 
 Prompts, responses, terminal scrollback, and raw provider payloads are not retained.
 
@@ -522,14 +621,15 @@ Required behavior:
 - header shows host, named session, session elapsed time (`up:`), workspace count, quality, event lag — the age of the oldest received but not yet applied event, zero when the queue is empty — and source coverage, truncating below the standard width in the fixed order of criterion 15;
 - `LIVE`, `RECONCILING`, `DISCONNECTED`, and `DEGRADED` indicators;
 - internal scrolling and lower selected-item activity;
-- stable ordering and selection during updates: Task Runs, Agent Nodes, and topology rows receive unique, persisted, immutable display ordinals on first entry into the model and siblings sort by them, never by an identity-key component; execution placement order remains in-session; a state refresh never reorders rows, and after a merge the merged-in rows vanish while the survivor keeps its own ordinal and relative position;
-- manual scroll disables follow; `f` or End resumes it;
-- expand/collapse and filtering that retains matching ancestors — in the dependency view, every prerequisite path to a matching run;
+- stable oldest-first ordering and selection during updates: one Task Run exists per provider/native-session identity; resuming it preserves the row and ordinal, while a different session in the same pane appends a new root below it; Task Runs, Agent Nodes, and topology rows receive unique, persisted, immutable display ordinals on first entry into the model and siblings at every depth sort by them, never by an identity-key component; execution placement order remains in-session; a state refresh never reorders rows, and after a merge the merged-in rows vanish while the survivor keeps its own ordinal and relative position;
+- follow selects the last visible row; manual scroll, collapse, or committed filtering disables follow, and `f` or End resumes it;
+- expand/collapse and filtering within the default-visible row set that retains matching ancestors — in the dependency view, every prerequisite path to a matching run;
 - execution-tree and dependency-DAG toggle; the dependency view renders the conceptual DAG of section 6.2 as a stable topologically sorted list with prerequisite and dependent columns per run — prerequisites precede dependents, the display ordinal breaks topological ties, state refreshes preserve order, and only dependency-edge changes may reorder, minimally — so 1,000 edges stay scrollable and scannable;
-- Detail distinguishes no recorded task relationships from operational statuses such as `blocked`, stale evidence, execution `ended`, `ended_unknown`, and other terminal task states;
+- Detail distinguishes no recorded task relationships from operational statuses such as `blocked`, stale evidence, execution `ended`, `ended_unknown`, and other terminal task states, and exposes native lifecycle end/time, lifecycle watermark, history readiness, measured rate totals, and rate-cursor initialization;
 - selection moves to a surviving ancestor or neighbor when its node closes, and follows the surviving run through an identity merge, with the reason shown;
 - with no overlay or filter draft active, unmodified `s` opens the Summary overlay and unmodified `c` sends one non-blocking clear command; modifier-bearing `s` and `c` do neither. `Esc` or any `s` key code closes an already-open Summary overlay, because overlay-local closing is deliberately modifier-blind;
-- the Summary overlay prints a `scope:` line, then groups by worker kind and model in two separate tables headed `per worker kind` and `per model`; their exact header lines are `worker kind | runs | live | total | mean | tok | mean tok/s` and `model | runs | live | total | mean | tok | mean tok/s`; `runs` and `live` count all group members, `total` and `mean` use only terminal runs with valid timing, `tok` is accumulated output tokens, and `mean tok/s` is total rated output tokens divided by total rated elapsed seconds rather than an unweighted mean of per-run rates; either token field renders `-` only when the required telemetry is unavailable;
+- the Summary overlay prints a `scope:` line, then groups every published, history-ready run still retained by the store, including default-hidden terminal history, by worker kind and model in two separate tables headed `per worker kind` and `per model`; their exact header lines are `worker kind | runs | live | total | mean | tok | mean tok/s` and `model | runs | live | total | mean | tok | mean tok/s`; `runs` and `live` count all group members, `total` and `mean` use only terminal runs with valid timing, `tok` is accumulated lifetime output tokens, and `mean tok/s` is aggregate measured output tokens divided by aggregate measured Working seconds rather than an unweighted mean of per-run rates; either token field renders `-` only when the required telemetry is unavailable;
+- per-run `TOK-S` uses post-baseline measured output tokens divided by the union of reliably observed Working intervals across pane occurrences; Idle, blocked, queued, unknown, terminal, history, reconnect, reconciliation, and offline intervals add no time, while a delayed cumulative token increase after Idle still enters the numerator once without Idle time; missing totals or zero Working time render an em dash, and positive persisted totals remain usable without a restored cursor;
 - a wall-aligned once-per-second paint tick redraws clock-derived surfaces without rebuilding the row projection. Projection rebuilding remains separately gated by model/operator changes and cached visibility or visible-live-duration deadlines, so elapsed Task Run labels advance only when their projected row actually requires that refresh;
 - `?` opens key help and setup guidance;
 - minimum-size screen and safe truncation for narrow panes and wide Unicode;
@@ -662,14 +762,15 @@ Provider adapters must not force unstable Claude Code or Codex JSON into an over
 - sanitized real Claude and Codex fixtures — the evidenced Codex depth-two chain and Claude depth-one spawns — plus one synthetic Codex depth-three `agent_path` fixture marked format-plausible but unevidenced (Claude's observed layout cannot express deeper nesting, so no deeper Claude fixture is fabricated), unknown parents, unknown-field tolerance, and allowlist redaction proven with sentinel strings;
 - Task Run identity priority and provisional merge;
 - Herdr `agent_session` preference, provider-local fallback, and conflicting-identity handling;
-- reducer transitions, live-observation stale grace versus observation-gap retirement, and `ended_unknown` closure;
+- reducer transitions, live-observation stale grace versus observation-gap retirement, native lifecycle watermark ordering, and semantic-terminal precedence;
 - execution-edge versus dependency-edge separation;
 - cycle rejection and event deduplication;
-- tree and dependency-list ordering, display-ordinal stability across refreshes and merges, selection, and retention calculations;
+- tree and dependency-list oldest-first ordering at every depth, display-ordinal stability across status refreshes, resumes, appends, and merges, selection, and one-hour retention calculations with ancestor closure;
 - execution, task, relationship, and observation-quality separation;
 - identity binding: path-to-ID promotion, single-K1 binding conflicts, merge preflight on contracted graphs including self-edges and cycles, and direct-dispatch cycle rejection;
 - relationship-only placeholders staying `queued` and dangling-announcement diagnostics;
-- `ended_unknown` refinement, reactivation by task-state events, and reactivation by resumed executions.
+- native lifecycle `Done`, `Error`, `Cancelled`, and `Unknown` mapping, same-session lifecycle clearing, stale-watermark rejection, and semantic terminal non-reopening;
+- active-time rate epochs, pane-occurrence Working union, delayed token increments, restore without a cursor, and aggregate Summary numerator/denominator.
 
 ### Integration tests
 
@@ -677,7 +778,9 @@ Provider adapters must not force unstable Claude Code or Codex JSON into an over
 - one-writer ordering and startup reconciliation;
 - pane create, close, move, and replacement by `terminal_id`;
 - same-session resume and different-session pane reuse;
+- exact dotted and underscore pane-status aliases through the collector, with other spellings ignored;
 - provider file watch and two-second fallback scan;
+- frozen history manifests, bounded pending output, SQLite-spilled associations, ordered barrier finalization for every durability outcome, interrupted replay suppression, and idempotent completion;
 - Controller wire responses including both `retryable` reasons, response precedence, their no-ledger and no-reducer effects, best-effort failure, and `--strict`;
 - reconnect with the subscribe-buffer-snapshot sequence and collector-attested event-gap indication;
 - second-launch focus and released-lock recovery;
@@ -690,7 +793,8 @@ Provider adapters must not force unstable Claude Code or Codex JSON into an over
 - fixed layout and header scope/freshness/coverage;
 - all four observation-quality states;
 - scroll, collapse, follow, filtered ancestors, dependency-list order stability, and selection recovery;
-- default visibility for all non-terminal runs except the 24-hour hook-only expiry and dismissal, plus one-hour terminal visibility unless dismissed;
+- default visibility for every semantic-terminal and native-lifecycle-ended root, child, and grandchild for exactly one hour, including expired structural ancestors retained for visible descendants and Summary retention after default hiding;
+- active-time `TOK-S`, restored persisted totals without a cursor, and Detail lifecycle/history/rate diagnostics;
 - first-launch CLI notice and `?` help;
 - narrow-terminal and wide-Unicode rendering.
 
@@ -758,14 +862,14 @@ Herdr Top's differentiating combination is:
 8. Provider failure leaves `DEGRADED / Herdr-only` visibility.
 9. Non-authoritative disappearance during live observation is `stale` for 30 seconds before `ended`; across an observation gap executions retire immediately.
 10. Execution end never implies semantic completion.
-11. All non-terminal runs remain visible regardless of age except that Controller-keyed runs with no execution leave the default view 24 hours after their last update and dismissed runs are hidden.
-12. Runs in a terminal state, including `ended_unknown`, remain default-visible for one hour unless dismissed with `c`, which hides them immediately; they remain filterable for 30 days.
+11. Runs without semantic terminal or native lifecycle-end evidence remain visible regardless of age except that Controller-keyed runs with no execution leave the default view 24 hours after their last update and explicitly dismissed runs are hidden.
+12. Semantic-terminal and native-lifecycle-ended Task Runs at root, child, and grandchild depth remain default-visible for exactly one hour; expired ancestors remain structurally visible while needed by a visible descendant, and published, history-ready default-hidden history remains included in Summary but is not restored by filtering or directly selectable for Detail.
 13. Activity events are ring-bounded to 100,000 per named session and seven days; the `event_id` ledger is retained independently for seven days; no semantic state depends on event retention.
 14. The fixed TUI supports scroll, stable selection, activity, follow, help, and narrow panes.
 15. At or above the standard width of 100 columns the header shows host, session, session elapsed time (`up:`), workspace count, quality, lag, and coverage; below it, down to the minimum supported width of 48 columns, fields truncate in the fixed order coverage, lag, workspace count, host — session, `up:`, and quality are never dropped.
 16. `q` stops only Herdr Top; agents continue.
 17. Detach/reattach keeps the collector running.
-18. Cold restart stops the collector; next manual launch restores from SQLite, backfills admitted provider artifacts, and reconciles.
+18. Cold restart stops the collector; next manual launch restores semantic state, lifecycle watermarks, history readiness, and measured rate totals from SQLite, then runs the durable frozen-manifest history drain and reconciles without restoring pane status or a rate cursor.
 19. Live handoff reconnects with the subscribe-buffer-snapshot sequence, and the disconnected interval is recorded and shown as a collector-attested event gap.
 20. Second launch focuses the owner and creates no second writer.
 21. Launches from different directories in the same named session — including the unnamed `default` session — share state through the session-key rule; different named sessions remain isolated.
@@ -777,6 +881,8 @@ Herdr Top's differentiating combination is:
 27. macOS/Linux artifacts install through Herdr without Rust.
 28. `doctor` reports health, provider-log root readability, pane-session artifact coverage, watcher freshness, Herdr integration versions, and native-session coverage without exposing content.
 29. On the reference machine the target load meets every budget in section 15, and twice the target load sustained for 60 seconds degrades visibly without losing Task Runs or edges.
+30. One Task Run is retained per provider/native-session identity; same-session resume preserves its ordinal, a different session in the same pane appends below it, and status changes never reorder siblings.
+31. `TOK-S` divides post-baseline measured output tokens by reliably observed Working time only; Summary divides aggregate measured tokens by aggregate measured Working time, and missing or zero denominators render unavailable.
 
 ## 18. Deferred capabilities
 

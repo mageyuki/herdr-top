@@ -1,6 +1,7 @@
 #[allow(dead_code)]
 mod common;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -10,21 +11,27 @@ use common::live_mock::{LiveConfig, LiveHerdr};
 use common::mock::{MockConfig, MockHerdr, fixture_payloads};
 use common::scripted_mock::{ScriptedConfig, ScriptedHerdr};
 use herdr_top::activity::ActivityDurability;
+use herdr_top::activity::{
+    DEFAULT_TERMINAL_VISIBILITY_MS, OperatorSnapshot, default_visible_task_run_count,
+    is_default_visible_task_run, runs_with_executions,
+};
 use herdr_top::herdr::collector::{self, CollectorHandle, ObservationQuality};
 use herdr_top::identity::MergeConflict;
 use herdr_top::lockfile::{StateRoot, state_root_in};
 use herdr_top::model::{
     AgentSessionReference, AgentSessionReferenceKind, ControllerEventKind, DependencyEdge,
     DisplayOrdinal, DomainModel, EventMetadata, ExecState, Execution, ExecutionEdge, GapKind,
-    NormalizedEvent, Pane, PaneAgentStatus, PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey,
-    SnapshotAgent, Tab, TaskRun, TaskState, TopologyAuthority, TopologySnapshot, Workspace,
+    NativeLifecycleWatermark, NativeSessionEndStatus, NormalizedEvent, Pane, PaneAgentStatus,
+    PaneSnapshot, Provider, ReconcileBatch, RunId, RunKey, SnapshotAgent, Tab, TaskRun,
+    TaskRunV6State, TaskState, TopologyAuthority, TopologySnapshot, Workspace,
 };
 use herdr_top::reducer::{ApplyOutcome, Reducer};
 use herdr_top::session_key;
 use herdr_top::store::writer::{WriterClient, WriterLifecycle, spawn_writer};
 use herdr_top::store::{
-    CollectorGap, NativeSessionBinding, PersistExecution, PersistOp, PersistTaskRun, RestoredState,
-    database_path, open_reader, open_writer,
+    CollectorGap, NativeSessionBinding, PersistExecution, PersistHistoryDrain,
+    PersistHistoryDrainRun, PersistOp, PersistTaskRun, PersistTaskRunV6, PersistV6Batch,
+    RestoredState, database_path, open_reader, open_writer,
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -35,6 +42,309 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 const WAIT: Duration = Duration::from_secs(3);
+
+#[test]
+fn historical_enrichment_never_regresses_live_state_or_watermark() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = StateRoot(directory.path().to_path_buf());
+    let mut store = open_writer(&root).unwrap();
+    let run_id = RunId::new();
+    let drain_id = herdr_top::model::HistoryDrainId::new("codex:convergence-history").unwrap();
+    let task_run = |state, created_at_ms, updated_at_ms, finished_at_ms, subject: &str| TaskRun {
+        run_id,
+        key: RunKey::Native {
+            provider: Provider::Codex,
+            sid: "convergence-history".to_owned(),
+        },
+        display_ordinal: DisplayOrdinal::new(1),
+        state,
+        has_controller_task_state_event: state == TaskState::Completed,
+        created_at_ms: Some(created_at_ms),
+        updated_at_ms: Some(updated_at_ms),
+        finished_at_ms,
+        subject: Some(subject.to_owned()),
+        dismissed_at_ms: None,
+    };
+    let persisted = |task_run: TaskRun| PersistTaskRun {
+        created_at_ms: task_run.created_at_ms.unwrap(),
+        updated_at_ms: task_run.updated_at_ms.unwrap(),
+        finished_at_ms: task_run.finished_at_ms,
+        native_session: Some(NativeSessionBinding {
+            provider: Provider::Codex,
+            native_session_id: "convergence-history".to_owned(),
+        }),
+        task_run,
+    };
+    let live_watermark = NativeLifecycleWatermark {
+        source_at_ms: 500,
+        observed_at_ms: 600,
+        source_order: "live:controller".to_owned(),
+    };
+    store
+        .apply_v6_batch(PersistV6Batch {
+            task_runs: vec![PersistTaskRunV6 {
+                task_run: persisted(task_run(
+                    TaskState::Completed,
+                    200,
+                    500,
+                    Some(500),
+                    "live subject",
+                )),
+                state: TaskRunV6State {
+                    lifecycle_watermark: Some(live_watermark.clone()),
+                    history_ready: true,
+                    latest_provider_at_ms: Some(500),
+                    ..TaskRunV6State::default()
+                },
+            }],
+            ..PersistV6Batch::default()
+        })
+        .unwrap();
+
+    store
+        .apply_v6_batch(PersistV6Batch {
+            task_runs: vec![PersistTaskRunV6 {
+                task_run: persisted(task_run(
+                    TaskState::Running,
+                    100,
+                    300,
+                    None,
+                    "historical subject",
+                )),
+                state: TaskRunV6State {
+                    history_ready: false,
+                    latest_provider_at_ms: Some(300),
+                    ..TaskRunV6State::default()
+                },
+            }],
+            history_drains: vec![PersistHistoryDrain {
+                drain_id: drain_id.clone(),
+                provider: Provider::Codex,
+                created_at_ms: 700,
+                artifacts: Vec::new(),
+            }],
+            history_associations: vec![PersistHistoryDrainRun { drain_id, run_id }],
+            ..PersistV6Batch::default()
+        })
+        .unwrap();
+
+    let restored = store.load_restored_state().unwrap();
+    let run = restored.model.task_run(&run_id).unwrap();
+    assert_eq!(run.state, TaskState::Completed);
+    assert!(run.has_controller_task_state_event);
+    assert_eq!(run.created_at_ms, Some(100));
+    assert_eq!(run.updated_at_ms, Some(500));
+    assert_eq!(run.finished_at_ms, Some(500));
+    assert_eq!(run.subject.as_deref(), Some("live subject"));
+    let state = restored.model.task_run_v6_state(&run_id).unwrap();
+    assert!(state.history_ready);
+    assert_eq!(state.latest_provider_at_ms, Some(500));
+    assert_eq!(state.lifecycle_watermark, Some(live_watermark));
+}
+
+#[test]
+fn historical_working_state_is_not_published_before_durable_finalization() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = StateRoot(directory.path().to_path_buf());
+    let mut store = open_writer(&root).unwrap();
+    let run_id = RunId::new();
+    let drain_id = herdr_top::model::HistoryDrainId::new("codex:no-working-flash").unwrap();
+    let manifest = PersistHistoryDrain {
+        drain_id: drain_id.clone(),
+        provider: Provider::Codex,
+        created_at_ms: 2_500,
+        artifacts: Vec::new(),
+    };
+    store
+        .apply_v6_batch(PersistV6Batch {
+            task_runs: vec![PersistTaskRunV6 {
+                task_run: PersistTaskRun {
+                    task_run: TaskRun {
+                        run_id,
+                        key: RunKey::Native {
+                            provider: Provider::Codex,
+                            sid: "historical-working".to_owned(),
+                        },
+                        display_ordinal: DisplayOrdinal::new(1),
+                        state: TaskState::Running,
+                        has_controller_task_state_event: true,
+                        created_at_ms: Some(1_000),
+                        updated_at_ms: Some(2_000),
+                        finished_at_ms: None,
+                        subject: None,
+                        dismissed_at_ms: None,
+                    },
+                    native_session: Some(NativeSessionBinding {
+                        provider: Provider::Codex,
+                        native_session_id: "historical-working".to_owned(),
+                    }),
+                    created_at_ms: 1_000,
+                    updated_at_ms: 2_000,
+                    finished_at_ms: None,
+                },
+                state: TaskRunV6State {
+                    history_ready: false,
+                    latest_provider_at_ms: Some(2_000),
+                    ..TaskRunV6State::default()
+                },
+            }],
+            history_drains: vec![manifest.clone()],
+            history_associations: vec![PersistHistoryDrainRun {
+                drain_id: drain_id.clone(),
+                run_id,
+            }],
+            ..PersistV6Batch::default()
+        })
+        .unwrap();
+
+    let staged = store.load_restored_state().unwrap();
+    assert_eq!(
+        staged.model.task_run(&run_id).unwrap().state,
+        TaskState::Running
+    );
+    assert!(
+        !staged
+            .model
+            .task_run_v6_state(&run_id)
+            .unwrap()
+            .history_ready
+    );
+    let (_before_commit, published_before_commit) = Reducer::new(staged);
+    assert!(
+        published_before_commit.borrow().task_run(&run_id).is_none(),
+        "historical Working must not enter a published snapshot before finalization commits"
+    );
+
+    let finalization = store.finalize_history_drain(&manifest, 3_000).unwrap();
+    assert_eq!(finalization.finalized_at_ms, 3_000);
+    assert_eq!(finalization.runs.len(), 1);
+    assert_eq!(finalization.runs[0].run_id, run_id);
+    assert!(finalization.runs[0].state.history_ready);
+    assert_eq!(
+        finalization.runs[0]
+            .state
+            .native_session_end
+            .as_ref()
+            .map(|end| end.status),
+        Some(NativeSessionEndStatus::Unknown)
+    );
+
+    let finalized = store.load_restored_state().unwrap();
+    let (_after_commit, published_after_commit) = Reducer::new(finalized);
+    let published = published_after_commit.borrow();
+    assert_eq!(
+        published.task_run(&run_id).unwrap().state,
+        TaskState::Running
+    );
+    assert!(published.task_run_v6_state(&run_id).unwrap().history_ready);
+    assert_eq!(
+        published
+            .task_run_v6_state(&run_id)
+            .and_then(|state| state.native_session_end.as_ref())
+            .map(|end| end.status),
+        Some(NativeSessionEndStatus::Unknown),
+        "the first published historical state must be the finalized native outcome"
+    );
+}
+
+#[test]
+fn terminal_visibility_is_one_hour_at_every_depth_and_closes_over_ancestors() {
+    let now_ms = 10_000_000;
+    let boundary_at_ms = now_ms - DEFAULT_TERMINAL_VISIBILITY_MS;
+    let root = RunId::new();
+    let child = RunId::new();
+    let grandchild = RunId::new();
+    let mut model = DomainModel::default();
+    for (run_id, sid, ordinal) in [
+        (root, "root", 1),
+        (child, "child", 2),
+        (grandchild, "grandchild", 3),
+    ] {
+        model.insert_task_run(TaskRun {
+            run_id,
+            key: RunKey::Native {
+                provider: Provider::Codex,
+                sid: sid.to_owned(),
+            },
+            display_ordinal: DisplayOrdinal::new(ordinal),
+            state: TaskState::Completed,
+            has_controller_task_state_event: true,
+            created_at_ms: Some(1),
+            updated_at_ms: Some(boundary_at_ms),
+            finished_at_ms: Some(boundary_at_ms),
+            subject: None,
+            dismissed_at_ms: None,
+        });
+    }
+    model.insert_execution_edge(ExecutionEdge {
+        parent_run_id: root,
+        child_run_id: child,
+    });
+    model.insert_execution_edge(ExecutionEdge {
+        parent_run_id: child,
+        child_run_id: grandchild,
+    });
+    let execution_runs = runs_with_executions(&model);
+    let operator = |times: HashMap<RunId, i64>| OperatorSnapshot {
+        activity: Arc::from([]),
+        terminal_times: Arc::new(times),
+    };
+    let all_at_boundary = operator(HashMap::from([
+        (root, boundary_at_ms),
+        (child, boundary_at_ms),
+        (grandchild, boundary_at_ms),
+    ]));
+
+    assert_eq!(
+        default_visible_task_run_count(&model, &all_at_boundary, now_ms - 1),
+        3
+    );
+    for run_id in [root, child, grandchild] {
+        assert!(!is_default_visible_task_run(
+            &model,
+            model.task_run(&run_id).unwrap(),
+            &execution_runs,
+            now_ms,
+        ));
+    }
+    assert_eq!(
+        default_visible_task_run_count(&model, &all_at_boundary, now_ms),
+        0
+    );
+
+    let mut visible_grandchild = model.task_run(&grandchild).unwrap().clone();
+    visible_grandchild.updated_at_ms = Some(boundary_at_ms + 1);
+    visible_grandchild.finished_at_ms = Some(boundary_at_ms + 1);
+    model.insert_task_run(visible_grandchild);
+    let descendant_visible = operator(HashMap::from([
+        (root, boundary_at_ms),
+        (child, boundary_at_ms),
+        (grandchild, boundary_at_ms + 1),
+    ]));
+    assert!(!is_default_visible_task_run(
+        &model,
+        model.task_run(&root).unwrap(),
+        &execution_runs,
+        now_ms,
+    ));
+    assert!(!is_default_visible_task_run(
+        &model,
+        model.task_run(&child).unwrap(),
+        &execution_runs,
+        now_ms,
+    ));
+    assert!(is_default_visible_task_run(
+        &model,
+        model.task_run(&grandchild).unwrap(),
+        &execution_runs,
+        now_ms,
+    ));
+    assert_eq!(
+        default_visible_task_run_count(&model, &descendant_visible, now_ms),
+        3,
+        "expired ancestors must remain as structural rows"
+    );
+}
 
 #[derive(Clone, Debug)]
 struct ScopedHerdrConfig {
@@ -691,6 +1001,92 @@ async fn scoped_subscription_keeps_primary_unscoped_and_enriches_each_snapshot_p
     );
 
     shutdown(handle, lifecycle).await;
+}
+
+#[tokio::test]
+async fn collector_accepts_exact_dotted_and_underscore_pane_status_aliases() {
+    let mut snapshot = agent_snapshot("alias-session", AgentSessionReferenceKind::Id, "idle");
+    snapshot["panes"]
+        .as_array_mut()
+        .unwrap()
+        .push(agent_pane_value(
+            "w1:p2",
+            "alias-sentinel-terminal",
+            "w1",
+            "w1:t1",
+            "alias-sentinel-session",
+        ));
+    let mock = ScopedHerdr::start(ScopedHerdrConfig::snapshots(vec![snapshot]))
+        .await
+        .unwrap();
+    let (_directory, root, lifecycle, writer) = test_writer();
+    let mut handle = collector::spawn(
+        mock.socket_path().to_path_buf(),
+        test_session(),
+        empty_restored(),
+        writer,
+    )
+    .await
+    .unwrap();
+    wait_quality(&mut handle.quality, ObservationQuality::Live).await;
+    wait_until(|| mock.enrichment_subscriptions() == 1).await;
+
+    mock.push_enrichment(agent_status_alias_push(
+        "pane.agent_status_changed",
+        "w1:p1",
+        "term_6583d08d791e41",
+        "working",
+    ))
+    .await
+    .unwrap();
+    wait_execution_state(&handle, ExecState::Working).await;
+    mock.push_enrichment(agent_status_alias_push(
+        "pane_agent_status_changed",
+        "w1:p1",
+        "term_6583d08d791e41",
+        "idle",
+    ))
+    .await
+    .unwrap();
+    wait_execution_state(&handle, ExecState::Idle).await;
+    mock.push_enrichment(agent_status_alias_push(
+        "pane.agent.status_changed",
+        "w1:p1",
+        "term_6583d08d791e41",
+        "working",
+    ))
+    .await
+    .unwrap();
+    mock.push_enrichment(agent_status_alias_push(
+        "pane_agent_status_changed",
+        "w1:p2",
+        "alias-sentinel-terminal",
+        "idle",
+    ))
+    .await
+    .unwrap();
+    wait_until(|| pane_status_event_count(&root) >= 3).await;
+    assert_eq!(
+        handle
+            .model
+            .borrow()
+            .executions()
+            .find(|execution| execution.pane_id == "w1:p1" && !execution.state.is_terminal())
+            .unwrap()
+            .state,
+        ExecState::Idle
+    );
+
+    shutdown(handle, lifecycle).await;
+    let connection = Connection::open(database_path(&root)).unwrap();
+    let rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE source_event_type = 'pane_agent_status_changed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 3);
 }
 
 #[tokio::test]
@@ -2521,20 +2917,19 @@ async fn different_sid_same_terminal_starts_new_run() {
             provider: Provider::Codex,
             sid: "old-sid".to_owned(),
         })
-        .unwrap()
-        .run_id;
+        .unwrap();
     let new_run = model
         .task_run_by_key(&RunKey::Native {
             provider: Provider::Codex,
             sid: "new-sid".to_owned(),
         })
-        .unwrap()
-        .run_id;
-    assert_ne!(old_run, new_run);
+        .unwrap();
+    assert_ne!(old_run.run_id, new_run.run_id);
+    assert!(old_run.display_ordinal < new_run.display_ordinal);
     assert!(
         model
             .executions()
-            .filter(|execution| execution.task_run_id == old_run)
+            .filter(|execution| execution.task_run_id == old_run.run_id)
             .all(|execution| execution.state.is_terminal())
     );
     assert_eq!(
@@ -2706,7 +3101,7 @@ fn binding_conflict_returns_typed_dropped_result() {
 }
 
 #[test]
-fn hook_metadata_and_later_log_start_converge_one_run() {
+fn hook_metadata_and_later_log_lifecycle_converge_one_run() {
     const ROLLOUT: &str = "77777777-7777-4777-8777-777777777777";
     let parent_run_id = RunId::new();
     let prerequisite_run_id = RunId::new();
@@ -2842,8 +3237,15 @@ fn hook_metadata_and_later_log_start_converge_one_run() {
     {
         let snapshot = shared.borrow();
         let run = snapshot.task_run(&child_run_id).unwrap();
-        assert_eq!(run.state, TaskState::Cancelled);
-        assert_eq!(run.finished_at_ms, Some(30));
+        assert_eq!(run.state, TaskState::Running);
+        assert_eq!(run.finished_at_ms, None);
+        assert_eq!(
+            snapshot
+                .task_run_v6_state(&child_run_id)
+                .and_then(|state| state.native_session_end.as_ref())
+                .map(|end| (end.status, end.at_ms)),
+            Some((NativeSessionEndStatus::Cancelled, 30))
+        );
     }
 
     let before_valid_start = {
@@ -2886,6 +3288,12 @@ fn hook_metadata_and_later_log_start_converge_one_run() {
     let run = snapshot.task_run(&child_run_id).unwrap();
     assert_eq!(run.state, TaskState::Running);
     assert_eq!(run.finished_at_ms, None);
+    assert!(
+        snapshot
+            .task_run_v6_state(&child_run_id)
+            .and_then(|state| state.native_session_end.as_ref())
+            .is_none()
+    );
     assert_eq!(run.subject.as_deref(), Some("preserved hook subject"));
     assert_eq!(
         snapshot
@@ -4079,10 +4487,19 @@ fn push(event: &str, data: Value) -> Value {
 }
 
 fn agent_status_push(pane_id: &str, terminal_id: &str, status: &str) -> Value {
+    agent_status_alias_push("pane_agent_status_changed", pane_id, terminal_id, status)
+}
+
+fn agent_status_alias_push(
+    event_type: &str,
+    pane_id: &str,
+    terminal_id: &str,
+    status: &str,
+) -> Value {
     push(
-        "pane_agent_status_changed",
+        event_type,
         json!({
-            "type": "pane_agent_status_changed",
+            "type": event_type,
             "pane_id": pane_id,
             "terminal_id": terminal_id,
             "agent_status": status,
@@ -4292,4 +4709,15 @@ fn event_count(root: &StateRoot) -> i64 {
     connection
         .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
         .expect("event count should query")
+}
+
+fn pane_status_event_count(root: &StateRoot) -> i64 {
+    let connection = Connection::open(database_path(root)).expect("database should open");
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE source_event_type = 'pane_agent_status_changed'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("pane status event count should query")
 }

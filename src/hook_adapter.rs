@@ -54,10 +54,11 @@ pub fn map_hook_payload(
     emitted_at_ms: i64,
     invocation_nonce: u64,
 ) -> Vec<ControllerEnvelope> {
-    let (provider_selector, wire_provider, supports_task_events) = match provider {
-        HookProvider::ClaudeCode => ("claude-code", "claude", true),
-        HookProvider::Codex => ("codex", "codex", false),
-    };
+    let (provider_selector, wire_provider, supports_task_events, ignores_explicit_empty_stop_type) =
+        match provider {
+            HookProvider::ClaudeCode => ("claude-code", "claude", true, true),
+            HookProvider::Codex => ("codex", "codex", false, false),
+        };
     let source = format!("hook:{provider_selector}");
     let session_run_id = format!("{source}:{}", payload.session_id);
     let make_envelope = |event_type: &str,
@@ -97,7 +98,7 @@ pub fn map_hook_payload(
             "started",
         )],
         "SessionEnd" => vec![make_envelope(
-            "dismiss",
+            "session_ended",
             session_run_id,
             None,
             None,
@@ -135,6 +136,15 @@ pub fn map_hook_payload(
             let Some(agent_id) = payload.agent_id.as_deref() else {
                 return Vec::new();
             };
+            // Claude Code emits SubagentStop hooks whose `agent_type` is an
+            // explicitly present empty string. The observed payloads of that
+            // shape had no preceding SubagentStart, so mapping them would
+            // create terminal forward-reference runs. Attributing the shape
+            // to provider-internal agents is an inference; the discriminator
+            // here is structural `Some("")`. Absent and null types still map.
+            if ignores_explicit_empty_stop_type && payload.agent_type.as_deref() == Some("") {
+                return Vec::new();
+            }
             vec![make_envelope(
                 "complete",
                 format!("{session_run_id}:agent:{agent_id}"),
@@ -399,6 +409,89 @@ mod tests {
         );
     }
 
+    fn subagent_stop_payload(agent_type: serde_json::Value) -> HookPayload {
+        serde_json::from_value(json!({
+            "hook_event_name": "SubagentStop",
+            "session_id": "session-123",
+            "agent_id": "agent-7",
+            "agent_type": agent_type
+        }))
+        .expect("test hook payload should deserialize")
+    }
+
+    #[test]
+    fn claude_explicit_empty_subagent_stop_maps_to_empty() {
+        let payload = subagent_stop_payload(json!(""));
+        assert_eq!(payload.agent_type.as_deref(), Some(""));
+
+        assert!(
+            map_hook_payload(HookProvider::ClaudeCode, &payload, EMITTED_AT_MS, NONCE).is_empty()
+        );
+    }
+
+    #[test]
+    fn claude_null_subagent_type_stop_retains_complete_envelope() {
+        let payload = subagent_stop_payload(json!(null));
+        assert_eq!(payload.agent_type, None);
+
+        let actual = map_hook_payload(HookProvider::ClaudeCode, &payload, EMITTED_AT_MS, NONCE);
+
+        assert_eq!(
+            actual,
+            vec![envelope(
+                "hook:claude-code:session-123:SubagentStop:agent-7:complete:1723456789012:0123456789abcdef",
+                "complete",
+                "hook:claude-code:session-123:agent:agent-7",
+                None,
+                None,
+                "claude",
+                None,
+            )]
+        );
+    }
+
+    #[test]
+    fn claude_nonempty_subagent_type_stop_retains_complete_envelope() {
+        let payload = subagent_stop_payload(json!("researcher"));
+        assert_eq!(payload.agent_type.as_deref(), Some("researcher"));
+
+        let actual = map_hook_payload(HookProvider::ClaudeCode, &payload, EMITTED_AT_MS, NONCE);
+
+        assert_eq!(
+            actual,
+            vec![envelope(
+                "hook:claude-code:session-123:SubagentStop:agent-7:complete:1723456789012:0123456789abcdef",
+                "complete",
+                "hook:claude-code:session-123:agent:agent-7",
+                None,
+                None,
+                "claude",
+                None,
+            )]
+        );
+    }
+
+    #[test]
+    fn codex_explicit_empty_subagent_stop_retains_complete_envelope() {
+        let payload = subagent_stop_payload(json!(""));
+        assert_eq!(payload.agent_type.as_deref(), Some(""));
+
+        let actual = map_hook_payload(HookProvider::Codex, &payload, EMITTED_AT_MS, NONCE);
+
+        assert_eq!(
+            actual,
+            vec![envelope(
+                "hook:codex:session-123:SubagentStop:agent-7:complete:1723456789012:0123456789abcdef",
+                "complete",
+                "hook:codex:session-123:agent:agent-7",
+                None,
+                None,
+                "codex",
+                None,
+            )]
+        );
+    }
+
     #[test]
     fn task_created_maps_dispatch_then_progress_with_distinct_ids() {
         let payload = serde_json::from_value(json!({
@@ -491,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn session_end_maps_to_one_dismiss_envelope_for_both_providers() {
+    fn session_end_maps_to_one_resumable_lifecycle_envelope_for_both_providers() {
         for (provider, selector, wire_provider) in [
             (HookProvider::ClaudeCode, "claude-code", "claude"),
             (HookProvider::Codex, "codex", "codex"),
@@ -499,7 +592,7 @@ mod tests {
             let actual = map_hook_payload(provider, &payload("SessionEnd"), EMITTED_AT_MS, NONCE);
 
             assert_eq!(actual.len(), 1);
-            assert_eq!(actual[0].event_type, "dismiss");
+            assert_eq!(actual[0].event_type, "session_ended");
             assert_eq!(
                 actual[0].task_run_id,
                 format!("hook:{selector}:session-123")

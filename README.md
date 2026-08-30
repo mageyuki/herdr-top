@@ -101,6 +101,19 @@ and time. The TUI paints no column-header row. As the tree pane narrows, it
 drops model, effort, token rate, token total, and time in that order after
 truncating labels and compressing deep indentation.
 
+Each provider-native session owns one Task Run. Resuming that session preserves
+its row and immutable display order; starting a different native session in the
+same pane appends a new root below it. Siblings at every depth stay oldest-first
+when their status changes. Follow mode tracks the last visible row, while manual
+navigation leaves follow mode.
+
+Terminal roots and descendants remain in the default tree for one hour, then
+become default-hidden while SQLite and Summary retain them. `TOK` is the
+lifetime output-token total. `TOK-S` instead divides only post-baseline measured
+tokens by reliably observed Working time; Idle, history replay, reconnect, and
+offline intervals add no time. Summary uses the aggregate measured numerator
+and denominator, not an average of per-run rates.
+
 Lineage evidence has three positions: Claude Agent-tool `.meta.json` sidecars;
 real Bash-command invocations of `codex exec resume <uuid>` or
 `claude --resume <uuid>` plus leading `CLAUDE_CONFIG_DIR=` assignments; and

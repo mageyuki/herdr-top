@@ -839,6 +839,10 @@ fn merge_in_memory(
     // for the process lifetime, and merged runs have disjoint ScopeKeys.
     model.fold_telemetry(survivor, absorbed);
     model.fold_run_kind(survivor, absorbed);
+    model.fold_task_run_v6_state(survivor, absorbed);
+    model.fold_run_rate_totals(survivor, absorbed);
+    // Neither pre-merge identity basis may bridge into the canonical post-merge run.
+    model.remove_run_rate_cursor(&survivor);
     model.remove_task_run_record(&absorbed);
     for execution in model.executions_mut() {
         if execution.task_run_id == absorbed {
@@ -872,10 +876,14 @@ mod tests {
 
     use crate::lockfile::StateRoot;
     use crate::model::{
-        AgentNode, DependencyEdge, DisplayOrdinal, ExecState, Execution, ExecutionEdge, TaskRun,
-        TaskState, graph::is_relationship_only,
+        AgentNode, DependencyEdge, DisplayOrdinal, ExecState, Execution, ExecutionEdge,
+        HistoryDrainId, NativeLifecycleWatermark, NativeSessionEnd, NativeSessionEndStatus,
+        RunRateTotals, TaskRun, TaskRunV6State, TaskState, graph::is_relationship_only,
     };
-    use crate::store::{NativeSessionBinding, PersistOp, PersistTaskRun, open_reader, open_writer};
+    use crate::store::{
+        NativeSessionBinding, PersistHistoryDrain, PersistHistoryDrainRun, PersistOp,
+        PersistTaskRun, PersistTaskRunV6, PersistV6Batch, open_reader, open_writer,
+    };
 
     use super::*;
 
@@ -1997,6 +2005,211 @@ mod tests {
                 durable_native_owner,
             ),
             (true, false, true, survivor)
+        );
+    }
+
+    #[test]
+    fn binding_merge_folds_all_v6_run_state_and_restores() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let survivor = RunId::new();
+        let absorbed = RunId::new();
+        let outstanding = HistoryDrainId::new("codex:outstanding").unwrap();
+        let completed = HistoryDrainId::new("codex:completed").unwrap();
+        let completed_manifest = PersistHistoryDrain {
+            drain_id: completed.clone(),
+            provider: Provider::Codex,
+            created_at_ms: 925,
+            artifacts: Vec::new(),
+        };
+        let survivor_run = TaskRun {
+            run_id: survivor,
+            key: RunKey::Controller("v6-survivor".to_owned()),
+            display_ordinal: DisplayOrdinal::new(1),
+            state: TaskState::Running,
+            has_controller_task_state_event: false,
+            created_at_ms: Some(1_000),
+            updated_at_ms: Some(1_000),
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        };
+        let absorbed_run = TaskRun {
+            run_id: absorbed,
+            key: native(Provider::Codex, "v6-absorbed"),
+            display_ordinal: DisplayOrdinal::new(2),
+            state: TaskState::Completed,
+            has_controller_task_state_event: true,
+            created_at_ms: Some(1_100),
+            updated_at_ms: Some(1_100),
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        };
+        let survivor_state = TaskRunV6State {
+            native_session_end: Some(NativeSessionEnd {
+                status: NativeSessionEndStatus::Done,
+                at_ms: 1_500,
+            }),
+            lifecycle_watermark: Some(NativeLifecycleWatermark {
+                source_at_ms: 1_500,
+                observed_at_ms: 1_600,
+                source_order: "provider:a".to_owned(),
+            }),
+            history_ready: true,
+            latest_provider_at_ms: Some(1_500),
+        };
+        let mut absorbed_state = TaskRunV6State {
+            native_session_end: Some(NativeSessionEnd {
+                status: NativeSessionEndStatus::Error,
+                at_ms: 1_500,
+            }),
+            lifecycle_watermark: Some(NativeLifecycleWatermark {
+                source_at_ms: 1_500,
+                observed_at_ms: 1_600,
+                source_order: "provider:z".to_owned(),
+            }),
+            history_ready: false,
+            latest_provider_at_ms: Some(1_900),
+        };
+        let survivor_totals = RunRateTotals {
+            output_tokens: i64::MAX as u64 - 10,
+            working_ms: i64::MAX - 100,
+        };
+        let absorbed_totals = RunRateTotals {
+            output_tokens: 29,
+            working_ms: 1_300,
+        };
+        store
+            .apply_v6_batch(PersistV6Batch {
+                task_runs: vec![
+                    PersistTaskRunV6 {
+                        task_run: PersistTaskRun {
+                            task_run: survivor_run.clone(),
+                            native_session: None,
+                            created_at_ms: 1_000,
+                            updated_at_ms: 1_000,
+                            finished_at_ms: None,
+                        },
+                        state: survivor_state.clone(),
+                    },
+                    PersistTaskRunV6 {
+                        task_run: PersistTaskRun {
+                            task_run: absorbed_run.clone(),
+                            native_session: Some(NativeSessionBinding {
+                                provider: Provider::Codex,
+                                native_session_id: "v6-absorbed".to_owned(),
+                            }),
+                            created_at_ms: 1_100,
+                            updated_at_ms: 1_100,
+                            finished_at_ms: None,
+                        },
+                        state: absorbed_state.clone(),
+                    },
+                ],
+                rate_totals: vec![(survivor, survivor_totals), (absorbed, absorbed_totals)],
+                history_drains: vec![
+                    PersistHistoryDrain {
+                        drain_id: outstanding.clone(),
+                        provider: Provider::Codex,
+                        created_at_ms: 900,
+                        artifacts: Vec::new(),
+                    },
+                    completed_manifest.clone(),
+                ],
+                history_associations: vec![
+                    PersistHistoryDrainRun {
+                        drain_id: outstanding,
+                        run_id: absorbed,
+                    },
+                    PersistHistoryDrainRun {
+                        drain_id: completed.clone(),
+                        run_id: absorbed,
+                    },
+                ],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+        let completed_result = store
+            .finalize_history_drain(&completed_manifest, 1_700)
+            .unwrap();
+        absorbed_state = completed_result.runs[0].state.clone();
+        assert!(absorbed_state.history_ready);
+
+        let mut model = DomainModel::default();
+        model.insert_task_run(survivor_run);
+        model.insert_task_run(absorbed_run);
+        model.set_task_run_v6_state(survivor, survivor_state);
+        model.set_task_run_v6_state(absorbed, absorbed_state.clone());
+        model.set_run_rate_totals(survivor, survivor_totals);
+        model.set_run_rate_totals(absorbed, absorbed_totals);
+        for run_id in [survivor, absorbed] {
+            let identity_basis = model.task_run(&run_id).unwrap().key.clone();
+            model.set_run_rate_cursor(
+                run_id,
+                crate::model::RunRateCursor {
+                    baseline_output_tokens: 10,
+                    last_observed_at_ms: 1_950,
+                    working: true,
+                    measurement_epoch: 7,
+                    identity_basis,
+                    live_baseline: true,
+                },
+            );
+        }
+
+        let batch =
+            apply_binding_plan_at(&mut model, BindingPlan::Merge { survivor, absorbed }, 2_000)
+                .unwrap();
+        assert!(batch.iter().any(|operation| matches!(
+            operation,
+            PersistOp::MergeTaskRuns {
+                survivor: actual_survivor,
+                absorbed: actual_absorbed,
+            } if *actual_survivor == survivor && *actual_absorbed == absorbed
+        )));
+        assert_eq!(model.task_run_v6_state(&absorbed), None);
+        assert_eq!(model.run_rate_totals(&absorbed), None);
+        assert_eq!(model.run_rate_cursor(&survivor), None);
+        assert_eq!(model.run_rate_cursor(&absorbed), None);
+        assert_eq!(
+            model.task_run_v6_state(&survivor),
+            Some(&TaskRunV6State {
+                native_session_end: absorbed_state.native_session_end,
+                lifecycle_watermark: absorbed_state.lifecycle_watermark,
+                history_ready: true,
+                latest_provider_at_ms: Some(1_900),
+            })
+        );
+        assert_eq!(
+            model.run_rate_totals(&survivor),
+            Some(&RunRateTotals {
+                output_tokens: i64::MAX as u64,
+                working_ms: i64::MAX,
+            })
+        );
+
+        store.apply_batch(batch).unwrap();
+        let restored = store.load_restored_state().unwrap();
+        assert_eq!(
+            restored.model.task_run_v6_state(&survivor),
+            model.task_run_v6_state(&survivor)
+        );
+        assert_eq!(
+            restored.model.run_rate_totals(&survivor),
+            model.run_rate_totals(&survivor)
+        );
+        assert_eq!(restored.model.run_rate_totals(&absorbed), None);
+        assert_eq!(
+            store
+                .history_drain_run_ids(&HistoryDrainId::new("codex:outstanding").unwrap())
+                .unwrap(),
+            vec![survivor]
+        );
+        assert_eq!(
+            store.history_drain_run_ids(&completed).unwrap(),
+            vec![survivor]
         );
     }
 }

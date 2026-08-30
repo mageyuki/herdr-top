@@ -1,16 +1,21 @@
 //! T9 dedicated writer thread, `WriterClient`, and `WriterLifecycle`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 #[cfg(test)]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::lockfile::OwnerRecord;
+use crate::model::HistoryDrainId;
 
-use super::{CleanupStats, LedgerEntry, PersistBatch, PersistOp, Store, StoreError};
+use super::{
+    CleanupStats, HistoryDrainFinalization, LedgerEntry, PersistBatch, PersistHistoryDrain,
+    PersistOp, PersistV6Batch, Store, StoreError,
+};
 
 const WRITER_QUEUE_CAPACITY: usize = 256;
 /// Maximum UTF-8 byte length retained for a persistence error detail.
@@ -749,6 +754,29 @@ impl EnqueuePermit<'_> {
         waiter.arm();
         PendingEnqueue { waiter }
     }
+
+    /// Consumes the permit and enqueues one versioned persistence batch, including v7 publication
+    /// and provenance state, without another channel operation.
+    #[must_use]
+    pub fn enqueue_v6(self, batch: PersistV6Batch) -> PendingEnqueue {
+        for entry in ledger_entries(&batch.operations) {
+            let _ = self.ledger.reserve(entry.event_id, entry.seen_at_ms);
+        }
+        let (acknowledgement, response) = oneshot::channel();
+        let mut waiter = AcknowledgementWaiter::new(
+            response,
+            self.health,
+            PersistenceOperation::Apply,
+            #[cfg(test)]
+            self.acknowledgement_test_control,
+        );
+        self.permit.send(WriterCommand::ApplyV6 {
+            batch,
+            acknowledgement,
+        });
+        waiter.arm();
+        PendingEnqueue { waiter }
+    }
 }
 
 impl WriterClient {
@@ -786,6 +814,32 @@ impl WriterClient {
         if self
             .sender
             .send(WriterCommand::Apply {
+                batch,
+                acknowledgement,
+            })
+            .await
+            .is_err()
+        {
+            return Err(self.health.runtime_error(queue_failure(operation)));
+        }
+        waiter.arm();
+        let delta = waiter.wait().await?;
+        self.ledger
+            .apply_cleanup(&delta.cleanup.deleted_ledger_entries);
+        Ok(())
+    }
+
+    /// Atomically commits one core-plus-v6 reducer persistence batch.
+    pub async fn apply_v6(&mut self, batch: PersistV6Batch) -> Result<(), WriterError> {
+        let operation = PersistenceOperation::Apply;
+        for entry in ledger_entries(&batch.operations) {
+            let _ = self.ledger.reserve(entry.event_id, entry.seen_at_ms);
+        }
+        let (acknowledgement, response) = oneshot::channel();
+        let mut waiter = self.waiter(response, operation);
+        if self
+            .sender
+            .send(WriterCommand::ApplyV6 {
                 batch,
                 acknowledgement,
             })
@@ -907,6 +961,75 @@ impl WriterClient {
             }
         })
         .await
+    }
+
+    /// Atomically upserts the frozen manifest and finalizes its drain on the writer thread.
+    pub async fn finalize_history_drain(
+        &mut self,
+        manifest: Arc<PersistHistoryDrain>,
+        observed_at_ms: i64,
+    ) -> Result<HistoryDrainFinalization, WriterError> {
+        let operation = PersistenceOperation::Apply;
+        let (acknowledgement, response) = oneshot::channel();
+        let mut waiter = self.waiter(response, operation);
+        if self
+            .sender
+            .send(WriterCommand::FinalizeHistoryDrain {
+                manifest,
+                observed_at_ms,
+                acknowledgement,
+            })
+            .await
+            .is_err()
+        {
+            return Err(self.health.runtime_error(queue_failure(operation)));
+        }
+        waiter.arm();
+        waiter.wait().await
+    }
+
+    /// Reads completion identity directly, including while persistence health is degraded.
+    pub async fn history_drain_finalized(
+        &self,
+        drain_id: &HistoryDrainId,
+    ) -> Result<bool, WriterError> {
+        let operation = PersistenceOperation::Barrier;
+        let (acknowledgement, response) = oneshot::channel();
+        let waiter = self.waiter(response, operation);
+        if self
+            .sender
+            .send(WriterCommand::HistoryDrainFinalized {
+                drain_id: drain_id.clone(),
+                acknowledgement,
+            })
+            .await
+            .is_err()
+        {
+            return Err(self.health.runtime_error(queue_failure(operation)));
+        }
+        waiter.wait_response_only().await
+    }
+
+    /// Reads the exact durable finalization page even while writer health is degraded.
+    pub async fn history_drain_finalization(
+        &self,
+        drain_id: &HistoryDrainId,
+    ) -> Result<Option<HistoryDrainFinalization>, WriterError> {
+        let operation = PersistenceOperation::Barrier;
+        let (acknowledgement, response) = oneshot::channel();
+        let waiter = self.waiter(response, operation);
+        if self
+            .sender
+            .send(WriterCommand::HistoryDrainFinalization {
+                drain_id: drain_id.clone(),
+                acknowledgement,
+            })
+            .await
+            .is_err()
+        {
+            return Err(self.health.runtime_error(queue_failure(operation)));
+        }
+        waiter.wait_response_only().await
     }
 
     /// Acknowledges after every command queued before this call has completed.
@@ -1096,6 +1219,20 @@ fn spawn_writer_with_test_control(
     Ok((lifecycle, writer, handle, injector))
 }
 
+#[cfg(test)]
+pub(super) fn spawn_writer_with_dropped_apply_ack(
+    store: Store,
+) -> Result<(WriterLifecycle, WriterClient), WriterError> {
+    let (lifecycle, writer, handle, _injector) = spawn_writer_with_test_control(
+        store,
+        super::unix_now_ms,
+        PersistenceOperation::Apply,
+        AcknowledgementTestMode::DropAcknowledgement,
+    )?;
+    handle.release();
+    Ok((lifecycle, writer))
+}
+
 fn spawn_writer_inner(
     store: Store,
     clock: fn() -> Result<i64, StoreError>,
@@ -1141,6 +1278,10 @@ enum WriterCommand {
         batch: PersistBatch,
         acknowledgement: oneshot::Sender<Result<WriterDelta, PersistenceFailure>>,
     },
+    ApplyV6 {
+        batch: PersistV6Batch,
+        acknowledgement: oneshot::Sender<Result<WriterDelta, PersistenceFailure>>,
+    },
     Cleanup {
         now_ms: i64,
         acknowledgement: oneshot::Sender<Result<WriterDelta, PersistenceFailure>>,
@@ -1153,6 +1294,20 @@ enum WriterCommand {
     ReplaceOwner {
         record: OwnerRecord,
         acknowledgement: oneshot::Sender<Result<(), PersistenceFailure>>,
+    },
+    FinalizeHistoryDrain {
+        manifest: Arc<PersistHistoryDrain>,
+        observed_at_ms: i64,
+        acknowledgement: oneshot::Sender<Result<HistoryDrainFinalization, PersistenceFailure>>,
+    },
+    HistoryDrainFinalized {
+        drain_id: HistoryDrainId,
+        acknowledgement: oneshot::Sender<Result<bool, PersistenceFailure>>,
+    },
+    HistoryDrainFinalization {
+        drain_id: HistoryDrainId,
+        acknowledgement:
+            oneshot::Sender<Result<Option<HistoryDrainFinalization>, PersistenceFailure>>,
     },
     Barrier {
         acknowledgement: oneshot::Sender<Result<(), PersistenceFailure>>,
@@ -1186,6 +1341,53 @@ fn writer_main(
                     WriterOperationGuard::new(health.clone(), PersistenceOperation::Apply);
                 operation_guard.arm();
                 let result = match store.apply_batch(batch) {
+                    Ok(()) => clock()
+                        .and_then(|now_ms| store.cleanup_retention(now_ms))
+                        .map(|cleanup| WriterDelta { cleanup })
+                        .map_err(|error| {
+                            store_failure(
+                                PersistenceOperation::Cleanup,
+                                PersistencePhase::PostApplyCommit,
+                                DurabilityDisposition::Committed,
+                                &error,
+                            )
+                        }),
+                    Err(error) => Err(store_failure(
+                        PersistenceOperation::Apply,
+                        PersistencePhase::CommandExecution,
+                        DurabilityDisposition::NotCommitted,
+                        &error,
+                    )),
+                };
+                let result = publish_store_result(result, &health);
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control
+                    && control.before_acknowledgement(PersistenceOperation::Apply, result.is_err())
+                {
+                    drop(acknowledgement);
+                    control.acknowledgement_dropped(PersistenceOperation::Apply);
+                    operation_guard.disarm();
+                    continue;
+                }
+                let _ = acknowledgement.send(result);
+                operation_guard.disarm();
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control {
+                    control.acknowledgement_attempted(PersistenceOperation::Apply);
+                }
+            }
+            WriterCommand::ApplyV6 {
+                batch,
+                acknowledgement,
+            } => {
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control {
+                    control.command_admitted(PersistenceOperation::Apply);
+                }
+                let mut operation_guard =
+                    WriterOperationGuard::new(health.clone(), PersistenceOperation::Apply);
+                operation_guard.arm();
+                let result = match store.apply_v6_batch(batch) {
                     Ok(()) => clock()
                         .and_then(|now_ms| store.cleanup_retention(now_ms))
                         .map(|cleanup| WriterDelta { cleanup })
@@ -1341,6 +1543,86 @@ fn writer_main(
                 if let Some(control) = &acknowledgement_test_control {
                     control.acknowledgement_attempted(PersistenceOperation::ReplaceOwner);
                 }
+            }
+            WriterCommand::FinalizeHistoryDrain {
+                manifest,
+                observed_at_ms,
+                acknowledgement,
+            } => {
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control {
+                    control.command_admitted(PersistenceOperation::Apply);
+                }
+                let mut operation_guard =
+                    WriterOperationGuard::new(health.clone(), PersistenceOperation::Apply);
+                operation_guard.arm();
+                let result = store
+                    .finalize_history_drain(manifest.as_ref(), observed_at_ms)
+                    .map_err(|error| {
+                        store_failure(
+                            PersistenceOperation::Apply,
+                            PersistencePhase::CommandExecution,
+                            DurabilityDisposition::NotCommitted,
+                            &error,
+                        )
+                    });
+                let result = publish_store_result(result, &health);
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control
+                    && control.before_acknowledgement(PersistenceOperation::Apply, result.is_err())
+                {
+                    drop(acknowledgement);
+                    control.acknowledgement_dropped(PersistenceOperation::Apply);
+                    operation_guard.disarm();
+                    continue;
+                }
+                let _ = acknowledgement.send(result);
+                operation_guard.disarm();
+                #[cfg(test)]
+                if let Some(control) = &acknowledgement_test_control {
+                    control.acknowledgement_attempted(PersistenceOperation::Apply);
+                }
+            }
+            WriterCommand::HistoryDrainFinalized {
+                drain_id,
+                acknowledgement,
+            } => {
+                let result = store.history_drain_finalized(&drain_id).map_err(|error| {
+                    store_failure(
+                        PersistenceOperation::Barrier,
+                        PersistencePhase::CommandExecution,
+                        DurabilityDisposition::NotApplicable,
+                        &error,
+                    )
+                });
+                let result = result.map_err(|store_failure| {
+                    let failure = store_failure.failure;
+                    if matches!(
+                        failure.code,
+                        PersistenceFailureCode::Sqlite | PersistenceFailureCode::Io
+                    ) {
+                        health.publish_failure_with_detail(failure, Some(store_failure.detail));
+                    }
+                    failure
+                });
+                let _ = acknowledgement.send(result);
+            }
+            WriterCommand::HistoryDrainFinalization {
+                drain_id,
+                acknowledgement,
+            } => {
+                let result = store
+                    .history_drain_finalization(&drain_id)
+                    .map_err(|error| {
+                        store_failure(
+                            PersistenceOperation::Barrier,
+                            PersistencePhase::CommandExecution,
+                            DurabilityDisposition::NotApplicable,
+                            &error,
+                        )
+                    });
+                let result = publish_store_result(result, &health);
+                let _ = acknowledgement.send(result);
             }
             WriterCommand::Barrier { acknowledgement } => {
                 #[cfg(test)]
@@ -1760,6 +2042,128 @@ mod tests {
         assert!(!subscription.has_changed().unwrap());
 
         lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_history_drain_finalized_is_caller_only_invalid_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let drain_id = HistoryDrainId::new("codex:unknown-writer-drain").unwrap();
+        let expected = expected_failure(
+            PersistenceOperation::Barrier,
+            PersistencePhase::CommandExecution,
+            PersistenceFailureCode::InvalidData,
+            DurabilityDisposition::NotApplicable,
+        );
+
+        assert_persistence_error(writer.history_drain_finalized(&drain_id).await, expected);
+        assert_eq!(
+            writer.health.snapshot(),
+            PersistenceHealthSnapshot::healthy()
+        );
+
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_drain_finalized_backend_read_failure_degrades_with_detail() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        store
+            .connection
+            .execute_batch("ALTER TABLE history_drains RENAME TO unavailable_history_drains;")
+            .unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let drain_id = HistoryDrainId::new("codex:broken-finalized-read").unwrap();
+        let expected = expected_failure(
+            PersistenceOperation::Barrier,
+            PersistencePhase::CommandExecution,
+            PersistenceFailureCode::Sqlite,
+            DurabilityDisposition::NotApplicable,
+        );
+
+        assert_persistence_error(writer.history_drain_finalized(&drain_id).await, expected);
+        assert_backend_history_read_failure(&writer, expected);
+
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_drain_finalization_backend_read_failure_degrades_with_detail() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        store
+            .connection
+            .execute_batch("ALTER TABLE history_drains RENAME TO unavailable_history_drains;")
+            .unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let drain_id = HistoryDrainId::new("codex:broken-finalization-read").unwrap();
+        let expected = expected_failure(
+            PersistenceOperation::Barrier,
+            PersistencePhase::CommandExecution,
+            PersistenceFailureCode::Sqlite,
+            DurabilityDisposition::NotApplicable,
+        );
+
+        assert_persistence_error(writer.history_drain_finalization(&drain_id).await, expected);
+        assert_backend_history_read_failure(&writer, expected);
+
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_only_history_reads_remain_callable_while_health_is_degraded() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let store = open_writer(&root).unwrap();
+        let (lifecycle, writer) = spawn_writer(store).unwrap();
+        let drain_id = HistoryDrainId::new("codex:degraded-response-only").unwrap();
+        let first = expected_failure(
+            PersistenceOperation::Apply,
+            PersistencePhase::CommandExecution,
+            PersistenceFailureCode::Sqlite,
+            DurabilityDisposition::NotCommitted,
+        );
+        let missing = expected_failure(
+            PersistenceOperation::Barrier,
+            PersistencePhase::CommandExecution,
+            PersistenceFailureCode::InvalidData,
+            DurabilityDisposition::NotApplicable,
+        );
+        writer.health.publish_failure(first);
+
+        assert_eq!(
+            writer.history_drain_finalization(&drain_id).await.unwrap(),
+            None
+        );
+        assert_persistence_error(writer.history_drain_finalized(&drain_id).await, missing);
+        assert_eq!(
+            writer.persistence_status(),
+            PersistenceStatus::Degraded { failure: first }
+        );
+
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    fn assert_backend_history_read_failure(writer: &WriterClient, expected: PersistenceFailure) {
+        let snapshot = writer.health.snapshot();
+        assert_eq!(
+            snapshot.status,
+            PersistenceStatus::Degraded { failure: expected }
+        );
+        let detail = snapshot.detail.expect("backend failure must retain detail");
+        assert!(!detail.as_str().is_empty());
+        assert!(detail.as_str().len() <= PERSISTENCE_DETAIL_MAX_BYTES);
+        assert!(std::str::from_utf8(detail.as_str().as_bytes()).is_ok());
+        assert!(
+            detail.as_str().contains("no such table") && detail.as_str().contains("history_drains"),
+            "unexpected backend detail: {}",
+            detail.as_str()
+        );
     }
 
     #[test]

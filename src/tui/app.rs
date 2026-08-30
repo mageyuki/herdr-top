@@ -1247,15 +1247,14 @@ impl App {
         {
             return Some(SelectionReason::Merged);
         }
-        if selected.run_id().is_some_and(|run_id| {
-            self.model
-                .task_run(&run_id)
-                .is_some_and(|run| run.state.is_terminal())
-                && self.state.terminal_times.get(&run_id).is_some_and(|time| {
-                    self.state.now_ms
-                        >= time.saturating_add(activity::DEFAULT_TERMINAL_VISIBILITY_MS)
-                })
-        }) {
+        if selected
+            .run_id()
+            .and_then(|run_id| self.model.task_run(&run_id))
+            .and_then(|run| self.model.effective_lifecycle_end_ms(run))
+            .is_some_and(|end_ms| {
+                self.state.now_ms >= end_ms.saturating_add(activity::DEFAULT_TERMINAL_VISIBILITY_MS)
+            })
+        {
             return Some(SelectionReason::AgedOut);
         }
         Some(SelectionReason::Closed)
@@ -1667,7 +1666,8 @@ mod tests {
     };
     use crate::model::{
         AgentNode, DependencyEdge, DisplayOrdinal, DomainModel, ExecState, Execution,
-        OperatorCommand, Pane, Provider, RunId, RunKey, Tab, TaskRun, TaskState, Workspace,
+        NativeSessionEnd, NativeSessionEndStatus, OperatorCommand, Pane, Provider, RunId, RunKey,
+        Tab, TaskRun, TaskRunV6State, TaskState, Workspace,
     };
     use crate::performance::{PerformanceDegradationReason, PerformanceSnapshot};
     use crate::store::writer::{
@@ -1719,6 +1719,13 @@ mod tests {
             });
         }
         model
+    }
+
+    fn set_run_finish(model: &mut DomainModel, run_id: RunId, finished_at_ms: i64) {
+        let mut run = model.task_run(&run_id).unwrap().clone();
+        run.updated_at_ms = Some(finished_at_ms);
+        run.finished_at_ms = Some(finished_at_ms);
+        model.insert_task_run(run);
     }
 
     fn shared_occurrence_model(
@@ -2664,8 +2671,10 @@ mod tests {
         assert_eq!(closed.state().selection_reason(), Some("closed"));
 
         let clock = TestClock::at(activity::DEFAULT_TERMINAL_VISIBILITY_MS - 1);
+        let mut aged_model = shared_occurrence_model(shared, sibling, TaskState::Completed, true);
+        set_run_finish(&mut aged_model, shared, 0);
         let (mut aged, _aged_senders) = app_with_runtime(
-            shared_occurrence_model(shared, sibling, TaskState::Completed, true),
+            aged_model,
             empty_operator(HashMap::from([(shared, 0)])),
             TuiSetup::default(),
             clock.clone(),
@@ -3205,11 +3214,13 @@ mod tests {
         let live = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
         let deadline = activity::DEFAULT_TERMINAL_VISIBILITY_MS + 1_000;
         let clock = TestClock::at(1_000);
+        let mut model = model_with_runs(&[
+            (terminal, "terminal", 1, TaskState::Completed),
+            (live, "live", 2, TaskState::Running),
+        ]);
+        set_run_finish(&mut model, terminal, 1_000);
         let (mut app, _senders) = app_with_runtime(
-            model_with_runs(&[
-                (terminal, "terminal", 1, TaskState::Completed),
-                (live, "live", 2, TaskState::Running),
-            ]),
+            model,
             empty_operator(HashMap::from([(terminal, 1_000)])),
             TuiSetup::default(),
             clock.clone(),
@@ -3382,6 +3393,127 @@ mod tests {
             assert!(app.poll_duration(&limiter, false, Duration::ZERO) > Duration::ZERO);
         }
         assert_eq!(app.projection_build_count(), 0);
+    }
+
+    #[test]
+    fn native_ended_run_arms_visibility_deadline_without_live_duration_cadence() {
+        let ended = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let native_end_at_ms = 4_000;
+        let mut model = model_with_runs(&[(ended, "native-ended", 1, TaskState::Running)]);
+        let mut timed = model.task_run(&ended).unwrap().clone();
+        timed.created_at_ms = Some(0);
+        timed.updated_at_ms = Some(native_end_at_ms);
+        model.insert_task_run(timed);
+        model.set_task_run_v6_state(
+            ended,
+            TaskRunV6State {
+                native_session_end: Some(NativeSessionEnd {
+                    status: NativeSessionEndStatus::Done,
+                    at_ms: native_end_at_ms,
+                }),
+                ..TaskRunV6State::default()
+            },
+        );
+        let deadline = native_end_at_ms + activity::DEFAULT_TERMINAL_VISIBILITY_MS;
+        let clock = TestClock::at(7_000);
+        let (mut app, _senders) = app_with_runtime(
+            model,
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+
+        assert_eq!(app.next_expiry_ms(), Some(deadline));
+        clock.set(8_000);
+        assert!(!app.refresh_if_changed().unwrap());
+        assert_eq!(app.next_expiry_ms(), Some(deadline));
+
+        clock.set(deadline);
+        assert!(app.refresh_if_changed().unwrap());
+        assert!(displayed_run_names(&app).is_empty());
+        assert_eq!(app.next_expiry_ms(), None);
+    }
+
+    #[test]
+    fn filtered_native_terminal_run_expires_from_cached_deadline_without_event() {
+        let terminal = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let terminal_at_ms = 1_000;
+        let boundary = terminal_at_ms + activity::DEFAULT_TERMINAL_VISIBILITY_MS;
+        let mut model = model_with_runs(&[(terminal, "terminal", 1, TaskState::Completed)]);
+        let mut searchable = model.task_run(&terminal).unwrap().clone();
+        searchable.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "searchable-terminal".to_owned(),
+        };
+        searchable.updated_at_ms = Some(terminal_at_ms);
+        searchable.finished_at_ms = Some(terminal_at_ms);
+        model.insert_task_run(searchable);
+        let clock = TestClock::at(boundary - 1);
+        let (mut app, _senders) = app_with_runtime(
+            model,
+            empty_operator(HashMap::from([(terminal, terminal_at_ms)])),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        type_text(&mut app, "searchable-terminal");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(displayed_run_names(&app), ["searchable-terminal"]);
+        assert_eq!(app.next_expiry_ms(), Some(boundary));
+
+        clock.set(boundary);
+        assert!(app.refresh_if_changed().unwrap());
+        assert!(displayed_run_names(&app).is_empty());
+        assert_eq!(app.next_expiry_ms(), None);
+    }
+
+    #[test]
+    fn native_ended_selected_run_ages_out_at_exact_visibility_boundary() {
+        let selected = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let survivor = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let native_end_at_ms = 4_000;
+        let deadline = native_end_at_ms + activity::DEFAULT_TERMINAL_VISIBILITY_MS;
+        let mut model = model_with_runs(&[
+            (selected, "native-ended", 1, TaskState::Running),
+            (survivor, "survivor", 2, TaskState::Running),
+        ]);
+        let mut native = model.task_run(&selected).unwrap().clone();
+        native.key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "native-ended".to_owned(),
+        };
+        native.updated_at_ms = Some(native_end_at_ms);
+        model.insert_task_run(native);
+        model.set_task_run_v6_state(
+            selected,
+            TaskRunV6State {
+                native_session_end: Some(NativeSessionEnd {
+                    status: NativeSessionEndStatus::Done,
+                    at_ms: native_end_at_ms,
+                }),
+                ..TaskRunV6State::default()
+            },
+        );
+        let clock = TestClock::at(deadline - 1);
+        let (mut app, _senders) = app_with_runtime(
+            model,
+            empty_operator(HashMap::new()),
+            TuiSetup::default(),
+            clock.clone(),
+        );
+        app.state.follow = false;
+        app.set_selection(Some(NodeKey::Run {
+            run_id: selected,
+            pane_id: Some("pane".to_owned()),
+        }));
+
+        assert_eq!(app.selected_run_id(), Some(selected));
+        clock.set(deadline);
+        assert!(app.refresh_if_changed().unwrap());
+        assert!(!displayed_run_names(&app).contains(&"native-ended".to_owned()));
+        assert_eq!(app.state().selection_reason(), Some("aged_out"));
     }
 
     #[test]
@@ -3623,7 +3755,7 @@ mod tests {
     }
 
     #[test]
-    fn live_duration_bounds_poll_and_terminal_transition_disarms_cadence() {
+    fn live_duration_bounds_poll_and_terminal_transition_arms_visibility_deadline() {
         let live = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let mut live_model = model_with_runs(&[(live, "live", 1, TaskState::Running)]);
         let mut timed = live_model.task_run(&live).unwrap().clone();
@@ -3652,7 +3784,10 @@ mod tests {
         senders.model.send(Arc::new(live_model)).unwrap();
         clock.set(8_000);
         assert!(app.refresh_if_changed().unwrap());
-        assert_eq!(app.next_expiry_ms(), None);
+        assert_eq!(
+            app.next_expiry_ms(),
+            Some(8_000 + activity::DEFAULT_TERMINAL_VISIBILITY_MS)
+        );
     }
 
     #[test]
@@ -3728,12 +3863,12 @@ mod tests {
             clock.clone(),
         );
 
-        model_sender
-            .send(Arc::new(model_with_runs(&[
-                (old, "old", 1, TaskState::Running),
-                (terminal, "terminal", 2, TaskState::Completed),
-            ])))
-            .unwrap();
+        let mut refreshed_model = model_with_runs(&[
+            (old, "old", 1, TaskState::Running),
+            (terminal, "terminal", 2, TaskState::Completed),
+        ]);
+        set_run_finish(&mut refreshed_model, terminal, terminal_at_ms);
+        model_sender.send(Arc::new(refreshed_model)).unwrap();
         operator_sender
             .send(empty_operator(HashMap::from([(terminal, terminal_at_ms)])))
             .unwrap();
@@ -3806,12 +3941,14 @@ mod tests {
         let selected = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
         let last = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
         let clock = TestClock::at(3_599_999);
+        let mut initial_model = model_with_runs(&[
+            (first, "first", 1, TaskState::Running),
+            (selected, "selected", 2, TaskState::Completed),
+            (last, "last", 3, TaskState::Running),
+        ]);
+        set_run_finish(&mut initial_model, selected, 0);
         let (mut app, senders) = app_with_runtime(
-            model_with_runs(&[
-                (first, "first", 1, TaskState::Running),
-                (selected, "selected", 2, TaskState::Completed),
-                (last, "last", 3, TaskState::Running),
-            ]),
+            initial_model,
             empty_operator(HashMap::from([(selected, 0)])),
             TuiSetup::default(),
             clock.clone(),

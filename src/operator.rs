@@ -11,8 +11,10 @@ use crate::activity::{
     ActivityDurability, ActivityIdentity, ActivityItem, OperatorSnapshot, RestoredOperatorState,
 };
 use crate::diagnostics::RuntimeWriteOutcome;
-use crate::model::{EventMetadata, NormalizedEvent, RunId, sanitize_controller_text};
-use crate::store::{PersistOp, PersistTaskRun};
+use crate::model::{
+    DomainModel, EventMetadata, HistoryDrainId, NormalizedEvent, RunId, sanitize_controller_text,
+};
+use crate::store::{FinalizedHistoryRun, PersistOp, PersistTaskRun};
 
 const ACTIVITY_LIMIT: usize = 10_000;
 
@@ -26,6 +28,12 @@ pub(crate) struct OperatorProjection {
     activity: Vec<ActivityItem>,
     terminal_times: HashMap<RunId, i64>,
     pending_identities: HashSet<ActivityIdentity>,
+    deferred_pending_identities: HashSet<ActivityIdentity>,
+    deferred_activity: HashMap<HistoryDrainId, HashSet<ActivityIdentity>>,
+    blocked_history_runs: HashSet<RunId>,
+    published_activity: Vec<ActivityItem>,
+    published_terminal_times: HashMap<RunId, i64>,
+    published_pending_identities: HashSet<ActivityIdentity>,
     publisher: watch::Sender<OperatorSnapshot>,
 }
 
@@ -43,129 +51,192 @@ impl OperatorProjection {
         let (publisher, receiver) = watch::channel(initial);
         (
             Self {
+                published_activity: activity.clone(),
+                published_terminal_times: terminal_times.clone(),
                 activity,
                 terminal_times,
                 pending_identities: HashSet::new(),
+                deferred_pending_identities: HashSet::new(),
+                deferred_activity: HashMap::new(),
+                blocked_history_runs: HashSet::new(),
+                published_pending_identities: HashSet::new(),
                 publisher,
             },
             receiver,
         )
     }
 
+    /// Restores bounded private Activity pages and canonical terminal state after a cold start.
+    pub(crate) fn restore_deferred_history(
+        &mut self,
+        deferred: HashMap<HistoryDrainId, Vec<ActivityItem>>,
+        model: &DomainModel,
+    ) {
+        self.blocked_history_runs = model
+            .task_runs()
+            .filter_map(|run| {
+                model
+                    .task_run_v6_state(&run.run_id)
+                    .is_some_and(|state| !state.history_ready)
+                    .then_some(run.run_id)
+            })
+            .collect();
+        self.terminal_times.clear();
+        for run in model.task_runs() {
+            if let Some(finished_at_ms) = run.finished_at_ms {
+                self.terminal_times.insert(run.run_id, finished_at_ms);
+            }
+        }
+        for (drain_id, items) in deferred {
+            let identities = items
+                .iter()
+                .map(|item| item.identity.clone())
+                .collect::<HashSet<_>>();
+            self.activity
+                .retain(|item| !identities.contains(&item.identity));
+            self.activity.extend(items);
+            self.deferred_activity.insert(drain_id, identities);
+        }
+        normalize_activity(&mut self.activity);
+    }
+
     /// Optimistically applies one complete reducer submission as durable.
     pub(crate) fn apply_submission(&mut self, batch: &[PersistOp]) {
-        let mut changed = false;
-        // Project the complete submission before applying its merge metadata so
-        // even events emitted after a merge op in the durable batch participate
-        // in every lineage rewrite from that same atomic submission.
-        for operation in batch {
-            if let PersistOp::RecordEvent { event, seen_at_ms } = operation {
-                let projected = project_event(event, *seen_at_ms);
-                if let Some(item) = projected {
-                    self.pending_identities.insert(item.identity.clone());
-                    self.activity
-                        .retain(|existing| existing.identity != item.identity);
-                    self.activity.push(item);
-                    changed = true;
-                }
-            }
-        }
-        for operation in batch {
-            match operation {
-                PersistOp::RecordEvent { .. } => {}
-                PersistOp::MergeTaskRuns { survivor, absorbed } => {
-                    for item in &mut self.activity {
-                        if item.task_run_id == Some(*absorbed) {
-                            item.task_run_id = Some(*survivor);
-                            self.pending_identities.insert(item.identity.clone());
-                            changed = true;
-                        }
-                    }
-                    changed |= self.merge_terminal_times(*survivor, *absorbed);
-                }
-                PersistOp::UpsertTaskRun(task_run) => {
-                    changed |= self.apply_terminal_time(task_run);
-                }
-                PersistOp::PromoteTaskRunKey { promoted, .. } => {
-                    changed |= self.apply_terminal_time(promoted);
-                }
-                PersistOp::UpsertWorkspace { .. }
-                | PersistOp::UpsertTab { .. }
-                | PersistOp::UpsertPane { .. }
-                | PersistOp::DeleteWorkspace { .. }
-                | PersistOp::DeleteTab { .. }
-                | PersistOp::ClearTabLabel { .. }
-                | PersistOp::ClearPaneDisplayName { .. }
-                | PersistOp::DeletePane { .. }
-                | PersistOp::UpsertExecution(_)
-                | PersistOp::UpsertAgentNode(_)
-                | PersistOp::UpsertExecutionEdge { .. }
-                | PersistOp::UpsertDependencyEdge { .. }
-                | PersistOp::RecordCollectorGap(_)
-                | PersistOp::AdvanceIngestSequence { .. } => {}
-            }
-        }
+        let (changed, pending) =
+            apply_submission_to(&mut self.activity, &mut self.terminal_times, batch);
+        self.pending_identities = pending;
+        let (published_changed, published_pending) = apply_submission_to(
+            &mut self.published_activity,
+            &mut self.published_terminal_times,
+            batch,
+        );
+        self.published_pending_identities = published_pending;
         if changed {
             normalize_activity(&mut self.activity);
+        }
+        if published_changed {
+            normalize_activity(&mut self.published_activity);
             self.publish();
+        }
+    }
+
+    /// Applies one historical submission to private coalescing state only.
+    pub(crate) fn apply_submission_without_publishing(
+        &mut self,
+        drain_id: &HistoryDrainId,
+        batch: &[PersistOp],
+    ) {
+        debug_assert!(
+            self.deferred_pending_identities.is_empty(),
+            "a deferred operator submission must finish before another is applied"
+        );
+        let (changed, pending) =
+            apply_submission_to(&mut self.activity, &mut self.terminal_times, batch);
+        self.deferred_pending_identities.clone_from(&pending);
+        self.deferred_activity
+            .entry(drain_id.clone())
+            .or_default()
+            .extend(pending);
+        if changed {
+            normalize_activity(&mut self.activity);
+            let retained = self
+                .activity
+                .iter()
+                .map(|item| &item.identity)
+                .collect::<HashSet<_>>();
+            for identities in self.deferred_activity.values_mut() {
+                identities.retain(|identity| retained.contains(identity));
+            }
         }
     }
 
     /// Reclassifies exactly the identities affected by the preceding submission.
     pub(crate) fn complete_submission(&mut self, outcome: RuntimeWriteOutcome) {
-        let durability = match outcome {
-            RuntimeWriteOutcome::Durable | RuntimeWriteOutcome::CommittedButDegraded(_) => {
-                ActivityDurability::Durable
-            }
-            RuntimeWriteOutcome::NotCommitted(_) | RuntimeWriteOutcome::Skipped => {
-                ActivityDurability::CurrentOnly
-            }
-            RuntimeWriteOutcome::DurabilityUnknown(_) => ActivityDurability::DurabilityUnknown,
-        };
-        let mut changed = false;
-        for item in &mut self.activity {
-            if self.pending_identities.contains(&item.identity) && item.durability != durability {
-                item.durability = durability;
-                changed = true;
-            }
-        }
+        let durability = activity_durability(outcome);
+        reclassify_pending(&mut self.activity, &self.pending_identities, durability);
+        let changed = reclassify_pending(
+            &mut self.published_activity,
+            &self.published_pending_identities,
+            durability,
+        );
         self.pending_identities.clear();
+        self.published_pending_identities.clear();
         if changed {
             self.publish();
         }
     }
 
-    fn apply_terminal_time(&mut self, persisted: &PersistTaskRun) -> bool {
-        let run_id = persisted.task_run.run_id;
-        if persisted.task_run.state.is_terminal() {
-            match self.terminal_times.entry(run_id) {
-                Entry::Occupied(_) => false,
-                Entry::Vacant(entry) => {
-                    entry.insert(persisted.finished_at_ms.unwrap_or(persisted.updated_at_ms));
-                    true
-                }
-            }
-        } else {
-            self.terminal_times.remove(&run_id).is_some()
+    /// Reclassifies a historical submission privately and retains retry identity on failure.
+    pub(crate) fn complete_submission_without_publishing(&mut self, outcome: RuntimeWriteOutcome) {
+        let durability = activity_durability(outcome);
+        reclassify_pending(
+            &mut self.activity,
+            &self.deferred_pending_identities,
+            durability,
+        );
+        if matches!(
+            outcome,
+            RuntimeWriteOutcome::Durable | RuntimeWriteOutcome::CommittedButDegraded(_)
+        ) {
+            self.deferred_pending_identities.clear();
         }
     }
 
-    fn merge_terminal_times(&mut self, survivor: RunId, absorbed: RunId) -> bool {
-        let survivor_time = self.terminal_times.remove(&survivor);
-        let absorbed_time = self.terminal_times.remove(&absorbed);
-        let merged_time = match (survivor_time, absorbed_time) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            (Some(time), None) | (None, Some(time)) => Some(time),
-            (None, None) => None,
-        };
-        if let Some(time) = merged_time {
-            self.terminal_times.insert(survivor, time);
+    /// Publishes the private coalesced state after its history drain is durably finalized.
+    pub(crate) fn publish_accumulated(
+        &mut self,
+        completed_drains: &[HistoryDrainId],
+        finalized_runs: &[FinalizedHistoryRun],
+        published_model: &DomainModel,
+    ) {
+        for drain_id in completed_drains {
+            self.deferred_activity.remove(drain_id);
         }
-        absorbed_time.is_some() || survivor_time != merged_time
+        for finalized in finalized_runs {
+            if finalized.state.history_ready {
+                self.blocked_history_runs.remove(&finalized.run_id);
+            } else {
+                self.blocked_history_runs.insert(finalized.run_id);
+            }
+        }
+        let hidden_activity = self
+            .deferred_activity
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut hidden_activity = hidden_activity;
+        hidden_activity.extend(self.activity.iter().filter_map(|item| {
+            item.task_run_id
+                .is_some_and(|run_id| self.blocked_history_runs.contains(&run_id))
+                .then_some(item.identity.clone())
+        }));
+
+        let mut next_activity = self
+            .activity
+            .iter()
+            .filter(|item| !hidden_activity.contains(&item.identity))
+            .cloned()
+            .collect::<Vec<_>>();
+        next_activity.extend(
+            self.published_activity
+                .iter()
+                .filter(|item| hidden_activity.contains(&item.identity))
+                .cloned(),
+        );
+        normalize_activity(&mut next_activity);
+        self.published_activity = next_activity;
+
+        self.published_terminal_times = published_model
+            .task_runs()
+            .filter_map(|run| run.finished_at_ms.map(|finished| (run.run_id, finished)))
+            .collect();
+        self.published_pending_identities.clear();
+        self.publish();
     }
 
     fn publish(&self) {
-        let next = snapshot(&self.activity, &self.terminal_times);
+        let next = snapshot(&self.published_activity, &self.published_terminal_times);
         self.publisher.send_if_modified(|current| {
             if current.activity.as_ref() == next.activity.as_ref()
                 && current.terminal_times.as_ref() == next.terminal_times.as_ref()
@@ -177,6 +248,127 @@ impl OperatorProjection {
             }
         });
     }
+}
+
+fn apply_submission_to(
+    activity: &mut Vec<ActivityItem>,
+    terminal_times: &mut HashMap<RunId, i64>,
+    batch: &[PersistOp],
+) -> (bool, HashSet<ActivityIdentity>) {
+    let mut changed = false;
+    let mut pending_identities = HashSet::new();
+    // Project the complete submission before applying its merge metadata so
+    // even events emitted after a merge op in the durable batch participate
+    // in every lineage rewrite from that same atomic submission.
+    for operation in batch {
+        if let PersistOp::RecordEvent { event, seen_at_ms } = operation
+            && let Some(item) = project_event(event, *seen_at_ms)
+        {
+            pending_identities.insert(item.identity.clone());
+            activity.retain(|existing| existing.identity != item.identity);
+            activity.push(item);
+            changed = true;
+        }
+    }
+    for operation in batch {
+        match operation {
+            PersistOp::RecordEvent { .. } => {}
+            PersistOp::MergeTaskRuns { survivor, absorbed } => {
+                for item in activity.iter_mut() {
+                    if item.task_run_id == Some(*absorbed) {
+                        item.task_run_id = Some(*survivor);
+                        pending_identities.insert(item.identity.clone());
+                        changed = true;
+                    }
+                }
+                changed |= merge_terminal_times(terminal_times, *survivor, *absorbed);
+            }
+            PersistOp::UpsertTaskRun(task_run) => {
+                changed |= apply_terminal_time(terminal_times, task_run);
+            }
+            PersistOp::PromoteTaskRunKey { promoted, .. } => {
+                changed |= apply_terminal_time(terminal_times, promoted);
+            }
+            PersistOp::UpsertWorkspace { .. }
+            | PersistOp::UpsertTab { .. }
+            | PersistOp::UpsertPane { .. }
+            | PersistOp::DeleteWorkspace { .. }
+            | PersistOp::DeleteTab { .. }
+            | PersistOp::ClearTabLabel { .. }
+            | PersistOp::ClearPaneDisplayName { .. }
+            | PersistOp::DeletePane { .. }
+            | PersistOp::UpsertExecution(_)
+            | PersistOp::UpsertAgentNode(_)
+            | PersistOp::UpsertExecutionEdge { .. }
+            | PersistOp::UpsertDependencyEdge { .. }
+            | PersistOp::RecordCollectorGap(_)
+            | PersistOp::AdvanceIngestSequence { .. } => {}
+        }
+    }
+    (changed, pending_identities)
+}
+
+fn apply_terminal_time(
+    terminal_times: &mut HashMap<RunId, i64>,
+    persisted: &PersistTaskRun,
+) -> bool {
+    let run_id = persisted.task_run.run_id;
+    if persisted.task_run.state.is_terminal() {
+        match terminal_times.entry(run_id) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(entry) => {
+                entry.insert(persisted.finished_at_ms.unwrap_or(persisted.updated_at_ms));
+                true
+            }
+        }
+    } else {
+        terminal_times.remove(&run_id).is_some()
+    }
+}
+
+fn merge_terminal_times(
+    terminal_times: &mut HashMap<RunId, i64>,
+    survivor: RunId,
+    absorbed: RunId,
+) -> bool {
+    let survivor_time = terminal_times.remove(&survivor);
+    let absorbed_time = terminal_times.remove(&absorbed);
+    let merged_time = match (survivor_time, absorbed_time) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(time), None) | (None, Some(time)) => Some(time),
+        (None, None) => None,
+    };
+    if let Some(time) = merged_time {
+        terminal_times.insert(survivor, time);
+    }
+    absorbed_time.is_some() || survivor_time != merged_time
+}
+
+const fn activity_durability(outcome: RuntimeWriteOutcome) -> ActivityDurability {
+    match outcome {
+        RuntimeWriteOutcome::Durable | RuntimeWriteOutcome::CommittedButDegraded(_) => {
+            ActivityDurability::Durable
+        }
+        RuntimeWriteOutcome::NotCommitted(_) | RuntimeWriteOutcome::Skipped => {
+            ActivityDurability::CurrentOnly
+        }
+        RuntimeWriteOutcome::DurabilityUnknown(_) => ActivityDurability::DurabilityUnknown,
+    }
+}
+
+fn reclassify_pending(
+    activity: &mut [ActivityItem],
+    pending_identities: &HashSet<ActivityIdentity>,
+    durability: ActivityDurability,
+) -> bool {
+    let mut changed = false;
+    for item in activity {
+        if pending_identities.contains(&item.identity) && item.durability != durability {
+            item.durability = durability;
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn project_event(event: &NormalizedEvent, seen_at_ms: i64) -> Option<ActivityItem> {

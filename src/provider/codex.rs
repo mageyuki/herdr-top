@@ -35,6 +35,22 @@ struct PayloadType {
 }
 
 #[derive(Deserialize)]
+struct ItemTypeEnvelope {
+    payload: Option<ItemTypePayload>,
+}
+
+#[derive(Deserialize)]
+struct ItemTypePayload {
+    item: Option<ItemType>,
+}
+
+#[derive(Deserialize)]
+struct ItemType {
+    #[serde(rename = "type")]
+    item_type: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct SessionEnvelope {
     payload: Option<SessionPayload>,
 }
@@ -58,6 +74,25 @@ struct ActivityEnvelope {
 struct ActivityPayload {
     event_id: Option<String>,
     occurred_at_ms: Option<i64>,
+    agent_thread_id: Option<String>,
+    agent_path: Option<String>,
+    kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct NestedActivityEnvelope {
+    payload: Option<NestedActivityPayload>,
+}
+
+#[derive(Deserialize)]
+struct NestedActivityPayload {
+    completed_at_ms: Option<i64>,
+    item: Option<NestedActivityItem>,
+}
+
+#[derive(Deserialize)]
+struct NestedActivityItem {
+    id: Option<String>,
     agent_thread_id: Option<String>,
     agent_path: Option<String>,
     kind: Option<String>,
@@ -186,10 +221,16 @@ impl CodexAdapter {
                     .ok()
                     .and_then(|envelope| envelope.payload)
                     .and_then(|payload| payload.payload_type);
-                if payload_type.as_deref() != Some("sub_agent_activity") {
-                    return Vec::new();
-                }
-                match parse_activity(&record.bytes) {
+                let activity = match payload_type.as_deref() {
+                    Some("sub_agent_activity") => parse_activity(&record.bytes),
+                    Some("item_completed")
+                        if item_type(&record.bytes).as_deref() == Some("SubAgentActivity") =>
+                    {
+                        parse_nested_activity(&record.bytes)
+                    }
+                    _ => return Vec::new(),
+                };
+                match activity {
                     Ok(activity) => activity_events(discovery, file, record, activity),
                     Err(error) => vec![malformed(
                         file,
@@ -208,6 +249,14 @@ fn record_type(record: &[u8]) -> Result<Option<String>, ()> {
     serde_json::from_slice::<RecordType>(record)
         .map(|record| record.record_type)
         .map_err(|_| ())
+}
+
+fn item_type(record: &[u8]) -> Option<String> {
+    serde_json::from_slice::<ItemTypeEnvelope>(record)
+        .ok()
+        .and_then(|envelope| envelope.payload)
+        .and_then(|payload| payload.item)
+        .and_then(|item| item.item_type)
 }
 
 fn parse_session(record: &[u8]) -> Result<BootstrapIdentity, StructuralError> {
@@ -246,6 +295,25 @@ fn parse_activity(record: &[u8]) -> Result<ActivityPayload, StructuralError> {
         .map_err(|_| StructuralError::Shape)?
         .payload
         .ok_or(StructuralError::Shape)?;
+    validate_activity(payload)
+}
+
+fn parse_nested_activity(record: &[u8]) -> Result<ActivityPayload, StructuralError> {
+    let payload = serde_json::from_slice::<NestedActivityEnvelope>(record)
+        .map_err(|_| StructuralError::Shape)?
+        .payload
+        .ok_or(StructuralError::Shape)?;
+    let item = payload.item.ok_or(StructuralError::Shape)?;
+    validate_activity(ActivityPayload {
+        event_id: item.id,
+        occurred_at_ms: payload.completed_at_ms,
+        agent_thread_id: item.agent_thread_id,
+        agent_path: item.agent_path,
+        kind: item.kind,
+    })
+}
+
+fn validate_activity(payload: ActivityPayload) -> Result<ActivityPayload, StructuralError> {
     if payload.event_id.is_none()
         || payload.occurred_at_ms.is_none()
         || payload.agent_thread_id.is_none()
@@ -322,13 +390,18 @@ fn activity_events(
         observed_at_ms,
         position,
     }];
-    if kind == "started" {
+    let observed_state = match kind.as_str() {
+        "started" | "spawned" => Some(ExecState::Working),
+        "completed" => Some(ExecState::Ended),
+        _ => None,
+    };
+    if let Some(state) = observed_state {
         events.push(ProviderEvent::AgentUpsert {
             provider: Provider::Codex,
             agent_thread_id,
             owner_session_id: owner_session_id.map(str::to_owned),
             parent_thread_id,
-            state: Some(ExecState::Working),
+            state: Some(state),
             model_id: None,
             depth,
             event_id: format!("prov:codex:up:{event_id}"),

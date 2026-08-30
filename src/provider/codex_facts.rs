@@ -122,6 +122,7 @@ struct ItemTypePayload {
 struct ItemType {
     #[serde(rename = "type")]
     item_type: Option<String>,
+    agent_thread_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -481,17 +482,27 @@ fn extract_item_completed(
     let Ok(envelope) = serde_json::from_str::<ItemTypeEnvelope>(line) else {
         return;
     };
-    let Some(item_type) = envelope
-        .payload
-        .and_then(|payload| payload.item)
-        .and_then(|item| item.item_type)
-    else {
+    let Some(item) = envelope.payload.and_then(|payload| payload.item) else {
+        return;
+    };
+    let Some(item_type) = item.item_type else {
         return;
     };
 
     match item_type.as_str() {
         "AgentMessage" => extract_agent_message(scope, line, at_ms, facts),
         "CommandExecution" => extract_command_execution(rollout_id, scope, line, at_ms, facts),
+        "SubAgentActivity" => {
+            if let (Some(agent_thread_id), Some(at_ms)) =
+                (item.agent_thread_id.filter(|id| is_uuid_token(id)), at_ms)
+            {
+                facts.push(LogFact::EvidenceId {
+                    parent: scope.clone(),
+                    id: EvidenceId::Uuid(agent_thread_id),
+                    at_ms,
+                });
+            }
+        }
         _ => {}
     }
 }
@@ -896,6 +907,65 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn nested_subagent_activity_emits_typed_child_evidence() {
+        const CHILD: &str = "273e0c2b-4af4-4014-b24c-8b0d03ba8905";
+        const INLINE_CHILD: &str = "d9999999-9999-4999-8999-999999999999";
+        let fixture_evidence = fixture_facts("codex-internal-subagents.jsonl", ROLLOUT);
+
+        assert!(fixture_evidence.contains(&LogFact::EvidenceId {
+            parent: SessionScope::Codex {
+                rollout_id: ROLLOUT.to_owned(),
+            },
+            id: EvidenceId::Uuid(CHILD.to_owned()),
+            at_ms: 1_787_547_600_040,
+        }));
+
+        let line = r#"{"timestamp":"2026-08-24T05:00:02.500Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1787547602100,"completed_at_ms":1787547602900,"item":{"type":"SubAgentActivity","id":"item_inline_subagent_activity","kind":"started","agent_thread_id":"d9999999-9999-4999-8999-999999999999","agent_path":"/root/inline_child"}}}"#;
+        let facts = extract_codex_line(ROLLOUT, 7, line);
+
+        assert!(facts.contains(&LogFact::EvidenceId {
+            parent: SessionScope::Codex {
+                rollout_id: ROLLOUT.to_owned(),
+            },
+            id: EvidenceId::Uuid(INLINE_CHILD.to_owned()),
+            at_ms: 1_787_547_602_500,
+        }));
+        assert!(!facts.iter().any(|fact| matches!(
+            fact,
+            LogFact::EvidenceId { at_ms, .. }
+                if matches!(*at_ms, 1_787_547_602_100 | 1_787_547_602_900)
+        )));
+    }
+
+    #[test]
+    fn nested_subagent_activity_rejects_missing_invalid_and_unrelated_evidence() {
+        let lines = [
+            r#"{"timestamp":"2026-08-24T05:00:03.000Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"SubAgentActivity","id":"item_missing_child","kind":"spawned","agent_path":"/root/missing_child"}}}"#,
+            r#"{"timestamp":"2026-08-24T05:00:03.100Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"SubAgentActivity","id":"item_invalid_child","kind":"spawned","agent_thread_id":"not-a-uuid","agent_path":"/root/invalid_child"}}}"#,
+            r#"{"timestamp":"2026-08-24T05:00:03.200Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"CollabAgentToolCall","id":"item_unrelated","agent_thread_id":"d8888888-8888-4888-8888-888888888888"}}}"#,
+        ];
+
+        for (ordinal, line) in lines.into_iter().enumerate() {
+            assert!(
+                extract_codex_line(ROLLOUT, ordinal as u64, line)
+                    .into_iter()
+                    .all(|fact| !matches!(fact, LogFact::EvidenceId { .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn nested_subagent_activity_envelope_debug_excludes_unallowlisted_body() {
+        const BODY_MARKER: &str = "NESTED_SUBAGENT_PRIVATE_BODY_DO_NOT_MATERIALIZE";
+        let line = format!(
+            r#"{{"timestamp":"2026-08-24T05:00:04.000Z","type":"event_msg","payload":{{"type":"item_completed","item":{{"type":"SubAgentActivity","id":"item_private_body","kind":"spawned","agent_thread_id":"d7777777-7777-4777-8777-777777777777","agent_path":"/root/private_body","private_body":"{BODY_MARKER}{}"}}}}}}"#,
+            "x".repeat(600)
+        );
+
+        assert_bounded_debug::<ItemTypeEnvelope>(&line, &[BODY_MARKER]);
     }
 
     #[test]

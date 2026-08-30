@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use super::ids::{DisplayOrdinal, Provider, RunId, RunKey};
-use super::state::{ExecState, PaneAgentStatus, TaskState};
+use super::state::{
+    ExecState, HistoryDrainId, PaneAgentStatus, RunRateTotals, TaskRunV6State, TaskState,
+};
+use crate::activity::ActivityItem;
 
 /// Operator intent delivered to the collector-owned reducer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -182,6 +185,17 @@ impl RunTelemetry {
 
 pub type RunTelemetryMap = HashMap<RunId, RunTelemetry>;
 
+/// Process-local baseline for one live-epoch active-time rate ledger.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RunRateCursor {
+    pub(crate) baseline_output_tokens: u64,
+    pub(crate) last_observed_at_ms: i64,
+    pub(crate) working: bool,
+    pub(crate) measurement_epoch: u64,
+    pub(crate) identity_basis: RunKey,
+    pub(crate) live_baseline: bool,
+}
+
 /// Stable provider run kinds recomputed from provider logs at startup.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunKind(String);
@@ -232,6 +246,29 @@ pub struct DependencyEdge {
     pub dependent_run_id: RunId,
 }
 
+/// The last published state of one run while canonical history remains quarantined.
+///
+/// Persistent fields are serialized into SQLite. Process-local telemetry, kind, and rate cursor
+/// are retained only by the live reducer and intentionally deserialize as absent after restart.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HistoryRunPublication {
+    pub canonical_run_id: RunId,
+    pub task_run: TaskRun,
+    pub state: TaskRunV6State,
+    pub aliases: Vec<RunKey>,
+    pub rate_totals: Option<RunRateTotals>,
+    pub executions: Vec<Execution>,
+    pub agent_nodes: Vec<AgentNode>,
+    pub execution_edges: Vec<ExecutionEdge>,
+    pub dependency_edges: Vec<DependencyEdge>,
+    #[serde(skip)]
+    telemetry: Option<RunTelemetry>,
+    #[serde(skip)]
+    run_kind: Option<RunKind>,
+    #[serde(skip)]
+    rate_cursor: Option<RunRateCursor>,
+}
+
 /// Counters maintained by the serialized reducer for Controller-input diagnostics.
 #[derive(Clone, Debug, Default)]
 pub struct ControllerDiagnostics {
@@ -243,6 +280,7 @@ pub struct ControllerDiagnostics {
     ingest_sequence_exhaustions: u64,
     provider_parent_conflicts: u64,
     provider_identity_disagreements: u64,
+    rate_total_saturations: u64,
     acceptor: ControllerDiagnosticsHandle,
 }
 
@@ -293,6 +331,12 @@ impl ControllerDiagnostics {
     #[must_use]
     pub const fn provider_identity_disagreements(&self) -> u64 {
         self.provider_identity_disagreements
+    }
+
+    /// Rate-ledger updates clamped to SQLite's non-negative signed domain.
+    #[must_use]
+    pub const fn rate_total_saturations(&self) -> u64 {
+        self.rate_total_saturations
     }
 
     /// Controller socket admissions rejected because the acceptor was saturated.
@@ -347,6 +391,10 @@ impl ControllerDiagnostics {
     pub(crate) fn record_provider_identity_disagreement(&mut self) {
         self.provider_identity_disagreements =
             self.provider_identity_disagreements.saturating_add(1);
+    }
+
+    pub(crate) fn record_rate_total_saturation(&mut self) {
+        self.rate_total_saturations = self.rate_total_saturations.saturating_add(1);
     }
 }
 
@@ -699,6 +747,9 @@ pub struct DomainModel {
     topology_ordinals: HashMap<(TopologyKind, String), DisplayOrdinal>,
     task_runs: HashMap<RunId, TaskRun>,
     run_ids_by_key: HashMap<RunKey, RunId>,
+    task_run_v6_state: HashMap<RunId, TaskRunV6State>,
+    run_rate_totals: HashMap<RunId, RunRateTotals>,
+    run_rate_cursors: HashMap<RunId, RunRateCursor>,
     /// Recomputed from provider logs at startup; no serialized or database projection owns it.
     telemetry: RunTelemetryMap,
     /// First provider kind per run; recomputed at startup and never persisted.
@@ -707,6 +758,10 @@ pub struct DomainModel {
     agent_nodes: HashMap<String, AgentNode>,
     execution_edges: HashSet<ExecutionEdge>,
     dependency_edges: HashSet<DependencyEdge>,
+    /// One bounded before-image per previously published run, spilled durably by the store.
+    history_run_publications: HashMap<RunId, HistoryRunPublication>,
+    /// Bounded restored Activity pages for unfinished drains; never included in model snapshots.
+    deferred_history_activity: HashMap<HistoryDrainId, Vec<ActivityItem>>,
     controller_diagnostics: ControllerDiagnostics,
     provider_diagnostics: ProviderDiagnostics,
 }
@@ -719,6 +774,90 @@ enum TopologyKind {
 }
 
 impl DomainModel {
+    /// Clones the coherent externally visible model while suppressing incomplete history rows.
+    ///
+    /// The reducer may continue accumulating durable historical rows internally; no task-run
+    /// keyed projection becomes visible until the matching drain finalization flips readiness.
+    pub(crate) fn publication_snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        let blocked = snapshot
+            .task_run_v6_state
+            .iter()
+            .filter_map(|(run_id, state)| (!state.history_ready).then_some(*run_id))
+            .collect::<HashSet<_>>();
+        if blocked.is_empty() {
+            snapshot.history_run_publications.clear();
+            snapshot.deferred_history_activity.clear();
+            return snapshot;
+        }
+        for run_id in &blocked {
+            snapshot.remove_task_run_projection(run_id);
+        }
+        let publications = snapshot
+            .history_run_publications
+            .values()
+            .filter(|publication| blocked.contains(&publication.canonical_run_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for publication in publications {
+            snapshot.restore_history_publication(publication);
+        }
+        let dangling = super::graph::dangling_announcement_components(&snapshot);
+        snapshot
+            .controller_diagnostics
+            .set_dangling_announcement_components(dangling);
+        snapshot.history_run_publications.clear();
+        snapshot.deferred_history_activity.clear();
+        snapshot
+    }
+
+    fn remove_task_run_projection(&mut self, run_id: &RunId) {
+        self.task_runs.remove(run_id);
+        self.run_ids_by_key.retain(|_, owner| owner != run_id);
+        self.task_run_v6_state.remove(run_id);
+        self.run_rate_totals.remove(run_id);
+        self.run_rate_cursors.remove(run_id);
+        self.telemetry.remove(run_id);
+        self.run_kinds.remove(run_id);
+        self.executions
+            .retain(|_, execution| &execution.task_run_id != run_id);
+        self.agent_nodes
+            .retain(|_, node| &node.task_run_id != run_id);
+        self.execution_edges
+            .retain(|edge| &edge.parent_run_id != run_id && &edge.child_run_id != run_id);
+        self.dependency_edges
+            .retain(|edge| &edge.prerequisite_run_id != run_id && &edge.dependent_run_id != run_id);
+    }
+
+    fn restore_history_publication(&mut self, publication: HistoryRunPublication) {
+        let run_id = publication.task_run.run_id;
+        self.insert_task_run(publication.task_run);
+        self.set_task_run_v6_state(run_id, publication.state);
+        for alias in publication.aliases {
+            self.insert_task_run_alias(alias, run_id);
+        }
+        if let Some(totals) = publication.rate_totals {
+            self.set_run_rate_totals(run_id, totals);
+        }
+        if let Some(cursor) = publication.rate_cursor {
+            self.set_run_rate_cursor(run_id, cursor);
+        }
+        if let Some(telemetry) = publication.telemetry {
+            self.telemetry.insert(run_id, telemetry);
+        }
+        if let Some(kind) = publication.run_kind {
+            self.run_kinds.insert(run_id, kind);
+        }
+        for execution in publication.executions {
+            self.insert_execution(execution);
+        }
+        for node in publication.agent_nodes {
+            self.insert_agent_node(node);
+        }
+        self.execution_edges.extend(publication.execution_edges);
+        self.dependency_edges.extend(publication.dependency_edges);
+    }
+
     /// Returns the reducer-owned Controller diagnostic counters.
     #[must_use]
     pub const fn controller_diagnostics(&self) -> &ControllerDiagnostics {
@@ -878,6 +1017,7 @@ impl DomainModel {
         let run_id = task_run.run_id;
         let key = task_run.key.clone();
         let replaced = self.task_runs.insert(run_id, task_run);
+        self.task_run_v6_state.entry(run_id).or_default();
         if let Some(previous) = &replaced
             && self.run_ids_by_key.get(&previous.key) == Some(&run_id)
         {
@@ -901,6 +1041,270 @@ impl DomainModel {
 
     pub fn task_runs(&self) -> impl Iterator<Item = &TaskRun> {
         self.task_runs.values()
+    }
+
+    /// Captures every task-run-keyed projection currently visible for one run.
+    pub(crate) fn capture_history_publication(
+        &self,
+        run_id: RunId,
+    ) -> Option<HistoryRunPublication> {
+        let task_run = self.task_run(&run_id)?.clone();
+        let mut aliases = self
+            .run_ids_by_key
+            .iter()
+            .filter_map(|(key, owner)| (*owner == run_id).then_some(key.clone()))
+            .collect::<Vec<_>>();
+        aliases.sort_by_key(stable_run_key_identity);
+        let mut executions = self
+            .executions
+            .values()
+            .filter(|execution| execution.task_run_id == run_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        executions.sort_by(|left, right| left.execution_id.cmp(&right.execution_id));
+        let mut agent_nodes = self
+            .agent_nodes
+            .values()
+            .filter(|node| node.task_run_id == run_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        agent_nodes.sort_by(|left, right| left.agent_node_id.cmp(&right.agent_node_id));
+        let mut execution_edges = self
+            .execution_edges
+            .iter()
+            .filter(|edge| edge.parent_run_id == run_id || edge.child_run_id == run_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        execution_edges.sort_by_key(|edge| (edge.parent_run_id, edge.child_run_id));
+        let mut dependency_edges = self
+            .dependency_edges
+            .iter()
+            .filter(|edge| edge.prerequisite_run_id == run_id || edge.dependent_run_id == run_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        dependency_edges.sort_by_key(|edge| (edge.prerequisite_run_id, edge.dependent_run_id));
+        Some(HistoryRunPublication {
+            canonical_run_id: run_id,
+            task_run,
+            state: self.task_run_v6_state(&run_id).cloned().unwrap_or_default(),
+            aliases,
+            rate_totals: self.run_rate_totals(&run_id).copied(),
+            executions,
+            agent_nodes,
+            execution_edges,
+            dependency_edges,
+            telemetry: self.telemetry.get(&run_id).cloned(),
+            run_kind: self.run_kinds.get(&run_id).cloned(),
+            rate_cursor: self.run_rate_cursors.get(&run_id).cloned(),
+        })
+    }
+
+    pub(crate) fn install_history_publication(
+        &mut self,
+        publication: HistoryRunPublication,
+    ) -> bool {
+        let published_run_id = publication.task_run.run_id;
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            self.history_run_publications.entry(published_run_id)
+        {
+            entry.insert(publication);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn release_history_publications(&mut self, canonical_run_id: RunId) -> bool {
+        let prior_len = self.history_run_publications.len();
+        self.history_run_publications
+            .retain(|_, publication| publication.canonical_run_id != canonical_run_id);
+        self.history_run_publications.len() != prior_len
+    }
+
+    pub(crate) fn set_deferred_history_activity(
+        &mut self,
+        activity: HashMap<HistoryDrainId, Vec<ActivityItem>>,
+    ) {
+        self.deferred_history_activity = activity;
+    }
+
+    pub(crate) fn take_deferred_history_activity(
+        &mut self,
+    ) -> HashMap<HistoryDrainId, Vec<ActivityItem>> {
+        std::mem::take(&mut self.deferred_history_activity)
+    }
+
+    /// Returns every run whose task-run-keyed projection differs from a before-image.
+    pub(crate) fn changed_task_run_ids_since(&self, before: &Self) -> HashSet<RunId> {
+        let mut changed = HashSet::new();
+        collect_changed_map_keys(&self.task_runs, &before.task_runs, &mut changed);
+        collect_changed_map_keys(
+            &self.task_run_v6_state,
+            &before.task_run_v6_state,
+            &mut changed,
+        );
+        collect_changed_map_keys(&self.run_rate_totals, &before.run_rate_totals, &mut changed);
+        collect_changed_map_keys(
+            &self.run_rate_cursors,
+            &before.run_rate_cursors,
+            &mut changed,
+        );
+        collect_changed_map_keys(&self.telemetry, &before.telemetry, &mut changed);
+        collect_changed_map_keys(&self.run_kinds, &before.run_kinds, &mut changed);
+
+        collect_changed_owned_rows(
+            &self.executions,
+            &before.executions,
+            |execution| execution.task_run_id,
+            &mut changed,
+        );
+        collect_changed_owned_rows(
+            &self.agent_nodes,
+            &before.agent_nodes,
+            |node| node.task_run_id,
+            &mut changed,
+        );
+        for edge in self
+            .execution_edges
+            .symmetric_difference(&before.execution_edges)
+        {
+            changed.insert(edge.parent_run_id);
+            changed.insert(edge.child_run_id);
+        }
+        for edge in self
+            .dependency_edges
+            .symmetric_difference(&before.dependency_edges)
+        {
+            changed.insert(edge.prerequisite_run_id);
+            changed.insert(edge.dependent_run_id);
+        }
+        for (key, owner) in &self.run_ids_by_key {
+            if before.run_ids_by_key.get(key) != Some(owner) {
+                changed.insert(*owner);
+                if let Some(previous) = before.run_ids_by_key.get(key) {
+                    changed.insert(*previous);
+                }
+            }
+        }
+        for (key, owner) in &before.run_ids_by_key {
+            if self.run_ids_by_key.get(key) != Some(owner) {
+                changed.insert(*owner);
+            }
+        }
+        changed
+    }
+
+    /// Returns persisted lifecycle and historical-readiness state for one run.
+    #[must_use]
+    pub fn task_run_v6_state(&self, run_id: &RunId) -> Option<&TaskRunV6State> {
+        self.task_run_v6_state.get(run_id)
+    }
+
+    /// Returns the endpoint used by lifecycle consumers without changing semantic task state.
+    #[must_use]
+    pub fn effective_lifecycle_end_ms(&self, run: &TaskRun) -> Option<i64> {
+        run.finished_at_ms.or_else(|| {
+            self.task_run_v6_state(&run.run_id)
+                .and_then(|state| state.native_session_end.as_ref())
+                .map(|end| end.at_ms)
+        })
+    }
+
+    /// Replaces persisted lifecycle and historical-readiness state for one run.
+    pub fn set_task_run_v6_state(
+        &mut self,
+        run_id: RunId,
+        state: TaskRunV6State,
+    ) -> Option<TaskRunV6State> {
+        self.task_run_v6_state.insert(run_id, state)
+    }
+
+    /// Returns closed active-time rate totals for one run.
+    #[must_use]
+    pub fn run_rate_totals(&self, run_id: &RunId) -> Option<&RunRateTotals> {
+        self.run_rate_totals.get(run_id)
+    }
+
+    /// Sets closed totals after clamping them to SQLite's persisted domain.
+    pub fn set_run_rate_totals(
+        &mut self,
+        run_id: RunId,
+        totals: RunRateTotals,
+    ) -> Option<RunRateTotals> {
+        let (totals, saturated) = totals.clamped();
+        if saturated {
+            self.controller_diagnostics.record_rate_total_saturation();
+        }
+        self.run_rate_totals.insert(run_id, totals)
+    }
+
+    /// Adds closed totals once and reports whether the persisted domain saturated.
+    pub fn accumulate_run_rate_totals(&mut self, run_id: RunId, delta: RunRateTotals) -> bool {
+        let saturated = self
+            .run_rate_totals
+            .entry(run_id)
+            .or_default()
+            .saturating_add(delta);
+        if saturated {
+            self.controller_diagnostics.record_rate_total_saturation();
+        }
+        saturated
+    }
+
+    /// Returns the current process-local rate cursor for one run.
+    #[must_use]
+    pub(crate) fn run_rate_cursor(&self, run_id: &RunId) -> Option<&RunRateCursor> {
+        self.run_rate_cursors.get(run_id)
+    }
+
+    pub(crate) fn set_run_rate_cursor(
+        &mut self,
+        run_id: RunId,
+        cursor: RunRateCursor,
+    ) -> Option<RunRateCursor> {
+        self.run_rate_cursors.insert(run_id, cursor)
+    }
+
+    pub(crate) fn remove_run_rate_cursor(&mut self, run_id: &RunId) -> Option<RunRateCursor> {
+        self.run_rate_cursors.remove(run_id)
+    }
+
+    pub(crate) fn clear_run_rate_cursors(&mut self) {
+        self.run_rate_cursors.clear();
+    }
+
+    pub(crate) fn run_rate_cursors(&self) -> impl Iterator<Item = (&RunId, &RunRateCursor)> {
+        self.run_rate_cursors.iter()
+    }
+
+    pub(crate) fn fold_task_run_v6_state(&mut self, survivor: RunId, absorbed: RunId) {
+        let absorbed_state = self.task_run_v6_state.remove(&absorbed).unwrap_or_default();
+        let survivor_state = self.task_run_v6_state.entry(survivor).or_default();
+        survivor_state.history_ready |= absorbed_state.history_ready;
+        survivor_state.latest_provider_at_ms = match (
+            survivor_state.latest_provider_at_ms,
+            absorbed_state.latest_provider_at_ms,
+        ) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (left @ Some(_), None) => left,
+            (None, right) => right,
+        };
+        if absorbed_state.lifecycle_watermark > survivor_state.lifecycle_watermark {
+            survivor_state.lifecycle_watermark = absorbed_state.lifecycle_watermark;
+            survivor_state.native_session_end = absorbed_state.native_session_end;
+        }
+        for publication in self.history_run_publications.values_mut() {
+            if publication.canonical_run_id == absorbed {
+                publication.canonical_run_id = survivor;
+            }
+        }
+    }
+
+    pub(crate) fn fold_run_rate_totals(&mut self, survivor: RunId, absorbed: RunId) {
+        let Some(absorbed_totals) = self.run_rate_totals.remove(&absorbed) else {
+            return;
+        };
+        self.accumulate_run_rate_totals(survivor, absorbed_totals);
     }
 
     /// Returns transient output-token telemetry for one run.
@@ -1042,10 +1446,14 @@ impl DomainModel {
 
     /// Restores a historical run without making its collector-scoped key addressable.
     pub fn insert_historical_task_run(&mut self, task_run: TaskRun) -> Option<TaskRun> {
+        self.task_run_v6_state.entry(task_run.run_id).or_default();
         self.task_runs.insert(task_run.run_id, task_run)
     }
 
     pub(crate) fn remove_task_run_record(&mut self, run_id: &RunId) -> Option<TaskRun> {
+        self.task_run_v6_state.remove(run_id);
+        self.run_rate_totals.remove(run_id);
+        self.run_rate_cursors.remove(run_id);
         self.task_runs.remove(run_id)
     }
 
@@ -1083,6 +1491,64 @@ impl DomainModel {
     pub fn remove_pane(&mut self, pane_id: &str) -> Option<Pane> {
         self.remove_pane_agent_status(pane_id);
         self.panes.remove(pane_id)
+    }
+}
+
+fn stable_run_key_identity(key: &RunKey) -> String {
+    match key {
+        RunKey::Controller(value) => format!("controller:{}:{value}", value.len()),
+        RunKey::Native { provider, sid } => {
+            format!("native:{provider:?}:{}:{sid}", sid.len())
+        }
+        RunKey::NativePath { provider, path } => {
+            format!("native-path:{provider:?}:{}:{path}", path.len())
+        }
+        RunKey::Provisional {
+            terminal_id,
+            start_ms,
+            seq,
+        } => format!(
+            "provisional:{}:{terminal_id}:{start_ms}:{seq}",
+            terminal_id.len()
+        ),
+    }
+}
+
+fn collect_changed_map_keys<V: PartialEq>(
+    current: &HashMap<RunId, V>,
+    before: &HashMap<RunId, V>,
+    changed: &mut HashSet<RunId>,
+) {
+    for (run_id, value) in current {
+        if before.get(run_id) != Some(value) {
+            changed.insert(*run_id);
+        }
+    }
+    for run_id in before.keys() {
+        if !current.contains_key(run_id) {
+            changed.insert(*run_id);
+        }
+    }
+}
+
+fn collect_changed_owned_rows<V: PartialEq, F: Fn(&V) -> RunId>(
+    current: &HashMap<String, V>,
+    before: &HashMap<String, V>,
+    owner: F,
+    changed: &mut HashSet<RunId>,
+) {
+    for (id, value) in current {
+        if before.get(id) != Some(value) {
+            changed.insert(owner(value));
+            if let Some(previous) = before.get(id) {
+                changed.insert(owner(previous));
+            }
+        }
+    }
+    for (id, value) in before {
+        if !current.contains_key(id) {
+            changed.insert(owner(value));
+        }
     }
 }
 
@@ -1146,7 +1612,7 @@ pub struct ControllerEvent {
     pub event: ControllerEventKind,
 }
 
-/// The nine Controller event types with their required endpoint carried by the variant.
+/// The Controller event types with their required endpoint carried by the variant.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "event_type")]
 pub enum ControllerEventKind {
@@ -1158,6 +1624,7 @@ pub enum ControllerEventKind {
     Complete,
     Failed,
     Cancelled,
+    SessionEnded,
     Dismiss,
 }
 
@@ -1318,7 +1785,58 @@ pub enum AgentSessionReferenceKind {
 mod tests {
     use super::*;
     use crate::model::ids::{DisplayOrdinal, Provider, RunId, RunKey};
-    use crate::model::state::{ExecState, PaneAgentStatus, TaskState};
+    use crate::model::state::{
+        ExecState, NativeSessionEnd, NativeSessionEndStatus, PaneAgentStatus, TaskState,
+    };
+
+    #[test]
+    fn effective_lifecycle_end_prefers_semantic_finish_then_native_end() {
+        let semantic = RunId::new();
+        let native = RunId::new();
+        let live = RunId::new();
+        let mut model = DomainModel::default();
+        for (run_id, ordinal, finished_at_ms) in
+            [(semantic, 1, Some(500)), (native, 2, None), (live, 3, None)]
+        {
+            model.insert_task_run(TaskRun {
+                run_id,
+                key: RunKey::Controller(format!("lifecycle-{ordinal}")),
+                display_ordinal: DisplayOrdinal::new(ordinal),
+                state: TaskState::Running,
+                has_controller_task_state_event: true,
+                created_at_ms: Some(100),
+                updated_at_ms: Some(500),
+                finished_at_ms,
+                subject: None,
+                dismissed_at_ms: None,
+            });
+        }
+        for (run_id, at_ms) in [(semantic, 300), (native, 400)] {
+            model.set_task_run_v6_state(
+                run_id,
+                TaskRunV6State {
+                    native_session_end: Some(NativeSessionEnd {
+                        status: NativeSessionEndStatus::Done,
+                        at_ms,
+                    }),
+                    ..TaskRunV6State::default()
+                },
+            );
+        }
+
+        assert_eq!(
+            model.effective_lifecycle_end_ms(model.task_run(&semantic).unwrap()),
+            Some(500)
+        );
+        assert_eq!(
+            model.effective_lifecycle_end_ms(model.task_run(&native).unwrap()),
+            Some(400)
+        );
+        assert_eq!(
+            model.effective_lifecycle_end_ms(model.task_run(&live).unwrap()),
+            None
+        );
+    }
 
     #[test]
     fn domain_model_construction() {

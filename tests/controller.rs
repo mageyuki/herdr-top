@@ -18,8 +18,8 @@ use herdr_top::herdr::controller::{
 use herdr_top::lockfile::{OwnerLock, StateRoot, state_root_in, try_acquire};
 use herdr_top::model::{
     ControllerDiagnosticsHandle, ControllerEventKind, DisplayOrdinal, EventMetadata,
-    MinimalProviderMetadata, NormalizedEvent, Provider, RunId, RunKey, SourceCoverage, TaskRun,
-    TaskState,
+    MinimalProviderMetadata, NativeSessionEndStatus, NormalizedEvent, Provider, RunId, RunKey,
+    SourceCoverage, TaskRun, TaskState,
 };
 use herdr_top::performance::{PerformanceIngress, SystemPerformanceClock, performance_tracker};
 use herdr_top::rendezvous::{
@@ -817,6 +817,151 @@ async fn duplicate_event_id_is_duplicate() {
     let event = envelope("same-event", "task_started", "run");
     assert_eq!(running.send(&event).await, ControllerResponse::Accepted);
     assert_eq!(running.send(&event).await, ControllerResponse::Duplicate);
+    running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_end_is_durable_and_same_session_start_reopens_without_reordering() {
+    let running = RunningController::start().await;
+    let event_base_ms = unix_now_ms().saturating_sub(400);
+    let mut start = envelope("native-start", "task_started", "native-root");
+    start["provider"] = json!("codex");
+    start["native_session_id"] = json!("session-1");
+    start["emitted_at_ms"] = json!(event_base_ms + 100);
+    assert_eq!(running.send(&start).await, ControllerResponse::Accepted);
+
+    let before = running
+        .collector
+        .model
+        .borrow()
+        .task_run_by_key(&RunKey::Native {
+            provider: Provider::Codex,
+            sid: "session-1".to_owned(),
+        })
+        .unwrap()
+        .clone();
+    let mut end = envelope("native-end", "session_ended", "native-root");
+    end["provider"] = json!("codex");
+    end["native_session_id"] = json!("session-1");
+    end["emitted_at_ms"] = json!(event_base_ms + 200);
+    assert_eq!(running.send(&end).await, ControllerResponse::Accepted);
+    let ended = running.collector.model.borrow();
+    assert_eq!(
+        ended.task_run(&before.run_id).unwrap().state,
+        TaskState::Running
+    );
+    assert_eq!(
+        ended
+            .task_run_v6_state(&before.run_id)
+            .unwrap()
+            .native_session_end
+            .as_ref()
+            .unwrap()
+            .status,
+        NativeSessionEndStatus::Done
+    );
+    drop(ended);
+
+    let mut resumed = start.clone();
+    resumed["event_id"] = json!("native-resume");
+    resumed["emitted_at_ms"] = json!(event_base_ms + 300);
+    assert_eq!(running.send(&resumed).await, ControllerResponse::Accepted);
+    let resumed_model = running.collector.model.borrow();
+    assert!(
+        resumed_model
+            .task_run_v6_state(&before.run_id)
+            .unwrap()
+            .native_session_end
+            .is_none()
+    );
+    assert_eq!(
+        resumed_model
+            .task_run(&before.run_id)
+            .unwrap()
+            .display_ordinal,
+        before.display_ordinal
+    );
+    drop(resumed_model);
+
+    let mut delayed_end = end.clone();
+    delayed_end["event_id"] = json!("native-delayed-end");
+    delayed_end["emitted_at_ms"] = json!(event_base_ms + 250);
+    assert_eq!(
+        running.send(&delayed_end).await,
+        ControllerResponse::Accepted
+    );
+    assert!(
+        running
+            .collector
+            .model
+            .borrow()
+            .task_run_v6_state(&before.run_id)
+            .unwrap()
+            .native_session_end
+            .is_none()
+    );
+
+    let mut final_end = end;
+    final_end["event_id"] = json!("native-final-end");
+    final_end["emitted_at_ms"] = json!(event_base_ms + 400);
+    assert_eq!(running.send(&final_end).await, ControllerResponse::Accepted);
+
+    let (_state, reopened) = running.stop_and_reopen().await;
+    let restored = reopened.load_restored_state().unwrap();
+    assert_eq!(
+        restored
+            .model
+            .task_run_v6_state(&before.run_id)
+            .unwrap()
+            .native_session_end
+            .as_ref()
+            .unwrap()
+            .status,
+        NativeSessionEndStatus::Done
+    );
+    assert_eq!(
+        restored
+            .model
+            .task_run(&before.run_id)
+            .unwrap()
+            .display_ordinal,
+        before.display_ordinal
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_and_unbound_session_end_are_accepted_without_forward_references() {
+    let running = RunningController::start().await;
+    let unknown = envelope("unknown-end", "session_ended", "missing");
+    assert_eq!(running.send(&unknown).await, ControllerResponse::Accepted);
+    assert!(
+        running
+            .collector
+            .model
+            .borrow()
+            .task_runs()
+            .next()
+            .is_none()
+    );
+
+    assert_eq!(
+        running
+            .send(&envelope("plain-start", "task_started", "plain"))
+            .await,
+        ControllerResponse::Accepted
+    );
+    let unbound = envelope("plain-end", "session_ended", "plain");
+    assert_eq!(running.send(&unbound).await, ControllerResponse::Accepted);
+    let model = running.collector.model.borrow();
+    let run = model
+        .task_run_by_key(&RunKey::Controller("plain".to_owned()))
+        .unwrap();
+    assert!(
+        model
+            .task_run_v6_state(&run.run_id)
+            .is_none_or(|state| state.native_session_end.is_none())
+    );
+    drop(model);
     running.stop().await;
 }
 
@@ -1624,13 +1769,235 @@ async fn emit_from_hook_malformed_or_oversized_input_is_ignored_without_delivery
     }
 }
 
+const REDACTED_EXPLICIT_EMPTY_STOP_SENTINEL: &str = "redacted-explicit-empty-stop-sentinel";
+
+/// Fully synthetic, redacted fixture that preserves only the observed
+/// structural shape of a provider-internal Claude Code `SubagentStop` hook
+/// payload: an explicitly present empty `agent_type` string beside the other
+/// observed top-level keys. No value is a captured private value; every
+/// content-bearing field carries the sentinel so any leak is detectable.
+fn redacted_claude_explicit_empty_stop_fixture() -> Value {
+    let sentinel = REDACTED_EXPLICIT_EMPTY_STOP_SENTINEL;
+    json!({
+        "agent_id": format!("agent-{sentinel}"),
+        "agent_transcript_path": format!("/{sentinel}/agent-transcript.jsonl"),
+        "agent_type": "",
+        "background_tasks": [{
+            "agent_type": format!("background-agent-type-{sentinel}"),
+            "description": format!("background-description-{sentinel}"),
+            "id": format!("background-id-{sentinel}"),
+            "status": "synthetic-status",
+            "type": "synthetic-type"
+        }],
+        "cwd": format!("/{sentinel}/cwd"),
+        "effort": {"level": "synthetic-level"},
+        "hook_event_name": "SubagentStop",
+        "last_assistant_message": format!("last-assistant-message-{sentinel}"),
+        "permission_mode": "auto",
+        "prompt_id": format!("prompt-{sentinel}"),
+        "session_crons": [],
+        "session_id": format!("session-{sentinel}"),
+        "stop_hook_active": false,
+        "transcript_path": format!("/{sentinel}/transcript.jsonl")
+    })
+}
+
+/// Fixture-integrity check: a missing or renamed top-level key, or a wrong
+/// nested key or type shape, fails here before the adapter is exercised.
+fn assert_redacted_claude_explicit_empty_stop_shape(fixture: &Value) {
+    let object = fixture.as_object().expect("fixture must be a JSON object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "agent_id",
+            "agent_transcript_path",
+            "agent_type",
+            "background_tasks",
+            "cwd",
+            "effort",
+            "hook_event_name",
+            "last_assistant_message",
+            "permission_mode",
+            "prompt_id",
+            "session_crons",
+            "session_id",
+            "stop_hook_active",
+            "transcript_path",
+        ]
+    );
+    for key in [
+        "agent_id",
+        "agent_transcript_path",
+        "agent_type",
+        "cwd",
+        "hook_event_name",
+        "last_assistant_message",
+        "permission_mode",
+        "prompt_id",
+        "session_id",
+        "transcript_path",
+    ] {
+        assert!(object[key].is_string(), "top-level {key} must be a string");
+    }
+    assert!(
+        object["stop_hook_active"].is_boolean(),
+        "stop_hook_active must be a boolean"
+    );
+    let effort = object["effort"]
+        .as_object()
+        .expect("effort must be an object");
+    assert_eq!(
+        effort.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["level"]
+    );
+    assert!(effort["level"].is_string(), "effort.level must be a string");
+    let background_tasks = object["background_tasks"]
+        .as_array()
+        .expect("background_tasks must be an array");
+    assert_eq!(background_tasks.len(), 1);
+    let background_task = background_tasks[0]
+        .as_object()
+        .expect("background_tasks[0] must be an object");
+    let mut background_task_keys: Vec<&str> = background_task.keys().map(String::as_str).collect();
+    background_task_keys.sort_unstable();
+    assert_eq!(
+        background_task_keys,
+        ["agent_type", "description", "id", "status", "type"]
+    );
+    for key in background_task_keys {
+        assert!(
+            background_task[key].is_string(),
+            "background_tasks[0].{key} must be a string"
+        );
+    }
+    assert_eq!(object["session_crons"], json!([]));
+    assert_eq!(object["hook_event_name"], "SubagentStop");
+    assert_eq!(object["agent_type"], "");
+    assert_eq!(object["permission_mode"], "auto");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn emit_from_hook_ignores_redacted_claude_explicit_empty_stop_without_delivery() {
+    let fixture = redacted_claude_explicit_empty_stop_fixture();
+    assert_redacted_claude_explicit_empty_stop_shape(&fixture);
+    let sentinel = REDACTED_EXPLICIT_EMPTY_STOP_SENTINEL;
+    let payload = serde_json::to_vec(&fixture).unwrap();
+    let session_run_id = format!("hook:claude-code:session-{sentinel}");
+    let agent_run_id = format!("{session_run_id}:agent:agent-{sentinel}");
+
+    for strict in [false, true] {
+        let (runtime_base, _runtime, listener) = scripted_emit_listener();
+        let runtime_path = runtime_base.path().to_path_buf();
+        let payload = payload.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            hook_emit_command(&runtime_path, strict, "claude-code", payload)
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            output.status.success(),
+            "strict={strict}: {}",
+            output_text(&output)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "strict={strict}: adapter stdout must be zero bytes"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "strict={strict}: explicit-empty stop must emit no output: {}",
+            output_text(&output)
+        );
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "strict={strict}: explicit-empty stop must not connect to the Controller"
+        );
+    }
+
+    let running = RendezvousController::start().await;
+    let (task_count_before, forward_references_before) = {
+        let model = running.collector.model.borrow();
+        (
+            model.task_runs().count(),
+            model
+                .controller_diagnostics()
+                .terminal_forward_reference_creations(),
+        )
+    };
+    for strict in [false, true] {
+        let runtime_path = running.runtime_base.path().to_path_buf();
+        let payload = payload.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            hook_emit_command(&runtime_path, strict, "claude-code", payload)
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            output.status.success(),
+            "strict={strict}: {}",
+            output_text(&output)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "strict={strict}: adapter stdout must be zero bytes"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "strict={strict}: explicit-empty stop must emit no output: {}",
+            output_text(&output)
+        );
+        assert!(
+            !output_text(&output).contains(sentinel),
+            "strict={strict}: sentinel leaked into adapter output"
+        );
+    }
+
+    let model = running.collector.model.borrow();
+    assert!(
+        model
+            .task_run_by_key(&RunKey::Controller(agent_run_id))
+            .is_none(),
+        "explicit-empty stop must not create a Task Run"
+    );
+    assert!(
+        model
+            .task_run_by_key(&RunKey::Controller(session_run_id))
+            .is_none(),
+        "explicit-empty stop must not create a controller-session run"
+    );
+    assert_eq!(model.task_runs().count(), task_count_before);
+    assert_eq!(
+        model
+            .controller_diagnostics()
+            .terminal_forward_reference_creations(),
+        forward_references_before
+    );
+    let state = format!("{:?}", *model);
+    assert!(
+        !state.contains(sentinel),
+        "sentinel leaked into reducer state"
+    );
+    let diagnostics = format!("{:?}", *running.collector.diagnostics.borrow());
+    assert!(
+        !diagnostics.contains(sentinel),
+        "sentinel leaked into runtime diagnostics"
+    );
+    drop(model);
+    running.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn emit_from_hook_treats_terminal_before_start_stale_event_as_benign() {
     let running = RendezvousController::start().await;
     let stop_payload = serde_json::to_vec(&json!({
         "hook_event_name": "SubagentStop",
         "session_id": "race-session",
-        "agent_id": "agent-7"
+        "agent_id": "agent-7",
+        "agent_type": "researcher"
     }))
     .unwrap();
     let runtime_path = running.runtime_base.path().to_path_buf();

@@ -175,7 +175,7 @@ impl PerformanceState {
         }
     }
 
-    fn admit(&mut self, admitted_at: Duration) -> AdmissionStamp {
+    fn admit(&mut self, admitted_at: Duration, record_rate_timestamp: bool) -> AdmissionStamp {
         let sequence = self
             .admission_high_water
             .checked_add(1)
@@ -183,7 +183,9 @@ impl PerformanceState {
         self.admission_high_water = sequence;
         let replaced = self.pending.insert(sequence, admitted_at);
         assert!(replaced.is_none(), "performance sequence must be unique");
-        self.admission_times.push_back(admitted_at);
+        if record_rate_timestamp {
+            self.admission_times.push_back(admitted_at);
+        }
         AdmissionStamp {
             sequence,
             admitted_at,
@@ -296,13 +298,22 @@ impl Drop for Admission {
 impl PerformanceIngress {
     #[must_use]
     pub fn admit(&self) -> Admission {
+        self.admit_recording_rate(true)
+    }
+
+    #[must_use]
+    pub(crate) fn admit_unrated(&self) -> Admission {
+        self.admit_recording_rate(false)
+    }
+
+    fn admit_recording_rate(&self, record_rate_timestamp: bool) -> Admission {
         let mut state = self
             .shared
             .state
             .lock()
             .expect("performance state mutex poisoned");
         let admitted_at = self.shared.clock.monotonic_now();
-        let stamp = state.admit(admitted_at);
+        let stamp = state.admit(admitted_at, record_rate_timestamp);
         drop(state);
         Admission {
             shared: self.shared.clone(),
@@ -672,6 +683,71 @@ mod tests {
         clock.set(Duration::from_secs(1));
         let (model, operator) = empty_inputs();
         assert_eq!(sampler.sample(&model, &operator, 0).events_one_second, 0);
+    }
+
+    #[test]
+    fn unrated_admission_tracks_lag_without_entering_rate_windows() {
+        let clock = Arc::new(TestPerformanceClock::new(Duration::ZERO));
+        let (ingress, mut sampler) = performance_tracker(clock.clone());
+        let explicit = ingress.admit_unrated();
+        clock.advance(Duration::from_millis(400));
+        let dropped = ingress.admit_unrated();
+        clock.advance(Duration::from_millis(700));
+        let (model, operator) = empty_inputs();
+
+        let pending = sampler.sample(&model, &operator, 0);
+        assert_eq!(
+            (
+                pending.event_lag,
+                pending.pending_events,
+                pending.admission_high_water,
+                pending.completion_high_water,
+                pending.events_one_second,
+                pending.events_ten_seconds,
+                pending.events_sixty_seconds,
+            ),
+            (Duration::from_millis(1_100), 2, 2, 0, 0, 0, 0)
+        );
+        assert!(
+            pending
+                .reasons
+                .contains(&PerformanceDegradationReason::EventLag)
+        );
+
+        explicit.complete();
+        let explicitly_completed = sampler.sample(&model, &operator, 0);
+        assert_eq!(
+            (
+                explicitly_completed.event_lag,
+                explicitly_completed.pending_events,
+                explicitly_completed.admission_high_water,
+                explicitly_completed.completion_high_water,
+                explicitly_completed.events_one_second,
+                explicitly_completed.events_ten_seconds,
+                explicitly_completed.events_sixty_seconds,
+            ),
+            (Duration::from_millis(700), 1, 2, 1, 0, 0, 0)
+        );
+
+        drop(dropped);
+        let dropped_completed = sampler.sample(&model, &operator, 0);
+        assert_eq!(
+            (
+                dropped_completed.event_lag,
+                dropped_completed.pending_events,
+                dropped_completed.admission_high_water,
+                dropped_completed.completion_high_water,
+                dropped_completed.events_one_second,
+                dropped_completed.events_ten_seconds,
+                dropped_completed.events_sixty_seconds,
+            ),
+            (Duration::ZERO, 0, 2, 2, 0, 0, 0)
+        );
+        assert!(
+            !dropped_completed
+                .reasons
+                .contains(&PerformanceDegradationReason::EventLag)
+        );
     }
 
     #[test]

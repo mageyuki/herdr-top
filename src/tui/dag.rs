@@ -149,11 +149,23 @@ pub(crate) fn build_rows(model: &DomainModel, order: &DagOrder, now_ms: i64) -> 
     build_rows_with_statuses(model, order, now_ms, &statuses)
 }
 
+#[cfg(test)]
 pub(crate) fn build_rows_with_statuses(
     model: &DomainModel,
     order: &DagOrder,
     now_ms: i64,
     statuses: &StatusReadModel,
+) -> Vec<TreeRow> {
+    let visible = order.run_ids().iter().copied().collect::<HashSet<_>>();
+    build_rows_with_statuses_visible(model, order, now_ms, statuses, &visible)
+}
+
+pub(crate) fn build_rows_with_statuses_visible(
+    model: &DomainModel,
+    order: &DagOrder,
+    now_ms: i64,
+    statuses: &StatusReadModel,
+    visible_runs: &HashSet<RunId>,
 ) -> Vec<TreeRow> {
     let stalled_runs =
         super::projection::stalled_run_ids(model, now_ms, crate::activity::stall_warn_ms());
@@ -178,6 +190,7 @@ pub(crate) fn build_rows_with_statuses(
         let mut neighbors = run_ids
             .into_iter()
             .flatten()
+            .filter(|run_id| visible_runs.contains(run_id))
             .filter_map(|run_id| model.task_run(run_id))
             .collect::<Vec<_>>();
         neighbors.sort_by_key(|run| (run.display_ordinal.get(), run.run_id));
@@ -189,6 +202,7 @@ pub(crate) fn build_rows_with_statuses(
     order
         .run_ids()
         .iter()
+        .filter(|run_id| visible_runs.contains(run_id))
         .filter_map(|run_id| model.task_run(run_id))
         .map(|run| {
             let display_status =
@@ -673,6 +687,80 @@ mod tests {
             .expect("DAG has the worker row");
 
         assert_eq!(worker.label, "⚠ working Codex [dispatched by: Parent]");
+    }
+
+    #[test]
+    fn hidden_runs_are_absent_from_visible_row_neighbor_columns() {
+        // Neighbors are inserted out of display order so ordering must come from ordinals.
+        let (model, ids) = model(
+            &[
+                ("P2", 3),
+                ("PH", 4),
+                ("D", 5),
+                ("Z2", 8),
+                ("P1", 2),
+                ("ZH", 7),
+                ("Z1", 6),
+            ],
+            &[
+                ("P2", "D"),
+                ("PH", "D"),
+                ("P1", "D"),
+                ("D", "Z2"),
+                ("D", "ZH"),
+                ("D", "Z1"),
+                ("PH", "Z1"),
+                ("P1", "ZH"),
+            ],
+        );
+        let mut order = DagOrder::default();
+        order.recompute(&model);
+        let statuses = crate::tui::projection::StatusReadModel::from_model(&model, 0);
+        let visible = ["P1", "P2", "D", "Z1", "Z2"]
+            .into_iter()
+            .map(|label| ids[label])
+            .collect::<std::collections::HashSet<_>>();
+
+        let rows = super::build_rows_with_statuses_visible(&model, &order, 0, &statuses, &visible);
+
+        let row_ids = rows
+            .iter()
+            .filter_map(|row| row.key.run_id())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(row_ids, visible, "hidden runs must not emit DAG rows");
+        let leaked = rows
+            .iter()
+            .flat_map(|row| {
+                row.prerequisites
+                    .iter()
+                    .map(|name| format!("prereq:{name}"))
+                    .chain(
+                        row.dependents
+                            .iter()
+                            .map(|name| format!("dependent:{name}")),
+                    )
+            })
+            .filter(|name| name.ends_with(":PH") || name.ends_with(":ZH"))
+            .collect::<Vec<_>>();
+        assert!(
+            leaked.is_empty(),
+            "hidden neighbor names leaked into visible rows: {leaked:?}"
+        );
+        let row = |label: &str| {
+            rows.iter()
+                .find(|row| row.key.run_id() == Some(ids[label]))
+                .unwrap_or_else(|| panic!("visible row {label}"))
+        };
+        assert_eq!(row("D").prerequisites, ["P1", "P2"]);
+        assert_eq!(row("D").dependents, ["Z1", "Z2"]);
+        assert!(row("P1").prerequisites.is_empty());
+        assert_eq!(row("P1").dependents, ["D"]);
+        assert!(row("P2").prerequisites.is_empty());
+        assert_eq!(row("P2").dependents, ["D"]);
+        assert_eq!(row("Z1").prerequisites, ["D"]);
+        assert!(row("Z1").dependents.is_empty());
+        assert_eq!(row("Z2").prerequisites, ["D"]);
+        assert!(row("Z2").dependents.is_empty());
     }
 
     #[test]

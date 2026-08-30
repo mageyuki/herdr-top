@@ -86,6 +86,7 @@ struct RunRowContext<'model, 'data> {
     live_lines: &'data LiveLineReadModel,
     stalled_runs: &'data HashSet<RunId>,
     statuses: &'data StatusReadModel,
+    native_aliases: &'data projection::NativeAliasIndex,
     now_ms: i64,
 }
 
@@ -352,11 +353,7 @@ fn format_time_value(metrics: &projection::RunMetricInputs, now_ms: i64) -> Stri
 }
 
 fn metric_end_ms(metrics: &projection::RunMetricInputs, now_ms: i64) -> Option<i64> {
-    if metrics.terminal {
-        metrics.finished_at_ms
-    } else {
-        Some(now_ms)
-    }
+    Some(metrics.lifecycle_end_at_ms.unwrap_or(now_ms))
 }
 
 #[derive(Clone, Copy)]
@@ -1116,6 +1113,9 @@ fn help_lines(diagnostics: &RuntimeDiagnosticsSnapshot, setup: &TuiSetup) -> Vec
         "i detail; s summary; w toggles Summary workspace/session scope; ? help".to_owned(),
         "Esc/opening key closes; Up/Down scrolls overlays".to_owned(),
         "Follow pins selection and viewport to newest; manual navigation disables it".to_owned(),
+        "History order: oldest at top; new sessions append below".to_owned(),
+        "Terminal roots and descendants stay 1h; Summary retains published history".to_owned(),
+        "tok/s uses measured Working time; Idle, history, and offline time add none".to_owned(),
         "Recovery: ancestor, stable neighbor, first; reasons are typed".to_owned(),
         "Controller input is optional capability; standalone setup is optional".to_owned(),
     ];
@@ -1541,7 +1541,12 @@ pub(crate) fn build_tree_rows(
     newest_agents: &NewestAgentNodes<'_>,
 ) -> Vec<TreeRow> {
     let statuses = StatusReadModel::from_model(model, state.now_ms());
-    build_tree_rows_with_statuses(model, state, newest_agents, &statuses)
+    let visible = crate::activity::default_visible_task_run_ids(
+        model,
+        &state.operator_snapshot(),
+        state.now_ms(),
+    );
+    build_tree_rows_with_statuses(model, state, newest_agents, &statuses, &visible)
 }
 
 fn build_tree_rows_with_statuses(
@@ -1549,6 +1554,7 @@ fn build_tree_rows_with_statuses(
     state: &AppState,
     newest_agents: &NewestAgentNodes<'_>,
     statuses: &StatusReadModel,
+    visible_runs: &HashSet<RunId>,
 ) -> Vec<TreeRow> {
     let mut rows = vec![TreeRow {
         key: NodeKey::Session,
@@ -1559,7 +1565,14 @@ fn build_tree_rows_with_statuses(
         prerequisites: Vec::new(),
         dependents: Vec::new(),
     }];
-    append_execution_tree_rows(&mut rows, model, state, newest_agents, statuses);
+    append_execution_tree_rows(
+        &mut rows,
+        model,
+        state,
+        newest_agents,
+        statuses,
+        visible_runs,
+    );
     rows
 }
 
@@ -1570,11 +1583,15 @@ pub(crate) fn build_rows(model: &DomainModel, state: &AppState) -> Vec<TreeRow> 
 pub(crate) fn build_projection(model: &DomainModel, state: &AppState) -> RowProjection {
     #[cfg(test)]
     state.record_projection_build();
-    let full_rows = build_full_rows(model, state);
-    projection::project_rows(
+    let operator = state.operator_snapshot();
+    let visible_runs =
+        crate::activity::default_visible_task_run_ids(model, &operator, state.now_ms());
+    let full_rows = build_full_rows(model, state, &visible_runs);
+    projection::project_rows_with_visible(
         model,
         &full_rows,
-        &state.operator_snapshot(),
+        &operator,
+        &visible_runs,
         state.filter_query(),
         state.collapsed(),
         state.view_mode(),
@@ -1585,11 +1602,15 @@ pub(crate) fn build_projection(model: &DomainModel, state: &AppState) -> RowProj
 pub(crate) fn build_uncollapsed_rows(model: &DomainModel, state: &AppState) -> Vec<TreeRow> {
     #[cfg(test)]
     state.record_projection_build();
-    let full_rows = build_full_rows(model, state);
-    projection::project_rows(
+    let operator = state.operator_snapshot();
+    let visible_runs =
+        crate::activity::default_visible_task_run_ids(model, &operator, state.now_ms());
+    let full_rows = build_full_rows(model, state, &visible_runs);
+    projection::project_rows_with_visible(
         model,
         &full_rows,
-        &state.operator_snapshot(),
+        &operator,
+        &visible_runs,
         state.filter_query(),
         &HashSet::new(),
         state.view_mode(),
@@ -1598,16 +1619,24 @@ pub(crate) fn build_uncollapsed_rows(model: &DomainModel, state: &AppState) -> V
     .rows
 }
 
-fn build_full_rows(model: &DomainModel, state: &AppState) -> Vec<TreeRow> {
+fn build_full_rows(
+    model: &DomainModel,
+    state: &AppState,
+    visible_runs: &HashSet<RunId>,
+) -> Vec<TreeRow> {
     let statuses = StatusReadModel::from_model(model, state.now_ms());
     match state.view_mode() {
         ViewMode::ExecutionTree => {
             let newest_agents = newest_agent_nodes(model, state.now_ms());
-            build_tree_rows_with_statuses(model, state, &newest_agents, &statuses)
+            build_tree_rows_with_statuses(model, state, &newest_agents, &statuses, visible_runs)
         }
-        ViewMode::DependencyDag => {
-            dag::build_rows_with_statuses(model, state.dag_order(), state.now_ms(), &statuses)
-        }
+        ViewMode::DependencyDag => dag::build_rows_with_statuses_visible(
+            model,
+            state.dag_order(),
+            state.now_ms(),
+            &statuses,
+            visible_runs,
+        ),
     }
 }
 
@@ -1617,11 +1646,13 @@ fn append_execution_tree_rows<'model>(
     state: &AppState,
     newest_agents: &NewestAgentNodes<'model>,
     statuses: &StatusReadModel,
+    visible_runs: &HashSet<RunId>,
 ) {
-    let (mut pane_runs, unattached, nested_runs) = place_runs(model, state);
+    let (mut pane_runs, unattached, nested_runs) = place_runs(model, state, visible_runs);
     let live_lines = LiveLineReadModel::from_model(model);
     let stalled_runs =
         projection::stalled_run_ids(model, state.now_ms(), crate::activity::stall_warn_ms());
+    let native_aliases = projection::NativeAliasIndex::from_model(model);
     let run_row_context = RunRowContext {
         model,
         nested_runs: &nested_runs,
@@ -1629,6 +1660,7 @@ fn append_execution_tree_rows<'model>(
         live_lines: &live_lines,
         stalled_runs: &stalled_runs,
         statuses,
+        native_aliases: &native_aliases,
         now_ms: state.now_ms(),
     };
     let mut run_render_state = RunRenderState::default();
@@ -1733,29 +1765,21 @@ fn append_execution_tree_rows<'model>(
     }
 }
 
-fn place_runs(model: &DomainModel, state: &AppState) -> (PaneRuns, Vec<RunId>, NestedRuns) {
+fn place_runs(
+    model: &DomainModel,
+    state: &AppState,
+    default_visible_runs: &HashSet<RunId>,
+) -> (PaneRuns, Vec<RunId>, NestedRuns) {
     let mut pane_runs = PaneRuns::new();
     let mut unattached = Vec::new();
     let mut unplaced = Vec::new();
     let mut candidate_parents = HashMap::new();
-    let mut runs = model.task_runs().collect::<Vec<_>>();
+    let mut runs = model
+        .task_runs()
+        .filter(|run| default_visible_runs.contains(&run.run_id))
+        .collect::<Vec<_>>();
     // Keep discovery deterministic; each output collection owns its display ordering below.
     runs.sort_by_key(|run| run.run_id);
-    let execution_run_ids = crate::activity::runs_with_executions(model);
-    let operator = state.operator_snapshot();
-    let default_visible_runs = runs
-        .iter()
-        .filter(|run| {
-            crate::activity::is_default_visible_task_run(
-                run,
-                &operator,
-                &execution_run_ids,
-                state.now_ms(),
-            )
-        })
-        .map(|run| run.run_id)
-        .collect::<HashSet<_>>();
-
     for run in runs {
         let all_executions = model
             .executions()
@@ -1964,7 +1988,7 @@ fn append_run_subtree(
             provider_from_key(&run.key).is_none_or(|provider| provider == agent.provider)
         })
         .collect::<Vec<_>>();
-    append_agent_rows(rows, agents, pane_id, depth.saturating_add(1));
+    append_agent_rows(rows, agents, pane_id, depth.saturating_add(1), context);
     let expand_nested_runs = !shared || render_state.expanded_shared_runs.insert(run_id);
     if expand_nested_runs && let Some(children) = context.nested_runs.get(&run_id) {
         for child_run_id in children {
@@ -1987,6 +2011,7 @@ fn append_agent_rows(
     agents: Vec<&AgentNode>,
     pane_id: Option<&str>,
     depth: usize,
+    context: &RunRowContext<'_, '_>,
 ) {
     // Filtering happens before this hierarchy is built. A visible child whose stale parent was
     // removed therefore becomes a root under the owning run instead of being silently orphaned.
@@ -2011,7 +2036,7 @@ fn append_agent_rows(
 
     let mut visited = HashSet::new();
     for root in roots {
-        append_agent_subtree(rows, root, &children, pane_id, depth, &mut visited);
+        append_agent_subtree(rows, root, &children, pane_id, depth, &mut visited, context);
     }
 }
 
@@ -2026,6 +2051,7 @@ fn append_agent_subtree(
     pane_id: Option<&str>,
     depth: usize,
     visited: &mut HashSet<String>,
+    context: &RunRowContext<'_, '_>,
 ) {
     if !visited.insert(agent.agent_node_id.clone()) {
         return;
@@ -2037,7 +2063,7 @@ fn append_agent_subtree(
             pane_id: pane_id.map(str::to_owned),
         },
         depth,
-        label: agent_node_label(agent, display_status),
+        label: agent_node_label(context.model, context.native_aliases, agent, display_status),
         label_without_duration_suffix: None,
         display_status: Some(display_status),
         prerequisites: Vec::new(),
@@ -2052,23 +2078,30 @@ fn append_agent_subtree(
                 pane_id,
                 depth.saturating_add(1),
                 visited,
+                context,
             );
         }
     }
 }
 
-fn agent_node_label(agent: &AgentNode, display_status: DisplayStatus) -> String {
-    let identity = agent
-        .native_session_id
-        .as_deref()
-        .unwrap_or(&agent.agent_node_id);
+/// Renders an Agent row from its own evidence plus the resolved run role; the native session
+/// ID and Agent Node ID stay in Detail.
+fn agent_node_label(
+    model: &DomainModel,
+    native_aliases: &projection::NativeAliasIndex,
+    agent: &AgentNode,
+    display_status: DisplayStatus,
+) -> String {
     let mut label = format!(
-        "{} {} {} native agent: {}",
+        "{} {} {} native agent",
         display_status.glyph(),
         display_status.status.label(),
         provider_label(agent.provider),
-        safe_text(identity),
     );
+    if let Some(role) = projection::agent_role_label(model, native_aliases, agent) {
+        label.push_str(": ");
+        label.push_str(&role);
+    }
     if let Some(model) = agent.model_id.as_deref() {
         label.push_str(&format!(" [model:{}]", safe_text(model)));
     }
@@ -2088,7 +2121,7 @@ pub(crate) fn task_run_label(
 ) -> String {
     let mut label = run_row_head(model, run, display_status);
     if show_duration_suffix {
-        append_run_duration(&mut label, run, now_ms);
+        append_run_duration(&mut label, model, run, now_ms);
     }
     append_task_run_annotations(model, run, label, shared, true)
 }
@@ -2125,9 +2158,20 @@ fn append_task_run_annotations(
         label.push_str(" [shared]");
     }
     if show_dispatch_parent && let Some(parent) = dispatch_parent_run(model, run.run_id) {
-        label.push_str(&format!(" [dispatched by: {}]", short_run_name(parent)));
+        label.push_str(&format!(
+            " [dispatched by: {}]",
+            dispatch_parent_label(model, parent)
+        ));
     }
     label
+}
+
+/// Names a dispatch parent without provider identity: its stable kind, then its captured
+/// subject, then the key-derived worker kind. Never the `short_run_name` identity fallback.
+fn dispatch_parent_label(model: &DomainModel, parent: &TaskRun) -> String {
+    projection::stable_run_kind(model, parent.run_id)
+        .or_else(|| parent.subject.as_deref().map(safe_text))
+        .unwrap_or_else(|| projection::worker_kind_label(parent))
 }
 
 fn dispatch_parent_run(model: &DomainModel, child_run_id: RunId) -> Option<&TaskRun> {
@@ -2218,14 +2262,14 @@ fn run_row_label_with_agent(
                 line
             })
     });
-    if !run.state.is_terminal()
+    if model.effective_lifecycle_end_ms(run).is_none()
         && let Some(live_line) = live_line
     {
         label.push_str(" — ");
         label.push_str(&live_line);
     }
     if show_duration_suffix {
-        append_run_duration(&mut label, run, now_ms);
+        append_run_duration(&mut label, model, run, now_ms);
     }
     label
 }
@@ -2238,12 +2282,17 @@ fn run_row_head(model: &DomainModel, run: &TaskRun, display_status: DisplayStatu
     );
     let run_kind = projection::run_kind_label(model, run);
     label.push_str(&run_kind);
-    let subject = if is_codex_worker(model, run) {
+    // A Codex child renders the kind alone. Any other provider-backed run keeps a captured
+    // subject but never falls back to its native session, hook session, or run identity; only a
+    // non-provider run still uses the key-derived fallback.
+    let subject = if projection::is_codex_child(model, run) {
+        String::new()
+    } else if let Some(subject) = run.subject.as_deref() {
+        safe_text(subject)
+    } else if projection::provider_backed_provider(model, run).is_some() {
         String::new()
     } else {
-        run.subject
-            .as_deref()
-            .map_or_else(|| run_subject_fallback(run), safe_text)
+        run_subject_fallback(run)
     };
     if !subject.is_empty() {
         label.push(' ');
@@ -2252,13 +2301,9 @@ fn run_row_head(model: &DomainModel, run: &TaskRun, display_status: DisplayStatu
     label
 }
 
-fn append_run_duration(label: &mut String, run: &TaskRun, now_ms: i64) {
+fn append_run_duration(label: &mut String, model: &DomainModel, run: &TaskRun, now_ms: i64) {
     let elapsed_ms = run.created_at_ms.and_then(|created_at_ms| {
-        let end_ms = if run.state.is_terminal() {
-            run.finished_at_ms?
-        } else {
-            now_ms
-        };
+        let end_ms = model.effective_lifecycle_end_ms(run).unwrap_or(now_ms);
         end_ms
             .checked_sub(created_at_ms)
             .filter(|elapsed_ms| *elapsed_ms >= 0)
@@ -2279,29 +2324,11 @@ fn run_uses_claude_tool_line(run: &TaskRun, agent: &AgentNode) -> bool {
     }
 }
 
-fn is_codex_worker(model: &DomainModel, run: &TaskRun) -> bool {
-    matches!(
-        &run.key,
-        RunKey::Native {
-            provider: Provider::Codex,
-            ..
-        } | RunKey::NativePath {
-            provider: Provider::Codex,
-            ..
-        }
-    ) && model
-        .execution_edges()
-        .any(|edge| edge.child_run_id == run.run_id)
-}
-
+/// Key-derived subject for a run without provider backing; provider identities never reach here.
 fn run_subject_fallback(run: &TaskRun) -> String {
     match &run.key {
-        RunKey::Controller(name) => name
-            .strip_prefix("hook:claude-code:")
-            .filter(|suffix| !suffix.contains(':'))
-            .map_or_else(|| run_name(run), safe_text),
-        RunKey::Native { sid, .. } => safe_text(sid),
-        RunKey::NativePath { .. } => run.run_id.to_string(),
+        RunKey::Controller(name) => safe_text(name),
+        RunKey::Native { .. } | RunKey::NativePath { .. } => String::new(),
         RunKey::Provisional {
             terminal_id,
             start_ms,
@@ -2322,24 +2349,6 @@ fn format_duration(elapsed_ms: i64) -> String {
         format!("{minutes:02}m{seconds:02}s")
     } else {
         format!("{total_seconds:02}s")
-    }
-}
-
-fn run_name(run: &TaskRun) -> String {
-    match &run.key {
-        RunKey::Controller(name) => safe_text(name),
-        RunKey::Native { provider, sid } => {
-            format!("{} {}", provider_label(*provider), safe_text(sid))
-        }
-        RunKey::NativePath { provider, path } => {
-            let _ = path;
-            format!("{} {}", provider_label(*provider), run.run_id)
-        }
-        RunKey::Provisional {
-            terminal_id,
-            start_ms,
-            seq,
-        } => format!("provisional {}:{start_ms}:{seq}", safe_text(terminal_id)),
     }
 }
 
@@ -2424,11 +2433,13 @@ mod tests {
     };
     use crate::model::{
         AgentNode, DependencyEdge, DisplayOrdinal, DomainModel, ExecState, Execution,
-        ExecutionEdge, Pane, PaneAgentStatus, Provider, RunId, RunKey, Tab, TaskRun, TaskState,
-        Workspace,
+        ExecutionEdge, NativeSessionEnd, NativeSessionEndStatus, ObservationOrigin, Pane,
+        PaneAgentStatus, PaneAgentStatusObservation, Provider, RunId, RunKey, RunRateTotals, Tab,
+        TaskRun, TaskRunV6State, TaskState, TokenBreakdown, TurnAttr, Workspace,
     };
     use crate::performance::{PerformanceDegradationReason, PerformanceSnapshot};
-    use crate::store::writer::PersistenceStatus;
+    use crate::reducer::Reducer;
+    use crate::store::{RestoredState, writer::PersistenceStatus};
     use crate::tui::app::{App, AppState, Clock, HeaderInputs, SystemClock, TuiSetup};
 
     fn run_id(value: &str) -> RunId {
@@ -2911,7 +2922,7 @@ mod tests {
                 .unwrap();
             assert!(
                 row.label
-                    .starts_with(&format!("{expected} Codex native agent:")),
+                    .starts_with(&format!("{expected} Codex native agent")),
                 "{}",
                 row.label,
             );
@@ -3032,6 +3043,123 @@ mod tests {
     }
 
     #[test]
+    fn native_session_end_suppresses_live_line_but_runtime_status_does_not() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let run = label_run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "native-end".to_owned(),
+            },
+            TaskState::Running,
+            None,
+            None,
+            Some("subject"),
+        );
+        let mut model = DomainModel::default();
+        model.insert_task_run(run.clone());
+        model.insert_agent_node(label_agent(
+            "live-line",
+            run_id,
+            Some(2),
+            Some(crate::provider::lane::LIVE_LINE_EVENT_KIND),
+            Some("must stay while resumable"),
+            None,
+        ));
+        let live_lines = LiveLineReadModel::from_model(&model);
+
+        for status in [
+            projection::TaskDisplayStatus::Idle,
+            projection::TaskDisplayStatus::Blocked,
+            projection::TaskDisplayStatus::Unknown,
+        ] {
+            let label = run_row_label_with_agent(
+                &model,
+                &run,
+                None,
+                3,
+                &live_lines,
+                projection::DisplayStatus::new(status, projection::StatusSource::AgentNodeState),
+                true,
+            );
+            assert!(label.contains(" — must stay while resumable"), "{label}");
+        }
+
+        model.set_task_run_v6_state(
+            run_id,
+            TaskRunV6State {
+                native_session_end: Some(NativeSessionEnd {
+                    status: NativeSessionEndStatus::Cancelled,
+                    at_ms: 3,
+                }),
+                ..TaskRunV6State::default()
+            },
+        );
+        let terminal_label = run_row_label_with_agent(
+            &model,
+            &run,
+            None,
+            3,
+            &live_lines,
+            projection::DisplayStatus::new(
+                projection::TaskDisplayStatus::Cancelled,
+                projection::StatusSource::NativeSessionLifecycle,
+            ),
+            true,
+        );
+
+        assert_eq!(terminal_label, "⊘ cancelled Codex subject");
+    }
+
+    #[test]
+    fn native_session_end_freezes_time_metric_and_duration_suffix() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let run = label_run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "frozen-duration".to_owned(),
+            },
+            TaskState::Running,
+            Some(1_000),
+            None,
+            Some("subject"),
+        );
+        let mut model = DomainModel::default();
+        model.insert_task_run(run.clone());
+        model.set_task_run_v6_state(
+            run_id,
+            TaskRunV6State {
+                native_session_end: Some(NativeSessionEnd {
+                    status: NativeSessionEndStatus::Done,
+                    at_ms: 4_000,
+                }),
+                ..TaskRunV6State::default()
+            },
+        );
+
+        assert_eq!(
+            format_time_value(&projection::run_metric_inputs(&model, &run), 10_000),
+            "03s"
+        );
+        assert_eq!(
+            run_row_label_with_agent(
+                &model,
+                &run,
+                None,
+                10_000,
+                &LiveLineReadModel::default(),
+                projection::DisplayStatus::new(
+                    projection::TaskDisplayStatus::Done,
+                    projection::StatusSource::NativeSessionLifecycle,
+                ),
+                true,
+            ),
+            "✓ done Codex subject · 03s"
+        );
+    }
+
+    #[test]
     fn build_rows_marks_quiet_run_stalled() {
         let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let now_ms = SystemClock.now_ms();
@@ -3130,7 +3258,301 @@ mod tests {
     }
 
     #[test]
-    fn summary_rows_group_all_runs_and_count_only_valid_terminal_durations() {
+    fn controller_primary_codex_rows_render_roles_without_provider_ids() {
+        const ROOT_SID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        const CHILD_SID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        const PANE_CHILD_SID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        const STRANGER_SID: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        const CLAUDE_SID: &str = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+        const CLAUDE_AGENT_ID: &str = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+        const WORKER_NODE: &str = "11111111-1111-4111-8111-111111111111";
+        const STRANGER_NODE: &str = "22222222-2222-4222-8222-222222222222";
+        const CLAUDE_NODE: &str = "33333333-3333-4333-8333-333333333333";
+        let root_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let child_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let pane_child_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        let claude_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAY");
+        let codex_run = |run_id: RunId, key: RunKey, ordinal: i64, subject: Option<&str>| TaskRun {
+            run_id,
+            key,
+            display_ordinal: DisplayOrdinal::new(ordinal),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: subject.map(str::to_owned),
+            dismissed_at_ms: None,
+        };
+        let agent = |agent_node_id: &str,
+                     provider: Provider,
+                     sid: &str,
+                     owner: RunId,
+                     ordinal: i64,
+                     parent: &str,
+                     model_id: Option<&str>,
+                     last_activity_at_ms: Option<i64>| AgentNode {
+            agent_node_id: agent_node_id.to_owned(),
+            provider,
+            native_session_id: Some(sid.to_owned()),
+            task_run_id: owner,
+            display_ordinal: DisplayOrdinal::new(ordinal),
+            parent_agent_node_id: Some(parent.to_owned()),
+            state: Some(ExecState::Working),
+            model_id: model_id.map(str::to_owned),
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms,
+            session_file: None,
+        };
+        let agent_row = |rows: &[TreeRow], agent_node_id: &str| -> TreeRow {
+            rows.iter()
+                .find(|row| {
+                    matches!(
+                        &row.key,
+                        NodeKey::Agent { agent_node_id: candidate, .. } if candidate == agent_node_id
+                    )
+                })
+                .cloned()
+                .unwrap_or_else(|| panic!("missing Agent row {agent_node_id}"))
+        };
+
+        // `converged` models the Controller/native identity convergence: the hook-created
+        // Controller key stays primary while the exact native session becomes an alias.
+        for converged in [false, true] {
+            let codex_key = |sid: &str| {
+                if converged {
+                    RunKey::Controller(format!("hook:codex:{sid}"))
+                } else {
+                    RunKey::Native {
+                        provider: Provider::Codex,
+                        sid: sid.to_owned(),
+                    }
+                }
+            };
+            let mut model = placement_model(&["pane-root", "pane-child", "pane-claude"]);
+            model.insert_task_run(codex_run(root_id, codex_key(ROOT_SID), 1, None));
+            model.insert_task_run(codex_run(
+                child_id,
+                codex_key(CHILD_SID),
+                2,
+                converged.then_some(CHILD_SID),
+            ));
+            model.insert_task_run(codex_run(pane_child_id, codex_key(PANE_CHILD_SID), 3, None));
+            if converged {
+                for (sid, run_id) in [
+                    (ROOT_SID, root_id),
+                    (CHILD_SID, child_id),
+                    (PANE_CHILD_SID, pane_child_id),
+                ] {
+                    model.insert_task_run_alias(
+                        RunKey::Native {
+                            provider: Provider::Codex,
+                            sid: sid.to_owned(),
+                        },
+                        run_id,
+                    );
+                }
+            }
+            model.set_run_kind(root_id, "codex-tui".to_owned());
+            model.set_run_kind(child_id, "worker".to_owned());
+            model.set_run_kind(pane_child_id, "worker".to_owned());
+            insert_placement_execution(
+                &mut model,
+                root_id,
+                "root-execution",
+                "pane-root",
+                ExecState::Working,
+            );
+            insert_placement_execution(
+                &mut model,
+                pane_child_id,
+                "pane-child-execution",
+                "pane-child",
+                ExecState::Working,
+            );
+            for child_run_id in [child_id, pane_child_id] {
+                model.insert_execution_edge(ExecutionEdge {
+                    parent_run_id: root_id,
+                    child_run_id,
+                });
+            }
+            // Codex Agent Nodes are owned by the root run and parented under its hidden
+            // provider root; only the exact native alias binds one to the child Task Run.
+            model.insert_agent_node(agent(
+                WORKER_NODE,
+                Provider::Codex,
+                CHILD_SID,
+                root_id,
+                10,
+                "provider-root",
+                Some("gpt-5"),
+                Some(5),
+            ));
+            model.insert_agent_node(agent(
+                STRANGER_NODE,
+                Provider::Codex,
+                STRANGER_SID,
+                root_id,
+                11,
+                "provider-root",
+                None,
+                None,
+            ));
+            // A Claude subagent run is Controller-keyed with no native alias; its Agent Node
+            // is owned by that run and carries the agent ID as its native session.
+            model.insert_task_run(codex_run(
+                claude_id,
+                RunKey::Controller(format!(
+                    "hook:claude-code:{CLAUDE_SID}:agent:{CLAUDE_AGENT_ID}"
+                )),
+                4,
+                None,
+            ));
+            model.set_run_kind(claude_id, "reviewer".to_owned());
+            insert_placement_execution(
+                &mut model,
+                claude_id,
+                "claude-execution",
+                "pane-claude",
+                ExecState::Working,
+            );
+            model.insert_agent_node(agent(
+                CLAUDE_NODE,
+                Provider::Claude,
+                CLAUDE_AGENT_ID,
+                claude_id,
+                12,
+                "claude-root",
+                None,
+                None,
+            ));
+
+            let state = AppState::default();
+            let rows = build_rows(&model, &state);
+            let root_row = only_run_row(&rows, root_id).clone();
+            let child_row = only_run_row(&rows, child_id).clone();
+            let pane_child_row = only_run_row(&rows, pane_child_id).clone();
+            let claude_row = only_run_row(&rows, claude_id).clone();
+
+            assert_eq!(
+                root_row.label, "● working codex-tui",
+                "converged={converged}: Codex root renders its kind alone"
+            );
+            assert_eq!(
+                child_row.label, "● working worker",
+                "converged={converged}: Codex child renders its role alone"
+            );
+            assert_eq!(
+                child_row.depth,
+                root_row.depth + 1,
+                "converged={converged}: headless child nests under its dispatch parent"
+            );
+            assert_eq!(
+                pane_child_row.label, "● working worker [dispatched by: codex-tui]",
+                "converged={converged}: pane-placed child names its parent by kind"
+            );
+            assert_eq!(
+                claude_row.label, "● working reviewer",
+                "converged={converged}: Claude subagent run renders its kind alone"
+            );
+            assert_eq!(
+                agent_row(&rows, WORKER_NODE).label,
+                "● working Codex native agent: worker [model:gpt-5] [last:5ms]",
+                "converged={converged}: exact-bound Codex agent renders the child role"
+            );
+            assert_eq!(
+                agent_row(&rows, STRANGER_NODE).label,
+                "● working Codex native agent",
+                "converged={converged}: unmatched Codex agent renders no identity suffix"
+            );
+            assert_eq!(
+                agent_row(&rows, CLAUDE_NODE).label,
+                "● working Claude native agent: reviewer",
+                "converged={converged}: Controller-keyed Claude agent renders its owning run kind"
+            );
+            let identities = [
+                ROOT_SID,
+                CHILD_SID,
+                PANE_CHILD_SID,
+                STRANGER_SID,
+                CLAUDE_SID,
+                CLAUDE_AGENT_ID,
+                WORKER_NODE,
+                STRANGER_NODE,
+                CLAUDE_NODE,
+            ];
+            let run_ids = [root_id, child_id, pane_child_id, claude_id].map(|id| id.to_string());
+            for row in rows
+                .iter()
+                .filter(|row| matches!(row.key, NodeKey::Run { .. } | NodeKey::Agent { .. }))
+            {
+                for identity in identities
+                    .iter()
+                    .copied()
+                    .chain(run_ids.iter().map(String::as_str))
+                {
+                    assert!(
+                        !row.label.contains(identity),
+                        "converged={converged}: primary row leaks {identity}: {}",
+                        row.label
+                    );
+                }
+            }
+
+            // A captured human subject is retained on the non-child root.
+            model.insert_task_run(codex_run(
+                root_id,
+                codex_key(ROOT_SID),
+                1,
+                Some("Ship the release"),
+            ));
+            let subject_rows = build_rows(&model, &state);
+            assert_eq!(
+                only_run_row(&subject_rows, root_id).label,
+                "● working codex-tui Ship the release",
+                "converged={converged}: the root keeps its captured subject"
+            );
+
+            // Detail remains the complete identity surface.
+            let operator = state.operator_snapshot();
+            let child_detail = projection::detail_lines(&projection::detail_projection(
+                &model,
+                &subject_rows,
+                &operator,
+                &child_row.key,
+                ViewMode::ExecutionTree,
+                None,
+            ));
+            assert!(
+                child_detail
+                    .iter()
+                    .any(|line| line.starts_with("key: ") && line.contains(CHILD_SID)),
+                "converged={converged}: child detail key: {child_detail:?}"
+            );
+            assert!(child_detail.contains(&format!("run_id: {child_id}")));
+            if !converged {
+                // Detail's native_session_id line is unchanged: a native-primary key reports
+                // itself, while a Controller-primary key reports its owned Agent Nodes.
+                assert!(child_detail.contains(&format!("native_session_id: {CHILD_SID}")));
+            }
+            let agent_detail = projection::detail_lines(&projection::detail_projection(
+                &model,
+                &subject_rows,
+                &operator,
+                &agent_row(&subject_rows, WORKER_NODE).key,
+                ViewMode::ExecutionTree,
+                None,
+            ));
+            assert!(agent_detail.contains(&format!("agent_node_id: {WORKER_NODE}")));
+            assert!(agent_detail.contains(&format!("native_session_id: {CHILD_SID}")));
+        }
+    }
+
+    #[test]
+    fn summary_rows_group_all_runs_by_effective_endpoint() {
         let mut model = DomainModel::default();
         let fixtures = [
             (
@@ -3146,7 +3568,7 @@ mod tests {
                 RunKey::Controller("hook:claude-code:S:task:B".to_owned()),
                 TaskState::Running,
                 Some(2_000),
-                Some(99_000),
+                None,
                 Some("model-a"),
             ),
             (
@@ -3154,7 +3576,7 @@ mod tests {
                 RunKey::Controller("hook:claude-code:S:task:C".to_owned()),
                 TaskState::Failed,
                 None,
-                None,
+                Some(12_000),
                 Some("model-a"),
             ),
             (
@@ -3195,7 +3617,7 @@ mod tests {
                 },
                 TaskState::Blocked,
                 Some(2_000),
-                Some(90_000),
+                None,
                 Some("model-a"),
             ),
             (
@@ -3222,6 +3644,13 @@ mod tests {
                     None,
                     None,
                     false,
+                );
+                model.set_run_rate_totals(
+                    run_id,
+                    crate::model::RunRateTotals {
+                        output_tokens: 10,
+                        working_ms: 1_000,
+                    },
                 );
             }
         }
@@ -3399,7 +3828,7 @@ mod tests {
                 ),
                 None,
                 5_000,
-                "◌ queued claude-code hook:claude-code:S:task:T",
+                "◌ queued claude-code",
             ),
             (
                 label_run(
@@ -3732,7 +4161,7 @@ mod tests {
                 10,
                 true,
             ),
-            "● working claude-code Shared child [shared] [dispatched by: Parent]"
+            "● working claude-code Shared child [shared] [dispatched by: Parent subject]"
         );
         assert_eq!(
             task_run_label(
@@ -3816,7 +4245,7 @@ mod tests {
     }
 
     #[test]
-    fn tok_output_only_and_mean_stable_across_completion() {
+    fn lifetime_output_and_measured_rate_are_stable_across_completion() {
         let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let running = label_run(
             run_id,
@@ -3836,6 +4265,13 @@ mod tests {
             Some("xhigh".to_owned()),
             None,
             true,
+        );
+        model.set_run_rate_totals(
+            run_id,
+            crate::model::RunRateTotals {
+                output_tokens: 83,
+                working_ms: 10_000,
+            },
         );
         let running_metrics = projection::run_metric_inputs(&model, &running);
 
@@ -3858,15 +4294,15 @@ mod tests {
             "the cumulative mean must stop at the terminal timestamp"
         );
 
-        let mut future_started = running_metrics.clone();
-        future_started.started_wall_ms = Some(10_001);
+        let mut unrated = running_metrics.clone();
+        unrated.measured_working_ms = Some(0);
         assert_eq!(
-            format_metric_value(MetricColumn::TokPerSecond, &future_started, 10_000),
+            format_metric_value(MetricColumn::TokPerSecond, &unrated, 10_000),
             "—"
         );
-        future_started.started_wall_ms = Some(10_000);
+        unrated.measured_working_ms = None;
         assert_eq!(
-            format_metric_value(MetricColumn::TokPerSecond, &future_started, 10_000),
+            format_metric_value(MetricColumn::TokPerSecond, &unrated, 10_000),
             "—"
         );
     }
@@ -3880,14 +4316,14 @@ mod tests {
                     provider: Provider::Codex,
                     sid: "native-session".to_owned(),
                 },
-                "● working Codex native-session",
+                "● working Codex",
             ),
             (
                 RunKey::NativePath {
                     provider: Provider::Codex,
                     path: "/private/session.jsonl".to_owned(),
                 },
-                "● working Codex 01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "● working Codex",
             ),
             (
                 RunKey::Provisional {
@@ -3899,7 +4335,19 @@ mod tests {
             ),
             (
                 RunKey::Controller("hook:claude-code:S:task:T".to_owned()),
-                "● working claude-code hook:claude-code:S:task:T",
+                "● working claude-code",
+            ),
+            (
+                RunKey::Controller("hook:claude-code:S".to_owned()),
+                "● working claude-code",
+            ),
+            (
+                RunKey::Controller("hook:unknown:S".to_owned()),
+                "● working unknown hook:unknown:S",
+            ),
+            (
+                RunKey::Controller("controller".to_owned()),
+                "● working controller controller",
             ),
         ] {
             let run = label_run(run_id, key, TaskState::Running, None, None, None);
@@ -4370,8 +4818,10 @@ mod tests {
         let workspace_x = label_column("Workspace: api");
         let tab_x = label_column("Tab: implementation");
         let pane_x = label_column("Pane: w1:p1");
-        let run_x = label_column("Codex controller");
-        let agent_x = label_column("Codex native agent: investigate");
+        // The provider-backed root has no captured subject, so its row is the kind alone and
+        // its unmatched Agent row carries no identity suffix.
+        let run_x = label_column("● working Codex") + Span::raw("● working ").width();
+        let agent_x = label_column("Codex native agent");
         assert_eq!(workspace_x, session_x + 4);
         assert_eq!(tab_x, workspace_x + 4);
         assert_eq!(pane_x, tab_x + 4);
@@ -4889,6 +5339,234 @@ mod tests {
         assert!(
             help.contains("headless rows use task/agent evidence"),
             "{help}"
+        );
+    }
+
+    #[test]
+    fn help_explains_append_only_history_visibility_and_active_time_rates() {
+        let help = help_lines(&healthy_runtime_diagnostics(), &TuiSetup::default()).join("\n");
+
+        assert!(
+            help.contains("oldest at top; new sessions append below"),
+            "{help}"
+        );
+        assert!(
+            help.contains(
+                "Terminal roots and descendants stay 1h; Summary retains published history"
+            ),
+            "{help}"
+        );
+        assert!(
+            help.contains(
+                "tok/s uses measured Working time; Idle, history, and offline time add none"
+            ),
+            "{help}"
+        );
+        assert!(!help.contains("auto-dismiss"), "{help}");
+        assert!(!help.contains("wall-time tok/s"), "{help}");
+    }
+
+    #[test]
+    fn summary_and_rate_use_retained_measured_totals_without_a_cursor() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let run = label_run(
+            run_id,
+            RunKey::Native {
+                provider: Provider::Codex,
+                sid: "restored-hidden-history".to_owned(),
+            },
+            TaskState::Completed,
+            Some(1_000),
+            Some(2_000),
+            None,
+        );
+        let mut model = DomainModel::default();
+        model.insert_task_run(run.clone());
+        model.set_run_rate_totals(
+            run_id,
+            crate::model::RunRateTotals {
+                output_tokens: 90,
+                working_ms: 3_000,
+            },
+        );
+        assert!(model.run_rate_cursor(&run_id).is_none());
+
+        let metrics = projection::run_metric_inputs(&model, &run);
+        assert_eq!(
+            format_metric_value(MetricColumn::TokPerSecond, &metrics, 99_000),
+            "30/s"
+        );
+        let summary = projection::summary_projection(
+            &model,
+            &[],
+            None,
+            projection::SummaryScope::Session,
+            99_000,
+        );
+        assert_eq!(summary.worker_kinds.len(), 1);
+        assert_eq!(summary.worker_kinds[0].run_count, 1);
+        assert_eq!(summary.worker_kinds[0].mean_tokens_per_second, Some(30.0));
+    }
+
+    #[test]
+    fn restored_rate_epoch_uses_exact_live_observation_times_and_never_bridges_offline_time() {
+        let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let key = RunKey::Native {
+            provider: Provider::Codex,
+            sid: "deterministic-rate".to_owned(),
+        };
+        let mut model = placement_model(&["pane-rate"]);
+        model.insert_task_run(TaskRun {
+            run_id,
+            key: key.clone(),
+            display_ordinal: DisplayOrdinal::new(10),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+            created_at_ms: Some(1_000),
+            updated_at_ms: Some(2_000),
+            finished_at_ms: None,
+            subject: None,
+            dismissed_at_ms: None,
+        });
+        model.insert_execution(Execution {
+            execution_id: "rate-execution".to_owned(),
+            pane_id: "pane-rate".to_owned(),
+            terminal_id: "terminal-pane-rate".to_owned(),
+            task_run_id: run_id,
+            state: ExecState::Working,
+        });
+        model
+            .telemetry_entry(run_id, 2_000)
+            .accumulate(100, None, None, None, false);
+        model.set_run_rate_totals(
+            run_id,
+            RunRateTotals {
+                output_tokens: 70,
+                working_ms: 3_000,
+            },
+        );
+        let (mut reducer, shared) = Reducer::new(RestoredState {
+            model,
+            next_ordinal: 11,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        });
+
+        let epoch = reducer.begin_rate_epoch();
+        reducer.activate_rate_epoch(50_000);
+        let live = ObservationOrigin::Live;
+        reducer.begin_provider_observation(&live, 50_000);
+        reducer
+            .apply_pane_agent_observation(
+                Vec::new(),
+                PaneAgentStatusObservation {
+                    pane_id: "pane-rate".to_owned(),
+                    status: PaneAgentStatus::Working,
+                },
+            )
+            .unwrap();
+        reducer.finish_provider_observation(None, Vec::new(), &live, None, 50_000);
+        let baseline = shared.borrow();
+        assert_eq!(
+            baseline.run_rate_totals(&run_id),
+            Some(&RunRateTotals {
+                output_tokens: 70,
+                working_ms: 3_000,
+            })
+        );
+        let cursor = baseline.run_rate_cursor(&run_id).unwrap();
+        assert_eq!(cursor.measurement_epoch, epoch);
+        assert_eq!(cursor.baseline_output_tokens, 100);
+        assert_eq!(cursor.last_observed_at_ms, 50_000);
+        assert!(cursor.working);
+        drop(baseline);
+
+        reducer.begin_provider_observation(&live, 52_000);
+        reducer.apply_telemetry_with_breakdown(
+            &key,
+            52_000,
+            40,
+            TokenBreakdown::default(),
+            TurnAttr {
+                model: None,
+                effort: None,
+                sandbox: None,
+            },
+        );
+        reducer.finish_provider_observation(None, Vec::new(), &live, None, 52_000);
+        assert_eq!(
+            shared.borrow().run_rate_totals(&run_id),
+            Some(&RunRateTotals {
+                output_tokens: 110,
+                working_ms: 5_000,
+            })
+        );
+
+        reducer.begin_provider_observation(&live, 52_000);
+        reducer
+            .apply_pane_agent_observation(
+                Vec::new(),
+                PaneAgentStatusObservation {
+                    pane_id: "pane-rate".to_owned(),
+                    status: PaneAgentStatus::Idle,
+                },
+            )
+            .unwrap();
+        reducer.finish_provider_observation(None, Vec::new(), &live, None, 52_000);
+        let idle_start = *shared.borrow().run_rate_totals(&run_id).unwrap();
+
+        reducer.begin_provider_observation(&live, 62_000);
+        reducer.apply_telemetry_with_breakdown(
+            &key,
+            62_000,
+            10,
+            TokenBreakdown::default(),
+            TurnAttr {
+                model: None,
+                effort: None,
+                sandbox: None,
+            },
+        );
+        reducer.finish_provider_observation(None, Vec::new(), &live, None, 62_000);
+        assert_eq!(
+            shared.borrow().run_rate_totals(&run_id),
+            Some(&RunRateTotals {
+                output_tokens: idle_start.output_tokens + 10,
+                working_ms: idle_start.working_ms,
+            })
+        );
+
+        reducer.begin_provider_observation(&live, 62_000);
+        reducer
+            .apply_pane_agent_observation(
+                Vec::new(),
+                PaneAgentStatusObservation {
+                    pane_id: "pane-rate".to_owned(),
+                    status: PaneAgentStatus::Working,
+                },
+            )
+            .unwrap();
+        reducer.finish_provider_observation(None, Vec::new(), &live, None, 62_000);
+
+        reducer.begin_provider_observation(&live, 63_000);
+        reducer.apply_telemetry_with_breakdown(
+            &key,
+            63_000,
+            20,
+            TokenBreakdown::default(),
+            TurnAttr {
+                model: None,
+                effort: None,
+                sandbox: None,
+            },
+        );
+        reducer.finish_provider_observation(None, Vec::new(), &live, None, 63_000);
+        assert_eq!(
+            shared.borrow().run_rate_totals(&run_id),
+            Some(&RunRateTotals {
+                output_tokens: 140,
+                working_ms: 6_000,
+            })
         );
     }
 
@@ -5473,7 +6151,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_parent_children_fall_to_unattached() {
+    fn dismissed_parent_is_absent_and_visible_grandchild_becomes_unattached() {
         let root = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let hidden_middle = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
         let visible_grandchild = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
@@ -5509,11 +6187,11 @@ mod tests {
         }
 
         let rows = build_uncollapsed_rows(&model, &AppState::default());
+        let grandchild_row = only_run_row(&rows, visible_grandchild);
         assert!(
             rows.iter()
                 .all(|row| row.key.run_id() != Some(hidden_middle))
         );
-        let grandchild_row = only_run_row(&rows, visible_grandchild);
         assert_eq!(grandchild_row.depth, 2);
         assert_eq!(
             grandchild_row.key,
@@ -5603,6 +6281,121 @@ mod tests {
     }
 
     #[test]
+    fn task_run_siblings_at_three_depths_follow_immutable_oldest_first_ordinals() {
+        let root_old = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAZ");
+        let root_new = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAY");
+        let child_old = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        let child_new = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let grandchild_old = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let grandchild_new = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAT");
+        let mut model = placement_model(&["pane-roots"]);
+
+        for (run_id, label, ordinal) in [
+            (grandchild_new, "grandchild-new", 60),
+            (grandchild_old, "grandchild-old", 50),
+            (child_new, "child-new", 40),
+            (child_old, "child-old", 30),
+            (root_new, "root-new", 20),
+            (root_old, "root-old", 10),
+        ] {
+            insert_placement_run(&mut model, run_id, label, ordinal);
+        }
+        for (run_id, label) in [(root_new, "root-new"), (root_old, "root-old")] {
+            insert_placement_execution(
+                &mut model,
+                run_id,
+                &format!("{label}-execution"),
+                "pane-roots",
+                ExecState::Working,
+            );
+        }
+        for (parent_run_id, child_run_id) in [
+            (root_old, child_new),
+            (root_old, child_old),
+            (child_old, grandchild_new),
+            (child_old, grandchild_old),
+        ] {
+            model.insert_execution_edge(ExecutionEdge {
+                parent_run_id,
+                child_run_id,
+            });
+        }
+
+        let state = AppState::default();
+        let expected_keys = vec![
+            (root_old, 4),
+            (child_old, 5),
+            (grandchild_old, 6),
+            (grandchild_new, 6),
+            (child_new, 5),
+            (root_new, 4),
+        ];
+        let expected_labels = vec![
+            "● working root-old root-old",
+            "● working child-old child-old",
+            "● working grandchild-old grandchild-old",
+            "● working grandchild-new grandchild-new",
+            "● working child-new child-new",
+            "● working root-new root-new",
+        ];
+        let run_keys = |rows: &[TreeRow]| {
+            rows.iter()
+                .filter_map(|row| row.key.run_id().map(|run_id| (run_id, row.depth)))
+                .collect::<Vec<_>>()
+        };
+        let run_labels = |rows: &[TreeRow]| {
+            rows.iter()
+                .filter(|row| row.key.run_id().is_some())
+                .map(|row| row.label.clone())
+                .collect::<Vec<_>>()
+        };
+        let visible = crate::activity::default_visible_task_run_ids(
+            &model,
+            &state.operator_snapshot(),
+            state.now_ms(),
+        );
+        let full_rows = build_full_rows(&model, &state, &visible);
+        let projected = build_projection(&model, &state);
+        assert_eq!(run_keys(&full_rows), expected_keys);
+        assert_eq!(run_keys(&projected.rows), expected_keys);
+        assert_eq!(run_labels(&projected.rows), expected_labels);
+
+        for run_id in [child_new, grandchild_new] {
+            let mut run = model.task_run(&run_id).unwrap().clone();
+            run.state = TaskState::Blocked;
+            model.insert_task_run(run);
+        }
+        model.insert_execution(Execution {
+            execution_id: "root-old-execution".to_owned(),
+            pane_id: "pane-roots".to_owned(),
+            terminal_id: "terminal-pane-roots".to_owned(),
+            task_run_id: root_old,
+            state: ExecState::Idle,
+        });
+
+        let visible = crate::activity::default_visible_task_run_ids(
+            &model,
+            &state.operator_snapshot(),
+            state.now_ms(),
+        );
+        let full_rows_after_status = build_full_rows(&model, &state, &visible);
+        let projected_after_status = build_projection(&model, &state);
+        assert_eq!(run_keys(&full_rows_after_status), expected_keys);
+        assert_eq!(run_keys(&projected_after_status.rows), expected_keys);
+        assert_eq!(
+            run_labels(&projected_after_status.rows),
+            vec![
+                "○ idle root-old root-old",
+                "● working child-old child-old",
+                "● working grandchild-old grandchild-old",
+                "● blocked grandchild-new grandchild-new",
+                "● blocked child-new child-new",
+                "● working root-new root-new",
+            ]
+        );
+    }
+
+    #[test]
     fn agent_rows_follow_persisted_ordinals_and_render_recursive_parentage() {
         let mut model = populated_model();
         let run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
@@ -5647,20 +6440,31 @@ mod tests {
             .filter(|row| matches!(row.key, NodeKey::Agent { .. }))
             .collect::<Vec<_>>();
 
+        let agent_node_id = |row: &TreeRow| match &row.key {
+            NodeKey::Agent { agent_node_id, .. } => agent_node_id.clone(),
+            other => panic!("expected an Agent row, got {other:?}"),
+        };
+
         assert_eq!(agent_rows.len(), 3);
-        assert!(agent_rows[0].label.contains("investigate"));
+        assert_eq!(agent_node_id(agent_rows[0]), "agent-1");
         assert_eq!(agent_rows[0].depth + 1, agent_rows[1].depth);
-        assert!(agent_rows[1].label.contains("child"));
-        assert!(
-            agent_rows[1]
-                .label
-                .starts_with("● working Codex native agent:")
+        assert_eq!(agent_node_id(agent_rows[1]), "agent-child");
+        assert_eq!(
+            agent_rows[1].label,
+            "● working Codex native agent [model:gpt-child] [last:99ms]"
         );
         assert!(!agent_rows[1].label.contains("[state:"));
-        assert!(agent_rows[1].label.contains("model:gpt-child"));
-        assert!(agent_rows[1].label.contains("last:99ms"));
         assert_eq!(agent_rows[0].depth, agent_rows[2].depth);
-        assert!(agent_rows[2].label.contains("orphan"));
+        assert_eq!(agent_node_id(agent_rows[2]), "agent-missing-parent");
+        for row in &agent_rows {
+            for identity in ["investigate", "orphan", "agent-", "native agent:"] {
+                assert!(
+                    !row.label.contains(identity),
+                    "Agent row leaks {identity}: {}",
+                    row.label
+                );
+            }
+        }
     }
 
     #[test]
@@ -5739,6 +6543,99 @@ mod tests {
             !has_agent_row(&rows, "stale-ended"),
             "an ended agent at the inactivity boundary must be hidden"
         );
+    }
+
+    #[test]
+    fn display_stale_parented_ended_agent_refines_exact_bound_child_run() {
+        let root_run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let child_run_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        for (child_state, native_end) in [
+            (TaskState::EndedUnknown, None),
+            (TaskState::Running, Some(NativeSessionEndStatus::Unknown)),
+        ] {
+            let mut model = placement_model(&["pane-root"]);
+            insert_placement_run(&mut model, root_run_id, "hook:codex:controller-root", 1);
+            insert_placement_execution(
+                &mut model,
+                root_run_id,
+                "root-execution",
+                "pane-root",
+                ExecState::Working,
+            );
+            model.insert_task_run(TaskRun {
+                run_id: child_run_id,
+                key: RunKey::Controller("hook:codex:child-sid".to_owned()),
+                display_ordinal: DisplayOrdinal::new(2),
+                state: child_state,
+                has_controller_task_state_event: true,
+                created_at_ms: None,
+                updated_at_ms: None,
+                finished_at_ms: (child_state == TaskState::EndedUnknown).then_some(0),
+                subject: Some("Durable child".to_owned()),
+                dismissed_at_ms: None,
+            });
+            model.insert_task_run_alias(
+                RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: "child-sid".to_owned(),
+                },
+                child_run_id,
+            );
+            if let Some(status) = native_end {
+                model.set_task_run_v6_state(
+                    child_run_id,
+                    TaskRunV6State {
+                        native_session_end: Some(NativeSessionEnd { status, at_ms: 0 }),
+                        ..TaskRunV6State::default()
+                    },
+                );
+            }
+            model.insert_execution_edge(ExecutionEdge {
+                parent_run_id: root_run_id,
+                child_run_id,
+            });
+            // The ended child Agent Node is owned by the controller/root run and parented, as in
+            // the persisted production topology; only its exact native alias binds it to the
+            // child Task Run. Its activity sits exactly at the display-staleness boundary.
+            model.insert_agent_node(AgentNode {
+                agent_node_id: "durable-ended-child".to_owned(),
+                provider: Provider::Codex,
+                native_session_id: Some("child-sid".to_owned()),
+                task_run_id: root_run_id,
+                display_ordinal: DisplayOrdinal::new(3),
+                parent_agent_node_id: Some("provider-root".to_owned()),
+                state: Some(ExecState::Ended),
+                model_id: None,
+                last_event_kind: None,
+                last_tool_name: None,
+                last_item_count: None,
+                last_byte_count: None,
+                last_activity_at_ms: Some(-crate::provider::lane::DEFAULT_HEADLESS_INACTIVITY_MS),
+                session_file: None,
+            });
+
+            let rows = build_rows(&model, &AppState::default());
+
+            assert_eq!(
+                only_run_row(&rows, child_run_id).display_status,
+                Some(projection::DisplayStatus::new(
+                    projection::TaskDisplayStatus::Done,
+                    projection::StatusSource::AgentNodeState,
+                )),
+                "child {child_state:?} with native end {native_end:?}"
+            );
+            assert!(
+                only_run_row(&rows, child_run_id)
+                    .label
+                    .starts_with("✓ done "),
+                "child {child_state:?} label: {}",
+                only_run_row(&rows, child_run_id).label
+            );
+            assert!(
+                !has_agent_row(&rows, "durable-ended-child"),
+                "the display-stale ended Agent row must stay hidden"
+            );
+        }
     }
 
     #[test]
@@ -6191,9 +7088,7 @@ mod tests {
                 ViewMode::ExecutionTree => {
                     assert!(screen.contains("native agent") || screen.contains("[running]"));
                     assert!(
-                        rows[4..=6]
-                            .iter()
-                            .any(|row| row.contains("Codex controller")),
+                        rows[4..=6].iter().any(|row| row.contains("working Codex")),
                         "the 48x14 tree body must contain its known Task Run row"
                     );
                 }

@@ -40,7 +40,13 @@ use serde_json::{Value, json};
 // non-vacuity, not speed, and the suite runs under full-host load. (A 5s
 // bound flaked under load twice across eras at ~35x its isolated runtime.)
 const WAIT: Duration = Duration::from_secs(30);
-const ROOT_THREAD: &str = "ALLOWLIST_NEGATIVE_CONTROL_THREAD_I2E_91B7";
+// Non-identity negative control for the artifact scanner. It reaches the
+// database, WAL, backup, and rendered tree as the synthetic fixture's model
+// value, the TUI surfaces as the rendered header session, and the log as an
+// explicit structured field. Provider thread IDs are deliberately not reused
+// here because primary rows no longer render them.
+const ARTIFACT_SCAN_CONTROL: &str = "ALLOWLIST_ARTIFACT_SCAN_CONTROL_I2E_5C8D";
+const ROOT_THREAD: &str = "ALLOWLIST_ROOT_THREAD_I2E_91B7";
 const CHILD_THREAD: &str = "ALLOWLIST_CHILD_THREAD_I2E_3F62";
 const PROMPT_SENTINEL: &str = "PROMPT_FORBIDDEN_SENTINEL_I2E_4C21";
 const RESPONSE_SENTINEL: &str = "RESPONSE_FORBIDDEN_SENTINEL_I2E_5D32";
@@ -294,17 +300,19 @@ async fn allowlist_scan_is_non_vacuous_across_every_artifact() {
 
     // Positive structural assertions intentionally precede every negative scan.
     wait_for_model(&collector.model, model_has_threads).await;
+    wait_for_model(&collector.model, model_has_scan_control).await;
     wait_for_database(&root, |connection| {
         persisted_thread_count(connection, &[ROOT_THREAD, CHILD_THREAD]) == 2
+            && persisted_model_count(connection, ARTIFACT_SCAN_CONTROL) == 1
     })
     .await;
     let rendered = render_collector(&collector);
-    for marker in [ROOT_THREAD, CHILD_THREAD] {
-        assert!(
-            rendered.contains(marker),
-            "rendered buffer omitted structural marker {marker}"
-        );
-    }
+    assert!(
+        rendered.contains(ARTIFACT_SCAN_CONTROL),
+        "rendered runtime tree omitted its header-carried artifact scan control"
+    );
+    // Primary provider-backed rows are UUID-free: provider thread IDs stay in Detail.
+    assert_runtime_tree_is_uuid_free("rendered", &rendered);
     let tui_surfaces = render_new_tui_surfaces(&collector);
     assert_eq!(
         tui_surfaces.len(),
@@ -313,7 +321,7 @@ async fn allowlist_scan_is_non_vacuous_across_every_artifact() {
     );
     for (surface, bytes) in &tui_surfaces {
         assert!(
-            String::from_utf8_lossy(bytes).contains(ROOT_THREAD),
+            String::from_utf8_lossy(bytes).contains(ARTIFACT_SCAN_CONTROL),
             "TUI surface {surface} omitted its allowlisted negative control"
         );
     }
@@ -330,7 +338,7 @@ async fn allowlist_scan_is_non_vacuous_across_every_artifact() {
 
     append(
         &observed_file,
-        br#"{"type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"allowlist-wal-update-i2e","occurred_at_ms":1786200001000,"agent_thread_id":"ALLOWLIST_NEGATIVE_CONTROL_THREAD_I2E_91B7","agent_path":"/root","kind":"interacted"}}
+        br#"{"type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"allowlist-wal-update-i2e","occurred_at_ms":1786200001000,"agent_thread_id":"ALLOWLIST_ROOT_THREAD_I2E_91B7","agent_path":"/root","kind":"interacted"}}
 "#,
     );
     wait_for_database(&root, |connection| {
@@ -359,13 +367,13 @@ async fn allowlist_scan_is_non_vacuous_across_every_artifact() {
     wait_for_file_text(&log_path, "malformed provider record").await;
     assert!(fs::metadata(&log_path).expect("log metadata").len() > 0);
 
-    // Harness-mode negative control plants an allowlisted provider ID into the log too.
+    // Harness-mode negative control plants the non-identity scan control into the log too.
     tracing::warn!(
         provider = "codex",
-        agent_thread_id = ROOT_THREAD,
+        artifact_scan_control = ARTIFACT_SCAN_CONTROL,
         "allowlist harness negative control"
     );
-    wait_for_file_text(&log_path, ROOT_THREAD).await;
+    wait_for_file_text(&log_path, ARTIFACT_SCAN_CONTROL).await;
 
     let mut artifacts = vec![
         Artifact::file("database", &database),
@@ -390,9 +398,9 @@ async fn allowlist_scan_is_non_vacuous_across_every_artifact() {
     )
     .expect("forbidden raw content must be absent from every artifact");
 
-    let hits = scan_artifacts(&artifacts, &[ROOT_THREAD])
+    let hits = scan_artifacts(&artifacts, &[ARTIFACT_SCAN_CONTROL])
         .expect_err("allowlisted-field negative control must make the scanner fail");
-    assert!(hits.iter().all(|hit| hit.sentinel == ROOT_THREAD));
+    assert!(hits.iter().all(|hit| hit.sentinel == ARTIFACT_SCAN_CONTROL));
     assert_eq!(
         hits.into_iter()
             .map(|hit| hit.artifact)
@@ -566,6 +574,32 @@ fn model_has_threads(model: &DomainModel) -> bool {
     })
 }
 
+fn assert_runtime_tree_is_uuid_free(surface: &str, rendered: &str) {
+    for identity in [ROOT_THREAD, CHILD_THREAD] {
+        assert!(
+            !rendered.contains(identity),
+            "{surface} runtime tree leaked provider thread ID {identity}"
+        );
+    }
+}
+
+fn model_has_scan_control(model: &DomainModel) -> bool {
+    model.agent_nodes().any(|node| {
+        node.native_session_id.as_deref() == Some(ROOT_THREAD)
+            && node.model_id.as_deref() == Some(ARTIFACT_SCAN_CONTROL)
+    })
+}
+
+fn persisted_model_count(connection: &Connection, model_id: &str) -> i64 {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM agent_nodes WHERE model_id = ?1",
+            [model_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+}
+
 fn persisted_thread_count(connection: &Connection, threads: &[&str]) -> i64 {
     threads
         .iter()
@@ -586,7 +620,7 @@ fn render_collector(collector: &collector::CollectorHandle) -> String {
         collector.model.clone(),
         HeaderInputs {
             host: "test-host".to_owned(),
-            session: "allowlist-harness".to_owned(),
+            session: ARTIFACT_SCAN_CONTROL.to_owned(),
             source_coverage: collector.source_coverage.clone(),
             performance: collector.performance.clone(),
         },
@@ -643,7 +677,7 @@ fn render_new_tui_surfaces(collector: &collector::CollectorHandle) -> Vec<(&'sta
         model_receiver,
         HeaderInputs {
             host: "test-host".to_owned(),
-            session: ROOT_THREAD.to_owned(),
+            session: ARTIFACT_SCAN_CONTROL.to_owned(),
             source_coverage: collector.source_coverage.clone(),
             performance: collector.performance.clone(),
         },
@@ -659,9 +693,10 @@ fn render_new_tui_surfaces(collector: &collector::CollectorHandle) -> Vec<(&'sta
         runtime.contains(TUI_ROW_ONLY_MARKER),
         "the unfiltered TUI surface needs a distinctive semantic-row control"
     );
+    assert_runtime_tree_is_uuid_free("tui-runtime", &runtime);
     surfaces.push(("tui-runtime", runtime.into_bytes()));
     app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-    for character in ROOT_THREAD.chars() {
+    for character in ARTIFACT_SCAN_CONTROL.chars() {
         app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
     }
     surfaces.push(("tui-filter", render_app(&app).into_bytes()));

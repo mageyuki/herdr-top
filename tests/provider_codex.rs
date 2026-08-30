@@ -4,7 +4,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use herdr_top::model::{ExecState, Provider};
+use herdr_top::model::{
+    ControllerEventKind, DomainModel, ExecState, MinimalProviderMetadata, NativeSessionEndStatus,
+    Provider, RunKey, TaskState,
+};
 use herdr_top::provider::codex::{CodexAdapter, CodexBootstrapParser};
 use herdr_top::provider::codex_facts::extract_codex_line;
 use herdr_top::provider::facts::{EvidenceId, LogFact, SessionScope};
@@ -13,6 +16,8 @@ use herdr_top::provider::{
     BootstrapParser, DiscoveryIndex, DiscoveryRoot, MergeOutcome, PathInterner, PendingEvents,
     ProviderDiagnostics, ProviderEvent, SourcePosition, TailRecord,
 };
+use herdr_top::reducer::Reducer;
+use herdr_top::store::RestoredState;
 
 use common::flat_jsonl_fixture;
 
@@ -216,6 +221,212 @@ fn parse_inline(
         .collect()
 }
 
+fn apply_synthesized_events(
+    mut restored: RestoredState,
+    events: impl IntoIterator<Item = ProviderEvent>,
+) -> RestoredState {
+    for event in events {
+        let ProviderEvent::Synthesized(controller) = event else {
+            continue;
+        };
+        let (reducer, _) = Reducer::new(restored);
+        let delta = reducer
+            .validate_controller_event(&controller)
+            .expect("provider controller event should validate");
+        restored = RestoredState {
+            model: delta.post_model,
+            next_ordinal: delta.post_next_ordinal,
+            next_ingest_seq: Some(1),
+            event_ledger: Vec::new(),
+        };
+    }
+    restored
+}
+
+fn empty_restored() -> RestoredState {
+    RestoredState {
+        model: DomainModel::default(),
+        next_ordinal: 1,
+        next_ingest_seq: Some(1),
+        event_ledger: Vec::new(),
+    }
+}
+
+#[test]
+fn native_root_runtime_lifecycle_and_ordinals_are_resumable_and_append_only() {
+    const NEW_ROOT: &str = "019f7504-83e2-75f0-870d-cc423f88a74c";
+    const UNKNOWN_ROOT: &str = "019f7504-83e2-75f0-870d-cc423f88a76e";
+    let mut synthesis = Synthesis::with_lifecycle_timing_at(30, 50, 1);
+    let mut admission = Admission::new(0);
+    let discovered = AdmissionIndex::new();
+
+    let started = synthesis.synthesize_batch(
+        Path::new("old-root.jsonl"),
+        [(
+            1,
+            LogFact::CodexTurnStarted {
+                rollout_id: ROOT_ID.to_owned(),
+                at_ms: 100,
+            },
+        )],
+        &mut admission,
+        &discovered,
+    );
+    let mut restored = apply_synthesized_events(empty_restored(), started);
+    let old_key = RunKey::Native {
+        provider: Provider::Codex,
+        sid: ROOT_ID.to_owned(),
+    };
+    let old_run = restored.model.task_run_by_key(&old_key).unwrap().clone();
+
+    let completed_turn = synthesis.synthesize_batch(
+        Path::new("old-root.jsonl"),
+        [(
+            2,
+            LogFact::CodexTurnComplete {
+                rollout_id: ROOT_ID.to_owned(),
+                at_ms: 120,
+            },
+        )],
+        &mut admission,
+        &discovered,
+    );
+    assert!(completed_turn.iter().any(|event| matches!(
+        event,
+        ProviderEvent::AgentUpsert {
+            agent_thread_id,
+            state: Some(ExecState::Idle),
+            ..
+        } if agent_thread_id == ROOT_ID
+    )));
+    assert!(completed_turn.iter().all(|event| !matches!(
+        event,
+        ProviderEvent::Synthesized(controller)
+            if matches!(
+                controller.event,
+                ControllerEventKind::Complete
+                    | ControllerEventKind::Failed
+                    | ControllerEventKind::Cancelled
+            )
+    )));
+
+    let aborted = synthesis.synthesize_batch(
+        Path::new("old-root.jsonl"),
+        [(
+            3,
+            LogFact::CodexTurnAborted {
+                rollout_id: ROOT_ID.to_owned(),
+                at_ms: 130,
+            },
+        )],
+        &mut admission,
+        &discovered,
+    );
+    restored = apply_synthesized_events(restored, aborted);
+    let state = restored.model.task_run_v6_state(&old_run.run_id).unwrap();
+    assert_eq!(
+        restored.model.task_run(&old_run.run_id).unwrap().state,
+        TaskState::Running
+    );
+    assert_eq!(
+        state.native_session_end.as_ref().map(|end| end.status),
+        Some(NativeSessionEndStatus::Cancelled)
+    );
+
+    let resumed = synthesis.synthesize_batch(
+        Path::new("old-root.jsonl"),
+        [(
+            4,
+            LogFact::CodexTurnStarted {
+                rollout_id: ROOT_ID.to_owned(),
+                at_ms: 140,
+            },
+        )],
+        &mut admission,
+        &discovered,
+    );
+    restored = apply_synthesized_events(restored, resumed);
+    let resumed_run = restored.model.task_run_by_key(&old_key).unwrap();
+    assert_eq!(resumed_run.run_id, old_run.run_id);
+    assert_eq!(resumed_run.display_ordinal, old_run.display_ordinal);
+    assert!(
+        restored
+            .model
+            .task_run_v6_state(&old_run.run_id)
+            .unwrap()
+            .native_session_end
+            .is_none()
+    );
+
+    let appended = synthesis.synthesize_batch(
+        Path::new("new-root.jsonl"),
+        [(
+            1,
+            LogFact::CodexTurnStarted {
+                rollout_id: NEW_ROOT.to_owned(),
+                at_ms: 150,
+            },
+        )],
+        &mut admission,
+        &discovered,
+    );
+    restored = apply_synthesized_events(restored, appended);
+    let new_run = restored
+        .model
+        .task_run_by_key(&RunKey::Native {
+            provider: Provider::Codex,
+            sid: NEW_ROOT.to_owned(),
+        })
+        .unwrap();
+    assert!(old_run.display_ordinal < new_run.display_ordinal);
+
+    let branch = |model: &DomainModel, next_ordinal| RestoredState {
+        model: model.clone(),
+        next_ordinal,
+        next_ingest_seq: Some(1),
+        event_ledger: Vec::new(),
+    };
+    let unknown_started = synthesis.synthesize_batch(
+        Path::new("unknown-root.jsonl"),
+        [(
+            1,
+            LogFact::CodexTurnStarted {
+                rollout_id: UNKNOWN_ROOT.to_owned(),
+                at_ms: 300,
+            },
+        )],
+        &mut admission,
+        &discovered,
+    );
+    let unknown_state = apply_synthesized_events(
+        branch(&restored.model, restored.next_ordinal),
+        unknown_started,
+    );
+    let unknown_key = RunKey::Native {
+        provider: Provider::Codex,
+        sid: UNKNOWN_ROOT.to_owned(),
+    };
+    let unknown_run_id = unknown_state
+        .model
+        .task_run_by_key(&unknown_key)
+        .unwrap()
+        .run_id;
+    let (mut reducer, shared) = Reducer::new(unknown_state);
+    assert!(!reducer.apply_lane_close(&unknown_key, 310).is_empty());
+    assert_eq!(
+        shared.borrow().task_run(&unknown_run_id).unwrap().state,
+        TaskState::Running
+    );
+    assert_eq!(
+        shared
+            .borrow()
+            .task_run_v6_state(&unknown_run_id)
+            .and_then(|state| state.native_session_end.as_ref())
+            .map(|end| end.status),
+        Some(NativeSessionEndStatus::Unknown)
+    );
+}
+
 #[test]
 fn real_depth_two_chain_resolves_identity_parent_and_depth() {
     let fixtures = FixtureIndex::new(&[
@@ -361,6 +572,243 @@ fn unknown_record_stubs_do_not_stop_known_records_on_both_sides() {
         !events
             .iter()
             .any(|event| matches!(event, ProviderEvent::Malformed { .. }))
+    );
+}
+
+#[test]
+fn nested_subagent_activity_normalizes_started_and_spawned() {
+    let fixtures = FixtureIndex::new(&["codex-depth2-root.jsonl"]);
+    let file = fixtures.file("codex-depth2-root.jsonl");
+    let cases = [
+        (
+            "started",
+            "d1111111-1111-4111-8111-111111111111",
+            "prov:codex:act:item_nested_started",
+            "prov:codex:up:item_nested_started",
+            1_787_547_610_201,
+            br#"{"timestamp":"2026-08-24T05:00:10.500Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1787547610101,"completed_at_ms":1787547610201,"item":{"type":"SubAgentActivity","id":"item_nested_started","kind":"started","agent_thread_id":"d1111111-1111-4111-8111-111111111111","agent_path":"/root/nested_started"}}}"# as &[u8],
+        ),
+        (
+            "spawned",
+            "d2222222-2222-4222-8222-222222222222",
+            "prov:codex:act:item_nested_spawned",
+            "prov:codex:up:item_nested_spawned",
+            1_787_547_611_401,
+            br#"{"timestamp":"2026-08-24T05:00:11.600Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1787547611301,"completed_at_ms":1787547611401,"item":{"type":"SubAgentActivity","id":"item_nested_spawned","kind":"spawned","agent_thread_id":"d2222222-2222-4222-8222-222222222222","agent_path":"/root/nested_spawned"}}}"# as &[u8],
+        ),
+    ];
+
+    for (kind, child_id, activity_id, upsert_id, completed_at_ms, record) in cases {
+        let events = parse_inline(&fixtures.index, file, 0, &[(7, record)]);
+
+        assert_eq!(events.len(), 2, "{kind}");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::Activity {
+                agent_thread_id,
+                activity,
+                event_id,
+                observed_at_ms,
+                ..
+            } if agent_thread_id == child_id
+                && activity.event_kind.as_deref() == Some(kind)
+                && event_id == activity_id
+                && *observed_at_ms == completed_at_ms
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::AgentUpsert {
+                agent_thread_id,
+                state: Some(ExecState::Working),
+                event_id,
+                observed_at_ms,
+                ..
+            } if agent_thread_id == child_id
+                && event_id == upsert_id
+                && *observed_at_ms == completed_at_ms
+        )));
+    }
+
+    let unrelated = br#"{"timestamp":"2026-08-24T05:00:12.700Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1787547612501,"completed_at_ms":1787547612601,"item":{"type":"CollabAgentToolCall","id":"item_unrelated","kind":"spawned","agent_thread_id":"d3333333-3333-4333-8333-333333333333","agent_path":"/root/unrelated"}}}"#;
+    assert!(
+        parse_inline(&fixtures.index, file, 0, &[(8, unrelated)]).is_empty(),
+        "unrelated item_completed item must produce zero provider events"
+    );
+}
+
+#[test]
+fn subagent_activity_completed_ends_only_the_child_agent_node() {
+    let fixtures = FixtureIndex::new(&["codex-depth2-root.jsonl"]);
+    let file = fixtures.file("codex-depth2-root.jsonl");
+    let cases = [
+        (
+            "legacy interacted",
+            110,
+            br#"{"type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"call_legacy_interacted","occurred_at_ms":1787547620101,"agent_thread_id":"e1111111-1111-4111-8111-111111111111","agent_path":"/root/legacy_interacted","kind":"interacted"}}"# as &[u8],
+            vec![ProviderEvent::Activity {
+                provider: Provider::Codex,
+                agent_thread_id: "e1111111-1111-4111-8111-111111111111".to_owned(),
+                activity: MinimalProviderMetadata {
+                    agent_id: Some("e1111111-1111-4111-8111-111111111111".to_owned()),
+                    parent_agent_id: Some(ROOT_ID.to_owned()),
+                    event_kind: Some("interacted".to_owned()),
+                    ..MinimalProviderMetadata::default()
+                },
+                depth: Some(1),
+                event_id: "prov:codex:act:call_legacy_interacted".to_owned(),
+                observed_at_ms: 1_787_547_620_101,
+                position: SourcePosition {
+                    path_id: file.path_id,
+                    generation: 7,
+                    offset: 110,
+                },
+            }],
+        ),
+        (
+            "nested interacted",
+            120,
+            br#"{"timestamp":"2026-08-24T05:00:21.500Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1787547621101,"completed_at_ms":1787547621201,"item":{"type":"SubAgentActivity","id":"item_nested_interacted","kind":"interacted","agent_thread_id":"e2222222-2222-4222-8222-222222222222","agent_path":"/root/nested_interacted"}}}"# as &[u8],
+            vec![ProviderEvent::Activity {
+                provider: Provider::Codex,
+                agent_thread_id: "e2222222-2222-4222-8222-222222222222".to_owned(),
+                activity: MinimalProviderMetadata {
+                    agent_id: Some("e2222222-2222-4222-8222-222222222222".to_owned()),
+                    parent_agent_id: Some(ROOT_ID.to_owned()),
+                    event_kind: Some("interacted".to_owned()),
+                    ..MinimalProviderMetadata::default()
+                },
+                depth: Some(1),
+                event_id: "prov:codex:act:item_nested_interacted".to_owned(),
+                observed_at_ms: 1_787_547_621_201,
+                position: SourcePosition {
+                    path_id: file.path_id,
+                    generation: 7,
+                    offset: 120,
+                },
+            }],
+        ),
+        (
+            "legacy completed",
+            130,
+            br#"{"type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"call_legacy_completed","occurred_at_ms":1787547622101,"agent_thread_id":"e3333333-3333-4333-8333-333333333333","agent_path":"/root/legacy_completed","kind":"completed"}}"# as &[u8],
+            vec![
+                ProviderEvent::Activity {
+                    provider: Provider::Codex,
+                    agent_thread_id: "e3333333-3333-4333-8333-333333333333".to_owned(),
+                    activity: MinimalProviderMetadata {
+                        agent_id: Some("e3333333-3333-4333-8333-333333333333".to_owned()),
+                        parent_agent_id: Some(ROOT_ID.to_owned()),
+                        event_kind: Some("completed".to_owned()),
+                        ..MinimalProviderMetadata::default()
+                    },
+                    depth: Some(1),
+                    event_id: "prov:codex:act:call_legacy_completed".to_owned(),
+                    observed_at_ms: 1_787_547_622_101,
+                    position: SourcePosition {
+                        path_id: file.path_id,
+                        generation: 7,
+                        offset: 130,
+                    },
+                },
+                ProviderEvent::AgentUpsert {
+                    provider: Provider::Codex,
+                    agent_thread_id: "e3333333-3333-4333-8333-333333333333".to_owned(),
+                    owner_session_id: Some(ROOT_ID.to_owned()),
+                    parent_thread_id: Some(ROOT_ID.to_owned()),
+                    state: Some(ExecState::Ended),
+                    model_id: None,
+                    depth: Some(1),
+                    event_id: "prov:codex:up:call_legacy_completed".to_owned(),
+                    observed_at_ms: 1_787_547_622_101,
+                    position: SourcePosition {
+                        path_id: file.path_id,
+                        generation: 7,
+                        offset: 130,
+                    },
+                },
+            ],
+        ),
+        (
+            "nested completed",
+            140,
+            br#"{"timestamp":"2026-08-24T05:00:23.500Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1787547623101,"completed_at_ms":1787547623201,"item":{"type":"SubAgentActivity","id":"item_nested_completed","kind":"completed","agent_thread_id":"e4444444-4444-4444-8444-444444444444","agent_path":"/root/nested_completed"}}}"# as &[u8],
+            vec![
+                ProviderEvent::Activity {
+                    provider: Provider::Codex,
+                    agent_thread_id: "e4444444-4444-4444-8444-444444444444".to_owned(),
+                    activity: MinimalProviderMetadata {
+                        agent_id: Some("e4444444-4444-4444-8444-444444444444".to_owned()),
+                        parent_agent_id: Some(ROOT_ID.to_owned()),
+                        event_kind: Some("completed".to_owned()),
+                        ..MinimalProviderMetadata::default()
+                    },
+                    depth: Some(1),
+                    event_id: "prov:codex:act:item_nested_completed".to_owned(),
+                    observed_at_ms: 1_787_547_623_201,
+                    position: SourcePosition {
+                        path_id: file.path_id,
+                        generation: 7,
+                        offset: 140,
+                    },
+                },
+                ProviderEvent::AgentUpsert {
+                    provider: Provider::Codex,
+                    agent_thread_id: "e4444444-4444-4444-8444-444444444444".to_owned(),
+                    owner_session_id: Some(ROOT_ID.to_owned()),
+                    parent_thread_id: Some(ROOT_ID.to_owned()),
+                    state: Some(ExecState::Ended),
+                    model_id: None,
+                    depth: Some(1),
+                    event_id: "prov:codex:up:item_nested_completed".to_owned(),
+                    observed_at_ms: 1_787_547_623_201,
+                    position: SourcePosition {
+                        path_id: file.path_id,
+                        generation: 7,
+                        offset: 140,
+                    },
+                },
+            ],
+        ),
+    ];
+
+    for (case, offset, record, expected) in cases {
+        assert_eq!(
+            parse_inline(&fixtures.index, file, 7, &[(offset, record)]),
+            expected,
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn malformed_nested_subagent_activity_does_not_stop_later_records() {
+    let fixtures = FixtureIndex::new(&["codex-depth2-root.jsonl"]);
+    let file = fixtures.file("codex-depth2-root.jsonl");
+    let expected_path = fixtures.relative_path("codex-depth2-root.jsonl");
+    let malformed = br#"{"timestamp":"2026-08-24T05:00:13.000Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1787547612900,"completed_at_ms":1787547613000,"item":{"type":"SubAgentActivity","id":"item_malformed_nested","kind":"spawned","agent_thread_id":"d4444444-4444-4444-8444-444444444444"}}}"#;
+    let good = br#"{"timestamp":"2026-08-24T05:00:14.000Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1787547613900,"completed_at_ms":1787547614000,"item":{"type":"SubAgentActivity","id":"item_after_malformed_nested","kind":"started","agent_thread_id":"d5555555-5555-4555-8555-555555555555","agent_path":"/root/after_malformed_nested"}}}"#;
+
+    let events = parse_inline(&fixtures.index, file, 7, &[(100, malformed), (300, good)]);
+
+    assert!(matches!(
+        events.first(),
+        Some(ProviderEvent::Malformed {
+            provider: Provider::Codex,
+            path_display,
+            generation: 7,
+            byte_offset: 100,
+            error_code: "codex_activity_shape",
+        }) if path_display == expected_path
+    ));
+    assert!(
+        events
+            .iter()
+            .any(|event| { event_id(event) == Some("prov:codex:act:item_after_malformed_nested") })
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| { event_id(event) == Some("prov:codex:up:item_after_malformed_nested") })
     );
 }
 
