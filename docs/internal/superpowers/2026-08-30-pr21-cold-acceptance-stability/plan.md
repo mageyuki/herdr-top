@@ -262,6 +262,8 @@ output, and any deviation. Do not commit.
 - Modify: `src/provider/lane.rs`
 - Modify: `src/tui/projection.rs`
 - Modify: `src/tui/view.rs`
+- Modify: `src/herdr/collector.rs` (test-only expectation updated after Task
+  review exposed the removed provider-session fallback)
 - Modify: `docs/tui.md`
 - Modify: `docs/design/herdr-top-mvp.md`
 - Create no file.
@@ -359,8 +361,10 @@ public Codex API.
 ```bash
 cargo test --locked --lib provider::lane::tests::codex_run_kind_prefers_role_and_meaningful_internal_name -- --exact --nocapture
 cargo test --locked --lib tui::view::tests::controller_primary_codex_rows_render_roles_without_provider_ids -- --exact --nocapture
+cargo test --locked --lib herdr::collector::provider_integration_tests::subject_chain_meta_title_cwd_id -- --exact --nocapture
 cargo test --locked --lib provider::lane::tests -- --nocapture
 cargo test --locked --lib tui::view::tests -- --nocapture
+cargo test --locked --lib
 cargo fmt --check
 git diff --check
 ```
