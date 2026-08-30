@@ -2541,6 +2541,8 @@ impl Reducer {
                     .map(|task_run| task_run.run_id),
                 _ => None,
             };
+            let resolved_native_session_owner =
+                provider.is_some() && native_sid.is_some() && existing_run.is_some();
             let run_id = match existing_run {
                 Some(run_id) => run_id,
                 None => self.insert_snapshot_run(
@@ -2576,6 +2578,14 @@ impl Reducer {
             persist.push(persist_execution(execution.clone(), now_ms));
             if !execution.state.is_terminal() {
                 self.activate_for_live_execution(run_id, now_ms, &mut persist);
+                if resolved_native_session_owner {
+                    self.reopen_native_lifecycle_for_live_execution(
+                        run_id,
+                        &execution.execution_id,
+                        now_ms,
+                        &mut persist,
+                    );
+                }
             }
 
             if let Some(provider) = provider {
@@ -2628,6 +2638,7 @@ impl Reducer {
 
         for run_id in pre_gap_runs {
             self.close_run_without_live_execution(run_id, now_ms, &mut persist);
+            self.close_history_ready_run_without_live_execution(run_id, now_ms, &mut persist);
         }
 
         Ok(persist)
@@ -3494,6 +3505,83 @@ impl Reducer {
         Self::touch_task_run(&mut task_run, timestamp_ms);
         self.model.insert_task_run(task_run.clone());
         persist.push(self.persist_task_run(task_run, timestamp_ms));
+    }
+
+    /// Clears a stale native end when a live snapshot execution proves the session is open.
+    ///
+    /// Runs only after activation, for a semantically nonterminal run that still carries a
+    /// native end. The snapshot watermark competes in the ordinary total order, so newer
+    /// terminal evidence is never erased.
+    fn reopen_native_lifecycle_for_live_execution(
+        &mut self,
+        run_id: RunId,
+        execution_id: &str,
+        timestamp_ms: i64,
+        persist: &mut PersistBatch,
+    ) {
+        let Some(task_run) = self.model.task_run(&run_id) else {
+            return;
+        };
+        if task_run.state.is_terminal()
+            || self
+                .model
+                .task_run_v6_state(&run_id)
+                .is_none_or(|state| state.native_session_end.is_none())
+        {
+            return;
+        }
+        self.apply_native_lifecycle(
+            run_id,
+            None,
+            NativeLifecycleWatermark {
+                source_at_ms: timestamp_ms,
+                observed_at_ms: timestamp_ms,
+                source_order: format!("snapshot-live-execution:{execution_id}"),
+            },
+            persist,
+        );
+    }
+
+    /// Applies the history close that durable finalization deferred while an execution was open.
+    ///
+    /// Runs after `close_run_without_live_execution`, for a history-ready, semantically
+    /// nonterminal run with provider evidence, no native end, and no live execution.
+    fn close_history_ready_run_without_live_execution(
+        &mut self,
+        run_id: RunId,
+        timestamp_ms: i64,
+        persist: &mut PersistBatch,
+    ) {
+        if self
+            .model
+            .executions()
+            .any(|execution| execution.task_run_id == run_id && !execution.state.is_terminal())
+        {
+            return;
+        }
+        let Some(task_run) = self.model.task_run(&run_id) else {
+            return;
+        };
+        if task_run.state.is_terminal() {
+            return;
+        }
+        let Some(latest_provider_at_ms) = self.model.task_run_v6_state(&run_id).and_then(|state| {
+            (state.history_ready && state.native_session_end.is_none())
+                .then_some(state.latest_provider_at_ms)
+                .flatten()
+        }) else {
+            return;
+        };
+        self.apply_native_lifecycle(
+            run_id,
+            Some(NativeSessionEndStatus::Unknown),
+            NativeLifecycleWatermark {
+                source_at_ms: latest_provider_at_ms,
+                observed_at_ms: timestamp_ms,
+                source_order: format!("snapshot-history-close:{run_id}"),
+            },
+            persist,
+        );
     }
 
     fn replace_topology(
@@ -12418,6 +12506,514 @@ mod tests {
         snapshot.panes[0].agent.as_mut().unwrap().agent_name = "unknown".to_owned();
         snapshot.panes[0].agent_session = None;
         snapshot
+    }
+
+    fn codex_session_pane(label: &str, sid: &str) -> PaneSnapshot {
+        PaneSnapshot {
+            pane_id: format!("pane-{label}"),
+            workspace_id: "workspace-1".to_owned(),
+            tab_id: "tab-1".to_owned(),
+            terminal_id: format!("terminal-{label}"),
+            display_name: None,
+            agent: Some(SnapshotAgent {
+                agent_name: "codex".to_owned(),
+                status: PaneAgentStatus::Working,
+            }),
+            agent_session: Some(AgentSessionReference {
+                source: "herdr".to_owned(),
+                agent: "codex".to_owned(),
+                kind: AgentSessionReferenceKind::Id,
+                value: sid.to_owned(),
+            }),
+        }
+    }
+
+    fn codex_agent_node(agent_node_id: &str, sid: &str, run_id: RunId, ordinal: i64) -> AgentNode {
+        AgentNode {
+            agent_node_id: agent_node_id.to_owned(),
+            provider: Provider::Codex,
+            native_session_id: Some(sid.to_owned()),
+            task_run_id: run_id,
+            display_ordinal: DisplayOrdinal::new(ordinal),
+            parent_agent_node_id: None,
+            state: Some(ExecState::Working),
+            model_id: None,
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms: None,
+            session_file: None,
+        }
+    }
+
+    fn upserted_task_run_ids(persist: &[PersistOp]) -> Vec<RunId> {
+        persist
+            .iter()
+            .filter_map(|operation| match operation {
+                PersistOp::UpsertTaskRun(value) => Some(value.task_run.run_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn live_snapshot_clears_restored_native_unknown() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = StateRoot(directory.path().to_path_buf());
+        let mut store = open_writer(&root).unwrap();
+        let repaired = RunId::new();
+        let completed = RunId::new();
+        let newer_terminal = RunId::new();
+        let never_ended = RunId::new();
+        let snapshot_floor_ms = unix_now_ms();
+        let sid = |label: &str| format!("restored-unknown-{label}");
+        let stale_watermark = |run_id: RunId| NativeLifecycleWatermark {
+            source_at_ms: 4_000,
+            observed_at_ms: 5_000,
+            source_order: format!("history-drain:codex:restored-unknown:{run_id}"),
+        };
+        let newer_watermark = NativeLifecycleWatermark {
+            source_at_ms: snapshot_floor_ms + 86_400_000,
+            observed_at_ms: snapshot_floor_ms + 86_400_000,
+            source_order: "live:newer-terminal".to_owned(),
+        };
+        let unknown_end = crate::model::NativeSessionEnd {
+            status: NativeSessionEndStatus::Unknown,
+            at_ms: 4_000,
+        };
+        let newer_done_end = crate::model::NativeSessionEnd {
+            status: NativeSessionEndStatus::Done,
+            at_ms: newer_watermark.source_at_ms,
+        };
+        let seeded =
+            |run_id: RunId, ordinal: i64, label: &str, state: TaskState, v6: TaskRunV6State| {
+                let mut task_run = run_with_controller_evidence(
+                    run_id,
+                    RunKey::Controller(sid(label)),
+                    ordinal,
+                    state,
+                );
+                task_run.finished_at_ms = state.is_terminal().then_some(3_500);
+                PersistTaskRunV6 {
+                    task_run: PersistTaskRun {
+                        task_run,
+                        native_session: None,
+                        created_at_ms: 3_000,
+                        updated_at_ms: 3_000,
+                        finished_at_ms: state.is_terminal().then_some(3_500),
+                    },
+                    state: v6,
+                }
+            };
+        let lifecycle = |end: Option<crate::model::NativeSessionEnd>,
+                         watermark: NativeLifecycleWatermark| {
+            TaskRunV6State {
+                native_session_end: end,
+                lifecycle_watermark: Some(watermark),
+                history_ready: true,
+                latest_provider_at_ms: Some(4_000),
+            }
+        };
+        store
+            .apply_v6_batch(PersistV6Batch {
+                operations: vec![
+                    PersistOp::UpsertAgentNode(codex_agent_node(
+                        "agent-repaired",
+                        &sid("repaired"),
+                        repaired,
+                        5,
+                    )),
+                    PersistOp::UpsertAgentNode(codex_agent_node(
+                        "agent-completed",
+                        &sid("completed"),
+                        completed,
+                        6,
+                    )),
+                    PersistOp::UpsertAgentNode(codex_agent_node(
+                        "agent-newer",
+                        &sid("newer"),
+                        newer_terminal,
+                        7,
+                    )),
+                    PersistOp::UpsertAgentNode(codex_agent_node(
+                        "agent-live",
+                        &sid("live"),
+                        never_ended,
+                        8,
+                    )),
+                ],
+                task_runs: vec![
+                    seeded(
+                        repaired,
+                        1,
+                        "repaired",
+                        TaskState::Running,
+                        lifecycle(Some(unknown_end.clone()), stale_watermark(repaired)),
+                    ),
+                    seeded(
+                        completed,
+                        2,
+                        "completed",
+                        TaskState::Completed,
+                        lifecycle(Some(unknown_end.clone()), stale_watermark(completed)),
+                    ),
+                    seeded(
+                        newer_terminal,
+                        3,
+                        "newer",
+                        TaskState::Running,
+                        lifecycle(Some(newer_done_end.clone()), newer_watermark.clone()),
+                    ),
+                    seeded(
+                        never_ended,
+                        4,
+                        "live",
+                        TaskState::Running,
+                        lifecycle(None, stale_watermark(never_ended)),
+                    ),
+                ],
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+        let (mut reducer, shared) = Reducer::new(store.load_restored_state().unwrap());
+        assert_eq!(
+            shared
+                .borrow()
+                .task_run_v6_state(&repaired)
+                .unwrap()
+                .native_session_end,
+            Some(unknown_end.clone()),
+            "the restored Unknown must be present before the live snapshot"
+        );
+
+        let persist = reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: TopologySnapshot {
+                    workspaces: vec![Workspace {
+                        workspace_id: "workspace-1".to_owned(),
+                    }],
+                    tabs: vec![Tab {
+                        tab_id: "tab-1".to_owned(),
+                        workspace_id: "workspace-1".to_owned(),
+                        label: None,
+                    }],
+                    panes: vec![
+                        codex_session_pane("repaired", &sid("repaired")),
+                        codex_session_pane("completed", &sid("completed")),
+                        codex_session_pane("newer", &sid("newer")),
+                        codex_session_pane("live", &sid("live")),
+                    ],
+                },
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+
+        assert_eq!(
+            upserted_task_run_ids(&persist),
+            vec![repaired],
+            "only the repaired run may receive a lifecycle write"
+        );
+        let model = shared.borrow();
+        let live_execution_id = model
+            .executions()
+            .find(|execution| execution.task_run_id == repaired && !execution.state.is_terminal())
+            .map(|execution| execution.execution_id.clone())
+            .expect("the snapshot must install a live execution for the repaired run");
+        assert_eq!(model.task_run(&repaired).unwrap().state, TaskState::Running);
+        let repaired_state = model.task_run_v6_state(&repaired).unwrap();
+        assert_eq!(repaired_state.native_session_end, None);
+        let snapshot_watermark = repaired_state
+            .lifecycle_watermark
+            .clone()
+            .expect("the live snapshot must store its watermark");
+        assert!(snapshot_watermark.source_at_ms >= snapshot_floor_ms);
+        assert_eq!(
+            snapshot_watermark.observed_at_ms,
+            snapshot_watermark.source_at_ms
+        );
+        assert_eq!(
+            snapshot_watermark.source_order,
+            format!("snapshot-live-execution:{live_execution_id}")
+        );
+        assert!(snapshot_watermark > stale_watermark(repaired));
+        assert!(repaired_state.history_ready);
+        assert_eq!(repaired_state.latest_provider_at_ms, Some(4_000));
+
+        assert_eq!(
+            model.task_run(&completed).unwrap().state,
+            TaskState::Completed,
+            "a semantically terminal run is not reopened"
+        );
+        let completed_state = model.task_run_v6_state(&completed).unwrap();
+        assert_eq!(
+            completed_state.native_session_end,
+            Some(unknown_end.clone())
+        );
+        assert_eq!(
+            completed_state.lifecycle_watermark,
+            Some(stale_watermark(completed))
+        );
+
+        assert_eq!(
+            model.task_run(&newer_terminal).unwrap().state,
+            TaskState::Running
+        );
+        let newer_state = model.task_run_v6_state(&newer_terminal).unwrap();
+        assert_eq!(
+            newer_state.native_session_end,
+            Some(newer_done_end.clone()),
+            "an older snapshot cannot erase a newer terminal watermark"
+        );
+        assert_eq!(
+            newer_state.lifecycle_watermark,
+            Some(newer_watermark.clone())
+        );
+
+        assert_eq!(
+            model.task_run(&never_ended).unwrap().state,
+            TaskState::Running
+        );
+        let never_ended_state = model.task_run_v6_state(&never_ended).unwrap();
+        assert_eq!(never_ended_state.native_session_end, None);
+        assert_eq!(
+            never_ended_state.lifecycle_watermark,
+            Some(stale_watermark(never_ended)),
+            "a run with no native end creates no lifecycle write"
+        );
+        drop(model);
+
+        let batch = reducer.decorate_reconciliation_batch(persist);
+        let persisted_repair = batch
+            .task_runs
+            .iter()
+            .find(|task_run| task_run.task_run.task_run.run_id == repaired)
+            .expect("the reconciliation batch must carry the repaired v6 state");
+        assert_eq!(persisted_repair.state.native_session_end, None);
+        assert_eq!(
+            persisted_repair.state.lifecycle_watermark,
+            Some(snapshot_watermark.clone())
+        );
+        assert_eq!(persisted_repair.task_run.task_run.state, TaskState::Running);
+        store.apply_v6_batch(batch.clone()).unwrap();
+        store.apply_v6_batch(batch).unwrap();
+        drop(store);
+
+        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+        let restored_repair = restored.model.task_run_v6_state(&repaired).unwrap();
+        assert_eq!(
+            restored.model.task_run(&repaired).unwrap().state,
+            TaskState::Running
+        );
+        assert_eq!(restored_repair.native_session_end, None);
+        assert_eq!(
+            restored_repair.lifecycle_watermark,
+            Some(snapshot_watermark)
+        );
+        assert_eq!(
+            restored.model.task_run(&completed).unwrap().state,
+            TaskState::Completed
+        );
+        assert_eq!(
+            restored
+                .model
+                .task_run_v6_state(&completed)
+                .unwrap()
+                .native_session_end,
+            Some(unknown_end)
+        );
+        let restored_newer = restored.model.task_run_v6_state(&newer_terminal).unwrap();
+        assert_eq!(restored_newer.native_session_end, Some(newer_done_end));
+        assert_eq!(restored_newer.lifecycle_watermark, Some(newer_watermark));
+        let restored_never_ended = restored.model.task_run_v6_state(&never_ended).unwrap();
+        assert_eq!(restored_never_ended.native_session_end, None);
+        assert_eq!(
+            restored_never_ended.lifecycle_watermark,
+            Some(stale_watermark(never_ended))
+        );
+    }
+
+    #[test]
+    fn history_finalization_before_snapshot_defers_only_stale_execution_close() {
+        let current = RunId::new();
+        let absent = RunId::new();
+        let sid = |label: &str| format!("finalized-before-snapshot-{label}");
+        let restored_watermark = |run_id: RunId| NativeLifecycleWatermark {
+            source_at_ms: 4_000,
+            observed_at_ms: 3_000,
+            source_order: format!("live:{run_id}"),
+        };
+        let mut model = DomainModel::default();
+        for (run_id, ordinal, label) in [(current, 1, "current"), (absent, 2, "absent")] {
+            model.insert_task_run(run_with_controller_evidence(
+                run_id,
+                RunKey::Controller(sid(label)),
+                ordinal,
+                TaskState::Running,
+            ));
+            model.set_task_run_v6_state(
+                run_id,
+                TaskRunV6State {
+                    native_session_end: None,
+                    lifecycle_watermark: Some(restored_watermark(run_id)),
+                    history_ready: false,
+                    latest_provider_at_ms: Some(4_000),
+                },
+            );
+            model.insert_agent_node(codex_agent_node(
+                &format!("agent-{label}"),
+                &sid(label),
+                run_id,
+                ordinal + 2,
+            ));
+            model.insert_execution(Execution {
+                execution_id: format!("restored-execution-{label}"),
+                pane_id: format!("pane-{label}"),
+                terminal_id: format!("terminal-{label}"),
+                task_run_id: run_id,
+                state: ExecState::Working,
+            });
+        }
+        let (mut reducer, shared) = Reducer::new(restored(model, 10));
+
+        let finalized_state = |run_id: RunId| TaskRunV6State {
+            native_session_end: None,
+            lifecycle_watermark: Some(restored_watermark(run_id)),
+            history_ready: true,
+            latest_provider_at_ms: Some(4_000),
+        };
+        assert!(
+            reducer.apply_history_finalization(&crate::store::HistoryDrainFinalization {
+                drain_id: crate::model::HistoryDrainId::new("codex:finalized-before-snapshot")
+                    .unwrap(),
+                finalized_at_ms: 5_000,
+                completed_drains: Vec::new(),
+                runs: vec![
+                    crate::store::FinalizedHistoryRun {
+                        run_id: current,
+                        state: finalized_state(current),
+                    },
+                    crate::store::FinalizedHistoryRun {
+                        run_id: absent,
+                        state: finalized_state(absent),
+                    },
+                ],
+            })
+        );
+        for run_id in [current, absent] {
+            let model = shared.borrow();
+            let state = model.task_run_v6_state(&run_id).unwrap();
+            assert!(state.history_ready);
+            assert_eq!(state.native_session_end, None);
+            assert!(
+                model
+                    .executions()
+                    .any(|execution| execution.task_run_id == run_id
+                        && !execution.state.is_terminal())
+            );
+        }
+
+        let snapshot = || TopologySnapshot {
+            workspaces: vec![Workspace {
+                workspace_id: "workspace-1".to_owned(),
+            }],
+            tabs: Vec::new(),
+            panes: vec![codex_session_pane("current", &sid("current"))],
+        };
+        let snapshot_floor_ms = unix_now_ms();
+        let persist = reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: snapshot(),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+
+        // Two restored executions end, the workspace and pane (plus its display-name clear)
+        // replace the empty topology, the current execution and agent node are reinstalled,
+        // and exactly one lifecycle write closes the absent run.
+        assert_eq!(persist.len(), 8, "{persist:#?}");
+        assert_eq!(
+            upserted_task_run_ids(&persist),
+            vec![absent],
+            "only the absent run receives the deferred history close"
+        );
+        let model = shared.borrow();
+        assert_eq!(model.task_run(&current).unwrap().state, TaskState::Running);
+        assert!(model.executions().any(|execution| {
+            execution.execution_id == "restored-execution-current"
+                && execution.task_run_id == current
+                && !execution.state.is_terminal()
+        }));
+        let current_state = model.task_run_v6_state(&current).unwrap();
+        assert_eq!(current_state.native_session_end, None);
+        assert_eq!(
+            current_state.lifecycle_watermark,
+            Some(restored_watermark(current))
+        );
+
+        assert_eq!(
+            model.task_run(&absent).unwrap().state,
+            TaskState::Running,
+            "controller-owned semantics stay untouched by the native close"
+        );
+        assert!(
+            !model
+                .executions()
+                .any(|execution| execution.task_run_id == absent && !execution.state.is_terminal())
+        );
+        let absent_state = model.task_run_v6_state(&absent).unwrap();
+        assert_eq!(
+            absent_state.native_session_end,
+            Some(crate::model::NativeSessionEnd {
+                status: NativeSessionEndStatus::Unknown,
+                at_ms: 4_000,
+            })
+        );
+        let deferred_watermark = absent_state
+            .lifecycle_watermark
+            .clone()
+            .expect("the deferred close must store its watermark");
+        assert_eq!(deferred_watermark.source_at_ms, 4_000);
+        assert!(deferred_watermark.observed_at_ms >= snapshot_floor_ms);
+        assert_eq!(
+            deferred_watermark.source_order,
+            format!("snapshot-history-close:{absent}")
+        );
+        drop(model);
+
+        let replay = reducer
+            .reconcile_gap(ReconcileBatch {
+                topology: snapshot(),
+                gap_kind: GapKind::Reconnect,
+            })
+            .unwrap();
+        assert_eq!(
+            upserted_task_run_ids(&replay),
+            Vec::<RunId>::new(),
+            "replaying the snapshot must not duplicate the lifecycle write"
+        );
+        let model = shared.borrow();
+        assert_eq!(
+            model
+                .task_run_v6_state(&absent)
+                .unwrap()
+                .lifecycle_watermark,
+            Some(deferred_watermark)
+        );
+        assert_eq!(
+            model
+                .task_run_v6_state(&current)
+                .unwrap()
+                .native_session_end,
+            None
+        );
+        assert_eq!(
+            model
+                .task_run_v6_state(&current)
+                .unwrap()
+                .lifecycle_watermark,
+            Some(restored_watermark(current))
+        );
     }
 
     #[test]

@@ -1178,6 +1178,11 @@ impl Store {
                               'completed', 'failed', 'cancelled', 'ended_unknown'\
                           ) \
                           AND run.native_session_end_status IS NULL \
+                          AND NOT EXISTS (\
+                              SELECT 1 FROM executions AS execution \
+                              WHERE execution.task_run_id = run.run_id \
+                                AND execution.ended_at_ms IS NULL\
+                          ) \
                           AND run.latest_provider_at_ms IS NOT NULL \
                           AND (\
                               run.lifecycle_source_at_ms IS NULL \
@@ -1195,6 +1200,11 @@ impl Store {
                               'completed', 'failed', 'cancelled', 'ended_unknown'\
                           ) \
                           AND run.native_session_end_status IS NULL \
+                          AND NOT EXISTS (\
+                              SELECT 1 FROM executions AS execution \
+                              WHERE execution.task_run_id = run.run_id \
+                                AND execution.ended_at_ms IS NULL\
+                          ) \
                           AND run.latest_provider_at_ms IS NOT NULL \
                           AND (\
                               run.lifecycle_source_at_ms IS NULL \
@@ -1212,6 +1222,11 @@ impl Store {
                               'completed', 'failed', 'cancelled', 'ended_unknown'\
                           ) \
                           AND run.native_session_end_status IS NULL \
+                          AND NOT EXISTS (\
+                              SELECT 1 FROM executions AS execution \
+                              WHERE execution.task_run_id = run.run_id \
+                                AND execution.ended_at_ms IS NULL\
+                          ) \
                           AND run.latest_provider_at_ms IS NOT NULL \
                           AND (\
                               run.lifecycle_source_at_ms IS NULL \
@@ -1229,6 +1244,11 @@ impl Store {
                               'completed', 'failed', 'cancelled', 'ended_unknown'\
                           ) \
                           AND run.native_session_end_status IS NULL \
+                          AND NOT EXISTS (\
+                              SELECT 1 FROM executions AS execution \
+                              WHERE execution.task_run_id = run.run_id \
+                                AND execution.ended_at_ms IS NULL\
+                          ) \
                           AND run.latest_provider_at_ms IS NOT NULL \
                           AND (\
                               run.lifecycle_source_at_ms IS NULL \
@@ -1246,6 +1266,11 @@ impl Store {
                               'completed', 'failed', 'cancelled', 'ended_unknown'\
                           ) \
                           AND run.native_session_end_status IS NULL \
+                          AND NOT EXISTS (\
+                              SELECT 1 FROM executions AS execution \
+                              WHERE execution.task_run_id = run.run_id \
+                                AND execution.ended_at_ms IS NULL\
+                          ) \
                           AND run.latest_provider_at_ms IS NOT NULL \
                           AND (\
                               run.lifecycle_source_at_ms IS NULL \
@@ -1268,6 +1293,11 @@ impl Store {
                        JOIN history_drains AS blocker ON blocker.drain_id = association.drain_id \
                        WHERE association.run_id = run.run_id \
                          AND blocker.finalized_at_ms IS NULL\
+                   ) \
+                   AND NOT EXISTS (\
+                       SELECT 1 FROM executions AS execution \
+                       WHERE execution.task_run_id = run.run_id \
+                         AND execution.ended_at_ms IS NULL\
                    )",
                 params![drain_id.as_str(), observed_at_ms, source_order_prefix],
             )?;
@@ -6647,6 +6677,138 @@ mod tests {
             );
             assert!(state.history_ready);
         }
+    }
+
+    #[test]
+    fn history_finalization_preserves_open_execution_native_lifecycle() {
+        let (_directory, root) = test_root();
+        let mut store = open_writer(&root).unwrap();
+        let drain_id = HistoryDrainId::new("codex:open-execution").unwrap();
+        let open_execution_run = RunId::new();
+        let ended_execution_run = RunId::new();
+        let barrier_at_ms = 5_000;
+        let history_order = |run_id: RunId| format!("history-drain:{}:{run_id}", drain_id.as_str());
+        let native_run = |run_id: RunId, ordinal: i64| PersistTaskRunV6 {
+            task_run: match run_op_with_key(
+                run_id,
+                RunKey::Native {
+                    provider: Provider::Codex,
+                    sid: format!("open-execution-{ordinal}"),
+                },
+                ordinal,
+                TaskState::Running,
+                3_000,
+                false,
+                Some(NativeSessionBinding {
+                    provider: Provider::Codex,
+                    native_session_id: format!("open-execution-{ordinal}"),
+                }),
+            ) {
+                PersistOp::UpsertTaskRun(task_run) => task_run,
+                _ => unreachable!(),
+            },
+            state: TaskRunV6State {
+                lifecycle_watermark: None,
+                history_ready: false,
+                latest_provider_at_ms: Some(4_000),
+                ..TaskRunV6State::default()
+            },
+        };
+        let execution =
+            |run_id: RunId, ordinal: i64, state: ExecState, ended_at_ms: Option<i64>| {
+                PersistOp::UpsertExecution(PersistExecution {
+                    execution: Execution {
+                        execution_id: format!("open-execution-{ordinal}"),
+                        pane_id: format!("pane-{ordinal}"),
+                        terminal_id: format!("terminal-{ordinal}"),
+                        task_run_id: run_id,
+                        state,
+                    },
+                    started_at_ms: 3_000,
+                    updated_at_ms: ended_at_ms.unwrap_or(3_500),
+                    ended_at_ms,
+                })
+            };
+        let manifest = PersistHistoryDrain {
+            drain_id: drain_id.clone(),
+            provider: Provider::Codex,
+            created_at_ms: 2_000,
+            artifacts: vec![PersistHistoryDrainArtifact {
+                artifact_id: "events.jsonl".to_owned(),
+                generation: "dev:1".to_owned(),
+                goalpost: 100,
+            }],
+        };
+        store
+            .apply_v6_batch(PersistV6Batch {
+                operations: vec![
+                    execution(open_execution_run, 1, ExecState::Working, None),
+                    execution(ended_execution_run, 2, ExecState::Ended, Some(4_500)),
+                ],
+                task_runs: vec![
+                    native_run(open_execution_run, 1),
+                    native_run(ended_execution_run, 2),
+                ],
+                history_drains: vec![manifest.clone()],
+                history_associations: [open_execution_run, ended_execution_run]
+                    .into_iter()
+                    .map(|run_id| PersistHistoryDrainRun {
+                        drain_id: drain_id.clone(),
+                        run_id,
+                    })
+                    .collect(),
+                ..PersistV6Batch::default()
+            })
+            .unwrap();
+        let open_ended_at: Option<i64> = store
+            .connection
+            .query_row(
+                "SELECT ended_at_ms FROM executions WHERE execution_id = 'open-execution-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(open_ended_at, None);
+
+        let finalization = store
+            .finalize_history_drain(&manifest, barrier_at_ms)
+            .unwrap();
+        assert_eq!(finalization.runs.len(), 2);
+        drop(store);
+        let restored = open_reader(&root).unwrap().load_restored_state().unwrap();
+
+        let open_state = restored
+            .model
+            .task_run_v6_state(&open_execution_run)
+            .unwrap();
+        assert!(open_state.history_ready);
+        assert_eq!(
+            open_state.native_session_end, None,
+            "a run whose execution is still open must not receive a history Unknown"
+        );
+        assert_eq!(open_state.lifecycle_watermark, None);
+        assert_eq!(open_state.latest_provider_at_ms, Some(4_000));
+
+        let ended_state = restored
+            .model
+            .task_run_v6_state(&ended_execution_run)
+            .unwrap();
+        assert!(ended_state.history_ready);
+        assert_eq!(
+            ended_state.native_session_end,
+            Some(NativeSessionEnd {
+                status: NativeSessionEndStatus::Unknown,
+                at_ms: 4_000,
+            })
+        );
+        assert_eq!(
+            ended_state.lifecycle_watermark,
+            Some(NativeLifecycleWatermark {
+                source_at_ms: 4_000,
+                observed_at_ms: barrier_at_ms,
+                source_order: history_order(ended_execution_run),
+            })
+        );
     }
 
     #[test]
