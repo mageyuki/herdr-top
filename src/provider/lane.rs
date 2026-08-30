@@ -519,11 +519,12 @@ impl Synthesis {
                 if self.session_meta.contains_key(artifact) {
                     return;
                 }
+                let event_kind = codex_run_kind(&originator, internal.as_ref());
                 self.session_meta.insert(
                     artifact.to_path_buf(),
                     CodexSessionMetadata {
                         cwd,
-                        originator: originator.clone(),
+                        originator,
                         internal,
                         cli_version,
                     },
@@ -547,7 +548,7 @@ impl Synthesis {
                     at_ms,
                     None,
                     Some(MinimalProviderMetadata {
-                        event_kind: Some(originator),
+                        event_kind,
                         ..MinimalProviderMetadata::default()
                     }),
                 )));
@@ -833,6 +834,25 @@ impl Synthesis {
         event.metadata.event_id = deterministic_subject_event_id(artifact, ordinal, &scope);
         events.push(ProviderEvent::Synthesized(event));
     }
+}
+
+/// Selects the published Codex run kind from session metadata.
+///
+/// Priority is the `ThreadSpawn` agent role, then a provider-defined internal-agent name, then
+/// the rollout originator; blank values are skipped so the reducer's first-nonempty rule never
+/// receives an empty kind. A `ThreadSpawn` nickname is volatile provider colour and is never a
+/// kind or a subject.
+fn codex_run_kind(originator: &str, internal: Option<&CodexInternal>) -> Option<String> {
+    let meaningful = |value: &str| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    };
+    match internal {
+        Some(CodexInternal::ThreadSpawn { role, .. }) => role.as_deref().and_then(meaningful),
+        Some(CodexInternal::Named { name }) => meaningful(name),
+        None => None,
+    }
+    .or_else(|| meaningful(originator))
 }
 
 /// Returns the identity form consumed by run-scoped liveness and telemetry routes.
@@ -3165,6 +3185,122 @@ mod tests {
                 .and_then(|metadata| metadata.event_kind.as_deref()),
             Some("reviewer")
         );
+    }
+
+    #[test]
+    fn codex_run_kind_prefers_role_and_meaningful_internal_name() {
+        fn rollout(digit: char) -> String {
+            let block = |width: usize| digit.to_string().repeat(width);
+            format!(
+                "{}-{}-4{}-8{}-{}",
+                block(8),
+                block(4),
+                block(3),
+                block(3),
+                block(12)
+            )
+        }
+        let thread_spawn = |role: Option<&str>| CodexInternal::ThreadSpawn {
+            parent_thread_id: ROLLOUT.to_owned(),
+            nickname: Some("volatile".to_owned()),
+            role: role.map(str::to_owned),
+        };
+        let cases = [
+            (
+                "thread-role",
+                '4',
+                "codex-tui",
+                Some(thread_spawn(Some("worker"))),
+                Some("worker"),
+            ),
+            (
+                "thread-no-role",
+                '5',
+                "codex-tui",
+                Some(thread_spawn(None)),
+                Some("codex-tui"),
+            ),
+            (
+                "named",
+                '6',
+                "codex-tui",
+                Some(CodexInternal::Named {
+                    name: "reviewer".to_owned(),
+                }),
+                Some("reviewer"),
+            ),
+            (
+                "empty-role",
+                '7',
+                "codex-tui",
+                Some(thread_spawn(Some(" "))),
+                Some("codex-tui"),
+            ),
+            (
+                "empty-name",
+                '8',
+                "codex-tui",
+                Some(CodexInternal::Named {
+                    name: String::new(),
+                }),
+                Some("codex-tui"),
+            ),
+            ("no-internal", '9', "codex-tui", None, Some("codex-tui")),
+            ("all-empty", 'a', "", Some(thread_spawn(Some(""))), None),
+        ];
+        for (artifact, digit, originator, internal, expected) in cases {
+            let rollout_id = rollout(digit);
+            let scope = SessionScope::Codex {
+                rollout_id: rollout_id.clone(),
+            };
+            let events = synthesize(
+                &mut Synthesis::default(),
+                &format!("{artifact}.jsonl"),
+                [(
+                    0,
+                    LogFact::CodexMeta {
+                        rollout_id: rollout_id.clone(),
+                        cwd: "/tmp/project".to_owned(),
+                        originator: originator.to_owned(),
+                        internal,
+                        cli_version: "0.1.0".to_owned(),
+                    },
+                )],
+            );
+            let started = synthesized_events(&events)
+                .into_iter()
+                .find(|event| matches!(event.event, ControllerEventKind::TaskStarted))
+                .unwrap_or_else(|| panic!("{artifact}: the lane must synthesize the Codex start"));
+            let published = started
+                .metadata
+                .provider_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.event_kind.as_deref());
+            assert_eq!(published, expected, "{artifact}: published lane kind");
+            assert_ne!(
+                published,
+                Some("volatile"),
+                "{artifact}: nickname is never a kind"
+            );
+            assert!(
+                started
+                    .metadata
+                    .label
+                    .as_deref()
+                    .is_none_or(|label| !label.contains("volatile")),
+                "{artifact}: nickname is never a subject"
+            );
+
+            let model = apply_once_per_event_id(&events);
+            let run = model
+                .task_run_by_key(&run_key_for_scope(&scope))
+                .unwrap_or_else(|| panic!("{artifact}: the lane must create the Codex run"));
+            assert_eq!(
+                model.run_kind(&run.run_id),
+                expected,
+                "{artifact}: projected run kind"
+            );
+        }
     }
 
     #[test]

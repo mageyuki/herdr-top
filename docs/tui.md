@@ -181,11 +181,15 @@ A Task Run follows this grammar:
   before it drops the operational state.
 - **Worker kind** comes from the projected run kind, falling back to the native
   provider name, the selector from a hook-backed Controller key, another
-  Controller key, or `provisional`.
-- **Subject** is the captured task subject. If none exists, the renderer uses a
-  key-derived identity rather than leaving the segment empty. A native or
-  native-path Codex run that is the child of an execution edge renders the kind
-  alone and suppresses the subject.
+  Controller key, or `provisional`. The run-kind source priority is normative
+  and described under [Run kind and primary-row identity](#run-kind-and-primary-row-identity).
+- **Subject** is the captured task subject. A provider-backed run with no
+  captured subject renders the kind alone; it never falls back to a native
+  session ID, hook session ID, or path-derived run UUID. A Codex child — a
+  Codex-backed run below an execution edge — renders the kind alone even when a
+  subject was captured. Only a run with no provider backing (a plain Controller
+  key or a provisional key) still uses its key-derived fallback rather than
+  leaving the segment empty.
 - **Live line** appears only on a non-terminal run. It comes from the log-lane
   live-line read model, or, for a Claude-flavoured run, from the newest Agent
   Node's last event kind with a `: <tool>` suffix when a tool name is present.
@@ -304,10 +308,14 @@ Relationship annotations are appended in this order when applicable:
   so the run appears under each hosting pane. Its descendants expand only on
   the first occurrence.
 - `[dispatched by: ...]` appears only on a pane-placed run and names its dispatch
-  parent. A run with no execution history instead nests physically beneath its
-  default-visible dispatch parent and carries no textual parent hint. A hidden
-  or expired parent never hides a child: the child falls back to `Unattached`
-  for that frame. A malformed parent cycle also falls back to `Unattached`.
+  parent by the parent's stable run kind, then its captured subject, then its
+  key-derived worker kind; it never uses the parent's native session, hook
+  session, or run identity, and it reads the same before and after
+  Controller/native alias convergence. A run with no execution history instead
+  nests physically beneath its default-visible dispatch parent and carries no
+  textual parent hint. A hidden or expired parent never hides a child: the
+  child falls back to `Unattached` for that frame. A malformed parent cycle
+  also falls back to `Unattached`.
 
 Rows do not append a visible annotation for the absence of relationships.
 Selected Task Run Detail reports `dispatch_parent`, `prerequisites`,
@@ -379,13 +387,58 @@ text and its status color.
 Native agent rows use this form:
 
 ```text
-<glyph> <status> <Claude|Codex> native agent: <native-session-or-node-id> [model:<model>] [last:<timestamp>ms]
+<glyph> <status> <Claude|Codex> native agent[: <role>] [model:<model>] [last:<timestamp>ms]
 ```
+
+`<role>` is the sanitized stable run kind of the Task Run the Agent Node
+represents. That run is resolved by exact native alias first: an Agent Node
+whose provider and nonempty native session ID exactly match a `RunKey::Native`
+binding renders that run's kind, so a Codex child Agent Node owned by its root
+run reports the child's role (`Codex native agent: worker`). Otherwise the
+owning Task Run applies only when it has no native binding of its own — a
+Controller-keyed Claude subagent run renders `Claude native agent: reviewer`
+from its owning run kind, while an unmatched Agent Node under a natively bound
+owner renders `Codex native agent` with no colon and no identity. The native
+session ID and Agent Node ID never appear in the row; Detail carries them.
+Model and activity annotations are unchanged.
 
 Visible native child Agent rows use their own evidence: `working`, `idle`, and
 `blocked` map one-to-one; `ended` maps to `done`; `stale` maps to `unknown` plus
 stalled; and absent or `unknown` maps to `unknown`. They never invent `queued`,
 `error`, or `cancelled`.
+
+### Run kind and primary-row identity
+
+The primary surface — every Task Run row, Agent row, and `[dispatched by: ...]`
+annotation in the execution tree and DAG — contains no provider session ID,
+hook session ID, run UUID, or Agent Node ID. Identity lives in the Selected
+detail overlay, which keeps the full key, `run_id`, bound `native_session_id`,
+`agent_node_id`, `parent_agent_node_id`, and `dispatch_parent` unchanged. The
+DAG prerequisite and dependent columns and the filter's searchable identity
+fields are unchanged by this rule.
+
+A run is **provider-backed** when its primary key is `RunKey::Native` or
+`RunKey::NativePath`, when its Controller key carries a recognized hook selector
+(`hook:claude-code:` or `hook:codex:`), or when an exact native or native-path
+binding in the task-run bindings resolves to it. The last rule keeps a
+Controller-primary run provider-backed after Controller/native alias
+convergence, so a Controller-keyed Codex run with a native alias below an
+execution edge is still a Codex child and renders its role alone.
+
+The published run kind is the first nonempty value observed for a run; a later
+value never overwrites it, and run kinds are never persisted. For a Codex
+rollout the log lane selects, in order:
+
+1. the `ThreadSpawn` agent role from the rollout's session metadata;
+2. a provider-defined internal-agent name;
+3. the rollout originator (for example `codex-tui` or `codex_cli_rs`).
+
+Blank values are skipped so an empty role or name never publishes an empty
+kind. The `ThreadSpawn` nickname is never a kind or a subject. The Codex
+rollout `agent_role` field is read opportunistically from an unstable external
+format and is not a stable public Codex API. A Claude subagent publishes its
+`agentType`, and hook-backed runs without a lane kind fall back to the hook
+selector.
 
 The provider-native root Agent that duplicates its owning Task Run is hidden
 from the tree. A visible descendant whose root is hidden attaches directly

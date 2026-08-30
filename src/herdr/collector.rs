@@ -22066,11 +22066,14 @@ mod provider_integration_tests {
                 .contains("claude-code cwd-project"),
             "cwd basename did not supply the subject"
         );
+        let fallback_label = harness.row_label(fallback_id);
+        assert_eq!(
+            fallback_label, "● working claude-code",
+            "provider-backed run without a subject must render its UUID-free kind alone"
+        );
         assert!(
-            harness
-                .row_label(fallback_id)
-                .contains(&format!("claude-code {ID_SESSION}")),
-            "session id did not supply the final fallback"
+            !fallback_label.contains(ID_SESSION),
+            "provider-backed primary row leaked the session ID: {fallback_label:?}"
         );
         assert!(
             harness

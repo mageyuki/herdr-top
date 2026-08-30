@@ -86,6 +86,7 @@ struct RunRowContext<'model, 'data> {
     live_lines: &'data LiveLineReadModel,
     stalled_runs: &'data HashSet<RunId>,
     statuses: &'data StatusReadModel,
+    native_aliases: &'data projection::NativeAliasIndex,
     now_ms: i64,
 }
 
@@ -1651,6 +1652,7 @@ fn append_execution_tree_rows<'model>(
     let live_lines = LiveLineReadModel::from_model(model);
     let stalled_runs =
         projection::stalled_run_ids(model, state.now_ms(), crate::activity::stall_warn_ms());
+    let native_aliases = projection::NativeAliasIndex::from_model(model);
     let run_row_context = RunRowContext {
         model,
         nested_runs: &nested_runs,
@@ -1658,6 +1660,7 @@ fn append_execution_tree_rows<'model>(
         live_lines: &live_lines,
         stalled_runs: &stalled_runs,
         statuses,
+        native_aliases: &native_aliases,
         now_ms: state.now_ms(),
     };
     let mut run_render_state = RunRenderState::default();
@@ -1985,7 +1988,7 @@ fn append_run_subtree(
             provider_from_key(&run.key).is_none_or(|provider| provider == agent.provider)
         })
         .collect::<Vec<_>>();
-    append_agent_rows(rows, agents, pane_id, depth.saturating_add(1));
+    append_agent_rows(rows, agents, pane_id, depth.saturating_add(1), context);
     let expand_nested_runs = !shared || render_state.expanded_shared_runs.insert(run_id);
     if expand_nested_runs && let Some(children) = context.nested_runs.get(&run_id) {
         for child_run_id in children {
@@ -2008,6 +2011,7 @@ fn append_agent_rows(
     agents: Vec<&AgentNode>,
     pane_id: Option<&str>,
     depth: usize,
+    context: &RunRowContext<'_, '_>,
 ) {
     // Filtering happens before this hierarchy is built. A visible child whose stale parent was
     // removed therefore becomes a root under the owning run instead of being silently orphaned.
@@ -2032,7 +2036,7 @@ fn append_agent_rows(
 
     let mut visited = HashSet::new();
     for root in roots {
-        append_agent_subtree(rows, root, &children, pane_id, depth, &mut visited);
+        append_agent_subtree(rows, root, &children, pane_id, depth, &mut visited, context);
     }
 }
 
@@ -2047,6 +2051,7 @@ fn append_agent_subtree(
     pane_id: Option<&str>,
     depth: usize,
     visited: &mut HashSet<String>,
+    context: &RunRowContext<'_, '_>,
 ) {
     if !visited.insert(agent.agent_node_id.clone()) {
         return;
@@ -2058,7 +2063,7 @@ fn append_agent_subtree(
             pane_id: pane_id.map(str::to_owned),
         },
         depth,
-        label: agent_node_label(agent, display_status),
+        label: agent_node_label(context.model, context.native_aliases, agent, display_status),
         label_without_duration_suffix: None,
         display_status: Some(display_status),
         prerequisites: Vec::new(),
@@ -2073,23 +2078,30 @@ fn append_agent_subtree(
                 pane_id,
                 depth.saturating_add(1),
                 visited,
+                context,
             );
         }
     }
 }
 
-fn agent_node_label(agent: &AgentNode, display_status: DisplayStatus) -> String {
-    let identity = agent
-        .native_session_id
-        .as_deref()
-        .unwrap_or(&agent.agent_node_id);
+/// Renders an Agent row from its own evidence plus the resolved run role; the native session
+/// ID and Agent Node ID stay in Detail.
+fn agent_node_label(
+    model: &DomainModel,
+    native_aliases: &projection::NativeAliasIndex,
+    agent: &AgentNode,
+    display_status: DisplayStatus,
+) -> String {
     let mut label = format!(
-        "{} {} {} native agent: {}",
+        "{} {} {} native agent",
         display_status.glyph(),
         display_status.status.label(),
         provider_label(agent.provider),
-        safe_text(identity),
     );
+    if let Some(role) = projection::agent_role_label(model, native_aliases, agent) {
+        label.push_str(": ");
+        label.push_str(&role);
+    }
     if let Some(model) = agent.model_id.as_deref() {
         label.push_str(&format!(" [model:{}]", safe_text(model)));
     }
@@ -2146,9 +2158,20 @@ fn append_task_run_annotations(
         label.push_str(" [shared]");
     }
     if show_dispatch_parent && let Some(parent) = dispatch_parent_run(model, run.run_id) {
-        label.push_str(&format!(" [dispatched by: {}]", short_run_name(parent)));
+        label.push_str(&format!(
+            " [dispatched by: {}]",
+            dispatch_parent_label(model, parent)
+        ));
     }
     label
+}
+
+/// Names a dispatch parent without provider identity: its stable kind, then its captured
+/// subject, then the key-derived worker kind. Never the `short_run_name` identity fallback.
+fn dispatch_parent_label(model: &DomainModel, parent: &TaskRun) -> String {
+    projection::stable_run_kind(model, parent.run_id)
+        .or_else(|| parent.subject.as_deref().map(safe_text))
+        .unwrap_or_else(|| projection::worker_kind_label(parent))
 }
 
 fn dispatch_parent_run(model: &DomainModel, child_run_id: RunId) -> Option<&TaskRun> {
@@ -2259,12 +2282,17 @@ fn run_row_head(model: &DomainModel, run: &TaskRun, display_status: DisplayStatu
     );
     let run_kind = projection::run_kind_label(model, run);
     label.push_str(&run_kind);
-    let subject = if is_codex_worker(model, run) {
+    // A Codex child renders the kind alone. Any other provider-backed run keeps a captured
+    // subject but never falls back to its native session, hook session, or run identity; only a
+    // non-provider run still uses the key-derived fallback.
+    let subject = if projection::is_codex_child(model, run) {
+        String::new()
+    } else if let Some(subject) = run.subject.as_deref() {
+        safe_text(subject)
+    } else if projection::provider_backed_provider(model, run).is_some() {
         String::new()
     } else {
-        run.subject
-            .as_deref()
-            .map_or_else(|| run_subject_fallback(run), safe_text)
+        run_subject_fallback(run)
     };
     if !subject.is_empty() {
         label.push(' ');
@@ -2296,29 +2324,11 @@ fn run_uses_claude_tool_line(run: &TaskRun, agent: &AgentNode) -> bool {
     }
 }
 
-fn is_codex_worker(model: &DomainModel, run: &TaskRun) -> bool {
-    matches!(
-        &run.key,
-        RunKey::Native {
-            provider: Provider::Codex,
-            ..
-        } | RunKey::NativePath {
-            provider: Provider::Codex,
-            ..
-        }
-    ) && model
-        .execution_edges()
-        .any(|edge| edge.child_run_id == run.run_id)
-}
-
+/// Key-derived subject for a run without provider backing; provider identities never reach here.
 fn run_subject_fallback(run: &TaskRun) -> String {
     match &run.key {
-        RunKey::Controller(name) => name
-            .strip_prefix("hook:claude-code:")
-            .filter(|suffix| !suffix.contains(':'))
-            .map_or_else(|| run_name(run), safe_text),
-        RunKey::Native { sid, .. } => safe_text(sid),
-        RunKey::NativePath { .. } => run.run_id.to_string(),
+        RunKey::Controller(name) => safe_text(name),
+        RunKey::Native { .. } | RunKey::NativePath { .. } => String::new(),
         RunKey::Provisional {
             terminal_id,
             start_ms,
@@ -2339,24 +2349,6 @@ fn format_duration(elapsed_ms: i64) -> String {
         format!("{minutes:02}m{seconds:02}s")
     } else {
         format!("{total_seconds:02}s")
-    }
-}
-
-fn run_name(run: &TaskRun) -> String {
-    match &run.key {
-        RunKey::Controller(name) => safe_text(name),
-        RunKey::Native { provider, sid } => {
-            format!("{} {}", provider_label(*provider), safe_text(sid))
-        }
-        RunKey::NativePath { provider, path } => {
-            let _ = path;
-            format!("{} {}", provider_label(*provider), run.run_id)
-        }
-        RunKey::Provisional {
-            terminal_id,
-            start_ms,
-            seq,
-        } => format!("provisional {}:{start_ms}:{seq}", safe_text(terminal_id)),
     }
 }
 
@@ -2930,7 +2922,7 @@ mod tests {
                 .unwrap();
             assert!(
                 row.label
-                    .starts_with(&format!("{expected} Codex native agent:")),
+                    .starts_with(&format!("{expected} Codex native agent")),
                 "{}",
                 row.label,
             );
@@ -3266,6 +3258,300 @@ mod tests {
     }
 
     #[test]
+    fn controller_primary_codex_rows_render_roles_without_provider_ids() {
+        const ROOT_SID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        const CHILD_SID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        const PANE_CHILD_SID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        const STRANGER_SID: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        const CLAUDE_SID: &str = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+        const CLAUDE_AGENT_ID: &str = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+        const WORKER_NODE: &str = "11111111-1111-4111-8111-111111111111";
+        const STRANGER_NODE: &str = "22222222-2222-4222-8222-222222222222";
+        const CLAUDE_NODE: &str = "33333333-3333-4333-8333-333333333333";
+        let root_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let child_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        let pane_child_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        let claude_id = run_id("01ARZ3NDEKTSV4RRFFQ69G5FAY");
+        let codex_run = |run_id: RunId, key: RunKey, ordinal: i64, subject: Option<&str>| TaskRun {
+            run_id,
+            key,
+            display_ordinal: DisplayOrdinal::new(ordinal),
+            state: TaskState::Running,
+            has_controller_task_state_event: true,
+            created_at_ms: None,
+            updated_at_ms: None,
+            finished_at_ms: None,
+            subject: subject.map(str::to_owned),
+            dismissed_at_ms: None,
+        };
+        let agent = |agent_node_id: &str,
+                     provider: Provider,
+                     sid: &str,
+                     owner: RunId,
+                     ordinal: i64,
+                     parent: &str,
+                     model_id: Option<&str>,
+                     last_activity_at_ms: Option<i64>| AgentNode {
+            agent_node_id: agent_node_id.to_owned(),
+            provider,
+            native_session_id: Some(sid.to_owned()),
+            task_run_id: owner,
+            display_ordinal: DisplayOrdinal::new(ordinal),
+            parent_agent_node_id: Some(parent.to_owned()),
+            state: Some(ExecState::Working),
+            model_id: model_id.map(str::to_owned),
+            last_event_kind: None,
+            last_tool_name: None,
+            last_item_count: None,
+            last_byte_count: None,
+            last_activity_at_ms,
+            session_file: None,
+        };
+        let agent_row = |rows: &[TreeRow], agent_node_id: &str| -> TreeRow {
+            rows.iter()
+                .find(|row| {
+                    matches!(
+                        &row.key,
+                        NodeKey::Agent { agent_node_id: candidate, .. } if candidate == agent_node_id
+                    )
+                })
+                .cloned()
+                .unwrap_or_else(|| panic!("missing Agent row {agent_node_id}"))
+        };
+
+        // `converged` models the Controller/native identity convergence: the hook-created
+        // Controller key stays primary while the exact native session becomes an alias.
+        for converged in [false, true] {
+            let codex_key = |sid: &str| {
+                if converged {
+                    RunKey::Controller(format!("hook:codex:{sid}"))
+                } else {
+                    RunKey::Native {
+                        provider: Provider::Codex,
+                        sid: sid.to_owned(),
+                    }
+                }
+            };
+            let mut model = placement_model(&["pane-root", "pane-child", "pane-claude"]);
+            model.insert_task_run(codex_run(root_id, codex_key(ROOT_SID), 1, None));
+            model.insert_task_run(codex_run(
+                child_id,
+                codex_key(CHILD_SID),
+                2,
+                converged.then_some(CHILD_SID),
+            ));
+            model.insert_task_run(codex_run(pane_child_id, codex_key(PANE_CHILD_SID), 3, None));
+            if converged {
+                for (sid, run_id) in [
+                    (ROOT_SID, root_id),
+                    (CHILD_SID, child_id),
+                    (PANE_CHILD_SID, pane_child_id),
+                ] {
+                    model.insert_task_run_alias(
+                        RunKey::Native {
+                            provider: Provider::Codex,
+                            sid: sid.to_owned(),
+                        },
+                        run_id,
+                    );
+                }
+            }
+            model.set_run_kind(root_id, "codex-tui".to_owned());
+            model.set_run_kind(child_id, "worker".to_owned());
+            model.set_run_kind(pane_child_id, "worker".to_owned());
+            insert_placement_execution(
+                &mut model,
+                root_id,
+                "root-execution",
+                "pane-root",
+                ExecState::Working,
+            );
+            insert_placement_execution(
+                &mut model,
+                pane_child_id,
+                "pane-child-execution",
+                "pane-child",
+                ExecState::Working,
+            );
+            for child_run_id in [child_id, pane_child_id] {
+                model.insert_execution_edge(ExecutionEdge {
+                    parent_run_id: root_id,
+                    child_run_id,
+                });
+            }
+            // Codex Agent Nodes are owned by the root run and parented under its hidden
+            // provider root; only the exact native alias binds one to the child Task Run.
+            model.insert_agent_node(agent(
+                WORKER_NODE,
+                Provider::Codex,
+                CHILD_SID,
+                root_id,
+                10,
+                "provider-root",
+                Some("gpt-5"),
+                Some(5),
+            ));
+            model.insert_agent_node(agent(
+                STRANGER_NODE,
+                Provider::Codex,
+                STRANGER_SID,
+                root_id,
+                11,
+                "provider-root",
+                None,
+                None,
+            ));
+            // A Claude subagent run is Controller-keyed with no native alias; its Agent Node
+            // is owned by that run and carries the agent ID as its native session.
+            model.insert_task_run(codex_run(
+                claude_id,
+                RunKey::Controller(format!(
+                    "hook:claude-code:{CLAUDE_SID}:agent:{CLAUDE_AGENT_ID}"
+                )),
+                4,
+                None,
+            ));
+            model.set_run_kind(claude_id, "reviewer".to_owned());
+            insert_placement_execution(
+                &mut model,
+                claude_id,
+                "claude-execution",
+                "pane-claude",
+                ExecState::Working,
+            );
+            model.insert_agent_node(agent(
+                CLAUDE_NODE,
+                Provider::Claude,
+                CLAUDE_AGENT_ID,
+                claude_id,
+                12,
+                "claude-root",
+                None,
+                None,
+            ));
+
+            let state = AppState::default();
+            let rows = build_rows(&model, &state);
+            let root_row = only_run_row(&rows, root_id).clone();
+            let child_row = only_run_row(&rows, child_id).clone();
+            let pane_child_row = only_run_row(&rows, pane_child_id).clone();
+            let claude_row = only_run_row(&rows, claude_id).clone();
+
+            assert_eq!(
+                root_row.label, "● working codex-tui",
+                "converged={converged}: Codex root renders its kind alone"
+            );
+            assert_eq!(
+                child_row.label, "● working worker",
+                "converged={converged}: Codex child renders its role alone"
+            );
+            assert_eq!(
+                child_row.depth,
+                root_row.depth + 1,
+                "converged={converged}: headless child nests under its dispatch parent"
+            );
+            assert_eq!(
+                pane_child_row.label, "● working worker [dispatched by: codex-tui]",
+                "converged={converged}: pane-placed child names its parent by kind"
+            );
+            assert_eq!(
+                claude_row.label, "● working reviewer",
+                "converged={converged}: Claude subagent run renders its kind alone"
+            );
+            assert_eq!(
+                agent_row(&rows, WORKER_NODE).label,
+                "● working Codex native agent: worker [model:gpt-5] [last:5ms]",
+                "converged={converged}: exact-bound Codex agent renders the child role"
+            );
+            assert_eq!(
+                agent_row(&rows, STRANGER_NODE).label,
+                "● working Codex native agent",
+                "converged={converged}: unmatched Codex agent renders no identity suffix"
+            );
+            assert_eq!(
+                agent_row(&rows, CLAUDE_NODE).label,
+                "● working Claude native agent: reviewer",
+                "converged={converged}: Controller-keyed Claude agent renders its owning run kind"
+            );
+            let identities = [
+                ROOT_SID,
+                CHILD_SID,
+                PANE_CHILD_SID,
+                STRANGER_SID,
+                CLAUDE_SID,
+                CLAUDE_AGENT_ID,
+                WORKER_NODE,
+                STRANGER_NODE,
+                CLAUDE_NODE,
+            ];
+            let run_ids = [root_id, child_id, pane_child_id, claude_id].map(|id| id.to_string());
+            for row in rows
+                .iter()
+                .filter(|row| matches!(row.key, NodeKey::Run { .. } | NodeKey::Agent { .. }))
+            {
+                for identity in identities
+                    .iter()
+                    .copied()
+                    .chain(run_ids.iter().map(String::as_str))
+                {
+                    assert!(
+                        !row.label.contains(identity),
+                        "converged={converged}: primary row leaks {identity}: {}",
+                        row.label
+                    );
+                }
+            }
+
+            // A captured human subject is retained on the non-child root.
+            model.insert_task_run(codex_run(
+                root_id,
+                codex_key(ROOT_SID),
+                1,
+                Some("Ship the release"),
+            ));
+            let subject_rows = build_rows(&model, &state);
+            assert_eq!(
+                only_run_row(&subject_rows, root_id).label,
+                "● working codex-tui Ship the release",
+                "converged={converged}: the root keeps its captured subject"
+            );
+
+            // Detail remains the complete identity surface.
+            let operator = state.operator_snapshot();
+            let child_detail = projection::detail_lines(&projection::detail_projection(
+                &model,
+                &subject_rows,
+                &operator,
+                &child_row.key,
+                ViewMode::ExecutionTree,
+                None,
+            ));
+            assert!(
+                child_detail
+                    .iter()
+                    .any(|line| line.starts_with("key: ") && line.contains(CHILD_SID)),
+                "converged={converged}: child detail key: {child_detail:?}"
+            );
+            assert!(child_detail.contains(&format!("run_id: {child_id}")));
+            if !converged {
+                // Detail's native_session_id line is unchanged: a native-primary key reports
+                // itself, while a Controller-primary key reports its owned Agent Nodes.
+                assert!(child_detail.contains(&format!("native_session_id: {CHILD_SID}")));
+            }
+            let agent_detail = projection::detail_lines(&projection::detail_projection(
+                &model,
+                &subject_rows,
+                &operator,
+                &agent_row(&subject_rows, WORKER_NODE).key,
+                ViewMode::ExecutionTree,
+                None,
+            ));
+            assert!(agent_detail.contains(&format!("agent_node_id: {WORKER_NODE}")));
+            assert!(agent_detail.contains(&format!("native_session_id: {CHILD_SID}")));
+        }
+    }
+
+    #[test]
     fn summary_rows_group_all_runs_by_effective_endpoint() {
         let mut model = DomainModel::default();
         let fixtures = [
@@ -3542,7 +3828,7 @@ mod tests {
                 ),
                 None,
                 5_000,
-                "◌ queued claude-code hook:claude-code:S:task:T",
+                "◌ queued claude-code",
             ),
             (
                 label_run(
@@ -3875,7 +4161,7 @@ mod tests {
                 10,
                 true,
             ),
-            "● working claude-code Shared child [shared] [dispatched by: Parent]"
+            "● working claude-code Shared child [shared] [dispatched by: Parent subject]"
         );
         assert_eq!(
             task_run_label(
@@ -4030,14 +4316,14 @@ mod tests {
                     provider: Provider::Codex,
                     sid: "native-session".to_owned(),
                 },
-                "● working Codex native-session",
+                "● working Codex",
             ),
             (
                 RunKey::NativePath {
                     provider: Provider::Codex,
                     path: "/private/session.jsonl".to_owned(),
                 },
-                "● working Codex 01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "● working Codex",
             ),
             (
                 RunKey::Provisional {
@@ -4049,7 +4335,19 @@ mod tests {
             ),
             (
                 RunKey::Controller("hook:claude-code:S:task:T".to_owned()),
-                "● working claude-code hook:claude-code:S:task:T",
+                "● working claude-code",
+            ),
+            (
+                RunKey::Controller("hook:claude-code:S".to_owned()),
+                "● working claude-code",
+            ),
+            (
+                RunKey::Controller("hook:unknown:S".to_owned()),
+                "● working unknown hook:unknown:S",
+            ),
+            (
+                RunKey::Controller("controller".to_owned()),
+                "● working controller controller",
             ),
         ] {
             let run = label_run(run_id, key, TaskState::Running, None, None, None);
@@ -4520,8 +4818,10 @@ mod tests {
         let workspace_x = label_column("Workspace: api");
         let tab_x = label_column("Tab: implementation");
         let pane_x = label_column("Pane: w1:p1");
-        let run_x = label_column("Codex controller");
-        let agent_x = label_column("Codex native agent: investigate");
+        // The provider-backed root has no captured subject, so its row is the kind alone and
+        // its unmatched Agent row carries no identity suffix.
+        let run_x = label_column("● working Codex") + Span::raw("● working ").width();
+        let agent_x = label_column("Codex native agent");
         assert_eq!(workspace_x, session_x + 4);
         assert_eq!(tab_x, workspace_x + 4);
         assert_eq!(pane_x, tab_x + 4);
@@ -6140,20 +6440,31 @@ mod tests {
             .filter(|row| matches!(row.key, NodeKey::Agent { .. }))
             .collect::<Vec<_>>();
 
+        let agent_node_id = |row: &TreeRow| match &row.key {
+            NodeKey::Agent { agent_node_id, .. } => agent_node_id.clone(),
+            other => panic!("expected an Agent row, got {other:?}"),
+        };
+
         assert_eq!(agent_rows.len(), 3);
-        assert!(agent_rows[0].label.contains("investigate"));
+        assert_eq!(agent_node_id(agent_rows[0]), "agent-1");
         assert_eq!(agent_rows[0].depth + 1, agent_rows[1].depth);
-        assert!(agent_rows[1].label.contains("child"));
-        assert!(
-            agent_rows[1]
-                .label
-                .starts_with("● working Codex native agent:")
+        assert_eq!(agent_node_id(agent_rows[1]), "agent-child");
+        assert_eq!(
+            agent_rows[1].label,
+            "● working Codex native agent [model:gpt-child] [last:99ms]"
         );
         assert!(!agent_rows[1].label.contains("[state:"));
-        assert!(agent_rows[1].label.contains("model:gpt-child"));
-        assert!(agent_rows[1].label.contains("last:99ms"));
         assert_eq!(agent_rows[0].depth, agent_rows[2].depth);
-        assert!(agent_rows[2].label.contains("orphan"));
+        assert_eq!(agent_node_id(agent_rows[2]), "agent-missing-parent");
+        for row in &agent_rows {
+            for identity in ["investigate", "orphan", "agent-", "native agent:"] {
+                assert!(
+                    !row.label.contains(identity),
+                    "Agent row leaks {identity}: {}",
+                    row.label
+                );
+            }
+        }
     }
 
     #[test]
@@ -6777,9 +7088,7 @@ mod tests {
                 ViewMode::ExecutionTree => {
                     assert!(screen.contains("native agent") || screen.contains("[running]"));
                     assert!(
-                        rows[4..=6]
-                            .iter()
-                            .any(|row| row.contains("Codex controller")),
+                        rows[4..=6].iter().any(|row| row.contains("working Codex")),
                         "the 48x14 tree body must contain its known Task Run row"
                     );
                 }

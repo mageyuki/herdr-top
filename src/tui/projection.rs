@@ -12,7 +12,8 @@ use crate::activity::{
 use crate::diagnostics::{ControllerInputStatus, RuntimeDiagnosticsSnapshot};
 use crate::herdr::collector::ObservationQuality;
 use crate::model::{
-    DomainModel, ExecState, Provider, RunId, RunKey, TaskRun, TaskState, TokenBreakdown, TurnAttr,
+    AgentNode, DomainModel, ExecState, Provider, RunId, RunKey, TaskRun, TaskState, TokenBreakdown,
+    TurnAttr,
 };
 use crate::store::writer::PersistenceStatus;
 
@@ -297,11 +298,118 @@ pub(crate) fn worker_kind_label(run: &TaskRun) -> String {
     }
 }
 
-pub(crate) fn run_kind_label(model: &DomainModel, run: &TaskRun) -> String {
+/// Returns the sanitized stable run kind, or `None` when no nonempty kind was published.
+pub(crate) fn stable_run_kind(model: &DomainModel, run_id: RunId) -> Option<String> {
     model
-        .run_kind(&run.run_id)
+        .run_kind(&run_id)
         .filter(|kind| !kind.is_empty())
-        .map_or_else(|| worker_kind_label(run), escape_controls)
+        .map(escape_controls)
+}
+
+pub(crate) fn run_kind_label(model: &DomainModel, run: &TaskRun) -> String {
+    stable_run_kind(model, run.run_id).unwrap_or_else(|| worker_kind_label(run))
+}
+
+fn key_provider(key: &RunKey) -> Option<Provider> {
+    match key {
+        RunKey::Native { provider, .. } | RunKey::NativePath { provider, .. } => Some(*provider),
+        RunKey::Controller(_) | RunKey::Provisional { .. } => None,
+    }
+}
+
+/// Maps the recognized hook selector of a hook-backed Controller key to its provider.
+fn hook_selector_provider(key: &RunKey) -> Option<Provider> {
+    let RunKey::Controller(name) = key else {
+        return None;
+    };
+    let (selector, _) = name.strip_prefix("hook:")?.split_once(':')?;
+    match selector {
+        "claude-code" => Some(Provider::Claude),
+        "codex" => Some(Provider::Codex),
+        _ => None,
+    }
+}
+
+/// Returns the provider that backs a Task Run.
+///
+/// Detection follows the primary key, then a recognized hook selector, then an exact native or
+/// native-path entry in the task-run bindings, so a Controller-primary run keeps its provider
+/// after Controller/native identity convergence.
+pub(crate) fn provider_backed_provider(model: &DomainModel, run: &TaskRun) -> Option<Provider> {
+    key_provider(&run.key)
+        .or_else(|| hook_selector_provider(&run.key))
+        .or_else(|| {
+            model
+                .task_run_bindings()
+                .filter(|(_, run_id)| **run_id == run.run_id)
+                .find_map(|(key, _)| key_provider(key))
+        })
+}
+
+/// A Codex-backed run below an execution edge is a Codex child whose row renders the kind alone.
+pub(crate) fn is_codex_child(model: &DomainModel, run: &TaskRun) -> bool {
+    provider_backed_provider(model, run) == Some(Provider::Codex)
+        && model
+            .execution_edges()
+            .any(|edge| edge.child_run_id == run.run_id)
+}
+
+/// Exact native-session aliases indexed once per frame for Agent-row role resolution.
+#[derive(Debug, Default)]
+pub(crate) struct NativeAliasIndex {
+    runs_by_session: HashMap<(Provider, String), RunId>,
+    natively_bound_runs: HashSet<RunId>,
+}
+
+impl NativeAliasIndex {
+    pub(crate) fn from_model(model: &DomainModel) -> Self {
+        let mut index = Self::default();
+        for (key, run_id) in model.task_run_bindings() {
+            match key {
+                RunKey::Native { provider, sid } => {
+                    index
+                        .runs_by_session
+                        .insert((*provider, sid.clone()), *run_id);
+                    index.natively_bound_runs.insert(*run_id);
+                }
+                RunKey::NativePath { .. } => {
+                    index.natively_bound_runs.insert(*run_id);
+                }
+                RunKey::Controller(_) | RunKey::Provisional { .. } => {}
+            }
+        }
+        index
+    }
+
+    /// Resolves the Task Run whose kind an Agent Node represents.
+    ///
+    /// An exact `(provider, native session)` alias wins, so a Codex child Agent Node owned by
+    /// its root run reports the child's role. Otherwise the owning run applies only when it has
+    /// no native binding of its own: a Controller-keyed Claude subagent run is that Agent Node's
+    /// run, while a natively bound owner would lend a sibling session an unrelated kind.
+    pub(crate) fn agent_kind_run(&self, agent: &AgentNode) -> Option<RunId> {
+        agent
+            .native_session_id
+            .as_deref()
+            .filter(|sid| !sid.is_empty())
+            .and_then(|sid| self.runs_by_session.get(&(agent.provider, sid.to_owned())))
+            .copied()
+            .or_else(|| {
+                (!self.natively_bound_runs.contains(&agent.task_run_id))
+                    .then_some(agent.task_run_id)
+            })
+    }
+}
+
+/// Returns the sanitized role rendered on an Agent row, if any.
+pub(crate) fn agent_role_label(
+    model: &DomainModel,
+    aliases: &NativeAliasIndex,
+    agent: &AgentNode,
+) -> Option<String> {
+    let run_id = aliases.agent_kind_run(agent)?;
+    model.task_run(&run_id)?;
+    stable_run_kind(model, run_id)
 }
 
 #[derive(Debug)]
@@ -4218,7 +4326,13 @@ mod tests {
         );
         let mut dag_order = crate::tui::dag::DagOrder::default();
         dag_order.recompute(&model);
-        let dag_text = crate::tui::dag::build_rows(&model, &dag_order, 0)
+        let dag_rows = crate::tui::dag::build_rows(&model, &dag_order, 0);
+        let dag_labels = dag_rows
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let dag_text = dag_rows
             .into_iter()
             .flat_map(|row| {
                 std::iter::once(row.label)
@@ -4230,8 +4344,13 @@ mod tests {
         for rendered in [&tree_label, &dag_text] {
             assert!(!rendered.contains(NATIVE_PATH));
             assert!(!rendered.contains("NATIVE_PATH_FORBIDDEN_I4_A2.jsonl"));
-            assert!(rendered.contains(&parent.run_id.to_string()));
         }
+        // Primary Task and dispatched-by labels stay UUID-free for the path-keyed native run;
+        // the DAG neighbor columns keep their identity names.
+        for rendered in [&tree_label, &dag_labels] {
+            assert!(!rendered.contains(&parent.run_id.to_string()));
+        }
+        assert!(tree_label.contains("[dispatched by: Codex]"));
 
         let child_row = row(
             NodeKey::Run {
