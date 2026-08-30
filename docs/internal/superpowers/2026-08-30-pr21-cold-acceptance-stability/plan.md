@@ -264,6 +264,12 @@ output, and any deviation. Do not commit.
 - Modify: `src/tui/view.rs`
 - Modify: `src/herdr/collector.rs` (test-only expectation updated after Task
   review exposed the removed provider-session fallback)
+- Modify: `tests/coverage_harness.rs` (test-only: the artifact-scan negative
+  control is a dedicated non-identity constant carried by the fixture model
+  value, the rendered header session, and an explicit structured log field,
+  because UUID-free primary rows no longer render the provider thread ID)
+- Modify: `tests/fixtures/provider/codex-allowlist-overlay-synthetic.jsonl`
+  (test-only: synthetic model value carries the artifact-scan control)
 - Modify: `docs/tui.md`
 - Modify: `docs/design/herdr-top-mvp.md`
 - Create no file.
@@ -362,12 +368,18 @@ public Codex API.
 cargo test --locked --lib provider::lane::tests::codex_run_kind_prefers_role_and_meaningful_internal_name -- --exact --nocapture
 cargo test --locked --lib tui::view::tests::controller_primary_codex_rows_render_roles_without_provider_ids -- --exact --nocapture
 cargo test --locked --lib herdr::collector::provider_integration_tests::subject_chain_meta_title_cwd_id -- --exact --nocapture
+cargo test --locked --test coverage_harness allowlist_scan_is_non_vacuous_across_every_artifact -- --exact --nocapture
 cargo test --locked --lib provider::lane::tests -- --nocapture
 cargo test --locked --lib tui::view::tests -- --nocapture
 cargo test --locked --lib
 cargo fmt --check
 git diff --check
 ```
+
+The coverage-harness command proves every claimed artifact (database, WAL,
+backup, log, rendered tree, and all six TUI surfaces) still contains the one
+common non-identity negative control while the rendered runtime tree contains
+neither provider thread ID.
 
 Return changed files, RED and GREEN evidence, exact rendered labels, test output,
 and any deviation. Do not commit.
