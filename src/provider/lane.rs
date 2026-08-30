@@ -277,8 +277,16 @@ impl Synthesis {
         scope: &ScopeKey,
         at_ms: i64,
         events: &mut Vec<ProviderEvent>,
-    ) -> bool {
+    ) -> Option<bool> {
         self.flush_due_completes(at_ms, events);
+        if let ScopeKey::ClaudeSubagent { parent, agent_id } = scope
+            && self
+                .subagent_ends
+                .get(&(parent.clone(), agent_id.clone()))
+                .is_some_and(|terminal| at_ms <= terminal.at_ms)
+        {
+            return None;
+        }
         self.pending_completes.remove(scope);
         self.pending_complete_origins.remove(scope);
         let was_completed = self.completed.remove(scope);
@@ -287,7 +295,7 @@ impl Synthesis {
             self.subagent_ends
                 .remove(&(parent.clone(), agent_id.clone()));
         }
-        was_completed || was_inactive
+        Some(was_completed || was_inactive)
     }
 
     fn start_scope(
@@ -473,7 +481,9 @@ impl Synthesis {
         match fact {
             LogFact::Append { scope, at_ms } => {
                 let key = ScopeKey::from(&scope);
-                let reopen = self.prepare_resume(&key, at_ms, events);
+                let Some(reopen) = self.prepare_resume(&key, at_ms, events) else {
+                    return;
+                };
                 self.last_append_ms.insert(key.clone(), at_ms);
                 self.last_append_origins.insert(key.clone(), origin.clone());
                 events.push(ProviderEvent::RunLiveness {
@@ -639,7 +649,9 @@ impl Synthesis {
                 let parent_scope = SessionScope::ClaudeRoot(parent.clone());
                 let child_scope = SessionScope::ClaudeSubagent { parent, agent_id };
                 let child_key = ScopeKey::from(&child_scope);
-                let _ = self.prepare_resume(&child_key, at_ms, events);
+                if self.prepare_resume(&child_key, at_ms, events).is_none() {
+                    return;
+                }
                 let provider_metadata = MinimalProviderMetadata {
                     event_kind: Some(agent_type),
                     ..MinimalProviderMetadata::default()
@@ -674,6 +686,14 @@ impl Synthesis {
             } => {
                 let terminal_key = (parent.clone(), agent_id.clone());
                 let previous = self.subagent_ends.get(&terminal_key).copied();
+                let scope = SessionScope::ClaudeSubagent { parent, agent_id };
+                let scope_key = ScopeKey::from(&scope);
+                // Durable terminals cannot be rewritten; only a grace-held Complete is mutable.
+                if previous.is_some_and(|previous| previous.failed)
+                    || self.completed.contains(&scope_key)
+                {
+                    return;
+                }
                 let terminal = *self
                     .subagent_ends
                     .entry(terminal_key)
@@ -687,14 +707,6 @@ impl Synthesis {
                         ordinal,
                         at_ms,
                     });
-                let scope = SessionScope::ClaudeSubagent { parent, agent_id };
-                let scope_key = ScopeKey::from(&scope);
-                // Durable terminals cannot be rewritten; only a grace-held Complete is mutable.
-                if previous.is_some_and(|previous| previous.failed)
-                    || self.completed.contains(&scope_key)
-                {
-                    return;
-                }
                 let SubagentEnd {
                     failed,
                     ordinal,
@@ -4100,6 +4112,385 @@ mod tests {
                 .state,
             crate::model::TaskState::Failed
         );
+    }
+
+    #[test]
+    fn stale_child_append_never_discards_grace_held_complete() {
+        const CHILD_APPEND_MS: i64 = 1_788_087_815_624;
+        const SUBAGENT_ENDED_MS: i64 = 1_788_087_817_159;
+
+        let mut synthesis = Synthesis::with_lifecycle_timing(30, 600);
+        let (scope, _) =
+            synthesize_subagent_start(&mut synthesis, "stale-append", Some(CHILD_APPEND_MS));
+        let scope_key = ScopeKey::from(&scope);
+        let terminal_key = (PARENT.to_owned(), "stale-append".to_owned());
+        let held = synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                2,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "stale-append".to_owned(),
+                    failed: false,
+                    at_ms: SUBAGENT_ENDED_MS,
+                },
+            )],
+        );
+        assert!(synthesized_events(&held).is_empty());
+        assert!(synthesis.pending_completes.contains_key(&scope_key));
+        assert!(synthesis.pending_complete_origins.contains_key(&scope_key));
+        assert!(synthesis.subagent_ends.contains_key(&terminal_key));
+        let was_completed = synthesis.completed.contains(&scope_key);
+
+        let stale = synthesize(
+            &mut synthesis,
+            "agent-stale-append.jsonl",
+            [(
+                3,
+                LogFact::Append {
+                    scope: scope.clone(),
+                    at_ms: CHILD_APPEND_MS,
+                },
+            )],
+        );
+
+        assert!(
+            synthesized_events(&stale)
+                .iter()
+                .all(|event| !matches!(event.event, ControllerEventKind::TaskStarted))
+        );
+        assert!(synthesis.pending_completes.contains_key(&scope_key));
+        assert!(synthesis.pending_complete_origins.contains_key(&scope_key));
+        assert_eq!(synthesis.completed.contains(&scope_key), was_completed);
+        assert_eq!(
+            synthesis
+                .subagent_ends
+                .get(&terminal_key)
+                .map(|terminal| terminal.at_ms),
+            Some(SUBAGENT_ENDED_MS)
+        );
+        assert!(matches!(
+            synthesized_events(&synthesis.advance_lifecycle(SUBAGENT_ENDED_MS + 30)).as_slice(),
+            [event]
+                if matches!(event.event, ControllerEventKind::Complete)
+                    && event.metadata.timestamp_ms == SUBAGENT_ENDED_MS
+        ));
+    }
+
+    #[test]
+    fn abandoning_stale_history_append_preserves_grace_held_complete() {
+        const CHILD_APPEND_MS: i64 = 1_788_087_815_624;
+        const SUBAGENT_ENDED_MS: i64 = 1_788_087_817_159;
+
+        let mut synthesis = Synthesis::with_lifecycle_timing(30, 600);
+        let (scope, _) =
+            synthesize_subagent_start(&mut synthesis, "history-stale", Some(CHILD_APPEND_MS));
+        let scope_key = ScopeKey::from(&scope);
+        let terminal_key = (PARENT.to_owned(), "history-stale".to_owned());
+        let held = synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                2,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "history-stale".to_owned(),
+                    failed: false,
+                    at_ms: SUBAGENT_ENDED_MS,
+                },
+            )],
+        );
+        assert!(synthesized_events(&held).is_empty());
+        assert_eq!(
+            synthesis.pending_complete_origins.get(&scope_key),
+            Some(&ObservationOrigin::Live)
+        );
+
+        let historical_origin = ObservationOrigin::Historical {
+            drain_id: crate::model::HistoryDrainId::new("claude:stale-child-append").unwrap(),
+            artifact_id: "agent-history-stale.jsonl".to_owned(),
+        };
+        let stale = synthesis.synthesize_batch_with_origin(
+            Path::new("agent-history-stale.jsonl"),
+            [(
+                3,
+                LogFact::Append {
+                    scope: scope.clone(),
+                    at_ms: CHILD_APPEND_MS,
+                },
+            )],
+            &mut Admission::new(0),
+            &AdmissionIndex::new(),
+            &historical_origin,
+        );
+        synthesis.abandon_origin(&historical_origin);
+
+        assert!(synthesis.pending_completes.contains_key(&scope_key));
+        assert_eq!(
+            synthesis.pending_complete_origins.get(&scope_key),
+            Some(&ObservationOrigin::Live)
+        );
+        assert_eq!(
+            synthesis
+                .subagent_ends
+                .get(&terminal_key)
+                .map(|terminal| terminal.at_ms),
+            Some(SUBAGENT_ENDED_MS)
+        );
+        assert!(stale.is_empty());
+        let flushed = synthesis.advance_lifecycle(SUBAGENT_ENDED_MS + 30);
+        assert!(matches!(
+            synthesized_events(&flushed).as_slice(),
+            [event]
+                if matches!(event.event, ControllerEventKind::Complete)
+                    && event.metadata.timestamp_ms == SUBAGENT_ENDED_MS
+        ));
+        assert_eq!(
+            synthesis.take_lifecycle_origin(&flushed[0]),
+            Some(ObservationOrigin::Live)
+        );
+        assert!(
+            synthesis
+                .advance_lifecycle(SUBAGENT_ENDED_MS + 60)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stale_child_append_never_reopens_completed_terminal() {
+        const SUBAGENT_ENDED_MS: i64 = 1_788_087_817_159;
+
+        let mut synthesis = Synthesis::with_lifecycle_timing(30, 600);
+        let (scope, _) = synthesize_subagent_start(
+            &mut synthesis,
+            "completed-stale",
+            Some(SUBAGENT_ENDED_MS - 1),
+        );
+        let scope_key = ScopeKey::from(&scope);
+        let terminal_key = (PARENT.to_owned(), "completed-stale".to_owned());
+        let _ = synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                2,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "completed-stale".to_owned(),
+                    failed: false,
+                    at_ms: SUBAGENT_ENDED_MS,
+                },
+            )],
+        );
+        assert!(matches!(
+            synthesized_events(&synthesis.advance_lifecycle(SUBAGENT_ENDED_MS + 30)).as_slice(),
+            [event] if matches!(event.event, ControllerEventKind::Complete)
+        ));
+        let previous_append_ms = synthesis.last_append_ms.get(&scope_key).copied();
+        let previous_append_origin = synthesis.last_append_origins.get(&scope_key).cloned();
+
+        let stale = synthesize(
+            &mut synthesis,
+            "agent-completed-stale.jsonl",
+            [(
+                3,
+                LogFact::Append {
+                    scope: scope.clone(),
+                    at_ms: SUBAGENT_ENDED_MS,
+                },
+            )],
+        );
+
+        assert!(stale.is_empty());
+        assert_eq!(
+            synthesis.last_append_ms.get(&scope_key).copied(),
+            previous_append_ms
+        );
+        assert_eq!(
+            synthesis.last_append_origins.get(&scope_key).cloned(),
+            previous_append_origin
+        );
+        assert!(synthesis.completed.contains(&scope_key));
+        assert_eq!(
+            synthesis
+                .subagent_ends
+                .get(&terminal_key)
+                .map(|terminal| terminal.at_ms),
+            Some(SUBAGENT_ENDED_MS)
+        );
+    }
+
+    #[test]
+    fn retroactive_duplicate_end_never_lowers_completed_resume_watermark() {
+        const RETROACTIVE_END_MS: i64 = 1_788_087_815_624;
+        const APPEND_MS: i64 = RETROACTIVE_END_MS + 1;
+        const PUBLISHED_END_MS: i64 = 1_788_087_817_159;
+
+        let mut synthesis = Synthesis::with_lifecycle_timing(30, 600);
+        let (scope, _) = synthesize_subagent_start(
+            &mut synthesis,
+            "retroactive-end",
+            Some(RETROACTIVE_END_MS - 1),
+        );
+        let scope_key = ScopeKey::from(&scope);
+        let terminal_key = (PARENT.to_owned(), "retroactive-end".to_owned());
+        let _ = synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                9,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "retroactive-end".to_owned(),
+                    failed: false,
+                    at_ms: PUBLISHED_END_MS,
+                },
+            )],
+        );
+        assert!(matches!(
+            synthesized_events(&synthesis.advance_lifecycle(PUBLISHED_END_MS + 30)).as_slice(),
+            [event] if matches!(event.event, ControllerEventKind::Complete)
+        ));
+
+        let duplicate = synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                3,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "retroactive-end".to_owned(),
+                    failed: false,
+                    at_ms: RETROACTIVE_END_MS,
+                },
+            )],
+        );
+        let stale = synthesize(
+            &mut synthesis,
+            "agent-retroactive-end.jsonl",
+            [(
+                4,
+                LogFact::Append {
+                    scope: scope.clone(),
+                    at_ms: APPEND_MS,
+                },
+            )],
+        );
+
+        assert!(duplicate.is_empty());
+        assert!(stale.is_empty());
+        assert!(synthesis.completed.contains(&scope_key));
+        assert_eq!(
+            synthesis
+                .subagent_ends
+                .get(&terminal_key)
+                .map(|terminal| terminal.at_ms),
+            Some(PUBLISHED_END_MS)
+        );
+    }
+
+    #[test]
+    fn stale_meta_resynthesis_never_discards_grace_held_complete() {
+        const SUBAGENT_ENDED_MS: i64 = 1_788_087_817_159;
+
+        let mut synthesis = Synthesis::with_lifecycle_timing(30, 600);
+        let (scope, _) =
+            synthesize_subagent_start(&mut synthesis, "stale-meta", Some(SUBAGENT_ENDED_MS - 1));
+        let scope_key = ScopeKey::from(&scope);
+        let terminal_key = (PARENT.to_owned(), "stale-meta".to_owned());
+        let held = synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                2,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "stale-meta".to_owned(),
+                    failed: false,
+                    at_ms: SUBAGENT_ENDED_MS,
+                },
+            )],
+        );
+        assert!(synthesized_events(&held).is_empty());
+        let was_completed = synthesis.completed.contains(&scope_key);
+
+        let stale = synthesize(
+            &mut synthesis,
+            "agent-child.meta.json",
+            [(
+                1,
+                LogFact::SubagentAppeared {
+                    parent: PARENT.to_owned(),
+                    agent_id: "stale-meta".to_owned(),
+                    agent_type: "reviewer".to_owned(),
+                    description: "Review stale-meta lifecycle".to_owned(),
+                    at_ms: SUBAGENT_ENDED_MS,
+                },
+            )],
+        );
+
+        assert!(synthesized_events(&stale).is_empty());
+        assert!(synthesis.pending_completes.contains_key(&scope_key));
+        assert!(synthesis.pending_complete_origins.contains_key(&scope_key));
+        assert_eq!(synthesis.completed.contains(&scope_key), was_completed);
+        assert_eq!(
+            synthesis
+                .subagent_ends
+                .get(&terminal_key)
+                .map(|terminal| terminal.at_ms),
+            Some(SUBAGENT_ENDED_MS)
+        );
+    }
+
+    #[test]
+    fn newer_child_append_still_reopens_after_complete() {
+        const SUBAGENT_ENDED_MS: i64 = 1_788_087_817_159;
+        const RESUMED_MS: i64 = SUBAGENT_ENDED_MS + 1;
+
+        let mut synthesis = Synthesis::with_lifecycle_timing(30, 600);
+        let (scope, _) =
+            synthesize_subagent_start(&mut synthesis, "newer-append", Some(SUBAGENT_ENDED_MS - 1));
+        let scope_key = ScopeKey::from(&scope);
+        let terminal_key = (PARENT.to_owned(), "newer-append".to_owned());
+        let _ = synthesize(
+            &mut synthesis,
+            "queue.jsonl",
+            [(
+                2,
+                LogFact::SubagentEnded {
+                    parent: PARENT.to_owned(),
+                    agent_id: "newer-append".to_owned(),
+                    failed: false,
+                    at_ms: SUBAGENT_ENDED_MS,
+                },
+            )],
+        );
+        assert!(matches!(
+            synthesized_events(&synthesis.advance_lifecycle(SUBAGENT_ENDED_MS + 30)).as_slice(),
+            [event] if matches!(event.event, ControllerEventKind::Complete)
+        ));
+        assert!(synthesis.completed.contains(&scope_key));
+
+        let resumed = synthesize(
+            &mut synthesis,
+            "agent-newer-append.jsonl",
+            [(
+                3,
+                LogFact::Append {
+                    scope: scope.clone(),
+                    at_ms: RESUMED_MS,
+                },
+            )],
+        );
+
+        assert!(synthesized_events(&resumed).iter().any(|event| {
+            matches!(event.event, ControllerEventKind::TaskStarted)
+                && event.metadata.timestamp_ms == RESUMED_MS
+        }));
+        assert!(!synthesis.pending_completes.contains_key(&scope_key));
+        assert!(!synthesis.pending_complete_origins.contains_key(&scope_key));
+        assert!(!synthesis.completed.contains(&scope_key));
+        assert!(!synthesis.subagent_ends.contains_key(&terminal_key));
     }
 
     #[test]
