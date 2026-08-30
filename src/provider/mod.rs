@@ -41,6 +41,8 @@ pub use tail::{
 /// Provider filesystem fallback interval.
 pub const RESCAN_INTERVAL: Duration = Duration::from_secs(2);
 const HINT_DEBOUNCE: Duration = Duration::from_millis(150);
+/// Retry cadence for flushing already-parsed events while egress is saturated.
+const PENDING_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 /// Fixed control-channel capacity.
 pub const CONTROL_CHANNEL_CAPACITY: usize = 256;
 /// Maximum number of entities retained before file advancement must pause.
@@ -2344,7 +2346,16 @@ fn provider_thread_main(
             break;
         }
         let until_periodic_rescan = rescan_interval.saturating_sub(last_full_rescan.elapsed());
-        let control = receiver.recv_timeout(until_periodic_rescan);
+        // Saturated egress leaves parsed events pending; retry them well before the
+        // periodic rescan instead of holding them for the whole interval.
+        let pending_retry_due =
+            pending.next_event().is_some() && PENDING_RETRY_INTERVAL < until_periodic_rescan;
+        let wait = if pending_retry_due {
+            PENDING_RETRY_INTERVAL
+        } else {
+            until_periodic_rescan
+        };
+        let control = receiver.recv_timeout(wait);
         let first_control = match control {
             Ok(Control::Stop) => {
                 flush_graceful_stop(&mut worker, &egress);
@@ -2352,11 +2363,15 @@ fn provider_thread_main(
             }
             Ok(control) => control,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                force_rescan.swap(false, Ordering::AcqRel);
                 if stop_flag.load(Ordering::Acquire) {
                     flush_graceful_stop(&mut worker, &egress);
                     break;
                 }
+                if pending_retry_due {
+                    retry_pending_egress(&egress, &mut pending);
+                    continue;
+                }
+                force_rescan.swap(false, Ordering::AcqRel);
                 run_provider_cycle(
                     &mut worker,
                     &egress,
@@ -2475,6 +2490,13 @@ fn flush_graceful_stop(worker: &mut impl ProviderWorker, egress: &ProviderEventS
             break;
         }
     }
+}
+
+/// Flush-only retry for pending events: never runs a cycle, touches the worker,
+/// or changes scan or watcher state. Egress saturation and closure diagnostics are
+/// recorded by the flush itself.
+fn retry_pending_egress(egress: &ProviderEventSender, pending: &mut PendingEvents) {
+    pending.flush_to_sender(egress);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4684,6 +4706,81 @@ mod tests {
             }
             assert_eq!(calls.load(Ordering::Relaxed), 1);
             assert!(handle.diagnostics().egress_saturations() > 0);
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(handle.stop())
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn pending_egress_retries_before_periodic_rescan_without_advancing_worker() {
+        run_bounded("pending egress retry", || {
+            const PENDING_DELIVERY_BUDGET: Duration = Duration::from_millis(250);
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            let worker = CountingWorker {
+                calls: Arc::clone(&calls),
+                emit: true,
+            };
+            let (egress, mut receiver) = tokio_mpsc::channel(1);
+            egress
+                .try_send(ProviderEvent::SourceState {
+                    provider: Provider::Claude,
+                    state: ProviderSourceState::Available,
+                })
+                .unwrap();
+            let handle = spawn_provider_thread_with_rescan_interval(
+                worker,
+                egress,
+                None,
+                Duration::from_secs(1),
+            )
+            .unwrap();
+            let diagnostics = handle.diagnostics();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while (calls.load(Ordering::Relaxed) < 1 || diagnostics.egress_saturations() == 0)
+                && Instant::now() < deadline
+            {
+                thread::yield_now();
+            }
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            assert!(diagnostics.egress_saturations() > 0);
+
+            let prefilled = receiver
+                .try_recv()
+                .expect("prefilled egress event should be drainable");
+            assert_eq!(event_kind(prefilled), "source");
+            let drained_at = Instant::now();
+
+            let pending_deadline = drained_at + PENDING_DELIVERY_BUDGET;
+            let pending = loop {
+                match receiver.try_recv() {
+                    Ok(event) => break Some(event),
+                    Err(tokio_mpsc::error::TryRecvError::Empty)
+                        if Instant::now() < pending_deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_) => break None,
+                }
+            };
+            let elapsed = drained_at.elapsed();
+            let pending = pending.unwrap_or_else(|| {
+                panic!(
+                    "pending worker event did not arrive within {PENDING_DELIVERY_BUDGET:?} \
+                     after draining egress (waited {elapsed:?}; worker calls = {})",
+                    calls.load(Ordering::Relaxed)
+                )
+            });
+            eprintln!("pending egress event delivered {elapsed:?} after drain");
+            assert_eq!(event_kind(pending), "working");
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                1,
+                "delivering pending egress must not advance the worker"
+            );
+
             tokio::runtime::Runtime::new()
                 .unwrap()
                 .block_on(handle.stop())
